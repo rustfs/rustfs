@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::compress_index::{Index, TryGetIndex};
-use crate::{BlockReadable, BoxReadBlockFuture, EtagResolvable, HashReaderDetector, HashReaderMut, Reader};
+use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
 use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
 use std::pin::Pin;
@@ -135,41 +135,9 @@ where
     }
 }
 
-impl<R> BlockReadable for EtagReader<R>
-where
-    R: Reader,
-{
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(async move {
-            let n = match self.inner.read_block(buf).await {
-                Ok(n) => n,
-                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => 0,
-                Err(err) => return Err(err),
-            };
-            if n > 0 {
-                self.md5.update(&buf[..n]);
-                return Ok(n);
-            }
-
-            self.finished = true;
-            if let Some(checksum) = &self.checksum {
-                let etag = self.md5.clone().finalize().to_vec();
-                let etag_hex = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
-                if checksum != &etag_hex {
-                    error!("Checksum mismatch, expected={:?}, actual={:?}", checksum, etag_hex);
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Checksum mismatch"));
-                }
-            }
-
-            Ok(0)
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlockReadable, WarpReader};
     use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -210,24 +178,6 @@ mod tests {
 
         let etag = etag_reader.try_resolve_etag();
         assert_eq!(etag, Some(expected));
-    }
-
-    #[tokio::test]
-    async fn test_etag_reader_read_block_updates_checksum() {
-        let data = b"hello world";
-        let mut hasher = Md5::new();
-        hasher.update(data);
-        let expected = faster_hex::hex_string(hasher.finalize().as_slice()).to_string();
-        let reader = BufReader::new(&data[..]);
-        let reader = Box::new(WarpReader::new(reader));
-        let mut etag_reader = EtagReader::new(reader, Some(expected.clone()));
-
-        let mut buf = [0_u8; 32];
-        let n = etag_reader.read_block(&mut buf).await.unwrap();
-        assert_eq!(n, data.len());
-        assert_eq!(&buf[..n], data);
-        assert_eq!(etag_reader.read_block(&mut buf).await.unwrap(), 0);
-        assert_eq!(etag_reader.try_resolve_etag(), Some(expected));
     }
 
     #[tokio::test]

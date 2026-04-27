@@ -59,7 +59,7 @@ pub fn get_signature(signing_key: [u8; 32], string_to_sign: &str) -> String {
 pub fn get_scope(location: &str, t: OffsetDateTime, service_type: &str) -> String {
     let format = format_description!("[year][month][day]");
     let mut ans = String::from("");
-    ans.push_str(&t.format(&format).unwrap().to_string());
+    ans.push_str(&t.format(&format).unwrap());
     ans.push('/');
     ans.push_str(location);
     ans.push('/');
@@ -234,7 +234,7 @@ pub fn pre_sign_v4(
     }
     query.push(("X-Amz-Algorithm".to_string(), SIGN_V4_ALGORITHM.to_string()));
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
-    query.push(("X-Amz-Date".to_string(), t.format(&format).unwrap().to_string()));
+    query.push(("X-Amz-Date".to_string(), t.format(&format).unwrap()));
     query.push(("X-Amz-Expires".to_string(), format!("{expires:010}")));
     query.push(("X-Amz-SignedHeaders".to_string(), signed_headers));
     query.push(("X-Amz-Credential".to_string(), credential));
@@ -312,7 +312,7 @@ fn sign_v4_inner(
 
     let headers = req.headers_mut();
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
-    headers.insert("X-Amz-Date", t.format(&format).unwrap().to_string().parse().unwrap());
+    headers.insert("X-Amz-Date", t.format(&format).unwrap().parse().unwrap());
 
     if !session_token.is_empty() {
         headers.insert("X-Amz-Security-Token", session_token.parse().unwrap());
@@ -364,7 +364,7 @@ fn _unsigned_trailer(mut req: request::Request<Body>, content_len: i64, trailer:
 
     let headers = req.headers_mut();
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
-    headers.insert("X-Amz-Date", t.format(&format).unwrap().to_string().parse().unwrap());
+    headers.insert("X-Amz-Date", t.format(&format).unwrap().parse().unwrap());
 
     for (k, _) in &trailer {
         headers.append("X-Amz-Trailer", k.as_str().to_lowercase().parse().unwrap());

@@ -53,6 +53,8 @@ on:
       - ".github/workflows/docker.yml"
       - ".github/workflows/audit.yml"
       - ".github/workflows/performance.yml"
+  merge_group:
+    types: [checks_requested]
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:

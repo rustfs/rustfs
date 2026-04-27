@@ -1405,7 +1405,8 @@ impl ECStore {
 
         let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
 
-        fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
+        fivs.versions
+            .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
@@ -3684,7 +3685,7 @@ mod pools_tests {
     #[test]
     fn test_take_decommission_canceler_takes_and_clears_slot() {
         let token = CancellationToken::new();
-        let mut cancelers = vec![Some(token.clone())];
+        let mut cancelers = vec![Some(token)];
 
         let taken = take_decommission_canceler(cancelers.as_mut_slice(), 0);
         assert!(taken.is_some());

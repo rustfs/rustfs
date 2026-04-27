@@ -160,7 +160,7 @@ async fn test_bucket_lifecycle_configuration() -> Result<(), Box<dyn std::error:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_bucket_lifecycle_rejects_zero_days() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_bucket_lifecycle_accepts_zero_days() -> Result<(), Box<dyn std::error::Error>> {
     use aws_sdk_s3::types::{BucketLifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter};
 
     let client = create_aws_s3_client().await?;
@@ -176,19 +176,12 @@ async fn test_bucket_lifecycle_rejects_zero_days() -> Result<(), Box<dyn std::er
         .build()?;
     let lifecycle = BucketLifecycleConfiguration::builder().rules(rule).build()?;
 
-    let err = client
+    client
         .put_bucket_lifecycle_configuration()
         .bucket(BUCKET)
         .lifecycle_configuration(lifecycle)
         .send()
-        .await
-        .expect_err("zero-day lifecycle expiration should be rejected");
-
-    let err_msg = format!("{err:?}");
-    assert!(
-        err_msg.contains("InvalidArgument") && err_msg.contains("greater than 0"),
-        "unexpected error: {err_msg}"
-    );
+        .await?;
 
     Ok(())
 }

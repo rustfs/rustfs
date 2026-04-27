@@ -83,7 +83,7 @@ impl LastDayTierStats {
     #[allow(dead_code)]
     fn merge(&self, m: LastDayTierStats) -> LastDayTierStats {
         let mut cl = self.clone();
-        let mut cm = m.clone();
+        let mut cm = m;
         let mut merged = LastDayTierStats::default();
 
         if cl.updated_at.unix_timestamp() > cm.updated_at.unix_timestamp() {

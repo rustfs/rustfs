@@ -88,7 +88,7 @@ impl ContextProvider for MetadataProvider {
         self.func_manager
             .udf(name)
             .ok()
-            .or(self.session.inner().scalar_functions().get(name).cloned())
+            .or_else(|| self.session.inner().scalar_functions().get(name).cloned())
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {

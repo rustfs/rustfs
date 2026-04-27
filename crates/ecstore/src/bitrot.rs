@@ -21,8 +21,6 @@ use std::time::Instant;
 use tokio::io::AsyncRead;
 use tracing::debug;
 
-const BITROT_READ_OPERATION: &str = "bitrot_read";
-
 /// Create a BitrotReader from either inline data or disk file stream
 ///
 /// # Parameters
@@ -66,39 +64,21 @@ pub async fn create_bitrot_reader(
         Ok(Some(reader))
     } else if let Some(disk) = disk {
         // Read from disk
-        if use_zero_copy {
-            if !disk.is_local() {
-                rustfs_io_metrics::record_io_path_selected(BITROT_READ_OPERATION, rustfs_io_metrics::IoPath::Legacy);
-                rustfs_io_metrics::record_io_fallback(
-                    rustfs_io_metrics::IoStage::ReadSetup,
-                    rustfs_io_metrics::FallbackReason::NonLocalBackend,
-                );
-
-                let rd = disk.read_file_stream(bucket, path, offset, length).await?;
-                let reader = BitrotReader::new(rd, shard_size, checksum_algo, skip_verify);
-                return Ok(Some(reader));
-            }
-
+        if use_zero_copy && disk.is_local() {
             // Try zero-copy read first (uses mmap on Unix)
             let start = Instant::now();
             match disk.read_file_zero_copy(bucket, path, offset, length).await {
                 Ok(bytes) => {
                     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-                    rustfs_io_metrics::record_io_path_selected(BITROT_READ_OPERATION, rustfs_io_metrics::IoPath::Fast);
-                    // `read_file_zero_copy()` returns a shared `Bytes` view, which preserves the
-                    // mmap-backed fast path without exposing chunk-native GET internals.
-                    rustfs_io_metrics::record_io_copy_mode(
-                        BITROT_READ_OPERATION,
-                        rustfs_io_metrics::CopyMode::SharedBytes,
-                        bytes.len(),
-                    );
+                    // Record zero-copy metrics
+                    rustfs_io_metrics::record_zero_copy_read(bytes.len(), duration_ms);
 
+                    // Log successful zero-copy read
                     debug!(
                         size = bytes.len(),
-                        duration_ms,
                         path = %path,
-                        "bitrot_fast_read_success"
+                        "zero_copy_read_success"
                     );
 
                     // Wrap Bytes in Cursor for AsyncRead
@@ -113,16 +93,14 @@ pub async fn create_bitrot_reader(
                     Ok(Some(reader))
                 }
                 Err(e) => {
-                    rustfs_io_metrics::record_io_path_selected(BITROT_READ_OPERATION, rustfs_io_metrics::IoPath::Legacy);
-                    rustfs_io_metrics::record_io_fallback(
-                        rustfs_io_metrics::IoStage::ReadSetup,
-                        rustfs_io_metrics::FallbackReason::Unknown,
-                    );
+                    // Record zero-copy fallback
+                    rustfs_io_metrics::record_zero_copy_fallback(&format!("{:?}", e));
 
+                    // Log zero-copy fallback
                     debug!(
-                        reason = %e,
+                        reason = %format!("{:?}", e),
                         path = %path,
-                        "bitrot_fast_read_fallback"
+                        "zero_copy_fallback"
                     );
 
                     // Fall back to regular stream read on error
@@ -139,7 +117,6 @@ pub async fn create_bitrot_reader(
                 }
             }
         } else {
-            rustfs_io_metrics::record_io_path_selected(BITROT_READ_OPERATION, rustfs_io_metrics::IoPath::Legacy);
             // Use regular stream read
             match disk.read_file_stream(bucket, path, offset, length).await {
                 Ok(rd) => {

@@ -100,14 +100,7 @@ pub fn sign_v2(
         let headers = req.headers_mut();
         let need_default_date = headers.get("Date").and_then(|v| v.to_str().ok()).is_none_or(|v| v.is_empty());
         if need_default_date {
-            headers.insert(
-                "Date",
-                d2.format(&format_description::well_known::Rfc2822)
-                    .unwrap()
-                    .to_string()
-                    .parse()
-                    .unwrap(),
-            );
+            headers.insert("Date", d2.format(&format_description::well_known::Rfc2822).unwrap().parse().unwrap());
         }
     }
     let string_to_sign = string_to_sign_v2(&req, virtual_host);

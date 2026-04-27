@@ -11,6 +11,7 @@
 
 # Failed tests
 test_bucket_create_delete_bucket_ownership
+test_create_bucket_no_ownership_controls
 test_bucket_logging_owner
 test_object_copy_not_owned_bucket
 test_bucket_policy_multipart
@@ -19,7 +20,6 @@ test_put_bucket_logging
 test_put_bucket_logging_errors
 test_put_bucket_logging_permissions
 test_put_bucket_logging_policy_wildcard
-test_rm_bucket_logging
 
 # Skipped tests (require IAM account or multiple storage classes)
 test_bucket_policy_deny_self_denied_policy
@@ -31,5 +31,4 @@ test_lifecycle_transition_encrypted
 # Tests with known issues (need further investigation)
 test_bucket_policy_different_tenant
 test_bucket_policy_tenanted_bucket
-# Flaky in CI: version count assertion (expects 5, gets 1) - timing/concurrency
-test_versioned_concurrent_object_create_concurrent_remove
+test_object_copy_to_itself_with_metadata

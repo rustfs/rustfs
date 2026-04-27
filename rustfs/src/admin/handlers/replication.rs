@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::auth::validate_admin_request;
+use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};
@@ -231,11 +232,23 @@ impl Operation for SetRemoteTargetHandler {
         }
 
         remote_target.source_bucket = bucket.clone();
+        let site_endpoint = if remote_target.endpoint.starts_with("http://") || remote_target.endpoint.starts_with("https://") {
+            remote_target.endpoint.clone()
+        } else if remote_target.secure {
+            format!("https://{}", remote_target.endpoint)
+        } else {
+            format!("http://{}", remote_target.endpoint)
+        };
+        if let Some(deployment_id) = site_replication_peer_deployment_id_for_endpoint(&site_endpoint).await {
+            remote_target.deployment_id = deployment_id;
+        }
 
         let bucket_target_sys = BucketTargetSys::get();
 
         if !update {
-            let (arn, exist) = bucket_target_sys.get_remote_arn(bucket, Some(&remote_target), "").await;
+            let (arn, exist) = bucket_target_sys
+                .get_remote_arn(bucket, Some(&remote_target), remote_target.deployment_id.as_str())
+                .await;
             remote_target.arn = arn.clone();
             if exist && !arn.is_empty() {
                 let arn_str = serde_json::to_string(&arn).unwrap_or_default();
@@ -275,15 +288,10 @@ impl Operation for SetRemoteTargetHandler {
 
         let arn = remote_target.arn.clone();
 
-        bucket_target_sys
+        let targets = bucket_target_sys
             .set_target(bucket, &remote_target, update)
             .await
             .map_err(map_bucket_target_error)?;
-
-        let targets = bucket_target_sys.list_bucket_targets(bucket).await.map_err(|e| {
-            error!("Failed to list bucket targets: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to list bucket targets".to_string())
-        })?;
         let json_targets = serde_json::to_vec(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
@@ -295,6 +303,7 @@ impl Operation for SetRemoteTargetHandler {
                 error!("Failed to update bucket targets: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
+        bucket_target_sys.update_all_targets(bucket, Some(&targets)).await;
 
         let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
@@ -392,12 +401,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
         let sys = BucketTargetSys::get();
 
-        sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
-
-        let targets = sys.list_bucket_targets(bucket).await.map_err(|e| {
-            error!("Failed to list bucket targets: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to list bucket targets".to_string())
-        })?;
+        let targets = sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
 
         let json_targets = serde_json::to_vec(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
@@ -410,6 +414,7 @@ impl Operation for RemoveRemoteTargetHandler {
                 error!("Failed to update bucket targets: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
+        sys.update_all_targets(bucket, Some(&targets)).await;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }

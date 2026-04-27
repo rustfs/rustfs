@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::iam_error::iam_error_to_s3_error;
 use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
@@ -79,10 +80,32 @@ fn delete_service_account_success_status(path: &str) -> StatusCode {
     }
 }
 
+fn merge_derived_service_account_claims(
+    target_claims: &mut HashMap<String, serde_json::Value>,
+    source_claims: &HashMap<String, serde_json::Value>,
+) {
+    for (key, value) in source_claims {
+        if key == "exp" {
+            continue;
+        }
+        target_claims.insert(key.clone(), value.clone());
+    }
+}
+
+fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &str) -> bool {
+    let caller_parent = if caller.parent_user.is_empty() {
+        caller.access_key.as_str()
+    } else {
+        caller.parent_user.as_str()
+    };
+
+    caller_parent == target_parent_user
+}
+
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
     debug!("{action}, e: {:?}", err);
     if is_err_no_such_service_account(&err) {
-        s3_error!(InvalidRequest, "service account not exist")
+        iam_error_to_s3_error(err)
     } else {
         s3_error!(InternalError, "{action}")
     }
@@ -91,7 +114,7 @@ fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str)
 fn map_temp_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
     debug!("{action}, e: {:?}", err);
     if is_err_no_such_temp_account(&err) {
-        s3_error!(InvalidRequest, "access key not exist")
+        iam_error_to_s3_error(err)
     } else {
         s3_error!(InternalError, "{action}")
     }
@@ -193,9 +216,7 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "access key has spaces"));
         }
 
-        create_req
-            .validate()
-            .map_err(|e| S3Error::with_message(InvalidRequest, e.to_string()))?;
+        create_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
 
         let session_policy = if let Some(policy) = &create_req.policy {
             let policy_bytes =
@@ -252,7 +273,7 @@ impl Operation for AddServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false, // Always require explicit Allow permission
             })
             .await
@@ -295,13 +316,7 @@ impl Operation for AddServiceAccount {
                     opts.claims = Some(HashMap::new());
                 }
 
-                for (k, v) in claims.iter() {
-                    if claims.contains_key("exp") {
-                        continue;
-                    }
-
-                    opts.claims.as_mut().unwrap().insert(k.clone(), v.clone());
-                }
+                merge_derived_service_account_claims(opts.claims.as_mut().unwrap(), &claims);
             }
         }
 
@@ -528,9 +543,7 @@ impl Operation for UpdateServiceAccount {
         let update_req: UpdateServiceAccountReq =
             serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
 
-        update_req
-            .validate()
-            .map_err(|e| S3Error::with_message(InvalidRequest, e.to_string()))?;
+        update_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
 
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
@@ -550,11 +563,20 @@ impl Operation for UpdateServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
         {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
+
+        let (svc_account, _) = iam_store
+            .get_service_account(&access_key)
+            .await
+            .map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
+
+        if !is_service_account_owner_of(&cred, &svc_account.parent_user) {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
@@ -666,7 +688,7 @@ impl Operation for InfoServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -733,7 +755,7 @@ impl Operation for TemporaryAccountInfo {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -807,7 +829,7 @@ impl Operation for InfoAccessKey {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -929,11 +951,13 @@ impl Operation for ListServiceAccount {
         };
 
         let target_account = if query.user.as_ref().is_some_and(|v| v != &cred.access_key) {
+            // Cross-user listing must be authorized by ListServiceAccounts, matching the
+            // sibling InfoServiceAccount/InfoAccessKey/ListAccessKeysBulk handlers.
             if !iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,
                     groups: &cred.groups,
-                    action: Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction),
+                    action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                     bucket: "",
                     conditions: &get_condition_values(
                         &req.headers,
@@ -944,7 +968,7 @@ impl Operation for ListServiceAccount {
                     ),
                     is_owner: owner,
                     object: "",
-                    claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                    claims: cred.claims_or_empty(),
                     deny_only: false,
                 })
                 .await
@@ -1022,7 +1046,9 @@ fn parse_list_access_keys_query(query: Option<&str>) -> ListAccessKeysQuery {
 
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
         match key.as_ref() {
-            "users" => parsed.users.push(value.into_owned()),
+            "users" if !value.is_empty() => {
+                parsed.users.push(value.into_owned());
+            }
             "all" => parsed.all = parse_bool_param(value.as_ref()),
             "listType" => parsed.list_type = value.into_owned(),
             _ => {}
@@ -1080,7 +1106,7 @@ impl Operation for ListAccessKeysBulk {
                     ),
                     is_owner: owner,
                     object: "",
-                    claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                    claims: cred.claims_or_empty(),
                     deny_only: false,
                 })
                 .await
@@ -1103,7 +1129,7 @@ impl Operation for ListAccessKeysBulk {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: self_only,
             })
             .await
@@ -1128,13 +1154,9 @@ impl Operation for ListAccessKeysBulk {
             }
             users
         } else {
-            let mut checked = Vec::new();
-            for user in requested_users {
-                if iam_store.get_user(&user).await.is_some() {
-                    checked.push(user);
-                }
-            }
-            checked
+            // Keep requested identities as-is. Some valid parent users (for example external
+            // identities) may not be persisted as regular IAM users, but can still own keys.
+            requested_users
         };
 
         let (list_sts_keys, list_service_accounts) = match query.list_type.as_str() {
@@ -1272,7 +1294,7 @@ impl Operation for DeleteServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -1404,9 +1426,54 @@ mod tests {
     }
 
     #[test]
+    fn list_access_keys_query_ignores_empty_users_values() {
+        let query = parse_list_access_keys_query(Some("users=&users=alice&users=&listType=all"));
+
+        assert_eq!(query.users, vec!["alice".to_string()]);
+        assert!(!query.all);
+        assert_eq!(query.list_type, ACCESS_KEY_LIST_ALL);
+    }
+
+    #[test]
+    fn list_access_keys_query_all_with_empty_users_does_not_conflict() {
+        let query = parse_list_access_keys_query(Some("users=&all=true&listType=all"));
+
+        assert!(query.users.is_empty());
+        assert!(query.all);
+        assert_eq!(query.list_type, ACCESS_KEY_LIST_ALL);
+        assert!(!query.all || query.users.is_empty());
+    }
+
+    #[test]
     fn list_access_keys_query_defaults_to_all_list_type() {
         let query = ListAccessKeysQuery::default();
         assert_eq!(query.list_type, ACCESS_KEY_LIST_ALL);
+    }
+
+    #[test]
+    fn list_service_account_cross_user_uses_list_service_accounts_action() {
+        let src = include_str!("service_account.rs");
+        let list_start = src
+            .find("impl Operation for ListServiceAccount")
+            .expect("ListServiceAccount operation should exist");
+        let list_block = &src[list_start..];
+        let list_end = list_block
+            .find("struct ListAccessKeysQuery")
+            .expect("ListAccessKeysQuery marker should exist");
+        let list_block = &list_block[..list_end];
+
+        assert!(
+            list_block.contains("query.user.as_ref().is_some_and(") && list_block.contains("v != &cred.access_key"),
+            "cross-user ListServiceAccount path should stay explicitly guarded"
+        );
+        assert!(
+            list_block.contains("ListServiceAccountsAdminAction"),
+            "cross-user ListServiceAccount should authorize with ListServiceAccountsAdminAction"
+        );
+        assert!(
+            !list_block.contains("UpdateServiceAccountAdminAction"),
+            "cross-user ListServiceAccount must not require UpdateServiceAccountAdminAction"
+        );
     }
 
     #[test]
@@ -1445,8 +1512,8 @@ mod tests {
             "get service account failed",
         );
 
-        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("service account not exist"));
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchResource);
+        assert_eq!(err.message(), Some("service account 'missing' does not exist"));
     }
 
     #[test]
@@ -1456,8 +1523,8 @@ mod tests {
             "get temporary account failed",
         );
 
-        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("access key not exist"));
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchResource);
+        assert_eq!(err.message(), Some("temp account 'missing' does not exist"));
     }
 
     #[test]
@@ -1468,5 +1535,44 @@ mod tests {
         let policy = policy.unwrap();
         assert!(policy.version.is_empty());
         assert!(policy.statements.is_empty());
+    }
+
+    #[test]
+    fn update_service_account_requires_requester_parent_match() {
+        let parent_owner = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            parent_user: String::new(),
+            ..Default::default()
+        };
+        let derived_owner = StoredCredentials {
+            access_key: "sa-user".to_string(),
+            parent_user: "owner-user".to_string(),
+            ..Default::default()
+        };
+        let foreign_user = StoredCredentials {
+            access_key: "other".to_string(),
+            parent_user: String::new(),
+            ..Default::default()
+        };
+
+        assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
+        assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
+        assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
+    }
+
+    #[test]
+    fn merge_derived_service_account_claims_skips_only_expiration() {
+        let mut merged = HashMap::new();
+        let source = HashMap::from([
+            ("exp".to_string(), json!(123456)),
+            ("parent".to_string(), json!("owner-user")),
+            ("custom".to_string(), json!("value")),
+        ]);
+
+        merge_derived_service_account_claims(&mut merged, &source);
+
+        assert!(!merged.contains_key("exp"));
+        assert_eq!(merged.get("parent"), Some(&json!("owner-user")));
+        assert_eq!(merged.get("custom"), Some(&json!("value")));
     }
 }

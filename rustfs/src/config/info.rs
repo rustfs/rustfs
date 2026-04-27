@@ -549,7 +549,7 @@ fn collect_config_info_json() -> ConfigInfoJson {
             let profile = config.workload_profile();
             let buffer_config = profile.config();
             Some(WorkloadProfileJson {
-                name: config.workload_name().to_string(),
+                name: config.workload_name(),
                 buffer_min_size: buffer_config.min_size,
                 buffer_max_size: buffer_config.max_size,
                 default_unknown: buffer_config.default_unknown,
@@ -590,20 +590,13 @@ struct FeatureSpec {
     default_enabled: bool,
 }
 
-fn feature_specs() -> [FeatureSpec; 9] {
+fn feature_specs() -> [FeatureSpec; 8] {
     [
-        FeatureSpec {
-            name: "direct-io",
-            enabled: cfg!(feature = "direct-io"),
-            description: "Aligned pread-based direct I/O reader support",
-            dependencies: "(none)",
-            default_enabled: true,
-        },
         FeatureSpec {
             name: "metrics-gpu",
             enabled: cfg!(feature = "metrics-gpu"),
             description: "Metrics GPU support",
-            dependencies: "rustfs-metrics/gpu",
+            dependencies: "rustfs-obs/gpu",
             default_enabled: false,
         },
         FeatureSpec {
@@ -652,7 +645,7 @@ fn feature_specs() -> [FeatureSpec; 9] {
             name: "full",
             enabled: cfg!(feature = "full"),
             description: "All features enabled",
-            dependencies: "metrics-gpu + ftps + swift + webdav + direct-io",
+            dependencies: "metrics-gpu + ftps + swift + webdav",
             default_enabled: false,
         },
     ]
@@ -926,13 +919,13 @@ mod tests {
         let info = collect_deps_info_json();
         let feature_names: Vec<_> = info.features.iter().map(|feature| feature.name).collect();
 
-        assert_eq!(info.total_count, 9);
-        assert_eq!(info.features.len(), 9);
-        assert!(feature_names.contains(&"direct-io"));
+        assert_eq!(info.total_count, 8);
+        assert_eq!(info.features.len(), 8);
         assert!(feature_names.contains(&"metrics-gpu"));
         assert!(feature_names.contains(&"io-scheduler-debug"));
         assert!(feature_names.contains(&"manual-test-runners"));
         assert!(!feature_names.contains(&"metrics"));
+        assert!(!feature_names.contains(&"direct-io"));
     }
 
     #[test]
@@ -942,7 +935,7 @@ mod tests {
         assert!(output.contains("| metrics-gpu |"));
         assert!(output.contains("| io-scheduler-debug |"));
         assert!(output.contains("| manual-test-runners |"));
-        assert!(output.contains("| direct-io | enabled by default |"));
-        assert!(output.contains("| full | metrics-gpu + ftps + swift + webdav + direct-io |"));
+        assert!(output.contains("| full | metrics-gpu + ftps + swift + webdav |"));
+        assert!(!output.contains("| direct-io |"));
     }
 }

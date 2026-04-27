@@ -19,6 +19,7 @@ use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
 };
+use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_utils::http::ip::get_source_ip_raw;
 use s3s::S3Error;
 use s3s::S3ErrorCode;
@@ -167,13 +168,14 @@ impl S3Auth for IAMAuth {
                 Ok((Some(id), _valid)) => {
                     // Return secret key for signature verification regardless of user status.
                     // Authorization will be checked separately in the authorization phase.
-                    return Ok(SecretKey::from(id.credentials.secret_key.clone()));
+                    return Ok(SecretKey::from(id.credentials.secret_key));
                 }
                 Ok((None, _)) => {
                     warn!("get_secret_key failed: no such user, access_key: {access_key}");
                 }
                 Err(e) => {
                     warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
+                    return Err(iam_lookup_error_to_s3_error(&e));
                 }
             }
         } else {
@@ -185,6 +187,10 @@ impl S3Auth for IAMAuth {
             "The Access Key Id you provided does not exist in our records."
         ))
     }
+}
+
+fn iam_lookup_error_to_s3_error(_err: &IamError) -> S3Error {
+    s3_error!(InternalError, "IAM user lookup failed")
 }
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
@@ -415,6 +421,19 @@ pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str
     token
 }
 
+pub(crate) fn extract_string_list_claim(claims: &HashMap<String, Value>, claim_name: &str) -> Vec<String> {
+    match get_claim_case_insensitive(claims, claim_name) {
+        ClaimLookup::Found(Value::Array(values)) => values.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect(),
+        ClaimLookup::Found(Value::String(value)) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        ClaimLookup::Missing | ClaimLookup::Ambiguous | ClaimLookup::Found(_) => Vec::new(),
+    }
+}
+
 /// Get condition values for policy evaluation
 ///
 /// # Arguments
@@ -611,16 +630,14 @@ pub fn get_condition_values_with_query(
             }
         }
 
-        if let Some(grps_val) = claims.get("groups")
-            && let Some(grps_is) = grps_val.as_array()
-        {
-            let grps = grps_is
-                .iter()
-                .filter_map(|g| g.as_str().map(|s| s.to_string()))
-                .collect::<Vec<String>>();
-            if !grps.is_empty() {
-                args.insert("groups".to_string(), grps);
-            }
+        let grps = extract_string_list_claim(claims, "groups");
+        if !grps.is_empty() {
+            args.insert("groups".to_string(), grps);
+        }
+
+        let roles = extract_string_list_claim(claims, "roles");
+        if !roles.is_empty() {
+            args.insert("roles".to_string(), roles);
         }
     }
 
@@ -957,6 +974,14 @@ mod tests {
     }
 
     #[test]
+    fn test_iam_lookup_error_maps_to_internal_error() {
+        let result = iam_lookup_error_to_s3_error(&IamError::Io(std::io::Error::other("load user failed")));
+
+        assert_eq!(result.code(), &S3ErrorCode::InternalError);
+        assert_eq!(result.message(), Some("IAM user lookup failed"));
+    }
+
+    #[test]
     fn test_check_claims_from_token_empty_token_and_access_key() {
         let mut cred = create_test_credentials();
         cred.access_key = "".to_string();
@@ -1206,6 +1231,49 @@ mod tests {
 
         assert_eq!(conditions.get("username"), Some(&vec!["ldap-user".to_string()]));
         assert_eq!(conditions.get("groups"), Some(&vec!["group1".to_string(), "group2".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_with_roles_claim_array() {
+        let mut cred = create_service_account_credentials();
+        let mut claims = HashMap::new();
+        claims.insert("roles".to_string(), json!(["role1", "role2"]));
+        cred.claims = Some(claims);
+
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("roles"), Some(&vec!["role1".to_string(), "role2".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_with_roles_claim_csv_and_case_insensitive() {
+        let mut cred = create_service_account_credentials();
+        let mut claims = HashMap::new();
+        claims.insert("Roles".to_string(), json!("role1, role2"));
+        cred.claims = Some(claims);
+
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("roles"), Some(&vec!["role1".to_string(), "role2".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_with_roles_claim_ambiguous_case_insensitive_match_returns_empty() {
+        let mut cred = create_service_account_credentials();
+        let mut claims = HashMap::new();
+        claims.insert("Roles".to_string(), json!(["role1"]));
+        claims.insert("ROLES".to_string(), json!(["role2"]));
+        cred.claims = Some(claims);
+
+        let headers = HeaderMap::new();
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("roles"), None);
     }
 
     #[test]

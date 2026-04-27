@@ -18,12 +18,12 @@ use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
 use crate::server::{
-    ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
+    ReadinessGateLayer, RemoteAddr,
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
-        AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer,
-        RequestContextLayer,
+        AdminChunkedContentLengthCompatLayer, BodylessStatusFixLayer, ConditionalCorsLayer, HeadRequestBodyFixLayer,
+        ObjectAttributesEtagFixLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
@@ -38,7 +38,7 @@ use hyper_util::{
     server::graceful::GracefulShutdown,
     service::TowerToHyperService,
 };
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
@@ -54,6 +54,7 @@ use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tonic::{Request, Status};
@@ -66,9 +67,67 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+const LABEL_HTTP_METHOD: &str = "method";
+const LABEL_HTTP_STATUS_CLASS: &str = "status_class";
+const METRIC_HTTP_SERVER_REQUESTS_TOTAL: &str = "rustfs_http_server_requests_total";
+const METRIC_HTTP_SERVER_FAILURES_TOTAL: &str = "rustfs_http_server_failures_total";
+const METRIC_HTTP_SERVER_ACTIVE_REQUESTS: &str = "rustfs_http_server_active_requests";
+const METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS: &str = "rustfs_http_server_request_duration_seconds";
+const METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_http_server_request_body_bytes_total";
+const METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES: &str = "rustfs_http_server_request_body_size_bytes";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL: &str = "rustfs_http_server_response_body_bytes_total";
+const METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES: &str = "rustfs_http_server_response_body_size_bytes";
+
+static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn request_method_label(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "PUT" => "PUT",
+        "POST" => "POST",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "OTHER",
+    }
+}
+
+#[inline]
+fn status_class_label(status: http::StatusCode) -> &'static str {
+    match status.as_u16() / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "unknown",
+    }
+}
+
+#[inline]
+fn record_active_http_requests(delta: i64) {
+    let next = if delta >= 0 {
+        ACTIVE_HTTP_REQUESTS.fetch_add(delta as u64, Ordering::Relaxed) + delta as u64
+    } else {
+        let decrement = (-delta) as u64;
+        ACTIVE_HTTP_REQUESTS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(decrement)))
+            .unwrap_or_else(|current| current)
+            .saturating_sub(decrement)
+    };
+    gauge!(METRIC_HTTP_SERVER_ACTIVE_REQUESTS).set(next as f64);
+}
+
+pub(crate) fn active_http_requests() -> u64 {
+    ACTIVE_HTTP_REQUESTS.load(Ordering::Relaxed)
+}
+
 pub async fn start_http_server(
     config: &config::Config,
-    worker_state_manager: ServiceStateManager,
     readiness: Arc<GlobalReadiness>,
 ) -> Result<(tokio::sync::broadcast::Sender<()>, SocketAddr)> {
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
@@ -161,12 +220,12 @@ pub async fn start_http_server(
     // Note: outbound material (root CAs, mTLS identity) is already applied in main.rs.
     let tls_snapshot = TlsMaterialSnapshot::load(tls_path)
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| Error::other(e.to_string()))?;
 
     let tls_acceptor = tls_snapshot
         .build_tls_acceptor(tls_path)
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| Error::other(e.to_string()))?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 
@@ -224,7 +283,7 @@ pub async fn start_http_server(
         let secret_key = config.secret_key.clone();
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
-        b.set_access(store.clone());
+        b.set_access(store);
         b.set_route(admin::make_admin_route(config.console_enable)?);
 
         // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
@@ -357,10 +416,6 @@ pub async fn start_http_server(
         let graceful = Arc::new(GracefulShutdown::new());
         debug!("graceful initiated");
 
-        // service ready
-        worker_state_manager.update(ServiceState::Ready);
-        // tls_acceptor is already Option<Arc<TlsAcceptorHolder>>, clone for the loop
-
         loop {
             debug!("Waiting for new connection...");
             let (socket, _) = {
@@ -458,7 +513,6 @@ pub async fn start_http_server(
             process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
         }
 
-        worker_state_manager.update(ServiceState::Stopping);
         match Arc::try_unwrap(graceful) {
             Ok(g) => {
                 tokio::select! {
@@ -476,7 +530,6 @@ pub async fn start_http_server(
                 debug!("Timeout reached, forcing shutdown");
             }
         }
-        worker_state_manager.update(ServiceState::Stopped);
     });
 
     Ok((shutdown_tx, local_addr))
@@ -490,7 +543,7 @@ struct ConnectionContext {
     is_console: bool,
     readiness: Arc<GlobalReadiness>,
     /// Pre-computed Keystone auth provider (avoids per-connection OnceLock read).
-    keystone_auth: Option<std::sync::Arc<rustfs_keystone::KeystoneAuthProvider>>,
+    keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
     /// Pre-computed trusted proxy layer (avoids per-connection is_enabled() check).
     trusted_proxy_layer: Option<rustfs_trusted_proxies::TrustedProxyLayer>,
 }
@@ -526,6 +579,45 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
             .collect::<Vec<_>>();
 
         if headers.is_empty() { None } else { Some(headers) }
+    }
+}
+
+/// Adapter that implements the OpenTelemetry [`Extractor`] trait for gRPC
+/// metadata maps so internode gRPC requests can continue distributed traces.
+struct MetadataMapCarrier<'a> {
+    metadata: &'a tonic::metadata::MetadataMap,
+}
+
+impl<'a> MetadataMapCarrier<'a> {
+    fn new(metadata: &'a tonic::metadata::MetadataMap) -> Self {
+        Self { metadata }
+    }
+}
+
+impl<'a> opentelemetry::propagation::Extractor for MetadataMapCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.metadata
+            .keys()
+            .filter_map(|key| match key {
+                tonic::metadata::KeyRef::Ascii(v) => Some(v.as_str()),
+                tonic::metadata::KeyRef::Binary(_) => None,
+            })
+            .collect()
+    }
+
+    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
+        let values = self
+            .metadata
+            .get_all(key)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+
+        if values.is_empty() { None } else { Some(values) }
     }
 }
 
@@ -596,9 +688,12 @@ fn process_connection(
         // 11. PropagateRequestIdLayer                — X-Request-ID → response
         // 12. CompressionLayer                       — response compression (whitelist, path-aware)
         // 13. PathCategoryInjectionLayer             — injects path category for compression predicate
-        // 14. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 15. ConditionalCorsLayer                   — S3 API CORS
-        // 16. RedirectLayer                          — console redirect (conditional)
+        // 14. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
+        // 15. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 16. ConditionalCorsLayer                   — S3 API CORS
+        // 17. RedirectLayer                          — console redirect (conditional)
+        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -681,28 +776,58 @@ fn process_connection(
                     .on_request(|request: &HttpRequest<_>, span: &Span| {
                         let _enter = span.enter();
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
-                        let labels = [("key_request_method", request.method().to_string())];
-                        counter!("rustfs.api.requests.total", &labels).increment(1);
-                        // Aggregate request body size for throughput monitoring (lightweight)
+                        let method = request_method_label(request.method());
+                        record_active_http_requests(1);
+                        counter!(
+                            METRIC_HTTP_SERVER_REQUESTS_TOTAL,
+                            LABEL_HTTP_METHOD => method
+                        )
+                        .increment(1);
+
                         if let Some(cl) = request.headers().get("content-length")
                             && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
                         {
-                            counter!("rustfs.request.body.bytes_total", "direction" => "request").increment(len);
+                            counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL).increment(len);
+                            histogram!(
+                                METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
+                                LABEL_HTTP_METHOD => method
+                            )
+                            .record(len as f64);
                         }
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
                         span.record("status_code", tracing::field::display(response.status()));
                         let _enter = span.enter();
-                        histogram!("rustfs.request.latency.ms").record(latency.as_millis() as f64);
+                        let status_class = status_class_label(response.status());
+                        record_active_http_requests(-1);
+                        histogram!(
+                            METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
+                            LABEL_HTTP_STATUS_CLASS => status_class
+                        )
+                        .record(latency.as_secs_f64());
+                        if response.status().is_client_error() || response.status().is_server_error() {
+                            counter!(
+                                METRIC_HTTP_SERVER_FAILURES_TOTAL,
+                                LABEL_HTTP_STATUS_CLASS => status_class
+                            )
+                            .increment(1);
+                        }
+                        if let Some(cl) = response.headers().get("content-length")
+                            && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+                        {
+                            histogram!(
+                                METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
+                                LABEL_HTTP_STATUS_CLASS => status_class
+                            )
+                            .record(len as f64);
+                        }
                         debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                        // Always track aggregate body bytes (lightweight counter, no debug logging)
-                        counter!("rustfs.request.body.bytes_total", "direction" => "response").increment(chunk.len() as u64);
+                        counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
-                            histogram!("rustfs.request.body.len").record(chunk.len() as f64);
                             debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                         }
                         #[cfg(not(feature = "tracing-chunk-debug"))]
@@ -723,7 +848,12 @@ fn process_connection(
                     })
                     .on_failure(|_error, latency: Duration, span: &Span| {
                         let _enter = span.enter();
-                        counter!("rustfs.api.requests.failure.total").increment(1);
+                        record_active_http_requests(-1);
+                        counter!(
+                            METRIC_HTTP_SERVER_FAILURES_TOTAL,
+                            LABEL_HTTP_STATUS_CLASS => "transport"
+                        )
+                        .increment(1);
                         debug!("http request failure error: {:?} in {:?}", _error, latency)
                     }),
             )
@@ -732,6 +862,7 @@ fn process_connection(
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(PathAwareCompressionPredicate::new(compression_config)))
             .layer(PathCategoryInjectionLayer)
+            .layer(S3ErrorMessageCompatLayer)
             .layer(ObjectAttributesEtagFixLayer)
             // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
             // Admin has its own CORS handling in router.rs
@@ -740,6 +871,16 @@ fn process_connection(
             // Bucket-level CORS takes precedence when configured (handled in router.rs for OPTIONS, and in ecfs.rs for actual requests)
             .layer(ConditionalCorsLayer::new())
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
+            // Must run first on responses: clear the body and remove
+            // Content-Length, Content-Type, and Transfer-Encoding for statuses
+            // that MUST NOT carry a body (1xx/204/304). Kept innermost so all
+            // other response-transforming layers see the already-bodyless
+            // response and so no layer (e.g. CORS) re-adds body headers afterward.
+            .layer(BodylessStatusFixLayer)
+            // HEAD responses must not send body bytes even when the inner S3 layer
+            // serializes an XML error payload. Keep this innermost so the final
+            // HTTP response written to hyper/h2 is bodyless.
+            .layer(HeadRequestBodyFixLayer)
             .service(service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
@@ -843,6 +984,21 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         error!("RPC signature verification failed: {}", e);
         Status::unauthenticated("No valid auth token")
     })?;
+
+    let parent_context =
+        global::get_text_map_propagator(|propagator| propagator.extract(&MetadataMapCarrier::new(req.metadata())));
+    if parent_context.has_active_span() {
+        let span_ref = parent_context.span();
+        debug!(
+            otel_trace_id = %span_ref.span_context().trace_id(),
+            otel_parent_span_id = %span_ref.span_context().span_id(),
+            sampled = span_ref.span_context().is_sampled(),
+            "Extracted trace context from incoming gRPC metadata"
+        );
+        if let Err(e) = tracing::Span::current().set_parent(parent_context) {
+            warn!("Failed to propagate tracing context from gRPC metadata: `{:?}`", e);
+        }
+    }
     Ok(req)
 }
 
@@ -1023,6 +1179,28 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&"user-agent"));
         assert!(keys.contains(&"content-type"));
+    }
+
+    #[test]
+    fn test_http_metric_names_and_labels_use_snake_case() {
+        let metric_names = [
+            METRIC_HTTP_SERVER_REQUESTS_TOTAL,
+            METRIC_HTTP_SERVER_FAILURES_TOTAL,
+            METRIC_HTTP_SERVER_ACTIVE_REQUESTS,
+            METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
+            METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL,
+            METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
+            METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL,
+            METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
+        ];
+
+        for metric_name in metric_names {
+            assert!(metric_name.starts_with("rustfs_"));
+            assert!(!metric_name.contains('.'));
+        }
+
+        assert_eq!(LABEL_HTTP_METHOD, "method");
+        assert_eq!(LABEL_HTTP_STATUS_CLASS, "status_class");
     }
 
     #[test]

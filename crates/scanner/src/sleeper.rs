@@ -21,6 +21,13 @@ use tokio::time::Duration;
 
 const MIN_SLEEP: Duration = Duration::from_millis(1);
 
+fn scanner_env_config() -> (ScannerSpeed, bool) {
+    let speed_str = rustfs_utils::get_env_str(ENV_SCANNER_SPEED, DEFAULT_SCANNER_SPEED);
+    let speed = ScannerSpeed::from_env_str(&speed_str);
+    let idle_mode = rustfs_utils::get_env_bool(ENV_SCANNER_IDLE_MODE, DEFAULT_SCANNER_IDLE_MODE);
+    (speed, idle_mode)
+}
+
 /// When `true` (default), the scanner throttles itself between operations.
 /// When `false`, all sleeps are skipped and the scanner runs at full speed.
 pub static SCANNER_IDLE_MODE: AtomicBool = AtomicBool::new(DEFAULT_SCANNER_IDLE_MODE);
@@ -28,10 +35,7 @@ pub static SCANNER_IDLE_MODE: AtomicBool = AtomicBool::new(DEFAULT_SCANNER_IDLE_
 /// Global scanner sleeper initialized from the `RUSTFS_SCANNER_SPEED` and
 /// `RUSTFS_SCANNER_IDLE_MODE` environment variables.
 pub static SCANNER_SLEEPER: LazyLock<DynamicSleeper> = LazyLock::new(|| {
-    let speed_str = rustfs_utils::get_env_str(ENV_SCANNER_SPEED, DEFAULT_SCANNER_SPEED);
-    let speed = ScannerSpeed::from_env_str(&speed_str);
-
-    let idle_mode = rustfs_utils::get_env_bool(ENV_SCANNER_IDLE_MODE, DEFAULT_SCANNER_IDLE_MODE);
+    let (speed, idle_mode) = scanner_env_config();
     SCANNER_IDLE_MODE.store(idle_mode, Ordering::Relaxed);
 
     DynamicSleeper::new(speed)
@@ -104,6 +108,13 @@ impl DynamicSleeper {
         let mut m = self.inner.max_sleep.write().unwrap_or_else(|e| e.into_inner());
         *m = speed.max_sleep();
     }
+
+    /// Reload speed and idle-mode settings from the current environment.
+    pub fn refresh_from_env(&self) {
+        let (speed, idle_mode) = scanner_env_config();
+        self.update(speed);
+        SCANNER_IDLE_MODE.store(idle_mode, Ordering::Relaxed);
+    }
 }
 
 /// A timer returned by [`DynamicSleeper::timer`].  Records the instant it
@@ -138,6 +149,7 @@ impl SleepTimer {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use temp_env::with_var;
 
     #[test]
     fn test_scanner_speed_presets() {
@@ -164,6 +176,26 @@ mod tests {
         let (factor, max_sleep) = s.read_params();
         assert_eq!(factor, 10.0);
         assert_eq!(max_sleep, Duration::from_secs(15));
+    }
+
+    #[test]
+    #[serial]
+    fn test_refresh_from_env_applies_speed_and_idle_mode_for_next_cycle() {
+        let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
+        SCANNER_IDLE_MODE.store(true, Ordering::Relaxed);
+
+        let s = DynamicSleeper::new(ScannerSpeed::Fastest);
+        with_var(ENV_SCANNER_SPEED, Some("slow"), || {
+            with_var(ENV_SCANNER_IDLE_MODE, Some("false"), || {
+                s.refresh_from_env();
+                let (factor, max_sleep) = s.read_params();
+                assert_eq!(factor, 10.0);
+                assert_eq!(max_sleep, Duration::from_secs(15));
+                assert!(!SCANNER_IDLE_MODE.load(Ordering::Relaxed));
+            });
+        });
+
+        SCANNER_IDLE_MODE.store(prev_mode, Ordering::Relaxed);
     }
 
     #[tokio::test(start_paused = true)]

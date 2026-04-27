@@ -530,7 +530,7 @@ mod tests {
             thresholds: vec![(MI_B as i64, 64 * KI_B), (i64::MAX, 256 * KI_B)],
         };
 
-        let profile = WorkloadProfile::Custom(custom_config.clone());
+        let profile = WorkloadProfile::Custom(custom_config);
         let config = profile.config();
 
         assert_eq!(config.calculate_buffer_size(512 * KI_B as i64), 64 * KI_B);
@@ -619,7 +619,7 @@ mod tests {
         };
         let custom2 = custom1.clone();
 
-        assert_eq!(WorkloadProfile::Custom(custom1.clone()), WorkloadProfile::Custom(custom2));
+        assert_eq!(WorkloadProfile::Custom(custom1), WorkloadProfile::Custom(custom2));
     }
 
     #[test]

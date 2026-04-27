@@ -13,205 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::erasure_coding::{calc_shard_size, calc_shard_size_legacy};
-use bytes::BytesMut;
-use futures_util::Stream;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
-use rustfs_io_core::IoChunk;
-use std::io;
-use std::pin::Pin;
-use std::sync::Mutex;
-use std::task::{Context, Poll};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio_util::io::ReaderStream;
-
-struct ChannelChunkStream {
-    receiver: Mutex<UnboundedReceiver<io::Result<IoChunk>>>,
-}
-
-impl ChannelChunkStream {
-    fn new(receiver: UnboundedReceiver<io::Result<IoChunk>>) -> Self {
-        Self {
-            receiver: Mutex::new(receiver),
-        }
-    }
-}
-
-impl Stream for ChannelChunkStream {
-    type Item = io::Result<IoChunk>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut receiver = self.receiver.lock().unwrap();
-        receiver.poll_recv(cx)
-    }
-}
-
-struct ChannelChunkWriter {
-    sender: UnboundedSender<io::Result<IoChunk>>,
-    buffer: BytesMut,
-    chunk_size: usize,
-}
-
-impl ChannelChunkWriter {
-    fn new(sender: UnboundedSender<io::Result<IoChunk>>, chunk_size: usize) -> Self {
-        Self {
-            sender,
-            buffer: BytesMut::with_capacity(chunk_size.max(1)),
-            chunk_size: chunk_size.max(1),
-        }
-    }
-
-    fn push_buffer(&mut self) -> io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-
-        let bytes = self.buffer.split().freeze();
-        self.sender
-            .send(Ok(IoChunk::Shared(bytes)))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "chunk stream receiver dropped"))
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        self.push_buffer()
-    }
-
-    fn send_error(&self, err: io::Error) {
-        let _ = self.sender.send(Err(err));
-    }
-}
-
-impl AsyncWrite for ChannelChunkWriter {
-    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::result::Result<usize, io::Error>> {
-        self.buffer.extend_from_slice(buf);
-        let chunk_size = self.chunk_size;
-        while self.buffer.len() >= chunk_size {
-            let chunk = self.buffer.split_to(chunk_size).freeze();
-            if self.sender.send(Ok(IoChunk::Shared(chunk))).is_err() {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "chunk stream receiver dropped")));
-            }
-        }
-
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), io::Error>> {
-        Poll::Ready(self.push_buffer())
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), io::Error>> {
-        Poll::Ready(self.finish())
-    }
-}
-
-fn multipart_logical_part_size(fi: &FileInfo, part_index: usize) -> usize {
-    let part = &fi.parts[part_index];
-    if part.actual_size > 0 {
-        part.actual_size as usize
-    } else {
-        part.size
-    }
-}
-
-fn multipart_logical_total_size(fi: &FileInfo) -> usize {
-    if fi.parts.is_empty() {
-        return fi.size.max(0) as usize;
-    }
-
-    fi.parts
-        .iter()
-        .map(|part| {
-            if part.actual_size > 0 {
-                part.actual_size as usize
-            } else {
-                part.size
-            }
-        })
-        .sum()
-}
-
-fn multipart_stored_part_size(fi: &FileInfo, part_index: usize) -> usize {
-    fi.parts[part_index].size
-}
-
-fn multipart_stored_total_size(fi: &FileInfo) -> usize {
-    if fi.parts.is_empty() {
-        return fi.size.max(0) as usize;
-    }
-
-    fi.parts.iter().map(|part| part.size).sum()
-}
-
-fn multipart_to_logical_part_offset(fi: &FileInfo, offset: usize) -> Result<(usize, usize)> {
-    if offset == 0 {
-        return Ok((0, 0));
-    }
-
-    let mut part_offset = offset;
-    for (i, _) in fi.parts.iter().enumerate() {
-        let logical_part_size = multipart_logical_part_size(fi, i);
-        if part_offset < logical_part_size {
-            return Ok((i, part_offset));
-        }
-
-        part_offset -= logical_part_size;
-    }
-
-    Err(Error::other("part not found"))
-}
-
-fn multipart_to_stored_part_offset(fi: &FileInfo, offset: usize) -> Result<(usize, usize)> {
-    if offset == 0 {
-        return Ok((0, 0));
-    }
-
-    let mut part_offset = offset;
-    for (i, part) in fi.parts.iter().enumerate() {
-        if part_offset < part.size {
-            return Ok((i, part_offset));
-        }
-
-        part_offset -= part.size;
-    }
-
-    Err(Error::other("part not found"))
-}
-
-fn block_window(
-    offset: usize,
-    length: usize,
-    block_size: usize,
-    block_index: usize,
-    start_block: usize,
-    end_block: usize,
-) -> (usize, usize) {
-    let end_remainder = offset.saturating_add(length) % block_size;
-    if start_block == end_block {
-        (offset % block_size, length)
-    } else if block_index == start_block {
-        (offset % block_size, block_size - (offset % block_size))
-    } else if block_index == end_block {
-        (0, if end_remainder == 0 { block_size } else { end_remainder })
-    } else {
-        (0, block_size)
-    }
-}
-
-fn direct_block_shard_size(
-    total_size: usize,
-    block_size: usize,
-    data_shards: usize,
-    block_index: usize,
-    uses_legacy: bool,
-) -> usize {
-    let block_start = block_index.saturating_mul(block_size);
-    let logical_block_size = total_size.saturating_sub(block_start).min(block_size);
-    if uses_legacy {
-        calc_shard_size_legacy(logical_block_size, data_shards)
-    } else {
-        calc_shard_size(logical_block_size, data_shards)
-    }
-}
 
 impl SetDisks {
     pub(super) async fn read_parts(
@@ -781,13 +583,12 @@ impl SetDisks {
         debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
-        let logical_total_size = multipart_logical_total_size(&fi);
-        let use_stored_part_sizes = length > logical_total_size as i64;
-        let total_size = if use_stored_part_sizes {
-            multipart_stored_total_size(&fi)
-        } else {
-            logical_total_size
-        };
+        let total_size = fi.size as usize;
+
+        if offset > total_size {
+            error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
+            return Err(Error::other("offset out of range"));
+        }
 
         let length = if length < 0 { total_size - offset } else { length as usize };
 
@@ -796,27 +597,19 @@ impl SetDisks {
             return Err(Error::other("offset out of range"));
         };
 
-        if offset > total_size || end_offset_exclusive > total_size {
+        if end_offset_exclusive > total_size {
             error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
             return Err(Error::other("offset out of range"));
         }
 
-        let (part_index, mut part_offset) = if use_stored_part_sizes {
-            multipart_to_stored_part_offset(&fi, offset)?
-        } else {
-            multipart_to_logical_part_offset(&fi, offset)?
-        };
+        let (part_index, mut part_offset) = fi.to_part_offset(offset)?;
 
         let mut end_offset = offset;
         if length > 0 {
-            end_offset = end_offset_exclusive - 1;
+            end_offset += length - 1
         }
 
-        let (last_part_index, last_part_relative_offset) = if use_stored_part_sizes {
-            multipart_to_stored_part_offset(&fi, end_offset)?
-        } else {
-            multipart_to_logical_part_offset(&fi, end_offset)?
-        };
+        let (last_part_index, last_part_relative_offset) = fi.to_part_offset(end_offset)?;
 
         debug!(
             bucket,
@@ -848,11 +641,7 @@ impl SetDisks {
             }
 
             let part_number = fi.parts[current_part].number;
-            let part_size = if use_stored_part_sizes {
-                multipart_stored_part_size(&fi, current_part)
-            } else {
-                multipart_logical_part_size(&fi, current_part)
-            };
+            let part_size = fi.parts[current_part].size;
             let mut part_length = part_size - part_offset;
             if part_length > (length - total_read) {
                 part_length = length - total_read
@@ -891,7 +680,6 @@ impl SetDisks {
 
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
-            let shard_length = till_offset.saturating_sub(read_offset);
             for (idx, disk_op) in disks.iter().enumerate() {
                 match create_bitrot_reader(
                     files[idx].data.as_deref(),
@@ -899,7 +687,7 @@ impl SetDisks {
                     bucket,
                     &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
                     read_offset,
-                    shard_length,
+                    till_offset.saturating_sub(read_offset),
                     erasure.shard_size(),
                     checksum_algo.clone(),
                     skip_verify_bitrot,

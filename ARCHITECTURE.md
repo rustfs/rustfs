@@ -86,7 +86,7 @@ Crates are organized in a dependency DAG with 9 depth levels (0 = leaf, 8 = top)
 ```
 Depth 0 — LEAF (no internal deps):
   appauth, checksums, config, credentials, crypto, io-metrics,
-  madmin, mcp, s3-common, workers, zip
+  madmin, s3-common, workers, zip
 
 Depth 1:
   io-core (→ io-metrics)
@@ -195,7 +195,6 @@ Depth 8 — TOP:
 | `trusted-proxies` | 4.0K | Trusted proxy / IP forwarding |
 | `zip` | 986 | ZIP archive support for bulk downloads |
 | `workers` | 136 | Simple worker abstraction |
-| `mcp` | 2.0K | Model Context Protocol server (AI tooling) |
 
 ## Architecture Invariants
 
@@ -224,7 +223,7 @@ Depth 8 — TOP:
 6. **Error types use `thiserror` with descriptive names** (e.g., `StorageError`,
    not bare `Error`).
    - ⚠️ VIOLATED: 6 crates use `pub enum Error`; 2 crates use `snafu`;
-     `mcp` and `heal` use `anyhow` in library code.
+      `heal` use `anyhow` in library code.
 
 ## Known Structural Issues
 
@@ -285,9 +284,9 @@ anyhow::Result<T>             // in library code (OK in tests/CLI)
 
 ### Metrics
 
-- Prometheus-style metrics via `rustfs-metrics` crate
+- Prometheus-style metrics via `rustfs-obs` runtime and schema
 - I/O-specific counters via `rustfs-io-metrics`
-- Registration happens at crate level, collection in `metrics` crate
+- Registration happens at crate level, collection/reporting in `rustfs-obs`
 
 ### Testing
 
@@ -369,7 +368,7 @@ The binary (`main.rs`) boots in this order:
   Add handler in `admin/handlers/`, register in `admin/router.rs`
 
 - **"Where do I add a new metric?"**
-  Define in `crates/metrics/`, register collector, expose via `/minio/v2/metrics`
+  Define descriptor/collector in `crates/obs/src/metrics/`, expose via `/minio/v2/metrics`
 
 ---
 

@@ -395,8 +395,27 @@ impl BucketTargetSys {
         }
     }
 
-    pub async fn set_target(&self, bucket: &str, target: &BucketTarget, update: bool) -> Result<(), BucketTargetError> {
-        if !target.target_type.is_valid() && !update {
+    pub async fn set_target(
+        &self,
+        bucket: &str,
+        target: &BucketTarget,
+        update: bool,
+    ) -> Result<BucketTargets, BucketTargetError> {
+        self.validate_target(bucket, target).await?;
+
+        let mut bucket_targets = match self.list_bucket_targets(bucket).await {
+            Ok(targets) => targets,
+            Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => BucketTargets::default(),
+            Err(err) => return Err(err),
+        };
+
+        Self::upsert_target_entry(&mut bucket_targets.targets, target, update)?;
+
+        Ok(bucket_targets)
+    }
+
+    pub async fn validate_target(&self, bucket: &str, target: &BucketTarget) -> Result<(), BucketTargetError> {
+        if !target.target_type.is_valid() {
             return Err(BucketTargetError::BucketRemoteArnTypeInvalid {
                 bucket: bucket.to_string(),
             });
@@ -450,52 +469,44 @@ impl BucketTargetSys {
             }
         }
 
-        {
-            let mut targets_map = self.targets_map.write().await;
-            let bucket_targets = targets_map.entry(bucket.to_string()).or_insert_with(Vec::new);
-            let mut found = false;
+        Ok(())
+    }
 
-            for (idx, existing_target) in bucket_targets.iter().enumerate() {
-                if existing_target.target_type.to_string() == target.target_type.to_string() {
-                    if existing_target.arn == target.arn {
-                        if !update {
-                            return Err(BucketTargetError::BucketRemoteAlreadyExists {
-                                bucket: existing_target.target_bucket.clone(),
-                            });
-                        }
-                        bucket_targets[idx] = target.clone();
-                        found = true;
-                        break;
-                    }
-                    if existing_target.endpoint == target.endpoint {
+    fn upsert_target_entry(
+        bucket_targets: &mut Vec<BucketTarget>,
+        target: &BucketTarget,
+        update: bool,
+    ) -> Result<(), BucketTargetError> {
+        let mut found = false;
+
+        for (idx, existing_target) in bucket_targets.iter().enumerate() {
+            if existing_target.target_type.to_string() == target.target_type.to_string() {
+                if existing_target.arn == target.arn {
+                    if !update {
                         return Err(BucketTargetError::BucketRemoteAlreadyExists {
                             bucket: existing_target.target_bucket.clone(),
                         });
                     }
+                    bucket_targets[idx] = target.clone();
+                    found = true;
+                    break;
+                }
+                if existing_target.endpoint == target.endpoint {
+                    return Err(BucketTargetError::BucketRemoteAlreadyExists {
+                        bucket: existing_target.target_bucket.clone(),
+                    });
                 }
             }
-
-            if !found && !update {
-                bucket_targets.push(target.clone());
-            }
         }
 
-        {
-            let mut arn_remotes_map = self.arn_remotes_map.write().await;
-            arn_remotes_map.insert(
-                target.arn.clone(),
-                ArnTarget {
-                    client: Some(Arc::new(target_client)),
-                    last_refresh: OffsetDateTime::now_utc(),
-                },
-            );
+        if !found && !update {
+            bucket_targets.push(target.clone());
         }
 
-        self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
         Ok(())
     }
 
-    pub async fn remove_target(&self, bucket: &str, arn_str: &str) -> Result<(), BucketTargetError> {
+    pub async fn remove_target(&self, bucket: &str, arn_str: &str) -> Result<BucketTargets, BucketTargetError> {
         if arn_str.is_empty() {
             return Err(BucketTargetError::BucketRemoteArnInvalid {
                 bucket: bucket.to_string(),
@@ -524,33 +535,16 @@ impl BucketTargetSys {
             }
         }
 
-        {
-            let mut targets_map = self.targets_map.write().await;
+        let targets = self.list_bucket_targets(bucket).await?;
+        let new_targets: Vec<BucketTarget> = targets.targets.iter().filter(|t| t.arn != arn_str).cloned().collect();
 
-            let Some(targets) = targets_map.get(bucket) else {
-                return Err(BucketTargetError::BucketRemoteTargetNotFound {
-                    bucket: bucket.to_string(),
-                });
-            };
-
-            let new_targets: Vec<BucketTarget> = targets.iter().filter(|t| t.arn != arn_str).cloned().collect();
-
-            if new_targets.len() == targets.len() {
-                return Err(BucketTargetError::BucketRemoteTargetNotFound {
-                    bucket: bucket.to_string(),
-                });
-            }
-
-            targets_map.insert(bucket.to_string(), new_targets);
+        if new_targets.len() == targets.targets.len() {
+            return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                bucket: bucket.to_string(),
+            });
         }
 
-        {
-            self.arn_remotes_map.write().await.remove(arn_str);
-        }
-
-        self.update_bandwidth_limit(bucket, arn_str, 0);
-
-        Ok(())
+        Ok(BucketTargets { targets: new_targets })
     }
 
     pub async fn mark_refresh_in_progress(&self, bucket: &str, arn: &str) {
@@ -593,7 +587,7 @@ impl BucketTargetSys {
         };
 
         if let Some(cli) = cli {
-            return Some(cli.clone());
+            return Some(cli);
         }
 
         // TODO: spawn a task to reload the target
@@ -603,7 +597,7 @@ impl BucketTargetSys {
 
         if let Some(last_refresh) = last_refresh {
             let now = OffsetDateTime::now_utc();
-            if now - last_refresh > Duration::from_secs(60 * 5) {
+            if now - last_refresh < Duration::from_secs(60 * 5) {
                 return None;
             }
         }
@@ -618,6 +612,16 @@ impl BucketTargetSys {
                 error!("get bucket targets config error:{}", e);
             }
         };
+
+        let cli = self
+            .arn_remotes_map
+            .read()
+            .await
+            .get(arn)
+            .and_then(|target| target.client.clone());
+        if cli.is_some() {
+            return cli;
+        }
 
         self.inc_arn_errs(bucket, arn).await;
         None
@@ -786,7 +790,10 @@ impl BucketTargetSys {
                         && tgt
                             .credentials
                             .as_ref()
-                            .map(|c| c.access_key == target.credentials.as_ref().unwrap_or(&Credentials::default()).access_key)
+                            .map(|c| {
+                                let default_creds = Credentials::default();
+                                c.access_key == target.credentials.as_ref().unwrap_or(&default_creds).access_key
+                            })
                             .unwrap_or(false)
                     {
                         return (tgt.arn.clone(), true);
@@ -892,6 +899,41 @@ pub struct RemoveObjectOptions {
     pub replication_status: ReplicationStatusType,
     pub replication_request: bool,
     pub replication_validity_check: bool,
+}
+
+fn build_remove_object_headers(version_id: Option<&str>, opts: &RemoveObjectOptions) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if opts.force_delete {
+        insert_header(&mut headers, SUFFIX_FORCE_DELETE, "true");
+    }
+    if opts.governance_bypass {
+        headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
+    }
+
+    if opts.replication_delete_marker {
+        insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
+    }
+
+    if let Some(t) = opts.replication_mtime {
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, t.format(&Rfc3339).unwrap_or_default());
+    }
+
+    if !opts.replication_status.is_empty() {
+        headers.insert(AMZ_BUCKET_REPLICATION_STATUS, opts.replication_status.as_str().parse().unwrap());
+    }
+
+    if let Some(version_id) = version_id {
+        insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, version_id);
+    }
+
+    if opts.replication_request {
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+    }
+    if opts.replication_validity_check {
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
+    }
+
+    headers
 }
 
 #[derive(Debug, Clone)]
@@ -1424,39 +1466,15 @@ impl TargetClient {
         version_id: Option<String>,
         opts: RemoveObjectOptions,
     ) -> Result<(), S3ClientError> {
-        let mut headers = HeaderMap::new();
-        if opts.force_delete {
-            insert_header(&mut headers, SUFFIX_FORCE_DELETE, "true");
-        }
-        if opts.governance_bypass {
-            headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
-        }
-
-        if opts.replication_delete_marker {
-            insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
-        }
-
-        if let Some(t) = opts.replication_mtime {
-            insert_header(&mut headers, SUFFIX_SOURCE_MTIME, t.format(&Rfc3339).unwrap_or_default());
-        }
-
-        if !opts.replication_status.is_empty() {
-            headers.insert(AMZ_BUCKET_REPLICATION_STATUS, opts.replication_status.as_str().parse().unwrap());
-        }
-
-        if opts.replication_request {
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
-        }
-        if opts.replication_validity_check {
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
-        }
+        let headers = build_remove_object_headers(version_id.as_deref(), &opts);
+        let api_version_id = if opts.replication_request { None } else { version_id };
 
         match self
             .client
             .delete_object()
             .bucket(bucket)
             .key(object)
-            .set_version_id(version_id)
+            .set_version_id(api_version_id)
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
@@ -1550,3 +1568,53 @@ impl From<std::io::Error> for BucketTargetError {
 }
 
 impl Error for BucketTargetError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_remove_object_headers_includes_internal_version_id_for_replication_delete() {
+        let version_id = Uuid::new_v4().to_string();
+        let headers = build_remove_object_headers(
+            Some(version_id.as_str()),
+            &RemoveObjectOptions {
+                force_delete: false,
+                governance_bypass: false,
+                replication_delete_marker: true,
+                replication_mtime: None,
+                replication_status: ReplicationStatusType::Replica,
+                replication_request: true,
+                replication_validity_check: false,
+            },
+        );
+
+        assert_eq!(
+            rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_VERSION_ID).as_deref(),
+            Some(version_id.as_str()),
+            "replication delete requests must preserve the version id in internal headers"
+        );
+    }
+
+    #[test]
+    fn build_remove_object_headers_omits_delete_marker_flag_for_marker_version_purge() {
+        let version_id = Uuid::new_v4().to_string();
+        let headers = build_remove_object_headers(
+            Some(version_id.as_str()),
+            &RemoveObjectOptions {
+                force_delete: false,
+                governance_bypass: false,
+                replication_delete_marker: false,
+                replication_mtime: None,
+                replication_status: ReplicationStatusType::Replica,
+                replication_request: true,
+                replication_validity_check: false,
+            },
+        );
+
+        assert!(
+            rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_DELETEMARKER).is_none(),
+            "delete-marker version purges must not masquerade as delete-marker creations"
+        );
+    }
+}

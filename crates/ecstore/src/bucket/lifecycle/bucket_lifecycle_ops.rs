@@ -11,20 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
+use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
     self, ExpirationOptions, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier};
 use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
+use crate::bucket::replication::{
+    DeletedObjectReplicationInfo, ReplicationConfig, check_replicate_delete, schedule_replication_delete,
+};
 use crate::bucket::{metadata_sys, metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -37,34 +35,33 @@ use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::store::ECStore;
-use crate::store_api::StorageAPI;
 use crate::store_api::{
     GetObjectReader, HTTPRangeSpec, ListOperations, MultipartOperations, ObjectInfo, ObjectOperations, ObjectOptions,
     ObjectToDelete,
 };
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
-use bytes::BytesMut;
 use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use rustfs_common::data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
-use rustfs_filemeta::{FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, get_file_info, is_restored_object_on_disk};
+use rustfs_filemeta::{
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, RestoreStatusOps,
+    VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
+};
 use rustfs_s3_common::EventName;
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
-use s3s::Body;
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
-    ServerSideEncryption, Timestamp,
+    Timestamp,
 };
-use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION, X_AMZ_STORAGE_CLASS};
+use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION};
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::HashMap;
 use std::env;
-use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -111,7 +108,7 @@ impl LifecycleSys {
     pub async fn get(&self, bucket: &str) -> Option<BucketLifecycleConfiguration> {
         match get_lifecycle_config(bucket).await {
             Ok((lc, _)) => Some(lc),
-            Err(err) if err == Error::ConfigNotFound => None,
+            Err(Error::ConfigNotFound) => None,
             Err(err) => {
                 warn!(bucket, error = ?err, "failed to load lifecycle config");
                 None
@@ -119,8 +116,25 @@ impl LifecycleSys {
         }
     }
 
-    pub fn trace(_oi: &ObjectInfo) -> TraceFn {
-        Arc::new(|_oi, _ctx| Box::pin(async move {}))
+    pub fn trace(oi: &ObjectInfo) -> TraceFn {
+        let bucket = oi.bucket.clone();
+        let name = oi.name.clone();
+        let version_id = oi.version_id.map(|v| v.to_string()).unwrap_or_default();
+        Arc::new(move |_action: String, _ctx: HashMap<String, String>| {
+            let bucket = bucket.clone();
+            let name = name.clone();
+            let version_id = version_id.clone();
+            Box::pin(async move {
+                info!(
+                    bucket = %bucket,
+                    object = %name,
+                    version_id = %version_id,
+                    action = %_action,
+                    "ILM lifecycle trace: {} on {}/{} (version: {})",
+                    _action, bucket, name, version_id
+                );
+            })
+        })
     }
 }
 
@@ -133,8 +147,8 @@ struct ExpiryTask {
 impl ExpiryOp for ExpiryTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
-        hasher.update(format!("{}", self.obj_info.name).as_bytes());
+        hasher.update(self.obj_info.bucket.as_bytes());
+        hasher.update(self.obj_info.name.as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -188,8 +202,8 @@ struct FreeVersionTask(ObjectInfo);
 impl ExpiryOp for FreeVersionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}", self.0.transitioned_object.tier).as_bytes());
-        hasher.update(format!("{}", self.0.transitioned_object.name).as_bytes());
+        hasher.update(self.0.transitioned_object.tier.as_bytes());
+        hasher.update(self.0.transitioned_object.name.as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -207,8 +221,8 @@ struct NewerNoncurrentTask {
 impl ExpiryOp for NewerNoncurrentTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}", self.bucket).as_bytes());
-        hasher.update(format!("{}", self.versions[0].object_name).as_bytes());
+        hasher.update(self.bucket.as_bytes());
+        hasher.update(self.versions[0].object_name.as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
@@ -240,7 +254,7 @@ impl ExpiryState {
 
     pub async fn pending_tasks(&self) -> usize {
         let rxs = &self.tasks_rx;
-        if rxs.len() == 0 {
+        if rxs.is_empty() {
             return 0;
         }
         let mut tasks = 0;
@@ -253,32 +267,33 @@ impl ExpiryState {
     pub async fn enqueue_tier_journal_entry(&mut self, je: &Jentry) -> Result<(), std::io::Error> {
         let wrkr = self.get_worker_ch(je.op_hash());
         if wrkr.is_none() {
-            *self.stats.as_mut().expect("err").missed_tier_journal_tasks.get_mut() += 1;
+            *self.stats.as_mut().expect("stats lock").missed_tier_journal_tasks.get_mut() += 1;
+            return Ok(());
         }
-        let wrkr = wrkr.expect("err");
+        let wrkr = wrkr.expect("worker channel should exist after None check");
         select! {
             //_ -> GlobalContext.Done() => ()
             _ = wrkr.send(Some(Box::new(je.clone()))) => (),
             else => {
-                *self.stats.as_mut().expect("err").missed_tier_journal_tasks.get_mut() += 1;
+                *self.stats.as_mut().expect("stats lock").missed_tier_journal_tasks.get_mut() += 1;
             }
         }
-        return Ok(());
+        Ok(())
     }
 
     pub async fn enqueue_free_version(&mut self, oi: ObjectInfo) {
         let task = FreeVersionTask(oi);
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
-            *self.stats.as_mut().expect("err").missed_freevers_tasks.get_mut() += 1;
+            *self.stats.as_mut().expect("stats lock").missed_freevers_tasks.get_mut() += 1;
             return;
         }
-        let wrkr = wrkr.expect("err!");
+        let wrkr = wrkr.expect("worker channel should exist after None check");
         select! {
             //_ -> GlobalContext.Done() => {}
             _ = wrkr.send(Some(Box::new(task))) => (),
             else => {
-                *self.stats.as_mut().expect("err").missed_freevers_tasks.get_mut() += 1;
+                *self.stats.as_mut().expect("stats lock").missed_freevers_tasks.get_mut() += 1;
             }
         }
     }
@@ -291,21 +306,21 @@ impl ExpiryState {
         };
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
-            *self.stats.as_mut().expect("err").missed_expiry_tasks.get_mut() += 1;
+            *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
             return;
         }
-        let wrkr = wrkr.expect("err!");
+        let wrkr = wrkr.expect("worker channel should exist after None check");
         select! {
             //_ -> GlobalContext.Done() => {}
             _ = wrkr.send(Some(Box::new(task))) => (),
             else => {
-                *self.stats.as_mut().expect("err").missed_expiry_tasks.get_mut() += 1;
+                *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
             }
         }
     }
 
     pub async fn enqueue_by_newer_noncurrent(&mut self, bucket: &str, versions: Vec<ObjectToDelete>, lc_event: lifecycle::Event) {
-        if versions.len() == 0 {
+        if versions.is_empty() {
             return;
         }
 
@@ -316,24 +331,28 @@ impl ExpiryState {
         };
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
-            *self.stats.as_mut().expect("err").missed_expiry_tasks.get_mut() += 1;
+            *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
             return;
         }
-        let wrkr = wrkr.expect("err!");
+        let wrkr = wrkr.expect("worker channel should exist after None check");
         select! {
             //_ -> GlobalContext.Done() => {}
             _ = wrkr.send(Some(Box::new(task))) => (),
             else => {
-                *self.stats.as_mut().expect("err").missed_expiry_tasks.get_mut() += 1;
+                *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
             }
         }
     }
 
     pub fn get_worker_ch(&self, h: u64) -> Option<Sender<Option<ExpiryOpType>>> {
-        if self.tasks_tx.len() == 0 {
+        if self.tasks_tx.is_empty() {
             return None;
         }
         Some(self.tasks_tx[h as usize % self.tasks_tx.len()].clone())
+    }
+
+    pub fn increment_missed_tier_journal_tasks(&mut self) {
+        *self.stats.as_mut().expect("stats lock").missed_tier_journal_tasks.get_mut() += 1;
     }
 
     pub async fn resize_workers(n: usize, api: Arc<ECStore>) {
@@ -349,11 +368,11 @@ impl ExpiryState {
             let rx = Arc::new(tokio::sync::Mutex::new(rx));
             state.tasks_tx.push(tx);
             state.tasks_rx.push(rx.clone());
-            *state.stats.as_mut().expect("err").workers.get_mut() += 1;
+            *state.stats.as_mut().expect("stats lock").workers.get_mut() += 1;
             tokio::spawn(async move {
                 let mut rx = rx.lock().await;
                 //let mut expiry_state = GLOBAL_ExpiryState.read().await;
-                ExpiryState::worker(&mut *rx, api).await;
+                ExpiryState::worker(&mut rx, api).await;
             });
         }
 
@@ -363,48 +382,50 @@ impl ExpiryState {
             worker.send(None).await.unwrap_or(());
             state.tasks_tx.remove(l - 1);
             state.tasks_rx.remove(l - 1);
-            *state.stats.as_mut().expect("err").workers.get_mut() -= 1;
+            *state.stats.as_mut().expect("stats lock").workers.get_mut() -= 1;
             l -= 1;
         }
     }
 
     pub async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>) {
-        //let cancel_token =
-        //    get_background_services_cancel_token().ok_or_else(|| Error::other("Background services not initialized"))?;
+        let cancel_token = crate::global::get_background_services_cancel_token().unwrap_or_else(|| {
+            static FALLBACK: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
+            FALLBACK.get_or_init(tokio_util::sync::CancellationToken::new)
+        });
 
         loop {
             select! {
-                //_ = cancel_token.cancelled() => {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("got ctrl+c, exits");
+                _ = cancel_token.cancelled() => {
+                    info!("lifecycle expiry worker received shutdown signal, exiting");
                     break;
                 }
                 v = rx.recv() => {
                     if v.is_none() {
                         break;
                     }
-                    let v = v.expect("err!");
+                    let v = v.expect("channel closed unexpectedly");
                     if v.is_none() {
                         //rx.close();
                         //drop(rx);
                         let _ = rx;
                         return;
                     }
-                    let v = v.expect("err!");
+                    let v = v.expect("received None after None check");
                     if v.as_any().is::<ExpiryTask>() {
-                        let v = v.as_any().downcast_ref::<ExpiryTask>().expect("err!");
-                        if v.obj_info.transitioned_object.status != "" {
+                        let v = v.as_any().downcast_ref::<ExpiryTask>().expect("ExpiryTask downcast failed");
+                        //debug!("lifecycle expiry worker received task: {:?}", v.obj_info);
+                        if !v.obj_info.transitioned_object.status.is_empty() {
                             apply_expiry_on_transitioned_object(api.clone(), &v.obj_info, &v.event, &v.src).await;
                         } else {
                             apply_expiry_on_non_transitioned_objects(api.clone(), &v.obj_info, &v.event, &v.src).await;
                         }
                     }
                     else if v.as_any().is::<NewerNoncurrentTask>() {
-                        let _v = v.as_any().downcast_ref::<NewerNoncurrentTask>().expect("err!");
-                        //delete_object_versions(api, &v.bucket, &v.versions, v.event).await;
+                        let v = v.as_any().downcast_ref::<NewerNoncurrentTask>().expect("NewerNoncurrentTask downcast failed");
+                        crate::client::object_handlers_common::delete_object_versions(&api, &v.bucket, &v.versions, v.event.clone()).await;
                     }
                     else if v.as_any().is::<Jentry>() {
-                        let v = v.as_any().downcast_ref::<Jentry>().expect("err!");
+                        let v = v.as_any().downcast_ref::<Jentry>().expect("Jentry downcast failed");
                         if let Err(err) = delete_object_from_remote_tier(&v.obj_name, &v.version_id, &v.tier_name).await {
                             warn!(
                                 object = %v.obj_name,
@@ -416,7 +437,7 @@ impl ExpiryState {
                         }
                     }
                     else if v.as_any().is::<FreeVersionTask>() {
-                        let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("err!");
+                        let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("FreeVersionTask downcast failed");
                         let oi = v.0.clone();
                         if let Err(err) = delete_object_from_remote_tier(
                             &oi.transitioned_object.name,
@@ -499,7 +520,7 @@ struct TransitionTask {
 impl ExpiryOp for TransitionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
+        hasher.update(self.obj_info.bucket.as_bytes());
         // hasher.update(format!("{}", self.obj_info.versions[0].object_name).as_bytes());
         xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
@@ -594,22 +615,40 @@ impl TransitionState {
                     if task.is_err() {
                         break;
                     }
-                    let task = task.expect("err!");
+                    let task = task.expect("channel recv should succeed after error check");
                     if task.is_none() {
                         //self.transition_rx.close();
                         //drop(self.transition_rx);
                         return;
                     }
-                    let task = task.expect("err!");
+                    let task = task.expect("received None after None check");
                     if task.as_any().is::<TransitionTask>() {
-                        let task = task.as_any().downcast_ref::<TransitionTask>().expect("err!");
+                        let task = task.as_any().downcast_ref::<TransitionTask>().expect("TransitionTask downcast failed");
 
                         GLOBAL_TransitionState.active_tasks.fetch_add(1, Ordering::SeqCst);
+
+                        let obj_info_for_event = ObjectInfo {
+                            bucket: task.obj_info.bucket.clone(),
+                            name: task.obj_info.name.clone(),
+                            size: task.obj_info.size,
+                            version_id: task.obj_info.version_id,
+                            ..Default::default()
+                        };
+
                         if let Err(err) = transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone())).await {
                             if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
                                 error!("Transition to {} failed for {}/{} version:{} with {}",
                                     task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.map(|v| v.to_string()).unwrap_or_default(), err.to_string());
                             }
+                            // Send s3:ObjectTransition:Failed event
+                            send_event(EventArgs {
+                                event_name: EventName::ObjectTransitionFailed.to_string(),
+                                bucket_name: obj_info_for_event.bucket.clone(),
+                                object: obj_info_for_event,
+                                user_agent: "Internal: [ILM-Transition]".to_string(),
+                                host: GLOBAL_LocalNodeName.to_string(),
+                                ..Default::default()
+                            });
                         } else {
                             let mut ts = TierStats {
                                 total_size: task.obj_info.size as u64,
@@ -620,6 +659,16 @@ impl TransitionState {
                                 ts.num_objects = 1;
                             }
                             GLOBAL_TransitionState.add_lastday_stats(&task.event.storage_class, ts);
+
+                            // Send s3:ObjectTransition:Complete event
+                            send_event(EventArgs {
+                                event_name: EventName::ObjectTransitionComplete.to_string(),
+                                bucket_name: obj_info_for_event.bucket.clone(),
+                                object: obj_info_for_event,
+                                user_agent: "Internal: [ILM-Transition]".to_string(),
+                                host: GLOBAL_LocalNodeName.to_string(),
+                                ..Default::default()
+                            });
                         }
                         GLOBAL_TransitionState.active_tasks.fetch_add(-1, Ordering::SeqCst);
                     }
@@ -634,7 +683,7 @@ impl TransitionState {
         tier_stats
             .entry(tier.to_string())
             .and_modify(|e| e.add_stats(ts))
-            .or_insert(LastDayTierStats::default());
+            .or_default();
     }
 
     pub fn get_daily_all_tier_stats(&self) -> DailyAllTierStats {
@@ -666,15 +715,15 @@ impl TransitionState {
             tokio::spawn(async move {
                 TransitionState::worker(clone_api).await;
             });
-            num_workers = num_workers + 1;
+            num_workers += 1;
             GLOBAL_TransitionState.num_workers.fetch_add(1, Ordering::SeqCst);
         }
 
         let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
         while num_workers > n {
             let worker = GLOBAL_TransitionState.kill_tx.clone();
-            worker.send(()).await;
-            num_workers = num_workers - 1;
+            let _ = worker.send(()).await;
+            num_workers -= 1;
             GLOBAL_TransitionState.num_workers.fetch_add(-1, Ordering::SeqCst);
         }
     }
@@ -683,10 +732,10 @@ impl TransitionState {
 pub async fn init_background_expiry(api: Arc<ECStore>) {
     let mut workers = get_env_usize("RUSTFS_MAX_EXPIRY_WORKERS", std::cmp::min(num_cpus::get(), 16));
     //globalILMConfig.getExpirationWorkers()
-    if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS") {
-        if let Ok(num_expirations) = env_expiration_workers.parse::<usize>() {
-            workers = num_expirations;
-        }
+    if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS")
+        && let Ok(num_expirations) = env_expiration_workers.parse::<usize>()
+    {
+        workers = num_expirations;
     }
 
     if workers == 0 {
@@ -1029,24 +1078,24 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
     for rule in &lc.rules {
         if let Some(transitions) = &rule.transitions {
             for transition in transitions {
-                if let Some(storage_class) = &transition.storage_class {
-                    if storage_class.as_str() != "" {
-                        let valid = GLOBAL_TierConfigMgr.read().await.is_tier_valid(storage_class.as_str());
-                        if !valid {
-                            return Err(std::io::Error::other(ERR_INVALID_STORAGECLASS));
-                        }
+                if let Some(storage_class) = &transition.storage_class
+                    && storage_class.as_str() != ""
+                {
+                    let valid = GLOBAL_TierConfigMgr.read().await.is_tier_valid(storage_class.as_str());
+                    if !valid {
+                        return Err(std::io::Error::other(ERR_INVALID_STORAGECLASS));
                     }
                 }
             }
         }
         if let Some(noncurrent_version_transitions) = &rule.noncurrent_version_transitions {
             for noncurrent_version_transition in noncurrent_version_transitions {
-                if let Some(storage_class) = &noncurrent_version_transition.storage_class {
-                    if storage_class.as_str() != "" {
-                        let valid = GLOBAL_TierConfigMgr.read().await.is_tier_valid(storage_class.as_str());
-                        if !valid {
-                            return Err(std::io::Error::other(ERR_INVALID_STORAGECLASS));
-                        }
+                if let Some(storage_class) = &noncurrent_version_transition.storage_class
+                    && storage_class.as_str() != ""
+                {
+                    let valid = GLOBAL_TierConfigMgr.read().await.is_tier_valid(storage_class.as_str());
+                    if !valid {
+                        return Err(std::io::Error::other(ERR_INVALID_STORAGECLASS));
                     }
                 }
             }
@@ -1067,6 +1116,104 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
+pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
+    let Some(lifecycle) = GLOBAL_LifecycleSys.get(&oi.bucket).await else {
+        return;
+    };
+    let Some(api) = crate::new_object_layer_fn() else {
+        return;
+    };
+
+    let mut marker = None;
+    let mut version_marker = None;
+    let mut object_infos = Vec::new();
+
+    loop {
+        let Ok(page) = api
+            .clone()
+            .list_object_versions(&oi.bucket, &oi.name, marker.clone(), version_marker.clone(), None, 1000)
+            .await
+        else {
+            return;
+        };
+
+        object_infos.extend(page.objects.into_iter().filter(|object| object.name == oi.name));
+
+        if !page.is_truncated {
+            break;
+        }
+
+        marker = page.next_marker;
+        version_marker = page.next_version_idmarker;
+    }
+
+    if object_infos.is_empty() {
+        object_infos.push(oi.clone());
+    }
+
+    let lock_config = match metadata_sys::get_object_lock_config(&oi.bucket).await {
+        Ok((cfg, _)) => Some(Arc::new(cfg)),
+        Err(_) => None,
+    };
+    let replication = match metadata_sys::get_replication_config(&oi.bucket).await {
+        Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(ReplicationConfig::new(Some(cfg), None))),
+        _ => None,
+    };
+
+    let object_opts = object_infos
+        .iter()
+        .map(|object| object.to_lifecycle_opts())
+        .collect::<Vec<ObjectOpts>>();
+    let Ok(events) = Evaluator::new(Arc::new(lifecycle))
+        .with_lock_retention(lock_config)
+        .with_replication_config(replication)
+        .eval(&object_opts)
+        .await
+    else {
+        return;
+    };
+
+    let mut to_delete_objs = Vec::new();
+    let mut noncurrent_event = None;
+
+    for (object, event) in object_infos.iter().zip(events.iter()) {
+        if event.due != Some(OffsetDateTime::UNIX_EPOCH) {
+            continue;
+        }
+
+        match event.action {
+            IlmAction::DeleteAction
+            | IlmAction::DeleteRestoredAction
+            | IlmAction::DeleteRestoredVersionAction
+            | IlmAction::DeleteAllVersionsAction
+            | IlmAction::DelMarkerDeleteAllVersionsAction => {
+                apply_expiry_rule(event, &src, object).await;
+            }
+            IlmAction::DeleteVersionAction => {
+                to_delete_objs.push(ObjectToDelete {
+                    object_name: object.name.clone(),
+                    version_id: object.version_id,
+                    ..Default::default()
+                });
+                if noncurrent_event.is_none() {
+                    noncurrent_event = Some(event.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !to_delete_objs.is_empty()
+        && let Some(event) = noncurrent_event
+    {
+        GLOBAL_ExpiryState
+            .write()
+            .await
+            .enqueue_by_newer_noncurrent(&oi.bucket, to_delete_objs, event)
+            .await;
+    }
+}
+
 pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     let Some(lc) = GLOBAL_LifecycleSys.get(bucket).await else {
         return Ok(());
@@ -1083,6 +1230,60 @@ pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: 
 
         for object in &page.objects {
             enqueue_transition_with_lifecycle(object, &lc, &src).await;
+        }
+
+        if !page.is_truncated {
+            return Ok(());
+        }
+
+        marker = page.next_marker;
+        version_marker = page.next_version_idmarker;
+    }
+}
+
+pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    let Ok((lc, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
+        return Ok(());
+    };
+    let lock_retention = metadata_sys::get_object_lock_config(bucket)
+        .await
+        .ok()
+        .and_then(|(cfg, _)| cfg.rule.and_then(|rule| rule.default_retention));
+    let replication_config = metadata_sys::get_replication_config(bucket).await.ok();
+    let mut marker = None;
+    let mut version_marker = None;
+    let src = LcEventSrc::Scanner;
+
+    loop {
+        let page = api
+            .clone()
+            .list_object_versions(bucket, "", marker.clone(), version_marker.clone(), None, 1000)
+            .await?;
+
+        for object in &page.objects {
+            let event = eval_action_from_lifecycle(&lc, lock_retention.clone(), replication_config.clone(), object).await;
+            match event.action {
+                IlmAction::DeleteAction
+                | IlmAction::DeleteVersionAction
+                | IlmAction::DeleteRestoredAction
+                | IlmAction::DeleteRestoredVersionAction
+                | IlmAction::DeleteAllVersionsAction
+                | IlmAction::DelMarkerDeleteAllVersionsAction => {
+                    if event
+                        .due
+                        .is_some_and(|due| due.unix_timestamp() <= OffsetDateTime::now_utc().unix_timestamp())
+                    {
+                        if object.is_remote() {
+                            apply_expiry_on_transitioned_object(api.clone(), object, &event, &src).await;
+                        } else {
+                            apply_expiry_on_non_transitioned_objects(api.clone(), object, &event, &src).await;
+                        }
+                    } else {
+                        apply_expiry_rule(&event, &src, object).await;
+                    }
+                }
+                _ => {}
+            }
         }
 
         if !page.is_truncated {
@@ -1140,8 +1341,8 @@ pub async fn expire_transitioned_object(
         &oi.transitioned_object.tier,
     )
     .await;
-    if ret.is_err() {
-        //transitionLogIf(ctx, err);
+    if let Err(e) = &ret {
+        error!("Failed to delete remote transitioned object {}: {:?}", oi.transitioned_object.name, e);
     }
     mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, ret.is_ok());
 
@@ -1154,7 +1355,9 @@ pub async fn expire_transitioned_object(
         }
     };
 
-    //defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
+    schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
+
+    //audit_log_lifecycle(oi, ILMExpiry, tags);
 
     let event_name = if oi.delete_marker {
         EventName::LifecycleExpirationDelete
@@ -1227,8 +1430,19 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
     result
 }
 
-pub fn audit_tier_actions(_api: ECStore, _tier: &str, _bytes: i64) -> TimeFn {
-    Arc::new(|| Box::pin(async move {}))
+pub fn audit_tier_actions(_tier: &str, bytes: i64) -> TimeFn {
+    let tier = _tier.to_string();
+    Arc::new(move || {
+        let tier = tier.clone();
+        Box::pin(async move {
+            info!(
+                tier = %tier,
+                bytes = bytes,
+                "ILM tier transition audit: completed transition of {} bytes to tier '{}'",
+                bytes, tier
+            );
+        })
+    })
 }
 
 pub async fn get_transitioned_object_reader(
@@ -1245,11 +1459,11 @@ pub async fn get_transitioned_object_reader(
         Err(err) => return Err(std::io::Error::other(err)),
     };
 
-    let ret = new_getobjectreader(rs, &oi, opts, &h);
+    let ret = new_getobjectreader(rs, oi, opts, h);
     if let Err(err) = ret {
         return Err(error_resp_to_object_err(err, vec![bucket, object]));
     }
-    let (get_fn, off, length) = ret.expect("err");
+    let (get_fn, off, length) = ret.expect("get_transitioned_object_reader should succeed after error check");
     let mut gopts = WarmBackendGetOpts::default();
 
     if off >= 0 && length >= 0 {
@@ -1269,8 +1483,8 @@ pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> 
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
     let vid = version_id.trim();
-    if vid != "" && vid != NULL_VERSION_ID {
-        if let Err(err) = Uuid::parse_str(vid) {
+    if !vid.is_empty() && vid != NULL_VERSION_ID {
+        if let Err(_err) = Uuid::parse_str(vid) {
             return Err(std::io::Error::other(
                 StorageError::InvalidVersionID(bucket.to_string(), object.to_string(), vid.to_string()).to_string(),
             ));
@@ -1326,30 +1540,27 @@ pub async fn put_restore_opts(
             if !strings_has_prefix_fold(&v.name.clone().unwrap(), "x-amz-meta") {
                 meta.insert(
                     format!("x-amz-meta-{}", v.name.as_ref().unwrap()),
-                    v.value.clone().unwrap_or("".to_string()),
+                    v.value.clone().unwrap_or_else(|| "".to_string()),
                 );
                 continue;
             }
-            meta.insert(v.name.clone().unwrap(), v.value.clone().unwrap_or("".to_string()));
+            meta.insert(v.name.clone().unwrap(), v.value.clone().unwrap_or_else(|| "".to_string()));
         }
-        if let Some(output_location) = rreq.output_location.as_ref() {
-            if let Some(s3) = &output_location.s3 {
-                if let Some(tags) = &s3.tagging {
-                    meta.insert(
-                        AMZ_OBJECT_TAGGING.to_string(),
-                        serde_urlencoded::to_string(tags.tag_set.clone()).unwrap_or("".to_string()),
-                    );
-                }
-            }
+        if let Some(output_location) = rreq.output_location.as_ref()
+            && let Some(s3) = &output_location.s3
+            && let Some(tags) = &s3.tagging
+        {
+            meta.insert(
+                AMZ_OBJECT_TAGGING.to_string(),
+                serde_urlencoded::to_string(tags.tag_set.clone()).unwrap_or_else(|_| "".to_string()),
+            );
         }
-        if let Some(output_location) = rreq.output_location.as_ref() {
-            if let Some(s3) = &output_location.s3 {
-                if let Some(encryption) = &s3.encryption {
-                    if encryption.encryption_type.as_str() != "" {
-                        meta.insert(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str().to_string(), AMZ_ENCRYPTION_AES.to_string());
-                    }
-                }
-            }
+        if let Some(output_location) = rreq.output_location.as_ref()
+            && let Some(s3) = &output_location.s3
+            && let Some(encryption) = &s3.encryption
+            && encryption.encryption_type.as_str() != ""
+        {
+            meta.insert(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str().to_string(), AMZ_ENCRYPTION_AES.to_string());
         }
         return Ok(ObjectOptions {
             versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
@@ -1361,7 +1572,7 @@ pub async fn put_restore_opts(
     for (k, v) in &oi.user_defined {
         meta.insert(k.to_string(), v.clone());
     }
-    if oi.user_tags.len() != 0 {
+    if !oi.user_tags.is_empty() {
         meta.insert(AMZ_OBJECT_TAGGING.to_string(), oi.user_tags.clone());
     }
     let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
@@ -1394,7 +1605,7 @@ impl LifecycleOps for ObjectInfo {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
             user_tags: self.user_tags.clone(),
-            version_id: self.version_id.clone(),
+            version_id: self.version_id,
             mod_time: self.mod_time,
             size: self.size as usize,
             is_latest: self.is_latest,
@@ -1421,38 +1632,42 @@ pub trait RestoreRequestOps {
 }
 
 impl RestoreRequestOps for RestoreRequest {
-    fn validate(&self, api: Arc<ECStore>) -> Result<(), std::io::Error> {
-        /*if self.type_.is_none() && self.select_parameters.is_some() {
+    fn validate(&self, _api: Arc<ECStore>) -> Result<(), std::io::Error> {
+        // SELECT type requires select_parameters, and vice versa
+        if self.type_.as_ref().is_none_or(|t| t.as_str() != RestoreRequestType::SELECT) && self.select_parameters.is_some() {
             return Err(std::io::Error::other("Select parameters can only be specified with SELECT request type"));
         }
-        if let Some(type_) = self.type_ && type_ == RestoreRequestType::SELECT && self.select_parameters.is_none() {
+        if let Some(type_) = &self.type_
+            && type_.as_str() == RestoreRequestType::SELECT
+            && self.select_parameters.is_none()
+        {
             return Err(std::io::Error::other("SELECT restore request requires select parameters to be specified"));
         }
 
-        if self.type_.is_none() && self.output_location.is_some() {
-            return Err(std::io::Error::other("OutputLocation required only for SELECT request type"));
+        // OutputLocation is only valid for SELECT requests
+        if self.type_.as_ref().is_none_or(|t| t.as_str() != RestoreRequestType::SELECT) && self.output_location.is_some() {
+            return Err(std::io::Error::other("OutputLocation can only be specified with SELECT request type"));
         }
-        if let Some(type_) = self.type_ && type_ == RestoreRequestType::SELECT && self.output_location.is_none() {
+        if let Some(type_) = &self.type_
+            && type_.as_str() == RestoreRequestType::SELECT
+            && self.output_location.is_none()
+        {
             return Err(std::io::Error::other("OutputLocation required for SELECT requests"));
         }
 
-        if let Some(type_) = self.type_ && type_ == RestoreRequestType::SELECT && self.days != 0 {
+        // Days must not be specified with SELECT requests
+        if let Some(type_) = &self.type_
+            && type_.as_str() == RestoreRequestType::SELECT
+            && self.days.is_some_and(|d| d > 0)
+        {
             return Err(std::io::Error::other("Days cannot be specified with SELECT restore request"));
         }
-        if self.days == 0 && self.type_.is_none() {
+
+        // For non-SELECT requests, days must be at least 1
+        if self.type_.is_none() && self.days.is_none_or(|d| d <= 0) {
             return Err(std::io::Error::other("restoration days should be at least 1"));
         }
-        if self.output_location.is_some() {
-            if _, err := api.get_bucket_info(self.output_location.s3.bucket_name, BucketOptions{}); err != nil {
-                return err
-            }
-            if self.output_location.s3.prefix == "" {
-                return Err(std::io::Error::other("Prefix is a required parameter in OutputLocation"));
-            }
-            if self.output_location.s3.encryption.encryption_type.as_str() != ServerSideEncryption::AES256 {
-                return NotImplemented{}
-            }
-        }*/
+
         Ok(())
     }
 }
@@ -1473,10 +1688,8 @@ pub async fn eval_action_from_lifecycle(
     let lock_enabled = if let Some(lr) = lr { lr.mode.is_some() } else { false };
 
     match event.action {
-        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
-            if lock_enabled {
-                return lifecycle::Event::default();
-            }
+        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction if lock_enabled => {
+            return lifecycle::Event::default();
         }
         IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction => {
             if oi.version_id.is_none() {
@@ -1497,10 +1710,10 @@ pub async fn eval_action_from_lifecycle(
                 //}
                 return lifecycle::Event::default();
             }
-            if let Some(rcfg) = rcfg {
-                if rep_has_active_rules(&rcfg.0, &oi.name, true) {
-                    return lifecycle::Event::default();
-                }
+            if let Some(rcfg) = rcfg
+                && rep_has_active_rules(&rcfg.0, &oi.name, true)
+            {
+                return lifecycle::Event::default();
             }
         }
         _ => (),
@@ -1558,7 +1771,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     let time_ilm = Metrics::time_ilm(lc_event.action);
 
     //debug!("lc_event.action: {:?}", lc_event.action);
-    //debug!("opts: {:?}", opts);
+    debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
     let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
         Ok(dobj) => dobj,
         Err(e) => {
@@ -1566,6 +1779,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
             return false;
         }
     };
+    schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
     //debug!("dobj: {:?}", dobj);
     if dobj.name.is_empty() {
         dobj = oi.clone();
@@ -1606,6 +1820,141 @@ pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &
     true
 }
 
+fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> crate::store_api::DeletedObject {
+    if dobj.delete_marker {
+        return crate::store_api::DeletedObject {
+            object_name: oi.name.clone(),
+            delete_marker: true,
+            delete_marker_version_id: dobj.version_id,
+            delete_marker_mtime: dobj.mod_time.or(oi.mod_time),
+            ..Default::default()
+        };
+    }
+
+    if oi.delete_marker && oi.version_id.is_some() {
+        return crate::store_api::DeletedObject {
+            object_name: oi.name.clone(),
+            delete_marker: false,
+            delete_marker_version_id: oi.version_id,
+            delete_marker_mtime: oi.mod_time,
+            ..Default::default()
+        };
+    }
+
+    crate::store_api::DeletedObject {
+        object_name: oi.name.clone(),
+        delete_marker: false,
+        version_id: oi.version_id,
+        delete_marker_mtime: oi.mod_time,
+        ..Default::default()
+    }
+}
+
+async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: &ObjectInfo) {
+    let mut delete_object = lifecycle_deleted_object(oi, dobj);
+    let version_id = if delete_object.delete_marker {
+        None
+    } else if delete_object.delete_marker_version_id.is_some() {
+        delete_object.delete_marker_version_id
+    } else {
+        delete_object.version_id
+    };
+
+    let replication_state = lifecycle_delete_replication_state(oi, version_id).await;
+    if replication_state.is_none() {
+        return;
+    }
+
+    delete_object.replication_state = replication_state;
+
+    schedule_replication_delete(DeletedObjectReplicationInfo {
+        delete_object,
+        bucket: oi.bucket.clone(),
+        event_type: REPLICATE_INCOMING_DELETE.to_string(),
+        ..Default::default()
+    })
+    .await;
+}
+
+fn should_reuse_lifecycle_delete_replication_state(oi: &ObjectInfo, version_delete: bool) -> bool {
+    let state = oi.replication_state();
+    if version_delete {
+        oi.version_purge_status == VersionPurgeStatusType::Pending && !state.purge_targets.is_empty()
+    } else {
+        oi.replication_status == rustfs_filemeta::ReplicationStatusType::Pending && !state.targets.is_empty()
+    }
+}
+
+fn lifecycle_version_purge_state_from_completed_targets(oi: &ObjectInfo) -> Option<ReplicationState> {
+    if oi.replication_status != rustfs_filemeta::ReplicationStatusType::Completed {
+        return None;
+    }
+
+    let targets = oi.replication_state().targets;
+    if targets.is_empty() {
+        return None;
+    }
+
+    let pending_status = targets.keys().map(|arn| format!("{arn}=PENDING;")).collect::<String>();
+
+    Some(ReplicationState {
+        replicate_decision_str: oi.replication_decision.clone(),
+        version_purge_status_internal: Some(pending_status.clone()),
+        purge_targets: rustfs_filemeta::version_purge_statuses_map(&pending_status),
+        ..Default::default()
+    })
+}
+
+async fn lifecycle_delete_replication_state(oi: &ObjectInfo, version_id: Option<Uuid>) -> Option<ReplicationState> {
+    if should_reuse_lifecycle_delete_replication_state(oi, version_id.is_some()) {
+        return Some(oi.replication_state());
+    }
+
+    if version_id.is_some()
+        && let Some(state) = lifecycle_version_purge_state_from_completed_targets(oi)
+    {
+        return Some(state);
+    }
+
+    let dsc = check_replicate_delete(
+        &oi.bucket,
+        &ObjectToDelete {
+            object_name: oi.name.clone(),
+            version_id,
+            ..Default::default()
+        },
+        oi,
+        &ObjectOptions {
+            version_id: version_id.map(|v| v.to_string()),
+            versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    if !dsc.replicate_any() {
+        return None;
+    }
+
+    Some(replication_state_for_delete(dsc, version_id.is_some()))
+}
+
+fn replication_state_for_delete(dsc: ReplicateDecision, version_delete: bool) -> ReplicationState {
+    let pending_status = dsc.pending_status();
+    let mut state = ReplicationState {
+        replicate_decision_str: dsc.to_string(),
+        ..Default::default()
+    };
+    if version_delete {
+        state.version_purge_status_internal = pending_status.clone();
+        state.purge_targets = rustfs_filemeta::version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
+    } else {
+        state.replication_status_internal = pending_status.clone();
+        state.targets = rustfs_filemeta::replication_statuses_map(pending_status.as_deref().unwrap_or_default());
+    }
+    state
+}
+
 pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut success = false;
     match event.action {
@@ -1629,7 +1978,9 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::{
         StaleMultipartUploadCandidate, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
-        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
+        lifecycle_deleted_object, lifecycle_version_purge_state_from_completed_targets,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
+        should_reuse_lifecycle_delete_replication_state,
     };
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -1640,8 +1991,9 @@ mod tests {
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::store::ECStore;
     use crate::store_api::{
-        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectOptions, PutObjReader,
+        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader,
     };
+    use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -1681,6 +2033,136 @@ mod tests {
         mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
 
         assert!(opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn lifecycle_deleted_object_uses_delete_marker_created_by_expiry() {
+        let source = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "key".to_string(),
+            ..Default::default()
+        };
+        let delete_result = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "key".to_string(),
+            delete_marker: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        let deleted = lifecycle_deleted_object(&source, &delete_result);
+
+        assert!(deleted.delete_marker);
+        assert_eq!(deleted.delete_marker_version_id, delete_result.version_id);
+        assert_eq!(deleted.version_id, None);
+        assert_eq!(deleted.object_name, "key");
+    }
+
+    #[test]
+    fn lifecycle_deleted_object_uses_version_id_for_noncurrent_version_purge() {
+        let version_id = Uuid::new_v4();
+        let source = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "key".to_string(),
+            version_id: Some(version_id),
+            ..Default::default()
+        };
+
+        let deleted = lifecycle_deleted_object(&source, &ObjectInfo::default());
+
+        assert!(!deleted.delete_marker);
+        assert_eq!(deleted.version_id, Some(version_id));
+        assert_eq!(deleted.delete_marker_version_id, None);
+    }
+
+    #[test]
+    fn lifecycle_deleted_object_uses_delete_marker_version_for_marker_purge() {
+        let version_id = Uuid::new_v4();
+        let source = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "key".to_string(),
+            delete_marker: true,
+            version_id: Some(version_id),
+            ..Default::default()
+        };
+
+        let deleted = lifecycle_deleted_object(&source, &ObjectInfo::default());
+
+        assert!(!deleted.delete_marker);
+        assert_eq!(deleted.delete_marker_version_id, Some(version_id));
+        assert_eq!(deleted.version_id, None);
+    }
+
+    #[test]
+    fn replication_state_for_delete_uses_replication_targets_for_current_delete() {
+        let arn = "arn:aws:s3:::target-bucket";
+        let mut dsc = ReplicateDecision::default();
+        dsc.set(rustfs_filemeta::ReplicateTargetDecision::new(arn.to_string(), true, false));
+
+        let state = replication_state_for_delete(dsc, false);
+
+        assert_eq!(state.replication_status_internal.as_deref(), Some(format!("{arn}=PENDING;").as_str()));
+        assert!(state.version_purge_status_internal.is_none());
+        assert!(state.targets.contains_key(arn));
+    }
+
+    #[test]
+    fn replication_state_for_delete_uses_purge_targets_for_version_delete() {
+        let arn = "arn:aws:s3:::target-bucket";
+        let mut dsc = ReplicateDecision::default();
+        dsc.set(rustfs_filemeta::ReplicateTargetDecision::new(arn.to_string(), true, false));
+
+        let state = replication_state_for_delete(dsc, true);
+
+        assert_eq!(state.version_purge_status_internal.as_deref(), Some(format!("{arn}=PENDING;").as_str()));
+        assert!(state.replication_status_internal.is_none());
+        assert!(state.purge_targets.contains_key(arn));
+    }
+
+    #[test]
+    fn lifecycle_delete_replication_state_reuses_only_pending_version_purge_state() {
+        let oi = ObjectInfo {
+            version_purge_status: VersionPurgeStatusType::Pending,
+            version_purge_status_internal: Some("arn:aws:s3:::target=PENDING;".to_string()),
+            replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
+            ..Default::default()
+        };
+
+        assert!(should_reuse_lifecycle_delete_replication_state(&oi, true));
+        assert!(!should_reuse_lifecycle_delete_replication_state(&oi, false));
+    }
+
+    #[test]
+    fn lifecycle_delete_replication_state_does_not_reuse_put_replication_for_version_delete() {
+        let oi = ObjectInfo {
+            replication_status: rustfs_filemeta::ReplicationStatusType::Completed,
+            replication_status_internal: Some("arn:aws:s3:::target=COMPLETED;".to_string()),
+            replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
+            ..Default::default()
+        };
+
+        assert!(
+            !should_reuse_lifecycle_delete_replication_state(&oi, true),
+            "version purges must not reuse plain object replication state from prior PUT/delete-marker replication"
+        );
+    }
+
+    #[test]
+    fn lifecycle_version_purge_state_from_completed_targets_derives_pending_purge_targets() {
+        let oi = ObjectInfo {
+            replication_status: rustfs_filemeta::ReplicationStatusType::Completed,
+            replication_status_internal: Some("arn:aws:s3:::target=COMPLETED;".to_string()),
+            replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
+            ..Default::default()
+        };
+
+        let state = lifecycle_version_purge_state_from_completed_targets(&oi)
+            .expect("completed replication targets should be convertible into version-purge targets");
+
+        assert_eq!(state.version_purge_status_internal.as_deref(), Some("arn:aws:s3:::target=PENDING;"));
+        assert!(state.purge_targets.contains_key("arn:aws:s3:::target"));
+        assert_eq!(state.replicate_decision_str, oi.replication_decision);
     }
 
     static STALE_MULTIPART_TEST_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();

@@ -18,8 +18,9 @@ use crate::{
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
     },
-    auth::{check_key_valid, get_session_token},
+    auth::{check_key_valid, extract_string_list_claim, get_session_token},
     server::ADMIN_PREFIX,
+    server::RemoteAddr,
 };
 use http::StatusCode;
 use http::header::HeaderValue;
@@ -30,7 +31,13 @@ use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::utils::serialize;
 use rustfs_iam::{manager::get_token_signing_key, oidc::OidcClaims, sys::SESSION_POLICY_NAME};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
-use rustfs_policy::{auth::get_new_credentials_with_metadata, policy::Policy};
+use rustfs_policy::{
+    auth::get_new_credentials_with_metadata,
+    policy::{
+        Args, Policy,
+        action::{Action, StsAction},
+    },
+};
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
@@ -46,6 +53,62 @@ use tracing::{debug, error, info, warn};
 const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION: &str = "AssumeRoleWithWebIdentity";
 const ASSUME_ROLE_VERSION: &str = "2011-06-15";
+
+fn has_identity_authorization_context(policies: &[String], groups: &[String]) -> bool {
+    !policies.is_empty() || !groups.is_empty()
+}
+
+fn configured_roles_claim_key(provider_id: &str) -> Option<String> {
+    rustfs_iam::get_oidc()
+        .as_ref()
+        .and_then(|oidc_sys| oidc_sys.get_provider_config(provider_id))
+        .map(|cfg| cfg.roles_claim.trim().to_string())
+        .filter(|claim| !claim.is_empty())
+}
+
+fn build_oidc_token_claims(
+    claims: &OidcClaims,
+    provider_id: &str,
+    groups: &[String],
+    roles_claim_key: Option<&str>,
+) -> HashMap<String, Value> {
+    let mut token_claims: HashMap<String, Value> = HashMap::new();
+    token_claims.insert("sub".to_string(), Value::String(claims.sub.clone()));
+    token_claims.insert("iss".to_string(), Value::String("rustfs-oidc".to_string()));
+    token_claims.insert("oidc_provider".to_string(), Value::String(provider_id.to_string()));
+
+    if !claims.email.is_empty() {
+        token_claims.insert("email".to_string(), Value::String(claims.email.clone()));
+    }
+    if !claims.username.is_empty() {
+        token_claims.insert("preferred_username".to_string(), Value::String(claims.username.clone()));
+    }
+    if !groups.is_empty() {
+        token_claims.insert(
+            "groups".to_string(),
+            Value::Array(groups.iter().map(|g| Value::String(g.clone())).collect()),
+        );
+    }
+    if let Some(roles_claim_key) = roles_claim_key {
+        let roles = extract_string_list_claim(&claims.raw, roles_claim_key);
+        if !roles.is_empty() {
+            token_claims.insert("roles".to_string(), Value::Array(roles.into_iter().map(Value::String).collect()));
+        }
+    }
+    token_claims
+}
+
+fn resolve_oidc_session_identity(claims: &OidcClaims) -> String {
+    if !claims.username.is_empty() {
+        claims.username.clone()
+    } else if !claims.email.is_empty() {
+        claims.email.clone()
+    } else if !claims.sub.is_empty() {
+        claims.sub.clone()
+    } else {
+        "oidc-user-unknown".to_string()
+    }
+}
 
 pub fn register_admin_auth_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(Method::POST, "/", AdminOperation(&AssumeRoleHandle {}))?;
@@ -91,7 +154,10 @@ impl Operation for AssumeRoleHandle {
         let body: AssumeRoleRequest = from_bytes(&bytes).map_err(|_e| s3_error!(InvalidRequest, "invalid STS request format"))?;
 
         match body.action.as_str() {
-            ASSUME_ROLE_ACTION => handle_assume_role(req.credentials, req.uri, req.headers, body).await,
+            ASSUME_ROLE_ACTION => {
+                let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+                handle_assume_role(req.credentials, req.uri, req.headers, remote_addr, body).await
+            }
             ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION => handle_assume_role_with_web_identity(body).await,
             _ => Err(s3_error!(InvalidArgument, "unsupported Action")),
         }
@@ -103,6 +169,7 @@ async fn handle_assume_role(
     credentials: Option<s3s::auth::Credentials>,
     uri: http::Uri,
     headers: http::HeaderMap,
+    remote_addr: Option<std::net::SocketAddr>,
     body: AssumeRoleRequest,
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
     let Some(user) = credentials else {
@@ -114,11 +181,31 @@ async fn handle_assume_role(
         return Err(s3_error!(InvalidRequest, "AccessDenied1"));
     }
 
-    let (cred, _owner) = check_key_valid(get_session_token(&uri, &headers).unwrap_or_default(), &user.access_key).await?;
+    let (cred, owner) = check_key_valid(get_session_token(&uri, &headers).unwrap_or_default(), &user.access_key).await?;
 
-    // TODO: Check permissions, do not allow STS access
     if cred.is_temp() || cred.is_service_account() {
         return Err(s3_error!(InvalidRequest, "AccessDenied"));
+    }
+
+    let Ok(iam_store) = rustfs_iam::get() else {
+        return Err(s3_error!(InvalidRequest, "iam not init"));
+    };
+    let conditions = crate::auth::get_condition_values(&headers, &cred, None, None, remote_addr);
+    if !iam_store
+        .is_allowed(&Args {
+            account: &cred.access_key,
+            groups: &cred.groups,
+            action: Action::StsAction(StsAction::AssumeRoleAction),
+            conditions: &conditions,
+            is_owner: owner,
+            claims: cred.claims_or_empty(),
+            deny_only: false,
+            bucket: "",
+            object: "",
+        })
+        .await
+    {
+        return Err(s3_error!(AccessDenied, "Access Denied"));
     }
 
     if body.version.as_str() != ASSUME_ROLE_VERSION {
@@ -143,10 +230,6 @@ async fn handle_assume_role(
     );
 
     claims.insert("parent".to_string(), Value::String(cred.access_key.clone()));
-
-    let Ok(iam_store) = rustfs_iam::get() else {
-        return Err(s3_error!(InvalidRequest, "iam not init"));
-    };
 
     if let Err(_err) = iam_store.policy_db_get(&cred.access_key, &cred.groups).await {
         error!(
@@ -201,7 +284,7 @@ async fn handle_assume_role(
             expiration: Timestamp::from(
                 new_cred
                     .expiration
-                    .unwrap_or(OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600))),
+                    .unwrap_or_else(|| OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600))),
             ),
             secret_access_key: new_cred.secret_key,
             session_token: new_cred.session_token,
@@ -241,7 +324,7 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     // Map claims to policies and groups
     let (policies, groups) = oidc_sys.map_claims_to_policies(&provider_id, &claims);
 
-    if policies.is_empty() && groups.is_empty() {
+    if !has_identity_authorization_context(&policies, &groups) {
         return Err(s3_error!(InvalidArgument, "no policies are available for this OIDC token"));
     }
 
@@ -269,20 +352,12 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     )
     .await?;
 
-    let subject = if !claims.email.is_empty() {
-        claims.email.clone()
-    } else if !claims.username.is_empty() {
-        claims.username.clone()
-    } else if !claims.sub.is_empty() {
-        claims.sub.clone()
-    } else {
-        "oidc-user-unknown".to_string()
-    };
+    let subject = resolve_oidc_session_identity(&claims);
 
     // Build XML response (AssumeRoleWithWebIdentityResponse)
     let expiration = new_cred
         .expiration
-        .unwrap_or(OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600)));
+        .unwrap_or_else(|| OffsetDateTime::now_utc().saturating_add(Duration::seconds(3600)));
     let exp_str = expiration
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
@@ -323,38 +398,15 @@ pub async fn create_oidc_sts_credentials(
     duration_seconds: usize,
     session_policy: Option<&str>,
 ) -> S3Result<rustfs_credentials::Credentials> {
-    let mut token_claims: HashMap<String, Value> = HashMap::new();
-    token_claims.insert("sub".to_string(), Value::String(claims.sub.clone()));
-    token_claims.insert("iss".to_string(), Value::String("rustfs-oidc".to_string()));
-    token_claims.insert("oidc_provider".to_string(), Value::String(provider_id.to_string()));
-
-    if !claims.email.is_empty() {
-        token_claims.insert("email".to_string(), Value::String(claims.email.clone()));
-    }
-    if !claims.username.is_empty() {
-        token_claims.insert("preferred_username".to_string(), Value::String(claims.username.clone()));
-    }
-    if !groups.is_empty() {
-        token_claims.insert(
-            "groups".to_string(),
-            Value::Array(groups.iter().map(|g| Value::String(g.clone())).collect()),
-        );
-    }
+    let roles_claim_key = configured_roles_claim_key(provider_id);
+    let mut token_claims = build_oidc_token_claims(claims, provider_id, groups, roles_claim_key.as_deref());
 
     // Set expiration
     let exp = OffsetDateTime::now_utc().saturating_add(Duration::seconds(duration_seconds as i64));
     token_claims.insert("exp".to_string(), Value::Number(serde_json::Number::from(exp.unix_timestamp())));
 
-    // Set the parent user: prefer email, then username, then sub
-    let parent_user = if !claims.email.is_empty() {
-        claims.email.clone()
-    } else if !claims.username.is_empty() {
-        claims.username.clone()
-    } else if !claims.sub.is_empty() {
-        claims.sub.clone()
-    } else {
-        "oidc-user-unknown".to_string()
-    };
+    // Set the parent user: prefer username, then email, then sub
+    let parent_user = resolve_oidc_session_identity(claims);
     info!(
         "OIDC STS credential: parent_user='{}' (email='{}', username='{}', sub='{}')",
         parent_user, claims.email, claims.username, claims.sub
@@ -483,5 +535,96 @@ mod tests {
         assert_eq!(clamp(3600), 3600); // normal
         assert_eq!(clamp(43200), 43200); // exact max
         assert_eq!(clamp(999999), 43200); // clamped to max
+    }
+
+    #[test]
+    fn test_has_identity_authorization_context() {
+        let empty: Vec<String> = vec![];
+        let groups = vec!["RustFS.ConsoleAdmin".to_string()];
+        let policies = vec!["consoleAdmin".to_string()];
+
+        assert!(!has_identity_authorization_context(&empty, &empty));
+        assert!(has_identity_authorization_context(&policies, &empty));
+        assert!(has_identity_authorization_context(&empty, &groups));
+    }
+
+    #[test]
+    fn test_extract_string_list_claim_supports_array_and_csv() {
+        let mut claims = HashMap::new();
+        claims.insert("roles".to_string(), serde_json::json!(["admin", "reader"]));
+        claims.insert("groups".to_string(), serde_json::json!("devs, ops"));
+
+        assert_eq!(extract_string_list_claim(&claims, "roles"), vec!["admin", "reader"]);
+        assert_eq!(extract_string_list_claim(&claims, "groups"), vec!["devs", "ops"]);
+    }
+
+    #[test]
+    fn test_extract_string_list_claim_prefers_exact_match() {
+        let mut claims = HashMap::new();
+        claims.insert("Roles".to_string(), serde_json::json!(["mixed-case"]));
+        claims.insert("roles".to_string(), serde_json::json!(["exact-match"]));
+
+        assert_eq!(extract_string_list_claim(&claims, "roles"), vec!["exact-match"]);
+    }
+
+    #[test]
+    fn test_extract_string_list_claim_ambiguous_case_insensitive_match_returns_empty() {
+        let mut claims = HashMap::new();
+        claims.insert("Roles".to_string(), serde_json::json!(["mixed-case"]));
+        claims.insert("ROLES".to_string(), serde_json::json!(["upper-case"]));
+
+        assert!(extract_string_list_claim(&claims, "roles").is_empty());
+    }
+
+    #[test]
+    fn test_build_oidc_token_claims_includes_normalized_roles() {
+        let mut raw = HashMap::new();
+        raw.insert("Roles".to_string(), serde_json::json!("admin, reader"));
+        let claims = OidcClaims {
+            sub: "user-sub".to_string(),
+            raw,
+            ..Default::default()
+        };
+        let token_claims = build_oidc_token_claims(&claims, "default", &["devs".to_string()], Some("roles"));
+
+        assert_eq!(token_claims.get("roles"), Some(&serde_json::json!(["admin", "reader"])));
+    }
+
+    #[test]
+    fn test_configured_roles_claim_key_requires_explicit_config() {
+        assert_eq!(configured_roles_claim_key("default"), None);
+    }
+
+    #[test]
+    fn test_resolve_oidc_session_identity_prefers_username_over_email() {
+        let claims = OidcClaims {
+            username: "john".to_string(),
+            email: "john@example.com".to_string(),
+            sub: "sub-1".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_oidc_session_identity(&claims), "john");
+    }
+
+    #[test]
+    fn test_resolve_oidc_session_identity_falls_back_to_email_then_sub() {
+        let claims_with_email = OidcClaims {
+            email: "john@example.com".to_string(),
+            sub: "sub-1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_oidc_session_identity(&claims_with_email), "john@example.com");
+
+        let claims_with_sub = OidcClaims {
+            sub: "sub-1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_oidc_session_identity(&claims_with_sub), "sub-1");
+    }
+
+    #[test]
+    fn test_resolve_oidc_session_identity_uses_unknown_when_all_empty() {
+        assert_eq!(resolve_oidc_session_identity(&OidcClaims::default()), "oidc-user-unknown");
     }
 }

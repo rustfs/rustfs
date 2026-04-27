@@ -64,7 +64,7 @@ rustfs-utils = { workspace = true }
 rustfs-config = { workspace = true }
 
 # Async dependencies
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time","io-uring"] }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 

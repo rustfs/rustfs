@@ -19,6 +19,7 @@ use crate::{
     DataUsageInfo, SizeSummary, TierStats,
 };
 use futures::future::join_all;
+use metrics::counter;
 use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete};
@@ -49,6 +50,42 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+
+fn record_set_scan_failure(first_err: &mut Option<Error>, err: Error) {
+    if first_err.is_none() {
+        *first_err = Some(err);
+    }
+}
+
+fn finalize_nsscanner_result(results: &[DataUsageCache], first_err: Option<Error>) -> Result<()> {
+    if results.iter().any(|result| result.info.last_update.is_some()) {
+        return Ok(());
+    }
+
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+async fn persist_and_publish_cache_snapshot<S: StorageAPI>(
+    store: Arc<S>,
+    updates: &mpsc::Sender<DataUsageCache>,
+    cache_snapshot: DataUsageCache,
+) -> Option<SystemTime> {
+    let last_update = cache_snapshot.info.last_update;
+
+    if let Err(e) = cache_snapshot.save(store, DATA_USAGE_CACHE_NAME).await {
+        error!("Failed to save data usage cache: {}", e);
+    }
+
+    if let Err(e) = updates.send(cache_snapshot).await {
+        error!("Failed to send data usage cache: {}", e);
+    }
+
+    last_update
+}
 
 #[async_trait::async_trait]
 pub trait ScannerIO: Send + Sync + Debug + 'static {
@@ -125,6 +162,8 @@ impl ScannerIO for ECStore {
                 let results_index_clone = results_index as usize;
                 // Clone the Arc to move it into the spawned task
                 let set_clone: Arc<SetDisks> = Arc::clone(set);
+                let pool_label = set.pool_index.to_string();
+                let set_label = set.set_index.to_string();
 
                 let child_token_clone = child_token.clone();
                 let want_cycle_clone = want_cycle;
@@ -150,9 +189,21 @@ impl ScannerIO for ECStore {
                         .nsscanner_cache(child_token_clone.clone(), all_buckets_clone, tx, want_cycle_clone, scan_mode_clone)
                         .await
                     {
-                        error!("Failed to scan set: {e}");
-                        let _ = first_err_mutex_clone.lock().await.insert(e);
-                        child_token_clone.cancel();
+                        counter!(
+                            "rustfs_scanner_set_failure_total",
+                            "pool" => pool_label.clone(),
+                            "set" => set_label.clone(),
+                            "stage" => "nsscanner_cache".to_string()
+                        )
+                        .increment(1);
+                        error!(
+                            pool = %pool_label,
+                            set = %set_label,
+                            error = %e,
+                            "Failed to scan set; continuing scanner cycle"
+                        );
+                        let mut first_err = first_err_mutex_clone.lock().await;
+                        record_set_scan_failure(&mut first_err, e);
                     }
                 });
                 wait_futs.push(scanner_fut);
@@ -162,6 +213,7 @@ impl ScannerIO for ECStore {
         let (update_tx, mut update_rx) = tokio::sync::oneshot::channel::<()>();
 
         let all_buckets_clone = all_buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>();
+        let results_mutex_for_updates = results_mutex.clone();
         tokio::spawn(async move {
             let mut last_update = SystemTime::UNIX_EPOCH;
             let mut has_sent_once = false;
@@ -177,7 +229,7 @@ impl ScannerIO for ECStore {
                             break;
                         }
 
-                        let results = results_mutex.lock().await;
+                        let results = results_mutex_for_updates.lock().await;
                         let mut all_merged = DataUsageCache::default();
                         for result in results.iter() {
                             if result.info.last_update.is_none() {
@@ -196,7 +248,7 @@ impl ScannerIO for ECStore {
                         break;
                     }
                     _ = ticker.tick() => {
-                        let results = results_mutex.lock().await;
+                        let results = results_mutex_for_updates.lock().await;
                         let mut all_merged = DataUsageCache::default();
                         for result in results.iter() {
                             if result.info.last_update.is_none() {
@@ -223,7 +275,9 @@ impl ScannerIO for ECStore {
 
         let _ = update_tx.send(());
 
-        Ok(())
+        let first_err = first_err_mutex.lock().await.take();
+        let results = results_mutex.lock().await.clone();
+        finalize_nsscanner_result(&results, first_err)
     }
 }
 
@@ -303,22 +357,20 @@ impl ScannerIOCache for SetDisks {
                         break;
                     }
                     _ = ticker.tick() => {
+                        let cache_snapshot = {
+                            let cache = cache_mutex_clone.lock().await;
+                            if cache.info.last_update == last_update {
+                                None
+                            } else {
+                                Some(cache.clone())
+                            }
+                        };
 
-                       let cache = cache_mutex_clone.lock().await;
-                       if cache.info.last_update == last_update {
-                        continue;
-                       }
-
-                       if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
-                           error!("Failed to save data usage cache: {}", e);
-                       }
-
-                       if let Err(e) = updates.send(cache.clone()).await {
-                           error!("Failed to send data usage cache: {}", e);
-
-                       }
-
-                       last_update = cache.info.last_update;
+                        let Some(cache_snapshot) = cache_snapshot else {
+                            continue;
+                        };
+                        last_update =
+                            persist_and_publish_cache_snapshot(store_clone.clone(), &updates, cache_snapshot).await;
                     }
                     res =  bucket_result_rx.recv() => {
                         if let Some(result) = res {
@@ -327,18 +379,13 @@ impl ScannerIOCache for SetDisks {
                             cache.info.last_update = Some(SystemTime::now());
 
                         } else {
-                            let mut cache = cache_mutex_clone.lock().await;
-                            cache.info.next_cycle =want_cycle;
-                            cache.info.last_update = Some(SystemTime::now());
-
-                            if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
-                                error!("Failed to save data usage cache: {}", e);
-                            }
-
-                            if let Err(e) = updates.send(cache.clone()).await {
-                                error!("Failed to send data usage cache: {}", e);
-
-                            }
+                            let cache_snapshot = {
+                                let mut cache = cache_mutex_clone.lock().await;
+                                cache.info.next_cycle = want_cycle;
+                                cache.info.last_update = Some(SystemTime::now());
+                                cache.clone()
+                            };
+                            let _ = persist_and_publish_cache_snapshot(store_clone.clone(), &updates, cache_snapshot).await;
 
                             return;
                         }
@@ -561,13 +608,7 @@ impl ScannerIODisk for Disk {
             Err(_) => None,
         };
 
-        let Some(ecstore) = new_object_layer_fn() else {
-            error!("ECStore not available");
-            return Err(StorageError::other("ECStore not available".to_string()));
-        };
-
-        item.apply_actions(ecstore, object_infos, lock_config, &mut size_summary)
-            .await;
+        item.apply_actions(object_infos, lock_config, &mut size_summary).await;
 
         if !free_version_infos.is_empty() {
             let mut expiry_state = GLOBAL_ExpiryState.write().await;
@@ -599,7 +640,7 @@ impl ScannerIODisk for Disk {
 
         let (lifecycle_config, _) = get_lifecycle_config(&cache.info.name)
             .await
-            .unwrap_or((BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
+            .unwrap_or_else(|_| (BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
 
         if lifecycle_config.has_active_rules("") {
             cache.info.lifecycle = Some(Arc::new(lifecycle_config));
@@ -666,5 +707,38 @@ impl ScannerIODisk for Disk {
                 Err(StorageError::other(format!("Failed to scan data folder: {e}")))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_set_scan_failure_preserves_first_error() {
+        let mut first = None;
+        record_set_scan_failure(&mut first, Error::other("first"));
+        record_set_scan_failure(&mut first, Error::other("second"));
+
+        let first = first.expect("first error should be recorded");
+        assert!(first.to_string().contains("first"));
+    }
+
+    #[test]
+    fn finalize_nsscanner_result_returns_ok_when_any_set_succeeds() {
+        let mut results = vec![DataUsageCache::default(), DataUsageCache::default()];
+        results[1].info.last_update = Some(SystemTime::now());
+
+        let result = finalize_nsscanner_result(&results, Some(Error::other("set failed")));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn finalize_nsscanner_result_returns_first_error_when_all_sets_fail() {
+        let results = vec![DataUsageCache::default(), DataUsageCache::default()];
+
+        let err = finalize_nsscanner_result(&results, Some(Error::other("set failed")))
+            .expect_err("all failed sets should bubble first error");
+        assert!(err.to_string().contains("set failed"));
     }
 }

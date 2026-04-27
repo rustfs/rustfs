@@ -18,11 +18,15 @@ use crate::heal::{
     storage::HealStorageAPI,
 };
 use crate::{Error, Result};
-use futures::future::join_all;
+use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
+use metrics::gauge;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::disk::DiskStore;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{error, info, warn};
 
 /// Erasure Set Healer
@@ -34,6 +38,29 @@ pub struct ErasureSetHealer {
 }
 
 impl ErasureSetHealer {
+    fn page_parallel_enabled() -> bool {
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE,
+            rustfs_config::DEFAULT_HEAL_PAGE_PARALLEL_ENABLE,
+        )
+    }
+
+    fn heal_page_object_concurrency() -> usize {
+        rustfs_utils::get_env_usize(
+            rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY,
+            rustfs_config::DEFAULT_HEAL_PAGE_OBJECT_CONCURRENCY,
+        )
+        .max(1)
+    }
+
+    fn effective_heal_page_object_concurrency() -> usize {
+        if Self::page_parallel_enabled() {
+            Self::heal_page_object_concurrency()
+        } else {
+            1
+        }
+    }
+
     pub fn new(
         storage: Arc<dyn HealStorageAPI>,
         progress: Arc<RwLock<HealProgress>>,
@@ -61,7 +88,7 @@ impl ErasureSetHealer {
 
         // 3. execute heal with resume
         let result = self
-            .execute_heal_with_resume(buckets, &resume_manager, &checkpoint_manager)
+            .execute_heal_with_resume(buckets, set_disk_id, &resume_manager, &checkpoint_manager)
             .await;
 
         // 4. cleanup resume state
@@ -144,6 +171,7 @@ impl ErasureSetHealer {
     async fn execute_heal_with_resume(
         &self,
         buckets: &[String],
+        set_disk_id: &str,
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
@@ -182,6 +210,7 @@ impl ErasureSetHealer {
             let bucket_result = self
                 .heal_bucket_with_resume(
                     bucket,
+                    set_disk_id,
                     bucket_idx,
                     &mut current_object_index,
                     &mut processed_objects,
@@ -232,16 +261,17 @@ impl ErasureSetHealer {
 
     /// heal single bucket with resume
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, _skipped_objects, resume_manager, checkpoint_manager), fields(bucket = %bucket, bucket_index = bucket_index))]
+    #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, skipped_objects, resume_manager, checkpoint_manager), fields(bucket = %bucket, bucket_index = bucket_index))]
     async fn heal_bucket_with_resume(
         &self,
         bucket: &str,
+        set_disk_id: &str,
         bucket_index: usize,
         current_object_index: &mut usize,
         processed_objects: &mut u64,
         successful_objects: &mut u64,
         failed_objects: &mut u64,
-        _skipped_objects: &mut u64,
+        skipped_objects: &mut u64,
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
@@ -259,6 +289,8 @@ impl ErasureSetHealer {
         // 2. process objects with pagination to avoid loading all objects into memory
         let mut continuation_token: Option<String> = None;
         let mut global_obj_idx = 0usize;
+        let page_concurrency_limit = Self::effective_heal_page_object_concurrency();
+        let in_flight = Arc::new(AtomicUsize::new(0));
 
         loop {
             // Get one page of objects
@@ -266,69 +298,139 @@ impl ErasureSetHealer {
                 .storage
                 .list_objects_for_heal_page(bucket, "", continuation_token.as_deref())
                 .await?;
+            let checkpoint = checkpoint_manager.get_checkpoint().await;
+            let page_resume_index = *current_object_index;
+            let semaphore = Arc::new(Semaphore::new(page_concurrency_limit));
+            let mut page_tasks = FuturesUnordered::new();
 
-            // Process objects in this page
             for object in objects {
-                // Skip objects before the checkpoint
-                if global_obj_idx < *current_object_index {
-                    global_obj_idx += 1;
+                let object_idx = global_obj_idx;
+                global_obj_idx += 1;
+
+                if object_idx < *current_object_index {
                     continue;
                 }
 
-                // check if already processed
-                if checkpoint_manager.get_checkpoint().await.processed_objects.contains(&object) {
-                    global_obj_idx += 1;
+                if checkpoint.processed_objects.contains(&object) || checkpoint.skipped_objects.contains(&object) {
                     continue;
                 }
 
-                // update current object
                 resume_manager
                     .set_current_item(Some(bucket.to_string()), Some(object.clone()))
                     .await?;
 
-                // Check if object still exists before attempting heal
-                let object_exists = match self.storage.object_exists(bucket, &object).await {
-                    Ok(exists) => exists,
-                    Err(e) => {
-                        warn!("Failed to check existence of {}/{}: {}, marking as failed", bucket, object, e);
-                        *failed_objects += 1;
-                        checkpoint_manager.add_failed_object(object.clone()).await?;
-                        global_obj_idx += 1;
-                        *current_object_index = global_obj_idx;
-                        continue;
-                    }
-                };
+                let storage = self.storage.clone();
+                let bucket_name = bucket.to_string();
+                let object_name = object.clone();
+                let cancel_token = self.cancel_token.clone();
+                let in_flight = in_flight.clone();
+                let set_label = set_disk_id.to_string();
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| Error::other(format!("Failed to acquire page concurrency permit: {e}")))?;
 
-                if !object_exists {
-                    info!(
-                        target: "rustfs:heal:heal_bucket_with_resume" ,"Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
-                        bucket, object
-                    );
-                    checkpoint_manager.add_processed_object(object.clone()).await?;
-                    *successful_objects += 1; // Treat as successful - object is gone as intended
-                    global_obj_idx += 1;
-                    *current_object_index = global_obj_idx;
-                    continue;
-                }
+                let current_in_flight = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                gauge!(
+                    "rustfs_heal_page_concurrency_current",
+                    "set" => set_label.clone()
+                )
+                .set(current_in_flight as f64);
 
-                // heal object
-                let heal_opts = HealOpts {
-                    scan_mode: HealScanMode::Normal,
-                    remove: true,
-                    recreate: true, // Keep recreate enabled for legitimate heal scenarios
-                    ..Default::default()
-                };
+                page_tasks.push(async move {
+                    let _permit = permit;
+                    let result = if cancel_token.is_cancelled() {
+                        Err(Error::TaskCancelled)
+                    } else {
+                        let object_exists = match storage.object_exists(&bucket_name, &object_name).await {
+                            Ok(exists) => exists,
+                            Err(err @ Error::TransientSkip { .. }) => {
+                                let current = in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
+                                gauge!(
+                                    "rustfs_heal_page_concurrency_current",
+                                    "set" => set_label.clone()
+                                )
+                                .set(current as f64);
+                                return (object_name, Err(err));
+                            }
+                            Err(err) => {
+                                let object_name_for_error = object_name.clone();
+                                let current = in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
+                                gauge!(
+                                    "rustfs_heal_page_concurrency_current",
+                                    "set" => set_label.clone()
+                                )
+                                .set(current as f64);
+                                return (
+                                    object_name,
+                                    Err(Error::other(format!(
+                                        "Failed to check existence of {}/{}: {}",
+                                        bucket_name, object_name_for_error, err
+                                    ))),
+                                );
+                            }
+                        };
 
-                match self.storage.heal_object(bucket, &object, None, &heal_opts).await {
-                    Ok((_result, None)) => {
+                        if !object_exists {
+                            Ok(false)
+                        } else {
+                            let heal_opts = HealOpts {
+                                scan_mode: HealScanMode::Normal,
+                                remove: true,
+                                recreate: true,
+                                ..Default::default()
+                            };
+                            match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
+                                Ok((_result, None)) => Ok(true),
+                                Ok((_, Some(err))) => Err(Error::other(err)),
+                                Err(err) => Err(err),
+                            }
+                        }
+                    };
+
+                    let current = in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
+                    gauge!(
+                        "rustfs_heal_page_concurrency_current",
+                        "set" => set_label.clone()
+                    )
+                    .set(current as f64);
+
+                    (object_name, result)
+                });
+            }
+
+            let mut completed_in_page = 0usize;
+            while let Some((object, result)) = page_tasks.next().await {
+                match result {
+                    Ok(true) => {
                         *successful_objects += 1;
                         checkpoint_manager.add_processed_object(object.clone()).await?;
                         info!("Successfully healed object {}/{}", bucket, object);
                     }
-                    Ok((_, Some(err))) => {
-                        *failed_objects += 1;
-                        checkpoint_manager.add_failed_object(object.clone()).await?;
-                        warn!("Failed to heal object {}/{}: {}", bucket, object, err);
+                    Ok(false) => {
+                        checkpoint_manager.add_processed_object(object.clone()).await?;
+                        *successful_objects += 1;
+                        info!(
+                            target: "rustfs:heal:heal_bucket_with_resume" ,"Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
+                            bucket, object
+                        );
+                    }
+                    Err(Error::TaskCancelled) => {
+                        gauge!(
+                            "rustfs_heal_page_concurrency_current",
+                            "set" => set_disk_id.to_string()
+                        )
+                        .set(0.0);
+                        return Err(Error::TaskCancelled);
+                    }
+                    Err(Error::TransientSkip { message }) => {
+                        *skipped_objects += 1;
+                        checkpoint_manager.add_skipped_object(object.clone()).await?;
+                        warn!(
+                            "Skipping heal for object {}/{} due to transient existence check error: {}",
+                            bucket, object, message
+                        );
                     }
                     Err(err) => {
                         *failed_objects += 1;
@@ -338,22 +440,22 @@ impl ErasureSetHealer {
                 }
 
                 *processed_objects += 1;
-                global_obj_idx += 1;
-                *current_object_index = global_obj_idx;
+                completed_in_page += 1;
 
-                // check cancel status
-                if self.cancel_token.is_cancelled() {
-                    info!("Heal task cancelled during object processing");
-                    return Err(Error::TaskCancelled);
-                }
-
-                // save checkpoint periodically
-                if global_obj_idx.is_multiple_of(100) {
-                    checkpoint_manager
-                        .update_position(bucket_index, *current_object_index)
-                        .await?;
+                if completed_in_page.is_multiple_of(100) {
+                    checkpoint_manager.update_position(bucket_index, page_resume_index).await?;
                 }
             }
+
+            *current_object_index = global_obj_idx;
+            checkpoint_manager
+                .update_position(bucket_index, *current_object_index)
+                .await?;
+            gauge!(
+                "rustfs_heal_page_concurrency_current",
+                "set" => set_disk_id.to_string()
+            )
+            .set(0.0);
 
             // Check if there are more pages
             if !is_truncated {
@@ -570,5 +672,36 @@ impl ErasureSetHealer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ErasureSetHealer;
+
+    #[test]
+    fn heal_page_object_concurrency_uses_default_when_env_is_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, || {
+            assert_eq!(
+                ErasureSetHealer::heal_page_object_concurrency(),
+                rustfs_config::DEFAULT_HEAL_PAGE_OBJECT_CONCURRENCY
+            );
+        });
+    }
+
+    #[test]
+    fn heal_page_object_concurrency_respects_env_override() {
+        temp_env::with_var(rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("11"), || {
+            assert_eq!(ErasureSetHealer::heal_page_object_concurrency(), 11);
+        });
+    }
+
+    #[test]
+    fn effective_heal_page_object_concurrency_disables_parallelism_when_flag_is_off() {
+        temp_env::with_var(rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("false"), || {
+            temp_env::with_var(rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("11"), || {
+                assert_eq!(ErasureSetHealer::effective_heal_page_object_concurrency(), 1);
+            });
+        });
     }
 }

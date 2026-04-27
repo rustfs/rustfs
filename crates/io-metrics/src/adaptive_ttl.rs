@@ -31,14 +31,14 @@ use std::time::{Duration, Instant};
 pub fn record_ttl_adjustment(_key: &str, base_ttl: u64, adjusted_ttl: u64) {
     use metrics::{counter, gauge};
 
-    counter!("rustfs.cache.ttl.adjustments").increment(1);
-    gauge!("rustfs.cache.ttl.base").set(base_ttl as f64);
-    gauge!("rustfs.cache.ttl.adjusted").set(adjusted_ttl as f64);
+    counter!("rustfs_cache_ttl_adjustments").increment(1);
+    gauge!("rustfs_cache_ttl_base").set(base_ttl as f64);
+    gauge!("rustfs_cache_ttl_adjusted").set(adjusted_ttl as f64);
 
     if adjusted_ttl > base_ttl {
-        counter!("rustfs.cache.ttl.extensions").increment(1);
+        counter!("rustfs_cache_ttl_extensions").increment(1);
     } else if adjusted_ttl < base_ttl {
-        counter!("rustfs.cache.ttl.reductions").increment(1);
+        counter!("rustfs_cache_ttl_reductions").increment(1);
     }
 }
 
@@ -46,7 +46,7 @@ pub fn record_ttl_adjustment(_key: &str, base_ttl: u64, adjusted_ttl: u64) {
 #[inline(always)]
 pub fn record_ttl_expiration() {
     use metrics::counter;
-    counter!("rustfs.cache.ttl.expirations").increment(1);
+    counter!("rustfs_cache_ttl_expirations").increment(1);
 }
 
 /// Record early eviction.
@@ -57,7 +57,7 @@ pub fn record_ttl_expiration() {
 #[inline(always)]
 pub fn record_early_eviction(reason: &str) {
     use metrics::counter;
-    counter!("rustfs.cache.evictions.early", "reason" => reason.to_string()).increment(1);
+    counter!("rustfs_cache_evictions_early", "reason" => reason.to_string()).increment(1);
 }
 
 /// Record access pattern change.
@@ -69,7 +69,7 @@ pub fn record_early_eviction(reason: &str) {
 #[inline(always)]
 pub fn record_access_pattern_change(from: &str, to: &str) {
     use metrics::counter;
-    counter!("rustfs.cache.access_pattern.changes", "from" => from.to_string(), "to" => to.to_string()).increment(1);
+    counter!("rustfs_cache_access_pattern_changes", "from" => from.to_string(), "to" => to.to_string()).increment(1);
 }
 
 /// Adaptive TTL statistics.
@@ -255,7 +255,7 @@ impl AccessTracker {
     /// Get keys sorted by access count (descending).
     pub fn top_keys(&self, n: usize) -> Vec<(&String, &AccessRecord)> {
         let mut entries: Vec<_> = self.records.iter().collect();
-        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.1.count));
         entries.into_iter().take(n).collect()
     }
 

@@ -13,85 +13,10 @@
 // limitations under the License.
 
 use super::*;
-use crate::store_api::ChunkNativePutData;
 
 impl SetDisks {
-    fn all_inline_bitrot_writers(writers: &[Option<crate::erasure_coding::BitrotWriterWrapper>]) -> bool {
-        writers.iter().all(|writer| {
-            writer
-                .as_ref()
-                .is_some_and(crate::erasure_coding::BitrotWriterWrapper::is_inline_buffer)
-        })
-    }
-
-    async fn write_chunk_native_put_data_inline(
-        data: &mut ChunkNativePutData,
-        erasure: Arc<erasure_coding::Erasure>,
-        writers: &mut [Option<crate::erasure_coding::BitrotWriterWrapper>],
-        write_quorum: usize,
-    ) -> std::io::Result<usize> {
-        let stream = data.take_stream()?;
-        let mut assembler = erasure_coding::encode::BlockAssembler::new(stream, erasure.block_size);
-        let encoder = erasure_coding::encode::ErasureChunkEncoder::new(erasure).await;
-        let mut writer_group = erasure_coding::encode::MultiWriter::new(writers, write_quorum);
-
-        loop {
-            let block = match assembler.next_block().await {
-                Ok(Some(block)) => block,
-                Ok(None) => break,
-                Err(err) => {
-                    data.restore_stream(assembler.into_inner());
-                    return Err(err);
-                }
-            };
-
-            let encoded = match encoder.encode_block(&block).await {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    data.restore_stream(assembler.into_inner());
-                    return Err(err);
-                }
-            };
-
-            if let Err(err) = writer_group.write_inline(&encoded) {
-                encoder.release(encoded).await;
-                data.restore_stream(assembler.into_inner());
-                return Err(err);
-            }
-
-            encoder.release(encoded).await;
-        }
-
-        let total_bytes = assembler.total_bytes();
-        let stream = assembler.into_inner();
-        if let Err(err) = writer_group.shutdown_inline() {
-            data.restore_stream(stream);
-            return Err(err);
-        }
-        data.restore_stream(stream);
-        Ok(total_bytes)
-    }
-
     pub(super) fn default_read_quorum(&self) -> usize {
         self.set_drive_count - self.default_parity_count
-    }
-
-    pub(super) async fn write_chunk_native_put_data(
-        data: &mut ChunkNativePutData,
-        erasure: Arc<erasure_coding::Erasure>,
-        writers: &mut [Option<crate::erasure_coding::BitrotWriterWrapper>],
-        write_quorum: usize,
-    ) -> std::io::Result<usize> {
-        if Self::all_inline_bitrot_writers(writers) {
-            return Self::write_chunk_native_put_data_inline(data, erasure, writers, write_quorum).await;
-        }
-
-        let stream = data.take_stream()?;
-        let (stream, written) = erasure_coding::encode::ErasureWritePipeline::new(erasure, write_quorum)
-            .run(stream, writers)
-            .await?;
-        data.restore_stream(stream);
-        Ok(written)
     }
 
     pub(super) fn default_write_quorum(&self) -> usize {
@@ -678,7 +603,9 @@ impl SetDisks {
                 if oi.delete_marker {
                     return None;
                 }
-                if should_prevent_write(&oi, http_preconditions.if_none_match, http_preconditions.if_match) {
+                let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
+                let if_match = http_preconditions.if_match_value().map(str::to_owned);
+                if should_prevent_write(&oi, if_none_match, if_match) {
                     return Some(StorageError::PreconditionFailed);
                 }
             }
@@ -689,7 +616,7 @@ impl SetDisks {
                 // When the object is not found,
                 // - if If-Match is set, we should return 404 NotFound
                 // - if If-None-Match is set, we should be able to proceed with the request
-                if http_preconditions.if_match.is_some() {
+                if http_preconditions.if_match_value().is_some() {
                     return Some(StorageError::ObjectNotFound(bucket.to_string(), object.to_string()));
                 }
             }
@@ -700,62 +627,5 @@ impl SetDisks {
         }
 
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
-    use crate::store_api::ChunkNativePutData;
-
-    #[tokio::test]
-    async fn write_chunk_native_put_data_restores_reader_state_after_encoding() {
-        let payload = b"chunk-native-put-payload".repeat(8);
-        let erasure = Arc::new(erasure_coding::Erasure::new(2, 1, 8));
-        let mut reader = ChunkNativePutData::from_vec(payload.clone());
-        let mut writers: Vec<Option<BitrotWriterWrapper>> = (0..erasure.total_shard_count())
-            .map(|_| {
-                Some(BitrotWriterWrapper::new(
-                    CustomWriter::new_inline_buffer(),
-                    erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256S,
-                ))
-            })
-            .collect();
-
-        let written = SetDisks::write_chunk_native_put_data(&mut reader, erasure.clone(), &mut writers, 2)
-            .await
-            .unwrap();
-
-        assert_eq!(written, payload.len());
-        assert_eq!(reader.size(), payload.len() as i64);
-        assert_eq!(reader.actual_size(), payload.len() as i64);
-        assert!(
-            reader.resolve_etag().is_some(),
-            "restored reader should preserve computed etag state after chunk-native encode"
-        );
-
-        let inline_lengths: Vec<usize> = writers
-            .into_iter()
-            .map(|writer| writer.expect("writer").into_inline_data().expect("inline data").len())
-            .collect();
-        assert!(inline_lengths.iter().all(|len| *len > 0));
-    }
-
-    #[tokio::test]
-    async fn write_chunk_native_put_data_detects_inline_writer_set() {
-        let erasure = Arc::new(erasure_coding::Erasure::new(2, 1, 8));
-        let writers: Vec<Option<BitrotWriterWrapper>> = (0..erasure.total_shard_count())
-            .map(|_| {
-                Some(BitrotWriterWrapper::new(
-                    CustomWriter::new_inline_buffer(),
-                    erasure.shard_size(),
-                    HashAlgorithm::HighwayHash256S,
-                ))
-            })
-            .collect();
-
-        assert!(SetDisks::all_inline_bitrot_writers(&writers));
     }
 }

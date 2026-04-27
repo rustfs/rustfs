@@ -51,7 +51,7 @@ impl InternodeMetrics {
             return;
         }
         self.sent_bytes_total.fetch_add(bytes, Ordering::Relaxed);
-        counter!("rustfs.internode.sent.bytes.total").increment(bytes);
+        counter!("rustfs_system_network_internode_sent_bytes_total").increment(bytes);
     }
 
     pub fn record_recv_bytes(&self, bytes: usize) {
@@ -60,22 +60,22 @@ impl InternodeMetrics {
             return;
         }
         self.recv_bytes_total.fetch_add(bytes, Ordering::Relaxed);
-        counter!("rustfs.internode.recv.bytes.total").increment(bytes);
+        counter!("rustfs_system_network_internode_recv_bytes_total").increment(bytes);
     }
 
     pub fn record_outgoing_request(&self) {
         self.outgoing_requests_total.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.internode.requests.outgoing.total").increment(1);
+        counter!("rustfs_system_network_internode_requests_outgoing_total").increment(1);
     }
 
     pub fn record_incoming_request(&self) {
         self.incoming_requests_total.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.internode.requests.incoming.total").increment(1);
+        counter!("rustfs_system_network_internode_requests_incoming_total").increment(1);
     }
 
     pub fn record_error(&self) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs.internode.errors.total").increment(1);
+        counter!("rustfs_system_network_internode_errors_total").increment(1);
     }
 
     pub fn record_dial_result(&self, duration: Duration, success: bool) {
@@ -83,11 +83,11 @@ impl InternodeMetrics {
         self.dial_total_time_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
         let samples = self.dial_samples_total.fetch_add(1, Ordering::Relaxed) + 1;
         let total = self.dial_total_time_nanos.load(Ordering::Relaxed);
-        gauge!("rustfs.internode.dial.avg_time.nanos").set(total as f64 / samples as f64);
+        gauge!("rustfs_system_network_internode_dial_avg_time_nanos").set(total as f64 / samples as f64);
 
         if !success {
             self.dial_errors_total.fetch_add(1, Ordering::Relaxed);
-            counter!("rustfs.internode.dial.errors.total").increment(1);
+            counter!("rustfs_system_network_internode_dial_errors_total").increment(1);
         }
 
         let now_ms = SystemTime::now()
@@ -101,11 +101,7 @@ impl InternodeMetrics {
     pub fn snapshot(&self) -> InternodeMetricsSnapshot {
         let dial_samples_total = self.dial_samples_total.load(Ordering::Relaxed);
         let dial_total_time_nanos = self.dial_total_time_nanos.load(Ordering::Relaxed);
-        let dial_avg_time_nanos = if dial_samples_total == 0 {
-            0
-        } else {
-            dial_total_time_nanos / dial_samples_total
-        };
+        let dial_avg_time_nanos = dial_total_time_nanos.checked_div(dial_samples_total).unwrap_or(0);
 
         InternodeMetricsSnapshot {
             sent_bytes_total: self.sent_bytes_total.load(Ordering::Relaxed),

@@ -25,9 +25,13 @@ pub use constants::compress::*;
 #[cfg(feature = "constants")]
 pub use constants::console::*;
 #[cfg(feature = "constants")]
+pub use constants::drive::*;
+#[cfg(feature = "constants")]
 pub use constants::env::*;
 #[cfg(feature = "constants")]
 pub use constants::heal::*;
+#[cfg(feature = "constants")]
+pub use constants::health::*;
 #[cfg(feature = "constants")]
 pub use constants::object::*;
 #[cfg(feature = "constants")]

@@ -230,12 +230,12 @@ impl FileMeta {
                                 }
                             }
 
-                            if let Some(checksum) = fi.checksum.as_ref() {
-                                insert_bytes(&mut obj.meta_sys, SUFFIX_CRC, checksum.to_vec());
-                            }
-
                             if let Some(mod_time) = fi.mod_time {
                                 obj.mod_time = Some(mod_time);
+                            }
+
+                            if let Some(content_hash) = fi.checksum.as_ref() {
+                                insert_bytes(&mut obj.meta_sys, SUFFIX_CRC, content_hash.to_vec());
                             }
                         }
 
@@ -382,6 +382,11 @@ impl FileMeta {
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
         let vid = Some(fi.version_id.unwrap_or(Uuid::nil()));
+        let target_is_delete_marker = self
+            .versions
+            .iter()
+            .find(|ver| ver.header.version_id == vid)
+            .is_some_and(|ver| ver.header.version_type == VersionType::Delete);
 
         let mut ventry = FileMetaVersion::default();
         if fi.deleted {
@@ -414,6 +419,10 @@ impl FileMeta {
             if !fi.version_purge_status().is_empty() && fi.version_purge_status() != VersionPurgeStatusType::Complete {
                 update_version = true;
             }
+        }
+
+        if target_is_delete_marker && !fi.deleted && !fi.version_purge_status().is_empty() {
+            update_version = false;
         }
 
         if fi.deleted {
@@ -1488,12 +1497,12 @@ mod test {
         }
 
         // Verify stable ordering
-        let original_order: Vec<_> = fm.versions.iter().map(|v| v.header.version_id).collect();
+        let original_order = fm.versions.iter().map(|v| v.header.version_id).len();
         fm.sort_by_mod_time();
-        let sorted_order: Vec<_> = fm.versions.iter().map(|v| v.header.version_id).collect();
+        let sorted_order = fm.versions.iter().map(|v| v.header.version_id).len();
 
         // Sorting should remain stable for identical timestamps
-        assert_eq!(original_order.len(), sorted_order.len());
+        assert_eq!(original_order, sorted_order);
     }
 
     #[test]
@@ -1660,6 +1669,45 @@ mod test {
     }
 
     #[test]
+    fn delete_version_removes_delete_marker_during_version_purge_replication() {
+        let version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(FileMetaVersion {
+            version_type: VersionType::Delete,
+            legacy_object: None,
+            object: None,
+            delete_marker: Some(MetaDeleteMarker {
+                version_id: Some(version_id),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                meta_sys: HashMap::new(),
+            }),
+            write_version: 1,
+            uses_legacy_checksum: false,
+        })
+        .unwrap();
+
+        let fi = FileInfo {
+            deleted: false,
+            mark_deleted: false,
+            version_id: Some(version_id),
+            replication_state_internal: Some(ReplicationState {
+                version_purge_status_internal: Some("target=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("target=PENDING;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = fm.delete_version(&fi).unwrap();
+
+        assert!(result.is_none());
+        assert!(
+            fm.versions.is_empty(),
+            "delete-marker version purge should remove the local marker instead of rewriting purge metadata onto it"
+        );
+    }
+
+    #[test]
     fn test_data_integrity_validation() {
         // Test data integrity checks
         let mut fm = FileMeta::new();
@@ -1723,6 +1771,30 @@ mod test {
 
         let after = fm.data.find(data_key_for_version(Some(Uuid::nil())).as_str()).unwrap();
         assert_eq!(after, Some(Bytes::from_static(b"inline").to_vec()));
+    }
+
+    #[test]
+    fn test_update_object_version_persists_checksum_metadata() {
+        let mut fm = FileMeta::new();
+        let version_id = Some(Uuid::new_v4());
+
+        let mut fi = crate::fileinfo::FileInfo::new("test", 2, 1);
+        fi.version_id = version_id;
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fm.add_version(fi).unwrap();
+
+        let checksum = Bytes::from_static(b"resolved-checksum");
+        let mut update = crate::fileinfo::FileInfo::new("test", 2, 1);
+        update.version_id = version_id;
+        update.metadata.insert("x-amz-meta-owner".to_string(), "alice".to_string());
+        update.checksum = Some(checksum.clone());
+
+        fm.update_object_version(update).unwrap();
+
+        let (_, version) = fm.find_version(version_id).unwrap();
+        let stored = version.into_fileinfo("bucket", "test", true);
+        assert_eq!(stored.metadata.get("x-amz-meta-owner"), Some(&"alice".to_string()));
+        assert_eq!(stored.checksum, Some(checksum));
     }
 
     #[test]
@@ -1962,6 +2034,7 @@ async fn test_read_xl_meta_no_data() {
     let mut file = File::create(&filepath).await.unwrap();
     // Write string data
     file.write_all(&buff).await.unwrap();
+    file.flush().await.unwrap();
 
     let mut f = File::open(&filepath).await.unwrap();
 

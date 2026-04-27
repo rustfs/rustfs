@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::compress_index::{Index, TryGetIndex};
-use crate::{BlockReadable, BoxReadBlockFuture, Reader};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use pin_project_lite::pin_project;
@@ -60,69 +59,6 @@ where
     }
 }
 
-fn encrypt_segment_bytes(cipher: &Aes256Gcm, nonce_bytes: &[u8; 12], plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
-    let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
-    let plaintext_len = plaintext.len();
-    let crc = {
-        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
-        hasher.update(plaintext);
-        hasher.finalize() as u32
-    };
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
-        .map_err(|e| Error::other(format!("encrypt error: {e}")))?;
-    let int_len = put_uvarint_len(plaintext_len as u64);
-    let clen = int_len + ciphertext.len() + 4;
-    let mut header = [0u8; 8];
-    header[0] = 0x00;
-    header[1] = (clen & 0xFF) as u8;
-    header[2] = ((clen >> 8) & 0xFF) as u8;
-    header[3] = ((clen >> 16) & 0xFF) as u8;
-    header[4] = (crc & 0xFF) as u8;
-    header[5] = ((crc >> 8) & 0xFF) as u8;
-    header[6] = ((crc >> 16) & 0xFF) as u8;
-    header[7] = ((crc >> 24) & 0xFF) as u8;
-    debug!(
-        "encrypt block header typ=0 len={} header={:?} plaintext_len={} ciphertext_len={}",
-        clen,
-        header,
-        plaintext_len,
-        ciphertext.len()
-    );
-    let mut out = Vec::with_capacity(8 + int_len + ciphertext.len());
-    out.extend_from_slice(&header);
-    let mut plaintext_len_buf = vec![0u8; int_len];
-    put_uvarint(&mut plaintext_len_buf, plaintext_len as u64);
-    out.extend_from_slice(&plaintext_len_buf);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
-}
-
-impl<R> EncryptReader<R>
-where
-    R: Reader,
-{
-    fn copy_buffered(&mut self, buf: &mut [u8]) -> usize {
-        if self.buffer_pos >= self.buffer.len() || buf.is_empty() {
-            return 0;
-        }
-
-        let to_copy = buf.len().min(self.buffer.len() - self.buffer_pos);
-        buf[..to_copy].copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + to_copy]);
-        self.buffer_pos += to_copy;
-        if self.buffer_pos == self.buffer.len() {
-            self.buffer.clear();
-            self.buffer_pos = 0;
-        }
-        to_copy
-    }
-
-    fn encrypt_segment(&self, plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
-        let nonce = derive_block_nonce(&self.base_nonce, self.block_index);
-        encrypt_segment_bytes(&self.cipher, &nonce, plaintext)
-    }
-}
-
 impl<R> AsyncRead for EncryptReader<R>
 where
     R: AsyncRead + Unpin + Send + Sync,
@@ -161,8 +97,49 @@ where
                     *this.buffer_pos += to_copy;
                     Poll::Ready(Ok(()))
                 } else {
+                    // Encrypt the chunk
                     let block_nonce = derive_block_nonce(this.base_nonce, *this.block_index);
-                    *this.buffer = encrypt_segment_bytes(this.cipher, &block_nonce, &this.read_buffer[..n])?;
+                    let nonce = Nonce::try_from(block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+                    let plaintext = &this.read_buffer[..n];
+                    let plaintext_len = plaintext.len();
+                    let crc = {
+                        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+                        hasher.update(plaintext);
+                        hasher.finalize() as u32
+                    };
+                    let ciphertext = this
+                        .cipher
+                        .encrypt(&nonce, plaintext)
+                        .map_err(|e| Error::other(format!("encrypt error: {e}")))?;
+                    let int_len = put_uvarint_len(plaintext_len as u64);
+                    let clen = int_len + ciphertext.len() + 4;
+                    // Header: 8 bytes
+                    // 0: type (0 = encrypted, 0xFF = end)
+                    // 1-3: length (little endian u24, ciphertext length)
+                    // 4-7: CRC32 of plaintext (little endian u32)
+                    let mut header = [0u8; 8];
+                    header[0] = 0x00; // 0 = encrypted
+                    header[1] = (clen & 0xFF) as u8;
+                    header[2] = ((clen >> 8) & 0xFF) as u8;
+                    header[3] = ((clen >> 16) & 0xFF) as u8;
+                    header[4] = (crc & 0xFF) as u8;
+                    header[5] = ((crc >> 8) & 0xFF) as u8;
+                    header[6] = ((crc >> 16) & 0xFF) as u8;
+                    header[7] = ((crc >> 24) & 0xFF) as u8;
+                    debug!(
+                        "encrypt block header typ=0 len={} header={:?} plaintext_len={} ciphertext_len={}",
+                        clen,
+                        header,
+                        plaintext_len,
+                        ciphertext.len()
+                    );
+                    let mut out = Vec::with_capacity(8 + int_len + ciphertext.len());
+                    out.extend_from_slice(&header);
+                    let mut plaintext_len_buf = [0u8; 10];
+                    let encoded_len = put_uvarint(&mut plaintext_len_buf, plaintext_len as u64);
+                    out.extend_from_slice(&plaintext_len_buf[..encoded_len]);
+                    out.extend_from_slice(&ciphertext);
+                    *this.buffer = out;
                     *this.buffer_pos = 0;
                     *this.block_index += 1;
                     let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
@@ -187,50 +164,6 @@ where
     }
 }
 
-impl<R> BlockReadable for EncryptReader<R>
-where
-    R: Reader,
-{
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(async move {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-
-            let mut written = self.copy_buffered(buf);
-            while written < buf.len() {
-                if self.finished {
-                    break;
-                }
-
-                let mut plaintext = vec![0u8; 8 * 1024];
-                let n = match self.inner.read_block(&mut plaintext).await {
-                    Ok(n) => n,
-                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => 0,
-                    Err(err) => return Err(err),
-                };
-                if n == 0 {
-                    self.buffer = [0xFF, 0, 0, 0, 0, 0, 0, 0].to_vec();
-                    self.buffer_pos = 0;
-                    self.finished = true;
-                } else {
-                    self.buffer = self.encrypt_segment(&plaintext[..n])?;
-                    self.buffer_pos = 0;
-                }
-
-                let copied = self.copy_buffered(&mut buf[written..]);
-                written += copied;
-
-                if copied == 0 && self.finished {
-                    break;
-                }
-            }
-
-            Ok(written)
-        })
-    }
-}
-
 pin_project! {
     /// A reader wrapper that decrypts data on the fly using AES-256-GCM.
     /// This is a demonstration. For production, use a secure and audited crypto library.
@@ -241,6 +174,8 @@ pin_project! {
         base_nonce: [u8; 12], // Base nonce recorded in object metadata
         current_nonce_base: [u8; 12], // Active base nonce for the current encrypted segment
         multipart_mode: bool,
+        multipart_parts: Vec<usize>,
+        current_part_index: usize,
         current_part: usize,
         block_index: usize,
         buffer: Vec<u8>,
@@ -267,6 +202,8 @@ where
             base_nonce: nonce,
             current_nonce_base: nonce,
             multipart_mode: false,
+            multipart_parts: Vec::new(),
+            current_part_index: 0,
             current_part: 0,
             block_index: 0,
             buffer: Vec::new(),
@@ -281,8 +218,8 @@ where
         }
     }
 
-    pub fn new_multipart(inner: R, key: [u8; 32], base_nonce: [u8; 12]) -> Self {
-        let first_part = 1;
+    pub fn new_multipart(inner: R, key: [u8; 32], base_nonce: [u8; 12], multipart_parts: Vec<usize>) -> Self {
+        let first_part = multipart_parts.first().copied().unwrap_or(1);
         let initial_nonce = derive_part_nonce(&base_nonce, first_part);
 
         debug!("decrypt_reader: initialized multipart mode");
@@ -293,6 +230,8 @@ where
             base_nonce,
             current_nonce_base: initial_nonce,
             multipart_mode: true,
+            multipart_parts,
+            current_part_index: 0,
             current_part: first_part,
             block_index: 0,
             buffer: Vec::new(),
@@ -332,90 +271,94 @@ where
                 return Poll::Ready(Ok(()));
             }
 
-            // Read header (8 bytes)
-            while !*this.header_done && *this.header_read < 8 {
-                let mut temp = [0u8; 8];
-                let mut temp_buf = ReadBuf::new(&mut temp[0..8 - *this.header_read]);
-                match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {
-                        let n = temp_buf.filled().len();
-                        if n == 0 {
-                            if *this.header_read == 0 {
-                                *this.finished = true;
-                                return Poll::Ready(Ok(()));
+            if *this.ciphertext_len == 0 {
+                // Read header (8 bytes) only when there is no in-flight payload.
+                while !*this.header_done && *this.header_read < 8 {
+                    let mut temp = [0u8; 8];
+                    let mut temp_buf = ReadBuf::new(&mut temp[0..8 - *this.header_read]);
+                    match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(())) => {
+                            let n = temp_buf.filled().len();
+                            if n == 0 {
+                                if *this.header_read == 0 {
+                                    *this.finished = true;
+                                    return Poll::Ready(Ok(()));
+                                }
+                                return Poll::Ready(Err(Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "unexpected EOF while reading encrypted block header",
+                                )));
                             }
-                            return Poll::Ready(Err(Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "unexpected EOF while reading encrypted block header",
-                            )));
+                            this.header_buf[*this.header_read..*this.header_read + n].copy_from_slice(&temp_buf.filled()[..n]);
+                            *this.header_read += n;
                         }
-                        this.header_buf[*this.header_read..*this.header_read + n].copy_from_slice(&temp_buf.filled()[..n]);
-                        *this.header_read += n;
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 }
-            }
 
-            if !*this.header_done && *this.header_read == 8 {
-                *this.header_done = true;
-            }
+                if !*this.header_done && *this.header_read == 8 {
+                    *this.header_done = true;
+                }
 
-            if !*this.header_done {
-                return Poll::Pending;
-            }
+                if !*this.header_done {
+                    return Poll::Pending;
+                }
 
-            let typ = this.header_buf[0];
-            let len =
-                (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
-            let crc = (this.header_buf[4] as u32)
-                | ((this.header_buf[5] as u32) << 8)
-                | ((this.header_buf[6] as u32) << 16)
-                | ((this.header_buf[7] as u32) << 24);
+                let typ = this.header_buf[0];
+                let len =
+                    (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
+                *this.header_read = 0;
+                *this.header_done = false;
 
-            *this.header_read = 0;
-            *this.header_done = false;
+                if typ == 0xFF {
+                    if *this.multipart_mode {
+                        let next_part = if *this.current_part_index + 1 < this.multipart_parts.len() {
+                            *this.current_part_index += 1;
+                            this.multipart_parts[*this.current_part_index]
+                        } else {
+                            *this.current_part + 1
+                        };
+                        debug!(
+                            next_part = next_part,
+                            "decrypt_reader: reached segment terminator, advancing to next part"
+                        );
+                        *this.current_part = next_part;
+                        *this.current_nonce_base = derive_part_nonce(this.base_nonce, *this.current_part);
+                        *this.block_index = 0;
+                        *this.ciphertext_read = 0;
+                        *this.ciphertext_len = 0;
+                        continue;
+                    }
 
-            if typ == 0xFF {
-                if *this.multipart_mode {
-                    debug!(
-                        next_part = *this.current_part + 1,
-                        "decrypt_reader: reached segment terminator, advancing to next part"
-                    );
-                    *this.current_part += 1;
-                    *this.current_nonce_base = derive_part_nonce(this.base_nonce, *this.current_part);
+                    *this.finished = true;
                     *this.block_index = 0;
                     *this.ciphertext_read = 0;
                     *this.ciphertext_len = 0;
                     continue;
                 }
 
-                *this.finished = true;
+                tracing::debug!(typ = typ, len = len, "decrypt block header");
+
+                if len == 0 {
+                    tracing::warn!("encountered zero-length encrypted block, treating as end of stream");
+                    *this.finished = true;
+                    *this.ciphertext_read = 0;
+                    *this.ciphertext_len = 0;
+                    continue;
+                }
+
+                let Some(payload_len) = len.checked_sub(4) else {
+                    tracing::error!("invalid encrypted block length: typ={} len={} header={:?}", typ, len, this.header_buf);
+                    return Poll::Ready(Err(Error::other("Invalid encrypted block length")));
+                };
+
+                if this.ciphertext_buf.len() < payload_len {
+                    this.ciphertext_buf.resize(payload_len, 0);
+                }
+                *this.ciphertext_len = payload_len;
                 *this.ciphertext_read = 0;
-                *this.ciphertext_len = 0;
-                continue;
             }
-
-            tracing::debug!(typ = typ, len = len, "decrypt block header");
-
-            if len == 0 {
-                tracing::warn!("encountered zero-length encrypted block, treating as end of stream");
-                *this.finished = true;
-                *this.ciphertext_read = 0;
-                *this.ciphertext_len = 0;
-                continue;
-            }
-
-            let Some(payload_len) = len.checked_sub(4) else {
-                tracing::error!("invalid encrypted block length: typ={} len={} header={:?}", typ, len, this.header_buf);
-                return Poll::Ready(Err(Error::other("Invalid encrypted block length")));
-            };
-
-            if this.ciphertext_buf.len() < payload_len {
-                this.ciphertext_buf.resize(payload_len, 0);
-            }
-            *this.ciphertext_len = payload_len;
-            *this.ciphertext_read = 0;
 
             while *this.ciphertext_read < *this.ciphertext_len {
                 let mut temp_buf = ReadBuf::new(&mut this.ciphertext_buf[*this.ciphertext_read..*this.ciphertext_len]);
@@ -487,12 +430,16 @@ where
                 return Poll::Ready(Err(Error::other("Plaintext length mismatch")));
             }
 
+            let expected_crc = (this.header_buf[4] as u32)
+                | ((this.header_buf[5] as u32) << 8)
+                | ((this.header_buf[6] as u32) << 16)
+                | ((this.header_buf[7] as u32) << 24);
             let actual_crc = {
                 let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
                 hasher.update(&plaintext);
                 hasher.finalize() as u32
             };
-            if actual_crc != crc {
+            if actual_crc != expected_crc {
                 *this.ciphertext_read = 0;
                 *this.ciphertext_len = 0;
                 return Poll::Ready(Err(Error::other("CRC32 mismatch")));
@@ -553,7 +500,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    use crate::{BlockReadable, HardLimitReader, WarpReader};
+    use crate::HardLimitReader;
 
     use super::*;
     use futures::StreamExt;
@@ -591,6 +538,49 @@ mod tests {
             let end = start + to_read;
             buf.put_slice(&self.inner.get_ref()[start..end]);
             self.inner.set_position(end as u64);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PendingChunkedCursor {
+        inner: Cursor<Vec<u8>>,
+        max_chunk: usize,
+        should_pending: bool,
+    }
+
+    impl PendingChunkedCursor {
+        fn new(data: Vec<u8>, max_chunk: usize) -> Self {
+            Self {
+                inner: Cursor::new(data),
+                max_chunk,
+                should_pending: true,
+            }
+        }
+    }
+
+    impl AsyncRead for PendingChunkedCursor {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.should_pending {
+                self.should_pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            if self.max_chunk == 0 || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let remaining = self.inner.get_ref().len() as u64 - self.inner.position();
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let to_read = remaining.min(self.max_chunk as u64).min(buf.remaining() as u64) as usize;
+            let start = self.inner.position() as usize;
+            let end = start + to_read;
+            buf.put_slice(&self.inner.get_ref()[start..end]);
+            self.inner.set_position(end as u64);
+            self.should_pending = true;
             Poll::Ready(Ok(()))
         }
     }
@@ -742,35 +732,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_encrypt_reader_read_block_round_trips() {
-        let data = b"hello sse encrypt via blocks";
-        let mut key = [0u8; 32];
-        let mut nonce = [0u8; 12];
-        rand::rng().fill_bytes(&mut key);
-        rand::rng().fill_bytes(&mut nonce);
-
-        let reader = Cursor::new(data.to_vec());
-        let mut encrypt_reader = EncryptReader::new(WarpReader::new(reader), key, nonce);
-        let mut encrypted = Vec::new();
-        let mut buf = [0u8; 17];
-
-        loop {
-            let n = encrypt_reader.read_block(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            encrypted.extend_from_slice(&buf[..n]);
-        }
-
-        let reader = Cursor::new(encrypted);
-        let mut decrypt_reader = DecryptReader::new(WarpReader::new(reader), key, nonce);
-        let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
-
-        assert_eq!(&decrypted, data);
-    }
-
-    #[tokio::test]
     async fn test_decrypt_reader_large_with_small_chunks() {
         let size = 1024 * 1024;
         let mut data = vec![0u8; size];
@@ -786,6 +747,29 @@ mod tests {
         encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
 
         let reader = ChunkedCursor::new(encrypted, 3);
+        let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
+        let mut decrypted = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        assert_eq!(decrypted, data);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_reader_large_with_pending_chunks() {
+        let size = 1024 * 1024;
+        let mut data = vec![0u8; size];
+        rand::rng().fill(&mut data[..]);
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let reader = Cursor::new(data.clone());
+        let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
+        let mut encrypted = Vec::new();
+        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+
+        let reader = PendingChunkedCursor::new(encrypted, 3);
         let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
@@ -877,7 +861,7 @@ mod tests {
         combined.extend_from_slice(&encrypted_two);
 
         let reader = BufReader::new(Cursor::new(combined));
-        let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce);
+        let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce, vec![1, 2]);
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
 
@@ -951,7 +935,7 @@ mod tests {
         combined.extend_from_slice(&encrypted_two);
 
         let reader = BufReader::new(Cursor::new(combined));
-        let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce);
+        let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce, vec![1, 2]);
         let mut decrypted = Vec::new();
         decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
 

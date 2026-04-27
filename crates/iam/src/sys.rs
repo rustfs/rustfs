@@ -16,9 +16,9 @@ use crate::error::Error as IamError;
 use crate::error::is_err_no_such_account;
 use crate::error::is_err_no_such_temp_account;
 use crate::error::{Error, Result};
-use crate::manager::IamCache;
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
+use crate::manager::{IamCache, IamSyncMetricsSnapshot};
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
@@ -134,6 +134,19 @@ impl PreparedIamAuth {
             }
         }
     }
+
+    /// Returns the resolved identity policy prepared for the current auth mode.
+    ///
+    /// This is intended for read-only views (for example `/accountinfo`) so
+    /// callers can reuse the same policy resolution path as authorization.
+    pub fn combined_policy_for_view(&self) -> Option<&Policy> {
+        match &self.mode {
+            PreparedIamMode::Regular { combined_policy } => Some(combined_policy),
+            PreparedIamMode::Sts { combined_policy, .. } => Some(combined_policy),
+            PreparedIamMode::ServiceAccount { combined_policy, .. } => Some(combined_policy),
+            PreparedIamMode::Opa | PreparedIamMode::Owner | PreparedIamMode::Deny => None,
+        }
+    }
 }
 
 impl<T: Store> IamSys<T> {
@@ -171,6 +184,10 @@ impl<T: Store> IamSys<T> {
     /// `true` if a watcher is configured, `false` otherwise
     pub fn has_watcher(&self) -> bool {
         self.store.api.has_watcher()
+    }
+
+    pub fn sync_metrics_snapshot(&self) -> IamSyncMetricsSnapshot {
+        self.store.sync_metrics_snapshot()
     }
 
     pub async fn set_policy_plugin_client(client: rustfs_policy::policy::opa::AuthZPlugin) {
@@ -738,7 +755,7 @@ impl<T: Store> IamSys<T> {
                 Ok((Some(res), ok))
             }
             None => {
-                let _ = self.store.load_user(access_key).await;
+                self.store.load_user(access_key).await?;
 
                 if let Some(res) = self.store.get_user(access_key).await {
                     let ok = res.credentials.is_valid();
@@ -967,7 +984,7 @@ impl<T: Store> IamSys<T> {
             let (effective_groups, groups_source) = match args.groups.as_ref() {
                 Some(g) if !g.is_empty() => (args.groups.clone(), "args"),
                 _ => match self.store.get_user(parent_user).await {
-                    Some(u) => (u.credentials.groups.clone(), "parent_user_credentials"),
+                    Some(u) => (u.credentials.groups, "parent_user_credentials"),
                     None => {
                         tracing::warn!(
                             parent_user = %parent_user,
@@ -1286,6 +1303,31 @@ mod tests {
     use std::collections::HashMap;
     use time::OffsetDateTime;
 
+    #[test]
+    fn test_combined_policy_for_view_returns_regular_policy() {
+        let policy = Policy {
+            version: "2012-10-17".to_string(),
+            ..Default::default()
+        };
+        let prepared = PreparedIamAuth {
+            needs_existing_object_tag: false,
+            mode: PreparedIamMode::Regular { combined_policy: policy },
+        };
+
+        let resolved = prepared.combined_policy_for_view();
+        assert_eq!(resolved.map(|p| p.version.as_str()), Some("2012-10-17"));
+    }
+
+    #[test]
+    fn test_combined_policy_for_view_returns_none_for_deny() {
+        let prepared = PreparedIamAuth {
+            needs_existing_object_tag: false,
+            mode: PreparedIamMode::Deny,
+        };
+
+        assert!(prepared.combined_policy_for_view().is_none());
+    }
+
     /// Mock Store for STS tests: either group-attached policies via parent user, or no IAM policies.
     #[derive(Clone)]
     struct StsTestMockStore {
@@ -1330,6 +1372,10 @@ mod tests {
         }
 
         async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            if user_type == UserType::Reg && name == "load-failure-user" {
+                return Err(Error::Io(std::io::Error::other("load user failed")));
+            }
+
             if user_type == UserType::Reg && name == "notify-user" {
                 let user = UserIdentity::from(Credentials {
                     access_key: name.to_string(),
@@ -1769,6 +1815,17 @@ mod tests {
             bucket_users.contains_key("notify-user"),
             "regular user mapped policy must be written to user_policies for bucket user listing"
         );
+    }
+
+    #[tokio::test]
+    async fn test_check_key_propagates_cache_miss_load_failure() {
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let result = iam_sys.check_key("load-failure-user").await;
+
+        assert!(matches!(result, Err(Error::Io(_))));
     }
 
     #[tokio::test]

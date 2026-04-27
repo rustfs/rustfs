@@ -6,24 +6,39 @@ Use the nearest subdirectory `AGENTS.md` for path-specific guidance.
 ## Rule Precedence
 
 1. System/developer instructions.
-2. This file (global defaults).
-3. The nearest `AGENTS.md` in the current path (more specific scope wins).
+2. Current user/task instructions.
+3. The nearest `AGENTS.md` in the current path.
+4. This file (global defaults).
 
 If repo-level instructions conflict, follow the nearest file and keep behavior aligned with CI.
+
+## Execution Discipline
+
+- Read the relevant existing code, tests, and local guidance before changing behavior.
+- State assumptions when they affect the implementation or verification path.
+- If a task has multiple plausible interpretations, list the options briefly and choose the narrowest reasonable path; ask when the ambiguity would make the change risky.
+- For multi-step work, keep the plan minimal and tied to verifiable outcomes.
+- Avoid redundant file reads, repeated commands, and unnecessary exploratory work once enough context is available.
+- A good result is a minimal diff with clear assumptions, no over-engineering, and independent verification.
 
 ## Communication and Language
 
 - Respond in the same language used by the requester.
 - Keep source code, comments, commit messages, and PR title/body in English.
+- Be concise. Avoid sycophantic openers, closing fluff, and verbose status reporting.
 
 ## Change Style for Existing Logic
 
 - Prefer direct, local code over extracting one-off helpers.
 - Extract a helper only when logic is reused or the extraction materially clarifies a non-trivial flow.
+- Solve only the requested problem; do not add speculative features, configurability, or adjacent improvements.
+- Prefer editing existing code over rewriting files or reshaping unrelated logic.
+- Modify only what is required and remove only artifacts introduced by your own changes.
 - Preserve the existing control-flow and logic shape when fixing bugs or addressing review comments, especially in init, distributed coordination, locking, metadata, and concurrency paths.
 - Do not refactor existing code only to make it easier to unit test.
 - Keep fixes narrowly aligned with the requested behavior; avoid semantic-adjacent rewrites while touching sensitive paths.
 - Keep code elegant, concise, and direct. Prefer minimal, readable implementations over over-engineering and excessive abstraction. Use comments to clarify non-obvious intent and invariants, not to compensate for unclear code.
+- Mention unrelated issues when useful, but do not fix them as part of a narrow task.
 
 ## Constant and String Usage
 
@@ -43,6 +58,8 @@ Avoid duplicating long crate lists or command matrices in instruction files.
 Reference the source files above instead.
 
 ## Verification Before PR
+
+Convert changes into independently verifiable outcomes. Prefer focused tests for behavior changes and run the relevant checks before declaring completion.
 
 For code changes, run and pass the following before opening a PR:
 
@@ -69,6 +86,7 @@ Do not open a PR with code changes when the required checks fail.
 - Use `N/A` for non-applicable template sections.
 - Include verification commands in the PR description.
 - When using `gh pr create`/`gh pr edit`, use `--body-file` instead of inline `--body` for multiline markdown.
+- Do not include the literal sequence `\n` in any GitHub issue, pull request, or discussion comment.
 - After fixing code review comments or CI findings, always mark corresponding review
   comments/threads as resolved before returning to the user.
 - In handling review comments, confirm the underlying issue before changing code.

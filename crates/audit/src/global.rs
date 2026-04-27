@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{AuditEntry, AuditResult, AuditSystem};
+use crate::{AuditEntry, AuditResult, AuditSystem, system::AuditTargetMetricSnapshot};
 use rustfs_ecstore::config::Config;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, trace, warn};
@@ -87,6 +87,15 @@ pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
 /// Reload the global audit system configuration
 pub async fn reload_audit_config(config: Config) -> AuditResult<()> {
     with_audit_system!(|system: Arc<AuditSystem>| async move { system.reload_config(config).await })
+}
+
+/// Returns per-target audit delivery metrics for Prometheus collection.
+pub async fn audit_target_metrics() -> Vec<AuditTargetMetricSnapshot> {
+    if let Some(system) = audit_system() {
+        system.snapshot_target_metrics().await
+    } else {
+        Vec::new()
+    }
 }
 
 /// Check if the global audit system is running

@@ -38,6 +38,14 @@ TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
 XDIST="${XDIST:-0}"
 
+# Compatibility default for the s3-tests harness:
+# this script provisions multiple local export directories on the same physical disk.
+# Prefer the canonical bypass knob by default, and only honor the legacy CI alias
+# when it is already provided by the environment.
+if [ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ] && [ -z "${MINIO_CI+x}" ]; then
+    export RUSTFS_UNSAFE_BYPASS_DISK_CHECK="true"
+fi
+
 # Directories (define early for use in test list loading)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -78,17 +86,20 @@ TEST_LISTS_DIR="${SCRIPT_DIR}"
 IMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/implemented_tests.txt"
 UNIMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/unimplemented_tests.txt"
 EXCLUDED_TESTS_FILE="${TEST_LISTS_DIR}/excluded_tests.txt"
-LEGACY_NON_STANDARD_TESTS_FILE="${TEST_LISTS_DIR}/non_standard_tests.txt"
+S3_TEST_FILE="s3tests/functional/test_s3.py"
 
 # =============================================================================
-# build_testexpr_from_file: Read test names from file and build pytest -k expr
+# load_testnodes_from_file: Read test names and build exact pytest node ids
 # =============================================================================
-# Reads test names from a file (one per line, ignoring comments and empty lines)
-# and builds a pytest -k expression to include only those tests.
+# Pytest -k matches substrings, so similar test names can accidentally include or
+# exclude each other. The default file-based path uses exact node ids instead.
 # =============================================================================
-build_testexpr_from_file() {
+TEST_NODE_ARGS=()
+USE_FILE_TEST_NODES=false
+
+load_testnodes_from_file() {
     local file="$1"
-    local expr=""
+    local line=""
 
     if [[ ! -f "${file}" ]]; then
         log_error "Test list file not found: ${file}"
@@ -102,36 +113,27 @@ build_testexpr_from_file() {
         line=$(echo "$line" | xargs)
         [[ -z "$line" ]] && continue
 
-        if [[ -n "${expr}" ]]; then
-            expr+=" or "
-        fi
-        expr+="${line}"
+        TEST_NODE_ARGS+=("${S3_TEST_FILE}::${line}")
     done < "${file}"
-
-    echo "${expr}"
 }
 
 # =============================================================================
-# MARKEXPR: pytest marker expression (safety net for marker-based filtering)
+# MARKEXPR: pytest marker expression
 # =============================================================================
-# Even though we use file-based test selection, we keep marker exclusions
-# as a safety net to ensure excluded tests do not slip through.
+# File-based test selection is authoritative. Keep the default marker expression
+# non-restrictive so implemented tests that carry upstream compatibility markers
+# are still run when they are listed in implemented_tests.txt.
 # =============================================================================
 if [[ -z "${MARKEXPR:-}" ]]; then
-    # Minimal marker exclusions as safety net (file-based filtering is primary)
-    MARKEXPR="not fails_on_aws and not fails_on_rgw and not fails_on_dbstore"
+    # Valid pytest -m expression that does not match any real marker.
+    MARKEXPR="not rustfs_never_marker"
 fi
 
 # =============================================================================
-# TESTEXPR: pytest -k expression to select specific tests
+# TESTEXPR: optional pytest -k expression to select specific tests
 # =============================================================================
-# By default, builds an inclusion expression from implemented_tests.txt,
-# combined with an exclusion expression from excluded_tests.txt and
-# unimplemented_tests.txt to prevent substring-matching collisions.
-#
-# For example, "test_object_raw_get" in the include list would also match
-# "test_object_raw_get_x_amz_expires_not_expired" via pytest -k substring
-# matching. The exclusion guard ensures only intended tests run.
+# By default, loads exact pytest node ids from implemented_tests.txt.
+# Set TESTEXPR to override this with a custom pytest -k expression.
 #
 # The file-based approach provides:
 #   1. Clear visibility of which tests are run
@@ -141,41 +143,14 @@ fi
 if [[ -z "${TESTEXPR:-}" ]]; then
     if [[ -f "${IMPLEMENTED_TESTS_FILE}" ]]; then
         log_info "Loading test list from: ${IMPLEMENTED_TESTS_FILE}"
-        INCLUDE_EXPR=$(build_testexpr_from_file "${IMPLEMENTED_TESTS_FILE}")
-        if [[ -z "${INCLUDE_EXPR}" ]]; then
+        load_testnodes_from_file "${IMPLEMENTED_TESTS_FILE}"
+        TEST_COUNT="${#TEST_NODE_ARGS[@]}"
+        if [[ "${TEST_COUNT}" -eq 0 ]]; then
             log_error "No tests found in ${IMPLEMENTED_TESTS_FILE}"
             exit 1
         fi
-        TEST_COUNT=$(grep -v '^#' "${IMPLEMENTED_TESTS_FILE}" | grep -v '^[[:space:]]*$' | wc -l | xargs)
-        log_info "Loaded ${TEST_COUNT} tests from implemented_tests.txt"
-
-        # Build exclusion expression from excluded and unimplemented lists
-        # to guard against pytest -k substring matching false positives
-        EXCLUDE_EXPR=""
-        EXCLUDE_FILES=("${EXCLUDED_TESTS_FILE}" "${UNIMPLEMENTED_TESTS_FILE}")
-        if [[ ! -f "${EXCLUDED_TESTS_FILE}" && -f "${LEGACY_NON_STANDARD_TESTS_FILE}" ]]; then
-            log_warn "excluded_tests.txt not found, fallback to legacy non_standard_tests.txt"
-            EXCLUDE_FILES=("${LEGACY_NON_STANDARD_TESTS_FILE}" "${UNIMPLEMENTED_TESTS_FILE}")
-        fi
-
-        for exclude_file in "${EXCLUDE_FILES[@]}"; do
-            if [[ -f "${exclude_file}" ]]; then
-                FILE_EXPR=$(build_testexpr_from_file "${exclude_file}")
-                if [[ -n "${FILE_EXPR}" ]]; then
-                    if [[ -n "${EXCLUDE_EXPR}" ]]; then
-                        EXCLUDE_EXPR+=" or "
-                    fi
-                    EXCLUDE_EXPR+="${FILE_EXPR}"
-                fi
-            fi
-        done
-
-        if [[ -n "${EXCLUDE_EXPR}" ]]; then
-            TESTEXPR="(${INCLUDE_EXPR}) and not (${EXCLUDE_EXPR})"
-            log_info "Added exclusion guard from excluded + unimplemented lists"
-        else
-            TESTEXPR="${INCLUDE_EXPR}"
-        fi
+        USE_FILE_TEST_NODES=true
+        log_info "Loaded ${TEST_COUNT} exact test nodes from implemented_tests.txt"
     else
         log_warn "Test list file not found: ${IMPLEMENTED_TESTS_FILE}"
         log_warn "Falling back to exclusion-based filtering"
@@ -249,8 +224,8 @@ Environment Variables:
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
   MAXFAIL                - Stop after N failures (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
-  MARKEXPR               - pytest marker expression (default: safety net exclusions)
-  TESTEXPR               - pytest -k expression (default: from implemented_tests.txt)
+  MARKEXPR               - pytest marker expression (default: no marker filtering)
+  TESTEXPR               - pytest -k expression (overrides implemented_tests.txt node list)
   S3TESTS_CONF_TEMPLATE  - Path to s3tests config template (default: .github/s3tests/s3tests.conf)
   S3TESTS_CONF           - Path to generated s3tests config (default: s3tests.conf)
   DATA_ROOT              - Root directory for test data storage (default: target)
@@ -841,6 +816,13 @@ fi
 # Resolve config path (absolute path for tox)
 CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
 
+PYTEST_SELECTION_ARGS=()
+if [[ "${USE_FILE_TEST_NODES}" == "true" ]]; then
+    PYTEST_SELECTION_ARGS=("${TEST_NODE_ARGS[@]}")
+else
+    PYTEST_SELECTION_ARGS=("${S3_TEST_FILE}" -k "${TESTEXPR}")
+fi
+
 # Run tests from s3tests/functional
 S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     tox -- \
@@ -848,9 +830,8 @@ S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     --maxfail="${MAXFAIL}" \
     --junitxml="${ARTIFACTS_DIR}/junit.xml" \
     ${XDIST_ARGS} \
-    s3tests/functional/test_s3.py \
+    "${PYTEST_SELECTION_ARGS[@]}" \
     -m "${MARKEXPR}" \
-    -k "${TESTEXPR}" \
     2>&1 | tee "${ARTIFACTS_DIR}/pytest.log"
 
 TEST_EXIT_CODE=${PIPESTATUS[0]}

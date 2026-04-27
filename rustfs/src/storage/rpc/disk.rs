@@ -131,6 +131,7 @@ impl NodeService {
                         .iter()
                         .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(json_str).ok())
                         .filter_map(|resp| encode_msgpack(&resp, "ReadMultipleResp").ok())
+                        .map(Into::into)
                         .collect();
 
                     Ok(Response::new(ReadMultipleResponse {
@@ -279,19 +280,19 @@ impl NodeService {
                         (Ok(raw_file_info), Ok(raw_file_info_bin)) => Ok(Response::new(ReadXlResponse {
                             success: true,
                             raw_file_info,
-                            raw_file_info_bin,
+                            raw_file_info_bin: raw_file_info_bin.into(),
                             error: None,
                         })),
                         (Err(err), _) => Ok(Response::new(ReadXlResponse {
                             success: false,
                             raw_file_info: String::new(),
-                            raw_file_info_bin: Vec::new(),
+                            raw_file_info_bin: Vec::new().into(),
                             error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                         })),
                         (_, Err(err)) => Ok(Response::new(ReadXlResponse {
                             success: false,
                             raw_file_info: String::new(),
-                            raw_file_info_bin: Vec::new(),
+                            raw_file_info_bin: Vec::new().into(),
                             error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                         })),
                     }
@@ -299,7 +300,7 @@ impl NodeService {
                 Err(err) => Ok(Response::new(ReadXlResponse {
                     success: false,
                     raw_file_info: String::new(),
-                    raw_file_info_bin: Vec::new(),
+                    raw_file_info_bin: Vec::new().into(),
                     error: Some(err.into()),
                 })),
             }
@@ -307,7 +308,7 @@ impl NodeService {
             Ok(Response::new(ReadXlResponse {
                 success: false,
                 raw_file_info: String::new(),
-                raw_file_info_bin: Vec::new(),
+                raw_file_info_bin: Vec::new().into(),
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
@@ -325,7 +326,7 @@ impl NodeService {
                     return Ok(Response::new(ReadVersionResponse {
                         success: false,
                         file_info: String::new(),
-                        file_info_bin: Vec::new(),
+                        file_info_bin: Vec::new().into(),
                         error: Some(DiskError::other(format!("decode ReadOptions failed: {err}")).into()),
                     }));
                 }
@@ -341,19 +342,19 @@ impl NodeService {
                         (Ok(file_info), Ok(file_info_bin)) => Ok(Response::new(ReadVersionResponse {
                             success: true,
                             file_info,
-                            file_info_bin,
+                            file_info_bin: file_info_bin.into(),
                             error: None,
                         })),
                         (Err(err), _) => Ok(Response::new(ReadVersionResponse {
                             success: false,
                             file_info: String::new(),
-                            file_info_bin: Vec::new(),
+                            file_info_bin: Vec::new().into(),
                             error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                         })),
                         (_, Err(err)) => Ok(Response::new(ReadVersionResponse {
                             success: false,
                             file_info: String::new(),
-                            file_info_bin: Vec::new(),
+                            file_info_bin: Vec::new().into(),
                             error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
                         })),
                     }
@@ -361,7 +362,7 @@ impl NodeService {
                 Err(err) => Ok(Response::new(ReadVersionResponse {
                     success: false,
                     file_info: String::new(),
-                    file_info_bin: Vec::new(),
+                    file_info_bin: Vec::new().into(),
                     error: Some(err.into()),
                 })),
             }
@@ -369,7 +370,7 @@ impl NodeService {
             Ok(Response::new(ReadVersionResponse {
                 success: false,
                 file_info: String::new(),
-                file_info_bin: Vec::new(),
+                file_info_bin: Vec::new().into(),
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }

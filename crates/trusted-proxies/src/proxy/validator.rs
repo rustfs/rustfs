@@ -16,10 +16,13 @@
 
 use axum::http::HeaderMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use crate::{ProxyChainAnalyzer, ProxyError, ProxyMetrics, TrustedProxyConfig, ValidationMode};
+use crate::{
+    CacheConfig, CacheStats, IpValidationCache, ProxyChainAnalyzer, ProxyError, ProxyMetrics, TrustedProxyConfig, ValidationMode,
+};
 
 /// Information about the client extracted from the request and proxy headers.
 #[derive(Debug, Clone)]
@@ -95,6 +98,8 @@ pub struct ProxyValidator {
     config: TrustedProxyConfig,
     /// Analyzer for verifying the integrity of the proxy chain.
     chain_analyzer: ProxyChainAnalyzer,
+    /// Cache for repeated direct-peer trusted proxy decisions.
+    validation_cache: Arc<IpValidationCache>,
     /// Metrics collector for observability.
     metrics: Option<ProxyMetrics>,
 }
@@ -102,11 +107,24 @@ pub struct ProxyValidator {
 impl ProxyValidator {
     /// Creates a new `ProxyValidator` with the given configuration and metrics.
     pub fn new(config: TrustedProxyConfig, metrics: Option<ProxyMetrics>) -> Self {
+        Self::with_cache_config(config, CacheConfig::default(), metrics)
+    }
+
+    /// Creates a new `ProxyValidator` with explicit cache configuration.
+    pub fn with_cache_config(config: TrustedProxyConfig, cache_config: CacheConfig, metrics: Option<ProxyMetrics>) -> Self {
         let chain_analyzer = ProxyChainAnalyzer::new(config.clone());
+        let cache_enabled = cache_config.capacity > 0 && cache_config.ttl_seconds > 0;
+        let validation_cache = Arc::new(IpValidationCache::new(
+            cache_config.capacity,
+            cache_config.ttl_duration(),
+            cache_enabled,
+            metrics.clone(),
+        ));
 
         Self {
             config,
             chain_analyzer,
+            validation_cache,
             metrics,
         }
     }
@@ -130,27 +148,64 @@ impl ProxyValidator {
 
     /// Internal logic for request validation.
     fn validate_request_internal(&self, peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
-        // Fallback to unspecified address if peer address is missing.
-        let peer_addr = peer_addr.unwrap_or_else(|| SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0));
+        let Some(peer_addr) = peer_addr else {
+            debug!("SocketAddr extension is missing; skipping trusted proxy evaluation");
+            return Ok(ClientInfo::direct(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)));
+        };
+
+        let peer_ip = peer_addr.ip();
+        if peer_ip.is_unspecified() {
+            debug!("Peer address is unspecified; skipping trusted proxy evaluation");
+            return Ok(ClientInfo::direct(peer_addr));
+        }
+
+        let is_trusted_proxy = self
+            .validation_cache
+            .is_trusted(&peer_ip, |ip| self.chain_analyzer.is_ip_trusted(ip));
 
         // Check if the direct peer is a trusted proxy.
-        if self.config.is_trusted(&peer_addr) {
-            debug!("Request received from trusted proxy: {}", peer_addr.ip());
+        if is_trusted_proxy {
+            debug!("Request received from trusted proxy: {}", peer_ip);
 
             // Parse and validate headers from the trusted proxy.
             self.validate_trusted_proxy_request(&peer_addr, headers)
         } else {
             // Log a warning if the request is from a private network but not trusted.
-            if self.config.is_private_network(&peer_addr.ip()) {
+            if self.config.is_private_network(&peer_ip) {
                 warn!(
                     "Request from private network but not trusted: {}. This might indicate a configuration issue.",
-                    peer_addr.ip()
+                    peer_ip
                 );
             }
 
             // Treat as a direct connection if the peer is not trusted.
             Ok(ClientInfo::direct(peer_addr))
         }
+    }
+
+    /// Returns cache statistics for direct-peer validation decisions.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.validation_cache.stats()
+    }
+
+    pub(crate) fn spawn_cache_maintenance_task(self: &Arc<Self>, cleanup_interval: Duration) {
+        if cleanup_interval.is_zero() || !self.validation_cache.is_enabled() {
+            return;
+        }
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("No Tokio runtime available; trusted proxy cache maintenance is disabled");
+            return;
+        };
+
+        let cache = self.validation_cache.clone();
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(cleanup_interval);
+            loop {
+                interval.tick().await;
+                cache.run_maintenance();
+            }
+        });
     }
 
     /// Validates a request that originated from a trusted proxy.

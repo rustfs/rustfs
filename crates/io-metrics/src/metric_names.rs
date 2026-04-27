@@ -14,59 +14,41 @@
 
 //! Metric name constants for consistent naming across the codebase.
 
-/// Request-level data plane metric names introduced by ADR 0001.
-pub mod data_plane {
-    /// Total number of selected request paths.
-    pub const PATH_SELECTED_TOTAL: &str = "rustfs.io.path.selected_total";
+/// Zero-copy operation metric names.
+pub mod zero_copy {
+    /// Total number of zero-copy buffer operations
+    pub const BUFFER_OPERATIONS_TOTAL: &str = "rustfs_zero_copy_buffer_operations_total";
 
-    /// Total bytes observed for a given effective copy mode.
-    pub const COPY_MODE_BYTES_TOTAL: &str = "rustfs.io.copy_mode.bytes_total";
+    /// Total bytes processed by zero-copy buffer operations
+    pub const BUFFER_BYTES_TOTAL: &str = "rustfs_zero_copy_buffer_bytes_total";
 
-    /// Total number of data plane fallbacks.
-    pub const FALLBACK_TOTAL: &str = "rustfs.io.zero_copy.fallback_total";
+    /// Total number of memory copies
+    pub const MEMORY_COPY_TOTAL: &str = "rustfs_memory_copy_total";
 
-    /// Current active local-disk mmap bytes held by chunk fast paths.
-    pub const LOCAL_DISK_ACTIVE_MMAP_BYTES: &str = "rustfs.io.local_disk.active_mmap.bytes";
+    /// Total bytes copied in memory
+    pub const MEMORY_COPY_BYTES_TOTAL: &str = "rustfs_memory_copy_bytes_total";
 
-    /// Total pooled chunks produced or consumed by LocalDisk compatibility paths.
-    pub const LOCAL_DISK_POOLED_CHUNKS_TOTAL: &str = "rustfs.io.local_disk.pooled_chunks.total";
+    /// Total number of shared reference operations
+    pub const SHARED_REF_OPERATIONS_TOTAL: &str = "rustfs_shared_ref_operations_total";
 
-    /// Total pooled bytes produced or consumed by LocalDisk compatibility paths.
-    pub const LOCAL_DISK_POOLED_BYTES_TOTAL: &str = "rustfs.io.local_disk.pooled_bytes.total";
+    /// Total number of BufReader layers eliminated
+    pub const BUFREADER_LAYERS_ELIMINATED_TOTAL: &str = "rustfs_bufreader_layers_eliminated_total";
 
-    /// Total number of compatibility chunk-stream aggregations performed for LocalDisk reads.
-    pub const LOCAL_DISK_COMPAT_COLLECT_TOTAL: &str = "rustfs.io.local_disk.compat_collect.total";
+    /// BufReader buffer size distribution
+    pub const BUFREADER_BUFFER_SIZE_BYTES: &str = "rustfs_bufreader_buffer_size_bytes";
 
-    /// Chunk count distribution for LocalDisk compatibility chunk aggregation.
-    pub const LOCAL_DISK_COMPAT_COLLECT_CHUNKS: &str = "rustfs.io.local_disk.compat_collect.chunks";
+    /// Total number of Direct I/O operations
+    pub const DIRECT_IO_OPERATIONS_TOTAL: &str = "rustfs_direct_io_operations_total";
 
-    /// Byte distribution for LocalDisk compatibility chunk aggregation.
-    pub const LOCAL_DISK_COMPAT_COLLECT_BYTES: &str = "rustfs.io.local_disk.compat_collect.bytes";
+    /// Total bytes processed by Direct I/O
+    pub const DIRECT_IO_BYTES_TOTAL: &str = "rustfs_direct_io_bytes_total";
 
-    /// Total number of attempted PUT fast paths.
-    pub const PUT_FAST_PATH_ATTEMPTS_TOTAL: &str = "rustfs.io.put.fast_path.attempts_total";
+    /// Average copy count per operation
+    pub const AVG_COPY_COUNT: &str = "rustfs_zero_copy_avg_copy_count";
 
-    /// Size distribution for attempted PUT fast paths.
-    pub const PUT_FAST_PATH_ATTEMPT_SIZE_BYTES: &str = "rustfs.io.put.fast_path.attempt.size.bytes";
+    /// Throughput in MB/s
+    pub const THROUGHPUT_MBPS: &str = "rustfs_zero_copy_throughput_mbps";
 
-    /// Total number of transformed PUT selections grouped by transform kind and ingress path.
-    pub const PUT_TRANSFORM_SELECTED_TOTAL: &str = "rustfs.io.put.transform.selected_total";
-
-    /// Size distribution for transformed PUT selections.
-    pub const PUT_TRANSFORM_SIZE_BYTES: &str = "rustfs.io.put.transform.size.bytes";
-
-    /// Total number of selected GET chunk fast paths.
-    pub const GET_FAST_PATH_SELECTED_TOTAL: &str = "rustfs.io.get.fast_path.selected_total";
-
-    /// Total number of GET chunk fast path probe failures before response commit.
-    pub const GET_FAST_PATH_PROBE_FAILED_TOTAL: &str = "rustfs.io.get.fast_path.probe_failed_total";
-
-    /// Total number of GET chunk fast path mid-stream errors after response commit.
-    pub const GET_FAST_PATH_MIDSTREAM_ERROR_TOTAL: &str = "rustfs.io.get.fast_path.midstream_error_total";
-
-    /// Byte distribution promised by GET chunk fast path selections or failures.
-    pub const GET_FAST_PATH_PROMISED_BYTES: &str = "rustfs.io.get.fast_path.promised.bytes";
-
-    /// Byte distribution already sent when a GET chunk fast path fails mid-stream.
-    pub const GET_FAST_PATH_MIDSTREAM_SENT_BYTES: &str = "rustfs.io.get.fast_path.midstream_sent.bytes";
+    /// Current memory saved estimate by zero-copy in bytes
+    pub const MEMORY_SAVED_BYTES: &str = "rustfs_zero_copy_memory_saved_bytes_current";
 }

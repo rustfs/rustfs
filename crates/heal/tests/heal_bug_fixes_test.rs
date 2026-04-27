@@ -281,3 +281,152 @@ fn test_heal_task_status_atomic_update() {
     // Note: We can't directly access private fields, but creation without panic
     // confirms the fix works
 }
+
+#[tokio::test]
+async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
+    use rustfs_heal::heal::storage::{DiskStatus, HealStorageAPI};
+    use rustfs_heal::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct MockStorage {
+        object_exists_calls: Arc<AtomicUsize>,
+        heal_object_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl HealStorageAPI for MockStorage {
+        async fn get_object_meta(
+            &self,
+            _bucket: &str,
+            _object: &str,
+        ) -> rustfs_heal::Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+            Ok(None)
+        }
+
+        async fn get_object_data(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> rustfs_heal::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_object(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<()> {
+            Ok(())
+        }
+
+        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
+            Ok(true)
+        }
+
+        async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_disk_status(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> rustfs_heal::Result<DiskStatus> {
+            Ok(DiskStatus::Ok)
+        }
+
+        async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> rustfs_heal::Result<()> {
+            Ok(())
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<rustfs_ecstore::store_api::BucketInfo>> {
+            Ok(None)
+        }
+
+        async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_heal::Result<()> {
+            Ok(())
+        }
+
+        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<rustfs_ecstore::store_api::BucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn object_exists(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
+            self.object_exists_calls.fetch_add(1, Ordering::SeqCst);
+            Err(rustfs_heal::Error::transient_skip(
+                "Skipped object existence check for bucket/object: simulated quorum failure",
+            ))
+        }
+
+        async fn get_object_size(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<u64>> {
+            Ok(None)
+        }
+
+        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _version_id: Option<&str>,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
+            self.heal_object_calls.fetch_add(1, Ordering::SeqCst);
+            Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
+        }
+
+        async fn heal_bucket(
+            &self,
+            _bucket: &str,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> rustfs_heal::Result<rustfs_madmin::heal_commands::HealResultItem> {
+            Ok(rustfs_madmin::heal_commands::HealResultItem::default())
+        }
+
+        async fn heal_format(
+            &self,
+            _dry_run: bool,
+        ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
+            Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
+        }
+
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_heal::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_objects_for_heal_page(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<&str>,
+        ) -> rustfs_heal::Result<(Vec<String>, Option<String>, bool)> {
+            Ok((Vec::new(), None, false))
+        }
+
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<rustfs_ecstore::disk::DiskStore> {
+            Err(rustfs_heal::Error::other("not implemented"))
+        }
+    }
+
+    let object_exists_calls = Arc::new(AtomicUsize::new(0));
+    let heal_object_calls = Arc::new(AtomicUsize::new(0));
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage {
+        object_exists_calls: object_exists_calls.clone(),
+        heal_object_calls: heal_object_calls.clone(),
+    });
+
+    let request = HealRequest::new(
+        HealType::Object {
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+        },
+        HealOptions::default(),
+        HealPriority::Normal,
+    );
+
+    let task = HealTask::from_request(request, storage);
+    task.execute().await.expect("transient existence check should be skipped");
+
+    assert_eq!(object_exists_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(heal_object_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(task.get_status().await, HealTaskStatus::Completed);
+    assert!(task.get_progress().await.is_completed());
+}

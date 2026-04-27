@@ -17,7 +17,10 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     store::{Key, QueueStore, Store},
-    target::{ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetType},
+    target::{
+        ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
+        TargetType,
+    },
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
@@ -76,7 +79,7 @@ impl WebhookArgs {
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
             if !path.is_absolute() {
-                return Err(TargetError::Configuration("webhook queueDir path should be absolute".to_string()));
+                return Err(TargetError::Configuration("webhook queue_dir path should be absolute".to_string()));
             }
         }
 
@@ -108,6 +111,7 @@ where
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     initialized: AtomicBool,
     cancel_sender: mpsc::Sender<()>,
+    delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: PhantomData<E>,
 }
 
@@ -124,6 +128,7 @@ where
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             initialized: AtomicBool::new(self.initialized.load(Ordering::SeqCst)),
             cancel_sender: self.cancel_sender.clone(),
+            delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })
     }
@@ -172,6 +177,7 @@ where
             store: queue_store,
             initialized: AtomicBool::new(false),
             cancel_sender,
+            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
     }
@@ -282,7 +288,7 @@ where
             bucket = %meta.bucket_name,
             object = %meta.object_name,
             event = %meta.event_name,
-            preview = %meta.best_effort_preview(&body, 256),
+            payload_len = body.len(),
             "Sending webhook payload"
         );
 
@@ -293,8 +299,7 @@ where
 
         if !self.args.auth_token.is_empty() {
             // Split auth_token string to check if the authentication type is included
-            let tokens: Vec<&str> = self.args.auth_token.split_whitespace().collect();
-            match tokens.len() {
+            match self.args.auth_token.split_whitespace().count() {
                 2 => {
                     // Already include authentication type and token, such as "Bearer token123"
                     req_builder = req_builder.header("Authorization", &self.args.auth_token);
@@ -321,6 +326,7 @@ where
         let status = resp.status();
         if status.is_success() {
             debug!("Event sent to webhook target: {}", self.id);
+            self.delivery_counters.record_success();
             Ok(())
         } else if status == StatusCode::FORBIDDEN {
             Err(TargetError::Authentication(format!(
@@ -370,16 +376,26 @@ where
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-        let queued = self.build_queued_payload(&event)?;
+        let queued = match self.build_queued_payload(&event) {
+            Ok(queued) => queued,
+            Err(err) => {
+                self.delivery_counters.record_final_failure();
+                return Err(err);
+            }
+        };
 
         if let Some(store) = &self.store {
-            store
-                .put_raw(
-                    &queued
-                        .encode()
-                        .map_err(|e| TargetError::Storage(format!("Failed to encode queued payload: {e}")))?,
-                )
-                .map_err(|e| TargetError::Storage(format!("Failed to save event to store: {e}")))?;
+            let encoded = match queued.encode() {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    self.delivery_counters.record_final_failure();
+                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
+                }
+            };
+            if let Err(e) = store.put_raw(&encoded) {
+                self.delivery_counters.record_final_failure();
+                return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+            }
             debug!("Event saved to store for target: {}", self.id);
             Ok(())
         } else {
@@ -387,10 +403,15 @@ where
                 Ok(_) => (),
                 Err(e) => {
                     error!("Failed to initialize Webhook target {}: {}", self.id.id, e);
+                    self.delivery_counters.record_final_failure();
                     return Err(TargetError::NotConnected);
                 }
             }
-            self.send_body(queued.body, &queued.meta).await
+            if let Err(err) = self.send_body(queued.body, &queued.meta).await {
+                self.delivery_counters.record_final_failure();
+                return Err(err);
+            }
+            Ok(())
         }
     }
 
@@ -443,6 +464,15 @@ where
 
     fn is_enabled(&self) -> bool {
         self.args.enable
+    }
+
+    fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
+        self.delivery_counters
+            .snapshot(self.store.as_deref().map_or(0, |store| store.len() as u64))
+    }
+
+    fn record_final_failure(&self) {
+        self.delivery_counters.record_final_failure();
     }
 }
 

@@ -17,10 +17,10 @@
 use std::sync::Arc;
 use tower::Layer;
 
-use crate::ProxyMetrics;
+use crate::LegacyTrustedProxyMiddleware;
 use crate::ProxyValidator;
 use crate::TrustedProxyConfig;
-use crate::TrustedProxyMiddleware;
+use crate::{CacheConfig, ProxyMetrics};
 
 /// Tower Layer for the trusted proxy middleware.
 #[derive(Clone, Debug)]
@@ -34,12 +34,22 @@ pub struct TrustedProxyLayer {
 impl TrustedProxyLayer {
     /// Creates a new `TrustedProxyLayer`.
     pub fn new(config: TrustedProxyConfig, metrics: Option<ProxyMetrics>, enabled: bool) -> Self {
-        let validator = ProxyValidator::new(config, metrics);
+        Self::with_cache_config(config, CacheConfig::default(), metrics, enabled)
+    }
 
-        Self {
-            validator: Arc::new(validator),
-            enabled,
+    /// Creates a new `TrustedProxyLayer` with explicit cache configuration.
+    pub fn with_cache_config(
+        config: TrustedProxyConfig,
+        cache_config: CacheConfig,
+        metrics: Option<ProxyMetrics>,
+        enabled: bool,
+    ) -> Self {
+        let validator = Arc::new(ProxyValidator::with_cache_config(config, cache_config.clone(), metrics));
+        if enabled {
+            validator.spawn_cache_maintenance_task(cache_config.cleanup_interval());
         }
+
+        Self { validator, enabled }
     }
 
     /// Creates a new `TrustedProxyLayer` that is enabled by default.
@@ -63,10 +73,10 @@ impl TrustedProxyLayer {
 }
 
 impl<S> Layer<S> for TrustedProxyLayer {
-    type Service = TrustedProxyMiddleware<S>;
+    type Service = LegacyTrustedProxyMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        TrustedProxyMiddleware {
+        LegacyTrustedProxyMiddleware {
             inner,
             validator: self.validator.clone(),
             enabled: self.enabled,

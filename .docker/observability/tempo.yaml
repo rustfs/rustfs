@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-partition_ring_live_store: true
 stream_over_http_enabled: true
 
 server:
@@ -33,33 +32,17 @@ distributor:
           endpoint: "0.0.0.0:4317"
         http:
           endpoint: "0.0.0.0:4318"
-  #log_received_spans:
-  #    enabled: true
-  #  log_discarded_spans:
-  #    enabled: true
 
-backend_scheduler:
-  provider:
-    compaction:
-      compaction:
-        block_retention: 1h
-
-backend_worker:
-  backend_scheduler_addr: localhost:3200
-  compaction:
-    block_retention: 1h
-  ring:
-    kvstore:
-      store: memberlist
-
-querier:
-  query_live_store: true
+ingester:
+  max_block_duration: 5m
 
 metrics_generator:
   registry:
     external_labels:
       source: tempo
       cluster: docker-compose
+  traces_storage:
+    path: /var/tempo/generator/traces
   storage:
     path: /var/tempo/generator/wal
     remote_write:
@@ -85,15 +68,5 @@ overrides:
       processors: [ "span-metrics", "service-graphs", "local-blocks" ]
       generate_native_histograms: both
 
-ingest:
-  enabled: true
-  kafka:
-    address: redpanda:9092
-    topic: tempo-ingest
-
-block_builder:
-  consume_cycle_duration: 30s
-
 usage_report:
   reporting_enabled: false
-

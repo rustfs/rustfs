@@ -547,7 +547,7 @@ pub struct DecryptionRequest<'a> {
     /// SSE-C key MD5 (Base64-encoded) - required if object was encrypted with SSE-C
     pub sse_customer_key_md5: Option<&'a SSECustomerKeyMD5>,
     /// Part number (for multipart upload, None for single-part)
-    pub part_number: Option<usize>,
+    pub part_number: Option<usize>, // Unused Fields
     /// Parts information for multipart objects
     pub parts: &'a [ObjectPartInfo],
     /// Object-level ETag, used to distinguish multipart objects from single-part objects.
@@ -934,7 +934,7 @@ async fn apply_ssec_encryption_material(
 ) -> Result<EncryptionMaterial, ApiError> {
     let params = SsecParams {
         algorithm,
-        key: sse_key.to_string(),
+        key: sse_key,
         key_md5: sse_key_md5,
     };
 
@@ -1058,7 +1058,7 @@ async fn apply_managed_encryption_material(
     }
 
     // Determine KMS key ID to use for internal key wrapping.
-    let mut kms_key_candidate = kms_key_id.clone().map(|s| s.to_string());
+    let mut kms_key_candidate = kms_key_id.clone();
     if kms_key_candidate.is_none() {
         // Try to get default key from KMS service (if available)
         if let Some(service) = get_global_encryption_service().await {
@@ -1318,18 +1318,20 @@ pub trait SseDekProvider: Send + Sync {
 // ============================================================================
 
 /// Production KMS-backed DEK provider
-/// Wraps the global ObjectEncryptionService to provide SSE DEK operations
-struct KmsSseDekProvider {
-    service: Arc<rustfs_kms::service::ObjectEncryptionService>,
-}
+/// Resolves the latest global ObjectEncryptionService on each call.
+struct KmsSseDekProvider;
 
 impl KmsSseDekProvider {
     /// Create a new KMS-backed provider
     pub async fn new() -> Result<Self, ApiError> {
-        let service = get_global_encryption_service()
+        Self::current_service()
             .await
             .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
-        Ok(Self { service })
+        Ok(Self)
+    }
+
+    async fn current_service() -> Option<Arc<rustfs_kms::service::ObjectEncryptionService>> {
+        get_global_encryption_service().await
     }
 }
 
@@ -1339,8 +1341,10 @@ impl SseDekProvider for KmsSseDekProvider {
         let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
 
         let kms_key_option = Some(kms_key_id.to_string());
-        let (data_key, encrypted_data_key) = self
-            .service
+        let service = Self::current_service()
+            .await
+            .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
+        let (data_key, encrypted_data_key) = service
             .create_data_key(&kms_key_option, &context)
             .await
             .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {}", e))))?;
@@ -1351,8 +1355,10 @@ impl SseDekProvider for KmsSseDekProvider {
     async fn decrypt_sse_dek(&self, encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8; 32], ApiError> {
         // Create a minimal context for decryption
         let context = ObjectEncryptionContext::new("".to_string(), "".to_string());
-        let data_key = self
-            .service
+        let service = Self::current_service()
+            .await
+            .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
+        let data_key = service
             .decrypt_data_key(encrypted_dek, &context)
             .await
             .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {}", e))))?;
@@ -1678,7 +1684,13 @@ where
         })
         .sum();
 
-    let reader = boxed_reader(DecryptReader::new_multipart(wrap_reader(encrypted_stream), key_bytes, base_nonce));
+    let multipart_parts = parts.iter().map(|part| part.number).collect();
+    let reader = boxed_reader(DecryptReader::new_multipart(
+        wrap_reader(encrypted_stream),
+        key_bytes,
+        base_nonce,
+        multipart_parts,
+    ));
 
     Ok((reader, total_plain_size))
 }
@@ -2075,6 +2087,71 @@ mod tests {
 
         let mut expected = part_one_plaintext;
         expected.extend_from_slice(&part_two_plaintext);
+
+        assert_eq!(plaintext_size, expected.len() as i64);
+        assert_eq!(decrypted, expected);
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_multipart_managed_stream_uses_actual_part_numbers_for_nonce_derivation() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        let key_bytes = [0xAu8; 32];
+        let base_nonce = [0xBu8; 12];
+
+        let part_three_plaintext = vec![0x55; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 13];
+        let part_five_plaintext = vec![0x66; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 29];
+
+        let part_three_nonce = derive_part_nonce(base_nonce, 3);
+        let part_five_nonce = derive_part_nonce(base_nonce, 5);
+
+        let encrypted_three = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_three_plaintext.clone()), key_bytes, part_three_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+        let encrypted_five = {
+            let mut buf = Vec::new();
+            EncryptReader::new(Cursor::new(part_five_plaintext.clone()), key_bytes, part_five_nonce)
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
+            buf
+        };
+
+        let mut encrypted_stream = Vec::with_capacity(encrypted_three.len() + encrypted_five.len());
+        encrypted_stream.extend_from_slice(&encrypted_three);
+        encrypted_stream.extend_from_slice(&encrypted_five);
+
+        let parts = vec![
+            ObjectPartInfo {
+                number: 3,
+                size: encrypted_three.len(),
+                actual_size: part_three_plaintext.len() as i64,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 5,
+                size: encrypted_five.len(),
+                actual_size: part_five_plaintext.len() as i64,
+                ..Default::default()
+            },
+        ];
+
+        let (mut decrypted_reader, plaintext_size) =
+            decrypt_multipart_managed_stream(Cursor::new(encrypted_stream), &parts, key_bytes, base_nonce)
+                .await
+                .unwrap();
+
+        let mut decrypted = Vec::new();
+        decrypted_reader.read_to_end(&mut decrypted).await.unwrap();
+
+        let mut expected = part_three_plaintext;
+        expected.extend_from_slice(&part_five_plaintext);
 
         assert_eq!(plaintext_size, expected.len() as i64);
         assert_eq!(decrypted, expected);
@@ -2760,6 +2837,73 @@ mod tests {
         assert_eq!(decrypted_data, plaintext, "Data decrypted with recovered key should match original");
 
         println!("✅ Full cycle (generate -> encrypt DEK -> decrypt DEK -> decrypt data) test passed!");
+    }
+
+    #[tokio::test]
+    async fn test_kms_sse_dek_provider_uses_latest_reconfigured_service() {
+        use rustfs_kms::config::KmsConfig;
+        use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
+        use std::sync::OnceLock;
+        use tempfile::TempDir;
+        use tokio::sync::Mutex;
+
+        static KMS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = KMS_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+
+        let manager = rustfs_kms::init_global_kms_service_manager();
+
+        let first_dir = TempDir::new().expect("first temp dir");
+        manager
+            .reconfigure(KmsConfig::local(first_dir.path().to_path_buf()))
+            .await
+            .expect("first KMS reconfigure should succeed");
+        manager
+            .get_encryption_service()
+            .await
+            .expect("first encryption service should exist")
+            .create_key(CreateKeyRequest {
+                key_name: Some("first-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("first key should be created");
+
+        let provider = KmsSseDekProvider::new().await.expect("provider should initialize");
+        provider
+            .generate_sse_dek("bucket", "object", "first-key")
+            .await
+            .expect("provider should use the initial service");
+
+        let second_dir = TempDir::new().expect("second temp dir");
+        manager
+            .reconfigure(KmsConfig::local(second_dir.path().to_path_buf()))
+            .await
+            .expect("second KMS reconfigure should succeed");
+        manager
+            .get_encryption_service()
+            .await
+            .expect("second encryption service should exist")
+            .create_key(CreateKeyRequest {
+                key_name: Some("second-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("second key should be created");
+
+        provider
+            .generate_sse_dek("bucket", "object", "second-key")
+            .await
+            .expect("provider should resolve the latest reconfigured service");
+
+        manager.stop().await.expect("kms service should stop cleanly");
     }
 
     #[test]

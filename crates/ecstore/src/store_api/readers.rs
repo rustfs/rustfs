@@ -1,101 +1,7 @@
 use super::*;
-use rustfs_rio::TryGetIndex;
-
-pub struct ChunkNativePutData {
-    stream: Option<HashReader>,
-    size: i64,
-    actual_size: i64,
-}
-
-impl Debug for ChunkNativePutData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChunkNativePutData").finish()
-    }
-}
-
-impl ChunkNativePutData {
-    pub fn new(stream: HashReader) -> Self {
-        let size = stream.size();
-        let actual_size = stream.actual_size();
-        Self {
-            stream: Some(stream),
-            size,
-            actual_size,
-        }
-    }
-
-    pub fn from_vec(data: Vec<u8>) -> Self {
-        use sha2::{Digest, Sha256};
-
-        let content_length = data.len() as i64;
-        let sha256hex = if content_length > 0 {
-            Some(hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower))
-        } else {
-            None
-        };
-        Self::new(HashReader::from_stream(Cursor::new(data), content_length, content_length, None, sha256hex, false).unwrap())
-    }
-
-    pub fn take_stream(&mut self) -> std::io::Result<HashReader> {
-        self.stream
-            .take()
-            .ok_or_else(|| std::io::Error::other("ChunkNativePutData stream already taken"))
-    }
-
-    pub fn restore_stream(&mut self, stream: HashReader) {
-        self.size = stream.size();
-        self.actual_size = stream.actual_size();
-        self.stream = Some(stream);
-    }
-
-    pub fn as_hash_reader(&self) -> Option<&HashReader> {
-        self.stream.as_ref()
-    }
-
-    pub fn as_hash_reader_mut(&mut self) -> Option<&mut HashReader> {
-        self.stream.as_mut()
-    }
-
-    pub fn index_bytes(&self) -> Option<Bytes> {
-        self.as_hash_reader()
-            .and_then(|reader| reader.try_get_index().map(|index| index.clone().into_vec()))
-    }
-
-    pub fn resolve_etag(&mut self) -> Option<String> {
-        self.as_hash_reader_mut()
-            .and_then(rustfs_rio::EtagResolvable::try_resolve_etag)
-    }
-
-    pub fn content_hash_bytes(&mut self) -> std::io::Result<Option<Bytes>> {
-        let Some(reader) = self.as_hash_reader_mut() else {
-            return Ok(None);
-        };
-
-        Ok(reader
-            .finalize_content_hash()?
-            .as_ref()
-            .map(|checksum| checksum.to_bytes(&[])))
-    }
-
-    pub fn content_crc_type(&self) -> Option<rustfs_rio::ChecksumType> {
-        self.as_hash_reader().and_then(HashReader::content_crc_type)
-    }
-
-    pub fn content_crc(&self) -> HashMap<String, String> {
-        self.as_hash_reader().map_or_else(HashMap::new, HashReader::content_crc)
-    }
-
-    pub fn size(&self) -> i64 {
-        self.size
-    }
-
-    pub fn actual_size(&self) -> i64 {
-        self.actual_size
-    }
-}
 
 pub struct PutObjReader {
-    data: ChunkNativePutData,
+    pub stream: HashReader,
 }
 
 impl Debug for PutObjReader {
@@ -106,81 +12,32 @@ impl Debug for PutObjReader {
 
 impl PutObjReader {
     pub fn new(stream: HashReader) -> Self {
-        Self {
-            data: ChunkNativePutData::new(stream),
-        }
+        PutObjReader { stream }
     }
 
-    pub fn chunk_native_data(&self) -> &ChunkNativePutData {
-        &self.data
-    }
-
-    pub fn chunk_native_data_mut(&mut self) -> &mut ChunkNativePutData {
-        &mut self.data
-    }
-
-    pub fn take_stream(&mut self) -> std::io::Result<HashReader> {
-        self.data.take_stream()
-    }
-
-    pub fn restore_stream(&mut self, stream: HashReader) {
-        self.data.restore_stream(stream);
-    }
-
-    pub fn as_hash_reader(&self) -> Option<&HashReader> {
-        self.data.as_hash_reader()
-    }
-
-    pub fn as_hash_reader_mut(&mut self) -> Option<&mut HashReader> {
-        self.data.as_hash_reader_mut()
-    }
-
-    pub fn index_bytes(&self) -> Option<Bytes> {
-        self.data.index_bytes()
-    }
-
-    pub fn resolve_etag(&mut self) -> Option<String> {
-        self.data.resolve_etag()
-    }
-
-    pub fn content_hash_bytes(&mut self) -> std::io::Result<Option<Bytes>> {
-        self.data.content_hash_bytes()
-    }
-
-    pub fn content_crc_type(&self) -> Option<rustfs_rio::ChecksumType> {
-        self.data.content_crc_type()
-    }
-
-    pub fn content_crc(&self) -> HashMap<String, String> {
-        self.data.content_crc()
+    pub fn as_hash_reader(&self) -> &HashReader {
+        &self.stream
     }
 
     pub fn from_vec(data: Vec<u8>) -> Self {
-        Self {
-            data: ChunkNativePutData::from_vec(data),
+        use sha2::{Digest, Sha256};
+        let content_length = data.len() as i64;
+        let sha256hex = if content_length > 0 {
+            Some(hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+        PutObjReader {
+            stream: HashReader::from_stream(Cursor::new(data), content_length, content_length, None, sha256hex, false).unwrap(),
         }
     }
 
     pub fn size(&self) -> i64 {
-        self.data.size()
+        self.stream.size()
     }
 
     pub fn actual_size(&self) -> i64 {
-        self.data.actual_size()
-    }
-}
-
-impl std::ops::Deref for PutObjReader {
-    type Target = ChunkNativePutData;
-
-    fn deref(&self) -> &Self::Target {
-        &self.data
-    }
-}
-
-impl std::ops::DerefMut for PutObjReader {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.data
+        self.stream.actual_size()
     }
 }
 
@@ -206,34 +63,31 @@ impl GetObjectReader {
             rs = HTTPRangeSpec::from_object_info(oi, part_number);
         }
 
-        let logical_size = oi.get_actual_size()?;
-        let encrypted_object = oi.user_defined.contains_key("x-rustfs-encryption-key")
-            || oi
-                .user_defined
-                .contains_key("x-amz-server-side-encryption-customer-algorithm");
+        // TODO:Encrypted
 
         let (algo, is_compressed) = oi.is_compressed_ok()?;
 
         // TODO: check TRANSITION
 
         if is_compressed {
+            let actual_size = oi.get_actual_size()?;
             let (off, length, dec_off, dec_length) = if let Some(rs) = rs {
                 // Support range requests for compressed objects
-                let (dec_off, dec_length) = rs.get_offset_length(logical_size)?;
+                let (dec_off, dec_length) = rs.get_offset_length(actual_size)?;
                 (0, oi.size, dec_off, dec_length)
             } else {
-                (0, oi.size, 0, logical_size)
+                (0, oi.size, 0, actual_size)
             };
 
             let dec_reader = DecompressReader::new(reader, algo);
 
-            let actual_size_usize = if logical_size > 0 {
-                logical_size as usize
+            let actual_size_usize = if actual_size > 0 {
+                actual_size as usize
             } else {
-                return Err(Error::other(format!("invalid decompressed size {logical_size}")));
+                return Err(Error::other(format!("invalid decompressed size {actual_size}")));
             };
 
-            let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if dec_off > 0 || dec_length != logical_size {
+            let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if dec_off > 0 || dec_length != actual_size {
                 // Use RangedDecompressReader for streaming range processing
                 // The new implementation supports any offset size by streaming and skipping data
                 match RangedDecompressReader::new(dec_reader, dec_off, dec_length, actual_size_usize) {
@@ -268,19 +122,8 @@ impl GetObjectReader {
             ));
         }
 
-        if encrypted_object && rs.is_none() {
-            return Ok((
-                GetObjectReader {
-                    stream: reader,
-                    object_info: oi.clone(),
-                },
-                0,
-                oi.size,
-            ));
-        }
-
         if let Some(rs) = rs {
-            let (off, length) = rs.get_offset_length(logical_size)?;
+            let (off, length) = rs.get_offset_length(oi.size)?;
 
             Ok((
                 GetObjectReader {
@@ -297,7 +140,7 @@ impl GetObjectReader {
                     object_info: oi.clone(),
                 },
                 0,
-                logical_size,
+                oi.size,
             ))
         }
     }
@@ -831,5 +674,59 @@ mod tests {
         let n2 = ranged_reader.read(&mut buf2).await.unwrap();
         assert_eq!(n2, 1);
         assert_eq!(&buf2[..1], b"e");
+    }
+
+    #[test]
+    fn test_get_object_reader_range_uses_stored_size_for_encrypted_metadata() {
+        let object_info = ObjectInfo {
+            size: 10,
+            user_defined: HashMap::from([("x-amz-server-side-encryption-customer-original-size".to_string(), "20".to_string())]),
+            ..Default::default()
+        };
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 8,
+            end: -1,
+        };
+
+        let (_, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(b"0123456789".to_vec())),
+            Some(range),
+            &object_info,
+            &ObjectOptions::default(),
+            &HeaderMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(offset, 8);
+        assert_eq!(length, 2);
+    }
+
+    #[test]
+    fn test_get_object_reader_suffix_range_uses_stored_size_for_encrypted_metadata() {
+        let object_info = ObjectInfo {
+            size: 10,
+            user_defined: HashMap::from([("x-rustfs-encryption-original-size".to_string(), "20".to_string())]),
+            ..Default::default()
+        };
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: 4,
+            end: -1,
+        };
+
+        let (_, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(b"0123456789".to_vec())),
+            Some(range),
+            &object_info,
+            &ObjectOptions::default(),
+            &HeaderMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(offset, 6);
+        assert_eq!(length, 4);
     }
 }

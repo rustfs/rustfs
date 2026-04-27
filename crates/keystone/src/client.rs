@@ -240,7 +240,7 @@ impl KeystoneClient {
         let _body: serde_json::Value = response.json().await.map_err(|e| KeystoneError::ParseError(e.to_string()))?;
 
         // Parse access key to extract user_id and project_id
-        let (user_id, project_id) = EC2Credential::parse_access_key(access_key).unwrap_or((access_key.to_string(), None));
+        let (user_id, project_id) = EC2Credential::parse_access_key(access_key).unwrap_or_else(|| (access_key.to_string(), None));
 
         Ok(EC2Credential {
             access: access_key.to_string(),

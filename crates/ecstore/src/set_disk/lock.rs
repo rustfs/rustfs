@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::disk::health_state::DriveMembershipSnapshot;
 
 impl SetDisks {
     pub(super) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
@@ -72,41 +73,28 @@ impl SetDisks {
     }
 
     pub(super) async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {
-        let mut disks = self.get_disks_internal().await;
-
-        // TODO: diskinfo filter online
-
-        let mut new_disk = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
-            if let Some(d) = disk
-                && d.is_online().await
-            {
-                new_disk.push(disk.clone());
-            }
-        }
+        let snapshot = self.drive_membership_snapshot().await;
+        let mut disks = snapshot.strict_online_candidates().into_iter().map(Some).collect::<Vec<_>>();
 
         let mut rng = rand::rng();
-
         disks.shuffle(&mut rng);
 
-        new_disk
-        // let disks = self.get_disks_internal().await;
-        // let (filtered, _) = self.filter_online_disks(disks).await;
-        // filtered.into_iter().filter(|disk| disk.is_some()).collect()
+        disks
     }
 
     pub(super) async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
-        let mut disks = self.get_online_disks().await;
+        let snapshot = self.drive_membership_snapshot().await;
+        let mut disks = snapshot
+            .strict_online_local_candidates()
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
 
         let mut rng = rand::rng();
 
         disks.shuffle(&mut rng);
 
         disks
-            .into_iter()
-            .filter(|v| v.as_ref().is_some_and(|d| d.is_local()))
-            .collect()
     }
 
     pub async fn get_online_disks_with_healing(&self, incl_healing: bool) -> (Vec<DiskStore>, bool) {
@@ -114,28 +102,41 @@ impl SetDisks {
         (disks, healing > 0)
     }
 
-    pub async fn get_online_disks_with_healing_and_info(&self, incl_healing: bool) -> (Vec<DiskStore>, Vec<DiskInfo>, usize) {
-        let mut disks = self.get_disks_internal().await;
+    pub async fn drive_membership_snapshot(&self) -> DriveMembershipSnapshot {
+        let disks = self.get_disks_internal().await;
+        DriveMembershipSnapshot::from_optional_disks(&disks)
+    }
 
-        let mut infos = Vec::with_capacity(disks.len());
+    pub async fn get_online_disks_with_healing_and_info(&self, incl_healing: bool) -> (Vec<DiskStore>, Vec<DiskInfo>, usize) {
+        let snapshot = self.drive_membership_snapshot().await;
+        let mut disks = snapshot.scanner_heal_candidates().into_iter().map(Some).collect::<Vec<_>>();
+
+        let mut infos: Vec<Option<DiskInfo>> = vec![None; disks.len()];
 
         let mut futures = Vec::with_capacity(disks.len());
-        let mut numbers: Vec<usize> = (0..disks.len()).collect();
         {
             let mut rng = rand::rng();
             disks.shuffle(&mut rng);
-
-            numbers.shuffle(&mut rng);
         }
 
-        for &i in numbers.iter() {
-            let disk = disks[i].clone();
+        for (i, disk) in disks.iter().cloned().enumerate() {
             futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.disk_info(&DiskInfoOptions::default()).await
+                let info = if let Some(disk) = disk {
+                    match disk.disk_info(&DiskInfoOptions::default()).await {
+                        Ok(info) => info,
+                        Err(err) => DiskInfo {
+                            error: err.to_string(),
+                            ..Default::default()
+                        },
+                    }
                 } else {
-                    Err(DiskError::DiskNotFound)
-                }
+                    DiskInfo {
+                        error: DiskError::DiskNotFound.to_string(),
+                        ..Default::default()
+                    }
+                };
+
+                Ok((i, info))
             });
         }
 
@@ -143,13 +144,13 @@ impl SetDisks {
         let processor = get_global_processors().metadata_processor();
         let results = processor.execute_batch(futures).await;
 
-        for result in results {
+        for (submitted_idx, result) in results.into_iter().enumerate() {
             match result {
-                Ok(res) => {
-                    infos.push(res);
+                Ok((disk_idx, info)) => {
+                    infos[disk_idx] = Some(info);
                 }
                 Err(err) => {
-                    infos.push(DiskInfo {
+                    infos[submitted_idx] = Some(DiskInfo {
                         error: err.to_string(),
                         ..Default::default()
                     });
@@ -167,8 +168,11 @@ impl SetDisks {
         let mut new_disks = Vec::new();
         let mut new_infos = Vec::new();
 
-        for &i in numbers.iter() {
-            let (info, disk) = (infos[i].clone(), disks[i].clone());
+        for (disk, info) in disks.into_iter().zip(infos) {
+            let Some(info) = info else {
+                continue;
+            };
+
             if !info.error.is_empty() || disk.is_none() {
                 continue;
             }
@@ -365,5 +369,162 @@ impl SetDisks {
         new_infos.extend(healing_infos);
 
         Ok((new_disks, new_infos, healing))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store_init::save_format_file;
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    async fn make_formatted_local_disk(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_idx);
+
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("local disk should be created");
+
+        let mut disk_format = format.clone();
+        disk_format.erasure.this = format.erasure.sets[0][disk_idx];
+        save_format_file(&Some(disk.clone()), &Some(disk_format))
+            .await
+            .expect("format should be saved");
+
+        (dir, endpoint, disk)
+    }
+
+    #[tokio::test]
+    async fn get_online_disks_with_healing_and_info_keeps_disk_and_info_aligned() {
+        let disk_count = 8;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        for _ in 0..32 {
+            let (online_disks, infos, healing) = set_disks.get_online_disks_with_healing_and_info(false).await;
+            assert_eq!(healing, 0);
+            assert_eq!(online_disks.len(), disk_count);
+            assert_eq!(infos.len(), disk_count);
+
+            for (disk, info) in online_disks.iter().zip(infos.iter()) {
+                assert!(
+                    info.error.is_empty(),
+                    "unexpected disk_info error for {}: {}",
+                    disk.endpoint(),
+                    info.error
+                );
+                assert_eq!(info.endpoint, disk.endpoint().to_string());
+                assert_eq!(
+                    info.id,
+                    disk.get_disk_id().await.expect("disk id lookup should succeed"),
+                    "disk info should stay aligned with disk {}",
+                    disk.endpoint()
+                );
+            }
+        }
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn drive_membership_snapshot_filters_offline_disks_from_candidates() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        let all_disks = set_disks.get_disks_internal().await;
+        all_disks[1]
+            .as_ref()
+            .expect("disk 1 should exist")
+            .force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Suspect);
+        all_disks[2]
+            .as_ref()
+            .expect("disk 2 should exist")
+            .force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Returning);
+        all_disks[3]
+            .as_ref()
+            .expect("disk 3 should exist")
+            .force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+
+        let snapshot = set_disks.drive_membership_snapshot().await;
+        assert_eq!(snapshot.online.len(), 1);
+        assert_eq!(snapshot.suspect.len(), 1);
+        assert_eq!(snapshot.returning.len(), 1);
+        assert_eq!(snapshot.offline.len(), 1);
+        assert_eq!(snapshot.scanner_heal_candidates().len(), 3);
+
+        let strict_online = set_disks.get_online_disks().await;
+        assert_eq!(strict_online.len(), 1, "strict online selection should exclude suspect/returning/offline");
+
+        let (online_disks, infos, healing) = set_disks.get_online_disks_with_healing_and_info(false).await;
+        assert_eq!(healing, 0);
+        assert_eq!(online_disks.len(), 3);
+        assert_eq!(infos.len(), 3);
+        assert!(
+            online_disks
+                .iter()
+                .all(|disk| { disk.runtime_state() != crate::disk::health_state::RuntimeDriveHealthState::Offline }),
+            "offline disks should be filtered by membership snapshot"
+        );
+
+        drop(temp_dirs);
     }
 }

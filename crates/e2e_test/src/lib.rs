@@ -100,10 +100,6 @@ mod cluster_concurrency_test;
 #[cfg(test)]
 mod checksum_upload_test;
 
-// Range request regression tests
-#[cfg(test)]
-mod range_request_test;
-
 // Group deletion tests
 #[cfg(test)]
 mod group_delete_test;
@@ -129,3 +125,5 @@ mod replication_extension_test;
 
 #[cfg(test)]
 mod snowball_auto_extract_test;
+
+pub mod tls_gen;

@@ -17,7 +17,10 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     store::{Key, QueueStore, Store},
-    target::{ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetType},
+    target::{
+        ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
+        TargetType,
+    },
 };
 use async_trait::async_trait;
 use hyper_rustls::ConfigBuilderExt;
@@ -464,12 +467,12 @@ impl MQTTArgs {
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
             if !path.is_absolute() {
-                return Err(TargetError::Configuration("mqtt queueDir path should be absolute".to_string()));
+                return Err(TargetError::Configuration("mqtt queue_dir path should be absolute".to_string()));
             }
 
             if self.qos == QoS::AtMostOnce {
                 return Err(TargetError::Configuration(
-                    "QoS should be AtLeastOnce (1) or ExactlyOnce (2) if queueDir is set".to_string(),
+                    "QoS should be AtLeastOnce (1) or ExactlyOnce (2) if queue_dir is set".to_string(),
                 ));
             }
         }
@@ -494,6 +497,7 @@ where
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     connected: Arc<AtomicBool>,
     bg_task_manager: Arc<BgTaskManager>,
+    delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: PhantomData<E>,
 }
 
@@ -505,7 +509,7 @@ where
     #[instrument(skip(args), fields(target_id_as_string = %id))]
     pub fn new(id: String, args: MQTTArgs) -> Result<Self, TargetError> {
         args.validate()?;
-        let target_id = TargetID::new(id.clone(), ChannelTargetType::Mqtt.as_str().to_string());
+        let target_id = TargetID::new(id, ChannelTargetType::Mqtt.as_str().to_string());
         let queue_store = if !args.queue_dir.is_empty() {
             let base_path = PathBuf::from(&args.queue_dir);
             let unique_dir_name = format!("rustfs-{}-{}", ChannelTargetType::Mqtt.as_str(), target_id.id).replace(":", "_");
@@ -546,6 +550,7 @@ where
             store: queue_store,
             connected: Arc::new(AtomicBool::new(false)),
             bg_task_manager,
+            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
     }
@@ -667,7 +672,7 @@ where
             bucket = %meta.bucket_name,
             object = %meta.object_name,
             event = %meta.event_name,
-            preview = %meta.best_effort_preview(&body, 256),
+            payload_len = body.len(),
             "Sending MQTT payload"
         );
 
@@ -685,6 +690,7 @@ where
             })?;
 
         debug!(target_id = %self.id, topic = %self.args.topic, "Event published to MQTT topic");
+        self.delivery_counters.record_success();
         Ok(())
     }
 
@@ -696,6 +702,7 @@ where
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: self.connected.clone(),
             bg_task_manager: self.bg_task_manager.clone(),
+            delivery_counters: self.delivery_counters.clone(),
             _phantom: PhantomData,
         })
     }
@@ -890,21 +897,31 @@ where
 
     #[instrument(skip(self, event), fields(target_id = %self.id))]
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-        let queued = self.build_queued_payload(&event)?;
+        let queued = match self.build_queued_payload(&event) {
+            Ok(queued) => queued,
+            Err(err) => {
+                self.delivery_counters.record_final_failure();
+                return Err(err);
+            }
+        };
 
         if let Some(store) = &self.store {
             debug!(target_id = %self.id, "Event saved to store start");
-            match store.put_raw(
-                &queued
-                    .encode()
-                    .map_err(|e| TargetError::Storage(format!("Failed to encode queued payload: {e}")))?,
-            ) {
+            let encoded = match queued.encode() {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    self.delivery_counters.record_final_failure();
+                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
+                }
+            };
+            match store.put_raw(&encoded) {
                 Ok(_) => {
                     debug!(target_id = %self.id, "Event saved to store for MQTT target successfully.");
                     Ok(())
                 }
                 Err(e) => {
                     error!(target_id = %self.id, error = %e, "Failed to save event to store");
+                    self.delivery_counters.record_final_failure();
                     return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
                 }
             }
@@ -920,15 +937,21 @@ where
                     Ok(_) => debug!(target_id = %self.id, "MQTT target initialized successfully."),
                     Err(e) => {
                         error!(target_id = %self.id, error = %e, "Failed to initialize MQTT target.");
+                        self.delivery_counters.record_final_failure();
                         return Err(TargetError::NotConnected);
                     }
                 }
                 if !self.connected.load(Ordering::SeqCst) {
                     error!(target_id = %self.id, "Cannot save (send directly) as target is not active after init attempt.");
+                    self.delivery_counters.record_final_failure();
                     return Err(TargetError::NotConnected);
                 }
             }
-            self.send_body(queued.body, &queued.meta).await
+            if let Err(err) = self.send_body(queued.body, &queued.meta).await {
+                self.delivery_counters.record_final_failure();
+                return Err(err);
+            }
+            Ok(())
         }
     }
 
@@ -1016,6 +1039,15 @@ where
 
     fn is_enabled(&self) -> bool {
         self.args.enable
+    }
+
+    fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
+        self.delivery_counters
+            .snapshot(self.store.as_deref().map_or(0, |store| store.len() as u64))
+    }
+
+    fn record_final_failure(&self) {
+        self.delivery_counters.record_final_failure();
     }
 }
 

@@ -33,6 +33,23 @@ pub struct HTTPPreconditions {
     pub if_unmodified_since: Option<OffsetDateTime>,
 }
 
+impl HTTPPreconditions {
+    pub(crate) fn if_match_value(&self) -> Option<&str> {
+        non_empty_condition_value(self.if_match.as_deref())
+    }
+
+    pub(crate) fn if_none_match_value(&self) -> Option<&str> {
+        non_empty_condition_value(self.if_none_match.as_deref())
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ObjectLockRetentionOptions {
+    pub mode: Option<String>,
+    pub retain_until: Option<OffsetDateTime>,
+    pub bypass_governance: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -69,8 +86,8 @@ pub struct ObjectOptions {
     pub lifecycle_audit_event: LcAuditEvent,
 
     pub eval_metadata: Option<HashMap<String, String>>,
+    pub object_lock_retention: Option<ObjectLockRetentionOptions>,
 
-    pub resolved_checksum: Option<Bytes>,
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
     pub capacity_scope_token: Option<Uuid>,
@@ -147,7 +164,10 @@ impl ObjectOptions {
         }
 
         if let Some(pre) = &self.http_preconditions {
-            if let Some(if_none_match) = &pre.if_none_match
+            let if_none_match = pre.if_none_match_value();
+            let if_match = pre.if_match_value();
+
+            if let Some(if_none_match) = if_none_match
                 && let Some(etag) = &obj_info.etag
                 && is_etag_equal(etag, if_none_match)
             {
@@ -162,7 +182,7 @@ impl ObjectOptions {
                 return Err(Error::NotModified);
             }
 
-            if let Some(if_match) = &pre.if_match {
+            if let Some(if_match) = if_match {
                 if let Some(etag) = &obj_info.etag {
                     if !is_etag_equal(etag, if_match) {
                         return Err(Error::PreconditionFailed);
@@ -172,7 +192,7 @@ impl ObjectOptions {
                 }
             }
             if has_valid_mod_time
-                && pre.if_match.is_none()
+                && if_match.is_none()
                 && let Some(if_unmodified_since) = &pre.if_unmodified_since
                 && let Some(mod_time) = &obj_info.mod_time
                 && is_modified_since(mod_time, if_unmodified_since)
@@ -183,6 +203,10 @@ impl ObjectOptions {
 
         Ok(())
     }
+}
+
+fn non_empty_condition_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn is_etag_equal(etag1: &str, etag2: &str) -> bool {
@@ -285,7 +309,7 @@ pub struct ObjectInfo {
     pub expires: Option<OffsetDateTime>,
     pub num_versions: usize,
     pub successor_mod_time: Option<OffsetDateTime>,
-    pub put_object_reader: Option<ChunkNativePutData>,
+    pub put_object_reader: Option<PutObjReader>,
     pub etag: Option<String>,
     pub inlined: bool,
     pub metadata_only: bool,
@@ -447,6 +471,11 @@ impl ObjectInfo {
             .replication_state_internal
             .as_ref()
             .and_then(|v| v.version_purge_status_internal.clone());
+        let replication_decision = fi
+            .replication_state_internal
+            .as_ref()
+            .map(|v| v.replicate_decision_str.clone())
+            .unwrap_or_default();
 
         let mut replication_status = fi.replication_status();
         if replication_status.is_empty()
@@ -511,18 +540,6 @@ impl ObjectInfo {
             })
             .collect();
 
-        let actual_size = fi
-            .parts
-            .iter()
-            .map(|part| {
-                if part.actual_size > 0 {
-                    part.actual_size
-                } else {
-                    i64::try_from(part.size).unwrap_or_default()
-                }
-            })
-            .sum();
-
         // TODO: part checksums
 
         ObjectInfo {
@@ -535,7 +552,6 @@ impl ObjectInfo {
             delete_marker: fi.deleted,
             mod_time: fi.mod_time,
             size: fi.size,
-            actual_size,
             parts,
             is_latest: fi.is_latest,
             user_tags,
@@ -556,6 +572,7 @@ impl ObjectInfo {
             replication_status,
             version_purge_status_internal,
             version_purge_status,
+            replication_decision,
             ..Default::default()
         }
     }
@@ -1024,6 +1041,7 @@ pub struct ObjectInfoOrErr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_filemeta::ReplicationState;
 
     #[test]
     fn get_actual_size_prefers_actual_size_field() {
@@ -1071,6 +1089,40 @@ mod tests {
         };
 
         assert_eq!(info.get_actual_size().unwrap(), 77);
+    }
+
+    #[test]
+    fn precondition_check_ignores_empty_etag_conditions() {
+        let opts = ObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some(String::new()),
+                if_none_match: Some(" ".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let info = ObjectInfo {
+            mod_time: Some(OffsetDateTime::now_utc()),
+            etag: Some("\"abc\"".to_string()),
+            ..Default::default()
+        };
+
+        assert!(opts.precondition_check(&info).is_ok());
+    }
+
+    #[test]
+    fn from_file_info_preserves_replication_decision() {
+        let fi = rustfs_filemeta::FileInfo {
+            replication_state_internal: Some(ReplicationState {
+                replicate_decision_str: "arn=true;false;arn:replication::1:dest;rule-id".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "object", true);
+
+        assert_eq!(info.replication_decision, "arn=true;false;arn:replication::1:dest;rule-id");
     }
 
     #[test]

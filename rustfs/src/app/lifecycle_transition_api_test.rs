@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
+use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::storage::ecfs::FS;
 use bytes::Bytes;
 use futures::stream;
@@ -27,8 +28,8 @@ use rustfs_ecstore::{
     global::GLOBAL_TierConfigMgr,
     store::ECStore,
     store_api::{
-        BucketOperations, BucketOptions, ChunkNativePutData, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations,
-        ObjectOptions,
+        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions,
+        PutObjReader,
     },
     tier::{
         tier_config::{TierConfig, TierType},
@@ -150,7 +151,7 @@ async fn upload_test_object(
     object: &str,
     data: &[u8],
 ) -> rustfs_ecstore::store_api::ObjectInfo {
-    let mut reader = ChunkNativePutData::from_vec(data.to_vec());
+    let mut reader = PutObjReader::from_vec(data.to_vec());
     (**ecstore)
         .put_object(bucket, object, &mut reader, &ObjectOptions::default())
         .await
@@ -180,6 +181,40 @@ async fn set_bucket_lifecycle_transition_with_tier(
 
     metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
     Ok(())
+}
+
+fn expiration_lifecycle_configuration(prefix: &str) -> BucketLifecycleConfiguration {
+    BucketLifecycleConfiguration {
+        expiry_updated_at: None,
+        rules: vec![LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            expiration: Some(LifecycleExpiration {
+                date: Some(Timestamp::from(
+                    time::OffsetDateTime::now_utc()
+                        .replace_time(time::Time::MIDNIGHT)
+                        .saturating_sub(time::Duration::days(1)),
+                )),
+                days: None,
+                expired_object_delete_marker: None,
+                ..Default::default()
+            }),
+            filter: Some(LifecycleRuleFilter {
+                and: None,
+                object_size_greater_than: None,
+                object_size_less_than: None,
+                prefix: Some(prefix.to_string()),
+                tag: None,
+                ..Default::default()
+            }),
+            id: Some("expire-existing".to_string()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }],
+    }
 }
 
 #[derive(Clone, Default)]
@@ -326,6 +361,24 @@ async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &
     }
 }
 
+async fn wait_for_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if let Ok(info) = ecstore.get_object_info(bucket, object, &ObjectOptions::default()).await
+            && info.delete_marker
+        {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn build_request<T>(input: T, method: Method) -> S3Request<T> {
     S3Request {
         input,
@@ -373,8 +426,7 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
         .build()
         .unwrap();
 
-    usecase
-        .execute_put_object(&fs, build_request(put_input, Method::PUT))
+    Box::pin(usecase.execute_put_object(&fs, build_request(put_input, Method::PUT)))
         .await
         .expect("Failed to put object through usecase");
 
@@ -410,8 +462,7 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
         .build()
         .unwrap();
 
-    usecase
-        .execute_copy_object(build_request(copy_input, Method::PUT))
+    Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
         .await
         .expect("Failed to copy object through usecase");
 
@@ -448,7 +499,7 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
         .await
         .expect("Failed to create multipart upload");
 
-    let mut reader = ChunkNativePutData::from_vec(payload.to_vec());
+    let mut reader = PutObjReader::from_vec(payload.to_vec());
     let uploaded_part = ecstore
         .put_object_part(bucket.as_str(), object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
         .await
@@ -468,8 +519,7 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
         .build()
         .unwrap();
 
-    usecase
-        .execute_complete_multipart_upload(build_request(complete_input, Method::POST))
+    Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
         .await
         .expect("Failed to complete multipart upload through usecase");
 
@@ -526,8 +576,7 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
     );
     insert_header(&mut req.headers, SUFFIX_FORCE_DELETE, "true");
 
-    usecase
-        .execute_delete_object(req)
+    Box::pin(usecase.execute_delete_object(req))
         .await
         .expect("Failed to delete object through usecase");
 
@@ -586,4 +635,38 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .map(|path| stdfs::canonicalize(path).unwrap().to_string_lossy().into_owned())
         .collect();
     assert_eq!(actual_paths, expected_paths);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn put_bucket_lifecycle_configuration_expires_existing_objects() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultBucketUsecase::without_context();
+
+    let bucket = format!("test-api-expire-existing-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/existing.txt";
+    let payload = b"expire existing object after lifecycle update";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+
+    let req = build_request(
+        PutBucketLifecycleConfigurationInput::builder()
+            .bucket(bucket.clone())
+            .lifecycle_configuration(Some(expiration_lifecycle_configuration("test/")))
+            .build()
+            .unwrap(),
+        Method::PUT,
+    );
+
+    usecase
+        .execute_put_bucket_lifecycle_configuration(req)
+        .await
+        .expect("Failed to update lifecycle configuration");
+
+    assert!(
+        wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
+        "existing object should be lifecycle-deleted after lifecycle update"
+    );
 }

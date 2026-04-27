@@ -15,7 +15,9 @@
 #![allow(clippy::map_entry)]
 
 use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
-use crate::bucket::lifecycle::bucket_lifecycle_ops::{enqueue_transition_immediate, init_background_expiry};
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{
+    enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
+};
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::check_abort_multipart_args;
 use crate::bucket::utils::check_complete_multipart_args;
@@ -59,10 +61,9 @@ use crate::{
     rpc::S3PeerSys,
     sets::Sets,
     store_api::{
-        BucketInfo, BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, DeleteBucketOptions, DeletedObject,
-        GetObjectReader, HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions,
-        MultipartOperations, MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo,
-        StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartOperations,
+        MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init,
 };
@@ -135,7 +136,8 @@ async fn enqueue_transition_after_write(result: Result<ObjectInfo>, src: LcEvent
     match result {
         Ok(oi) => {
             if should_enqueue_transition_immediately(&oi) {
-                enqueue_transition_immediate(&oi, src).await;
+                enqueue_transition_immediate(&oi, src.clone()).await;
+                enqueue_immediate_expiry(&oi, src).await;
             }
             Ok(oi)
         }
@@ -161,7 +163,7 @@ mod rebalance;
 use peer::init_local_peer;
 pub use peer::{
     all_local_disk, all_local_disk_path, find_local_disk, find_local_disk_by_ref, get_disk_infos, get_disk_via_endpoint,
-    has_space_for, init_local_disks, init_lock_clients,
+    has_space_for, init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
 };
 
 #[derive(Debug)]
@@ -260,13 +262,7 @@ impl ObjectIO for ECStore {
         self.handle_get_object_reader(bucket, object, range, h, opts).await
     }
     #[instrument(level = "debug", skip(self, data))]
-    async fn put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &mut ChunkNativePutData,
-        opts: &ObjectOptions,
-    ) -> Result<ObjectInfo> {
+    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
         enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject).await
     }
 }
@@ -502,7 +498,7 @@ impl MultipartOperations for ECStore {
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: &mut ChunkNativePutData,
+        data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         self.handle_put_object_part(bucket, object, upload_id, part_id, data, opts)
@@ -675,6 +671,17 @@ impl ServerPoolsAvailableSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::endpoints::{Endpoints, PoolEndpoints};
+    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
+    use crate::store_init::{connect_load_init_formats, init_disks};
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    async fn reset_local_disk_globals() {
+        GLOBAL_LOCAL_DISK_MAP.write().await.clear();
+        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+        GLOBAL_LOCAL_DISK_SET_DRIVES.write().await.clear();
+    }
 
     #[tokio::test]
     async fn test_get_disk_infos() {
@@ -725,6 +732,73 @@ mod tests {
     async fn test_find_local_disk() {
         let result = find_local_disk(&"/nonexistent/path".to_string()).await;
         assert!(result.is_none(), "Should return None for nonexistent path");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_find_local_disk_by_ref_backfills_uuid_map() {
+        reset_local_disk_globals().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for local disk ref test");
+        let disk_paths = (0..4)
+            .map(|idx| temp_dir.path().join(format!("disk{}", idx + 1)))
+            .collect::<Vec<_>>();
+        for disk_path in &disk_paths {
+            std::fs::create_dir_all(disk_path).expect("create disk path");
+        }
+
+        let mut endpoints = Vec::new();
+        for (idx, disk_path) in disk_paths.iter().enumerate() {
+            let mut endpoint = Endpoint::try_from(disk_path.to_str().expect("disk path to str")).expect("endpoint");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(idx);
+            endpoints.push(endpoint);
+        }
+
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "find-local-disk-by-ref-test".to_string(),
+            platform: "test".to_string(),
+        }]);
+
+        init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
+
+        let (disks, errs) = init_disks(
+            &endpoint_pools.as_ref().first().expect("pool endpoints").endpoints,
+            &DiskOption {
+                cleanup: true,
+                health_check: false,
+            },
+        )
+        .await;
+
+        assert!(errs.iter().all(|err| err.is_none()), "disk init should succeed: {errs:?}");
+        connect_load_init_formats(true, &disks, 1, 4, None)
+            .await
+            .expect("initialize format metadata");
+
+        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+
+        let local_disks = all_local_disk().await;
+        let first_disk = local_disks.first().expect("local disk exists");
+        let disk_id = first_disk
+            .get_disk_id()
+            .await
+            .expect("get disk id should succeed")
+            .expect("disk id should exist");
+
+        let found = find_local_disk_by_ref(&disk_id.to_string()).await;
+        assert!(found.is_some(), "disk lookup by id should backfill cache");
+        assert_eq!(
+            GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(&disk_id).cloned(),
+            Some(first_disk.endpoint().to_string())
+        );
+
+        reset_local_disk_globals().await;
     }
 
     #[tokio::test]

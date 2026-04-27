@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::console::is_console_path;
+use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
@@ -27,6 +28,7 @@ use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
+use s3s::S3ErrorCode;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -273,6 +275,68 @@ fn is_empty_body_admin_put_path(path: &str) -> bool {
 }
 
 #[derive(Clone)]
+pub struct S3ErrorMessageCompatLayer;
+
+impl<S> Layer<S> for S3ErrorMessageCompatLayer {
+    type Service = S3ErrorMessageCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        S3ErrorMessageCompatService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct S3ErrorMessageCompatService<S> {
+    inner: S,
+}
+
+impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for S3ErrorMessageCompatService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
+    RestBody::Error: Into<S::Error> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let response = inner.call(req).await?;
+            let (parts, body) = response.into_parts();
+            let should_fix = parts.status == StatusCode::FORBIDDEN && is_xml_response(&parts.headers);
+
+            let response = match body {
+                HybridBody::Rest { rest_body } => {
+                    if !should_fix {
+                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    } else {
+                        let (rest_body, changed) = fix_s3_error_message_in_xml(rest_body).await.map_err(Into::into)?;
+                        let mut parts = parts;
+                        if changed {
+                            parts.headers.remove(http::header::CONTENT_LENGTH);
+                        }
+                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    }
+                }
+                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+            };
+
+            Ok(response)
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct ObjectAttributesEtagFixLayer;
 
 impl<S> Layer<S> for ObjectAttributesEtagFixLayer {
@@ -335,6 +399,159 @@ where
     }
 }
 
+/// Tower middleware that strips the body (and body-describing headers) from
+/// responses whose HTTP status code MUST NOT carry a body per RFC 9110 §6.4.1
+/// and §15 (1xx, 204, 205, 304).
+///
+/// The inner s3s layer serializes every `S3Error` — including 304 `NotModified`
+/// preconditions — as an XML body. Returning that body for a 304 is a protocol
+/// violation: hyper's HTTP/1.1 encoder forces the body to zero length but
+/// preserves the response, while the HTTP/2 path fills in `content-length`
+/// from the body's size hint and writes DATA frames after a HEADERS frame that
+/// should have carried END_STREAM. h2 clients (curl, browsers) and proxies see
+/// the malformed response as a connection-level failure — in the wild this
+/// surfaces as `GOAWAY error=0` on h2 and as an upstream-disconnect 5xx from
+/// reverse proxies like ngrok (`ERR_NGROK_3004`).
+#[derive(Clone)]
+pub struct BodylessStatusFixLayer;
+
+impl<S> Layer<S> for BodylessStatusFixLayer {
+    type Service = BodylessStatusFixService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        BodylessStatusFixService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct BodylessStatusFixService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for BodylessStatusFixService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    ReqBody: Send + 'static,
+    RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
+    RestBody::Error: Into<S::Error> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let response = inner.call(req).await?;
+            let (mut parts, body) = response.into_parts();
+
+            if !is_bodyless_status(parts.status) {
+                return Ok(Response::from_parts(parts, body));
+            }
+
+            let response = match body {
+                HybridBody::Rest { .. } => {
+                    parts.headers.remove(http::header::CONTENT_LENGTH);
+                    parts.headers.remove(http::header::CONTENT_TYPE);
+                    parts.headers.remove(http::header::TRANSFER_ENCODING);
+                    Response::from_parts(
+                        parts,
+                        HybridBody::Rest {
+                            rest_body: RestBody::from(Bytes::new()),
+                        },
+                    )
+                }
+                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+            };
+
+            Ok(response)
+        })
+    }
+}
+
+/// Tower middleware that strips the actual response body for `HEAD` requests
+/// while preserving metadata headers such as `Content-Length`.
+///
+/// The inner s3s layer may serialize S3 errors as XML bodies. That is valid for
+/// regular requests, but for `HEAD` the HTTP layer must suppress the response
+/// body entirely. If we forward the serialized error body over HTTP/2, clients
+/// observe DATA frames on a `HEAD` response and fail the exchange with a
+/// protocol error.
+#[derive(Clone)]
+pub struct HeadRequestBodyFixLayer;
+
+impl<S> Layer<S> for HeadRequestBodyFixLayer {
+    type Service = HeadRequestBodyFixService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        HeadRequestBodyFixService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct HeadRequestBodyFixService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for HeadRequestBodyFixService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        let is_head = req.method() == Method::HEAD;
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let response = inner.call(req).await?;
+            if !is_head {
+                return Ok(response);
+            }
+
+            let (mut parts, body) = response.into_parts();
+            parts.headers.remove(http::header::TRANSFER_ENCODING);
+
+            let response = match body {
+                HybridBody::Rest { .. } => Response::from_parts(
+                    parts,
+                    HybridBody::Rest {
+                        rest_body: RestBody::from(Bytes::new()),
+                    },
+                ),
+                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+            };
+
+            Ok(response)
+        })
+    }
+}
+
+fn is_bodyless_status(status: StatusCode) -> bool {
+    status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::RESET_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+}
+
 fn is_xml_response(headers: &HeaderMap) -> bool {
     let is_xml = headers
         .get(http::header::CONTENT_TYPE)
@@ -362,6 +579,30 @@ where
     let xml = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
     let fixed = strip_quotes_from_first_etag(xml);
     Ok(RestBody::from(Bytes::from(fixed)))
+}
+
+async fn fix_s3_error_message_in_xml<RestBody>(body: RestBody) -> Result<(RestBody, bool), RestBody::Error>
+where
+    RestBody: Body<Data = Bytes> + From<Bytes>,
+{
+    let bytes = BodyExt::collect(body).await?.to_bytes();
+    let xml = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+    let (fixed, changed) = insert_missing_signature_error_message(xml);
+    Ok((RestBody::from(Bytes::from(fixed)), changed))
+}
+
+fn insert_missing_signature_error_message(mut xml: String) -> (String, bool) {
+    if !xml.contains("<Code>SignatureDoesNotMatch</Code>") || xml.contains("<Message>") {
+        return (xml, false);
+    }
+
+    let Some(code_end) = xml.find("</Code>") else {
+        return (xml, false);
+    };
+
+    let message = ApiError::error_code_to_message(&S3ErrorCode::SignatureDoesNotMatch);
+    xml.insert_str(code_end + "</Code>".len(), &format!("<Message>{message}</Message>"));
+    (xml, true)
 }
 
 fn strip_quotes_from_first_etag(xml: String) -> String {
@@ -454,8 +695,11 @@ impl ConditionalCorsLayer {
         let allowed_origin = match (origin, &self.cors_origins) {
             (Some(orig), Some(config)) if config == "*" => Some(orig),
             (Some(orig), Some(config)) => {
-                let origins: Vec<&str> = config.split(',').map(|s| s.trim()).collect();
-                if origins.contains(&orig.as_str()) { Some(orig) } else { None }
+                if config.split(',').map(|s| s.trim()).any(|x| x == orig.as_str()) {
+                    Some(orig)
+                } else {
+                    None
+                }
             }
             (Some(orig), None) => Some(orig), // Default: allow all if not configured
             _ => None,
@@ -780,6 +1024,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_fix_s3_error_message_in_xml_reports_changed_body() {
+        let body = Full::from(Bytes::from_static(b"<Error><Code>SignatureDoesNotMatch</Code></Error>"));
+
+        let (fixed, changed) = fix_s3_error_message_in_xml(body).await.unwrap();
+        let bytes = BodyExt::collect(fixed).await.unwrap().to_bytes();
+
+        assert!(changed);
+        assert!(bytes.starts_with(b"<Error><Code>SignatureDoesNotMatch</Code><Message>"));
+        assert!(bytes.ends_with(b"</Message></Error>"));
+    }
+
+    #[tokio::test]
+    async fn test_fix_s3_error_message_in_xml_reports_unchanged_body() {
+        let input = Bytes::from_static(b"<Error><Code>AccessDenied</Code></Error>");
+        let body = Full::from(input.clone());
+
+        let (fixed, changed) = fix_s3_error_message_in_xml(body).await.unwrap();
+        let bytes = BodyExt::collect(fixed).await.unwrap().to_bytes();
+
+        assert!(!changed);
+        assert_eq!(bytes, input);
+    }
+
+    #[test]
+    fn test_insert_missing_signature_error_message() {
+        let (fixed, changed) =
+            insert_missing_signature_error_message("<Error><Code>SignatureDoesNotMatch</Code></Error>".to_string());
+
+        assert!(changed);
+        assert!(fixed.contains("<Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided."));
+    }
+
+    #[test]
+    fn test_insert_missing_signature_error_message_preserves_existing_message() {
+        let input = "<Error><Code>SignatureDoesNotMatch</Code><Message>custom</Message></Error>".to_string();
+        let (fixed, changed) = insert_missing_signature_error_message(input.clone());
+
+        assert!(!changed);
+        assert_eq!(fixed, input);
+    }
+
     #[test]
     fn test_is_s3_path_excludes_admin_and_special_paths() {
         assert!(ConditionalCorsLayer::is_s3_path("/my-bucket/key"));
@@ -917,6 +1203,242 @@ mod tests {
                 .is_none()
         );
         assert!(response_headers.get(cors::response::ACCESS_CONTROL_MAX_AGE).is_none());
+    }
+
+    mod bodyless_status_fix {
+        use super::*;
+        use crate::server::hybrid::HybridBody;
+        use http_body_util::Empty;
+
+        // The production service takes `Request<Incoming>`, but `Incoming` can't be
+        // constructed in unit tests. `BodylessStatusFixService` doesn't inspect the
+        // request body, so parameterising over an arbitrary `B` is safe here.
+        #[derive(Clone)]
+        struct FixedResponse {
+            status: StatusCode,
+            body: Bytes,
+            content_type: Option<&'static str>,
+        }
+
+        impl<B: Send + 'static> Service<Request<B>> for FixedResponse {
+            type Response = Response<HybridBody<Full<Bytes>, Empty<Bytes>>>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                let this = self.clone();
+                Box::pin(async move {
+                    let body = this.body.clone();
+                    let len = body.len();
+                    let mut builder = Response::builder().status(this.status);
+                    builder = builder.header(http::header::CONTENT_LENGTH, len.to_string());
+                    if let Some(ct) = this.content_type {
+                        builder = builder.header(http::header::CONTENT_TYPE, ct);
+                    }
+                    builder = builder.header(http::header::ETAG, "\"abc123\"");
+                    Ok(builder
+                        .body(HybridBody::Rest {
+                            rest_body: Full::from(body),
+                        })
+                        .expect("build response"))
+                })
+            }
+        }
+
+        fn empty_request() -> Request<()> {
+            Request::builder().uri("/").body(()).expect("request")
+        }
+
+        async fn collect_body<B: Body<Data = Bytes>>(body: B) -> Bytes
+        where
+            B::Error: std::fmt::Debug,
+        {
+            BodyExt::collect(body).await.expect("collect body").to_bytes()
+        }
+
+        #[tokio::test]
+        async fn strips_body_and_content_headers_for_304() {
+            let mut svc = BodylessStatusFixLayer.layer(FixedResponse {
+                status: StatusCode::NOT_MODIFIED,
+                body: Bytes::from_static(b"<Error><Code>NotModified</Code></Error>"),
+                content_type: Some("application/xml"),
+            });
+
+            let res = svc.call(empty_request()).await.expect("service call");
+            let (parts, body) = res.into_parts();
+
+            assert_eq!(parts.status, StatusCode::NOT_MODIFIED);
+            assert!(parts.headers.get(http::header::CONTENT_LENGTH).is_none());
+            assert!(parts.headers.get(http::header::CONTENT_TYPE).is_none());
+            assert_eq!(parts.headers.get(http::header::ETAG).unwrap(), "\"abc123\"");
+
+            let bytes = collect_body(body).await;
+            assert!(bytes.is_empty(), "304 response body must be empty");
+        }
+
+        #[tokio::test]
+        async fn strips_body_for_204() {
+            let mut svc = BodylessStatusFixLayer.layer(FixedResponse {
+                status: StatusCode::NO_CONTENT,
+                body: Bytes::from_static(b"unexpected"),
+                content_type: None,
+            });
+
+            let res = svc.call(empty_request()).await.expect("service call");
+            let (parts, body) = res.into_parts();
+
+            assert_eq!(parts.status, StatusCode::NO_CONTENT);
+            assert!(parts.headers.get(http::header::CONTENT_LENGTH).is_none());
+
+            let bytes = collect_body(body).await;
+            assert!(bytes.is_empty());
+        }
+
+        #[tokio::test]
+        async fn preserves_body_for_200() {
+            let payload = Bytes::from_static(b"hello");
+            let mut svc = BodylessStatusFixLayer.layer(FixedResponse {
+                status: StatusCode::OK,
+                body: payload.clone(),
+                content_type: Some("text/plain"),
+            });
+
+            let res = svc.call(empty_request()).await.expect("service call");
+            let (parts, body) = res.into_parts();
+
+            assert_eq!(parts.status, StatusCode::OK);
+            assert_eq!(parts.headers.get(http::header::CONTENT_TYPE).unwrap(), "text/plain");
+            assert_eq!(
+                parts.headers.get(http::header::CONTENT_LENGTH).unwrap(),
+                payload.len().to_string().as_str()
+            );
+
+            let bytes = collect_body(body).await;
+            assert_eq!(bytes, payload);
+        }
+
+        #[test]
+        fn is_bodyless_status_matches_rfc9110_statuses() {
+            assert!(is_bodyless_status(StatusCode::CONTINUE));
+            assert!(is_bodyless_status(StatusCode::SWITCHING_PROTOCOLS));
+            assert!(is_bodyless_status(StatusCode::NO_CONTENT));
+            assert!(is_bodyless_status(StatusCode::RESET_CONTENT));
+            assert!(is_bodyless_status(StatusCode::NOT_MODIFIED));
+
+            assert!(!is_bodyless_status(StatusCode::OK));
+            assert!(!is_bodyless_status(StatusCode::PARTIAL_CONTENT));
+            assert!(!is_bodyless_status(StatusCode::NOT_FOUND));
+            assert!(!is_bodyless_status(StatusCode::PRECONDITION_FAILED));
+            assert!(!is_bodyless_status(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+    }
+
+    mod head_request_body_fix {
+        use super::*;
+        use crate::server::hybrid::HybridBody;
+        use http_body_util::Empty;
+
+        #[derive(Clone)]
+        struct FixedResponse {
+            status: StatusCode,
+            body: Bytes,
+            content_type: Option<&'static str>,
+        }
+
+        impl<B: Send + 'static> Service<Request<B>> for FixedResponse {
+            type Response = Response<HybridBody<Full<Bytes>, Empty<Bytes>>>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                let this = self.clone();
+                Box::pin(async move {
+                    let body = this.body.clone();
+                    let len = body.len();
+                    let mut builder = Response::builder().status(this.status);
+                    builder = builder.header(http::header::CONTENT_LENGTH, len.to_string());
+                    builder = builder.header(http::header::TRANSFER_ENCODING, "chunked");
+                    if let Some(ct) = this.content_type {
+                        builder = builder.header(http::header::CONTENT_TYPE, ct);
+                    }
+                    Ok(builder
+                        .body(HybridBody::Rest {
+                            rest_body: Full::from(body),
+                        })
+                        .expect("build response"))
+                })
+            }
+        }
+
+        fn request_with_method(method: Method) -> Request<()> {
+            Request::builder()
+                .method(method)
+                .uri("/bucket/object")
+                .body(())
+                .expect("request")
+        }
+
+        async fn collect_body<B: Body<Data = Bytes>>(body: B) -> Bytes
+        where
+            B::Error: std::fmt::Debug,
+        {
+            BodyExt::collect(body).await.expect("collect body").to_bytes()
+        }
+
+        #[tokio::test]
+        async fn strips_body_for_head_errors_but_preserves_metadata_headers() {
+            let payload = Bytes::from_static(b"<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code></Error>");
+            let mut svc = HeadRequestBodyFixLayer.layer(FixedResponse {
+                status: StatusCode::NOT_FOUND,
+                body: payload.clone(),
+                content_type: Some("application/xml"),
+            });
+
+            let res = svc.call(request_with_method(Method::HEAD)).await.expect("service call");
+            let (parts, body) = res.into_parts();
+
+            assert_eq!(parts.status, StatusCode::NOT_FOUND);
+            assert_eq!(
+                parts.headers.get(http::header::CONTENT_LENGTH).unwrap(),
+                payload.len().to_string().as_str()
+            );
+            assert_eq!(parts.headers.get(http::header::CONTENT_TYPE).unwrap(), "application/xml");
+            assert!(parts.headers.get(http::header::TRANSFER_ENCODING).is_none());
+
+            let bytes = collect_body(body).await;
+            assert!(bytes.is_empty(), "HEAD response body must be empty");
+        }
+
+        #[tokio::test]
+        async fn preserves_body_for_get_errors() {
+            let payload = Bytes::from_static(b"<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code></Error>");
+            let mut svc = HeadRequestBodyFixLayer.layer(FixedResponse {
+                status: StatusCode::NOT_FOUND,
+                body: payload.clone(),
+                content_type: Some("application/xml"),
+            });
+
+            let res = svc.call(request_with_method(Method::GET)).await.expect("service call");
+            let (parts, body) = res.into_parts();
+
+            assert_eq!(parts.status, StatusCode::NOT_FOUND);
+            assert_eq!(
+                parts.headers.get(http::header::CONTENT_LENGTH).unwrap(),
+                payload.len().to_string().as_str()
+            );
+            assert_eq!(parts.headers.get(http::header::TRANSFER_ENCODING).unwrap(), "chunked");
+
+            let bytes = collect_body(body).await;
+            assert_eq!(bytes, payload);
+        }
     }
 
     #[test]

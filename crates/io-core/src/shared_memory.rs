@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn test_arc_data_clone() {
         let data = vec![1u8, 2, 3, 4, 5];
-        let arc_data = ArcData::new(data.clone());
+        let arc_data = ArcData::new(data);
 
         assert_eq!(arc_data.ref_count(), 1);
 
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn test_arc_data_deref() {
         let data = vec![1u8, 2, 3, 4, 5];
-        let arc_data = ArcData::new(data.clone());
+        let arc_data = ArcData::new(data);
 
         // Test Deref trait
         assert_eq!(arc_data.len(), 5);
@@ -289,7 +289,7 @@ mod tests {
         let pool = SharedMemoryPool::with_defaults();
         let data = vec![1u8, 2, 3, 4, 5];
 
-        let arc_data = pool.create(data.clone());
+        let arc_data = pool.create(data);
         assert_eq!(arc_data.ref_count(), 1);
 
         let shared = pool.share(&arc_data);
@@ -303,7 +303,7 @@ mod tests {
         let pool = SharedMemoryPool::with_defaults();
         let data = vec![1u8; 1024];
 
-        let arc_data = pool.create_with_size(data.clone(), 1024);
+        let arc_data = pool.create_with_size(data, 1024);
 
         assert_eq!(arc_data.size(), Some(1024));
         assert_eq!(pool.stats().current_memory.load(Ordering::Relaxed), 1024);

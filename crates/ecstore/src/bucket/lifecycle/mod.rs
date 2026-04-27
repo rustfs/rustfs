@@ -14,8 +14,9 @@
 
 pub mod bucket_lifecycle_audit;
 pub mod bucket_lifecycle_ops;
+pub mod core;
 pub mod evaluator;
-pub mod lifecycle;
+pub use self::core as lifecycle;
 pub mod rule;
 pub mod tier_last_day_stats;
 pub mod tier_sweeper;

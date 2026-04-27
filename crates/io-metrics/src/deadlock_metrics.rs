@@ -20,52 +20,52 @@ use std::time::Duration;
 #[inline(always)]
 pub fn record_deadlock_detected(cycle_length: usize) {
     use metrics::{counter, histogram};
-    counter!("rustfs.deadlock.detected").increment(1);
-    histogram!("rustfs.deadlock.cycle_length").record(cycle_length as f64);
+    counter!("rustfs_deadlock_detected_total").increment(1);
+    histogram!("rustfs_deadlock_cycle_length").record(cycle_length as f64);
 }
 
 /// Record long-held lock.
 #[inline(always)]
 pub fn record_long_held_lock(_lock_id: u64, hold_time: Duration) {
     use metrics::{counter, histogram};
-    counter!("rustfs.deadlock.long_held").increment(1);
-    histogram!("rustfs.deadlock.hold_time.secs").record(hold_time.as_secs_f64());
+    counter!("rustfs_deadlock_long_held").increment(1);
+    histogram!("rustfs_deadlock_hold_time_secs").record(hold_time.as_secs_f64());
 }
 
 /// Record lock acquisition.
 #[inline(always)]
 pub fn record_lock_acquisition(lock_type: &str) {
     use metrics::counter;
-    counter!("rustfs.lock.acquisitions", "type" => lock_type.to_string()).increment(1);
+    counter!("rustfs_lock_acquisitions", "type" => lock_type.to_string()).increment(1);
 }
 
 /// Record lock release.
 #[inline(always)]
 pub fn record_lock_release(lock_type: &str, hold_time: Duration) {
     use metrics::{counter, histogram};
-    counter!("rustfs.lock.releases", "type" => lock_type.to_string()).increment(1);
-    histogram!("rustfs.lock.hold_time.secs", "type" => lock_type.to_string()).record(hold_time.as_secs_f64());
+    counter!("rustfs_lock_releases", "type" => lock_type.to_string()).increment(1);
+    histogram!("rustfs_lock_hold_time_secs", "type" => lock_type.to_string()).record(hold_time.as_secs_f64());
 }
 
 /// Record lock contention.
 #[inline(always)]
 pub fn record_lock_contention(lock_type: &str) {
     use metrics::counter;
-    counter!("rustfs.lock.contentions", "type" => lock_type.to_string()).increment(1);
+    counter!("rustfs_lock_contentions", "type" => lock_type.to_string()).increment(1);
 }
 
 /// Record wait graph edge added.
 #[inline(always)]
 pub fn record_wait_edge_added() {
     use metrics::counter;
-    counter!("rustfs.deadlock.wait_edges.added").increment(1);
+    counter!("rustfs_deadlock_wait_edges_added").increment(1);
 }
 
 /// Record wait graph edge removed.
 #[inline(always)]
 pub fn record_wait_edge_removed() {
     use metrics::counter;
-    counter!("rustfs.deadlock.wait_edges.removed").increment(1);
+    counter!("rustfs_deadlock_wait_edges_removed").increment(1);
 }
 
 #[cfg(test)]

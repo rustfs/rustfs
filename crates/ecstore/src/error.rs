@@ -1173,7 +1173,7 @@ mod tests {
     fn test_io_error_with_disk_error_inside() {
         // Test io::Error containing DiskError -> StorageError conversion
         let original_disk_error = DiskError::FileNotFound;
-        let io_with_disk_error = std::io::Error::other(original_disk_error.clone());
+        let io_with_disk_error = std::io::Error::other(original_disk_error);
 
         // Convert io::Error to StorageError
         let storage_error: StorageError = io_with_disk_error.into();

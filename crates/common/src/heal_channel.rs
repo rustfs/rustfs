@@ -18,7 +18,7 @@ use std::{
     fmt::{self, Display},
     sync::OnceLock,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 pub const HEAL_DELETE_DANGLING: bool = true;
@@ -206,11 +206,59 @@ pub struct HealOpts {
     pub set: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealAdmissionDropReason {
+    QueueFull,
+    PolicyDropped,
+}
+
+impl HealAdmissionDropReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::PolicyDropped => "policy_dropped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealAdmissionResult {
+    Accepted,
+    Merged,
+    Full,
+    Dropped(HealAdmissionDropReason),
+}
+
+impl HealAdmissionResult {
+    pub fn result_label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Merged => "merged",
+            Self::Full => "full",
+            Self::Dropped(_) => "dropped",
+        }
+    }
+
+    pub fn reason_label(self) -> &'static str {
+        match self {
+            Self::Dropped(reason) => reason.as_str(),
+            _ => "none",
+        }
+    }
+
+    pub fn is_admitted(self) -> bool {
+        matches!(self, Self::Accepted | Self::Merged)
+    }
+}
+
 /// Heal channel command type
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum HealChannelCommand {
     /// Start a new heal task
-    Start(HealChannelRequest),
+    Start {
+        request: HealChannelRequest,
+        response_tx: oneshot::Sender<Result<HealAdmissionResult, String>>,
+    },
     /// Query heal task status
     Query { heal_path: String, client_token: String },
     /// Cancel heal task
@@ -339,9 +387,22 @@ pub fn subscribe_heal_responses() -> broadcast::Receiver<HealChannelResponse> {
     heal_response_sender().subscribe()
 }
 
+/// Send heal start request and wait for structured admission feedback.
+pub async fn send_heal_request_with_admission(request: HealChannelRequest) -> Result<HealAdmissionResult, String> {
+    let (response_tx, response_rx) = oneshot::channel();
+    send_heal_command(HealChannelCommand::Start { request, response_tx }).await?;
+    response_rx
+        .await
+        .map_err(|e| format!("Failed to receive heal admission response: {e}"))?
+}
+
 /// Send heal start request
 pub async fn send_heal_request(request: HealChannelRequest) -> Result<(), String> {
-    send_heal_command(HealChannelCommand::Start(request)).await
+    match send_heal_request_with_admission(request).await? {
+        HealAdmissionResult::Accepted | HealAdmissionResult::Merged => Ok(()),
+        HealAdmissionResult::Full => Err("Heal request queue is full".to_string()),
+        HealAdmissionResult::Dropped(reason) => Err(format!("Heal request dropped: {}", reason.as_str())),
+    }
 }
 
 /// Send heal query request
@@ -450,7 +511,7 @@ pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) 
         }
 
         if let Some(e) = &rule.noncurrent_version_expiration {
-            if let Some(true) = e.noncurrent_days.map(|d| d > 0) {
+            if e.noncurrent_days.is_some() {
                 return true;
             }
             if let Some(true) = e.newer_noncurrent_versions.map(|d| d > 0) {
@@ -541,6 +602,19 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heal_admission_result_labels_are_stable() {
+        assert_eq!(HealAdmissionResult::Accepted.result_label(), "accepted");
+        assert_eq!(HealAdmissionResult::Merged.result_label(), "merged");
+        assert_eq!(HealAdmissionResult::Full.result_label(), "full");
+        assert_eq!(
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull).reason_label(),
+            "queue_full"
+        );
+        assert!(HealAdmissionResult::Merged.is_admitted());
+        assert!(!HealAdmissionResult::Full.is_admitted());
+    }
 
     #[tokio::test]
     async fn heal_response_broadcast_reaches_subscriber() {

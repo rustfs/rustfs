@@ -16,10 +16,16 @@
 //! This module defines the configuration for audit systems, including
 //! webhook and MQTT audit-related settings.
 
+mod kafka;
 mod mqtt;
+mod nats;
+mod pulsar;
 mod webhook;
 
+pub use kafka::*;
 pub use mqtt::*;
+pub use nats::*;
+pub use pulsar::*;
 pub use webhook::*;
 
 use crate::DEFAULT_DELIMITER;
@@ -29,8 +35,17 @@ pub const AUDIT_PREFIX: &str = "audit";
 pub const AUDIT_ROUTE_PREFIX: &str = const_str::concat!(AUDIT_PREFIX, DEFAULT_DELIMITER);
 
 pub const AUDIT_WEBHOOK_SUB_SYS: &str = "audit_webhook";
+pub const AUDIT_KAFKA_SUB_SYS: &str = "audit_kafka";
 pub const AUDIT_MQTT_SUB_SYS: &str = "audit_mqtt";
+pub const AUDIT_NATS_SUB_SYS: &str = "audit_nats";
+pub const AUDIT_PULSAR_SUB_SYS: &str = "audit_pulsar";
 
 pub const AUDIT_STORE_EXTENSION: &str = ".audit";
 #[allow(dead_code)]
-pub const AUDIT_SUB_SYSTEMS: &[&str] = &[AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS];
+pub const AUDIT_SUB_SYSTEMS: &[&str] = &[
+    AUDIT_KAFKA_SUB_SYS,
+    AUDIT_MQTT_SUB_SYS,
+    AUDIT_NATS_SUB_SYS,
+    AUDIT_PULSAR_SUB_SYS,
+    AUDIT_WEBHOOK_SUB_SYS,
+];

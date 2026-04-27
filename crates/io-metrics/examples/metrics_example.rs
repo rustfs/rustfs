@@ -143,7 +143,7 @@ fn metrics_recording_example() {
 
     println!("  Recorded 10 cache operations (hits: 7, misses: 3)");
     println!("  Metrics reported via metrics crate");
-    println!("  View via Prometheus/Grafana");
+    println!("  Export via rustfs-obs OTEL pipeline");
 
     println!();
 }

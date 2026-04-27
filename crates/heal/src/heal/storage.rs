@@ -17,8 +17,11 @@ use async_trait::async_trait;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::{
     disk::{DiskStore, endpoint::Endpoint},
+    error::StorageError,
     store::ECStore,
-    store_api::{BucketInfo, BucketOperations, HealOperations, ListOperations, ObjectIO, ObjectOperations, StorageAPI},
+    store_api::{
+        BucketInfo, BucketOperations, HealOperations, ListOperations, ObjectIO, ObjectOperations, ObjectOptions, StorageAPI,
+    },
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Arc;
@@ -137,6 +140,37 @@ impl ECStoreHealStorage {
     }
 }
 
+fn is_transient_object_exists_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    [
+        "failed to acquire read lock",
+        "lock acquisition failed",
+        "lock acquisition timeout",
+        "quorum not reached",
+        "deadline has elapsed",
+        "timed out",
+        "network error",
+        "transport error",
+        "connection refused",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
+}
+
+fn is_transient_object_exists_error(err: &StorageError) -> bool {
+    if err.is_quorum_error() {
+        return true;
+    }
+
+    match err {
+        StorageError::Lock(lock_err) => lock_err.is_retryable() || is_transient_object_exists_message(&lock_err.to_string()),
+        StorageError::Io(io_err) => is_transient_object_exists_message(&io_err.to_string()),
+        StorageError::SlowDown | StorageError::OperationCanceled => true,
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl HealStorageAPI for ECStoreHealStorage {
     async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
@@ -208,7 +242,7 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn put_object_data(&self, bucket: &str, object: &str, data: &[u8]) -> Result<()> {
         debug!("Putting object data: {}/{} ({} bytes)", bucket, object, data.len());
 
-        let mut reader = rustfs_ecstore::store_api::ChunkNativePutData::from_vec(data.to_vec());
+        let mut reader = rustfs_ecstore::store_api::PutObjReader::from_vec(data.to_vec());
         match (*self.ecstore)
             .put_object(bucket, object, &mut reader, &Default::default())
             .await
@@ -408,14 +442,24 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool> {
         debug!("Checking object exists: {}/{}", bucket, object);
 
-        // Use get_object_info for efficient existence check without heavy heal operations
-        match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
+        // Existence checks are best-effort for background heal scheduling, so avoid
+        // acquiring an extra namespace read lock here.
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        match self.ecstore.get_object_info(bucket, object, &opts).await {
             Ok(_) => Ok(true), // Object exists
             Err(e) => {
-                // Map ObjectNotFound to false, other errors must be propagated!
                 if matches!(e, rustfs_ecstore::error::StorageError::ObjectNotFound(_, _)) {
                     debug!("Object not found: {}/{}", bucket, object);
                     Ok(false)
+                } else if is_transient_object_exists_error(&e) {
+                    warn!("Skipping object existence check for {}/{} due to transient error: {}", bucket, object, e);
+                    Err(Error::transient_skip(format!(
+                        "Skipped object existence check for {bucket}/{object}: {e}"
+                    )))
                 } else {
                     error!("Error checking object existence {}/{}: {}", bucket, object, e);
                     Err(Error::other(e))
@@ -592,5 +636,36 @@ impl HealStorageAPI for ECStoreHealStorage {
         Err(Error::TaskExecutionFailed {
             message: format!("No available disk found for set_disk_id: {set_disk_id}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_transient_object_exists_error, is_transient_object_exists_message};
+    use rustfs_ecstore::error::StorageError;
+
+    #[test]
+    fn transient_object_exists_message_matches_lock_quorum_failures() {
+        assert!(is_transient_object_exists_message(
+            "Failed to acquire read lock: ns_loc: read lock acquisition failed on bucket/object: Quorum not reached: required 2, achieved 0"
+        ));
+        assert!(is_transient_object_exists_message("deadline has elapsed"));
+    }
+
+    #[test]
+    fn transient_object_exists_error_matches_quorum_variants() {
+        assert!(is_transient_object_exists_error(&StorageError::ErasureReadQuorum));
+        assert!(is_transient_object_exists_error(&StorageError::InsufficientReadQuorum(
+            "bucket".to_string(),
+            "object".to_string(),
+        )));
+    }
+
+    #[test]
+    fn transient_object_exists_error_does_not_treat_not_found_as_transient() {
+        assert!(!is_transient_object_exists_error(&StorageError::ObjectNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+        )));
     }
 }

@@ -37,7 +37,7 @@
 //! - Early lock release after metadata read
 //! - Lock hold time monitoring
 //! - Configurable optimization (can be disabled for debugging)
-//! - Prometheus metrics for lock contention analysis
+//! - Lock contention metrics emitted through the shared metrics pipeline
 //!
 //! # Architecture
 //!
@@ -147,11 +147,7 @@ impl LockStats {
     pub fn avg_hold_time(&self) -> Duration {
         let total = self.total_hold_time_us.load(Ordering::Relaxed);
         let count = self.locks_released_early.load(Ordering::Relaxed);
-        if count > 0 {
-            Duration::from_micros(total / count)
-        } else {
-            Duration::ZERO
-        }
+        total.checked_div(count).map(Duration::from_micros).unwrap_or(Duration::ZERO)
     }
 
     /// Get maximum hold time.
@@ -227,7 +223,7 @@ impl<G> OptimizedLockGuard<G> {
 
         self.stats.record_early_release(hold_time);
 
-        histogram!("rustfs.lock.hold.duration.seconds").record(hold_time.as_secs_f64());
+        histogram!("rustfs_lock_hold_duration_seconds").record(hold_time.as_secs_f64());
 
         debug!(
             resource = %self.resource,
@@ -251,7 +247,7 @@ impl<G> Drop for OptimizedLockGuard<G> {
 
             self.stats.record_early_release(hold_time);
 
-            histogram!("rustfs.lock.hold.duration.seconds").record(hold_time.as_secs_f64());
+            histogram!("rustfs_lock_hold_duration_seconds").record(hold_time.as_secs_f64());
 
             debug!(
                 resource = %self.resource,

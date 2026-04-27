@@ -40,7 +40,7 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(&manifest)
         .ancestors()
         .nth(2)
-        .unwrap_or(std::path::Path::new("."))
+        .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf()
 }
 

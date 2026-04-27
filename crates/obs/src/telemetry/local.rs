@@ -148,7 +148,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         .init();
 
     set_observability_metric_enabled(false);
-    counter!("rustfs.start.total").increment(1);
+    counter!("rustfs_start_total").increment(1);
     info!("Init stdout logging (level: {})", logger_level);
 
     OtelGuard {

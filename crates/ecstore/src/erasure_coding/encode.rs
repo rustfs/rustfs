@@ -17,178 +17,43 @@ use crate::disk::error_reduce::count_errs;
 use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_write_quorum_errs};
 use crate::erasure_coding::BitrotWriterWrapper;
 use crate::erasure_coding::Erasure;
-use crate::erasure_coding::erasure::{EncodeBlockBuffer, EncodedShardBlock, EncodedShardBufferPool};
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use rustfs_rio::BlockReadable;
 use std::sync::Arc;
+use std::vec;
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tracing::error;
+
+const ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: &str = "RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES";
+const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 8;
+
+fn encode_channel_capacity(expanded_block_bytes: usize, max_inflight_bytes: usize) -> usize {
+    if expanded_block_bytes == 0 {
+        return 1;
+    }
+
+    max_inflight_bytes
+        .saturating_div(expanded_block_bytes)
+        .clamp(1, DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS)
+}
+
+fn queued_block_bytes(block: &[Bytes]) -> usize {
+    block.iter().map(Bytes::len).sum()
+}
+
+async fn drain_queued_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Bytes>>) {
+    while let Some(block) = rx.recv().await {
+        rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_block_bytes(&block));
+    }
+}
 
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
     write_quorum: usize,
     errs: Vec<Option<Error>>,
-}
-
-pub(crate) struct BlockAssembler<R> {
-    reader: R,
-    block_buffer: EncodeBlockBuffer,
-    total_bytes: usize,
-}
-
-impl<R> BlockAssembler<R>
-where
-    R: AsyncRead + BlockReadable + Send + Sync + Unpin + 'static,
-{
-    pub(crate) fn new(reader: R, block_size: usize) -> Self {
-        Self {
-            reader,
-            block_buffer: EncodeBlockBuffer::new(block_size),
-            total_bytes: 0,
-        }
-    }
-
-    pub(crate) async fn next_block(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        match self.block_buffer.read_from_block(&mut self.reader).await {
-            Ok(n) if n > 0 => {
-                self.total_bytes += n;
-                Ok(Some(self.block_buffer.filled(n).to_vec()))
-            }
-            Ok(_) => Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                if let Some(inner) = e.get_ref()
-                    && rustfs_rio::is_checksum_mismatch(inner)
-                {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
-                }
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    pub(crate) fn total_bytes(&self) -> usize {
-        self.total_bytes
-    }
-
-    pub(crate) fn into_inner(self) -> R {
-        self.reader
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ErasureChunkEncoder {
-    erasure: Arc<Erasure>,
-    buffer_pool: EncodedShardBufferPool,
-}
-
-impl ErasureChunkEncoder {
-    pub(crate) async fn new(erasure: Arc<Erasure>) -> Self {
-        let reusable_capacity = erasure.shard_size() * erasure.total_shard_count();
-        Self {
-            erasure,
-            buffer_pool: EncodedShardBufferPool::with_prefill(reusable_capacity, 2).await,
-        }
-    }
-
-    pub(crate) async fn encode_block(&self, block: &[u8]) -> std::io::Result<EncodedShardBlock> {
-        let reusable_buffer = self.buffer_pool.acquire().await;
-        self.erasure.encode_data_block_with_buffer(block, reusable_buffer)
-    }
-
-    pub(crate) async fn release(&self, block: EncodedShardBlock) {
-        self.buffer_pool.release(block).await;
-    }
-}
-
-pub(crate) struct ErasureWritePipeline {
-    erasure: Arc<Erasure>,
-    write_quorum: usize,
-}
-
-impl ErasureWritePipeline {
-    pub(crate) fn new(erasure: Arc<Erasure>, write_quorum: usize) -> Self {
-        Self { erasure, write_quorum }
-    }
-
-    pub(crate) async fn run<R>(&self, reader: R, writers: &mut [Option<BitrotWriterWrapper>]) -> std::io::Result<(R, usize)>
-    where
-        R: AsyncRead + BlockReadable + Send + Sync + Unpin + 'static,
-    {
-        let (tx, mut rx) = mpsc::channel::<EncodedShardBlock>(8);
-        let producer = ErasureChunkEncoder::new(self.erasure.clone()).await;
-        let writer_pool = producer.clone();
-        let block_size = self.erasure.block_size;
-
-        let task = tokio::spawn(async move {
-            let mut assembler = BlockAssembler::new(reader, block_size);
-            while let Some(block) = assembler.next_block().await? {
-                let res = producer.encode_block(&block).await?;
-                if let Err(err) = tx.send(res).await {
-                    return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
-                }
-            }
-
-            let total = assembler.total_bytes();
-            Ok((assembler.into_inner(), total))
-        });
-
-        let mut writers = MultiWriter::new(writers, self.write_quorum);
-        let mut write_err = None;
-
-        while let Some(block) = rx.recv().await {
-            if block.is_empty() {
-                break;
-            }
-            let write_result = writers.write(&block).await;
-            writer_pool.release(block).await;
-            if let Err(err) = write_result {
-                write_err = Some(err);
-                break;
-            }
-        }
-
-        if let Some(err) = write_err {
-            task.abort();
-            let _ = task.await;
-            if let Err(shutdown_err) = writers.shutdown().await {
-                error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
-            }
-            return Err(err);
-        }
-
-        let (reader, total) = task.await??;
-        writers.shutdown().await?;
-        Ok((reader, total))
-    }
-}
-
-pub(crate) trait ShardSource {
-    fn shard_count(&self) -> usize;
-    fn shard(&self, idx: usize) -> Bytes;
-}
-
-impl ShardSource for EncodedShardBlock {
-    fn shard_count(&self) -> usize {
-        self.shard_count()
-    }
-
-    fn shard(&self, idx: usize) -> Bytes {
-        self.shard(idx)
-    }
-}
-
-impl ShardSource for Vec<Bytes> {
-    fn shard_count(&self) -> usize {
-        self.len()
-    }
-
-    fn shard(&self, idx: usize) -> Bytes {
-        self[idx].clone()
-    }
 }
 
 impl<'a> MultiWriter<'a> {
@@ -201,10 +66,10 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
-    async fn write_shard(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>, shard: Bytes) {
+    async fn write_shard(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>, shard: &Bytes) {
         match writer_opt {
             Some(writer) => {
-                match writer.write(&shard).await {
+                match writer.write(shard).await {
                     Ok(n) => {
                         if n < shard.len() {
                             *err = Some(Error::ShortWrite);
@@ -224,40 +89,16 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
-    fn write_shard_inline(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>, shard: Bytes) {
-        match writer_opt {
-            Some(writer) => match writer.write_inline_sync(&shard) {
-                Ok(n) => {
-                    if n < shard.len() {
-                        *err = Some(Error::ShortWrite);
-                        *writer_opt = None;
-                    } else {
-                        *err = None;
-                    }
-                }
-                Err(e) => {
-                    *err = Some(Error::from(e));
-                }
-            },
-            None => {
-                *err = Some(Error::DiskNotFound);
-            }
-        }
-    }
-
-    pub async fn write<T>(&mut self, data: &T) -> std::io::Result<()>
-    where
-        T: ShardSource,
-    {
-        assert_eq!(data.shard_count(), self.writers.len());
+    pub async fn write(&mut self, data: Vec<Bytes>) -> std::io::Result<()> {
+        assert_eq!(data.len(), self.writers.len());
 
         {
             let mut futures = FuturesUnordered::new();
-            for (idx, (writer_opt, err)) in self.writers.iter_mut().zip(self.errs.iter_mut()).enumerate() {
+            for ((writer_opt, err), shard) in self.writers.iter_mut().zip(self.errs.iter_mut()).zip(data.iter()) {
                 if err.is_some() {
                     continue; // Skip if we already have an error for this writer
                 }
-                futures.push(Self::write_shard(writer_opt, err, data.shard(idx)));
+                futures.push(Self::write_shard(writer_opt, err, shard));
             }
             while let Some(()) = futures.next().await {}
         }
@@ -289,46 +130,7 @@ impl<'a> MultiWriter<'a> {
             self.writers.len(),
             self.errs
                 .iter()
-                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
-    }
-
-    pub fn write_inline<T>(&mut self, data: &T) -> std::io::Result<()>
-    where
-        T: ShardSource,
-    {
-        assert_eq!(data.shard_count(), self.writers.len());
-
-        for (idx, (writer_opt, err)) in self.writers.iter_mut().zip(self.errs.iter_mut()).enumerate() {
-            if err.is_some() {
-                continue;
-            }
-            Self::write_shard_inline(writer_opt, err, data.shard(idx));
-        }
-
-        let nil_count = self.errs.iter().filter(|&e| e.is_none()).count();
-        if nil_count >= self.write_quorum {
-            return Ok(());
-        }
-
-        if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
-            return Err(std::io::Error::other(format!(
-                "Failed to write inline data: {} (offline-disks={}/{})",
-                write_err,
-                count_errs(&self.errs, &Error::DiskNotFound),
-                self.writers.len()
-            )));
-        }
-
-        Err(std::io::Error::other(format!(
-            "Failed to write inline data: (offline-disks={}/{}): {}",
-            count_errs(&self.errs, &Error::DiskNotFound),
-            self.writers.len(),
-            self.errs
-                .iter()
-                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")
         )))
@@ -337,23 +139,6 @@ impl<'a> MultiWriter<'a> {
     async fn shutdown_writer(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>) {
         match writer_opt {
             Some(writer) => match writer.shutdown().await {
-                Ok(()) => {
-                    *err = None;
-                }
-                Err(e) => {
-                    *err = Some(Error::from(e));
-                    *writer_opt = None;
-                }
-            },
-            None => {
-                *err = Some(Error::DiskNotFound);
-            }
-        }
-    }
-
-    fn shutdown_writer_inline(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>) {
-        match writer_opt {
-            Some(writer) => match writer.shutdown_inline_sync() {
                 Ok(()) => {
                     *err = None;
                 }
@@ -407,41 +192,7 @@ impl<'a> MultiWriter<'a> {
             self.writers.len(),
             self.errs
                 .iter()
-                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
-    }
-
-    pub fn shutdown_inline(&mut self) -> std::io::Result<()> {
-        for (writer_opt, err) in self.writers.iter_mut().zip(self.errs.iter_mut()) {
-            if err.is_some() {
-                continue;
-            }
-            Self::shutdown_writer_inline(writer_opt, err);
-        }
-
-        let nil_count = self.errs.iter().filter(|&e| e.is_none()).count();
-        if nil_count >= self.write_quorum {
-            return Ok(());
-        }
-
-        if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
-            return Err(std::io::Error::other(format!(
-                "Failed to shutdown inline writers: {} (offline-disks={}/{})",
-                write_err,
-                count_errs(&self.errs, &Error::DiskNotFound),
-                self.writers.len()
-            )));
-        }
-
-        Err(std::io::Error::other(format!(
-            "Failed to shutdown inline writers: (offline-disks={}/{}): {}",
-            count_errs(&self.errs, &Error::DiskNotFound),
-            self.writers.len(),
-            self.errs
-                .iter()
-                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")
         )))
@@ -451,14 +202,88 @@ impl<'a> MultiWriter<'a> {
 impl Erasure {
     pub async fn encode<R>(
         self: Arc<Self>,
-        reader: R,
+        mut reader: R,
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
     ) -> std::io::Result<(R, usize)>
     where
-        R: AsyncRead + BlockReadable + Send + Sync + Unpin + 'static,
+        R: AsyncRead + Send + Sync + Unpin + 'static,
     {
-        ErasureWritePipeline::new(self, quorum).run(reader, writers).await
+        // Bound queued encoded blocks by memory budget to avoid per-request spikes.
+        let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
+        let max_inflight_bytes = rustfs_utils::get_env_usize(
+            ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
+            DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
+        );
+        let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
+        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(inflight_blocks);
+
+        let task = tokio::spawn(async move {
+            let block_size = self.block_size;
+            let mut total = 0;
+            let mut buf = vec![0u8; block_size];
+            loop {
+                match rustfs_utils::read_full(&mut reader, &mut buf).await {
+                    Ok(n) if n > 0 => {
+                        total += n;
+                        let res = self.encode_data(&buf[..n])?;
+                        let queued_bytes = queued_block_bytes(&res);
+                        rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
+                        if let Err(err) = tx.send(res).await {
+                            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
+                            return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
+                        }
+                    }
+                    Ok(_) => {
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // Check if the inner error is a checksum mismatch - if so, propagate it
+                        if let Some(inner) = e.get_ref()
+                            && rustfs_rio::is_checksum_mismatch(inner)
+                        {
+                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+
+            Ok((reader, total))
+        });
+
+        let mut writers = MultiWriter::new(writers, quorum);
+
+        let mut write_err = None;
+
+        while let Some(block) = rx.recv().await {
+            if block.is_empty() {
+                break;
+            }
+            let queued_bytes = queued_block_bytes(&block);
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
+            if let Err(err) = writers.write(block).await {
+                write_err = Some(err);
+                break;
+            }
+        }
+
+        if let Some(err) = write_err {
+            task.abort();
+            let _ = task.await;
+            drain_queued_inflight_bytes(&mut rx).await;
+            if let Err(shutdown_err) = writers.shutdown().await {
+                error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
+            }
+            return Err(err);
+        }
+
+        let (reader, total) = task.await??;
+        writers.shutdown().await?;
+        Ok((reader, total))
     }
 }
 
@@ -467,7 +292,6 @@ mod tests {
     use super::*;
     use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
     use rustfs_utils::HashAlgorithm;
-    use std::io::Cursor;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -524,27 +348,17 @@ mod tests {
         assert!(!committed.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn block_assembler_splits_input_into_erasure_blocks() {
-        let reader = tokio::io::BufReader::new(Cursor::new(b"abcdefghijkl".to_vec()));
-        let mut assembler = BlockAssembler::new(reader, 4);
-
-        assert_eq!(assembler.next_block().await.unwrap(), Some(b"abcd".to_vec()));
-        assert_eq!(assembler.next_block().await.unwrap(), Some(b"efgh".to_vec()));
-        assert_eq!(assembler.next_block().await.unwrap(), Some(b"ijkl".to_vec()));
-        assert_eq!(assembler.next_block().await.unwrap(), None);
-        assert_eq!(assembler.total_bytes(), 12);
+    #[test]
+    fn encode_channel_capacity_never_returns_zero() {
+        assert_eq!(encode_channel_capacity(0, 1024), 1);
+        assert_eq!(encode_channel_capacity(4096, 0), 1);
+        assert_eq!(encode_channel_capacity(4096, 1024), 1);
     }
 
-    #[tokio::test]
-    async fn erasure_chunk_encoder_produces_full_shard_block() {
-        let erasure = Arc::new(Erasure::new(2, 1, 4));
-        let encoder = ErasureChunkEncoder::new(erasure.clone()).await;
-        let block = encoder.encode_block(b"abcd").await.unwrap();
-
-        assert_eq!(block.shard_count(), 3);
-        assert_eq!(block.shard(0).len(), erasure.shard_size());
-
-        encoder.release(block).await;
+    #[test]
+    fn encode_channel_capacity_respects_budget_and_hard_cap() {
+        assert_eq!(encode_channel_capacity(4 * 1024 * 1024, 32 * 1024 * 1024), 8);
+        assert_eq!(encode_channel_capacity(16 * 1024 * 1024, 32 * 1024 * 1024), 2);
+        assert_eq!(encode_channel_capacity(1, usize::MAX), DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS);
     }
 }

@@ -45,13 +45,10 @@ use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::is_valid_storage_class;
-use rustfs_ecstore::store_api::{
-    ChunkNativePutData, CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions,
-};
+use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
-use rustfs_object_io::put::PutObjectChecksums;
-use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
+use rustfs_rio::{CompressReader, HashReader};
 use rustfs_s3_common::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -70,6 +67,15 @@ use tokio_util::io::StreamReader;
 use tracing::{instrument, warn};
 use urlencoding::encode;
 use uuid::Uuid;
+
+fn merge_part_encryption_metadata(
+    metadata: &HashMap<String, String>,
+    part_metadata: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = metadata.clone();
+    merged.extend(part_metadata.clone());
+    merged
+}
 
 /// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
 /// Used by execute_upload_part_copy to reject out-of-bounds ranges per S3 spec.
@@ -426,7 +432,6 @@ impl DefaultMultipartUsecase {
         let mt2 = HashMap::new();
         let replicate_options =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-
         let dsc = must_replicate(&bucket, &key, replicate_options).await;
 
         if dsc.replicate_any() {
@@ -647,19 +652,12 @@ impl DefaultMultipartUsecase {
         };
 
         let opts = ObjectOptions::default();
-        let mut fi = store
+        let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(ApiError::from)?;
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
-        let mut requested_checksum_type = rustfs_rio::ChecksumType::from_header(&req.headers);
-        if !requested_checksum_type.is_set()
-            && let Some(checksum_algo) = fi.user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
-            && let Some(checksum_type) = fi.user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE)
-        {
-            requested_checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(checksum_algo, checksum_type);
-        }
 
         // Apply adaptive buffer sizing based on part size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
@@ -671,8 +669,6 @@ impl DefaultMultipartUsecase {
         );
 
         let is_compressible = rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
-
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
 
         let actual_size = size;
 
@@ -687,31 +683,30 @@ impl DefaultMultipartUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        if is_compressible {
-            let mut hrd =
-                HashReader::new(reader, size, actual_size, md5hex.take(), sha256hex.take(), false).map_err(ApiError::from)?;
+        let mut reader = if is_compressible {
+            let mut hrd = HashReader::from_stream(body, size, actual_size, md5hex.take(), sha256hex.take(), false)
+                .map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
-            if requested_checksum_type.is_set() && hrd.checksum().is_none() {
-                hrd.enable_auto_checksum(requested_checksum_type).map_err(ApiError::from)?;
-            }
 
-            let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
-            reader = Box::new(compress_reader);
             size = HashReader::SIZE_PRESERVE_LAYER;
-            md5hex = None;
-            sha256hex = None;
-        }
-
-        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+            HashReader::from_reader(
+                CompressReader::new(hrd, CompressionAlgorithm::default()),
+                size,
+                actual_size,
+                None,
+                None,
+                false,
+            )
+            .map_err(ApiError::from)?
+        } else {
+            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+        };
 
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
             return Err(ApiError::from(err).into());
-        }
-        if requested_checksum_type.is_set() && reader.checksum().is_none() {
-            reader.enable_auto_checksum(requested_checksum_type).map_err(ApiError::from)?;
         }
 
         let has_ssec = sse_customer_algorithm.is_some();
@@ -762,30 +757,27 @@ impl DefaultMultipartUsecase {
                 let requested_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
-
-                fi.user_defined.extend(material.metadata);
+                reader =
+                    HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                        .map_err(ApiError::from)?;
 
                 (requested_sse, requested_kms_key_id)
             }
             None => (None, None),
         };
 
-        let mut reader = ChunkNativePutData::new(reader);
+        let mut reader = PutObjReader::new(reader);
 
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
 
-        let mut checksums = PutObjectChecksums {
-            crc32: input.checksum_crc32,
-            crc32c: input.checksum_crc32c,
-            sha1: input.checksum_sha1,
-            sha256: input.checksum_sha256,
-            crc64nvme: input.checksum_crc64nvme,
-        };
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
 
         if let Some(alg) = &input.checksum_algorithm
             && let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
@@ -805,26 +797,25 @@ impl DefaultMultipartUsecase {
             })
         {
             match alg.as_str() {
-                ChecksumAlgorithm::CRC32 => checksums.crc32 = checksum_str,
-                ChecksumAlgorithm::CRC32C => checksums.crc32c = checksum_str,
-                ChecksumAlgorithm::SHA1 => checksums.sha1 = checksum_str,
-                ChecksumAlgorithm::SHA256 => checksums.sha256 = checksum_str,
-                ChecksumAlgorithm::CRC64NVME => checksums.crc64nvme = checksum_str,
+                ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
                 _ => (),
             }
         }
-        checksums.merge_from_map(&reader.content_crc());
 
         let output = UploadPartOutput {
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
             sse_customer_algorithm,
             sse_customer_key_md5,
-            checksum_crc32: checksums.crc32,
-            checksum_crc32c: checksums.crc32c,
-            checksum_sha1: checksums.sha1,
-            checksum_sha256: checksums.sha256,
-            checksum_crc64nvme: checksums.crc64nvme,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             ..Default::default()
         };
@@ -939,7 +930,7 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut mp_info = store
+        let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
             .await
             .map_err(ApiError::from)?;
@@ -1015,8 +1006,6 @@ impl DefaultMultipartUsecase {
 
         let is_compressible = rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(src_stream));
-
         let src_decryption_request = DecryptionRequest {
             bucket: &src_bucket,
             key: &src_key,
@@ -1028,23 +1017,74 @@ impl DefaultMultipartUsecase {
             etag: src_info.etag.as_deref(),
         };
 
-        if let Some(material) = sse_decryption(src_decryption_request).await? {
-            reader = material.wrap_single_reader(reader);
-            if let Some(original) = material.original_size {
-                src_info.actual_size = original;
-            }
-        }
-
         let actual_size = length;
         let mut size = length;
 
-        if is_compressible {
-            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            size = HashReader::SIZE_PRESERVE_LAYER;
-        }
+        let mut reader = match sse_decryption(src_decryption_request).await? {
+            Some(material) => {
+                if let Some(original) = material.original_size {
+                    src_info.actual_size = original;
+                }
 
-        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                if material.is_multipart {
+                    let (decrypted_stream, plaintext_size) =
+                        material.wrap_reader(src_stream, size).await.map_err(ApiError::from)?;
+                    size = plaintext_size;
+
+                    if is_compressible {
+                        let hrd = HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                        size = HashReader::SIZE_PRESERVE_LAYER;
+                        HashReader::from_reader(
+                            CompressReader::new(hrd, CompressionAlgorithm::default()),
+                            size,
+                            actual_size,
+                            None,
+                            None,
+                            false,
+                        )
+                        .map_err(ApiError::from)?
+                    } else {
+                        HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+                    }
+                } else if is_compressible {
+                    let hrd =
+                        HashReader::from_stream(material.wrap_single_reader(src_stream), size, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                    size = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        size,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(material.wrap_single_reader(src_stream), size, actual_size, None, None, false)
+                        .map_err(ApiError::from)?
+                }
+            }
+            None => {
+                if is_compressible {
+                    let hrd =
+                        HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                    size = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        size,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+                }
+            }
+        };
 
         let server_side_encryption = mp_info
             .user_defined
@@ -1079,26 +1119,48 @@ impl DefaultMultipartUsecase {
 
         encryption_request.check_upload_part_customer_key_md5(&mp_info.user_defined, sse_customer_key_md5.clone())?;
 
-        let (requested_sse, requested_kms_key_id) = match sse_encryption(encryption_request).await? {
+        let (requested_sse, requested_kms_key_id, dst_user_defined) = match sse_encryption(encryption_request).await? {
             Some(material) => {
                 let requested_sse = Some(material.server_side_encryption.clone());
                 let requested_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
+                reader =
+                    HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                        .map_err(ApiError::from)?;
+                let dst_user_defined = merge_part_encryption_metadata(&mp_info.user_defined, &material.metadata);
 
-                mp_info.user_defined.extend(material.metadata);
-
-                (requested_sse, requested_kms_key_id)
+                (requested_sse, requested_kms_key_id, dst_user_defined)
             }
-            None => (None, None),
+            None => (None, None, mp_info.user_defined.clone()),
         };
 
-        let mut reader = ChunkNativePutData::new(reader);
+        if let Some(checksum_algorithm) = mp_info
+            .user_defined
+            .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
+            .filter(|checksum_algorithm| !checksum_algorithm.is_empty())
+        {
+            let checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(
+                checksum_algorithm,
+                mp_info
+                    .user_defined
+                    .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            );
+            if !checksum_type.is_set() {
+                return Err(ApiError::from(StorageError::other(format!(
+                    "Invalid multipart checksum type: {checksum_algorithm}"
+                )))
+                .into());
+            }
+            reader.add_calculated_checksum(checksum_type).map_err(ApiError::from)?;
+        }
+
+        let mut reader = PutObjReader::new(reader);
 
         let dst_opts = ObjectOptions {
-            user_defined: mp_info.user_defined.clone(),
+            user_defined: dst_user_defined,
             ..Default::default()
         };
 
@@ -1107,10 +1169,17 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let copy_checksums = reader.as_hash_reader().content_crc();
+        let checksum_value = |checksum_type: rustfs_rio::ChecksumType| copy_checksums.get(&checksum_type.to_string()).cloned();
+
         let copy_part_result = CopyPartResult {
+            checksum_crc32: checksum_value(rustfs_rio::ChecksumType::CRC32),
+            checksum_crc32c: checksum_value(rustfs_rio::ChecksumType::CRC32C),
+            checksum_sha1: checksum_value(rustfs_rio::ChecksumType::SHA1),
+            checksum_sha256: checksum_value(rustfs_rio::ChecksumType::SHA256),
+            checksum_crc64nvme: checksum_value(rustfs_rio::ChecksumType::CRC64_NVME),
             e_tag: part_info.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
-            ..Default::default()
         };
 
         let output = UploadPartCopyOutput {
@@ -1131,6 +1200,9 @@ impl DefaultMultipartUsecase {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri, header::HeaderValue};
+    use rustfs_filemeta::ObjectPartInfo;
+    use std::{collections::HashMap, io::Cursor};
+    use tokio::io::AsyncReadExt;
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -1185,6 +1257,161 @@ mod tests {
         assert_eq!(location, "/bucket/nested/object");
     }
 
+    #[test]
+    fn merge_part_encryption_metadata_keeps_source_metadata_unchanged() {
+        let multipart_metadata = HashMap::from([
+            ("x-rustfs-encryption-iv".to_string(), "base-nonce".to_string()),
+            ("x-rustfs-encryption-key".to_string(), "base-key".to_string()),
+        ]);
+        let part_metadata = HashMap::from([
+            ("x-rustfs-encryption-iv".to_string(), "part-nonce".to_string()),
+            ("x-rustfs-encryption-original-size".to_string(), "1024".to_string()),
+        ]);
+
+        let merged = merge_part_encryption_metadata(&multipart_metadata, &part_metadata);
+
+        assert_eq!(multipart_metadata.get("x-rustfs-encryption-iv").map(String::as_str), Some("base-nonce"));
+        assert_eq!(merged.get("x-rustfs-encryption-iv").map(String::as_str), Some("part-nonce"));
+        assert_eq!(merged.get("x-rustfs-encryption-key").map(String::as_str), Some("base-key"));
+    }
+
+    #[tokio::test]
+    async fn managed_multipart_roundtrip_preserves_session_nonce_between_parts() {
+        let prepare_request = PrepareEncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key_md5: None,
+        };
+        let session_material = sse_prepare_encryption(prepare_request)
+            .await
+            .expect("prepare multipart encryption")
+            .expect("managed multipart session material");
+        let session_metadata = session_material.metadata.clone();
+        let session_nonce = session_metadata
+            .get("x-rustfs-encryption-iv")
+            .cloned()
+            .expect("session nonce metadata");
+        let part_key = session_metadata.get("x-rustfs-encryption-key").cloned();
+        let part_nonce = Some(session_nonce.clone());
+
+        let part_one_plaintext = vec![0x31; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 23];
+        let part_two_plaintext = vec![0x32; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE * 2 + 7];
+
+        let part_one_material = sse_encryption(EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: Some(session_material.server_side_encryption.clone()),
+            ssekms_key_id: session_material.kms_key_id.clone(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: part_one_plaintext.len() as i64,
+            part_number: Some(1),
+            part_key: part_key.clone(),
+            part_nonce: part_nonce.clone(),
+        })
+        .await
+        .expect("encrypt part one")
+        .expect("part one material");
+        let part_one_metadata = merge_part_encryption_metadata(&session_metadata, &part_one_material.metadata);
+        let mut encrypted_one = Vec::new();
+        part_one_material
+            .wrap_reader(Cursor::new(part_one_plaintext.clone()))
+            .read_to_end(&mut encrypted_one)
+            .await
+            .expect("read encrypted part one");
+
+        let part_two_material = sse_encryption(EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: Some(session_material.server_side_encryption.clone()),
+            ssekms_key_id: session_material.kms_key_id.clone(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: part_two_plaintext.len() as i64,
+            part_number: Some(2),
+            part_key,
+            part_nonce,
+        })
+        .await
+        .expect("encrypt part two")
+        .expect("part two material");
+        let part_two_metadata = merge_part_encryption_metadata(&session_metadata, &part_two_material.metadata);
+        let mut encrypted_two = Vec::new();
+        part_two_material
+            .wrap_reader(Cursor::new(part_two_plaintext.clone()))
+            .read_to_end(&mut encrypted_two)
+            .await
+            .expect("read encrypted part two");
+
+        assert_eq!(
+            session_metadata.get("x-rustfs-encryption-iv").map(String::as_str),
+            Some(session_nonce.as_str())
+        );
+        assert_ne!(
+            part_one_metadata.get("x-rustfs-encryption-iv"),
+            session_metadata.get("x-rustfs-encryption-iv")
+        );
+        assert_ne!(
+            part_two_metadata.get("x-rustfs-encryption-iv"),
+            session_metadata.get("x-rustfs-encryption-iv")
+        );
+
+        let parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                size: encrypted_one.len(),
+                actual_size: part_one_plaintext.len() as i64,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                size: encrypted_two.len(),
+                actual_size: part_two_plaintext.len() as i64,
+                ..Default::default()
+            },
+        ];
+
+        let mut encrypted_stream = Vec::with_capacity(encrypted_one.len() + encrypted_two.len());
+        encrypted_stream.extend_from_slice(&encrypted_one);
+        encrypted_stream.extend_from_slice(&encrypted_two);
+
+        let decryption_material = sse_decryption(DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &session_metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            part_number: None,
+            parts: &parts,
+            etag: Some("multipart-etag"),
+        })
+        .await
+        .expect("decrypt multipart")
+        .expect("managed decryption material");
+
+        let (mut decrypted_reader, plaintext_size) = decryption_material
+            .wrap_reader(Cursor::new(encrypted_stream), -1)
+            .await
+            .expect("wrap multipart reader");
+
+        let mut decrypted = Vec::new();
+        decrypted_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("read decrypted multipart data");
+
+        let mut expected = part_one_plaintext;
+        expected.extend_from_slice(&part_two_plaintext);
+
+        assert_eq!(plaintext_size, expected.len() as i64);
+        assert_eq!(decrypted, expected);
+    }
+
     #[tokio::test]
     async fn execute_abort_multipart_upload_returns_internal_error_when_store_uninitialized() {
         let input = AbortMultipartUploadInput::builder()
@@ -1223,7 +1450,9 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::POST);
 
-        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
     }
 
@@ -1250,7 +1479,9 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::POST);
 
-        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .unwrap_err();
         assert_ne!(err.code(), &S3ErrorCode::InvalidPartOrder);
     }
 
@@ -1277,7 +1508,9 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::POST);
 
-        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPartOrder);
     }
 
@@ -1327,7 +1560,9 @@ mod tests {
             let mut req = build_request(input, Method::POST);
             req.headers.insert(header_name, HeaderValue::from_str(header_value).unwrap());
 
-            let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+            let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+                .await
+                .unwrap_err();
             assert_eq!(err.code(), &S3ErrorCode::InvalidRequest, "header {header_name} should be rejected");
         }
     }
@@ -1436,7 +1671,7 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::PUT);
 
-        let err = make_usecase().execute_upload_part_copy(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_upload_part_copy(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 

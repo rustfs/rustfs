@@ -19,11 +19,11 @@ use crate::heal::{
 };
 use crate::{Error, Result};
 use rustfs_common::heal_channel::{
-    HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse, HealScanMode,
-    publish_heal_response,
+    HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse,
+    HealScanMode, publish_heal_response,
 };
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
 /// Heal channel processor
@@ -82,14 +82,18 @@ impl HealChannelProcessor {
     /// Process heal command
     async fn process_command(&self, command: HealChannelCommand) -> Result<()> {
         match command {
-            HealChannelCommand::Start(request) => self.process_start_request(request).await,
+            HealChannelCommand::Start { request, response_tx } => self.process_start_request(request, response_tx).await,
             HealChannelCommand::Query { heal_path, client_token } => self.process_query_request(heal_path, client_token).await,
             HealChannelCommand::Cancel { heal_path } => self.process_cancel_request(heal_path).await,
         }
     }
 
     /// Process start request
-    async fn process_start_request(&self, request: HealChannelRequest) -> Result<()> {
+    async fn process_start_request(
+        &self,
+        request: HealChannelRequest,
+        response_tx: oneshot::Sender<std::result::Result<HealAdmissionResult, String>>,
+    ) -> Result<()> {
         info!(
             "Processing heal start request: {} for bucket: {}/{}",
             request.id,
@@ -98,31 +102,60 @@ impl HealChannelProcessor {
         );
 
         // Convert channel request to heal request
-        let heal_request = self.convert_to_heal_request(request.clone())?;
+        let heal_request = match self.convert_to_heal_request(request.clone()) {
+            Ok(heal_request) => heal_request,
+            Err(err) => {
+                let error_text = err.to_string();
+                let _ = response_tx.send(Err(error_text.clone()));
+                self.publish_response(HealChannelResponse {
+                    request_id: request.id,
+                    success: false,
+                    data: None,
+                    error: Some(error_text),
+                });
+                return Ok(());
+            }
+        };
 
         // Submit to heal manager
         match self.heal_manager.submit_heal_request(heal_request).await {
-            Ok(task_id) => {
-                info!("Successfully submitted heal request: {} as task: {}", request.id, task_id);
+            Ok(admission) => {
+                info!(
+                    request_id = %request.id,
+                    admission = admission.result_label(),
+                    "Heal request admission decision completed"
+                );
+
+                let _ = response_tx.send(Ok(admission));
+
+                let (success, error) = match admission {
+                    HealAdmissionResult::Accepted | HealAdmissionResult::Merged => (true, None),
+                    HealAdmissionResult::Full => (false, Some("Heal request queue is full".to_string())),
+                    HealAdmissionResult::Dropped(reason) => (false, Some(format!("Heal request dropped: {}", reason.as_str()))),
+                };
 
                 let response = HealChannelResponse {
                     request_id: request.id,
-                    success: true,
-                    data: Some(format!("Task ID: {task_id}").into_bytes()),
-                    error: None,
+                    success,
+                    data: Some(
+                        format!("admission={},reason={}", admission.result_label(), admission.reason_label()).into_bytes(),
+                    ),
+                    error,
                 };
 
                 self.publish_response(response);
             }
             Err(e) => {
-                error!("Failed to submit heal request: {} - {}", request.id, e);
+                let error_text = e.to_string();
+                error!("Failed to submit heal request: {} - {}", request.id, error_text);
+                let _ = response_tx.send(Err(error_text.clone()));
 
                 // Send error response
                 let response = HealChannelResponse {
                     request_id: request.id,
                     success: false,
                     data: None,
-                    error: Some(e.to_string()),
+                    error: Some(error_text),
                 };
 
                 self.publish_response(response);
@@ -247,8 +280,9 @@ impl HealChannelProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heal::manager::HealConfig;
     use crate::heal::storage::HealStorageAPI;
-    use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealScanMode};
+    use rustfs_common::heal_channel::{HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode};
     use std::sync::Arc;
 
     // Mock storage for testing
@@ -568,5 +602,93 @@ mod tests {
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
         assert!(matches!(heal_request.heal_type, HealType::Bucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_process_start_request_returns_admission_result() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = Arc::new(HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        ));
+        let processor = HealChannelProcessor::new(manager);
+
+        let request = HealChannelRequest {
+            id: "admission-id".to_string(),
+            bucket: "bucket".to_string(),
+            object_prefix: Some("object".to_string()),
+            object_version_id: None,
+            disk: None,
+            priority: HealChannelPriority::Low,
+            scan_mode: Some(HealScanMode::Normal),
+            remove_corrupted: None,
+            recreate_missing: None,
+            update_parity: None,
+            recursive: None,
+            dry_run: None,
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+        };
+
+        let (tx, rx) = oneshot::channel();
+        processor
+            .process_start_request(request.clone(), tx)
+            .await
+            .expect("first admission should succeed");
+        assert_eq!(
+            rx.await
+                .expect("oneshot should resolve")
+                .expect("admission should be returned"),
+            HealAdmissionResult::Accepted
+        );
+
+        let (tx, rx) = oneshot::channel();
+        processor
+            .process_start_request(request, tx)
+            .await
+            .expect("duplicate admission should succeed");
+        assert_eq!(
+            rx.await
+                .expect("oneshot should resolve")
+                .expect("admission should be returned"),
+            HealAdmissionResult::Merged
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_start_request_returns_error_on_invalid_request() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let request = HealChannelRequest {
+            id: "invalid-id".to_string(),
+            bucket: "bucket".to_string(),
+            object_prefix: None,
+            object_version_id: None,
+            disk: Some("invalid".to_string()),
+            priority: HealChannelPriority::Normal,
+            scan_mode: None,
+            remove_corrupted: None,
+            recreate_missing: None,
+            update_parity: None,
+            recursive: None,
+            dry_run: None,
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+        };
+
+        let (tx, rx) = oneshot::channel();
+        processor
+            .process_start_request(request, tx)
+            .await
+            .expect("processor should surface invalid request through response channel");
+        assert!(rx.await.expect("oneshot should resolve").is_err());
     }
 }

@@ -81,6 +81,8 @@ config:
       start_delay_secs: ""
       # Enable/disable scanner sleeps for throttling
       idle_mode: ""
+      # Timeout for scanner cache saves in seconds (minimum 1 second)
+      cache_save_timeout_secs: ""
     obs_endpoint:
       enabled: false # If true, rustfs will export metrics, traces, logs and profiling data to the specified OTLP endpoints. If false, the individual settings for metrics, traces, logs and profiling endpoints will be ignored and all data will not be exported.
       base_endpoint: "" #Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318
@@ -97,6 +99,16 @@ config:
       profiling:
         enabled: false
         endpoint: "" # If specified, rustfs will export profiling data to this endpoint. e.g. "http://localhost:6060/debug/pprof/profile"
+    kms:
+      enabled: false
+      type: "vault" # Only Support vault currently.
+      vault:
+        vault_backend: "" # Only support vault kv2 and vault transit. 
+        vault_address: ""
+        vault_token: ""
+        vault_mount_path: ""
+        default_key: ""
+
 
 extraEnv: [] # This is for setting extra environment variables in the rustfs container. It should be a list of key value pairs. For example:
 # extraEnv:
@@ -143,6 +155,14 @@ containerSecurityContext:
   runAsNonRoot: true
 
 service:
+  annotations: {}
+  headlessAnnotations: {} # Applied to the headless Service when mode.distributed.enabled=true
+  traefikAnnotations: # Applied to the Service when mode.distributed.enabled=true and ingress.className=traefik
+    traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
+    traefik.ingress.kubernetes.io/service.sticky.cookie.httponly: "true"
+    traefik.ingress.kubernetes.io/service.sticky.cookie.name: rustfs
+    traefik.ingress.kubernetes.io/service.sticky.cookie.samesite: none
+    traefik.ingress.kubernetes.io/service.sticky.cookie.secure: "true"
   type: ClusterIP
   endpoint:
     port: 9000
@@ -155,12 +175,7 @@ service:
 ingress:
   enabled: true
   className: "nginx" # Specify the classname, traefik or nginx. Different classname has different annotations for session sticky.
-  traefikAnnotations:
-    traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
-    traefik.ingress.kubernetes.io/service.sticky.cookie.httponly: "true"
-    traefik.ingress.kubernetes.io/service.sticky.cookie.name: rustfs
-    traefik.ingress.kubernetes.io/service.sticky.cookie.samesite: none
-    traefik.ingress.kubernetes.io/service.sticky.cookie.secure: "true"
+  traefikAnnotations: {} # Deprecated: use service.traefikAnnotations instead
   nginxAnnotations:
     nginx.ingress.kubernetes.io/affinity: cookie
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
@@ -168,7 +183,8 @@ ingress:
     nginx.ingress.kubernetes.io/session-cookie-hash: sha1
     nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
     nginx.ingress.kubernetes.io/session-cookie-name: rustfs
-  customAnnotations: # Additional custom annotations (merged with class-specific annotations)
+  annotations: {}
+  customAnnotations: # Deprecated: use ingress.annotations instead
     {}
   hosts:
     - host: example.rustfs.com
@@ -212,8 +228,13 @@ gatewayApi:
 
 mtls:
   enabled: false
-  serverOnly: false # If true, only server side TLS will be enabled. If false, both server and client side TLS will be enabled.
-  # This is for setting up mTLS for ingress.
+  clientCertPath: "/opt/tls/client_cert.pem"
+  clientKeyPath: "/opt/tls/client_key.pem"
+  existingIssuerRef:
+    enabled: false
+    name: ""
+    kind: ""
+    group: ""
 
 resources: {}
   # We usually recommend not to specify default resources and to leave this as a conscious
@@ -232,8 +253,9 @@ livenessProbe:
   enabled: true # omitted
   httpGet:
     path: /health
-    port: endpoint
-  initialDelaySeconds: 10
+    port: 9000
+    scheme: HTTP
+  initialDelaySeconds: 30
   periodSeconds: 5
   timeoutSeconds: 3
   successThreshold: 1
@@ -244,7 +266,8 @@ readinessProbe:
   httpGet:
     path: /health/ready
     port: endpoint
-  initialDelaySeconds: 30
+    scheme: HTTP
+  initialDelaySeconds: 10
   periodSeconds: 5
   timeoutSeconds: 3
   successThreshold: 1
@@ -265,9 +288,11 @@ storageclass:
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
   pvcAnnotations: {}
-  # pvcAnnotations:
-    # - name: team
-    #   value: "RustFS"
+    #pvcAnnotations:
+    #  data:
+    #    key: value
+    #  logs:
+    #    key: value
 
 pdb:
   create: false

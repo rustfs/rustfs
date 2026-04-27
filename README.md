@@ -100,28 +100,28 @@ To get started with RustFS, follow these steps:
 curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 ```
 
-### 2\. Docker Quick Start (Option 2)
+### 2. Docker Quick Start (Option 2)
 
 The RustFS container runs as a non-root user `rustfs` (UID `10001`). If you run Docker with `-v` to mount a host directory, please ensure the host directory owner is set to `10001`, otherwise you will encounter permission denied errors.
 
 ```bash
- # Create data and logs directories
- mkdir -p data logs
+# Create data and logs directories
+mkdir -p data logs
 
- # Change the owner of these directories
- chown -R 10001:10001 data logs
+# Change the owner of these directories
+chown -R 10001:10001 data logs
 
- # Using latest version
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+# Using latest version
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
- # Using specific version
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-alpha.76
+# Using specific version
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-alpha.76
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
 
 ```bash
- podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 ```
 
 You can also use Docker Compose. Using the `docker-compose.yml` file in the root directory:
@@ -218,6 +218,48 @@ rustfs --help
 3. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs/clients to interact with your RustFS instance.
 
 **NOTE**: To access the RustFS instance via `https`, please refer to the [TLS Configuration Docs](https://docs.rustfs.com/integration/tls-configured.html).
+
+### OIDC Roles Claim (Microsoft Entra ID)
+
+RustFS supports mapping an OIDC claim containing role values into the existing
+authorization pipeline. The `roles_claim` setting is **optional**: when unset or
+empty, only the `groups` claim contributes to authorization (same as older
+RustFS releases). For Microsoft Entra ID app roles, set `roles_claim=roles` so
+both console admin checks and bucket IAM policies can evaluate those roles.
+
+Example environment configuration (opt-in roles claim):
+
+```bash
+RUSTFS_IDENTITY_OPENID_ENABLE=on
+RUSTFS_IDENTITY_OPENID_CONFIG_URL="https://login.microsoftonline.com/<tenant-id>/v2.0/.well-known/openid-configuration"
+RUSTFS_IDENTITY_OPENID_CLIENT_ID="<client-id>"
+RUSTFS_IDENTITY_OPENID_CLIENT_SECRET="<client-secret>"
+RUSTFS_IDENTITY_OPENID_SCOPES="openid,profile,email"
+RUSTFS_IDENTITY_OPENID_GROUPS_CLAIM="groups"
+RUSTFS_IDENTITY_OPENID_ROLES_CLAIM="roles"
+```
+
+Policy condition example (evaluate app roles directly with `jwt:roles`; when
+`roles_claim` is configured, RustFS also merges those values into `jwt:groups`
+for backward compatibility with older policies):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*"],
+      "Resource": ["arn:aws:s3:::*"],
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "jwt:roles": ["RustFS.ConsoleAdmin"]
+        }
+      }
+    }
+  ]
+}
+```
 
 ## Documentation
 

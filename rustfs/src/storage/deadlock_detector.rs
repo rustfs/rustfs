@@ -34,7 +34,7 @@
 //! - Request resource tracking (locks, memory, file handles)
 //! - Lock wait graph analysis for cycle detection
 //! - Configurable detection interval and hang threshold
-//! - Prometheus metrics for deadlock events
+//! - Deadlock metrics emitted through the shared metrics pipeline
 //! - Detailed diagnostic logging
 //!
 //! # Usage
@@ -464,7 +464,7 @@ impl DeadlockDetector {
         if let Some(cycle) = Self::find_cycle(&wait_graph) {
             deadlocks_detected.fetch_add(1, Ordering::Relaxed);
 
-            counter!("rustfs.deadlock.detected.total").increment(1);
+            counter!("rustfs_deadlock_detected_total").increment(1);
 
             // Log detailed deadlock information
             error!(

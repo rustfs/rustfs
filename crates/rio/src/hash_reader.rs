@@ -90,10 +90,7 @@ use crate::ChecksumType;
 use crate::Sha256Hasher;
 use crate::compress_index::{Index, TryGetIndex};
 use crate::get_content_checksum;
-use crate::{
-    BlockReadable, BoxReadBlockFuture, DynReader, EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, WarpReader,
-    boxed_reader, wrap_reader,
-};
+use crate::{DynReader, EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, WarpReader, boxed_reader, wrap_reader};
 use base64::Engine;
 use base64::engine::general_purpose;
 use http::HeaderMap;
@@ -288,7 +285,7 @@ impl HashReader {
             Ok(Self {
                 inner,
                 size,
-                checksum: md5hex.clone(),
+                checksum: md5hex,
                 actual_size,
                 diskable_md5,
                 bytes_read: 0,
@@ -370,7 +367,7 @@ impl HashReader {
 
         if let Some(checksum) = cs {
             if checksum.checksum_type.trailing() {
-                self.trailer_s3s = trailing_headers.clone();
+                self.trailer_s3s = trailing_headers;
             }
 
             self.content_hash = Some(checksum.clone());
@@ -411,9 +408,9 @@ impl HashReader {
         Ok(())
     }
 
-    pub fn enable_auto_checksum(&mut self, checksum_type: ChecksumType) -> Result<(), std::io::Error> {
+    pub fn add_calculated_checksum(&mut self, checksum_type: ChecksumType) -> Result<(), std::io::Error> {
         if !checksum_type.is_set() {
-            return Ok(());
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum type"));
         }
 
         let Some(hasher) = checksum_type.hasher() else {
@@ -425,6 +422,7 @@ impl HashReader {
             ..Default::default()
         });
         self.content_hasher = Some(hasher);
+
         Ok(())
     }
 
@@ -468,97 +466,6 @@ impl HashReader {
             return map;
         }
         map
-    }
-
-    pub fn finalize_content_hash(&mut self) -> std::io::Result<Option<Checksum>> {
-        self.finish_checksum_validation()?;
-        Ok(self.content_hash.clone())
-    }
-
-    fn update_read_state(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.bytes_read += data.len() as u64;
-
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(hasher) = self.content_sha256_hasher.as_mut() {
-            hasher.write_all(data)?;
-        }
-
-        if let Some(hasher) = self.content_hasher.as_mut() {
-            hasher.write_all(data)?;
-        }
-
-        Ok(())
-    }
-
-    fn finish_checksum_validation(&mut self) -> std::io::Result<()> {
-        if self.checksum_on_finish {
-            return Ok(());
-        }
-
-        if let (Some(mut hasher), Some(expected_sha256)) = (self.content_sha256_hasher.take(), self.content_sha256.as_ref()) {
-            let sha256 = hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower);
-            if sha256 != *expected_sha256 {
-                error!("SHA256 mismatch, expected={:?}, actual={:?}", expected_sha256, sha256);
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SHA256 mismatch"));
-            }
-        }
-
-        if let Some(mut expected_content_hash) = self.content_hash.clone()
-            && let Some(mut hasher) = self.content_hasher.take()
-        {
-            if expected_content_hash.checksum_type.trailing()
-                && let Some(trailer) = self.trailer_s3s.as_ref()
-                && let Some(Some(checksum_str)) = trailer.read(|headers| {
-                    expected_content_hash
-                        .checksum_type
-                        .key()
-                        .and_then(|key| headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string())))
-                })
-            {
-                expected_content_hash.encoded = checksum_str;
-                expected_content_hash.raw = general_purpose::STANDARD
-                    .decode(&expected_content_hash.encoded)
-                    .map_err(|_| std::io::Error::other("Invalid base64 checksum"))?;
-
-                if expected_content_hash.raw.is_empty() {
-                    return Err(std::io::Error::other("Content hash mismatch"));
-                }
-            }
-
-            let content_hash = hasher.finalize();
-            if expected_content_hash.encoded.is_empty() {
-                expected_content_hash.raw = content_hash.clone();
-                expected_content_hash.encoded = general_purpose::STANDARD.encode(&content_hash);
-                self.content_hash = Some(expected_content_hash);
-            } else if content_hash != expected_content_hash.raw {
-                let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
-                let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);
-                error!(
-                    "Content hash mismatch, type={:?}, encoded={:?}, expected={:?}, actual={:?}",
-                    expected_content_hash.checksum_type, expected_content_hash.encoded, expected_hex, actual_hex
-                );
-                let checksum_err = crate::errors::ChecksumMismatch {
-                    want: expected_hex,
-                    got: actual_hex,
-                };
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, checksum_err));
-            }
-        }
-
-        self.checksum_on_finish = true;
-        Ok(())
-    }
-
-    pub async fn read_block(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read_block(buf).await?;
-        self.update_read_state(&buf[..n])?;
-        if n == 0 {
-            self.finish_checksum_validation()?;
-        }
-        Ok(n)
     }
 }
 
@@ -619,23 +526,90 @@ impl HashReaderMut for HashReader {
 
 impl AsyncRead for HashReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
+        let this = self.project();
 
         let before = buf.filled().len();
-        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+        match this.inner.poll_read(cx, buf) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => {
                 let data = &buf.filled()[before..];
                 let filled = data.len();
-                if let Err(e) = this.update_read_state(data) {
-                    error!("hash reader state update error, error={:?}", e);
-                    return Poll::Ready(Err(std::io::Error::other(e)));
+
+                *this.bytes_read += filled as u64;
+
+                if filled > 0 {
+                    // Update SHA256 hasher
+                    if let Some(hasher) = this.content_sha256_hasher
+                        && let Err(e) = hasher.write_all(data)
+                    {
+                        error!("SHA256 hasher write error, error={:?}", e);
+                        return Poll::Ready(Err(std::io::Error::other(e)));
+                    }
+
+                    // Update content hasher
+                    if let Some(hasher) = this.content_hasher
+                        && let Err(e) = hasher.write_all(data)
+                    {
+                        return Poll::Ready(Err(std::io::Error::other(e)));
+                    }
                 }
 
-                if filled == 0
-                    && let Err(e) = this.finish_checksum_validation()
-                {
-                    return Poll::Ready(Err(e));
+                if filled == 0 && !*this.checksum_on_finish {
+                    // check SHA256
+                    if let (Some(hasher), Some(expected_sha256)) = (this.content_sha256_hasher, this.content_sha256) {
+                        let sha256 = hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower);
+                        if sha256 != *expected_sha256 {
+                            error!("SHA256 mismatch, expected={:?}, actual={:?}", expected_sha256, sha256);
+                            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SHA256 mismatch")));
+                        }
+                    }
+
+                    // check content hasher
+                    if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
+                        if expected_content_hash.checksum_type.trailing()
+                            && let Some(trailer) = this.trailer_s3s.as_ref()
+                            && let Some(Some(checksum_str)) = trailer.read(|headers| {
+                                expected_content_hash
+                                    .checksum_type
+                                    .key()
+                                    .and_then(|key| headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string())))
+                            })
+                        {
+                            expected_content_hash.encoded = checksum_str;
+                            expected_content_hash.raw = general_purpose::STANDARD
+                                .decode(&expected_content_hash.encoded)
+                                .map_err(|_| std::io::Error::other("Invalid base64 checksum"))?;
+
+                            if expected_content_hash.raw.is_empty() {
+                                return Poll::Ready(Err(std::io::Error::other("Content hash mismatch")));
+                            }
+                        }
+
+                        let content_hash = hasher.finalize();
+
+                        if expected_content_hash.raw.is_empty()
+                            && expected_content_hash.encoded.is_empty()
+                            && !expected_content_hash.checksum_type.trailing()
+                        {
+                            expected_content_hash.raw = content_hash;
+                            expected_content_hash.encoded = general_purpose::STANDARD.encode(&expected_content_hash.raw);
+                        } else if content_hash != expected_content_hash.raw {
+                            let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
+                            let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);
+                            error!(
+                                "Content hash mismatch, type={:?}, encoded={:?}, expected={:?}, actual={:?}",
+                                expected_content_hash.checksum_type, expected_content_hash.encoded, expected_hex, actual_hex
+                            );
+                            // Use ChecksumMismatch error so that API layer can return BadDigest
+                            let checksum_err = crate::errors::ChecksumMismatch {
+                                want: expected_hex,
+                                got: actual_hex,
+                            };
+                            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, checksum_err)));
+                        }
+                    }
+
+                    *this.checksum_on_finish = true;
                 }
                 Poll::Ready(Ok(()))
             }
@@ -673,39 +647,13 @@ impl TryGetIndex for HashReader {
     }
 }
 
-impl BlockReadable for HashReader {
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(async move { self.read_block(buf).await })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{DecryptReader, EncryptReader, encrypt_reader, wrap_reader};
     use rand::RngExt;
     use std::io::Cursor;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
-
-    struct UnexpectedEofReader;
-
-    impl AsyncRead for UnexpectedEofReader {
-        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl BlockReadable for UnexpectedEofReader {
-        fn read_block<'a>(&'a mut self, _buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-            Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "synthetic unexpected eof")) })
-        }
-    }
-
-    impl EtagResolvable for UnexpectedEofReader {}
-    impl HashReaderDetector for UnexpectedEofReader {}
-    impl TryGetIndex for UnexpectedEofReader {}
+    use tokio::io::{AsyncReadExt, BufReader};
 
     #[tokio::test]
     async fn test_hashreader_wrapping_logic() {
@@ -734,7 +682,7 @@ mod tests {
             HashReader::from_stream(BufReader::new(Cursor::new(&data[..])), size, actual_size, etag.clone(), None, false)
                 .unwrap();
         let etag_reader = EtagReader::new(reader3, etag.clone());
-        let hash_reader3 = HashReader::from_reader(etag_reader, size, actual_size, etag.clone(), None, false).unwrap();
+        let hash_reader3 = HashReader::from_reader(etag_reader, size, actual_size, etag, None, false).unwrap();
         assert_eq!(hash_reader3.size(), size);
         assert_eq!(hash_reader3.actual_size(), actual_size);
     }
@@ -819,34 +767,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hashreader_read_block_reads_full_and_tail_block() {
-        let data = b"hello block reader";
+    async fn test_add_calculated_checksum_records_checksum() {
+        let data = b"server-side copy checksum";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let reader = Box::new(WarpReader::new(reader));
-        let mut hash_reader = HashReader::new(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
+        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
 
-        let mut first = [0_u8; 8];
-        let n1 = hash_reader.read_block(&mut first).await.unwrap();
-        assert_eq!(n1, 8);
-        assert_eq!(&first[..n1], b"hello bl");
+        hash_reader.add_calculated_checksum(ChecksumType::CRC64_NVME).unwrap();
 
-        let mut second = [0_u8; 32];
-        let n2 = hash_reader.read_block(&mut second).await.unwrap();
-        assert_eq!(n2, data.len() - n1);
-        assert_eq!(&second[..n2], b"ock reader");
+        let mut buf = Vec::new();
+        hash_reader.read_to_end(&mut buf).await.unwrap();
 
-        let n3 = hash_reader.read_block(&mut second).await.unwrap();
-        assert_eq!(n3, 0);
-    }
+        let expected = Checksum::new_from_data(ChecksumType::CRC64_NVME, data).unwrap();
+        let checksums = hash_reader.content_crc();
 
-    #[tokio::test]
-    async fn test_hashreader_read_block_propagates_unexpected_eof() {
-        let mut hash_reader = HashReader::new(Box::new(UnexpectedEofReader), 0, 0, None, None, true).unwrap();
-        let mut buf = [0_u8; 8];
-
-        let err = hash_reader.read_block(&mut buf).await.unwrap_err();
-
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(buf, data);
+        assert_eq!(hash_reader.content_crc_type(), Some(ChecksumType::CRC64_NVME));
+        assert_eq!(checksums.get("CRC64NVME"), Some(&expected.encoded));
     }
 
     #[tokio::test]

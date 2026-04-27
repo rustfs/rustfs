@@ -20,11 +20,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "small_put_bench"
-path = "src/bin/small_put_bench.rs"
-test = false
-
 [lints]
 workspace = true
 
@@ -46,7 +41,6 @@ serde_json.workspace = true
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-clap = { workspace = true }
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes.workspace = true
@@ -58,8 +52,6 @@ async-compression = { workspace = true, features = ["tokio", "bzip2", "xz"] }
 async-trait = { workspace = true }
 flate2.workspace = true
 http.workspace = true
-http-body.workspace = true
-http-body-util.workspace = true
 reqwest = { workspace = true }
 rustfs-signer.workspace = true
 tracing = { workspace = true }
@@ -81,3 +73,4 @@ rcgen.workspace = true
 anyhow.workspace = true
 rustls.workspace = true
 zip.workspace = true
+clap.workspace = true

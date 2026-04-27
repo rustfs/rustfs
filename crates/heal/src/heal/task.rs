@@ -14,6 +14,7 @@
 
 use crate::heal::{ErasureSetHealer, progress::HealProgress, storage::HealStorageAPI};
 use crate::{Error, Result};
+use metrics::{counter, histogram};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -133,16 +134,20 @@ pub struct HealRequest {
     pub priority: HealPriority,
     /// Created time
     pub created_at: SystemTime,
+    /// Queue admission time used for scheduler delay metrics
+    pub enqueued_at: SystemTime,
 }
 
 impl HealRequest {
     pub fn new(heal_type: HealType, options: HealOptions, priority: HealPriority) -> Self {
+        let now = SystemTime::now();
         Self {
             id: Uuid::new_v4().to_string(),
             heal_type,
             options,
             priority,
-            created_at: SystemTime::now(),
+            created_at: now,
+            enqueued_at: now,
         }
     }
 
@@ -193,6 +198,8 @@ pub struct HealTask {
     pub progress: Arc<RwLock<HealProgress>>,
     /// Created time
     pub created_at: SystemTime,
+    /// Queue admission time
+    pub enqueued_at: SystemTime,
     /// Started time
     pub started_at: Arc<RwLock<Option<SystemTime>>>,
     /// Completed time
@@ -214,11 +221,33 @@ impl HealTask {
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             created_at: request.created_at,
+            enqueued_at: request.enqueued_at,
             started_at: Arc::new(RwLock::new(None)),
             completed_at: Arc::new(RwLock::new(None)),
             task_start_instant: Arc::new(RwLock::new(None)),
             cancel_token: tokio_util::sync::CancellationToken::new(),
             storage,
+        }
+    }
+
+    pub fn metric_type_label(&self) -> &'static str {
+        match &self.heal_type {
+            HealType::Object { .. } => "object",
+            HealType::Bucket { .. } => "bucket",
+            HealType::ErasureSet { .. } => "erasure_set",
+            HealType::Metadata { .. } => "metadata",
+            HealType::MRF { .. } => "mrf",
+            HealType::ECDecode { .. } => "ec_decode",
+        }
+    }
+
+    pub fn metric_set_label(&self) -> String {
+        match &self.heal_type {
+            HealType::ErasureSet { set_disk_id, .. } => set_disk_id.clone(),
+            _ => match (self.options.pool_index, self.options.set_index) {
+                (Some(pool), Some(set)) => format!("pool_{pool}_set_{set}"),
+                _ => "global".to_string(),
+            },
         }
     }
 
@@ -272,11 +301,26 @@ impl HealTask {
         }
     }
 
+    async fn skip_due_to_transient_object_exists(&self, bucket: &str, object: &str, err: &Error) -> Result<()> {
+        warn!(
+            "Skipping heal for {}/{} due to transient object existence check error: {}",
+            bucket, object, err
+        );
+
+        let mut progress = self.progress.write().await;
+        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
+        progress.update_progress(0, 1, 0, 0);
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self), fields(task_id = %self.id, heal_type = ?self.heal_type))]
     pub async fn execute(&self) -> Result<()> {
         // update status and timestamps atomically to avoid race conditions
         let now = SystemTime::now();
         let start_instant = Instant::now();
+        let queue_delay = now.duration_since(self.enqueued_at).unwrap_or_default();
+        let type_label = self.metric_type_label().to_string();
+        let set_label = self.metric_set_label();
         {
             let mut status = self.status.write().await;
             let mut started_at = self.started_at.write().await;
@@ -285,6 +329,19 @@ impl HealTask {
             *started_at = Some(now);
             *task_start_instant = Some(start_instant);
         }
+
+        histogram!(
+            "rustfs_heal_queue_delay_seconds",
+            "type" => type_label.clone(),
+            "set" => set_label.clone()
+        )
+        .record(queue_delay.as_secs_f64());
+        counter!(
+            "rustfs_heal_task_start_total",
+            "type" => type_label,
+            "set" => set_label
+        )
+        .increment(1);
 
         info!("Task started");
 
@@ -369,7 +426,13 @@ impl HealTask {
         // Step 1: Check if object exists and get metadata
         warn!("Step 1: Checking object existence and metadata");
         self.check_control_flags().await?;
-        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
+        let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
+            Ok(exists) => exists,
+            Err(err @ Error::TransientSkip { .. }) => {
+                return self.skip_due_to_transient_object_exists(bucket, object, &err).await;
+            }
+            Err(err) => return Err(err),
+        };
         if !object_exists {
             warn!("Object does not exist: {}/{}", bucket, object);
             if self.options.recreate_missing {
@@ -631,7 +694,13 @@ impl HealTask {
         // Step 1: Check if object exists
         info!("Step 1: Checking object existence");
         self.check_control_flags().await?;
-        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
+        let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
+            Ok(exists) => exists,
+            Err(err @ Error::TransientSkip { .. }) => {
+                return self.skip_due_to_transient_object_exists(bucket, object, &err).await;
+            }
+            Err(err) => return Err(err),
+        };
         if !object_exists {
             warn!("Object does not exist: {}/{}", bucket, object);
             return Err(Error::TaskExecutionFailed {
@@ -791,7 +860,13 @@ impl HealTask {
         // Step 1: Check if object exists
         info!("Step 1: Checking object existence");
         self.check_control_flags().await?;
-        let object_exists = self.await_with_control(self.storage.object_exists(bucket, object)).await?;
+        let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
+            Ok(exists) => exists,
+            Err(err @ Error::TransientSkip { .. }) => {
+                return self.skip_due_to_transient_object_exists(bucket, object, &err).await;
+            }
+            Err(err) => return Err(err),
+        };
         if !object_exists {
             warn!("Object does not exist: {}/{}", bucket, object);
             return Err(Error::TaskExecutionFailed {

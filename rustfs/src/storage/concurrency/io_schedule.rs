@@ -1263,11 +1263,7 @@ impl IoLoadMetrics {
     pub(crate) fn lifetime_average_wait(&self) -> Duration {
         let total = self.total_wait_ns.load(Ordering::Relaxed);
         let count = self.observation_count.load(Ordering::Relaxed);
-        if count == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(total / count)
-        }
+        total.checked_div(count).map(Duration::from_nanos).unwrap_or(Duration::ZERO)
     }
 
     /// Get the total observation count
@@ -1281,7 +1277,7 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     // Record concurrent request metrics
     {
         use metrics::gauge;
-        gauge!("rustfs.concurrent.get.requests").set(concurrent_requests as f64);
+        gauge!("rustfs_concurrent_get_requests").set(concurrent_requests as f64);
     }
 
     // For low concurrency, use the base buffer size for maximum throughput
@@ -1687,7 +1683,7 @@ impl<T> IoPriorityQueue<T> {
 
 /// Global metrics for I/O priority queue monitoring.
 ///
-/// These metrics are exposed for Prometheus scraping and provide
+/// These metrics are emitted through the shared metrics pipeline and provide
 /// visibility into the priority queue behavior.
 #[allow(dead_code)]
 pub struct IoPriorityMetrics {

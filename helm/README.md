@@ -36,6 +36,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.scanner.speed | string | `""` | Scanner speed preset: `fastest`, `fast`, `default`, `slow`, `slowest`. |
 | config.rustfs.scanner.start_delay_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_SCANNER_START_DELAY_SECS`. |
 | config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`). |
+| config.rustfs.scanner.cache_save_timeout_secs | string | `""` | Override scanner cache save timeout in seconds with `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (minimum `1`). |
 | config.rustfs.obs_endpoint.enabled | bool | `false` | Whether to send metrics/logs/traces/profilings to remote endpoint, eg, OLTP. |
 | config.rustfs.obs_endpoint.base_endpoint | string | `""` | Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318. |
 | config.rustfs.obs_endpoint.use_stdout | bool | `false` | Whether to output logs to stdout in addition the OLTP. |
@@ -47,6 +48,13 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.obs_endpoint.logs.endpoint | string | `""` | Remote endpoint url for logs. |
 | config.rustfs.obs_endpoint.profiling.enabled | bool | `false` | Whether to send profiling to remote endpoint. |
 | config.rustfs.obs_endpoint.profiling.endpoint | string | `""` | Remote endpoint url for profiling. |
+| config.rustfs.kms.enabled | bool | `false`| Whether to enable kms. |
+| config.rustfs.kms.type | string | `vault`| The kms type that RustFS supported. |
+| config.rustfs.kms.vault.vault_backend | string | `""`| The vault backend, `vault-kv2` or `vault-transit`. |
+| config.rustfs.kms.vault.vault_address | string | `""`| The vault address. |
+| config.rustfs.kms.vault.vault_token | string | `""`| The vault token. |
+| config.rustfs.kms.vault.vault_mount_path | string | `"transit"`| The vault mount path, only works if `vault_backend` equals `vault-transit` . |
+| config.rustfs.kms.vault.default_key | string | `"transit"`| The master key id for RustFS. |
 | extraEnv | map | `[]` |  Extra environment variables for RustFS container. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
@@ -95,7 +103,13 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | mode.standalone.existingClaim.dataClaim |string |`""` |Whether to use existing pvc claim for data storage. |
 | mode.standalone.existingClaim.logsClaim |string |`""` |Whether to use existing pvc claim for logs storage. |
 | mtls.enabled | bool | `false` | Enable mtls betweens pods. |
-| mtls.serverOnly | bool | `false` | Only enable server https. |
+| mtls.clientCertPath | string | `/opt/tls/client_cert.pem` | The path for client cert. |
+| mtls.clientKeyPath | string | `/opt/tls/client_key.pem` | The path for client key. |
+| mtls.existingIssuerRef.enabled | bool | `false` | Enable to use external/existing certificate issuer.|
+| mtls.existingIssuerRef.name | string | `""` | The name of external/existing certificate issuer. |
+| mtls.existingIssuerRef.kind | string | `""` | The kind of external/existing certificate iss
+uer. `ClusterIssuer` or `Issuer`. |
+| mtls.existingIssuerRef.group | string | `""` | The group of external/existing certificate issuer. |
 | nameOverride | string | `""` |  |
 | nodeSelector | object | `{}` |  |
 | pdb.create | bool | `false` | Enable/disable a Pod Disruption Budget creation |
@@ -133,7 +147,8 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | storageclass.dataStorageSize | string | `"256Mi"` | The storage size for data PVC. |
 | storageclass.logStorageSize | string | `"256Mi"` | The storage size for logs PVC. |
 | storageclass.name | string | `"local-path"` | The name for StorageClass. |
-| storageclass.pvcAnnotations | map | `{}` | PVC customized annotations. |
+| storageclass.pvcAnnotations.data | map | `{}` | Data pvc customized annotations. |
+| storageclass.pvcAnnotations.logs | map | `{}` | Logs pvc customized annotations. |
 | tolerations | list | `[]` |  |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |

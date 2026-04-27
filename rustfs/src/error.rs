@@ -259,9 +259,6 @@ impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
         // Check if the error is a ChecksumMismatch (BadDigest)
         if let Some(inner) = err.get_ref() {
-            if let Some(storage_error) = inner.downcast_ref::<StorageError>() {
-                return storage_error.clone().into();
-            }
             if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some() {
                 return ApiError {
                     code: S3ErrorCode::BadDigest,
@@ -554,16 +551,5 @@ mod tests {
         // ApiError doesn't implement Error::source() properly, so this would be None
         // This is expected because ApiError is not a typical Error implementation
         assert!(error.source().is_none());
-    }
-
-    #[test]
-    fn test_api_error_from_io_error_unwraps_invalid_range_storage_error() {
-        let io_error = std::io::Error::from(StorageError::InvalidRangeSpec("range invalid".to_string()));
-
-        let api_error: ApiError = io_error.into();
-
-        assert_eq!(api_error.code, S3ErrorCode::InvalidRange);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::InvalidRange));
-        assert!(api_error.source.is_some());
     }
 }

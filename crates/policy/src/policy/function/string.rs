@@ -320,6 +320,31 @@ mod tests {
         pollster::block_on(result) ^ negate
     }
 
+    #[test]
+    fn test_jwt_roles_condition_uses_roles_values() {
+        assert!(test_eval(
+            new_fkv("jwt:roles", vec!["RustFS.ConsoleAdmin"]),
+            false,
+            false,
+            false,
+            vec![("roles", vec!["RustFS.ConsoleAdmin"])]
+        ));
+        assert!(!test_eval(
+            new_fkv("jwt:roles", vec!["RustFS.ConsoleAdmin"]),
+            false,
+            false,
+            false,
+            vec![("roles", vec!["readonly"])]
+        ));
+        assert!(!test_eval(
+            new_fkv("jwt:roles", vec!["RustFS.ConsoleAdmin"]),
+            false,
+            false,
+            false,
+            vec![("groups", vec!["RustFS.ConsoleAdmin"])]
+        ));
+    }
+
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["yourbucket/myobject"])] => false ; "2")]
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![] => false ; "3")]

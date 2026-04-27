@@ -25,8 +25,12 @@ use crate::store::ECStore;
 use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
 use rustfs_config::COMMENT_KEY;
 use rustfs_config::DEFAULT_DELIMITER;
-use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
-use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::audit::{
+    AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_SUB_SYS, AUDIT_PULSAR_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS,
+};
+use rustfs_config::notify::{
+    NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+};
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,7 +148,7 @@ impl KVS {
     pub fn insert(&mut self, key: String, value: String) {
         for kv in self.0.iter_mut() {
             if kv.key == key {
-                kv.value = value.clone();
+                kv.value = value;
                 return;
             }
         }
@@ -241,6 +245,12 @@ pub fn init() {
     kvs.insert(AUDIT_WEBHOOK_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_WEBHOOK_KVS.clone());
     kvs.insert(NOTIFY_MQTT_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_MQTT_KVS.clone());
     kvs.insert(AUDIT_MQTT_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_MQTT_KVS.clone());
+    kvs.insert(NOTIFY_NATS_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_NATS_KVS.clone());
+    kvs.insert(AUDIT_NATS_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_NATS_KVS.clone());
+    kvs.insert(NOTIFY_PULSAR_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_PULSAR_KVS.clone());
+    kvs.insert(AUDIT_PULSAR_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_PULSAR_KVS.clone());
+    kvs.insert(NOTIFY_KAFKA_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_KAFKA_KVS.clone());
+    kvs.insert(AUDIT_KAFKA_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_KAFKA_KVS.clone());
     kvs.insert(IDENTITY_OPENID_SUB_SYS.to_owned(), oidc::DEFAULT_IDENTITY_OPENID_KVS.clone());
 
     // Register all default configurations

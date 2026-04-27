@@ -1021,7 +1021,7 @@ mod tests {
             "if-modified-since",
             HeaderValue::from_str(&valid_mod_time.format(&RFC1123).unwrap()).unwrap(),
         );
-        let info14 = info3.clone();
+        let info14 = info3;
         assert!(check_preconditions(&headers14, &info14).is_ok());
 
         // [15] If-Match with no ETag → PreconditionFailed
@@ -1055,6 +1055,17 @@ mod tests {
             ..Default::default()
         };
         assert!(check_preconditions(&headers17, &info17).is_ok());
+
+        // [18] Empty conditional ETag headers are ignored
+        let mut headers18 = HeaderMap::new();
+        headers18.insert("if-match", HeaderValue::from_static(""));
+        headers18.insert("if-none-match", HeaderValue::from_static(" "));
+        let info18 = ObjectInfo {
+            mod_time: Some(valid_mod_time),
+            etag: Some(valid_etag.to_string()),
+            ..Default::default()
+        };
+        assert!(check_preconditions(&headers18, &info18).is_ok());
     }
 
     #[test]

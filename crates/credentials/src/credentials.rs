@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io::Error;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use time::OffsetDateTime;
 
 /// Global active credentials
@@ -314,6 +314,17 @@ impl fmt::Debug for Credentials {
 }
 
 impl Credentials {
+    /// Returns a reference to this credential's claims, or a shared empty map
+    /// when the credential has no claims attached. Avoids per-call allocation
+    /// at call sites that need an `&HashMap<String, Value>`.
+    pub fn claims_or_empty(&self) -> &HashMap<String, Value> {
+        static EMPTY: LazyLock<HashMap<String, Value>> = LazyLock::new(HashMap::new);
+        match &self.claims {
+            Some(c) => c,
+            None => &EMPTY,
+        }
+    }
+
     pub fn is_expired(&self) -> bool {
         if self.expiration.is_none() {
             return false;
@@ -448,7 +459,7 @@ mod tests {
             // Initialize
             let test_ak = "test_access_key".to_string();
             let test_sk = "test_secret_key_123456".to_string();
-            init_global_action_credentials(Some(test_ak.clone()), Some(test_sk.clone())).ok();
+            init_global_action_credentials(Some(test_ak), Some(test_sk)).ok();
         }
 
         // Verify the state after initialization
@@ -472,6 +483,16 @@ mod tests {
             assert_eq!(ak.len(), 20);
             assert_eq!(sk.len(), 32);
         }
+    }
+
+    #[test]
+    fn test_gen_secret_key_uses_url_safe_base64_without_padding() {
+        let key = gen_secret_key(32).expect("secret key should generate");
+
+        assert_eq!(key.len(), 32);
+        assert!(!key.contains('/'));
+        assert!(!key.contains('+'));
+        assert!(!key.contains('='));
     }
 
     #[test]

@@ -18,14 +18,12 @@ use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_
 use crate::scanner_folder::data_usage_update_dir_cycles;
 use crate::scanner_io::ScannerIO;
 use crate::sleeper::SCANNER_SLEEPER;
-use crate::{DataUsageInfo, ScannerError};
+use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
-use rustfs_config::DEFAULT_SCANNER_SPEED;
-use rustfs_config::ENV_SCANNER_SPEED;
-use rustfs_config::ENV_SCANNER_START_DELAY_SECS;
 use rustfs_config::ScannerSpeed;
+use rustfs_config::{DEFAULT_SCANNER_SPEED, ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -40,11 +38,15 @@ use tracing::{debug, error, info, instrument, warn};
 
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
-/// Returns the base cycle interval. If `RUSTFS_SCANNER_START_DELAY_SECS`
-/// is set (or `RUSTFS_DATA_SCANNER_START_DELAY_SECS` as deprecated alias),
-/// it takes precedence; otherwise the value is derived from the
-/// `RUSTFS_SCANNER_SPEED` preset.
+/// Returns the base cycle interval.
+/// Priority order:
+/// 1. RUSTFS_SCANNER_CYCLE (if set, overrides everything)
+/// 2. RUSTFS_SCANNER_START_DELAY_SECS (for backward compatibility)
+/// 3. RUSTFS_SCANNER_SPEED preset
 fn cycle_interval() -> Duration {
+    if let Some(secs) = rustfs_utils::get_env_opt_u64(ENV_SCANNER_CYCLE) {
+        return Duration::from_secs(secs);
+    }
     if let Some(secs) = scanner_start_delay_secs() {
         return Duration::from_secs(secs);
     }
@@ -85,8 +87,8 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
 
-    let ctx_clone = ctx.clone();
-    let storeapi_clone = storeapi.clone();
+    let ctx_clone = ctx;
+    let storeapi_clone = storeapi;
     tokio::spawn(async move {
         let sleep_time = initial_scanner_delay();
         tokio::time::sleep(sleep_time).await;
@@ -181,6 +183,8 @@ fn get_lock_acquire_timeout() -> Duration {
 
 #[instrument(skip_all)]
 async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
+    let _activity_guard = ScannerActivityGuard::new();
+    SCANNER_SLEEPER.refresh_from_env();
     info!("Start run data scanner cycle");
     cycle_info.current = cycle_info.next;
     let now = Instant::now();
@@ -321,6 +325,7 @@ pub async fn store_data_usage_in_backend(
     let mut attempts = 1u32;
 
     while let Some(data_usage_info) = receiver.recv().await {
+        let _activity_guard = ScannerActivityGuard::new();
         if ctx.is_cancelled() {
             break;
         }
@@ -356,6 +361,7 @@ pub async fn store_data_usage_in_backend(
 mod tests {
     use super::*;
     use serial_test::serial;
+    use temp_env::{with_var, with_var_unset};
 
     #[test]
     #[serial]
@@ -374,6 +380,42 @@ mod tests {
         let delay = initial_scanner_delay_for(Some(120));
         assert!(delay >= Duration::from_secs(108));
         assert!(delay <= Duration::from_secs(132));
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_prefers_explicit_cycle_override() {
+        with_var(ENV_SCANNER_SPEED, Some("slowest"), || {
+            with_var(ENV_SCANNER_CYCLE, Some("42"), || {
+                assert_eq!(cycle_interval(), Duration::from_secs(42));
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_supports_minio_speed_alias() {
+        with_var_unset(ENV_SCANNER_SPEED, || {
+            with_var_unset(ENV_SCANNER_CYCLE, || {
+                with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
+                    with_var("MINIO_SCANNER_SPEED", Some("slowest"), || {
+                        assert_eq!(cycle_interval(), Duration::from_secs(30 * 60));
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_supports_minio_cycle_alias() {
+        with_var_unset(ENV_SCANNER_CYCLE, || {
+            with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
+                with_var("MINIO_SCANNER_CYCLE", Some("90"), || {
+                    assert_eq!(cycle_interval(), Duration::from_secs(90));
+                });
+            });
+        });
     }
 
     #[test]

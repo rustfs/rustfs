@@ -13,12 +13,18 @@
 // limitations under the License.
 
 mod arn;
+mod kafka;
 mod mqtt;
+mod nats;
+mod pulsar;
 mod store;
 mod webhook;
 
 pub use arn::*;
+pub use kafka::*;
 pub use mqtt::*;
+pub use nats::*;
+pub use pulsar::*;
 pub use store::*;
 pub use webhook::*;
 
@@ -64,9 +70,14 @@ pub const ENV_NOTIFY_SEND_CONCURRENCY: &str = "RUSTFS_NOTIFY_SEND_CONCURRENCY";
 pub const DEFAULT_NOTIFY_SEND_CONCURRENCY: usize = 64;
 
 #[allow(dead_code)]
-pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS];
+pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[
+    NOTIFY_KAFKA_SUB_SYS,
+    NOTIFY_MQTT_SUB_SYS,
+    NOTIFY_NATS_SUB_SYS,
+    NOTIFY_PULSAR_SUB_SYS,
+    NOTIFY_WEBHOOK_SUB_SYS,
+];
 
-#[allow(dead_code)]
 pub const NOTIFY_KAFKA_SUB_SYS: &str = "notify_kafka";
 pub const NOTIFY_MQTT_SUB_SYS: &str = "notify_mqtt";
 #[allow(dead_code)]
@@ -83,4 +94,5 @@ pub const NOTIFY_AMQP_SUB_SYS: &str = "notify_amqp";
 pub const NOTIFY_POSTGRES_SUB_SYS: &str = "notify_postgres";
 #[allow(dead_code)]
 pub const NOTIFY_REDIS_SUB_SYS: &str = "notify_redis";
+pub const NOTIFY_PULSAR_SUB_SYS: &str = "notify_pulsar";
 pub const NOTIFY_WEBHOOK_SUB_SYS: &str = "notify_webhook";

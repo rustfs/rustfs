@@ -84,7 +84,7 @@ mod tests {
         assert!(Arc::ptr_eq(&metrics1, &metrics2));
 
         // Create a MetricsCollector with the global metrics
-        let collector = MetricsCollector::new(metrics1.clone(), 100);
+        let collector = MetricsCollector::new(metrics1, 100);
 
         // Record some data
         let rt = tokio::runtime::Runtime::new().unwrap();

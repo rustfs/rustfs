@@ -1264,10 +1264,10 @@ mod tests {
         // Test very long strings
         let long_string = "a".repeat(1000);
         let long_req = AddServiceAccountReq {
-            policy: Some(serde_json::json!({"Statement": [long_string.clone()]})),
+            policy: Some(serde_json::json!({"Statement": [long_string]})),
             target_user: Some(long_string.clone()),
             access_key: long_string.clone(),
-            secret_key: long_string.clone(),
+            secret_key: long_string,
             name: Some("valid_name".to_string()),
             description: Some("valid description".to_string()),
             expiration: None,

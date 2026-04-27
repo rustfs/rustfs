@@ -31,6 +31,7 @@ use rustfs_ecstore::{
         },
         metadata_sys,
         object_lock::objectlock_sys::check_retention_for_modification,
+        replication::{GLOBAL_REPLICATION_STATS, ReplicationConfigurationExt},
         tagging::{decode_tags, decode_tags_to_map, encode_tags},
         utils::serialize,
         versioning::VersioningApi,
@@ -38,7 +39,7 @@ use rustfs_ecstore::{
     },
     error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
     new_object_layer_fn,
-    store_api::{BucketOperations, BucketOptions, ObjectOperations, ObjectOptions},
+    store_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations, ObjectOptions},
 };
 use rustfs_s3_common::{S3Operation, record_s3_op};
 use rustfs_targets::EventName;
@@ -70,6 +71,22 @@ impl FS {
     pub fn new() -> Self {
         rustfs_s3_common::init_s3_metrics();
         Self {}
+    }
+
+    async fn replication_tagging_enabled(bucket: &str, object: &str) -> bool {
+        metadata_sys::get_replication_config(bucket)
+            .await
+            .map(|(cfg, _)| cfg.has_active_rules(object, true))
+            .unwrap_or(false)
+    }
+
+    async fn record_replication_tagging_metric(bucket: &str, object: &str, api: &str, is_err: bool) {
+        if !Self::replication_tagging_enabled(bucket, object).await {
+            return;
+        }
+        if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+            stats.inc_proxy(bucket, api, is_err).await;
+        }
     }
 
     pub async fn get_object_tag_conditions_for_policy(
@@ -228,14 +245,14 @@ impl S3 for FS {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let usecase = DefaultMultipartUsecase::from_global();
-        usecase.execute_complete_multipart_upload(req).await
+        Box::pin(usecase.execute_complete_multipart_upload(req)).await
     }
 
     /// Copy an object from one location to another
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let usecase = DefaultObjectUsecase::from_global();
-        usecase.execute_copy_object(req).await
+        Box::pin(usecase.execute_copy_object(req)).await
     }
 
     #[instrument(
@@ -345,7 +362,7 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let usecase = DefaultObjectUsecase::from_global();
-        usecase.execute_delete_object(req).await
+        Box::pin(usecase.execute_delete_object(req)).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -374,7 +391,9 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        store.delete_object_tags(&bucket, &object, &opts).await.map_err(|e| {
+        let delete_tags_result = store.delete_object_tags(&bucket, &object, &opts).await;
+        Self::record_replication_tagging_metric(&bucket, &object, "DeleteObjectTagging", delete_tags_result.is_err()).await;
+        delete_tags_result.map_err(|e| {
             error!("Failed to delete object tags: {}", e);
             ApiError::from(e)
         })?;
@@ -393,7 +412,7 @@ impl S3 for FS {
             }
         };
 
-        counter!("rustfs.delete_object_tagging.success").increment(1);
+        counter!("rustfs_delete_object_tagging_success").increment(1);
 
         let event_version_id = version_id
             .as_deref()
@@ -413,7 +432,7 @@ impl S3 for FS {
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "delete").record(duration.as_secs_f64());
+        histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "delete").record(duration.as_secs_f64());
         result
     }
 
@@ -611,7 +630,7 @@ impl S3 for FS {
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let usecase = DefaultObjectUsecase::from_global();
-        usecase.execute_get_object(req).await
+        Box::pin(usecase.execute_get_object(req)).await
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
@@ -801,7 +820,9 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let tags = store.get_object_tags(bucket, object, &opts).await.map_err(|e| {
+        let tags_result = store.get_object_tags(bucket, object, &opts).await;
+        Self::record_replication_tagging_metric(bucket, object, "GetObjectTagging", tags_result.is_err()).await;
+        let tags = tags_result.map_err(|e| {
             if is_err_object_not_found(&e) {
                 error!("Object not found: {}", e);
                 return s3_error!(NoSuchKey);
@@ -813,9 +834,9 @@ impl S3 for FS {
         let tag_set = decode_tags(tags.as_str());
         debug!("Decoded tag set: {:?}", tag_set);
 
-        counter!("rustfs.get_object_tagging.success").increment(1);
+        counter!("rustfs_get_object_tagging_success").increment(1);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "get").record(duration.as_secs_f64());
+        histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "get").record(duration.as_secs_f64());
         Ok(S3Response::new(GetObjectTaggingOutput {
             tag_set,
             version_id: req.input.version_id.clone(),
@@ -1102,7 +1123,7 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let usecase = DefaultObjectUsecase::from_global();
-        usecase.execute_put_object(self, req).await
+        Box::pin(usecase.execute_put_object(self, req)).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
@@ -1284,44 +1305,27 @@ impl S3 for FS {
             .as_ref()
             .and_then(|r| r.retain_until_date.as_ref())
             .map(|d| OffsetDateTime::from(d.clone()));
-        let new_mode = retention.as_ref().and_then(|r| r.mode.as_ref()).map(|mode| mode.as_str());
+        let new_mode = retention
+            .as_ref()
+            .and_then(|r| r.mode.as_ref())
+            .map(|mode| mode.as_str().to_string());
 
-        // TODO(security): Known TOCTOU race condition (fix in future PR).
-        //
-        // There is a time-of-check-time-of-use (TOCTOU) window between the retention
-        // check below (using get_object_info + check_retention_for_modification) and
-        // the actual update performed later in put_object_metadata.
-        //
-        // In theory:
-        //   * Thread A reads retention mode = GOVERNANCE and checks the bypass header.
-        //   * Thread B updates retention to COMPLIANCE mode.
-        //   * Thread A then proceeds to modify retention, still assuming GOVERNANCE,
-        //     and effectively bypasses what is now COMPLIANCE mode.
-        //
-        // This would violate the S3 spec, which states that COMPLIANCE-mode retention
-        // cannot be modified even with a bypass header.
-        //
-        // Possible fixes (to be implemented in a future change):
-        //   1. Pass the expected retention mode down to the storage layer and verify
-        //      it has not changed immediately before the update.
-        //   2. Use optimistic concurrency (e.g., version/etag) so that the update
-        //      fails if the object changed between check and update.
-        //   3. Perform the retention check inside the same lock/transaction scope as
-        //      the metadata update within the storage layer.
-        //
-        // Current mitigation: the storage layer provides a fast_lock_manager, which
-        // offers some protection, but it does not fully eliminate this race.
+        let bypass_governance = has_bypass_governance_header(&req.headers);
+        // Keep the early check for existing response behavior; put_object_metadata
+        // repeats the same check after taking the metadata write lock.
         let check_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
 
-        if let Ok(existing_obj_info) = store.get_object_info(&bucket, &key, &check_opts).await {
-            let bypass_governance = has_bypass_governance_header(&req.headers);
-            if let Some(block_reason) =
-                check_retention_for_modification(&existing_obj_info.user_defined, new_mode, new_retain_until, bypass_governance)
-            {
-                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
-            }
+        if let Ok(existing_obj_info) = store.get_object_info(&bucket, &key, &check_opts).await
+            && let Some(block_reason) = check_retention_for_modification(
+                &existing_obj_info.user_defined,
+                new_mode.as_deref(),
+                new_retain_until,
+                bypass_governance,
+            )
+        {
+            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
         }
 
         let eval_metadata = parse_object_lock_retention(retention)?;
@@ -1330,10 +1334,15 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
         opts.eval_metadata = Some(eval_metadata);
+        opts.object_lock_retention = Some(ObjectLockRetentionOptions {
+            mode: new_mode,
+            retain_until: new_retain_until,
+            bypass_governance,
+        });
 
         let object_info = store.put_object_metadata(&bucket, &key, &opts).await.map_err(|e| {
             error!("put_object_metadata failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
+            S3Error::from(ApiError::from(e))
         })?;
 
         let output = PutObjectRetentionOutput {
@@ -1375,9 +1384,11 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        store.put_object_tags(&bucket, &object, &tags, &opts).await.map_err(|e| {
+        let put_tags_result = store.put_object_tags(&bucket, &object, &tags, &opts).await;
+        Self::record_replication_tagging_metric(&bucket, &object, "PutObjectTagging", put_tags_result.is_err()).await;
+        put_tags_result.map_err(|e| {
             error!("Failed to put object tags: {}", e);
-            counter!("rustfs.put_object_tagging.failure").increment(1);
+            counter!("rustfs_put_object_tagging_failure").increment(1);
             ApiError::from(e)
         })?;
 
@@ -1395,7 +1406,7 @@ impl S3 for FS {
             }
         };
 
-        counter!("rustfs.put_object_tagging.success").increment(1);
+        counter!("rustfs_put_object_tagging_success").increment(1);
 
         let event_version_id = req
             .input
@@ -1419,7 +1430,7 @@ impl S3 for FS {
         }));
         let _ = helper.complete(&result);
         let duration = start_time.elapsed();
-        histogram!("rustfs.object_tagging.operation.duration.seconds", "operation" => "put").record(duration.as_secs_f64());
+        histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "put").record(duration.as_secs_f64());
         result
     }
 
@@ -1447,6 +1458,6 @@ impl S3 for FS {
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
         record_s3_op(S3Operation::UploadPartCopy, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
-        usecase.execute_upload_part_copy(req).await
+        Box::pin(usecase.execute_upload_part_copy(req)).await
     }
 }

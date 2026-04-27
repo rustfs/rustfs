@@ -18,27 +18,153 @@
 //! `openidconnect` crate for standards-compliant discovery, token exchange,
 //! and ID token verification.
 
-use crate::oidc_state::{OidcAuthSession, OidcStateStore};
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata};
+use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
+use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
 use openidconnect::{
-    AsyncHttpClient, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope,
+    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, LogoutRequest, Nonce,
+    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl, Scope,
 };
+use reqwest::Client;
 use rustfs_config::oidc::*;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_config};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::RwLock;
+use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 use url::Url;
 
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
+const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
+const OIDC_PLUGIN_AUTHN_WINDOW: StdDuration = StdDuration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OidcPluginAuthnMetricsSnapshot {
+    pub failed_requests_minute: u64,
+    pub last_fail_seconds: u64,
+    pub last_succ_seconds: u64,
+    pub succ_avg_rtt_ms_minute: u64,
+    pub succ_max_rtt_ms_minute: u64,
+    pub total_requests_minute: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OidcPluginAuthnSample {
+    observed_at: Instant,
+    succeeded: bool,
+    rtt_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct OidcPluginAuthnMetrics {
+    samples: Mutex<VecDeque<OidcPluginAuthnSample>>,
+    last_fail_at: Mutex<Option<Instant>>,
+    last_succ_at: Mutex<Option<Instant>>,
+}
+
+fn lock_oidc_plugin_authn_metrics<'a, T>(mutex: &'a Mutex<T>, metric: &'static str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            warn!("recovering poisoned OIDC plugin authn metrics lock: {}", metric);
+            err.into_inner()
+        }
+    }
+}
+
+fn seconds_since(now: Instant, observed_at: Option<Instant>) -> u64 {
+    observed_at
+        .map(|instant| now.duration_since(instant).as_secs())
+        .unwrap_or_default()
+}
+
+impl OidcPluginAuthnMetrics {
+    fn record(&self, rtt_ms: u64, succeeded: bool) {
+        let now = Instant::now();
+        let mut samples = lock_oidc_plugin_authn_metrics(&self.samples, "samples");
+        samples.push_back(OidcPluginAuthnSample {
+            observed_at: now,
+            succeeded,
+            rtt_ms,
+        });
+        while samples
+            .front()
+            .is_some_and(|sample| now.duration_since(sample.observed_at) > OIDC_PLUGIN_AUTHN_WINDOW)
+        {
+            samples.pop_front();
+        }
+        drop(samples);
+
+        if succeeded {
+            *lock_oidc_plugin_authn_metrics(&self.last_succ_at, "last_succ_at") = Some(now);
+        } else {
+            *lock_oidc_plugin_authn_metrics(&self.last_fail_at, "last_fail_at") = Some(now);
+        }
+    }
+
+    fn snapshot(&self) -> OidcPluginAuthnMetricsSnapshot {
+        let now = Instant::now();
+        let (total_requests_minute, failed_requests_minute, succ_avg_rtt_ms_minute, succ_max_rtt_ms_minute) = {
+            let mut samples = lock_oidc_plugin_authn_metrics(&self.samples, "samples");
+            while samples
+                .front()
+                .is_some_and(|sample| now.duration_since(sample.observed_at) > OIDC_PLUGIN_AUTHN_WINDOW)
+            {
+                samples.pop_front();
+            }
+
+            let mut failed_requests_minute = 0u64;
+            let mut successful_requests = 0u64;
+            let mut successful_rtt_sum = 0u64;
+            let mut succ_max_rtt_ms_minute = 0u64;
+
+            for sample in samples.iter() {
+                if sample.succeeded {
+                    successful_requests += 1;
+                    successful_rtt_sum += sample.rtt_ms;
+                    succ_max_rtt_ms_minute = succ_max_rtt_ms_minute.max(sample.rtt_ms);
+                } else {
+                    failed_requests_minute += 1;
+                }
+            }
+
+            let succ_avg_rtt_ms_minute = successful_rtt_sum.checked_div(successful_requests).unwrap_or_default();
+
+            (
+                samples.len() as u64,
+                failed_requests_minute,
+                succ_avg_rtt_ms_minute,
+                succ_max_rtt_ms_minute,
+            )
+        };
+
+        let last_fail_seconds = seconds_since(now, *lock_oidc_plugin_authn_metrics(&self.last_fail_at, "last_fail_at"));
+        let last_succ_seconds = seconds_since(now, *lock_oidc_plugin_authn_metrics(&self.last_succ_at, "last_succ_at"));
+
+        OidcPluginAuthnMetricsSnapshot {
+            failed_requests_minute,
+            last_fail_seconds,
+            last_succ_seconds,
+            succ_avg_rtt_ms_minute,
+            succ_max_rtt_ms_minute,
+            total_requests_minute,
+        }
+    }
+}
+
+static OIDC_PLUGIN_AUTHN_METRICS: LazyLock<OidcPluginAuthnMetrics> = LazyLock::new(OidcPluginAuthnMetrics::default);
+
+pub fn oidc_plugin_authn_metrics_snapshot() -> OidcPluginAuthnMetricsSnapshot {
+    OIDC_PLUGIN_AUTHN_METRICS.snapshot()
+}
 
 // ---- HTTP Client Adapter ----
 
@@ -68,7 +194,46 @@ impl std::error::Error for OidcHttpError {
 }
 
 /// HTTP client adapter bridging reqwest 0.13 to the `openidconnect` `AsyncHttpClient` trait.
-pub(crate) struct ReqwestHttpClient(reqwest::Client);
+pub(crate) struct ReqwestHttpClient {
+    default: Client,
+    no_proxy: Client,
+}
+
+fn build_oidc_http_client(disable_proxy: bool) -> Result<Client, String> {
+    let mut builder = reqwest::Client::builder();
+    if disable_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|err| format!("failed to build OIDC reqwest client: {err}"))
+}
+
+fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
+    let Some(host) = Url::parse(uri).ok().and_then(|url| url.host_str().map(str::to_owned)) else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
+}
+
+impl ReqwestHttpClient {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            default: build_oidc_http_client(false)?,
+            no_proxy: build_oidc_http_client(true)?,
+        })
+    }
+
+    fn client_for_uri(&self, uri: &str) -> &Client {
+        if should_bypass_proxy_for_oidc_uri(uri) {
+            &self.no_proxy
+        } else {
+            &self.default
+        }
+    }
+}
 
 impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
     type Error = OidcHttpError;
@@ -76,15 +241,22 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 
     fn call(&'c self, request: http::Request<Vec<u8>>) -> Self::Future {
         Box::pin(async move {
+            let started_at = Instant::now();
             let (parts, body) = request.into_parts();
-            let response = self
-                .0
-                .request(parts.method, parts.uri.to_string())
+            let uri = parts.uri.to_string();
+            let client = self.client_for_uri(&uri);
+            let response = client
+                .request(parts.method, uri)
                 .headers(parts.headers)
                 .body(body)
                 .send()
-                .await
-                .map_err(OidcHttpError::Reqwest)?;
+                .await;
+
+            let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let succeeded = response.as_ref().is_ok_and(|resp| resp.status().is_success());
+            OIDC_PLUGIN_AUTHN_METRICS.record(elapsed_ms, succeeded);
+
+            let response = response.map_err(OidcHttpError::Reqwest)?;
 
             let status = response.status();
             let headers = response.headers().clone();
@@ -112,6 +284,7 @@ pub struct OidcProviderConfig {
     pub client_id: String,
     pub client_secret: Option<String>,
     pub scopes: Vec<String>,
+    pub other_audiences: Vec<String>,
     pub redirect_uri: Option<String>,
     pub redirect_uri_dynamic: bool,
     pub claim_name: String,
@@ -119,6 +292,7 @@ pub struct OidcProviderConfig {
     pub role_policy: String,
     pub display_name: String,
     pub groups_claim: String,
+    pub roles_claim: String,
     pub email_claim: String,
     pub username_claim: String,
 }
@@ -169,7 +343,7 @@ pub struct OidcClaims {
 /// on-the-fly from metadata when needed.
 #[derive(Clone)]
 struct ProviderState {
-    metadata: CoreProviderMetadata,
+    metadata: ProviderMetadataWithLogout,
     discovered_at: Instant,
 }
 
@@ -189,10 +363,19 @@ pub struct OidcSys {
     http_client: ReqwestHttpClient,
 }
 
+fn trusted_aud(other_audiences: &[String], audience: &Audience) -> bool {
+    for aud in other_audiences {
+        if audience.as_str() == aud.as_str() {
+            return true;
+        }
+    }
+    false
+}
+
 impl OidcSys {
     /// Parse environment variables and discover all configured OIDC providers.
     pub async fn new() -> Result<Self, String> {
-        let http_client = ReqwestHttpClient(reqwest::Client::new());
+        let http_client = ReqwestHttpClient::new()?;
         let parsed_configs = load_effective_oidc_provider_configs(get_global_server_config().as_ref());
         let mut configs = HashMap::new();
         let mut provider_states = HashMap::new();
@@ -225,13 +408,13 @@ impl OidcSys {
     }
 
     /// Create an OidcSys with no providers (useful for when OIDC is not configured).
-    pub fn empty() -> Self {
-        Self {
+    pub fn empty() -> Result<Self, String> {
+        Ok(Self {
             configs: HashMap::new(),
             provider_states: RwLock::new(HashMap::new()),
             state_store: OidcStateStore::new(),
-            http_client: ReqwestHttpClient(reqwest::Client::new()),
-        }
+            http_client: ReqwestHttpClient::new()?,
+        })
     }
 
     /// Return true if any OIDC providers are configured and enabled.
@@ -308,7 +491,7 @@ impl OidcSys {
         state: &str,
         code: &str,
         redirect_uri: &str,
-    ) -> Result<(OidcClaims, String, OidcAuthSession), String> {
+    ) -> Result<(OidcClaims, String, OidcAuthSession, String), String> {
         // Retrieve and consume the state (single-use)
         let session = self
             .state_store
@@ -348,7 +531,9 @@ impl OidcSys {
             .id_token()
             .ok_or_else(|| "no id_token in token response".to_string())?;
 
-        let verifier = client.id_token_verifier();
+        let verifier = client
+            .id_token_verifier()
+            .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
         let verified = id_token.claims(&verifier, &Nonce::new(session.nonce.clone()));
         if let Err(e) = verified {
             let refreshed_state = self
@@ -370,7 +555,9 @@ impl OidcSys {
             )
             .set_auth_type(AuthType::RequestBody);
 
-            let verifier = client.id_token_verifier();
+            let verifier = client
+                .id_token_verifier()
+                .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
             id_token
                 .claims(&verifier, &Nonce::new(session.nonce.clone()))
                 .map_err(|retry_err| format!("ID token verification failed after JWKS refresh: {retry_err}"))?;
@@ -385,11 +572,67 @@ impl OidcSys {
             sub: extract_string_claim(&raw, "sub"),
             email: extract_string_claim(&raw, &config.email_claim),
             username: extract_string_claim(&raw, &config.username_claim),
-            groups: extract_groups_claim(&raw, &config.groups_claim),
+            groups: extract_canonical_group_values(&raw, &config.groups_claim, &config.roles_claim),
             raw,
         };
 
-        Ok((claims, session.provider_id.clone(), session))
+        Ok((claims, session.provider_id.clone(), session, raw_jwt))
+    }
+
+    /// Store a one-time logout session keyed by an opaque token so the console can
+    /// trigger browser logout without persisting the raw ID token.
+    pub async fn create_logout_token(&self, provider_id: &str, id_token: &str) -> Result<String, String> {
+        if !self.configs.contains_key(provider_id) {
+            return Err(format!("unknown OIDC provider: {provider_id}"));
+        }
+
+        let token = CsrfToken::new_random().secret().clone();
+        self.state_store
+            .insert_logout(
+                token.clone(),
+                OidcLogoutSession {
+                    provider_id: provider_id.to_string(),
+                    id_token: id_token.to_string(),
+                },
+            )
+            .await;
+
+        Ok(token)
+    }
+
+    /// Build the RP-initiated logout URL for a previously issued logout token.
+    /// Returns `Ok(None)` when the provider does not advertise an end-session endpoint.
+    pub async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>, String> {
+        let session = self
+            .state_store
+            .take_logout(logout_token)
+            .await
+            .ok_or_else(|| "invalid or expired OIDC logout token".to_string())?;
+
+        let config = self
+            .configs
+            .get(&session.provider_id)
+            .ok_or_else(|| format!("unknown OIDC provider: {}", session.provider_id))?;
+        let state = self.ensure_provider_state(&session.provider_id, config).await?;
+        let Some(end_session_endpoint) = state.metadata.additional_metadata().end_session_endpoint.clone() else {
+            return Ok(None);
+        };
+
+        let id_token: CoreIdToken = session
+            .id_token
+            .parse()
+            .map_err(|e: serde_json::Error| format!("failed to parse ID token for logout: {e}"))?;
+        let post_logout_redirect_uri = PostLogoutRedirectUrl::new(post_logout_redirect_uri.to_string())
+            .map_err(|e| format!("invalid post logout redirect URI: {e}"))?;
+
+        let logout_url = LogoutRequest::from(end_session_endpoint)
+            .set_id_token_hint(&id_token)
+            .set_client_id(ClientId::new(config.client_id.clone()))
+            .set_post_logout_redirect_uri(post_logout_redirect_uri)
+            .http_get_url()
+            .to_string();
+
+        Ok(Some(logout_url))
     }
 
     /// Map OIDC claims to rustfs policy names.
@@ -483,7 +726,9 @@ impl OidcSys {
 
         // Verify the token (signature, issuer, audience, expiry) — skip nonce
         // (nonce is only required for the authorization code flow)
-        let verifier = client.id_token_verifier();
+        let verifier = client
+            .id_token_verifier()
+            .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
         if let Err(e) = id_token.claims(&verifier, |_: Option<&Nonce>| Ok(())) {
             state = self
                 .refresh_provider_state(&provider_id, &config)
@@ -498,7 +743,9 @@ impl OidcSys {
                 config.client_secret.as_ref().map(|s| ClientSecret::new(s.clone())),
             )
             .set_auth_type(AuthType::RequestBody);
-            let verifier = client.id_token_verifier();
+            let verifier = client
+                .id_token_verifier()
+                .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
             id_token
                 .claims(&verifier, |_: Option<&Nonce>| Ok(()))
                 .map_err(|retry_err| format!("ID token verification failed after JWKS refresh: {retry_err}"))?;
@@ -509,7 +756,7 @@ impl OidcSys {
             sub: extract_string_claim(&raw_claims, "sub"),
             email: extract_string_claim(&raw_claims, &config.email_claim),
             username: extract_string_claim(&raw_claims, &config.username_claim),
-            groups: extract_groups_claim(&raw_claims, &config.groups_claim),
+            groups: extract_canonical_group_values(&raw_claims, &config.groups_claim, &config.roles_claim),
             raw: raw_claims,
         };
 
@@ -696,6 +943,14 @@ impl OidcSys {
             scopes_str.split(',').map(|s| s.trim().to_string()).collect()
         };
 
+        let other_audiences_str = get_env(ENV_IDENTITY_OPENID_OTHER_AUDIENCES);
+        let other_audiences = other_audiences_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
         let redirect_uri_dynamic_str = get_env(ENV_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC);
         let redirect_uri_dynamic = redirect_uri_dynamic_str.is_empty()
             || redirect_uri_dynamic_str
@@ -719,6 +974,7 @@ impl OidcSys {
                 v
             }
         };
+        let roles_claim = get_env(ENV_IDENTITY_OPENID_ROLES_CLAIM);
         let email_claim = {
             let v = get_env(ENV_IDENTITY_OPENID_EMAIL_CLAIM);
             if v.is_empty() {
@@ -755,6 +1011,7 @@ impl OidcSys {
             client_id: get_env(ENV_IDENTITY_OPENID_CLIENT_ID),
             client_secret,
             scopes,
+            other_audiences,
             redirect_uri,
             redirect_uri_dynamic,
             claim_name,
@@ -762,6 +1019,7 @@ impl OidcSys {
             role_policy: get_env(ENV_IDENTITY_OPENID_ROLE_POLICY),
             display_name,
             groups_claim,
+            roles_claim,
             email_claim,
             username_claim,
         })
@@ -787,6 +1045,14 @@ impl OidcSys {
             scopes_str.split(',').map(|s| s.trim().to_string()).collect()
         };
 
+        let other_audiences_str = kvs.get(OIDC_OTHER_AUDIENCES);
+        let other_audiences = other_audiences_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
         let redirect_uri_dynamic = kvs
             .lookup(OIDC_REDIRECT_URI_DYNAMIC)
             .unwrap_or_else(|| EnableState::On.to_string())
@@ -800,6 +1066,9 @@ impl OidcSys {
         let groups_claim = kvs
             .lookup(OIDC_GROUPS_CLAIM)
             .unwrap_or_else(|| OIDC_DEFAULT_GROUPS_CLAIM.to_string());
+        let roles_claim = kvs
+            .lookup(OIDC_ROLES_CLAIM)
+            .unwrap_or_else(|| OIDC_DEFAULT_ROLES_CLAIM.to_string());
         let email_claim = kvs
             .lookup(OIDC_EMAIL_CLAIM)
             .unwrap_or_else(|| OIDC_DEFAULT_EMAIL_CLAIM.to_string());
@@ -817,6 +1086,7 @@ impl OidcSys {
             client_id: kvs.get(OIDC_CLIENT_ID),
             client_secret,
             scopes,
+            other_audiences,
             redirect_uri,
             redirect_uri_dynamic,
             claim_name,
@@ -824,6 +1094,7 @@ impl OidcSys {
             role_policy: kvs.get(OIDC_ROLE_POLICY),
             display_name,
             groups_claim,
+            roles_claim,
             email_claim,
             username_claim,
         })
@@ -841,22 +1112,40 @@ impl OidcSys {
         for candidate_issuer in candidates.iter() {
             let issuer_url = IssuerUrl::new(candidate_issuer.clone()).map_err(|e| format!("invalid issuer URL: {e}"))?;
 
-            match CoreProviderMetadata::discover_async(issuer_url, http_client)
-                .await
-                .map_err(|e| format!("discovery failed: {e}"))
-            {
-                Ok(metadata) => {
-                    return Ok(ProviderState {
-                        metadata,
-                        discovered_at: Instant::now(),
-                    });
-                }
-                Err(error) => {
-                    last_errors.push(format!("issuer '{candidate_issuer}': {error}"));
-                    warn!(
-                        "OIDC provider '{}' discovery attempt failed for issuer '{}': {}",
-                        config.id, candidate_issuer, error
-                    );
+            for attempt in 0..OIDC_DISCOVERY_TRANSPORT_RETRIES {
+                match ProviderMetadataWithLogout::discover_async(issuer_url.clone(), http_client)
+                    .await
+                    .map_err(|e| format!("discovery failed: {e}"))
+                {
+                    Ok(metadata) => {
+                        return Ok(ProviderState {
+                            metadata,
+                            discovered_at: Instant::now(),
+                        });
+                    }
+                    Err(error) => {
+                        let is_transient_transport = error.contains("Request failed");
+                        let should_retry = is_transient_transport && attempt + 1 < OIDC_DISCOVERY_TRANSPORT_RETRIES;
+                        if should_retry {
+                            warn!(
+                                "OIDC provider '{}' discovery transport attempt {}/{} failed for issuer '{}': {}",
+                                config.id,
+                                attempt + 1,
+                                OIDC_DISCOVERY_TRANSPORT_RETRIES,
+                                candidate_issuer,
+                                error
+                            );
+                            sleep(OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY).await;
+                            continue;
+                        }
+
+                        last_errors.push(format!("issuer '{candidate_issuer}': {error}"));
+                        warn!(
+                            "OIDC provider '{}' discovery attempt failed for issuer '{}': {}",
+                            config.id, candidate_issuer, error
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -917,7 +1206,7 @@ pub fn load_effective_oidc_provider_configs(server_config: Option<&ServerConfig>
 }
 
 pub async fn validate_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
-    let http_client = ReqwestHttpClient(reqwest::Client::new());
+    let http_client = ReqwestHttpClient::new()?;
     let state = OidcSys::discover_provider(config, &http_client).await?;
 
     Ok(OidcProviderValidationResult {
@@ -1025,6 +1314,21 @@ fn extract_groups_claim(claims: &HashMap<String, serde_json::Value>, key: &str) 
     }
 }
 
+fn extract_canonical_group_values(
+    claims: &HashMap<String, serde_json::Value>,
+    groups_claim: &str,
+    roles_claim: &str,
+) -> Vec<String> {
+    let mut groups = extract_groups_claim(claims, groups_claim);
+    if !roles_claim.is_empty() && roles_claim != groups_claim {
+        groups.extend(extract_groups_claim(claims, roles_claim));
+    }
+    groups.retain(|g| !g.is_empty());
+    groups.sort();
+    groups.dedup();
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,6 +1375,34 @@ mod tests {
         claims.insert("groups".to_string(), serde_json::json!(42));
         let groups = extract_groups_claim(&claims, "groups");
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_extract_canonical_group_values_merges_groups_and_roles() {
+        let mut claims = HashMap::new();
+        claims.insert("groups".to_string(), serde_json::json!(["devs", "admins"]));
+        claims.insert("roles".to_string(), serde_json::json!(["admins", "consoleAdmin"]));
+
+        let merged = extract_canonical_group_values(&claims, "groups", "roles");
+        assert_eq!(merged, vec!["admins", "consoleAdmin", "devs"]);
+    }
+
+    #[test]
+    fn test_extract_canonical_group_values_skips_duplicate_claim_name() {
+        let mut claims = HashMap::new();
+        claims.insert("roles".to_string(), serde_json::json!(["consoleAdmin"]));
+
+        let merged = extract_canonical_group_values(&claims, "roles", "roles");
+        assert_eq!(merged, vec!["consoleAdmin"]);
+    }
+
+    #[test]
+    fn test_extract_canonical_group_values_roles_only() {
+        let mut claims = HashMap::new();
+        claims.insert("roles".to_string(), serde_json::json!(["consoleAdmin", "bucket-reader"]));
+
+        let merged = extract_canonical_group_values(&claims, "groups", "roles");
+        assert_eq!(merged, vec!["bucket-reader", "consoleAdmin"]);
     }
 
     #[test]
@@ -1239,6 +1571,7 @@ mod tests {
             client_id: "rustfs-oidc-test".to_string(),
             client_secret: None,
             scopes: vec!["openid".to_string()],
+            other_audiences: vec![],
             redirect_uri: None,
             redirect_uri_dynamic: false,
             claim_name: "sub".to_string(),
@@ -1246,6 +1579,7 @@ mod tests {
             role_policy: String::new(),
             display_name: "mock-oidc".to_string(),
             groups_claim: "groups".to_string(),
+            roles_claim: String::new(),
             email_claim: "email".to_string(),
             username_claim: "username".to_string(),
         }
@@ -1261,6 +1595,7 @@ mod tests {
         use std::io::Read;
         use std::io::Write;
         use std::net::{Shutdown, TcpListener};
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
         // After the last completed response, exit if no new connection arrives within this window.
@@ -1284,11 +1619,13 @@ mod tests {
         })
         .to_string();
         let jwks_body = r#"{"keys":[]}"#;
+        let (ready_tx, ready_rx) = mpsc::channel();
 
         let handle = std::thread::spawn(move || {
             listener
                 .set_nonblocking(true)
                 .expect("failed to set discovery mock listener non-blocking");
+            let _ = ready_tx.send(());
 
             let mut seen = 0usize;
             let start = Instant::now();
@@ -1355,6 +1692,9 @@ mod tests {
                 }
             }
         });
+        ready_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("mock OIDC discovery server should become ready");
 
         (base, handle)
     }
@@ -1418,7 +1758,7 @@ mod tests {
 
     #[test]
     fn test_map_claims_to_policies_no_provider() {
-        let sys = OidcSys::empty();
+        let sys = OidcSys::empty().expect("failed to initialize empty OIDC system");
 
         let claims = OidcClaims {
             sub: "user123".to_string(),
@@ -1509,6 +1849,7 @@ mod tests {
         );
         kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
         kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        kvs.insert(OIDC_ROLES_CLAIM.to_string(), "app_roles".to_string());
 
         cfg.0
             .entry(IDENTITY_OPENID_SUB_SYS.to_string())
@@ -1520,6 +1861,44 @@ mod tests {
         assert_eq!(parsed[0].id, "default");
         assert_eq!(parsed[0].client_id, "console");
         assert!(parsed[0].enabled);
+        assert_eq!(parsed[0].roles_claim, "app_roles");
+    }
+
+    #[test]
+    fn test_parse_persisted_provider_config_omitted_roles_claim_is_empty() {
+        let mut cfg = ServerConfig::new();
+        let mut kvs = KVS(vec![
+            rustfs_ecstore::config::KV {
+                key: ENABLE_KEY.to_string(),
+                value: EnableState::Off.to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CONFIG_URL.to_string(),
+                value: String::new(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CLIENT_ID.to_string(),
+                value: String::new(),
+                hidden_if_empty: false,
+            },
+        ]);
+        kvs.insert(
+            OIDC_CONFIG_URL.to_string(),
+            "https://example.com/.well-known/openid-configuration".to_string(),
+        );
+        kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
+        kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+
+        cfg.0
+            .entry(IDENTITY_OPENID_SUB_SYS.to_string())
+            .or_default()
+            .insert(DEFAULT_DELIMITER.to_string(), kvs);
+
+        let parsed = OidcSys::parse_persisted_configs(&cfg);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].roles_claim, "");
     }
 
     #[test]
@@ -1538,9 +1917,20 @@ mod tests {
 
     #[test]
     fn test_oidc_sys_empty() {
-        let sys = OidcSys::empty();
+        let sys = OidcSys::empty().expect("failed to initialize empty OIDC system");
         assert!(!sys.has_providers());
         assert!(sys.list_providers().is_empty());
+    }
+
+    #[test]
+    fn test_should_bypass_proxy_for_oidc_uri_loopback_only() {
+        assert!(should_bypass_proxy_for_oidc_uri("http://127.0.0.1:9000/.well-known/openid-configuration"));
+        assert!(should_bypass_proxy_for_oidc_uri("http://localhost:9000/.well-known/openid-configuration"));
+        assert!(should_bypass_proxy_for_oidc_uri("http://[::1]:9000/.well-known/openid-configuration"));
+        assert!(!should_bypass_proxy_for_oidc_uri(
+            "https://idp.example.com/.well-known/openid-configuration"
+        ));
+        assert!(!should_bypass_proxy_for_oidc_uri("not-a-url"));
     }
 
     /// Helper to create an OidcSys with configs only (no provider states needed).
@@ -1553,7 +1943,7 @@ mod tests {
             configs: config_map,
             provider_states: RwLock::new(HashMap::new()),
             state_store: OidcStateStore::new(),
-            http_client: ReqwestHttpClient(reqwest::Client::new()),
+            http_client: ReqwestHttpClient::new().expect("failed to initialize OIDC HTTP clients"),
         }
     }
 
@@ -1565,6 +1955,7 @@ mod tests {
             client_id: "client-id".to_string(),
             client_secret: None,
             scopes: vec!["openid".to_string()],
+            other_audiences: vec![],
             redirect_uri: None,
             redirect_uri_dynamic: true,
             claim_name: "groups".to_string(),
@@ -1572,6 +1963,7 @@ mod tests {
             role_policy: "".to_string(),
             display_name: id.to_string(),
             groups_claim: "groups".to_string(),
+            roles_claim: String::new(),
             email_claim: "email".to_string(),
             username_claim: "preferred_username".to_string(),
         }
@@ -1658,6 +2050,7 @@ mod tests {
             client_id: "my-client".to_string(),
             client_secret: Some("secret".to_string()),
             scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+            other_audiences: vec![],
             redirect_uri: None,
             redirect_uri_dynamic: true,
             claim_name: "groups".to_string(),
@@ -1665,6 +2058,7 @@ mod tests {
             role_policy: "readwrite".to_string(),
             display_name: "Test Provider".to_string(),
             groups_claim: "groups".to_string(),
+            roles_claim: String::new(),
             email_claim: "email".to_string(),
             username_claim: "preferred_username".to_string(),
         };

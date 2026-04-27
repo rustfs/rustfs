@@ -93,6 +93,13 @@ pub struct Disk {
     pub pool_index: i32,
     pub set_index: i32,
     pub disk_index: i32,
+    #[serde(rename = "runtimeState", default, skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<String>,
+    #[serde(rename = "offlineDurationSeconds", default, skip_serializing_if = "Option::is_none")]
+    pub offline_duration_seconds: Option<u64>,
+    /// Leaf physical block devices backing this disk path when the platform can resolve them.
+    #[serde(rename = "physicalDeviceIds", default, skip_serializing_if = "Option::is_none")]
+    pub physical_device_ids: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -349,9 +356,49 @@ pub struct InfoMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmp_serde::{Deserializer, Serializer};
     use serde_json;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, io::Cursor};
     use time::OffsetDateTime;
+
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct LegacyDiskCompat {
+        endpoint: String,
+        #[serde(rename = "rootDisk")]
+        root_disk: bool,
+        #[serde(rename = "path")]
+        drive_path: String,
+        healing: bool,
+        scanning: bool,
+        state: String,
+        uuid: String,
+        major: u32,
+        minor: u32,
+        model: Option<String>,
+        #[serde(rename = "totalspace")]
+        total_space: u64,
+        #[serde(rename = "usedspace")]
+        used_space: u64,
+        #[serde(rename = "availspace")]
+        available_space: u64,
+        #[serde(rename = "readthroughput")]
+        read_throughput: f64,
+        #[serde(rename = "writethroughput")]
+        write_throughput: f64,
+        #[serde(rename = "readlatency")]
+        read_latency: f64,
+        #[serde(rename = "writelatency")]
+        write_latency: f64,
+        utilization: f64,
+        metrics: Option<DiskMetrics>,
+        heal_info: Option<HealingDisk>,
+        used_inodes: u64,
+        free_inodes: u64,
+        local: bool,
+        pool_index: i32,
+        set_index: i32,
+        disk_index: i32,
+    }
 
     #[test]
     fn test_item_state_to_string() {
@@ -437,6 +484,7 @@ mod tests {
         assert!(disk.heal_info.is_none());
         assert_eq!(disk.used_inodes, 0);
         assert_eq!(disk.free_inodes, 0);
+        assert!(disk.physical_device_ids.is_none());
         assert!(!disk.local);
         assert_eq!(disk.pool_index, 0);
         assert_eq!(disk.set_index, 0);
@@ -465,9 +513,12 @@ mod tests {
             write_latency: 7.8,
             utilization: 50.0,
             metrics: Some(DiskMetrics::default()),
+            runtime_state: Some("online".to_string()),
+            offline_duration_seconds: Some(0),
             heal_info: None,
             used_inodes: 1000000,
             free_inodes: 9000000,
+            physical_device_ids: Some(vec!["nvme0n1".to_string()]),
             local: true,
             pool_index: 0,
             set_index: 1,
@@ -485,7 +536,111 @@ mod tests {
         assert_eq!(disk.total_space, 1000000000000);
         assert_eq!(disk.utilization, 50.0);
         assert!(disk.metrics.is_some());
+        assert_eq!(disk.runtime_state.as_deref(), Some("online"));
+        assert_eq!(disk.offline_duration_seconds, Some(0));
+        assert_eq!(disk.physical_device_ids, Some(vec!["nvme0n1".to_string()]));
         assert!(disk.local);
+    }
+
+    #[test]
+    fn test_disk_msgpack_backward_compat_from_legacy_layout() {
+        let legacy = LegacyDiskCompat {
+            endpoint: "http://legacy-node:9000".to_string(),
+            root_disk: false,
+            drive_path: "/data/legacy".to_string(),
+            healing: false,
+            scanning: false,
+            state: ITEM_ONLINE.to_string(),
+            uuid: "legacy-uuid".to_string(),
+            major: 8,
+            minor: 2,
+            model: Some("legacy".to_string()),
+            total_space: 42,
+            used_space: 12,
+            available_space: 30,
+            read_throughput: 1.0,
+            write_throughput: 2.0,
+            read_latency: 3.0,
+            write_latency: 4.0,
+            utilization: 5.0,
+            metrics: None,
+            heal_info: None,
+            used_inodes: 11_125,
+            free_inodes: 98_000,
+            local: true,
+            pool_index: 1,
+            set_index: 2,
+            disk_index: 3,
+        };
+
+        let mut encoded = Vec::new();
+        legacy.serialize(&mut Serializer::new(&mut encoded)).unwrap();
+
+        let mut decoder = Deserializer::new(Cursor::new(encoded));
+        let decoded: Disk = serde::Deserialize::deserialize(&mut decoder).unwrap();
+        assert_eq!(decoded.used_inodes, 11_125);
+        assert_eq!(decoded.runtime_state, None);
+        assert_eq!(decoded.offline_duration_seconds, None);
+        assert_eq!(decoded.physical_device_ids, None);
+    }
+
+    #[test]
+    fn test_disk_msgpack_forward_compat_to_legacy_layout() {
+        let current = Disk {
+            endpoint: "http://current-node:9000".to_string(),
+            root_disk: false,
+            drive_path: "/data/current".to_string(),
+            healing: false,
+            scanning: false,
+            state: ITEM_ONLINE.to_string(),
+            uuid: "current-uuid".to_string(),
+            major: 8,
+            minor: 3,
+            model: Some("current".to_string()),
+            total_space: 64,
+            used_space: 20,
+            available_space: 44,
+            read_throughput: 1.5,
+            write_throughput: 2.5,
+            read_latency: 3.5,
+            write_latency: 4.5,
+            utilization: 6.5,
+            metrics: None,
+            heal_info: None,
+            used_inodes: 22_250,
+            free_inodes: 97_000,
+            local: true,
+            pool_index: 1,
+            set_index: 2,
+            disk_index: 3,
+            physical_device_ids: Some(vec!["nvme0n1".to_string(), "nvme1n1".to_string()]),
+            runtime_state: Some("online".to_string()),
+            offline_duration_seconds: Some(0),
+        };
+
+        let mut encoded = Vec::new();
+        current
+            .serialize(&mut Serializer::new(&mut encoded).with_struct_map())
+            .unwrap();
+
+        let mut decoder = Deserializer::new(Cursor::new(encoded));
+        let decoded: LegacyDiskCompat = serde::Deserialize::deserialize(&mut decoder).unwrap();
+        assert_eq!(decoded.used_inodes, 22_250);
+        assert_eq!(decoded.disk_index, 3);
+        assert_eq!(decoded.endpoint, "http://current-node:9000");
+    }
+
+    #[test]
+    fn test_disk_serializes_physical_device_ids_when_present() {
+        let disk = Disk {
+            physical_device_ids: Some(vec!["nvme0n1".to_string(), "nvme1n1".to_string()]),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&disk).unwrap();
+        assert!(json.contains("physicalDeviceIds"));
+        assert!(json.contains("nvme0n1"));
+        assert!(json.contains("nvme1n1"));
     }
 
     #[test]

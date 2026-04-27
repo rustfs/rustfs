@@ -32,7 +32,7 @@ rustfs-ecstore = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-utils = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["sync","io-util","time","macros"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -42,6 +42,7 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -50,6 +51,8 @@ tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 walkdir = { workspace = true }
 http = { workspace = true }
+temp-env = { workspace = true }
+tokio = { workspace = true, features = ["test-util","fs"] }
 
 [lib]
 doctest = false

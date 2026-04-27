@@ -11,13 +11,7 @@ pub trait ObjectIO: Send + Sync + Debug + 'static {
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader>;
 
-    async fn put_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        data: &mut ChunkNativePutData,
-        opts: &ObjectOptions,
-    ) -> Result<ObjectInfo>;
+    async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo>;
 }
 
 /// Bucket-level storage operations.
@@ -132,7 +126,7 @@ pub trait MultipartOperations: Send + Sync + Debug {
         object: &str,
         upload_id: &str,
         part_id: usize,
-        data: &mut ChunkNativePutData,
+        data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo>;
     async fn get_multipart_info(

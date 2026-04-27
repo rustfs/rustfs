@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::compress_index::{Index, TryGetIndex};
-use crate::{BlockReadable, BoxReadBlockFuture, Reader};
 use pin_project_lite::pin_project;
 use rustfs_utils::compress::{CompressionAlgorithm, compress_block, decompress_block};
 use rustfs_utils::{put_uvarint, uvarint};
@@ -85,31 +84,6 @@ where
             temp_buffer: Vec::with_capacity(block_size),
             read_buffer: vec![0u8; block_size],
         }
-    }
-
-    fn copy_buffered(&mut self, buf: &mut [u8]) -> usize {
-        if self.pos >= self.buffer.len() || buf.is_empty() {
-            return 0;
-        }
-
-        let to_copy = min(buf.len(), self.buffer.len() - self.pos);
-        buf[..to_copy].copy_from_slice(&self.buffer[self.pos..self.pos + to_copy]);
-        self.pos += to_copy;
-        if self.pos == self.buffer.len() {
-            self.buffer.clear();
-            self.pos = 0;
-        }
-        to_copy
-    }
-
-    fn queue_compressed_block(&mut self, uncompressed_data: &[u8]) -> io::Result<()> {
-        let out = build_compressed_block(uncompressed_data, self.compression_algorithm);
-        self.written += out.len();
-        self.uncomp_written += uncompressed_data.len();
-        self.index.add(self.written as i64, self.uncomp_written as i64)?;
-        self.buffer = out;
-        self.pos = 0;
-        Ok(())
     }
 }
 
@@ -195,50 +169,6 @@ where
 }
 
 delegate_reader_capabilities_generic_no_index!(CompressReader<R>, inner);
-
-impl<R> BlockReadable for CompressReader<R>
-where
-    R: Reader,
-{
-    fn read_block<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxReadBlockFuture<'a> {
-        Box::pin(async move {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-
-            let mut written = self.copy_buffered(buf);
-            while written < buf.len() {
-                if self.done {
-                    break;
-                }
-
-                self.temp_buffer.resize(self.block_size, 0);
-                let n = {
-                    let inner = &mut self.inner;
-                    let temp = &mut self.temp_buffer[..self.block_size];
-                    match inner.read_block(temp).await {
-                        Ok(n) => n,
-                        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => 0,
-                        Err(err) => return Err(err),
-                    }
-                };
-
-                if n == 0 {
-                    self.done = true;
-                    self.temp_buffer.clear();
-                    break;
-                }
-
-                let block = self.temp_buffer[..n].to_vec();
-                self.temp_buffer.clear();
-                self.queue_compressed_block(&block)?;
-                written += self.copy_buffered(&mut buf[written..]);
-            }
-
-            Ok(written)
-        })
-    }
-}
 
 pin_project! {
     /// A reader wrapper that decompresses data on the fly using DEFLATE algorithm.
@@ -460,7 +390,6 @@ fn build_compressed_block(uncompressed_data: &[u8], compression_algorithm: Compr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlockReadable, WarpReader};
     use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -549,28 +478,5 @@ mod tests {
         decompress_reader.read_to_end(&mut decompressed).await.unwrap();
 
         assert_eq!(&decompressed, &data);
-    }
-
-    #[tokio::test]
-    async fn test_compress_reader_read_block_round_trips() {
-        let data = b"hello world, hello world, hello world!";
-        let reader = Cursor::new(data.to_vec());
-        let mut compress_reader = CompressReader::new(WarpReader::new(reader), CompressionAlgorithm::Gzip);
-        let mut compressed = Vec::new();
-        let mut buf = [0u8; 19];
-
-        loop {
-            let n = compress_reader.read_block(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            compressed.extend_from_slice(&buf[..n]);
-        }
-
-        let mut decompress_reader = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::Gzip);
-        let mut decompressed = Vec::new();
-        decompress_reader.read_to_end(&mut decompressed).await.unwrap();
-
-        assert_eq!(&decompressed, data);
     }
 }

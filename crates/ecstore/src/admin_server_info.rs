@@ -162,8 +162,9 @@ pub async fn get_local_server_property() -> ServerProperties {
 
     let mut props = ServerProperties {
         endpoint: addr,
-        uptime: SystemTime::now()
-            .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
+        uptime: GLOBAL_BOOT_TIME
+            .get()
+            .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
             .unwrap_or_default()
             .as_secs(),
         network,

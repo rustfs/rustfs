@@ -24,11 +24,15 @@ use s3s::{Body, S3Request, S3Response, S3Result};
 use serde_json::{Value, json};
 
 pub fn register_health_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
-    // Health check endpoint for monitoring and orchestration
-    r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::GET, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
-    r.insert(Method::HEAD, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
+    if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
+        // Health check endpoint for monitoring and orchestration
+        r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::GET, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::HEAD, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
+    }
+
+    // Profiling routes are controlled separately and must not be affected by health endpoint toggles.
     r.insert(Method::GET, PROFILE_CPU_PATH, AdminOperation(&TriggerProfileCPU {}))?;
     r.insert(Method::GET, PROFILE_MEMORY_PATH, AdminOperation(&TriggerProfileMemory {}))?;
 
@@ -51,9 +55,9 @@ pub(crate) enum HealthProbe {
     Readiness,
 }
 
-pub(crate) fn collect_dependency_readiness() -> (bool, bool) {
+pub(crate) async fn collect_dependency_readiness() -> (bool, bool) {
     let usecase = DefaultAdminUsecase::from_global();
-    let readiness = usecase.execute_collect_dependency_readiness();
+    let readiness = usecase.execute_collect_dependency_readiness().await;
     (readiness.storage_ready, readiness.iam_ready)
 }
 
@@ -72,6 +76,13 @@ pub(crate) fn health_check_state(storage_ready: bool, iam_ready: bool, probe: He
         status,
         ready,
     }
+}
+
+pub(crate) fn health_minimal_response_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE,
+        rustfs_config::DEFAULT_HEALTH_MINIMAL_RESPONSE_ENABLE,
+    )
 }
 
 pub(crate) fn build_component_details(storage_ready: bool, iam_ready: bool) -> Value {
@@ -95,6 +106,36 @@ pub(crate) fn probe_from_path(path: &str) -> HealthProbe {
     }
 }
 
+pub(crate) fn build_health_payload(
+    health: HealthCheckState,
+    storage_ready: bool,
+    iam_ready: bool,
+    service: &str,
+    uptime: Option<u64>,
+) -> Value {
+    if health_minimal_response_enabled() {
+        return json!({
+            "status": health.status,
+            "ready": health.ready,
+        });
+    }
+
+    let mut payload = json!({
+        "status": health.status,
+        "ready": health.ready,
+        "service": service,
+        "timestamp": jiff::Zoned::now().to_string(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "details": build_component_details(storage_ready, iam_ready),
+    });
+
+    if let Some(uptime) = uptime {
+        payload["uptime"] = json!(uptime);
+    }
+
+    payload
+}
+
 pub(crate) fn build_health_response(
     method: Method,
     probe: HealthProbe,
@@ -102,14 +143,7 @@ pub(crate) fn build_health_response(
     iam_ready: bool,
 ) -> S3Response<(StatusCode, Body)> {
     let health = health_check_state(storage_ready, iam_ready, probe);
-    let health_info = json!({
-        "status": health.status,
-        "ready": health.ready,
-        "service": "rustfs-endpoint",
-        "timestamp": jiff::Zoned::now().to_string(),
-        "version": env!("CARGO_PKG_VERSION"),
-        "details": build_component_details(storage_ready, iam_ready)
-    });
+    let health_info = build_health_payload(health, storage_ready, iam_ready, "rustfs-endpoint", None);
 
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -131,7 +165,7 @@ impl Operation for HealthCheckHandler {
         let method = req.method;
 
         // Only GET and HEAD are allowed
-        if method != http::Method::GET && method != http::Method::HEAD {
+        if method != Method::GET && method != Method::HEAD {
             // 405 Method Not Allowed
             let mut headers = HeaderMap::new();
             headers.insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
@@ -142,7 +176,7 @@ impl Operation for HealthCheckHandler {
         }
 
         let probe = probe_from_path(req.uri.path());
-        let (storage_ready, iam_ready) = collect_dependency_readiness();
+        let (storage_ready, iam_ready) = collect_dependency_readiness().await;
 
         Ok(build_health_response(method, probe, storage_ready, iam_ready))
     }
@@ -151,6 +185,7 @@ impl Operation for HealthCheckHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temp_env::with_var;
 
     #[test]
     fn test_readiness_state_ready() {
@@ -227,5 +262,19 @@ mod tests {
     fn test_build_health_response_head_returns_empty_body() {
         let resp = build_health_response(Method::HEAD, HealthProbe::Readiness, false, false);
         assert_eq!(resp.output.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_build_health_payload_minimal_mode_returns_status_and_ready_only() {
+        let health = health_check_state(true, false, HealthProbe::Readiness);
+        with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("true"), || {
+            let payload = build_health_payload(health, true, false, "rustfs-endpoint", Some(123));
+            assert_eq!(payload["status"], "degraded");
+            assert_eq!(payload["ready"], false);
+            assert!(payload.get("version").is_none());
+            assert!(payload.get("details").is_none());
+            assert!(payload.get("service").is_none());
+            assert!(payload.get("uptime").is_none());
+        });
     }
 }

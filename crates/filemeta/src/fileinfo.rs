@@ -349,7 +349,7 @@ impl FileInfo {
 
         self.parts.push(part);
 
-        self.parts.sort_by(|a, b| a.number.cmp(&b.number));
+        self.parts.sort_by_key(|a| a.number);
     }
 
     // to_part_offset gets the part index where offset is located, returns part index and offset
@@ -429,7 +429,7 @@ impl FileInfo {
         if self.deleted {
             return "delete-marker".to_string();
         }
-        self.data_dir.map_or("".to_string(), |dir| dir.to_string())
+        self.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string())
     }
 
     /// Read quorum returns expected read quorum for this FileInfo
@@ -643,13 +643,11 @@ pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     }
 
     match progress_tokens[1] {
-        "true" | "\"true\"" => {
-            if tokens.len() == 1 {
-                return Ok(RestoreStatus {
-                    is_restore_in_progress: Some(true),
-                    ..Default::default()
-                });
-            }
+        "true" | "\"true\"" if tokens.len() == 1 => {
+            return Ok(RestoreStatus {
+                is_restore_in_progress: Some(true),
+                ..Default::default()
+            });
         }
         "false" | "\"false\"" => {
             if tokens.len() != 2 {

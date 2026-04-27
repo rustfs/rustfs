@@ -1940,4 +1940,28 @@ mod test {
         assert!(!found);
         assert!(policies.is_empty());
     }
+
+    #[test]
+    fn test_policy_round_trips_through_json_value() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    }
+  ]
+}"#,
+        )
+        .expect("policy should parse");
+
+        let value = serde_json::to_value(&policy).expect("policy should serialize");
+        let round_trip: Policy = serde_json::from_value(value).expect("policy should deserialize from serde_json::Value");
+
+        assert_eq!(round_trip.version, policy.version);
+        assert_eq!(round_trip.statements.len(), policy.statements.len());
+        assert_eq!(round_trip.statements[0].effect, policy.statements[0].effect);
+    }
 }

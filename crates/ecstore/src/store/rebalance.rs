@@ -24,9 +24,9 @@ fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &ObjectOptions)
     let object = decode_dir_object(object);
 
     if let Some(version_id) = &opts.version_id {
-        StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), version_id.clone())
+        StorageError::VersionNotFound(bucket.to_owned(), object, version_id.clone())
     } else {
-        StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())
+        StorageError::ObjectNotFound(bucket.to_owned(), object)
     }
 }
 
@@ -418,7 +418,7 @@ impl ECStore {
             if is_err_object_not_found(err)
                 && let Err(err) = opts.precondition_check(&pinfo.object_info)
             {
-                return Err(err.clone());
+                return Err(err);
             }
 
             if !is_err_object_not_found(err) && !is_err_version_not_found(err) {

@@ -15,11 +15,17 @@
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
 use crate::{
-    Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
+    Event,
+    error::NotificationError,
+    notifier::EventNotifier,
+    registry::TargetRegistry,
+    rules::{BucketNotificationConfig, ParseConfigError},
+    stream,
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{
-    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS,
+    NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
@@ -32,14 +38,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 const MAX_RECENT_LIVE_EVENTS: usize = 1024;
 
 fn subsystem_target_type(target_type: &str) -> &str {
     match target_type {
         NOTIFY_WEBHOOK_SUB_SYS => "webhook",
+        NOTIFY_KAFKA_SUB_SYS => "kafka",
         NOTIFY_MQTT_SUB_SYS => "mqtt",
+        NOTIFY_NATS_SUB_SYS => "nats",
+        NOTIFY_PULSAR_SUB_SYS => "pulsar",
         _ => target_type,
     }
 }
@@ -106,8 +115,27 @@ pub struct NotificationMetrics {
     processed_events: AtomicUsize,
     /// Number of events that failed to handle
     failed_events: AtomicUsize,
+    /// Number of dispatch attempts skipped before delivery
+    skipped_events: AtomicUsize,
     /// System startup time
     start_time: Instant,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationMetricSnapshot {
+    pub current_send_in_progress: u64,
+    pub events_errors_total: u64,
+    pub events_sent_total: u64,
+    pub events_skipped_total: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationTargetMetricSnapshot {
+    pub failed_messages: u64,
+    pub queue_length: u64,
+    pub target_id: String,
+    pub target_type: String,
+    pub total_messages: u64,
 }
 
 impl Default for NotificationMetrics {
@@ -122,6 +150,7 @@ impl NotificationMetrics {
             processing_events: AtomicUsize::new(0),
             processed_events: AtomicUsize::new(0),
             failed_events: AtomicUsize::new(0),
+            skipped_events: AtomicUsize::new(0),
             start_time: Instant::now(),
         }
     }
@@ -136,9 +165,17 @@ impl NotificationMetrics {
         self.processed_events.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn decrement_processing(&self) {
+        self.processing_events.fetch_sub(1, Ordering::Relaxed);
+    }
+
     pub fn increment_failed(&self) {
         self.processing_events.fetch_sub(1, Ordering::Relaxed);
         self.failed_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_skipped(&self) {
+        self.skipped_events.fetch_add(1, Ordering::Relaxed);
     }
 
     // Provide public methods to get count
@@ -154,8 +191,21 @@ impl NotificationMetrics {
         self.failed_events.load(Ordering::Relaxed)
     }
 
+    pub fn skipped_count(&self) -> usize {
+        self.skipped_events.load(Ordering::Relaxed)
+    }
+
     pub fn uptime(&self) -> Duration {
         self.start_time.elapsed()
+    }
+
+    pub fn snapshot(&self) -> NotificationMetricSnapshot {
+        NotificationMetricSnapshot {
+            current_send_in_progress: self.processing_count() as u64,
+            events_errors_total: self.failed_count() as u64,
+            events_sent_total: self.processed_count() as u64,
+            events_skipped_total: self.skipped_count() as u64,
+        }
     }
 }
 
@@ -187,14 +237,15 @@ impl NotificationSystem {
         let concurrency_limiter =
             rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
         let (live_event_sender, _) = broadcast::channel(1024);
+        let metrics = Arc::new(NotificationMetrics::new());
         NotificationSystem {
             subscriber_view: NotificationSystemSubscriberView::new(),
-            notifier: Arc::new(EventNotifier::new()),
+            notifier: Arc::new(EventNotifier::new(metrics.clone())),
             registry: Arc::new(TargetRegistry::new()),
             config: Arc::new(RwLock::new(config)),
             stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
             concurrency_limiter: Arc::new(Semaphore::new(concurrency_limiter)), // Limit the maximum number of concurrent processing events to 20
-            metrics: Arc::new(NotificationMetrics::new()),
+            metrics,
             live_event_sender,
             live_event_history: Arc::new(RwLock::new(LiveEventHistory::default())),
         }
@@ -264,7 +315,10 @@ impl NotificationSystem {
 
         let config = {
             let guard = self.config.read().await;
-            debug!("Initializing notification system with config: {:?}", *guard);
+            debug!(
+                subsystem_count = guard.0.len(),
+                "Initializing notification system with configuration summary"
+            );
             guard.clone()
         };
 
@@ -472,7 +526,10 @@ impl NotificationSystem {
                 if !changed {
                     info!("Target {} of type {} not found, no changes made.", target_name, target_type);
                 }
-                debug!("Config after remove: {:?}", config);
+                debug!(
+                    subsystem_count = config.0.len(),
+                    "Target config removal processed and configuration summary updated"
+                );
                 changed
             })
             .await;
@@ -548,7 +605,6 @@ impl NotificationSystem {
         bucket: &str,
         cfg: &BucketNotificationConfig,
     ) -> Result<(), NotificationError> {
-        self.subscriber_view.apply_bucket_config(bucket, cfg);
         let arn_list = self.notifier.get_arn_list(&cfg.region).await;
         if arn_list.is_empty() {
             return Err(NotificationError::Configuration("No targets configured".to_string()));
@@ -557,13 +613,18 @@ impl NotificationSystem {
         // Validate the configuration against the available ARNs
         if let Err(e) = cfg.validate(&cfg.region, &arn_list) {
             debug!("Bucket notification config validation region:{} failed: {}", &cfg.region, e);
-            if !e.to_string().contains("ARN not found") {
+            if !matches!(e, ParseConfigError::ArnNotFound(_)) {
                 return Err(NotificationError::BucketNotification(e.to_string()));
-            } else {
-                error!("config validate failed, err: {}", e);
             }
+            warn!(
+                bucket = %bucket,
+                region = %cfg.region,
+                error = %e,
+                "Bucket notification config references missing target ARN; keeping compatibility and loading remaining rules"
+            );
         }
 
+        self.subscriber_view.apply_bucket_config(bucket, cfg);
         let rules_map = cfg.get_rules_map();
         self.notifier.add_rules_map(bucket, rules_map.clone()).await;
         info!("Loaded notification config for bucket: {}", bucket);
@@ -585,8 +646,33 @@ impl NotificationSystem {
         status.insert("processing_events".to_string(), self.metrics.processing_count().to_string());
         status.insert("processed_events".to_string(), self.metrics.processed_count().to_string());
         status.insert("failed_events".to_string(), self.metrics.failed_count().to_string());
+        status.insert("skipped_events".to_string(), self.metrics.skipped_count().to_string());
 
         status
+    }
+
+    pub fn snapshot_metrics(&self) -> NotificationMetricSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub async fn snapshot_target_metrics(&self) -> Vec<NotificationTargetMetricSnapshot> {
+        let targets = self.notifier.target_list().read().await.values();
+        let mut snapshots = Vec::with_capacity(targets.len());
+
+        for target in targets {
+            let delivery = target.delivery_snapshot();
+            let target_id = target.id();
+            snapshots.push(NotificationTargetMetricSnapshot {
+                failed_messages: delivery.failed_messages,
+                queue_length: delivery.queue_length,
+                target_id: target_id.to_string(),
+                target_type: target_id.name,
+                total_messages: delivery.total_messages,
+            });
+        }
+
+        snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        snapshots
     }
 
     // Add a method to shut down the system
@@ -678,5 +764,26 @@ mod tests {
         let target_id = runtime_target_id_for_subsystem(NOTIFY_MQTT_SUB_SYS, "Analytics");
         assert_eq!(target_id.id, "analytics");
         assert_eq!(target_id.name, "mqtt");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_kafka_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_KAFKA_SUB_SYS, "EventBus");
+        assert_eq!(target_id.id, "eventbus");
+        assert_eq!(target_id.name, "kafka");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_nats_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_NATS_SUB_SYS, "Bus");
+        assert_eq!(target_id.id, "bus");
+        assert_eq!(target_id.name, "nats");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_pulsar_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_PULSAR_SUB_SYS, "Ledger");
+        assert_eq!(target_id.id, "ledger");
+        assert_eq!(target_id.name, "pulsar");
     }
 }

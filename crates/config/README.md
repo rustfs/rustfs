@@ -53,8 +53,24 @@ Current guidance:
 
 ## Scanner environment aliases
 
+- `RUSTFS_SCANNER_SPEED` (canonical, also accepts `MINIO_SCANNER_SPEED`)
+- `RUSTFS_SCANNER_CYCLE` (canonical, also accepts `MINIO_SCANNER_CYCLE`)
 - `RUSTFS_SCANNER_START_DELAY_SECS` (canonical)
 - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
+- `RUSTFS_SCANNER_IDLE_MODE` (canonical)
+- `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (canonical)
+
+## Drive timeout environment variables
+
+- `RUSTFS_DRIVE_METADATA_TIMEOUT_SECS`
+- `RUSTFS_DRIVE_DISK_INFO_TIMEOUT_SECS`
+- `RUSTFS_DRIVE_LIST_DIR_TIMEOUT_SECS`
+- `RUSTFS_DRIVE_WALKDIR_TIMEOUT_SECS`
+- `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS`
+
+Legacy compatibility fallback:
+- `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION`
+  This legacy variable is treated as a deprecated fallback for the operation-specific drive timeout variables above when a canonical variable is unset.
 
 ## 📄 License
 

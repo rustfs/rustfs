@@ -71,7 +71,7 @@ fn test_trusted_proxy_config() {
         TrustedProxy::Cidr("10.0.0.0/8".parse().unwrap()),
     ];
 
-    let config = TrustedProxyConfig::new(proxies.clone(), ValidationMode::Strict, true, 10, true, vec![]);
+    let config = TrustedProxyConfig::new(proxies, ValidationMode::Strict, true, 10, true, vec![]);
 
     assert_eq!(config.proxies.len(), 2);
     assert_eq!(config.validation_mode, ValidationMode::Strict);

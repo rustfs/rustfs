@@ -19,6 +19,7 @@ pub mod error_conv;
 pub mod error_reduce;
 pub mod format;
 pub mod fs;
+pub mod health_state;
 pub mod local;
 pub mod os;
 
@@ -33,6 +34,7 @@ pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::disk::disk_store::LocalDiskWrapper;
+use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
 use crate::rpc::RemoteDisk;
 use bytes::Bytes;
@@ -41,7 +43,6 @@ use error::DiskError;
 use error::{Error, Result};
 use local::LocalDisk;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
-use rustfs_io_core::BoxChunkStream;
 use rustfs_madmin::info_commands::DiskMetrics;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::PathBuf, sync::Arc};
@@ -297,14 +298,6 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_file_chunks(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<BoxChunkStream> {
-        match self {
-            Disk::Local(local_disk) => local_disk.read_file_chunks(volume, path, offset, length).await,
-            Disk::Remote(remote_disk) => remote_disk.read_file_chunks(volume, path, offset, length).await,
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         match self {
             Disk::Local(local_disk) => local_disk.append_file(volume, path).await,
@@ -420,6 +413,30 @@ impl DiskAPI for Disk {
 }
 
 impl Disk {
+    pub fn runtime_state(&self) -> RuntimeDriveHealthState {
+        match self {
+            Disk::Local(local_disk) => local_disk.runtime_state(),
+            Disk::Remote(remote_disk) => remote_disk.runtime_state(),
+        }
+    }
+
+    pub fn offline_duration_secs(&self) -> Option<u64> {
+        match self {
+            Disk::Local(local_disk) => local_disk.offline_duration_secs(),
+            Disk::Remote(remote_disk) => remote_disk.offline_duration_secs(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
+        match self {
+            Disk::Local(local_disk) => local_disk.force_runtime_state_for_test(state),
+            Disk::Remote(remote_disk) => remote_disk.force_runtime_state_for_test(state),
+        }
+    }
+}
+
+impl Disk {
     /// Enable health monitoring on this disk.
     /// Called after startup format loading completes so that remote peers
     /// have time to come online before being marked as faulty.
@@ -514,9 +531,6 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     /// On other platforms, falls back to efficient read operations.
     async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
 
-    /// Chunk-based file read compatibility layer for the zero-copy data plane.
-    async fn read_file_chunks(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<BoxChunkStream>;
-
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream
@@ -582,6 +596,8 @@ pub struct DiskInfo {
     pub scanning: bool,
     pub endpoint: String,
     pub mount_path: String,
+    /// Leaf physical block devices backing this mount path when available.
+    pub physical_device_ids: Vec<String>,
     pub id: Option<Uuid>,
     pub rotational: bool,
     pub metrics: DiskMetrics,

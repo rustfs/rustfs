@@ -754,7 +754,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
         buckets: Vec<String>,
     ) -> Result<(), EcstoreError> {
         // Load bucket metadata system in background
-        let pool_clone = self.clone();
+        let pool_clone = self;
 
         tokio::spawn(async move {
             pool_clone.start_resync_routine(buckets, cancellation_token).await;
@@ -824,10 +824,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
         let cancel_token = CancellationToken::new();
         resyncer.register_cancel_token(&opts, cancel_token.clone()).await;
         tokio::spawn(async move {
-            resyncer
-                .clone()
-                .resync_bucket(cancel_token, storage, false, opts.clone())
-                .await;
+            Box::pin(resyncer.clone().resync_bucket(cancel_token, storage, false, opts.clone())).await;
             resyncer.clear_cancel_token(&opts).await;
         });
 
@@ -914,7 +911,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
                         };
                         tokio::spawn(async move {
                             resync.register_cancel_token(&opts, ctx.clone()).await;
-                            resync.clone().resync_bucket(ctx, storage, true, opts.clone()).await;
+                            Box::pin(resync.clone().resync_bucket(ctx, storage, true, opts.clone())).await;
                             resync.clear_cancel_token(&opts).await;
                         });
                     }
@@ -959,6 +956,9 @@ pub type DynReplicationPool = dyn ReplicationPoolTrait + Send + Sync;
 /// Trait that abstracts the replication pool operations
 #[async_trait::async_trait]
 pub trait ReplicationPoolTrait: std::fmt::Debug {
+    fn active_workers(&self) -> i32;
+    fn active_mrf_workers(&self) -> i32;
+    fn active_lrg_workers(&self) -> i32;
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo);
     async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo);
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
@@ -975,6 +975,18 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
 // Implement the trait for ReplicationPool
 #[async_trait::async_trait]
 impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
+    fn active_workers(&self) -> i32 {
+        ReplicationPool::<S>::active_workers(self)
+    }
+
+    fn active_mrf_workers(&self) -> i32 {
+        ReplicationPool::<S>::active_mrf_workers(self)
+    }
+
+    fn active_lrg_workers(&self) -> i32 {
+        ReplicationPool::<S>::active_lrg_workers(self)
+    }
+
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo) {
         self.queue_replica_task(ri).await;
     }

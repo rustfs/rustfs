@@ -357,7 +357,7 @@ impl S3PeerSys {
 
         ress.into_iter()
             .filter(|op| op.is_some())
-            .find_map(|op| op.clone())
+            .find_map(|op| op)
             .ok_or(Error::VolumeNotFound)
     }
 
@@ -575,7 +575,7 @@ pub struct RemotePeerS3Client {
 
 impl RemotePeerS3Client {
     pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
-        let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default().to_string();
+        let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default();
         let client = Self {
             node,
             pools,

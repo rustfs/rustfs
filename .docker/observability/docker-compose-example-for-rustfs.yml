@@ -85,10 +85,8 @@ services:
     networks:
       - otel-network
     restart: unless-stopped
-    depends_on:
-      - redpanda
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3200/ready" ]
+      test: [ "CMD", "/tempo", "-version" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -205,7 +203,7 @@ services:
       - prometheus
       - loki
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:13133" ]
+      test: [ "CMD", "/otelcol-contrib", "--version" ]
       interval: 10s
       timeout: 5s
       retries: 3

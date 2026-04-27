@@ -5,8 +5,8 @@ metadata:
   name: {{ include "rustfs.fullname" . }}-transport
   namespace: {{ .Release.Namespace }}
 spec:
-  rootcas:
-    - {{ include "rustfs.fullname" . }}-root-ca-secret
+  rootCAs:
+    - secret: {{ include "rustfs.fullname" . }}-root-ca-secret
   certificatesSecrets:
     - {{ include "rustfs.fullname" . }}-mtls-secret
   insecureSkipVerify: true

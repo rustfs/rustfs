@@ -1,13 +1,4 @@
 {{- if .Values.ingress.enabled -}}
-{{- $ingressAnnotations := dict }}
-{{- if eq .Values.ingress.className "nginx" }}
-{{- $ingressAnnotations = deepCopy (default (dict) .Values.ingress.nginxAnnotations) }}
-{{- else if eq .Values.ingress.className "traefik" }}
-{{- $ingressAnnotations = deepCopy (default (dict) .Values.ingress.traefikAnnotations) }}
-{{- end }}
-{{- with .Values.ingress.customAnnotations }}
-{{- $ingressAnnotations = merge $ingressAnnotations . }}
-{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -18,9 +9,9 @@ metadata:
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-  {{- with $ingressAnnotations }}
+  {{- with (include "rustfs.ingressAnnotations" .) }}
   annotations:
-    {{- toYaml . | nindent 4 }}
+    {{- . | nindent 4 }}
   {{- end }}
 spec:
   {{- with .Values.ingress.className }}

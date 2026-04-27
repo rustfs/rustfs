@@ -19,130 +19,11 @@
 use bytes::{Bytes, BytesMut};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use reed_solomon_simd;
-use rustfs_rio::BlockReadable;
 use smallvec::SmallVec;
 use std::io;
-use std::sync::Arc;
 use tokio::io::AsyncRead;
-use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
-
-pub(crate) struct EncodeBlockBuffer {
-    buf: Vec<u8>,
-}
-
-impl EncodeBlockBuffer {
-    pub(crate) fn new(block_size: usize) -> Self {
-        Self {
-            buf: vec![0u8; block_size],
-        }
-    }
-
-    pub(crate) async fn read_from<R>(&mut self, reader: &mut R) -> io::Result<usize>
-    where
-        R: AsyncRead + Send + Sync + Unpin,
-    {
-        rustfs_utils::read_full(&mut *reader, &mut self.buf).await
-    }
-
-    pub(crate) async fn read_from_block<R>(&mut self, reader: &mut R) -> io::Result<usize>
-    where
-        R: BlockReadable + Send + Sync + Unpin,
-    {
-        reader.read_block(&mut self.buf).await
-    }
-
-    pub(crate) fn filled(&self, len: usize) -> &[u8] {
-        &self.buf[..len]
-    }
-}
-
-pub struct EncodedShardBlock {
-    data: Bytes,
-    shard_size: usize,
-    shard_count: usize,
-}
-
-impl EncodedShardBlock {
-    pub(crate) fn new(data: Bytes, shard_size: usize, shard_count: usize) -> Self {
-        Self {
-            data,
-            shard_size,
-            shard_count,
-        }
-    }
-
-    pub fn shard_count(&self) -> usize {
-        self.shard_count
-    }
-
-    pub fn len(&self) -> usize {
-        self.shard_count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.shard_count == 0
-    }
-
-    pub fn shard(&self, idx: usize) -> Bytes {
-        let start = idx * self.shard_size;
-        let end = start + self.shard_size;
-        self.data.slice(start..end)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = Bytes> + '_ {
-        (0..self.shard_count).map(|idx| self.shard(idx))
-    }
-
-    pub fn into_vec(self) -> Vec<Bytes> {
-        (0..self.shard_count).map(|idx| self.shard(idx)).collect()
-    }
-
-    pub fn into_reusable_buffer(self) -> BytesMut {
-        match self.data.try_into_mut() {
-            Ok(mut buf) => {
-                buf.clear();
-                buf
-            }
-            Err(data) => BytesMut::with_capacity(data.len()),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct EncodedShardBufferPool {
-    capacity: usize,
-    free: Arc<Mutex<Vec<BytesMut>>>,
-}
-
-impl EncodedShardBufferPool {
-    pub(crate) async fn with_prefill(capacity: usize, initial: usize) -> Self {
-        let mut free = Vec::with_capacity(initial);
-        for _ in 0..initial {
-            free.push(BytesMut::with_capacity(capacity));
-        }
-
-        Self {
-            capacity,
-            free: Arc::new(Mutex::new(free)),
-        }
-    }
-
-    pub(crate) async fn acquire(&self) -> BytesMut {
-        let mut free = self.free.lock().await;
-        free.pop().unwrap_or_else(|| BytesMut::with_capacity(self.capacity))
-    }
-
-    pub(crate) async fn release(&self, block: EncodedShardBlock) {
-        let mut free = self.free.lock().await;
-        let mut buf = block.into_reusable_buffer();
-        if buf.capacity() < self.capacity {
-            buf.reserve(self.capacity - buf.capacity());
-        }
-        free.push(buf);
-    }
-}
 
 /// Legacy calc_shard_size formula: (block_size.div_ceil(data_shards) + 1) & !1
 /// Matches main branch and filemeta::ErasureInfo for old-version files.
@@ -470,25 +351,6 @@ impl Erasure {
     /// A vector of encoded shards as `Bytes`.
     #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
     pub fn encode_data(&self, data: &[u8]) -> io::Result<Vec<Bytes>> {
-        Ok(self.encode_data_block(data)?.into_vec())
-    }
-
-    /// Encode one logical block into an `EncodedShardBlock` using a caller-provided backing buffer.
-    ///
-    /// This is the explicit reuse-oriented variant for non-hot paths that want to
-    /// thread a reusable `BytesMut` across multiple encode calls.
-    #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
-    pub fn encode_data_with_buffer(&self, data: &[u8], data_buffer: BytesMut) -> io::Result<EncodedShardBlock> {
-        self.encode_data_block_with_buffer(data, data_buffer)
-    }
-
-    #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
-    pub(crate) fn encode_data_block(&self, data: &[u8]) -> io::Result<EncodedShardBlock> {
-        self.encode_data_block_with_buffer(data, BytesMut::with_capacity(self.shard_size() * self.total_shard_count()))
-    }
-
-    #[tracing::instrument(level = "debug", skip_all, fields(data_len=data.len()))]
-    pub(crate) fn encode_data_block_with_buffer(&self, data: &[u8], mut data_buffer: BytesMut) -> io::Result<EncodedShardBlock> {
         let shard_size_fn = if self.uses_legacy {
             calc_shard_size_legacy
         } else {
@@ -497,10 +359,7 @@ impl Erasure {
         let per_shard_size = shard_size_fn(data.len(), self.data_shards);
         let need_total_size = per_shard_size * self.total_shard_count();
 
-        data_buffer.clear();
-        if data_buffer.capacity() < need_total_size {
-            data_buffer.reserve(need_total_size - data_buffer.capacity());
-        }
+        let mut data_buffer = BytesMut::with_capacity(need_total_size);
         data_buffer.extend_from_slice(data);
         data_buffer.resize(need_total_size, 0u8);
 
@@ -523,7 +382,14 @@ impl Erasure {
         }
 
         // Zero-copy split, all shards reference data_buffer
-        Ok(EncodedShardBlock::new(data_buffer.freeze(), per_shard_size, self.total_shard_count()))
+        let mut data_buffer = data_buffer.freeze();
+        let mut shards = Vec::with_capacity(self.total_shard_count());
+        for _ in 0..self.total_shard_count() {
+            let shard = data_buffer.split_to(per_shard_size);
+            shards.push(shard);
+        }
+
+        Ok(shards)
     }
 
     /// Decode and reconstruct missing shards in-place.
@@ -612,8 +478,8 @@ impl Erasure {
     ///
     /// # Arguments
     /// * `reader` - An async reader implementing AsyncRead + Send + Sync + Unpin
-    /// * `mut on_block` - Async callback that receives encoded blocks and returns the block for reuse
-    /// * `F` - Callback type: FnMut(Result<EncodedShardBlock, std::io::Error>) -> Future<Output=Result<Option<EncodedShardBlock>, E>> + Send
+    /// * `mut on_block` - Async callback that receives encoded blocks and returns a Result
+    /// * `F` - Callback type: FnMut(Result<Vec<Bytes>, std::io::Error>) -> Future<Output=Result<(), E>> + Send
     /// * `Fut` - Future type returned by the callback
     /// * `E` - Error type returned by the callback
     /// * `R` - Reader type implementing AsyncRead + Send + Sync + Unpin
@@ -630,24 +496,19 @@ impl Erasure {
     ) -> Result<usize, E>
     where
         R: AsyncRead + Send + Sync + Unpin,
-        F: FnMut(std::io::Result<EncodedShardBlock>) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<Option<EncodedShardBlock>, E>> + Send,
+        F: FnMut(std::io::Result<Vec<Bytes>>) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), E>> + Send,
     {
         let block_size = self.block_size;
         let mut total = 0;
-        let mut block_buffer = EncodeBlockBuffer::new(block_size);
-        let reusable_capacity = self.shard_size() * self.total_shard_count();
-        let buffer_pool = EncodedShardBufferPool::with_prefill(reusable_capacity, 1).await;
+        let mut buf = vec![0u8; block_size];
         loop {
-            match block_buffer.read_from(&mut *reader).await {
+            match rustfs_utils::read_full(&mut *reader, &mut buf).await {
                 Ok(n) if n > 0 => {
                     warn!("encode_stream_callback_async read n={}", n);
                     total += n;
-                    let reusable_buffer = buffer_pool.acquire().await;
-                    let res = self.encode_data_block_with_buffer(block_buffer.filled(n), reusable_buffer);
-                    if let Some(block) = on_block(res).await? {
-                        buffer_pool.release(block).await;
-                    }
+                    let res = self.encode_data(&buf[..n]);
+                    on_block(res).await?
                 }
                 Ok(_) => {
                     warn!("encode_stream_callback_async read unexpected ok");
@@ -659,7 +520,7 @@ impl Erasure {
                 }
                 Err(e) => {
                     warn!("encode_stream_callback_async read error={:?}", e);
-                    let _ = on_block(Err(e)).await?;
+                    on_block(Err(e)).await?;
                     break;
                 }
             }
@@ -885,8 +746,8 @@ mod tests {
                     let tx = tx.clone();
                     async move {
                         let shards = res.unwrap();
-                        tx.send(shards.iter().collect()).await.unwrap();
-                        Ok(Some(shards))
+                        tx.send(shards).await.unwrap();
+                        Ok(())
                     }
                 })
                 .await
@@ -896,36 +757,6 @@ mod tests {
         assert!(result.is_ok());
         let collected_shards = rx.recv().await.unwrap();
         assert_eq!(collected_shards.len(), data_shards + parity_shards);
-    }
-
-    #[test]
-    fn test_encode_data_with_buffer_supports_explicit_reuse() {
-        let erasure = Erasure::new(4, 2, 1024);
-        let reusable_capacity = erasure.shard_size() * erasure.total_shard_count();
-
-        let first_data = b"explicit reusable buffer path".repeat(32);
-        let first_block = erasure
-            .encode_data_with_buffer(&first_data, BytesMut::with_capacity(reusable_capacity))
-            .expect("first encode should succeed");
-        let reusable_buffer = first_block.into_reusable_buffer();
-        assert!(reusable_buffer.capacity() >= reusable_capacity);
-
-        let second_data = b"second encode through same reusable buffer".repeat(24);
-        let second_block = erasure
-            .encode_data_with_buffer(&second_data, reusable_buffer)
-            .expect("second encode should succeed");
-
-        let mut shards_opt: Vec<Option<Vec<u8>>> = second_block.iter().map(|shard| Some(shard.to_vec())).collect();
-        shards_opt[1] = None;
-        shards_opt[5] = None;
-        erasure.decode_data(&mut shards_opt).expect("decode should succeed");
-
-        let mut recovered = Vec::new();
-        for shard in shards_opt.iter().take(erasure.data_shards) {
-            recovered.extend_from_slice(shard.as_ref().expect("data shard should exist after decode"));
-        }
-        recovered.truncate(second_data.len());
-        assert_eq!(&recovered, &second_data);
     }
 
     #[tokio::test]
@@ -954,8 +785,8 @@ mod tests {
                     let tx = tx.clone();
                     async move {
                         let shards = res.unwrap();
-                        tx.send(shards.iter().collect()).await.unwrap();
-                        Ok(Some(shards))
+                        tx.send(shards).await.unwrap();
+                        Ok(())
                     }
                 })
                 .await
@@ -968,8 +799,8 @@ mod tests {
 
         // Test decode using the old API that operates in-place
         let mut decode_input: Vec<Option<Vec<u8>>> = vec![None; data_shards + parity_shards];
-        for (i, shard) in shards.iter().enumerate().take(data_shards) {
-            decode_input[i] = Some(shard.to_vec());
+        for i in 0..data_shards {
+            decode_input[i] = Some(shards[i].to_vec());
         }
         erasure.decode_data(&mut decode_input).unwrap();
 
@@ -1366,8 +1197,8 @@ mod tests {
                         let tx = tx.clone();
                         async move {
                             let shards = res.unwrap();
-                            tx.send(shards.iter().collect()).await.unwrap();
-                            Ok(Some(shards))
+                            tx.send(shards).await.unwrap();
+                            Ok(())
                         }
                     })
                     .await
@@ -1400,64 +1231,6 @@ mod tests {
 
             recovered.truncate(data_clone.len());
             assert_eq!(&recovered, &data_clone);
-        }
-
-        #[tokio::test]
-        #[ignore]
-        async fn stress_simd_stream_callback_reuses_backing_buffers_across_many_blocks() {
-            use std::io::Cursor;
-            use std::sync::Arc;
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            use tokio::sync::Mutex;
-
-            let data_shards = 4;
-            let parity_shards = 2;
-            let block_size = 1024;
-            let erasure = Arc::new(Erasure::new(data_shards, parity_shards, block_size));
-
-            let sample =
-                b"SIMD stress callback test payload that intentionally spans many blocks to exercise reusable backing buffers.";
-            let data = sample.repeat((4 * 1024 * 1024 / sample.len()).max(1));
-            let data_clone = data.clone();
-            let mut reader = Cursor::new(data);
-
-            let recovered = Arc::new(Mutex::new(Vec::with_capacity(data_clone.len())));
-            let block_count = Arc::new(AtomicUsize::new(0));
-            let erasure_for_callback = erasure.clone();
-            let recovered_for_callback = recovered.clone();
-            let block_count_for_callback = block_count.clone();
-
-            erasure
-                .clone()
-                .encode_stream_callback_async::<_, _, (), _>(&mut reader, move |res| {
-                    let erasure_for_callback = erasure_for_callback.clone();
-                    let recovered_for_callback = recovered_for_callback.clone();
-                    let block_count_for_callback = block_count_for_callback.clone();
-                    async move {
-                        let shards = res.unwrap();
-                        block_count_for_callback.fetch_add(1, Ordering::Relaxed);
-
-                        let mut shards_opt: Vec<Option<Vec<u8>>> = shards.iter().map(|b| Some(b.to_vec())).collect();
-                        shards_opt[1] = None;
-                        shards_opt[5] = None;
-                        erasure_for_callback.decode_data(&mut shards_opt).unwrap();
-
-                        let mut recovered = recovered_for_callback.lock().await;
-                        for shard in shards_opt.iter().take(data_shards) {
-                            recovered.extend_from_slice(shard.as_ref().unwrap());
-                        }
-
-                        Ok(Some(shards))
-                    }
-                })
-                .await
-                .unwrap();
-
-            assert!(block_count.load(Ordering::Relaxed) > 1024);
-
-            let mut recovered = recovered.lock().await;
-            recovered.truncate(data_clone.len());
-            assert_eq!(&*recovered, &data_clone);
         }
     }
 }

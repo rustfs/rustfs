@@ -151,6 +151,17 @@ pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
     Ok(volume1 == volume2)
 }
 
+pub fn get_physical_device_ids(disk: &str) -> std::io::Result<Vec<String>> {
+    let path_wide = to_wide_path(Path::new(disk));
+    let volume = get_volume_name(&path_wide)?;
+
+    Ok(vec![String::from_utf16_lossy(&volume)])
+}
+
+pub fn check_cross_device_mounts(_paths: &[String]) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub fn get_drive_stats(_major: u32, _minor: u32) -> std::io::Result<IOStats> {
     Ok(IOStats::default())
 }

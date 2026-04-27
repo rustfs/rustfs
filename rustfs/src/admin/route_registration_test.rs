@@ -14,13 +14,14 @@
 
 use crate::admin::{
     handlers::{
-        audit, bucket_meta, heal, health, kms, oidc, pools, profile_admin, quota, rebalance, replication, site_replication, sts,
-        system, tier, user,
+        audit, bucket_meta, heal, health, kms, module_switch, oidc, pools, profile_admin, quota, rebalance, replication,
+        site_replication, sts, system, tier, user,
     },
     router::{AdminOperation, S3Router},
 };
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use hyper::Method;
+use temp_env::with_var;
 
 fn admin_path(path: &str) -> String {
     format!("{}{}", ADMIN_PREFIX, path)
@@ -51,6 +52,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     quota::register_quota_route(router).expect("register quota route");
     bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
     audit::register_audit_target_route(router).expect("register audit target route");
+    module_switch::register_module_switch_route(router).expect("register module switch route");
     replication::register_replication_route(router).expect("register replication route");
     site_replication::register_site_replication_route(router).expect("register site replication route");
     profile_admin::register_profiling_route(router).expect("register profile route");
@@ -92,6 +94,8 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/idp/builtin/policy-entities"));
     assert_route(&router, Method::GET, &admin_path("/v3/target/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/audit/target/list"));
+    assert_route(&router, Method::GET, &admin_path("/v3/module-switches"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/module-switches"));
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
@@ -158,6 +162,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/oidc/validate"));
     assert_route(&router, Method::GET, &admin_path("/v3/oidc/authorize/default"));
     assert_route(&router, Method::GET, &admin_path("/v3/oidc/callback/default"));
+    assert_route(&router, Method::GET, &admin_path("/v3/oidc/logout"));
 
     assert!(
         !router.contains_route(Method::GET, "/rustfs/rpc/read_file_stream"),
@@ -183,6 +188,8 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::PUT, compat_admin_alias_path("/v3/set-bucket-quota")),
         (Method::GET, compat_admin_alias_path("/v3/get-bucket-quota")),
         (Method::GET, compat_admin_alias_path("/v3/audit/target/list")),
+        (Method::GET, compat_admin_alias_path("/v3/module-switches")),
+        (Method::PUT, compat_admin_alias_path("/v3/module-switches")),
         (Method::PUT, compat_admin_alias_path("/v3/audit/target/audit_webhook/test-audit")),
         (Method::DELETE, compat_admin_alias_path("/v3/audit/target/audit_webhook/test-audit/reset")),
         (Method::POST, compat_admin_alias_path("/v3/heal/")),
@@ -199,6 +206,7 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, compat_admin_alias_path("/v3/oidc/providers")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/authorize/default")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/callback/default")),
+        (Method::GET, compat_admin_alias_path("/v3/oidc/logout")),
         (Method::GET, compat_admin_alias_path("/v3/oidc/config")),
         (Method::PUT, compat_admin_alias_path("/v3/oidc/config/default")),
         (Method::PUT, compat_admin_alias_path("/v3/site-replication/add")),
@@ -222,6 +230,39 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
             path
         );
     }
+}
+
+#[test]
+fn test_health_routes_not_registered_when_disabled_by_env() {
+    with_var(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"), || {
+        let mut router: S3Router<AdminOperation> = S3Router::new(false);
+        health::register_health_route(&mut router).expect("register health route");
+
+        assert!(
+            !router.contains_route(Method::GET, HEALTH_PREFIX),
+            "GET /health must not be registered when health endpoint is disabled"
+        );
+        assert!(
+            !router.contains_route(Method::HEAD, HEALTH_PREFIX),
+            "HEAD /health must not be registered when health endpoint is disabled"
+        );
+        assert!(
+            !router.contains_route(Method::GET, HEALTH_READY_PATH),
+            "GET /health/ready must not be registered when health endpoint is disabled"
+        );
+        assert!(
+            !router.contains_route(Method::HEAD, HEALTH_READY_PATH),
+            "HEAD /health/ready must not be registered when health endpoint is disabled"
+        );
+        assert!(
+            router.contains_route(Method::GET, PROFILE_CPU_PATH),
+            "GET /profile/cpu must stay registered when health endpoint is disabled"
+        );
+        assert!(
+            router.contains_route(Method::GET, PROFILE_MEMORY_PATH),
+            "GET /profile/memory must stay registered when health endpoint is disabled"
+        );
+    });
 }
 
 #[test]

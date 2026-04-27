@@ -23,6 +23,7 @@ use tracing::{error, info, instrument, warn};
 
 pub mod cache;
 pub mod error;
+pub mod keyring;
 pub mod manager;
 pub mod oidc;
 pub mod oidc_state;
@@ -100,7 +101,7 @@ pub async fn init_oidc_sys() -> Result<()> {
         }
         Err(e) => {
             warn!("OIDC initialization failed (non-fatal): {}", e);
-            OidcSys::empty()
+            OidcSys::empty().map_err(Error::StringError)?
         }
     };
 

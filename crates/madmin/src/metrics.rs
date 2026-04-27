@@ -351,7 +351,7 @@ impl RPCMetrics {
                         s_by_de
                             .entry(key.to_string())
                             .and_modify(|v| v.merge(value))
-                            .or_insert(value.clone());
+                            .or_insert_with(|| value.clone());
                     }
                 }
                 None => self.by_destination = Some(by_destination.clone()),
@@ -365,7 +365,7 @@ impl RPCMetrics {
                         s_by_caller
                             .entry(key.to_string())
                             .and_modify(|v| v.merge(value))
-                            .or_insert(value.clone());
+                            .or_insert_with(|| value.clone());
                     }
                 }
                 None => self.by_caller = Some(by_caller.clone()),
