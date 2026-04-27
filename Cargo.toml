@@ -292,7 +292,7 @@ opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rus
 opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.31.0" }
-pyroscope = { version = "2.0.2", features = ["backend-pprof-rs"] }
+pyroscope = { version = "2.0.3", features = ["backend-pprof-rs"] }
 
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
