@@ -56,13 +56,20 @@ pub(crate) fn variable_resolver_for_policy_args(args: &Args<'_>) -> VariableReso
     VariableResolver::new(context)
 }
 
-fn build_resource(action: &Action, bucket: &str, object: &str) -> String {
+const LIST_BUCKET_PREFIX_CONDITION_KEY: &str = "prefix";
+
+fn build_resource(
+    action: &Action,
+    bucket: &str,
+    object: &str,
+    conditions: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
     let bucket_resource_only = matches!(
         action,
         Action::S3Action(
             S3Action::ListBucketAction | S3Action::ListBucketVersionsAction | S3Action::ListBucketMultipartUploadsAction
         )
-    );
+    ) && conditions.contains_key(LIST_BUCKET_PREFIX_CONDITION_KEY);
 
     let mut resource = String::from(bucket);
     if bucket_resource_only || object.is_empty() {
@@ -115,7 +122,7 @@ impl Statement {
             return false;
         }
 
-        let resource = build_resource(&args.action, args.bucket, args.object);
+        let resource = build_resource(&args.action, args.bucket, args.object, args.conditions);
 
         if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
             return true;
@@ -242,7 +249,7 @@ impl BPStatement {
             return false;
         }
 
-        let resource = build_resource(&args.action, args.bucket, args.object);
+        let resource = build_resource(&args.action, args.bucket, args.object, args.conditions);
 
         if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions).await {
             return false;
