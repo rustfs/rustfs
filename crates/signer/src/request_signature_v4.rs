@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 use super::constants::UNSIGNED_PAYLOAD;
 use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
-use super::utils::{get_host_addr, sign_v4_trim_all};
+use super::utils::{HostAddrError, sign_v4_trim_all, try_get_host_addr};
 use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
 use s3s::Body;
 
@@ -173,7 +173,15 @@ fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &Has
         let k: &str = &k;
         match k {
             "host" => {
-                let _ = buf.write_str(&get_host_addr(req));
+                let host_addr = try_get_host_addr(req).map_err(|err| match err {
+                    HostAddrError::InvalidHostHeader => SignV4Error::InvalidHeaderValue {
+                        name: "host".to_string(),
+                    },
+                    HostAddrError::MissingUriHost => SignV4Error::InvalidUri {
+                        reason: "request uri has no host".to_string(),
+                    },
+                })?;
+                let _ = buf.write_str(&host_addr);
                 let _ = buf.write_char('\n');
             }
             _ => {
@@ -1110,6 +1118,24 @@ mod tests {
         assert!(matches!(
             err,
             SignV4Error::InvalidHeaderValue { name } if name == "x-amz-meta-invalid"
+        ));
+    }
+
+    #[test]
+    fn try_sign_v4_returns_invalid_uri_error_when_uri_has_no_host() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("/object")
+            .body(Body::empty())
+            .unwrap();
+        let headers = req.headers_mut();
+        headers.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(UNSIGNED_PAYLOAD));
+
+        let err = try_sign_v4(req, 0, "rustfsadmin", "rustfsadmin", "", "us-east-1").unwrap_err();
+        assert!(matches!(
+            err,
+            SignV4Error::InvalidUri { reason } if reason.contains("no host")
         ));
     }
 
