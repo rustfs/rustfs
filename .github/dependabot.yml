@@ -27,9 +27,8 @@ updates:
       timezone: "Asia/Shanghai"
       time: "08:00"
     assignees:
-      - "heihutu"
-    reviewers:
       - "houseme"
+    reviewers:
       - "overtrue"
       - "majinghe"
     ignore:
@@ -39,6 +38,8 @@ updates:
         versions: [ "0.23.x" ]
       - dependency-name: "ratelimit"
         versions: [ "1.x" ]
+      - dependency-name: "ratelimit"
+        versions: [ "2.x" ]
     groups:
       s3s:
         update-types:
