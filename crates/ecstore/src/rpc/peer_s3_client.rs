@@ -18,7 +18,9 @@ use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
 use crate::global::GLOBAL_LOCAL_DISK_MAP;
-use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::rpc::client::{
+    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
+};
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
@@ -717,14 +719,37 @@ impl RemotePeerS3Client {
                     self.health.log_success();
                 }
                 self.health.decrement_waiting();
+                if let Err(err) = &operation_result
+                    && is_network_like_disk_error(err)
+                {
+                    self.mark_faulty_and_start_recovery("operation_network_error").await;
+                }
                 operation_result
             }
             Err(_) => {
                 // Timeout occurred, mark peer as potentially faulty
                 self.health.decrement_waiting();
+                self.mark_faulty_and_start_recovery("operation_timeout").await;
                 warn!("Remote peer operation timeout after {:?}", timeout_duration);
                 Err(Error::other(format!("Remote peer operation timeout after {timeout_duration:?}")))
             }
+        }
+    }
+
+    async fn mark_faulty_and_start_recovery(&self, reason: &'static str) {
+        if self.health.swap_ok_to_faulty() {
+            warn!(
+                addr = %self.addr,
+                reason,
+                "Remote peer marked faulty after network failure"
+            );
+
+            let health = Arc::clone(&self.health);
+            let cancel_token = self.cancel_token.clone();
+            let addr = self.addr.clone();
+            tokio::spawn(async move {
+                Self::monitor_remote_peer_recovery(addr, health, cancel_token).await;
+            });
         }
     }
 }
@@ -865,6 +890,72 @@ impl PeerS3Client for RemotePeerS3Client {
             get_max_timeout_duration(),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
+        let node = Node {
+            url: url::Url::parse(addr).expect("test peer URL should parse"),
+            pools: vec![0],
+            is_local: false,
+            grid_host: addr.to_string(),
+        };
+
+        RemotePeerS3Client {
+            node: Some(node),
+            pools: Some(vec![0]),
+            addr: addr.to_string(),
+            health: Arc::new(DiskHealthTracker::new()),
+            cancel_token: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_marks_remote_peer_faulty_on_network_like_error() {
+        let client = test_remote_peer("http://peer-network-error:9000");
+
+        let err = client
+            .execute_with_timeout(
+                || async {
+                    Err::<(), Error>(DiskError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    )))
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("network-like error should fail");
+
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io network error, got {other:?}"),
+            },
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert!(client.health.is_faulty(), "network-like errors should mark remote peer faulty");
+
+        client.cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_keeps_remote_peer_online_for_business_error() {
+        let client = test_remote_peer("http://peer-business-error:9000");
+
+        let err = client
+            .execute_with_timeout(|| async { Err::<(), Error>(DiskError::FileNotFound) }, Duration::from_secs(1))
+            .await
+            .expect_err("business error should fail");
+
+        assert_eq!(err, DiskError::FileNotFound);
+        assert!(!client.health.is_faulty(), "business errors should not mark remote peer faulty");
+
+        client.cancel_token.cancel();
     }
 }
 
