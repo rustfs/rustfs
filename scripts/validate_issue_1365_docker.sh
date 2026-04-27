@@ -122,7 +122,7 @@ main() {
   trap cleanup EXIT INT TERM
 
   log_info "Starting docker compose from ${COMPOSE_FILE}"
-  compose up -d
+  compose up -d --build
 
   log_info "Waiting for RustFS health endpoint"
   wait_for_endpoint "http://${S3_HOST}:${S3_PORT}/health"
