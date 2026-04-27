@@ -40,26 +40,46 @@ pub use generated::*;
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 
-/// Timeout for connection establishment - reduced for faster failure detection
-const CONNECT_TIMEOUT_SECS: u64 = 3;
-
-/// TCP keepalive interval - how often to probe the connection
-const TCP_KEEPALIVE_SECS: u64 = 10;
-
-/// HTTP/2 keepalive interval - application-layer heartbeat
-const HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 5;
-
-/// HTTP/2 keepalive timeout - how long to wait for PING ACK
-const HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 3;
-
-/// Overall RPC timeout - maximum time for any single RPC operation
-const RPC_TIMEOUT_SECS: u64 = 30;
-
 /// Default HTTPS prefix for rustfs
 /// This is the default HTTPS prefix for rustfs.
 /// It is used to identify HTTPS URLs.
 /// Default value: https://
 const RUSTFS_HTTPS_PREFIX: &str = "https://";
+
+fn internode_connect_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_INTERNODE_CONNECT_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_INTERNODE_CONNECT_TIMEOUT_SECS,
+    ))
+}
+
+fn internode_tcp_keepalive() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_INTERNODE_TCP_KEEPALIVE_SECS,
+        rustfs_config::DEFAULT_INTERNODE_TCP_KEEPALIVE_SECS,
+    ))
+}
+
+fn internode_http2_keep_alive_interval() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS,
+        rustfs_config::DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS,
+    ))
+}
+
+fn internode_http2_keep_alive_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS,
+    ))
+}
+
+fn internode_rpc_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_INTERNODE_RPC_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_INTERNODE_RPC_TIMEOUT_SECS,
+    ))
+}
 
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
 ///
@@ -71,20 +91,25 @@ const RUSTFS_HTTPS_PREFIX: &str = "https://";
 pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {}", addr);
     let dial_started_at = Instant::now();
+    let connect_timeout = internode_connect_timeout();
+    let tcp_keepalive = internode_tcp_keepalive();
+    let http2_keepalive_interval = internode_http2_keep_alive_interval();
+    let http2_keepalive_timeout = internode_http2_keep_alive_timeout();
+    let rpc_timeout = internode_rpc_timeout();
 
     let mut connector = Endpoint::from_shared(addr.to_string())?
         // Fast connection timeout for dead peer detection
-        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .connect_timeout(connect_timeout)
         // TCP-level keepalive - OS will probe connection
-        .tcp_keepalive(Some(Duration::from_secs(TCP_KEEPALIVE_SECS)))
+        .tcp_keepalive(Some(tcp_keepalive))
         // HTTP/2 PING frames for application-layer health check
-        .http2_keep_alive_interval(Duration::from_secs(HTTP2_KEEPALIVE_INTERVAL_SECS))
+        .http2_keep_alive_interval(http2_keepalive_interval)
         // How long to wait for PING ACK before considering connection dead
-        .keep_alive_timeout(Duration::from_secs(HTTP2_KEEPALIVE_TIMEOUT_SECS))
+        .keep_alive_timeout(http2_keepalive_timeout)
         // Send PINGs even when no active streams (critical for idle connections)
         .keep_alive_while_idle(true)
         // Overall timeout for any RPC - fail fast on unresponsive peers
-        .timeout(Duration::from_secs(RPC_TIMEOUT_SECS));
+        .timeout(rpc_timeout);
 
     let root_cert = GLOBAL_ROOT_CERT.read().await;
     if addr.starts_with(RUSTFS_HTTPS_PREFIX) {

@@ -8569,6 +8569,8 @@ dependencies = [
  "flatbuffers",
  "prost 0.14.3",
  "rustfs-common",
+ "rustfs-config",
+ "rustfs-utils",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
