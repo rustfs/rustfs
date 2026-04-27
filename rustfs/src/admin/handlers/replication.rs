@@ -288,15 +288,10 @@ impl Operation for SetRemoteTargetHandler {
 
         let arn = remote_target.arn.clone();
 
-        bucket_target_sys
+        let targets = bucket_target_sys
             .set_target(bucket, &remote_target, update)
             .await
             .map_err(map_bucket_target_error)?;
-
-        let targets = bucket_target_sys.list_bucket_targets(bucket).await.map_err(|e| {
-            error!("Failed to list bucket targets: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to list bucket targets".to_string())
-        })?;
         let json_targets = serde_json::to_vec(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
@@ -308,6 +303,7 @@ impl Operation for SetRemoteTargetHandler {
                 error!("Failed to update bucket targets: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
+        bucket_target_sys.update_all_targets(bucket, Some(&targets)).await;
 
         let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
@@ -405,12 +401,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
         let sys = BucketTargetSys::get();
 
-        sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
-
-        let targets = sys.list_bucket_targets(bucket).await.map_err(|e| {
-            error!("Failed to list bucket targets: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to list bucket targets".to_string())
-        })?;
+        let targets = sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
 
         let json_targets = serde_json::to_vec(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
@@ -423,6 +414,7 @@ impl Operation for RemoveRemoteTargetHandler {
                 error!("Failed to update bucket targets: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
+        sys.update_all_targets(bucket, Some(&targets)).await;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
