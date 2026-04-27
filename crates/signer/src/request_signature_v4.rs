@@ -60,7 +60,7 @@ struct SignFailure {
     error: SignV4Error,
 }
 
-type SignOutcome = std::result::Result<request::Request<Body>, SignFailure>;
+type SignOutcome = std::result::Result<request::Request<Body>, Box<SignFailure>>;
 
 #[allow(non_upper_case_globals)] // FIXME
 static v4_ignored_headers: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
@@ -72,7 +72,7 @@ static v4_ignored_headers: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
 });
 
 fn fail(request: request::Request<Body>, error: SignV4Error) -> SignOutcome {
-    Err(SignFailure { request, error })
+    Err(Box::new(SignFailure { request, error }))
 }
 
 fn format_yyyymmdd(t: OffsetDateTime) -> SignResult<String> {
@@ -135,10 +135,6 @@ fn try_get_hashed_payload(req: &request::Request<Body>) -> SignResult<String> {
     Ok(hashed_payload.to_string())
 }
 
-fn get_hashed_payload(req: &request::Request<Body>) -> String {
-    try_get_hashed_payload(req).unwrap_or_else(|_| UNSIGNED_PAYLOAD.to_string())
-}
-
 fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> SignResult<String> {
     let mut headers = Vec::<String>::new();
     let mut vals = HashMap::<String, Vec<String>>::new();
@@ -194,10 +190,6 @@ fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &Has
         }
     }
     String::from_utf8(buf.to_vec()).map_err(|err| SignV4Error::CanonicalUtf8 { reason: err.to_string() })
-}
-
-fn get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> String {
-    try_get_canonical_headers(req, ignored_headers).unwrap_or_default()
 }
 
 fn header_exists(key: &str, headers: &[String]) -> bool {
@@ -267,10 +259,6 @@ fn try_get_canonical_request(
     Ok(canonical_request.join("\n"))
 }
 
-fn get_canonical_request(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>, hashed_payload: &str) -> String {
-    try_get_canonical_request(req, ignored_headers, hashed_payload).unwrap_or_default()
-}
-
 fn try_get_string_to_sign_v4(
     t: OffsetDateTime,
     location: &str,
@@ -285,10 +273,6 @@ fn try_get_string_to_sign_v4(
     string_to_sign.push('\n');
     string_to_sign.push_str(&hex_sha256(canonical_request.as_bytes(), |s| s.to_string()));
     Ok(string_to_sign)
-}
-
-fn get_string_to_sign_v4(t: OffsetDateTime, location: &str, canonical_request: &str, service_type: &str) -> String {
-    try_get_string_to_sign_v4(t, location, canonical_request, service_type).unwrap_or_default()
 }
 
 fn pre_sign_v4_inner(
@@ -735,7 +719,9 @@ mod tests {
         );
         *req.uri_mut() = Uri::from_parts(parts).unwrap();
 
-        let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
+        let hashed_payload = try_get_hashed_payload(&req).expect("example request should have valid payload header");
+        let canonical_request =
+            try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload).expect("example request should canonicalize");
         assert_eq!(
             canonical_request,
             concat!(
@@ -753,7 +739,8 @@ mod tests {
             )
         );
 
-        let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
+        let string_to_sign = try_get_string_to_sign_v4(t, region, &canonical_request, service)
+            .expect("example request should build string-to-sign");
         assert_eq!(
             string_to_sign,
             concat!(
@@ -809,7 +796,9 @@ mod tests {
         //println!("parts.path_and_query: {:?}", parts.path_and_query);
         *req.uri_mut() = Uri::from_parts(parts).unwrap();
 
-        let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
+        let hashed_payload = try_get_hashed_payload(&req).expect("example request should have valid payload header");
+        let canonical_request =
+            try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload).expect("example request should canonicalize");
         println!("canonical_request: \n{canonical_request}\n");
         assert_eq!(
             canonical_request,
@@ -828,7 +817,8 @@ mod tests {
             )
         );
 
-        let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
+        let string_to_sign = try_get_string_to_sign_v4(t, region, &canonical_request, service)
+            .expect("example request should build string-to-sign");
         println!("string_to_sign: \n{string_to_sign}\n");
         assert_eq!(
             string_to_sign,
@@ -874,7 +864,9 @@ mod tests {
         headers.insert("x-amz-date", timestamp.parse().unwrap());
 
         println!("{:?}", req.uri().query());
-        let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
+        let hashed_payload = try_get_hashed_payload(&req).expect("example request should have valid payload header");
+        let canonical_request =
+            try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload).expect("example request should canonicalize");
         println!("canonical_request: \n{canonical_request}\n");
         assert_eq!(
             canonical_request,
@@ -893,7 +885,8 @@ mod tests {
             )
         );
 
-        let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
+        let string_to_sign = try_get_string_to_sign_v4(t, region, &canonical_request, service)
+            .expect("example request should build string-to-sign");
         println!("string_to_sign: \n{string_to_sign}\n");
         assert_eq!(
             string_to_sign,
@@ -939,7 +932,9 @@ mod tests {
         headers.insert("x-amz-date", timestamp.parse().unwrap());
 
         println!("{:?}", req.uri().query());
-        let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
+        let hashed_payload = try_get_hashed_payload(&req).expect("example request should have valid payload header");
+        let canonical_request =
+            try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload).expect("example request should canonicalize");
         println!("canonical_request: \n{canonical_request}\n");
         assert_eq!(
             canonical_request,
@@ -958,7 +953,8 @@ mod tests {
             )
         );
 
-        let string_to_sign = get_string_to_sign_v4(t, region, &canonical_request, service);
+        let string_to_sign = try_get_string_to_sign_v4(t, region, &canonical_request, service)
+            .expect("example request should build string-to-sign");
         println!("string_to_sign: \n{string_to_sign}\n");
         assert_eq!(
             string_to_sign,
@@ -1006,11 +1002,19 @@ mod tests {
         canonical_request.push('\n');
         canonical_request.push_str(req.uri().query().unwrap());
         canonical_request.push('\n');
-        canonical_request.push_str(&get_canonical_headers(&req, &v4_ignored_headers));
+        canonical_request.push_str(
+            try_get_canonical_headers(&req, &v4_ignored_headers)
+                .expect("presigned request should canonicalize headers")
+                .as_str(),
+        );
         canonical_request.push('\n');
         canonical_request.push_str(&get_signed_headers(&req, &v4_ignored_headers));
         canonical_request.push('\n');
-        canonical_request.push_str(&get_hashed_payload(&req));
+        canonical_request.push_str(
+            try_get_hashed_payload(&req)
+                .expect("presigned request should include payload hash")
+                .as_str(),
+        );
         //println!("canonical_request: \n{}\n", canonical_request);
         assert_eq!(
             canonical_request,
@@ -1054,11 +1058,19 @@ mod tests {
         canonical_request.push('\n');
         canonical_request.push_str(req.uri().query().unwrap());
         canonical_request.push('\n');
-        canonical_request.push_str(&get_canonical_headers(&req, &v4_ignored_headers));
+        canonical_request.push_str(
+            try_get_canonical_headers(&req, &v4_ignored_headers)
+                .expect("presigned request should canonicalize headers")
+                .as_str(),
+        );
         canonical_request.push('\n');
         canonical_request.push_str(&get_signed_headers(&req, &v4_ignored_headers));
         canonical_request.push('\n');
-        canonical_request.push_str(&get_hashed_payload(&req));
+        canonical_request.push_str(
+            try_get_hashed_payload(&req)
+                .expect("presigned request should include payload hash")
+                .as_str(),
+        );
         //println!("canonical_request: \n{}\n", canonical_request);
         assert_eq!(
             canonical_request,
