@@ -85,6 +85,27 @@ const C_UNKNOWN: i32 = -1;
 const C_OFFLINE: i32 = 0;
 const C_ONLINE: i32 = 1;
 
+fn invalid_utf8_header_error(scope: &str, header_name: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{scope}: invalid UTF-8 header value for `{header_name}`"),
+    )
+}
+
+fn validate_header_values(headers: &HeaderMap, scope: &str) -> Result<(), std::io::Error> {
+    for (name, value) in headers {
+        value.to_str().map_err(|_| invalid_utf8_header_error(scope, name.as_str()))?;
+    }
+    Ok(())
+}
+
+fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> std::io::Error {
+    match error {
+        rustfs_signer::SignV4Error::InvalidHeaderValue { name } => invalid_utf8_header_error(scope, &name),
+        other => std::io::Error::other(format!("{scope}: {other}")),
+    }
+}
+
 //pub type ReaderImpl = Box<dyn Reader + Send + Sync + 'static>;
 pub enum ReaderImpl {
     Body(Bytes),
@@ -560,8 +581,9 @@ impl TransitionClient {
                         "extra signed headers for presign with signature v2 is not supported.",
                     )));
                 }
-                let headers = req.headers_mut();
                 if let Some(extra_headers) = metadata.extra_pre_sign_header.as_ref() {
+                    validate_header_values(extra_headers, "presign extra header")?;
+                    let headers = req.headers_mut();
                     for (k, v) in extra_headers {
                         headers.insert(k, v.clone());
                     }
@@ -570,7 +592,7 @@ impl TransitionClient {
             if signer_type == SignatureType::SignatureV2 {
                 req = rustfs_signer::pre_sign_v2(req, &access_key_id, &secret_access_key, metadata.expires, is_virtual_host);
             } else if signer_type == SignatureType::SignatureV4 {
-                req = rustfs_signer::pre_sign_v4(
+                req = rustfs_signer::try_pre_sign_v4(
                     req,
                     &access_key_id,
                     &secret_access_key,
@@ -578,12 +600,14 @@ impl TransitionClient {
                     &location,
                     metadata.expires,
                     OffsetDateTime::now_utc(),
-                );
+                )
+                .map_err(|err| signer_error_to_io_error("failed to presign v4 request", err))?;
             }
             return Ok(req);
         }
 
         self.set_user_agent(&mut req);
+        validate_header_values(&metadata.custom_header, "request custom header")?;
 
         for (k, v) in metadata.custom_header.clone() {
             if let Some(key) = k {
@@ -593,15 +617,15 @@ impl TransitionClient {
 
         //req.content_length = metadata.content_length;
         if metadata.content_length <= -1 {
-            if let Ok(chunked_value) = HeaderValue::from_str(&vec!["chunked"].join(",")) {
-                req.headers_mut().insert(http::header::TRANSFER_ENCODING, chunked_value);
-            }
+            req.headers_mut()
+                .insert(http::header::TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
         }
 
-        if metadata.content_md5_base64.len() > 0 {
-            if let Ok(md5_value) = HeaderValue::from_str(&metadata.content_md5_base64) {
-                req.headers_mut().insert("Content-Md5", md5_value);
-            }
+        if !metadata.content_md5_base64.is_empty() {
+            let md5_value = HeaderValue::from_str(&metadata.content_md5_base64).map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid Content-Md5 header value: {err}"))
+            })?;
+            req.headers_mut().insert("Content-Md5", md5_value);
         }
 
         if signer_type == SignatureType::SignatureAnonymous {
@@ -634,14 +658,15 @@ impl TransitionClient {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             req.headers_mut().insert(header_name, header_value);
 
-            req = rustfs_signer::sign_v4_trailer(
+            req = rustfs_signer::try_sign_v4_trailer(
                 req,
                 &access_key_id,
                 &secret_access_key,
                 &session_token,
                 &location,
                 metadata.trailer.clone(),
-            );
+            )
+            .map_err(|err| signer_error_to_io_error("failed to sign v4 request", err))?;
         }
 
         if metadata.content_length > 0 {
@@ -1354,7 +1379,10 @@ pub struct CreateBucketConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_tls_config, load_root_store_from_tls_path, with_rustls_init_guard};
+    use super::{
+        build_tls_config, load_root_store_from_tls_path, signer_error_to_io_error, validate_header_values, with_rustls_init_guard,
+    };
+    use http::{HeaderMap, HeaderValue};
 
     #[test]
     fn rustls_guard_converts_panics_to_io_errors() {
@@ -1403,5 +1431,30 @@ mod tests {
             // If a default is already present, the branch above is simply skipped.
         });
         assert!(outcome.is_ok(), "provider install guard must not panic when a provider is already set");
+    }
+
+    #[test]
+    fn validate_header_values_returns_header_name_for_non_utf8_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-meta-invalid",
+            HeaderValue::from_bytes(&[0xFF]).expect("invalid utf8 bytes should be accepted by HeaderValue"),
+        );
+
+        let err =
+            validate_header_values(&headers, "request custom header").expect_err("invalid header value should fail validation");
+        assert!(err.to_string().contains("x-amz-meta-invalid"));
+    }
+
+    #[test]
+    fn signer_error_mapping_preserves_header_name() {
+        let err = signer_error_to_io_error(
+            "failed to sign v4 request",
+            rustfs_signer::SignV4Error::InvalidHeaderValue {
+                name: "x-amz-meta-invalid".to_string(),
+            },
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("x-amz-meta-invalid"));
     }
 }

@@ -35,6 +35,16 @@ use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use s3s::S3ErrorCode;
 use std::collections::HashMap;
 
+fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> std::io::Error {
+    match error {
+        rustfs_signer::SignV4Error::InvalidHeaderValue { name } => std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{scope}: invalid UTF-8 header value for `{name}`"),
+        ),
+        other => std::io::Error::other(format!("{scope}: {other}")),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BucketLocationCache {
     items: HashMap<String, String>,
@@ -179,10 +189,15 @@ impl TransitionClient {
             content_sha256 = UNSIGNED_PAYLOAD.to_string();
         }
 
-        if let Ok(content_sha256_value) = content_sha256.parse() {
-            req.headers_mut().insert("X-Amz-Content-Sha256", content_sha256_value);
-        }
-        let req = rustfs_signer::sign_v4(req, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1");
+        let content_sha256_value = content_sha256.parse().map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid X-Amz-Content-Sha256 header value: {err}"),
+            )
+        })?;
+        req.headers_mut().insert("X-Amz-Content-Sha256", content_sha256_value);
+        let req = rustfs_signer::try_sign_v4(req, 0, &access_key_id, &secret_access_key, &session_token, "us-east-1")
+            .map_err(|err| signer_error_to_io_error("failed to sign bucket location request", err))?;
         Ok(req)
     }
 }
