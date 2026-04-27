@@ -348,60 +348,72 @@ impl PeerRestClient {
     }
 
     pub async fn get_se_linux_info(&self) -> Result<SysService> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(GetSeLinuxInfoRequest {});
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(GetSeLinuxInfoRequest {});
 
-        let response = client.get_se_linux_info(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.get_se_linux_info(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            let data = response.sys_services;
+
+            let mut buf = Deserializer::new(Cursor::new(data));
+            let sys_services: SysService = Deserialize::deserialize(&mut buf)?;
+
+            Ok(sys_services)
         }
-        let data = response.sys_services;
-
-        let mut buf = Deserializer::new(Cursor::new(data));
-        let sys_services: SysService = Deserialize::deserialize(&mut buf)?;
-
-        Ok(sys_services)
+        .await)
+        .await
     }
 
     pub async fn get_sys_config(&self) -> Result<SysConfig> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(GetSysConfigRequest {});
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(GetSysConfigRequest {});
 
-        let response = client.get_sys_config(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.get_sys_config(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            let data = response.sys_config;
+
+            let mut buf = Deserializer::new(Cursor::new(data));
+            let sys_config: SysConfig = Deserialize::deserialize(&mut buf)?;
+
+            Ok(sys_config)
         }
-        let data = response.sys_config;
-
-        let mut buf = Deserializer::new(Cursor::new(data));
-        let sys_config: SysConfig = Deserialize::deserialize(&mut buf)?;
-
-        Ok(sys_config)
+        .await)
+        .await
     }
 
     pub async fn get_sys_errors(&self) -> Result<SysErrors> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(GetSysErrorsRequest {});
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(GetSysErrorsRequest {});
 
-        let response = client.get_sys_errors(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.get_sys_errors(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            let data = response.sys_errors;
+
+            let mut buf = Deserializer::new(Cursor::new(data));
+            let sys_errors: SysErrors = Deserialize::deserialize(&mut buf)?;
+
+            Ok(sys_errors)
         }
-        let data = response.sys_errors;
-
-        let mut buf = Deserializer::new(Cursor::new(data));
-        let sys_errors: SysErrors = Deserialize::deserialize(&mut buf)?;
-
-        Ok(sys_errors)
+        .await)
+        .await
     }
 
     pub async fn get_mem_info(&self) -> Result<MemInfo> {
@@ -646,118 +658,122 @@ impl PeerRestClient {
     }
 
     pub async fn delete_user(&self, access_key: &str) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(DeleteUserRequest {
-            access_key: access_key.to_string(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(DeleteUserRequest {
+                access_key: access_key.to_string(),
+            });
 
-        let result = client.delete_user(request).await;
-        if result.is_err() {
-            self.evict_connection().await;
-        }
-        let response = result?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.delete_user(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn delete_service_account(&self, access_key: &str) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(DeleteServiceAccountRequest {
-            access_key: access_key.to_string(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(DeleteServiceAccountRequest {
+                access_key: access_key.to_string(),
+            });
 
-        let result = client.delete_service_account(request).await;
-        if result.is_err() {
-            self.evict_connection().await;
-        }
-        let response = result?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.delete_service_account(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn load_user(&self, access_key: &str, temp: bool) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(LoadUserRequest {
-            access_key: access_key.to_string(),
-            temp,
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(LoadUserRequest {
+                access_key: access_key.to_string(),
+                temp,
+            });
 
-        let result = client.load_user(request).await;
-        if result.is_err() {
-            self.evict_connection().await;
-        }
-        let response = result?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.load_user(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn load_service_account(&self, access_key: &str) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(LoadServiceAccountRequest {
-            access_key: access_key.to_string(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(LoadServiceAccountRequest {
+                access_key: access_key.to_string(),
+            });
 
-        let result = client.load_service_account(request).await;
-        if result.is_err() {
-            self.evict_connection().await;
-        }
-        let response = result?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.load_service_account(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn load_group(&self, group: &str) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(LoadGroupRequest {
-            group: group.to_string(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(LoadGroupRequest {
+                group: group.to_string(),
+            });
 
-        let result = client.load_group(request).await;
-        if result.is_err() {
-            self.evict_connection().await;
-        }
-        let response = result?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.load_group(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn reload_site_replication_config(&self) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(ReloadSiteReplicationConfigRequest {});
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(ReloadSiteReplicationConfigRequest {});
 
-        let response = client.reload_site_replication_config(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.reload_site_replication_config(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn signal_service(&self, sig: u64, sub_sys: &str, dry_run: bool, _exec_at: SystemTime) -> Result<()> {
