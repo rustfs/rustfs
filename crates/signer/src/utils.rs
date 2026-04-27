@@ -16,24 +16,37 @@ use http::request;
 
 use s3s::Body;
 
-pub fn get_host_addr(req: &request::Request<Body>) -> String {
+#[derive(Debug, thiserror::Error)]
+pub enum HostAddrError {
+    #[error("invalid UTF-8 header value for `host`")]
+    InvalidHostHeader,
+    #[error("request uri has no host")]
+    MissingUriHost,
+}
+
+pub fn try_get_host_addr(req: &request::Request<Body>) -> Result<String, HostAddrError> {
     let host = req.headers().get("host");
     let uri = req.uri();
-    let req_host;
-    if let Some(port) = uri.port() {
-        req_host = format!("{}:{}", uri.host().unwrap(), port);
+    let uri_host = uri.host().ok_or(HostAddrError::MissingUriHost)?;
+
+    let req_host = if let Some(port) = uri.port() {
+        format!("{uri_host}:{port}")
     } else {
-        req_host = uri.host().unwrap().to_string();
+        uri_host.to_string()
+    };
+
+    if let Some(host) = host {
+        let host = host.to_str().map_err(|_| HostAddrError::InvalidHostHeader)?;
+        if req_host != host {
+            return Ok(host.to_string());
+        }
     }
-    if let Some(host) = host
-        && req_host != *host.to_str().unwrap()
-    {
-        return (*host.to_str().unwrap()).to_string();
-    }
-    /*if req.uri_ref().unwrap().host().is_some() {
-        return req.uri_ref().unwrap().host().unwrap();
-    }*/
-    req_host
+
+    Ok(req_host)
+}
+
+pub fn get_host_addr(req: &request::Request<Body>) -> String {
+    try_get_host_addr(req).unwrap()
 }
 
 pub fn sign_v4_trim_all(input: &str) -> String {
