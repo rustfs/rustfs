@@ -83,11 +83,13 @@ fn internode_rpc_timeout() -> Duration {
 
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
 ///
-/// This function is designed to detect dead peers quickly:
-/// - Fast connection timeout (3s instead of default 30s+)
-/// - Aggressive TCP keepalive (10s)
-/// - HTTP/2 PING every 5s, timeout at 3s
-/// - Overall RPC timeout of 30s (reduced from 60s)
+/// This function is designed to detect dead peers quickly using env-configurable
+/// internode transport settings. Defaults come from `rustfs_config` constants:
+/// - Connect timeout: `DEFAULT_INTERNODE_CONNECT_TIMEOUT_SECS` (3s)
+/// - TCP keepalive: `DEFAULT_INTERNODE_TCP_KEEPALIVE_SECS` (10s)
+/// - HTTP/2 keepalive interval: `DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS` (5s)
+/// - HTTP/2 keepalive timeout: `DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS` (3s)
+/// - RPC timeout: `DEFAULT_INTERNODE_RPC_TIMEOUT_SECS` (10s)
 pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {}", addr);
     let dial_started_at = Instant::now();

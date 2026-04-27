@@ -61,7 +61,10 @@ pub fn get_max_timeout_duration() -> Duration {
 }
 
 fn get_drive_timeout_duration(env_key: &str, default_secs: u64) -> Duration {
-    Duration::from_secs(rustfs_utils::get_env_u64(env_key, default_secs))
+    Duration::from_secs(
+        rustfs_utils::get_env_opt_u64_with_aliases(env_key, &[rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION])
+            .unwrap_or(default_secs),
+    )
 }
 
 pub fn get_drive_metadata_timeout() -> Duration {
@@ -1122,13 +1125,10 @@ mod tests {
     }
 
     #[test]
-    fn drive_metadata_timeout_ignores_legacy_fallback_when_canonical_unset() {
+    fn drive_metadata_timeout_uses_legacy_fallback_when_canonical_unset() {
         temp_env::with_var_unset(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, || {
             temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
-                assert_eq!(
-                    get_drive_metadata_timeout(),
-                    Duration::from_secs(rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS)
-                );
+                assert_eq!(get_drive_metadata_timeout(), Duration::from_secs(17));
             });
         });
     }
