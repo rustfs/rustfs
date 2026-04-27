@@ -242,7 +242,7 @@ percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
 pretty_assertions = "1.4.1"
 rand = { version = "0.10.1", features = ["serde"] }
-ratelimit = "0.10.1"
+ratelimit = "2.0.0"
 rayon = "1.12.0"
 reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
 reed-solomon-simd = "3.1.0"
@@ -292,7 +292,7 @@ opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rus
 opentelemetry_sdk = { version = "0.31.0" }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.31.0" }
-pyroscope = { version = "2.0.2", features = ["backend-pprof-rs"] }
+pyroscope = { version = "2.0.3", features = ["backend-pprof-rs"] }
 
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
