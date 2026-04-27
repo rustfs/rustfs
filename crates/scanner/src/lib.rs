@@ -32,3 +32,26 @@ pub use data_usage_define::*;
 pub use error::ScannerError;
 pub use scanner::init_data_scanner;
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn current_scanner_activity() -> u64 {
+    SCANNER_ACTIVE_WORK_UNITS.load(Ordering::Relaxed)
+}
+
+pub(crate) struct ScannerActivityGuard;
+
+impl ScannerActivityGuard {
+    pub(crate) fn new() -> Self {
+        SCANNER_ACTIVE_WORK_UNITS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ScannerActivityGuard {
+    fn drop(&mut self) {
+        let _ = SCANNER_ACTIVE_WORK_UNITS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(1)));
+    }
+}
