@@ -15,7 +15,6 @@
 use crate::error::Error as IamError;
 use crate::error::is_err_no_such_account;
 use crate::error::is_err_no_such_temp_account;
-use crate::error::is_err_no_such_user;
 use crate::error::{Error, Result};
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
@@ -756,11 +755,7 @@ impl<T: Store> IamSys<T> {
                 Ok((Some(res), ok))
             }
             None => {
-                match self.store.load_user(access_key).await {
-                    Ok(()) => {}
-                    Err(err) if is_err_no_such_user(&err) => {}
-                    Err(err) => return Err(err),
-                }
+                self.store.load_user(access_key).await?;
 
                 if let Some(res) = self.store.get_user(access_key).await {
                     let ok = res.credentials.is_valid();
