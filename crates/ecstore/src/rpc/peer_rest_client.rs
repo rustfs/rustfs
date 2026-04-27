@@ -348,190 +348,206 @@ impl PeerRestClient {
     }
 
     pub async fn get_se_linux_info(&self) -> Result<SysService> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(GetSeLinuxInfoRequest {});
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(GetSeLinuxInfoRequest {});
 
-            let response = client.get_se_linux_info(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.get_se_linux_info(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                let data = response.sys_services;
+
+                let mut buf = Deserializer::new(Cursor::new(data));
+                let sys_services: SysService = Deserialize::deserialize(&mut buf)?;
+
+                Ok(sys_services)
             }
-            let data = response.sys_services;
-
-            let mut buf = Deserializer::new(Cursor::new(data));
-            let sys_services: SysService = Deserialize::deserialize(&mut buf)?;
-
-            Ok(sys_services)
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn get_sys_config(&self) -> Result<SysConfig> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(GetSysConfigRequest {});
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(GetSysConfigRequest {});
 
-            let response = client.get_sys_config(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.get_sys_config(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                let data = response.sys_config;
+
+                let mut buf = Deserializer::new(Cursor::new(data));
+                let sys_config: SysConfig = Deserialize::deserialize(&mut buf)?;
+
+                Ok(sys_config)
             }
-            let data = response.sys_config;
-
-            let mut buf = Deserializer::new(Cursor::new(data));
-            let sys_config: SysConfig = Deserialize::deserialize(&mut buf)?;
-
-            Ok(sys_config)
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn get_sys_errors(&self) -> Result<SysErrors> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(GetSysErrorsRequest {});
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(GetSysErrorsRequest {});
 
-            let response = client.get_sys_errors(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.get_sys_errors(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                let data = response.sys_errors;
+
+                let mut buf = Deserializer::new(Cursor::new(data));
+                let sys_errors: SysErrors = Deserialize::deserialize(&mut buf)?;
+
+                Ok(sys_errors)
             }
-            let data = response.sys_errors;
-
-            let mut buf = Deserializer::new(Cursor::new(data));
-            let sys_errors: SysErrors = Deserialize::deserialize(&mut buf)?;
-
-            Ok(sys_errors)
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn get_mem_info(&self) -> Result<MemInfo> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(GetMemInfoRequest {});
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(GetMemInfoRequest {});
 
-            let response = client.get_mem_info(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.get_mem_info(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                let data = response.mem_info;
+
+                let mut buf = Deserializer::new(Cursor::new(data));
+                let mem_info: MemInfo = Deserialize::deserialize(&mut buf)?;
+
+                Ok(mem_info)
             }
-            let data = response.mem_info;
-
-            let mut buf = Deserializer::new(Cursor::new(data));
-            let mem_info: MemInfo = Deserialize::deserialize(&mut buf)?;
-
-            Ok(mem_info)
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn get_metrics(&self, t: MetricType, opts: &CollectMetricsOpts) -> Result<RealtimeMetrics> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let mut buf_t = Vec::new();
-            t.serialize(&mut Serializer::new(&mut buf_t))?;
-            let mut buf_o = Vec::new();
-            opts.serialize(&mut Serializer::new(&mut buf_o))?;
-            let request = Request::new(GetMetricsRequest {
-                metric_type: buf_t.into(),
-                opts: buf_o.into(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let mut buf_t = Vec::new();
+                t.serialize(&mut Serializer::new(&mut buf_t))?;
+                let mut buf_o = Vec::new();
+                opts.serialize(&mut Serializer::new(&mut buf_o))?;
+                let request = Request::new(GetMetricsRequest {
+                    metric_type: buf_t.into(),
+                    opts: buf_o.into(),
+                });
 
-            let response = client.get_metrics(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.get_metrics(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                let data = response.realtime_metrics;
+
+                let mut buf = Deserializer::new(Cursor::new(data));
+                let realtime_metrics: RealtimeMetrics = Deserialize::deserialize(&mut buf)?;
+
+                Ok(realtime_metrics)
             }
-            let data = response.realtime_metrics;
-
-            let mut buf = Deserializer::new(Cursor::new(data));
-            let realtime_metrics: RealtimeMetrics = Deserialize::deserialize(&mut buf)?;
-
-            Ok(realtime_metrics)
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn get_live_events(&self, after_sequence: u64, limit: u32) -> Result<PeerLiveEventsBatch> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(GetLiveEventsRequest { after_sequence, limit });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(GetLiveEventsRequest { after_sequence, limit });
 
-            let response = client.get_live_events(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.get_live_events(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
-            }
 
-            Ok(PeerLiveEventsBatch {
-                events: response.events.to_vec(),
-                next_sequence: response.next_sequence,
-                truncated: response.truncated,
-            })
-        }
-        .await)
+                Ok(PeerLiveEventsBatch {
+                    events: response.events.to_vec(),
+                    next_sequence: response.next_sequence,
+                    truncated: response.truncated,
+                })
+            }
+            .await,
+        )
         .await
     }
 
     pub async fn get_proc_info(&self) -> Result<ProcInfo> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(GetProcInfoRequest {});
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(GetProcInfoRequest {});
 
-            let response = client.get_proc_info(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.get_proc_info(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                let data = response.proc_info;
+
+                let mut buf = Deserializer::new(Cursor::new(data));
+                let proc_info: ProcInfo = Deserialize::deserialize(&mut buf)?;
+
+                Ok(proc_info)
             }
-            let data = response.proc_info;
-
-            let mut buf = Deserializer::new(Cursor::new(data));
-            let proc_info: ProcInfo = Deserialize::deserialize(&mut buf)?;
-
-            Ok(proc_info)
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn start_profiling(&self, profiler: &str) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(StartProfilingRequest {
-                profiler: profiler.to_string(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(StartProfilingRequest {
+                    profiler: profiler.to_string(),
+                });
 
-            let response = client.start_profiling(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.start_profiling(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
@@ -556,247 +572,271 @@ impl PeerRestClient {
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(LoadBucketMetadataRequest {
-                bucket: bucket.to_string(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(LoadBucketMetadataRequest {
+                    bucket: bucket.to_string(),
+                });
 
-            let response = client.load_bucket_metadata(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.load_bucket_metadata(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn delete_bucket_metadata(&self, bucket: &str) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(DeleteBucketMetadataRequest {
-                bucket: bucket.to_string(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(DeleteBucketMetadataRequest {
+                    bucket: bucket.to_string(),
+                });
 
-            let response = client.delete_bucket_metadata(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.delete_bucket_metadata(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn delete_policy(&self, policy: &str) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(DeletePolicyRequest {
-                policy_name: policy.to_string(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(DeletePolicyRequest {
+                    policy_name: policy.to_string(),
+                });
 
-            let response = client.delete_policy(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.delete_policy(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn load_policy(&self, policy: &str) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(LoadPolicyRequest {
-                policy_name: policy.to_string(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(LoadPolicyRequest {
+                    policy_name: policy.to_string(),
+                });
 
-            let response = client.load_policy(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.load_policy(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn load_policy_mapping(&self, user_or_group: &str, user_type: u64, is_group: bool) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(LoadPolicyMappingRequest {
-                user_or_group: user_or_group.to_string(),
-                user_type,
-                is_group,
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(LoadPolicyMappingRequest {
+                    user_or_group: user_or_group.to_string(),
+                    user_type,
+                    is_group,
+                });
 
-            let response = client.load_policy_mapping(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.load_policy_mapping(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn delete_user(&self, access_key: &str) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(DeleteUserRequest {
-                access_key: access_key.to_string(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(DeleteUserRequest {
+                    access_key: access_key.to_string(),
+                });
 
-            let response = client.delete_user(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.delete_user(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn delete_service_account(&self, access_key: &str) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(DeleteServiceAccountRequest {
-                access_key: access_key.to_string(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(DeleteServiceAccountRequest {
+                    access_key: access_key.to_string(),
+                });
 
-            let response = client.delete_service_account(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.delete_service_account(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn load_user(&self, access_key: &str, temp: bool) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(LoadUserRequest {
-                access_key: access_key.to_string(),
-                temp,
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(LoadUserRequest {
+                    access_key: access_key.to_string(),
+                    temp,
+                });
 
-            let response = client.load_user(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.load_user(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn load_service_account(&self, access_key: &str) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(LoadServiceAccountRequest {
-                access_key: access_key.to_string(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(LoadServiceAccountRequest {
+                    access_key: access_key.to_string(),
+                });
 
-            let response = client.load_service_account(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.load_service_account(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn load_group(&self, group: &str) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(LoadGroupRequest {
-                group: group.to_string(),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(LoadGroupRequest {
+                    group: group.to_string(),
+                });
 
-            let response = client.load_group(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.load_group(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn reload_site_replication_config(&self) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(ReloadSiteReplicationConfigRequest {});
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(ReloadSiteReplicationConfigRequest {});
 
-            let response = client.reload_site_replication_config(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.reload_site_replication_config(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
     pub async fn signal_service(&self, sig: u64, sub_sys: &str, dry_run: bool, _exec_at: SystemTime) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let mut vars = HashMap::new();
-            vars.insert(PEER_RESTSIGNAL.to_string(), sig.to_string());
-            vars.insert(PEER_RESTSUB_SYS.to_string(), sub_sys.to_string());
-            vars.insert(PEER_RESTDRY_RUN.to_string(), dry_run.to_string());
-            let request = Request::new(SignalServiceRequest {
-                vars: Some(Mss { value: vars }),
-            });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let mut vars = HashMap::new();
+                vars.insert(PEER_RESTSIGNAL.to_string(), sig.to_string());
+                vars.insert(PEER_RESTSUB_SYS.to_string(), sub_sys.to_string());
+                vars.insert(PEER_RESTDRY_RUN.to_string(), dry_run.to_string());
+                let request = Request::new(SignalServiceRequest {
+                    vars: Some(Mss { value: vars }),
+                });
 
-            let response = client.signal_service(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.signal_service(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
+                Ok(())
             }
-            Ok(())
-        }
-        .await)
+            .await,
+        )
         .await
     }
 
@@ -811,80 +851,88 @@ impl PeerRestClient {
     }
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(ReloadPoolMetaRequest {});
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(ReloadPoolMetaRequest {});
 
-            let response = client.reload_pool_meta(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.reload_pool_meta(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
-            }
 
-            Ok(())
-        }
-        .await)
+                Ok(())
+            }
+            .await,
+        )
         .await
     }
 
     pub async fn stop_rebalance(&self) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(StopRebalanceRequest {});
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(StopRebalanceRequest {});
 
-            let response = client.stop_rebalance(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.stop_rebalance(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
-            }
 
-            Ok(())
-        }
-        .await)
+                Ok(())
+            }
+            .await,
+        )
         .await
     }
 
     pub async fn load_rebalance_meta(&self, start_rebalance: bool) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
 
-            let response = client.load_rebalance_meta(request).await?.into_inner();
+                let response = client.load_rebalance_meta(request).await?.into_inner();
 
-            warn!("load_rebalance_meta response {:?}, grid_host: {:?}", response, &self.grid_host);
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                warn!("load_rebalance_meta response {:?}, grid_host: {:?}", response, &self.grid_host);
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
-            }
 
-            Ok(())
-        }
-        .await)
+                Ok(())
+            }
+            .await,
+        )
         .await
     }
 
     pub async fn load_transition_tier_config(&self) -> Result<()> {
-        self.finalize_result(async {
-            let mut client = self.get_client().await?;
-            let request = Request::new(LoadTransitionTierConfigRequest {});
+        self.finalize_result(
+            async {
+                let mut client = self.get_client().await?;
+                let request = Request::new(LoadTransitionTierConfigRequest {});
 
-            let response = client.load_transition_tier_config(request).await?.into_inner();
-            if !response.success {
-                if let Some(msg) = response.error_info {
-                    return Err(Error::other(msg));
+                let response = client.load_transition_tier_config(request).await?.into_inner();
+                if !response.success {
+                    if let Some(msg) = response.error_info {
+                        return Err(Error::other(msg));
+                    }
+                    return Err(Error::other(""));
                 }
-                return Err(Error::other(""));
-            }
 
-            Ok(())
-        }
-        .await)
+                Ok(())
+            }
+            .await,
+        )
         .await
     }
 }
