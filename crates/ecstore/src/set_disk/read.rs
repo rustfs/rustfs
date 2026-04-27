@@ -57,6 +57,46 @@ where
     Ok((responses, errors))
 }
 
+async fn collect_read_parts_results<F>(
+    tasks: Vec<F>,
+    read_quorum: usize,
+) -> std::result::Result<(Vec<Option<Vec<ObjectPartInfo>>>, Vec<Option<DiskError>>), ()>
+where
+    F: Future<Output = disk::error::Result<Vec<ObjectPartInfo>>> + Send + 'static,
+{
+    let mut responses = vec![None; tasks.len()];
+    let mut errors = vec![Some(DiskError::DiskNotFound); tasks.len()];
+    let mut successful_responses = 0usize;
+    let mut pending = tasks.len();
+    let mut join_set = JoinSet::new();
+
+    for (index, task) in tasks.into_iter().enumerate() {
+        join_set.spawn(async move { (index, task.await) });
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        pending = pending.saturating_sub(1);
+
+        match join_result {
+            Ok((index, Ok(resp))) => {
+                responses[index] = Some(resp);
+                errors[index] = None;
+                successful_responses += 1;
+            }
+            Ok((index, Err(err))) => {
+                errors[index] = Some(err);
+            }
+            Err(_) => return Err(()),
+        }
+
+        if successful_responses + pending < read_quorum {
+            return Err(());
+        }
+    }
+
+    Ok((responses, errors))
+}
+
 impl SetDisks {
     pub(super) async fn read_parts(
         disks: &[Option<DiskStore>],
@@ -67,9 +107,6 @@ impl SetDisks {
     ) -> disk::error::Result<Vec<ObjectPartInfo>> {
         let mut errs = Vec::with_capacity(disks.len());
         let mut object_parts = Vec::with_capacity(disks.len());
-
-        // Use batch processor for better performance
-        let processor = get_global_processors().read_processor();
         let bucket = bucket.to_string();
         let part_meta_paths = part_meta_paths.to_vec();
 
@@ -90,19 +127,13 @@ impl SetDisks {
             })
             .collect();
 
-        let results = processor.execute_batch(tasks).await;
-        for result in results {
-            match result {
-                Ok(res) => {
-                    errs.push(None);
-                    object_parts.push(res);
-                }
-                Err(e) => {
-                    errs.push(Some(e));
-                    object_parts.push(vec![]);
-                }
-            }
-        }
+        let (responses, collected_errors) = match collect_read_parts_results(tasks, read_quorum).await {
+            Ok(collected) => collected,
+            Err(()) => return Err(DiskError::ErasureReadQuorum),
+        };
+
+        errs.extend(collected_errors);
+        object_parts.extend(responses.into_iter().map(|resp| resp.unwrap_or_default()));
 
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             return Err(err);
@@ -946,6 +977,57 @@ mod tests {
 
         let (responses, errors) = collect_read_multiple_results(tasks, 2).await.expect("quorum should succeed");
 
+        assert_eq!(responses.iter().filter(|item| item.is_some()).count(), 2);
+        assert_eq!(errors.iter().filter(|item| item.is_none()).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_read_parts_results_fails_early_when_quorum_is_impossible() {
+        let started = std::time::Instant::now();
+        let part = ObjectPartInfo {
+            number: 1,
+            etag: "etag".to_string(),
+            ..Default::default()
+        };
+
+        let tasks: Vec<_> = vec![
+            (10_u64, Err(DiskError::DiskNotFound)),
+            (15, Err(DiskError::DiskNotFound)),
+            (250, Ok::<Vec<ObjectPartInfo>, DiskError>(vec![part])),
+        ]
+        .into_iter()
+        .map(|(delay_ms, outcome)| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            outcome
+        })
+        .collect();
+
+        let result = collect_read_parts_results(tasks, 2).await;
+        assert!(result.is_err(), "quorum should become impossible before slow tail completes");
+        assert!(started.elapsed() < std::time::Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn collect_read_parts_results_returns_collected_responses_on_quorum() {
+        let part = ObjectPartInfo {
+            number: 1,
+            etag: "etag".to_string(),
+            ..Default::default()
+        };
+
+        let tasks: Vec<_> = vec![
+            (10_u64, Ok::<Vec<ObjectPartInfo>, DiskError>(vec![part.clone()])),
+            (15, Ok::<Vec<ObjectPartInfo>, DiskError>(vec![part.clone()])),
+            (250, Err(DiskError::DiskNotFound)),
+        ]
+        .into_iter()
+        .map(|(delay_ms, outcome)| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            outcome
+        })
+        .collect();
+
+        let (responses, errors) = collect_read_parts_results(tasks, 2).await.expect("quorum should succeed");
         assert_eq!(responses.iter().filter(|item| item.is_some()).count(), 2);
         assert_eq!(errors.iter().filter(|item| item.is_none()).count(), 2);
     }
