@@ -8703,6 +8703,7 @@ dependencies = [
  "rustfs-utils",
  "s3s",
  "serde_urlencoded",
+ "thiserror 2.0.18",
  "time",
  "tracing",
 ]
