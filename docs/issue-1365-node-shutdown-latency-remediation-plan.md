@@ -595,6 +595,35 @@ helper 能力建议:
 3. 节点恢复重新纳入:
    - 不出现长时间脑裂式 oscillation
 
+### 12.6 本地 Docker 验证路径
+
+当所有子任务代码落地完成后，允许并建议使用仓库现有 Docker 模式进行本地最终验证。
+
+优先使用两条路径:
+
+1. 单节点基础可用性与接口回归
+   - `docker-compose-simple.yml`
+   - 用于验证服务启动、`/health`、`/health/ready`、基本 S3/console 连通性
+2. S3 兼容与端到端动作回归
+   - `DEPLOY_MODE=docker ./scripts/s3-tests/run.sh`
+   - 使用仓库现有 Docker 模式启动容器并执行兼容测试
+
+建议顺序:
+
+1. 先确认 Docker 启动后的健康状态:
+   - `curl http://127.0.0.1:9000/health`
+   - `curl http://127.0.0.1:9000/health/ready`
+2. 再执行 Docker 模式下的兼容测试:
+   - `DEPLOY_MODE=docker ./scripts/s3-tests/run.sh`
+3. 若后续补齐多节点 Docker/Compose 验证编排，再追加节点下线注入验证:
+   - 停单容器
+   - 观察首次请求、第二批请求和控制面恢复行为
+
+说明:
+
+1. 当前仓库已有成熟的 Docker 模式 S3 测试脚本，适合作为“所有子任务完成后的本地最终验证入口”。
+2. 若要严格复现 Issue #1365 的“节点下线”场景，最终仍建议补一套多节点 Docker Compose 验证编排。
+
 ## 13. 推荐提交拆分
 
 为了保持可审阅粒度，建议拆成 4 个 commit:

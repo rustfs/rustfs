@@ -58,12 +58,34 @@ make pre-commit
 4. 经 nginx 入口访问
 5. 直连健康 RustFS 节点访问
 
+### 5. 本地 Docker 最终验证
+
+当所有子任务代码完成后，至少执行一轮本地 Docker 模式验证，作为最终交付前的本地验收。
+
+建议执行:
+
+```bash
+docker compose -f docker-compose-simple.yml up -d
+curl http://127.0.0.1:9000/health
+curl http://127.0.0.1:9000/health/ready
+DEPLOY_MODE=docker ./scripts/s3-tests/run.sh
+docker compose -f docker-compose-simple.yml down -v
+```
+
+如果后续补齐多节点 Docker Compose 场景，则在该阶段追加:
+
+1. 单节点停机/断开
+2. 首次请求耗时验证
+3. 第二批请求耗时验证
+4. 控制面 fast-fail 与恢复验证
+
 ## 验收标准
 
 1. 所有命令通过。
 2. 故障注入场景下，无新的 panic 或稳定性异常。
 3. 首次故障请求耗时、第二批请求耗时、控制面耗时均明显优于未改造前。
-4. 没有发现新的 correctness 回归。
+4. 本地 Docker 模式验证通过。
+5. 没有发现新的 correctness 回归。
 
 ## 提交要求
 
