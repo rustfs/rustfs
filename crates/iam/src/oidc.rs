@@ -1264,8 +1264,10 @@ mod tests {
         use std::time::{Duration, Instant};
 
         // After the last completed response, exit if no new connection arrives within this window.
-        const IDLE_SHUTDOWN: Duration = Duration::from_millis(100);
-        const ABSOLUTE_CAP: Duration = Duration::from_millis(500);
+        // Keep the mock server alive long enough for slower CI/macOS test environments to finish
+        // discovery + JWKS requests without racing the shutdown timer.
+        const IDLE_SHUTDOWN: Duration = Duration::from_secs(1);
+        const ABSOLUTE_CAP: Duration = Duration::from_secs(5);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1361,6 +1363,22 @@ mod tests {
         err.contains(base) && err.contains(&format!("{base}/")) && err.contains("discovery failed for all issuer variants")
     }
 
+    async fn validate_mocked_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
+        let http_client = ReqwestHttpClient(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .map_err(|e| format!("failed to build local OIDC test client: {e}"))?,
+        );
+        let state = OidcSys::discover_provider(config, &http_client).await?;
+
+        Ok(OidcProviderValidationResult {
+            issuer: state.metadata.issuer().to_string(),
+            authorization_endpoint: state.metadata.authorization_endpoint().to_string(),
+            token_endpoint: state.metadata.token_endpoint().map(ToString::to_string),
+        })
+    }
+
     #[tokio::test]
     async fn test_validate_oidc_provider_config_retries_with_issuer_candidates() {
         // Discovery document must advertise the canonical issuer path. The first candidate has no
@@ -1369,7 +1387,7 @@ mod tests {
         let config_url = format!("{base}/application/o/rustfs");
         let config = build_mocked_oidc_provider_config("default", &config_url);
 
-        let result = validate_oidc_provider_config(&config).await;
+        let result = validate_mocked_oidc_provider_config(&config).await;
 
         let validation_result = result.expect("OIDC provider validation should succeed");
         assert_eq!(validation_result.issuer, format!("{base}/application/o/rustfs/"));
@@ -1382,7 +1400,7 @@ mod tests {
         let config_url = format!("{base}/application/o/rustfs");
         let config = build_mocked_oidc_provider_config("default", &config_url);
 
-        let err = validate_oidc_provider_config(&config)
+        let err = validate_mocked_oidc_provider_config(&config)
             .await
             .expect_err("OIDC provider validation should fail");
         assert!(discovery_error_contains_all_variants(&err, &base));
