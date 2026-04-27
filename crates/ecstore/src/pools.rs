@@ -3736,8 +3736,7 @@ mod pools_tests {
     #[test]
     #[cfg(windows)]
     fn test_path2_bucket_object_with_base_path_supports_windows_separators() {
-        let (bucket, object) =
-            super::path2_bucket_object_with_base_path("C:\\data", "C:\\data\\my-bucket\\nested\\object.txt");
+        let (bucket, object) = super::path2_bucket_object_with_base_path("C:\\data", "C:\\data\\my-bucket\\nested\\object.txt");
 
         assert_eq!(bucket, "my-bucket");
         assert_eq!(object, "nested/object.txt");

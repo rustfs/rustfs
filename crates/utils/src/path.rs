@@ -94,7 +94,8 @@ pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
         return true;
     }
 
-    s.get(..prefix.len()).is_some_and(|s_prefix| s_prefix.eq_ignore_ascii_case(prefix))
+    s.get(..prefix.len())
+        .is_some_and(|s_prefix| s_prefix.eq_ignore_ascii_case(prefix))
 }
 
 /// Checks if string `s` starts with `prefix`.
