@@ -14,6 +14,48 @@
 
 use super::*;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
+use std::future::Future;
+use tokio::task::JoinSet;
+
+async fn collect_read_multiple_results<F>(
+    tasks: Vec<F>,
+    read_quorum: usize,
+) -> std::result::Result<(Vec<Option<Vec<ReadMultipleResp>>>, Vec<Option<DiskError>>), ()>
+where
+    F: Future<Output = disk::error::Result<Vec<ReadMultipleResp>>> + Send + 'static,
+{
+    let mut responses = vec![None; tasks.len()];
+    let mut errors = vec![Some(DiskError::DiskNotFound); tasks.len()];
+    let mut successful_responses = 0usize;
+    let mut pending = tasks.len();
+    let mut join_set = JoinSet::new();
+
+    for (index, task) in tasks.into_iter().enumerate() {
+        join_set.spawn(async move { (index, task.await) });
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        pending = pending.saturating_sub(1);
+
+        match join_result {
+            Ok((index, Ok(resp))) => {
+                responses[index] = Some(resp);
+                errors[index] = None;
+                successful_responses += 1;
+            }
+            Ok((index, Err(err))) => {
+                errors[index] = Some(err);
+            }
+            Err(_) => return Err(()),
+        }
+
+        if successful_responses + pending < read_quorum {
+            return Err(());
+        }
+    }
+
+    Ok((responses, errors))
+}
 
 impl SetDisks {
     pub(super) async fn read_parts(
@@ -384,10 +426,23 @@ impl SetDisks {
         read_quorum: usize,
     ) -> Vec<ReadMultipleResp> {
         let mut futures = Vec::with_capacity(disks.len());
-        let mut ress = Vec::with_capacity(disks.len());
-        let mut errors = Vec::with_capacity(disks.len());
+        let empty_quorum_result = || {
+            req.files
+                .iter()
+                .map(|want| ReadMultipleResp {
+                    bucket: req.bucket.clone(),
+                    prefix: req.prefix.clone(),
+                    file: want.clone(),
+                    exists: false,
+                    error: Error::ErasureReadQuorum.to_string(),
+                    data: Vec::new(),
+                    mod_time: None,
+                })
+                .collect::<Vec<_>>()
+        };
 
         for disk in disks.iter() {
+            let disk = disk.clone();
             let req = req.clone();
             futures.push(async move {
                 if let Some(disk) = disk {
@@ -398,19 +453,10 @@ impl SetDisks {
             });
         }
 
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(res) => {
-                    ress.push(Some(res));
-                    errors.push(None);
-                }
-                Err(e) => {
-                    ress.push(None);
-                    errors.push(Some(e));
-                }
-            }
-        }
+        let (ress, errors) = match collect_read_multiple_results(futures, read_quorum).await {
+            Ok(collected) => collected,
+            Err(()) => return empty_quorum_result(),
+        };
 
         // debug!("ReadMultipleResp ress {:?}", ress);
         // debug!("ReadMultipleResp errors {:?}", errors);
@@ -837,5 +883,70 @@ impl SetDisks {
         debug!(bucket, object, total_read, expected_length = length, "Multipart read finished");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collect_read_multiple_results_fails_early_when_quorum_is_impossible() {
+        let started = std::time::Instant::now();
+        let resp = ReadMultipleResp {
+            bucket: "bucket".to_string(),
+            prefix: "prefix".to_string(),
+            file: "file".to_string(),
+            exists: true,
+            error: String::new(),
+            data: vec![1],
+            mod_time: None,
+        };
+
+        let tasks: Vec<_> = vec![
+            (10_u64, Err(DiskError::DiskNotFound)),
+            (15, Err(DiskError::DiskNotFound)),
+            (250, Ok::<Vec<ReadMultipleResp>, DiskError>(vec![resp])),
+        ]
+        .into_iter()
+        .map(|(delay_ms, outcome)| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            outcome
+        })
+        .collect();
+
+        let result = collect_read_multiple_results(tasks, 2).await;
+        assert!(result.is_err(), "quorum should become impossible before slow tail completes");
+        assert!(started.elapsed() < std::time::Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn collect_read_multiple_results_returns_collected_responses_on_quorum() {
+        let resp = ReadMultipleResp {
+            bucket: "bucket".to_string(),
+            prefix: "prefix".to_string(),
+            file: "file".to_string(),
+            exists: true,
+            error: String::new(),
+            data: vec![1, 2, 3],
+            mod_time: None,
+        };
+
+        let tasks: Vec<_> = vec![
+            (10_u64, Ok::<Vec<ReadMultipleResp>, DiskError>(vec![resp.clone()])),
+            (15, Ok::<Vec<ReadMultipleResp>, DiskError>(vec![resp.clone()])),
+            (250, Err(DiskError::DiskNotFound)),
+        ]
+        .into_iter()
+        .map(|(delay_ms, outcome)| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            outcome
+        })
+        .collect();
+
+        let (responses, errors) = collect_read_multiple_results(tasks, 2).await.expect("quorum should succeed");
+
+        assert_eq!(responses.iter().filter(|item| item.is_some()).count(), 2);
+        assert_eq!(errors.iter().filter(|item| item.is_none()).count(), 2);
     }
 }
