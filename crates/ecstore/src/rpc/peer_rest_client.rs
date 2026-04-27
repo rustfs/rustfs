@@ -405,102 +405,122 @@ impl PeerRestClient {
     }
 
     pub async fn get_mem_info(&self) -> Result<MemInfo> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(GetMemInfoRequest {});
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(GetMemInfoRequest {});
 
-        let response = client.get_mem_info(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.get_mem_info(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            let data = response.mem_info;
+
+            let mut buf = Deserializer::new(Cursor::new(data));
+            let mem_info: MemInfo = Deserialize::deserialize(&mut buf)?;
+
+            Ok(mem_info)
         }
-        let data = response.mem_info;
-
-        let mut buf = Deserializer::new(Cursor::new(data));
-        let mem_info: MemInfo = Deserialize::deserialize(&mut buf)?;
-
-        Ok(mem_info)
+        .await)
+        .await
     }
 
     pub async fn get_metrics(&self, t: MetricType, opts: &CollectMetricsOpts) -> Result<RealtimeMetrics> {
-        let mut client = self.get_client().await?;
-        let mut buf_t = Vec::new();
-        t.serialize(&mut Serializer::new(&mut buf_t))?;
-        let mut buf_o = Vec::new();
-        opts.serialize(&mut Serializer::new(&mut buf_o))?;
-        let request = Request::new(GetMetricsRequest {
-            metric_type: buf_t.into(),
-            opts: buf_o.into(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let mut buf_t = Vec::new();
+            t.serialize(&mut Serializer::new(&mut buf_t))?;
+            let mut buf_o = Vec::new();
+            opts.serialize(&mut Serializer::new(&mut buf_o))?;
+            let request = Request::new(GetMetricsRequest {
+                metric_type: buf_t.into(),
+                opts: buf_o.into(),
+            });
 
-        let response = client.get_metrics(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.get_metrics(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            let data = response.realtime_metrics;
+
+            let mut buf = Deserializer::new(Cursor::new(data));
+            let realtime_metrics: RealtimeMetrics = Deserialize::deserialize(&mut buf)?;
+
+            Ok(realtime_metrics)
         }
-        let data = response.realtime_metrics;
-
-        let mut buf = Deserializer::new(Cursor::new(data));
-        let realtime_metrics: RealtimeMetrics = Deserialize::deserialize(&mut buf)?;
-
-        Ok(realtime_metrics)
+        .await)
+        .await
     }
 
     pub async fn get_live_events(&self, after_sequence: u64, limit: u32) -> Result<PeerLiveEventsBatch> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(GetLiveEventsRequest { after_sequence, limit });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(GetLiveEventsRequest { after_sequence, limit });
 
-        let response = client.get_live_events(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.get_live_events(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
-        }
 
-        Ok(PeerLiveEventsBatch {
-            events: response.events.to_vec(),
-            next_sequence: response.next_sequence,
-            truncated: response.truncated,
-        })
+            Ok(PeerLiveEventsBatch {
+                events: response.events.to_vec(),
+                next_sequence: response.next_sequence,
+                truncated: response.truncated,
+            })
+        }
+        .await)
+        .await
     }
 
     pub async fn get_proc_info(&self) -> Result<ProcInfo> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(GetProcInfoRequest {});
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(GetProcInfoRequest {});
 
-        let response = client.get_proc_info(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.get_proc_info(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            let data = response.proc_info;
+
+            let mut buf = Deserializer::new(Cursor::new(data));
+            let proc_info: ProcInfo = Deserialize::deserialize(&mut buf)?;
+
+            Ok(proc_info)
         }
-        let data = response.proc_info;
-
-        let mut buf = Deserializer::new(Cursor::new(data));
-        let proc_info: ProcInfo = Deserialize::deserialize(&mut buf)?;
-
-        Ok(proc_info)
+        .await)
+        .await
     }
 
     pub async fn start_profiling(&self, profiler: &str) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(StartProfilingRequest {
-            profiler: profiler.to_string(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(StartProfilingRequest {
+                profiler: profiler.to_string(),
+            });
 
-        let response = client.start_profiling(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.start_profiling(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn download_profile_data(&self) -> Result<()> {
@@ -524,85 +544,105 @@ impl PeerRestClient {
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(LoadBucketMetadataRequest {
-            bucket: bucket.to_string(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(LoadBucketMetadataRequest {
+                bucket: bucket.to_string(),
+            });
 
-        let response = client.load_bucket_metadata(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.load_bucket_metadata(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn delete_bucket_metadata(&self, bucket: &str) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(DeleteBucketMetadataRequest {
-            bucket: bucket.to_string(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(DeleteBucketMetadataRequest {
+                bucket: bucket.to_string(),
+            });
 
-        let response = client.delete_bucket_metadata(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.delete_bucket_metadata(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn delete_policy(&self, policy: &str) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(DeletePolicyRequest {
-            policy_name: policy.to_string(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(DeletePolicyRequest {
+                policy_name: policy.to_string(),
+            });
 
-        let response = client.delete_policy(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.delete_policy(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn load_policy(&self, policy: &str) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(LoadPolicyRequest {
-            policy_name: policy.to_string(),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(LoadPolicyRequest {
+                policy_name: policy.to_string(),
+            });
 
-        let response = client.load_policy(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.load_policy(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn load_policy_mapping(&self, user_or_group: &str, user_type: u64, is_group: bool) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(LoadPolicyMappingRequest {
-            user_or_group: user_or_group.to_string(),
-            user_type,
-            is_group,
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(LoadPolicyMappingRequest {
+                user_or_group: user_or_group.to_string(),
+                user_type,
+                is_group,
+            });
 
-        let response = client.load_policy_mapping(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.load_policy_mapping(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn delete_user(&self, access_key: &str) -> Result<()> {
