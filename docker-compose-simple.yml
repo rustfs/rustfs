@@ -19,9 +19,6 @@ services:
   rustfs:
     image: rustfs/rustfs:latest
     container_name: rustfs-server
-    build:
-      context: .
-      dockerfile: Dockerfile.source
     security_opt:
       - "no-new-privileges:true"
     ports:
@@ -38,9 +35,9 @@ services:
       - RUSTFS_SECRET_KEY=rustfsadmin # CHANGEME
       - RUSTFS_OBS_LOGGER_LEVEL=info
       - RUSTFS_TLS_PATH=/opt/tls
-      # Local-dev convenience default for single-host docker volumes.
-      # Set `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=false` to enforce strict topology checks.
-      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      # Keep strict disk topology checks enabled by default.
+      # For local testing only, set `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true` explicitly.
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-false}
 
     volumes:
       - rustfs_data_0:/data/rustfs0

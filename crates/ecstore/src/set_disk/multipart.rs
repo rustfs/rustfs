@@ -46,9 +46,7 @@ where
             Ok((index, Err(err))) => {
                 errs[index] = Some(err);
             }
-            Err(_) => {
-                return Err(DiskError::Unexpected);
-            }
+            Err(_) => {}
         }
 
         if successful_responses + pending < read_quorum {
@@ -212,6 +210,26 @@ mod tests {
 
         assert_eq!(err, DiskError::ErasureReadQuorum);
         assert!(started.elapsed() < Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn collect_list_parts_results_tolerates_single_panicked_task_when_quorum_is_met() {
+        let tasks: Vec<_> = vec![(5_u64, true), (10, false), (12, false)]
+            .into_iter()
+            .map(|(delay_ms, should_panic)| async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                if should_panic {
+                    panic!("simulated task panic");
+                }
+                Ok::<Vec<String>, DiskError>(vec!["part.1".to_string(), "part.1.meta".to_string()])
+            })
+            .collect();
+
+        let (errs, object_parts) = collect_list_parts_results(tasks, 2)
+            .await
+            .expect("quorum should still succeed");
+        assert_eq!(errs.iter().filter(|err| err.is_none()).count(), 2);
+        assert_eq!(object_parts.iter().filter(|parts| !parts.is_empty()).count(), 2);
     }
 
     #[test]

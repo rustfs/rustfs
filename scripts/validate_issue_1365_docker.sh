@@ -6,6 +6,7 @@ COMPOSE_FILE="${COMPOSE_FILE:-docker-compose-simple.yml}"
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-120}"
 KEEP_UP="${KEEP_UP:-false}"
 RUN_S3_TESTS="${RUN_S3_TESTS:-true}"
+BUILD_LOCAL_IMAGE="${BUILD_LOCAL_IMAGE:-true}"
 S3_HOST="${S3_HOST:-127.0.0.1}"
 S3_PORT="${S3_PORT:-9000}"
 
@@ -19,6 +20,7 @@ Options:
   --wait-timeout <secs>     health wait timeout (default: 120)
   --keep-up                 keep compose services up after the script exits
   --skip-s3-tests           skip scripts/s3-tests/run.sh
+  --skip-build              skip local Dockerfile.source image build
   -h, --help                show help
 
 Environment:
@@ -26,6 +28,7 @@ Environment:
   WAIT_TIMEOUT_SECS
   KEEP_UP
   RUN_S3_TESTS
+  BUILD_LOCAL_IMAGE
   S3_HOST
   S3_PORT
 USAGE
@@ -47,7 +50,17 @@ require_cmd() {
 }
 
 compose() {
-  docker compose -f "${PROJECT_ROOT}/${COMPOSE_FILE}" "$@"
+  local compose_path
+  compose_path="$(resolve_compose_file)"
+  docker compose -f "${compose_path}" "$@"
+}
+
+resolve_compose_file() {
+  if [[ "${COMPOSE_FILE}" = /* ]]; then
+    printf '%s\n' "${COMPOSE_FILE}"
+  else
+    printf '%s\n' "${PROJECT_ROOT}/${COMPOSE_FILE}"
+  fi
 }
 
 cleanup() {
@@ -77,6 +90,10 @@ parse_args() {
         ;;
       --skip-s3-tests)
         RUN_S3_TESTS=false
+        shift
+        ;;
+      --skip-build)
+        BUILD_LOCAL_IMAGE=false
         shift
         ;;
       -h|--help)
@@ -121,8 +138,20 @@ main() {
 
   trap cleanup EXIT INT TERM
 
-  log_info "Starting docker compose from ${COMPOSE_FILE}"
-  compose up -d --build
+  if [[ "${BUILD_LOCAL_IMAGE}" == "true" ]]; then
+    log_info "Building rustfs/rustfs:latest from Dockerfile.source"
+    docker build -f "${PROJECT_ROOT}/Dockerfile.source" -t rustfs/rustfs:latest "${PROJECT_ROOT}"
+  else
+    log_info "Skipping local image build"
+  fi
+
+  if [[ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ]]; then
+    export RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
+    log_info "RUSTFS_UNSAFE_BYPASS_DISK_CHECK not set; defaulting to true for local validation"
+  fi
+
+  log_info "Starting docker compose from $(resolve_compose_file)"
+  compose up -d
 
   log_info "Waiting for RustFS health endpoint"
   wait_for_endpoint "http://${S3_HOST}:${S3_PORT}/health"

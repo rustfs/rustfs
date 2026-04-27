@@ -15,6 +15,7 @@
 use crate::error::{Error, Result};
 use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::{
+    disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
     endpoints::EndpointServerPools,
     global::is_dist_erasure,
     metrics_realtime::{CollectMetricsOpts, MetricType},
@@ -56,6 +57,8 @@ use tracing::warn;
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
+const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
+const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {
@@ -110,6 +113,7 @@ impl PeerRestClient {
 
     pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
+            self.mark_offline_and_spawn_recovery();
             return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
         }
 
@@ -167,27 +171,37 @@ impl PeerRestClient {
         let offline = Arc::clone(&self.offline);
         let recovery_running = Arc::clone(&self.recovery_running);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            let mut delay = get_drive_active_check_interval();
+            let connect_timeout = get_drive_active_check_timeout();
 
-            loop {
-                interval.tick().await;
-                if Self::perform_connectivity_check(&grid_host).await.is_ok() {
+            for _ in 0..PEER_REST_RECOVERY_MAX_ATTEMPTS {
+                tokio::time::sleep(delay).await;
+                if Self::perform_connectivity_check(&grid_host, connect_timeout).await.is_ok() {
                     offline.store(false, Ordering::Release);
                     recovery_running.store(false, Ordering::Release);
                     return;
                 }
+
+                delay = std::cmp::min(delay.saturating_mul(2), PEER_REST_RECOVERY_MAX_BACKOFF);
             }
+
+            warn!(
+                grid_host = %grid_host,
+                attempts = PEER_REST_RECOVERY_MAX_ATTEMPTS,
+                "peer recovery monitor reached max attempts; will retry on next request"
+            );
+            recovery_running.store(false, Ordering::Release);
         });
     }
 
-    async fn perform_connectivity_check(addr: &str) -> Result<()> {
+    async fn perform_connectivity_check(addr: &str, timeout_duration: Duration) -> Result<()> {
         let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {e}")))?;
         let Some(host) = url.host_str() else {
             return Err(Error::other("No host in URL".to_string()));
         };
 
         let port = url.port_or_known_default().unwrap_or(80);
-        match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port))).await {
+        match tokio::time::timeout(timeout_duration, TcpStream::connect((host, port))).await {
             Ok(Ok(stream)) => {
                 drop(stream);
                 Ok(())

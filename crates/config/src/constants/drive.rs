@@ -41,11 +41,11 @@ pub const DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS: u64 = 5;
 
 /// Interval in seconds between active health probes for local and remote drives.
 pub const ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS: &str = "RUSTFS_DRIVE_ACTIVE_CHECK_INTERVAL_SECS";
-pub const DEFAULT_DRIVE_ACTIVE_CHECK_INTERVAL_SECS: u64 = 5;
+pub const DEFAULT_DRIVE_ACTIVE_CHECK_INTERVAL_SECS: u64 = 15;
 
 /// Timeout in seconds for a single active health probe.
 pub const ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS: &str = "RUSTFS_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS";
-pub const DEFAULT_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS: u64 = 2;
+pub const DEFAULT_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS: u64 = 5;
 
 /// Number of consecutive failures before a suspect drive is classified as offline.
 pub const ENV_DRIVE_SUSPECT_FAILURE_THRESHOLD: &str = "RUSTFS_DRIVE_SUSPECT_FAILURE_THRESHOLD";

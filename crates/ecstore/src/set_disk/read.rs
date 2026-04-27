@@ -46,7 +46,7 @@ where
             Ok((index, Err(err))) => {
                 errors[index] = Some(err);
             }
-            Err(_) => return Err(()),
+            Err(_) => {}
         }
 
         if successful_responses + pending < read_quorum {
@@ -86,7 +86,7 @@ where
             Ok((index, Err(err))) => {
                 errors[index] = Some(err);
             }
-            Err(_) => return Err(()),
+            Err(_) => {}
         }
 
         if successful_responses + pending < read_quorum {
@@ -982,6 +982,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_read_multiple_results_tolerates_single_panicked_task_when_quorum_is_met() {
+        let resp = ReadMultipleResp {
+            bucket: "bucket".to_string(),
+            prefix: "prefix".to_string(),
+            file: "file".to_string(),
+            exists: true,
+            error: String::new(),
+            data: vec![1, 2, 3],
+            mod_time: None,
+        };
+
+        let tasks: Vec<_> = vec![(5_u64, true), (10, false), (12, false)]
+            .into_iter()
+            .map(|(delay_ms, should_panic)| {
+                let resp = resp.clone();
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    if should_panic {
+                        panic!("simulated task panic");
+                    }
+                    Ok::<Vec<ReadMultipleResp>, DiskError>(vec![resp])
+                }
+            })
+            .collect();
+
+        let (responses, errors) = collect_read_multiple_results(tasks, 2)
+            .await
+            .expect("quorum should still succeed");
+        assert_eq!(responses.iter().filter(|item| item.is_some()).count(), 2);
+        assert_eq!(errors.iter().filter(|item| item.is_none()).count(), 2);
+    }
+
+    #[tokio::test]
     async fn collect_read_parts_results_fails_early_when_quorum_is_impossible() {
         let started = std::time::Instant::now();
         let part = ObjectPartInfo {
@@ -1028,6 +1061,35 @@ mod tests {
         .collect();
 
         let (responses, errors) = collect_read_parts_results(tasks, 2).await.expect("quorum should succeed");
+        assert_eq!(responses.iter().filter(|item| item.is_some()).count(), 2);
+        assert_eq!(errors.iter().filter(|item| item.is_none()).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_read_parts_results_tolerates_single_panicked_task_when_quorum_is_met() {
+        let part = ObjectPartInfo {
+            number: 1,
+            etag: "etag".to_string(),
+            ..Default::default()
+        };
+
+        let tasks: Vec<_> = vec![(5_u64, true), (10, false), (12, false)]
+            .into_iter()
+            .map(|(delay_ms, should_panic)| {
+                let part = part.clone();
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    if should_panic {
+                        panic!("simulated task panic");
+                    }
+                    Ok::<Vec<ObjectPartInfo>, DiskError>(vec![part])
+                }
+            })
+            .collect();
+
+        let (responses, errors) = collect_read_parts_results(tasks, 2)
+            .await
+            .expect("quorum should still succeed");
         assert_eq!(responses.iter().filter(|item| item.is_some()).count(), 2);
         assert_eq!(errors.iter().filter(|item| item.is_none()).count(), 2);
     }
