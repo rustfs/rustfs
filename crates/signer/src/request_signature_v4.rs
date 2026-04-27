@@ -75,10 +75,11 @@ fn fail(request: request::Request<Body>, error: SignV4Error) -> SignOutcome {
     Err(Box::new(SignFailure { request, error }))
 }
 
-fn format_yyyymmdd(t: OffsetDateTime) -> SignResult<String> {
-    let format = format_description!("[year][month][day]");
-    t.format(&format)
-        .map_err(|err| SignV4Error::TimeFormat { reason: err.to_string() })
+fn format_yyyymmdd(t: OffsetDateTime) -> String {
+    let mut value = String::with_capacity(8);
+    // Build YYYYMMDD directly from date components to avoid formatter fallbacks.
+    let _ = write!(value, "{:04}{:02}{:02}", t.year(), u8::from(t.month()), t.day());
+    value
 }
 
 fn format_amz_datetime(t: OffsetDateTime) -> SignResult<String> {
@@ -90,7 +91,7 @@ fn format_amz_datetime(t: OffsetDateTime) -> SignResult<String> {
 pub fn get_signing_key(secret: &str, loc: &str, t: OffsetDateTime, service_type: &str) -> [u8; 32] {
     let mut s = "AWS4".to_string();
     s.push_str(secret);
-    let date_value = format_yyyymmdd(t).unwrap_or_default();
+    let date_value = format_yyyymmdd(t);
     let date = hmac_sha256(s.into_bytes(), date_value.into_bytes());
     let location = hmac_sha256(date, loc);
     let service = hmac_sha256(location, service_type);
@@ -104,7 +105,7 @@ pub fn get_signature(signing_key: [u8; 32], string_to_sign: &str) -> String {
 
 pub fn get_scope(location: &str, t: OffsetDateTime, service_type: &str) -> String {
     let mut ans = String::from("");
-    ans.push_str(format_yyyymmdd(t).unwrap_or_default().as_str());
+    ans.push_str(format_yyyymmdd(t).as_str());
     ans.push('/');
     ans.push_str(location);
     ans.push('/');
@@ -417,7 +418,10 @@ fn _sign_v4_sts(
 ) -> request::Request<Body> {
     match sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new()) {
         Ok(request) => request,
-        Err(failure) => failure.request,
+        Err(failure) => {
+            warn!(error = %failure.error, "failed to sign v4 sts request");
+            failure.request
+        }
     }
 }
 
@@ -1132,5 +1136,22 @@ mod tests {
         );
         let query = presigned.uri().query().unwrap_or_default();
         assert!(!query.contains("X-Amz-Signature="));
+    }
+
+    #[test]
+    fn sign_v4_sts_returns_original_request_on_non_utf8_header_value() {
+        let signed = _sign_v4_sts(
+            build_request_with_invalid_header_value("http://examplebucket.s3.amazonaws.com/object"),
+            "rustfsadmin",
+            "rustfsadmin",
+            "us-east-1",
+        );
+        assert!(signed.headers().get(http::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn format_yyyymmdd_is_zero_padded() {
+        let t = datetime!(0001-01-02 03:04:05 UTC);
+        assert_eq!(format_yyyymmdd(t), "00010102");
     }
 }
