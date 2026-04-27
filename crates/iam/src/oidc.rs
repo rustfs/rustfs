@@ -1704,12 +1704,7 @@ mod tests {
     }
 
     async fn validate_mocked_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
-        let http_client = ReqwestHttpClient(
-            reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .map_err(|e| format!("failed to build local OIDC test client: {e}"))?,
-        );
+        let http_client = ReqwestHttpClient::new()?;
         let state = OidcSys::discover_provider(config, &http_client).await?;
 
         Ok(OidcProviderValidationResult {
