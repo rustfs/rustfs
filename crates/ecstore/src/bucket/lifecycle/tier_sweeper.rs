@@ -21,13 +21,137 @@
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::global::GLOBAL_TierConfigMgr;
+use rustfs_utils::get_env_usize;
 use sha2::{Digest, Sha256};
 use std::any::Any;
+use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+use tracing::warn;
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
 static XXHASH_SEED: u64 = 0;
+
+const ENV_REMOTE_DELETE_MAX_CONCURRENCY: &str = "RUSTFS_REMOTE_DELETE_MAX_CONCURRENCY";
+const ENV_REMOTE_DELETE_BREAKER_THRESHOLD: &str = "RUSTFS_REMOTE_DELETE_BREAKER_THRESHOLD";
+const ENV_REMOTE_DELETE_BREAKER_WINDOW_SECS: &str = "RUSTFS_REMOTE_DELETE_BREAKER_WINDOW_SECS";
+const DEFAULT_REMOTE_DELETE_BREAKER_THRESHOLD: usize = 50;
+const DEFAULT_REMOTE_DELETE_BREAKER_WINDOW_SECS: usize = 30;
+const METRIC_DELETE_REMOTE_FAILED_TOTAL: &str = "delete.remote.failed_total";
+const METRIC_DELETE_REMOTE_BREAKER_TOTAL: &str = "delete.remote.breaker_total";
+const METRIC_DELETE_REMOTE_INFLIGHT: &str = "delete.remote.inflight";
+
+static REMOTE_DELETE_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+static REMOTE_DELETE_LIMITER: LazyLock<Semaphore> = LazyLock::new(|| {
+    let default_limit = std::cmp::min(num_cpus::get(), 16).max(1);
+    let concurrency = get_env_usize(ENV_REMOTE_DELETE_MAX_CONCURRENCY, default_limit).max(1);
+    Semaphore::new(concurrency)
+});
+
+static REMOTE_DELETE_BREAKER: LazyLock<Mutex<RemoteDeleteBreaker>> = LazyLock::new(|| {
+    Mutex::new(RemoteDeleteBreaker::new(
+        get_env_usize(ENV_REMOTE_DELETE_BREAKER_THRESHOLD, DEFAULT_REMOTE_DELETE_BREAKER_THRESHOLD).max(1),
+        Duration::from_secs(
+            get_env_usize(ENV_REMOTE_DELETE_BREAKER_WINDOW_SECS, DEFAULT_REMOTE_DELETE_BREAKER_WINDOW_SECS) as u64,
+        ),
+    ))
+});
+
+#[derive(Debug)]
+struct RemoteDeleteBreaker {
+    threshold: usize,
+    window: Duration,
+    failures: VecDeque<Instant>,
+}
+
+impl RemoteDeleteBreaker {
+    fn new(threshold: usize, window: Duration) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            window: window.max(Duration::from_secs(1)),
+            failures: VecDeque::new(),
+        }
+    }
+
+    fn should_short_circuit(&mut self, now: Instant) -> bool {
+        self.prune(now);
+        self.failures.len() >= self.threshold
+    }
+
+    fn record_signer_failure(&mut self, now: Instant) -> bool {
+        self.prune(now);
+        let was_open = self.failures.len() >= self.threshold;
+        self.failures.push_back(now);
+        !was_open && self.failures.len() >= self.threshold
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(ts) = self.failures.front().copied() {
+            if now.duration_since(ts) > self.window {
+                self.failures.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+struct RemoteDeleteInflightGuard;
+
+impl RemoteDeleteInflightGuard {
+    fn new() -> Self {
+        let inflight = REMOTE_DELETE_INFLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics::gauge!(METRIC_DELETE_REMOTE_INFLIGHT).set(inflight as f64);
+        Self
+    }
+}
+
+impl Drop for RemoteDeleteInflightGuard {
+    fn drop(&mut self) {
+        let inflight = REMOTE_DELETE_INFLIGHT.fetch_sub(1, Ordering::Relaxed) - 1;
+        metrics::gauge!(METRIC_DELETE_REMOTE_INFLIGHT).set(inflight as f64);
+    }
+}
+
+fn is_signer_header_error(err: &std::io::Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("invalid utf-8 header value")
+        || message.contains("invalidheadervalue")
+        || (message.contains("sign v4") && message.contains("header value"))
+}
+
+fn remote_delete_breaker_is_open(now: Instant) -> bool {
+    let mut breaker = match REMOTE_DELETE_BREAKER.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    breaker.should_short_circuit(now)
+}
+
+fn record_remote_delete_failure(err: &std::io::Error, now: Instant) {
+    metrics::counter!(METRIC_DELETE_REMOTE_FAILED_TOTAL).increment(1);
+
+    if !is_signer_header_error(err) {
+        return;
+    }
+
+    let mut breaker = match REMOTE_DELETE_BREAKER.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if breaker.record_signer_failure(now) {
+        warn!(
+            threshold = breaker.threshold,
+            window_secs = breaker.window.as_secs(),
+            "remote tier delete breaker opened by signer/header failures"
+        );
+    }
+}
 
 #[derive(Default)]
 #[allow(dead_code)]
@@ -148,12 +272,31 @@ impl ExpiryOp for Jentry {
 }
 
 pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
+    if remote_delete_breaker_is_open(Instant::now()) {
+        metrics::counter!(METRIC_DELETE_REMOTE_BREAKER_TOTAL).increment(1);
+        return Err(std::io::Error::other("remote tier delete breaker is open due to signer/header failures"));
+    }
+
+    let _permit = REMOTE_DELETE_LIMITER
+        .acquire()
+        .await
+        .map_err(|_| std::io::Error::other("remote tier delete limiter is closed"))?;
+    let _inflight = RemoteDeleteInflightGuard::new();
+
     let mut config_mgr = GLOBAL_TierConfigMgr.write().await;
     let w = match config_mgr.get_driver(tier_name).await {
         Ok(w) => w,
-        Err(e) => return Err(std::io::Error::other(e)),
+        Err(e) => {
+            let err = std::io::Error::other(e);
+            record_remote_delete_failure(&err, Instant::now());
+            return Err(err);
+        }
     };
-    w.remove(obj_name, rv_id).await
+    let result = w.remove(obj_name, rv_id).await;
+    if let Err(err) = &result {
+        record_remote_delete_failure(err, Instant::now());
+    }
+    result
 }
 
 pub fn transitioned_delete_journal_entry(
@@ -189,4 +332,36 @@ pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject
 }
 
 #[cfg(test)]
-mod test {}
+mod test {
+    use super::{RemoteDeleteBreaker, is_signer_header_error};
+    use std::io::{Error, ErrorKind};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn signer_header_error_detection_matches_utf8_failures() {
+        let err = Error::new(
+            ErrorKind::InvalidInput,
+            "failed to sign v4 request: invalid UTF-8 header value for `x-amz-meta-invalid`",
+        );
+        assert!(is_signer_header_error(&err));
+    }
+
+    #[test]
+    fn signer_header_error_detection_rejects_unrelated_errors() {
+        let err = Error::other("dial tcp: i/o timeout");
+        assert!(!is_signer_header_error(&err));
+    }
+
+    #[test]
+    fn breaker_opens_at_threshold_and_recovers_after_window() {
+        let mut breaker = RemoteDeleteBreaker::new(3, Duration::from_secs(30));
+        let start = Instant::now();
+
+        assert!(!breaker.should_short_circuit(start));
+        assert!(!breaker.record_signer_failure(start));
+        assert!(!breaker.record_signer_failure(start + Duration::from_secs(1)));
+        assert!(breaker.record_signer_failure(start + Duration::from_secs(2)));
+        assert!(breaker.should_short_circuit(start + Duration::from_secs(3)));
+        assert!(!breaker.should_short_circuit(start + Duration::from_secs(40)));
+    }
+}
