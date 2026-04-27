@@ -893,72 +893,6 @@ impl PeerS3Client for RemotePeerS3Client {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
-        let node = Node {
-            url: url::Url::parse(addr).expect("test peer URL should parse"),
-            pools: vec![0],
-            is_local: false,
-            grid_host: addr.to_string(),
-        };
-
-        RemotePeerS3Client {
-            node: Some(node),
-            pools: Some(vec![0]),
-            addr: addr.to_string(),
-            health: Arc::new(DiskHealthTracker::new()),
-            cancel_token: CancellationToken::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execute_with_timeout_marks_remote_peer_faulty_on_network_like_error() {
-        let client = test_remote_peer("http://peer-network-error:9000");
-
-        let err = client
-            .execute_with_timeout(
-                || async {
-                    Err::<(), Error>(DiskError::Io(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        "connection refused",
-                    )))
-                },
-                Duration::from_secs(1),
-            )
-            .await
-            .expect_err("network-like error should fail");
-
-        assert_eq!(
-            match &err {
-                DiskError::Io(io_err) => io_err.kind(),
-                other => panic!("expected io network error, got {other:?}"),
-            },
-            std::io::ErrorKind::ConnectionRefused
-        );
-        assert!(client.health.is_faulty(), "network-like errors should mark remote peer faulty");
-
-        client.cancel_token.cancel();
-    }
-
-    #[tokio::test]
-    async fn test_execute_with_timeout_keeps_remote_peer_online_for_business_error() {
-        let client = test_remote_peer("http://peer-business-error:9000");
-
-        let err = client
-            .execute_with_timeout(|| async { Err::<(), Error>(DiskError::FileNotFound) }, Duration::from_secs(1))
-            .await
-            .expect_err("business error should fail");
-
-        assert_eq!(err, DiskError::FileNotFound);
-        assert!(!client.health.is_faulty(), "business errors should not mark remote peer faulty");
-
-        client.cancel_token.cancel();
-    }
-}
-
 pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
     let disks = clone_drives().await;
     let before_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
@@ -1091,4 +1025,70 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
 
 async fn clone_drives() -> Vec<Option<DiskStore>> {
     GLOBAL_LOCAL_DISK_MAP.read().await.values().cloned().collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
+        let node = Node {
+            url: url::Url::parse(addr).expect("test peer URL should parse"),
+            pools: vec![0],
+            is_local: false,
+            grid_host: addr.to_string(),
+        };
+
+        RemotePeerS3Client {
+            node: Some(node),
+            pools: Some(vec![0]),
+            addr: addr.to_string(),
+            health: Arc::new(DiskHealthTracker::new()),
+            cancel_token: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_marks_remote_peer_faulty_on_network_like_error() {
+        let client = test_remote_peer("http://peer-network-error:9000");
+
+        let err = client
+            .execute_with_timeout(
+                || async {
+                    Err::<(), Error>(DiskError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    )))
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("network-like error should fail");
+
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io network error, got {other:?}"),
+            },
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert!(client.health.is_faulty(), "network-like errors should mark remote peer faulty");
+
+        client.cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_keeps_remote_peer_online_for_business_error() {
+        let client = test_remote_peer("http://peer-business-error:9000");
+
+        let err = client
+            .execute_with_timeout(|| async { Err::<(), Error>(DiskError::FileNotFound) }, Duration::from_secs(1))
+            .await
+            .expect_err("business error should fail");
+
+        assert_eq!(err, DiskError::FileNotFound);
+        assert!(!client.health.is_faulty(), "business errors should not mark remote peer faulty");
+
+        client.cancel_token.cancel();
+    }
 }
