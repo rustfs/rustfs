@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::LazyLock;
 use time::{OffsetDateTime, macros::format_description};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::constants::UNSIGNED_PAYLOAD;
 use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
@@ -32,6 +32,36 @@ pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SERVICE_TYPE_S3: &str = "s3";
 pub const SERVICE_TYPE_STS: &str = "sts";
 
+#[derive(Debug, thiserror::Error)]
+pub enum SignV4Error {
+    #[error("invalid UTF-8 header value for `{name}`")]
+    InvalidHeaderValue { name: String },
+    #[error("failed to format signing timestamp: {reason}")]
+    TimeFormat { reason: String },
+    #[error("failed to build signing timestamp: {reason}")]
+    TimeComponent { reason: String },
+    #[error("failed to encode query parameters: {reason}")]
+    QueryEncode { reason: String },
+    #[error("failed to parse uri: {reason}")]
+    InvalidUri { reason: String },
+    #[error("failed to build uri from parts: {reason}")]
+    InvalidUriParts { reason: String },
+    #[error("failed to convert canonical headers to UTF-8: {reason}")]
+    CanonicalUtf8 { reason: String },
+    #[error("failed to parse header value for `{name}`: {reason}")]
+    HeaderValueParse { name: String, reason: String },
+}
+
+pub type SignResult<T> = std::result::Result<T, SignV4Error>;
+
+#[derive(Debug)]
+struct SignFailure {
+    request: request::Request<Body>,
+    error: SignV4Error,
+}
+
+type SignOutcome = std::result::Result<request::Request<Body>, SignFailure>;
+
 #[allow(non_upper_case_globals)] // FIXME
 static v4_ignored_headers: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
     let mut m = <HashMap<String, bool>>::new();
@@ -41,11 +71,27 @@ static v4_ignored_headers: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
     m
 });
 
+fn fail(request: request::Request<Body>, error: SignV4Error) -> SignOutcome {
+    Err(SignFailure { request, error })
+}
+
+fn format_yyyymmdd(t: OffsetDateTime) -> SignResult<String> {
+    let format = format_description!("[year][month][day]");
+    t.format(&format)
+        .map_err(|err| SignV4Error::TimeFormat { reason: err.to_string() })
+}
+
+fn format_amz_datetime(t: OffsetDateTime) -> SignResult<String> {
+    let format = format_description!("[year][month][day]T[hour][minute][second]Z");
+    t.format(&format)
+        .map_err(|err| SignV4Error::TimeFormat { reason: err.to_string() })
+}
+
 pub fn get_signing_key(secret: &str, loc: &str, t: OffsetDateTime, service_type: &str) -> [u8; 32] {
     let mut s = "AWS4".to_string();
     s.push_str(secret);
-    let format = format_description!("[year][month][day]");
-    let date = hmac_sha256(s.into_bytes(), t.format(&format).unwrap().into_bytes());
+    let date_value = format_yyyymmdd(t).unwrap_or_default();
+    let date = hmac_sha256(s.into_bytes(), date_value.into_bytes());
     let location = hmac_sha256(date, loc);
     let service = hmac_sha256(location, service_type);
 
@@ -57,9 +103,8 @@ pub fn get_signature(signing_key: [u8; 32], string_to_sign: &str) -> String {
 }
 
 pub fn get_scope(location: &str, t: OffsetDateTime, service_type: &str) -> String {
-    let format = format_description!("[year][month][day]");
     let mut ans = String::from("");
-    ans.push_str(&t.format(&format).unwrap());
+    ans.push_str(format_yyyymmdd(t).unwrap_or_default().as_str());
     ans.push('/');
     ans.push_str(location);
     ans.push('/');
@@ -76,19 +121,25 @@ fn get_credential(access_key_id: &str, location: &str, t: OffsetDateTime, servic
     s
 }
 
-fn get_hashed_payload(req: &request::Request<Body>) -> String {
+fn try_get_hashed_payload(req: &request::Request<Body>) -> SignResult<String> {
     let headers = req.headers();
     let mut hashed_payload = "";
     if let Some(payload) = headers.get("X-Amz-Content-Sha256") {
-        hashed_payload = payload.to_str().unwrap();
+        hashed_payload = payload.to_str().map_err(|_| SignV4Error::InvalidHeaderValue {
+            name: "x-amz-content-sha256".to_string(),
+        })?;
     }
     if hashed_payload.is_empty() {
         hashed_payload = UNSIGNED_PAYLOAD;
     }
-    hashed_payload.to_string()
+    Ok(hashed_payload.to_string())
 }
 
-fn get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> String {
+fn get_hashed_payload(req: &request::Request<Body>) -> String {
+    try_get_hashed_payload(req).unwrap_or_else(|_| UNSIGNED_PAYLOAD.to_string())
+}
+
+fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> SignResult<String> {
     let mut headers = Vec::<String>::new();
     let mut vals = HashMap::<String, Vec<String>>::new();
     for k in req.headers().keys() {
@@ -100,8 +151,14 @@ fn get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap
             .headers()
             .get_all(k)
             .iter()
-            .map(|e| e.to_str().unwrap().to_string())
-            .collect();
+            .map(|e| {
+                e.to_str()
+                    .map(|v| v.to_string())
+                    .map_err(|_| SignV4Error::InvalidHeaderValue {
+                        name: k.as_str().to_lowercase(),
+                    })
+            })
+            .collect::<SignResult<Vec<String>>>()?;
         vals.insert(k.as_str().to_lowercase(), vv);
     }
     if !header_exists("host", &headers) {
@@ -123,7 +180,10 @@ fn get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap
                 let _ = buf.write_char('\n');
             }
             _ => {
-                for (idx, v) in vals[k].iter().enumerate() {
+                let Some(values) = vals.get(k) else {
+                    continue;
+                };
+                for (idx, v) in values.iter().enumerate() {
                     if idx > 0 {
                         let _ = buf.write_char(',');
                     }
@@ -133,7 +193,11 @@ fn get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap
             }
         }
     }
-    String::from_utf8(buf.to_vec()).unwrap()
+    String::from_utf8(buf.to_vec()).map_err(|err| SignV4Error::CanonicalUtf8 { reason: err.to_string() })
+}
+
+fn get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> String {
+    try_get_canonical_headers(req, ignored_headers).unwrap_or_default()
 }
 
 fn header_exists(key: &str, headers: &[String]) -> bool {
@@ -162,7 +226,11 @@ fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashMap<St
     headers.join(";")
 }
 
-fn get_canonical_request(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>, hashed_payload: &str) -> String {
+fn try_get_canonical_request(
+    req: &request::Request<Body>,
+    ignored_headers: &HashMap<String, bool>,
+    hashed_payload: &str,
+) -> SignResult<String> {
     let mut canonical_query_string = "".to_string();
     if let Some(q) = req.uri().query() {
         // Parse query string into key-value pairs
@@ -192,26 +260,38 @@ fn get_canonical_request(req: &request::Request<Body>, ignored_headers: &HashMap
         req.method().to_string(),
         req.uri().path().to_string(),
         canonical_query_string,
-        get_canonical_headers(req, ignored_headers),
+        try_get_canonical_headers(req, ignored_headers)?,
         get_signed_headers(req, ignored_headers),
         hashed_payload.to_string(),
     ];
-    canonical_request.join("\n")
+    Ok(canonical_request.join("\n"))
 }
 
-fn get_string_to_sign_v4(t: OffsetDateTime, location: &str, canonical_request: &str, service_type: &str) -> String {
+fn get_canonical_request(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>, hashed_payload: &str) -> String {
+    try_get_canonical_request(req, ignored_headers, hashed_payload).unwrap_or_default()
+}
+
+fn try_get_string_to_sign_v4(
+    t: OffsetDateTime,
+    location: &str,
+    canonical_request: &str,
+    service_type: &str,
+) -> SignResult<String> {
     let mut string_to_sign = SIGN_V4_ALGORITHM.to_string();
     string_to_sign.push('\n');
-    let format = format_description!("[year][month][day]T[hour][minute][second]Z");
-    string_to_sign.push_str(&t.format(&format).unwrap());
+    string_to_sign.push_str(format_amz_datetime(t)?.as_str());
     string_to_sign.push('\n');
     string_to_sign.push_str(&get_scope(location, t, service_type));
     string_to_sign.push('\n');
     string_to_sign.push_str(&hex_sha256(canonical_request.as_bytes(), |s| s.to_string()));
-    string_to_sign
+    Ok(string_to_sign)
 }
 
-pub fn pre_sign_v4(
+fn get_string_to_sign_v4(t: OffsetDateTime, location: &str, canonical_request: &str, service_type: &str) -> String {
+    try_get_string_to_sign_v4(t, location, canonical_request, service_type).unwrap_or_default()
+}
+
+fn pre_sign_v4_inner(
     req: request::Request<Body>,
     access_key_id: &str,
     secret_access_key: &str,
@@ -219,9 +299,9 @@ pub fn pre_sign_v4(
     location: &str,
     expires: i64,
     t: OffsetDateTime,
-) -> request::Request<Body> {
+) -> SignOutcome {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
-        return req;
+        return Ok(req);
     }
 
     let credential = get_credential(access_key_id, location, t, SERVICE_TYPE_S3);
@@ -233,8 +313,11 @@ pub fn pre_sign_v4(
         query = result.unwrap_or_default();
     }
     query.push(("X-Amz-Algorithm".to_string(), SIGN_V4_ALGORITHM.to_string()));
-    let format = format_description!("[year][month][day]T[hour][minute][second]Z");
-    query.push(("X-Amz-Date".to_string(), t.format(&format).unwrap()));
+    let amz_date = match format_amz_datetime(t) {
+        Ok(value) => value,
+        Err(err) => return fail(req, err),
+    };
+    query.push(("X-Amz-Date".to_string(), amz_date));
     query.push(("X-Amz-Expires".to_string(), format!("{expires:010}")));
     query.push(("X-Amz-SignedHeaders".to_string(), signed_headers));
     query.push(("X-Amz-Credential".to_string(), credential));
@@ -244,16 +327,38 @@ pub fn pre_sign_v4(
 
     let uri = req.uri().clone();
     let mut parts = req.uri().clone().into_parts();
-    parts.path_and_query = Some(
-        format!("{}?{}", uri.path(), serde_urlencoded::to_string(&query).unwrap())
-            .parse()
-            .unwrap(),
-    );
+    let query_str = match serde_urlencoded::to_string(&query) {
+        Ok(value) => value,
+        Err(err) => {
+            return fail(req, SignV4Error::QueryEncode { reason: err.to_string() });
+        }
+    };
+    parts.path_and_query = Some(match format!("{}?{}", uri.path(), query_str).parse() {
+        Ok(value) => value,
+        Err(err) => {
+            return fail(req, SignV4Error::InvalidUri { reason: err.to_string() });
+        }
+    });
     let mut req = req;
-    *req.uri_mut() = Uri::from_parts(parts).unwrap();
+    *req.uri_mut() = match Uri::from_parts(parts) {
+        Ok(value) => value,
+        Err(err) => {
+            return fail(req, SignV4Error::InvalidUriParts { reason: err.to_string() });
+        }
+    };
 
-    let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &get_hashed_payload(&req));
-    let string_to_sign = get_string_to_sign_v4(t, location, &canonical_request, SERVICE_TYPE_S3);
+    let hashed_payload = match try_get_hashed_payload(&req) {
+        Ok(value) => value,
+        Err(err) => return fail(req, err),
+    };
+    let canonical_request = match try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload) {
+        Ok(value) => value,
+        Err(err) => return fail(req, err),
+    };
+    let string_to_sign = match try_get_string_to_sign_v4(t, location, &canonical_request, SERVICE_TYPE_S3) {
+        Ok(value) => value,
+        Err(err) => return fail(req, err),
+    };
     //println!("canonical_request: \n{}\n", canonical_request);
     //println!("string_to_sign: \n{}\n", string_to_sign);
     let signing_key = get_signing_key(secret_access_key, location, t, SERVICE_TYPE_S3);
@@ -261,20 +366,57 @@ pub fn pre_sign_v4(
 
     let uri = req.uri().clone();
     let mut parts = req.uri().clone().into_parts();
-    parts.path_and_query = Some(
-        format!(
-            "{}?{}&X-Amz-Signature={}",
-            uri.path(),
-            serde_urlencoded::to_string(&query).unwrap(),
-            signature
-        )
-        .parse()
-        .unwrap(),
-    );
+    let query_str = match serde_urlencoded::to_string(&query) {
+        Ok(value) => value,
+        Err(err) => {
+            return fail(req, SignV4Error::QueryEncode { reason: err.to_string() });
+        }
+    };
+    parts.path_and_query = Some(match format!("{}?{}&X-Amz-Signature={}", uri.path(), query_str, signature).parse() {
+        Ok(value) => value,
+        Err(err) => {
+            return fail(req, SignV4Error::InvalidUri { reason: err.to_string() });
+        }
+    });
 
-    *req.uri_mut() = Uri::from_parts(parts).unwrap();
+    *req.uri_mut() = match Uri::from_parts(parts) {
+        Ok(value) => value,
+        Err(err) => {
+            return fail(req, SignV4Error::InvalidUriParts { reason: err.to_string() });
+        }
+    };
 
-    req
+    Ok(req)
+}
+
+pub fn try_pre_sign_v4(
+    req: request::Request<Body>,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    location: &str,
+    expires: i64,
+    t: OffsetDateTime,
+) -> SignResult<request::Request<Body>> {
+    pre_sign_v4_inner(req, access_key_id, secret_access_key, session_token, location, expires, t).map_err(|f| f.error)
+}
+
+pub fn pre_sign_v4(
+    req: request::Request<Body>,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    location: &str,
+    expires: i64,
+    t: OffsetDateTime,
+) -> request::Request<Body> {
+    match pre_sign_v4_inner(req, access_key_id, secret_access_key, session_token, location, expires, t) {
+        Ok(request) => request,
+        Err(failure) => {
+            warn!(error = %failure.error, "failed to presign v4 request");
+            failure.request
+        }
+    }
 }
 
 fn _post_pre_sign_signature_v4(policy_base64: &str, t: OffsetDateTime, secret_access_key: &str, location: &str) -> String {
@@ -289,7 +431,10 @@ fn _sign_v4_sts(
     secret_access_key: &str,
     location: &str,
 ) -> request::Request<Body> {
-    sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new())
+    match sign_v4_inner(req, 0, access_key_id, secret_access_key, "", location, SERVICE_TYPE_STS, HeaderMap::new()) {
+        Ok(request) => request,
+        Err(failure) => failure.request,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -302,38 +447,119 @@ fn sign_v4_inner(
     location: &str,
     service_type: &str,
     trailer: HeaderMap,
-) -> request::Request<Body> {
+) -> SignOutcome {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
-        return req;
+        return Ok(req);
     }
 
     let t = OffsetDateTime::now_utc();
-    let t2 = t.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
+    let t2 = match time::Time::from_hms(0, 0, 0) {
+        Ok(midnight) => t.replace_time(midnight),
+        Err(err) => {
+            return fail(req, SignV4Error::TimeComponent { reason: err.to_string() });
+        }
+    };
 
-    let headers = req.headers_mut();
-    let format = format_description!("[year][month][day]T[hour][minute][second]Z");
-    headers.insert("X-Amz-Date", t.format(&format).unwrap().parse().unwrap());
+    let amz_date = match format_amz_datetime(t) {
+        Ok(value) => value,
+        Err(err) => return fail(req, err),
+    };
+    let amz_date_value = match amz_date.parse::<http::HeaderValue>() {
+        Ok(value) => value,
+        Err(err) => {
+            return fail(
+                req,
+                SignV4Error::HeaderValueParse {
+                    name: "X-Amz-Date".to_string(),
+                    reason: err.to_string(),
+                },
+            );
+        }
+    };
+    req.headers_mut().insert("X-Amz-Date", amz_date_value);
 
     if !session_token.is_empty() {
-        headers.insert("X-Amz-Security-Token", session_token.parse().unwrap());
+        let token_value = match session_token.parse::<http::HeaderValue>() {
+            Ok(value) => value,
+            Err(err) => {
+                return fail(
+                    req,
+                    SignV4Error::HeaderValueParse {
+                        name: "X-Amz-Security-Token".to_string(),
+                        reason: err.to_string(),
+                    },
+                );
+            }
+        };
+        req.headers_mut().insert("X-Amz-Security-Token", token_value);
     }
 
     if !trailer.is_empty() {
+        let mut trailer_values = Vec::new();
         for (k, _) in &trailer {
-            headers.append("X-Amz-Trailer", k.as_str().to_lowercase().parse().unwrap());
+            let parsed = match k.as_str().to_lowercase().parse::<http::HeaderValue>() {
+                Ok(value) => value,
+                Err(err) => {
+                    return fail(
+                        req,
+                        SignV4Error::HeaderValueParse {
+                            name: "X-Amz-Trailer".to_string(),
+                            reason: err.to_string(),
+                        },
+                    );
+                }
+            };
+            trailer_values.push(parsed);
+        }
+        let content_encoding = match "aws-chunked".parse::<http::HeaderValue>() {
+            Ok(value) => value,
+            Err(err) => {
+                return fail(
+                    req,
+                    SignV4Error::HeaderValueParse {
+                        name: "Content-Encoding".to_string(),
+                        reason: err.to_string(),
+                    },
+                );
+            }
+        };
+        let decoded_len = match format!("{content_len:010}").parse::<http::HeaderValue>() {
+            Ok(value) => value,
+            Err(err) => {
+                return fail(
+                    req,
+                    SignV4Error::HeaderValueParse {
+                        name: "x-amz-decoded-content-length".to_string(),
+                        reason: err.to_string(),
+                    },
+                );
+            }
+        };
+        let headers = req.headers_mut();
+        for value in trailer_values {
+            headers.append("X-Amz-Trailer", value);
         }
 
-        headers.insert("Content-Encoding", "aws-chunked".parse().unwrap());
-        headers.insert("x-amz-decoded-content-length", format!("{content_len:010}").parse().unwrap());
+        headers.insert("Content-Encoding", content_encoding);
+        headers.insert("x-amz-decoded-content-length", decoded_len);
     }
 
     if service_type == SERVICE_TYPE_STS {
-        headers.remove("X-Amz-Content-Sha256");
+        req.headers_mut().remove("X-Amz-Content-Sha256");
     }
 
-    let hashed_payload = get_hashed_payload(&req);
-    let canonical_request = get_canonical_request(&req, &v4_ignored_headers, &hashed_payload);
-    let string_to_sign = get_string_to_sign_v4(t, location, &canonical_request, service_type);
+    let hashed_payload = match try_get_hashed_payload(&req) {
+        Ok(value) => value,
+        Err(err) => return fail(req, err),
+    };
+    let canonical_request = match try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload) {
+        Ok(value) => value,
+        Err(err) => return fail(req, err),
+    };
+    let string_to_sign = match try_get_string_to_sign_v4(t, location, &canonical_request, service_type) {
+        Ok(value) => value,
+        Err(err) => return fail(req, err),
+    };
     let signing_key = get_signing_key(secret_access_key, location, t, service_type);
     let credential = get_credential(access_key_id, location, t2, service_type);
     let signed_headers = get_signed_headers(&req, &v4_ignored_headers);
@@ -343,42 +569,28 @@ fn sign_v4_inner(
     let headers = req.headers_mut();
 
     let auth = format!("{SIGN_V4_ALGORITHM} Credential={credential}, SignedHeaders={signed_headers}, Signature={signature}");
-    headers.insert("Authorization", auth.parse().unwrap());
+    let auth_value = match auth.parse::<http::HeaderValue>() {
+        Ok(value) => value,
+        Err(err) => {
+            return fail(
+                req,
+                SignV4Error::HeaderValueParse {
+                    name: "Authorization".to_string(),
+                    reason: err.to_string(),
+                },
+            );
+        }
+    };
+    headers.insert("Authorization", auth_value);
 
     if !trailer.is_empty() {
         //req.Trailer = trailer;
         for (_, v) in &trailer {
             headers.append(http::header::TRAILER, v.clone());
         }
-        return streaming_unsigned_v4(req, session_token, content_len, t);
+        return Ok(streaming_unsigned_v4(req, session_token, content_len, t));
     }
-    req
-}
-
-fn _unsigned_trailer(mut req: request::Request<Body>, content_len: i64, trailer: HeaderMap) {
-    if !trailer.is_empty() {
-        return;
-    }
-    let t = OffsetDateTime::now_utc();
-    let t = t.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
-
-    let headers = req.headers_mut();
-    let format = format_description!("[year][month][day]T[hour][minute][second]Z");
-    headers.insert("X-Amz-Date", t.format(&format).unwrap().parse().unwrap());
-
-    for (k, _) in &trailer {
-        headers.append("X-Amz-Trailer", k.as_str().to_lowercase().parse().unwrap());
-    }
-
-    headers.insert("Content-Encoding", "aws-chunked".parse().unwrap());
-    headers.insert("x-amz-decoded-content-length", format!("{content_len:010}").parse().unwrap());
-
-    if !trailer.is_empty() {
-        for (_, v) in &trailer {
-            headers.append(http::header::TRAILER, v.clone());
-        }
-    }
-    streaming_unsigned_v4(req, "", content_len, t);
+    Ok(req)
 }
 
 pub fn sign_v4(
@@ -389,6 +601,32 @@ pub fn sign_v4(
     session_token: &str,
     location: &str,
 ) -> request::Request<Body> {
+    match sign_v4_inner(
+        req,
+        content_len,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        location,
+        SERVICE_TYPE_S3,
+        HeaderMap::new(),
+    ) {
+        Ok(request) => request,
+        Err(failure) => {
+            warn!(error = %failure.error, "failed to sign v4 request");
+            failure.request
+        }
+    }
+}
+
+pub fn try_sign_v4(
+    req: request::Request<Body>,
+    content_len: i64,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    location: &str,
+) -> SignResult<request::Request<Body>> {
     sign_v4_inner(
         req,
         content_len,
@@ -399,6 +637,7 @@ pub fn sign_v4(
         SERVICE_TYPE_S3,
         HeaderMap::new(),
     )
+    .map_err(|failure| failure.error)
 }
 
 pub fn sign_v4_trailer(
@@ -409,6 +648,32 @@ pub fn sign_v4_trailer(
     location: &str,
     trailer: HeaderMap,
 ) -> request::Request<Body> {
+    match sign_v4_inner(
+        req,
+        0,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        location,
+        SERVICE_TYPE_S3,
+        trailer,
+    ) {
+        Ok(request) => request,
+        Err(failure) => {
+            warn!(error = %failure.error, "failed to sign v4 trailer request");
+            failure.request
+        }
+    }
+}
+
+pub fn try_sign_v4_trailer(
+    req: request::Request<Body>,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    location: &str,
+    trailer: HeaderMap,
+) -> SignResult<request::Request<Body>> {
     sign_v4_inner(
         req,
         0,
@@ -419,11 +684,13 @@ pub fn sign_v4_trailer(
         SERVICE_TYPE_S3,
         trailer,
     )
+    .map_err(|failure| failure.error)
 }
 
 #[cfg(test)]
 #[allow(unused_variables, unused_mut)]
 mod tests {
+    use http::HeaderValue;
     use http::request;
     use time::macros::datetime;
 
@@ -805,5 +1072,53 @@ mod tests {
                 "UNSIGNED-PAYLOAD",
             )
         );
+    }
+
+    fn build_request_with_invalid_header_value(uri: &str) -> request::Request<Body> {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let headers = req.headers_mut();
+        headers.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(UNSIGNED_PAYLOAD));
+        headers.insert("x-amz-meta-invalid", HeaderValue::from_bytes(&[0xFF]).unwrap());
+        req
+    }
+
+    #[test]
+    fn try_sign_v4_returns_error_for_non_utf8_header_value() {
+        let req = build_request_with_invalid_header_value("http://examplebucket.s3.amazonaws.com/object");
+        let err = try_sign_v4(req, 0, "rustfsadmin", "rustfsadmin", "", "us-east-1").unwrap_err();
+        assert!(matches!(
+            err,
+            SignV4Error::InvalidHeaderValue { name } if name == "x-amz-meta-invalid"
+        ));
+    }
+
+    #[test]
+    fn legacy_sign_apis_do_not_panic_on_non_utf8_header_value() {
+        let signed = sign_v4(
+            build_request_with_invalid_header_value("http://examplebucket.s3.amazonaws.com/object"),
+            0,
+            "rustfsadmin",
+            "rustfsadmin",
+            "",
+            "us-east-1",
+        );
+        assert!(signed.headers().get(http::header::AUTHORIZATION).is_none());
+
+        let presigned = pre_sign_v4(
+            build_request_with_invalid_header_value("http://examplebucket.s3.amazonaws.com/object"),
+            "rustfsadmin",
+            "rustfsadmin",
+            "",
+            "us-east-1",
+            60,
+            datetime!(2026-04-27 00:00:00 UTC),
+        );
+        let query = presigned.uri().query().unwrap_or_default();
+        assert!(!query.contains("X-Amz-Signature="));
     }
 }
