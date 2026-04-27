@@ -395,8 +395,27 @@ impl BucketTargetSys {
         }
     }
 
-    pub async fn set_target(&self, bucket: &str, target: &BucketTarget, update: bool) -> Result<(), BucketTargetError> {
-        if !target.target_type.is_valid() && !update {
+    pub async fn set_target(
+        &self,
+        bucket: &str,
+        target: &BucketTarget,
+        update: bool,
+    ) -> Result<BucketTargets, BucketTargetError> {
+        self.validate_target(bucket, target).await?;
+
+        let mut bucket_targets = match self.list_bucket_targets(bucket).await {
+            Ok(targets) => targets,
+            Err(BucketTargetError::BucketRemoteTargetNotFound { .. }) => BucketTargets::default(),
+            Err(err) => return Err(err),
+        };
+
+        Self::upsert_target_entry(&mut bucket_targets.targets, target, update)?;
+
+        Ok(bucket_targets)
+    }
+
+    pub async fn validate_target(&self, bucket: &str, target: &BucketTarget) -> Result<(), BucketTargetError> {
+        if !target.target_type.is_valid() {
             return Err(BucketTargetError::BucketRemoteArnTypeInvalid {
                 bucket: bucket.to_string(),
             });
@@ -450,52 +469,44 @@ impl BucketTargetSys {
             }
         }
 
-        {
-            let mut targets_map = self.targets_map.write().await;
-            let bucket_targets = targets_map.entry(bucket.to_string()).or_insert_with(Vec::new);
-            let mut found = false;
+        Ok(())
+    }
 
-            for (idx, existing_target) in bucket_targets.iter().enumerate() {
-                if existing_target.target_type.to_string() == target.target_type.to_string() {
-                    if existing_target.arn == target.arn {
-                        if !update {
-                            return Err(BucketTargetError::BucketRemoteAlreadyExists {
-                                bucket: existing_target.target_bucket.clone(),
-                            });
-                        }
-                        bucket_targets[idx] = target.clone();
-                        found = true;
-                        break;
-                    }
-                    if existing_target.endpoint == target.endpoint {
+    fn upsert_target_entry(
+        bucket_targets: &mut Vec<BucketTarget>,
+        target: &BucketTarget,
+        update: bool,
+    ) -> Result<(), BucketTargetError> {
+        let mut found = false;
+
+        for (idx, existing_target) in bucket_targets.iter().enumerate() {
+            if existing_target.target_type.to_string() == target.target_type.to_string() {
+                if existing_target.arn == target.arn {
+                    if !update {
                         return Err(BucketTargetError::BucketRemoteAlreadyExists {
                             bucket: existing_target.target_bucket.clone(),
                         });
                     }
+                    bucket_targets[idx] = target.clone();
+                    found = true;
+                    break;
+                }
+                if existing_target.endpoint == target.endpoint {
+                    return Err(BucketTargetError::BucketRemoteAlreadyExists {
+                        bucket: existing_target.target_bucket.clone(),
+                    });
                 }
             }
-
-            if !found && !update {
-                bucket_targets.push(target.clone());
-            }
         }
 
-        {
-            let mut arn_remotes_map = self.arn_remotes_map.write().await;
-            arn_remotes_map.insert(
-                target.arn.clone(),
-                ArnTarget {
-                    client: Some(Arc::new(target_client)),
-                    last_refresh: OffsetDateTime::now_utc(),
-                },
-            );
+        if !found && !update {
+            bucket_targets.push(target.clone());
         }
 
-        self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
         Ok(())
     }
 
-    pub async fn remove_target(&self, bucket: &str, arn_str: &str) -> Result<(), BucketTargetError> {
+    pub async fn remove_target(&self, bucket: &str, arn_str: &str) -> Result<BucketTargets, BucketTargetError> {
         if arn_str.is_empty() {
             return Err(BucketTargetError::BucketRemoteArnInvalid {
                 bucket: bucket.to_string(),
@@ -524,33 +535,16 @@ impl BucketTargetSys {
             }
         }
 
-        {
-            let mut targets_map = self.targets_map.write().await;
+        let targets = self.list_bucket_targets(bucket).await?;
+        let new_targets: Vec<BucketTarget> = targets.targets.iter().filter(|t| t.arn != arn_str).cloned().collect();
 
-            let Some(targets) = targets_map.get(bucket) else {
-                return Err(BucketTargetError::BucketRemoteTargetNotFound {
-                    bucket: bucket.to_string(),
-                });
-            };
-
-            let new_targets: Vec<BucketTarget> = targets.iter().filter(|t| t.arn != arn_str).cloned().collect();
-
-            if new_targets.len() == targets.len() {
-                return Err(BucketTargetError::BucketRemoteTargetNotFound {
-                    bucket: bucket.to_string(),
-                });
-            }
-
-            targets_map.insert(bucket.to_string(), new_targets);
+        if new_targets.len() == targets.targets.len() {
+            return Err(BucketTargetError::BucketRemoteTargetNotFound {
+                bucket: bucket.to_string(),
+            });
         }
 
-        {
-            self.arn_remotes_map.write().await.remove(arn_str);
-        }
-
-        self.update_bandwidth_limit(bucket, arn_str, 0);
-
-        Ok(())
+        Ok(BucketTargets { targets: new_targets })
     }
 
     pub async fn mark_refresh_in_progress(&self, bucket: &str, arn: &str) {
@@ -603,7 +597,7 @@ impl BucketTargetSys {
 
         if let Some(last_refresh) = last_refresh {
             let now = OffsetDateTime::now_utc();
-            if now - last_refresh > Duration::from_secs(60 * 5) {
+            if now - last_refresh < Duration::from_secs(60 * 5) {
                 return None;
             }
         }
@@ -618,6 +612,16 @@ impl BucketTargetSys {
                 error!("get bucket targets config error:{}", e);
             }
         };
+
+        let cli = self
+            .arn_remotes_map
+            .read()
+            .await
+            .get(arn)
+            .and_then(|target| target.client.clone());
+        if cli.is_some() {
+            return cli;
+        }
 
         self.inc_arn_errs(bucket, arn).await;
         None

@@ -46,7 +46,7 @@ use rustfs_ecstore::bucket::{
     metadata_sys,
     object_lock::ObjectLockApi,
     policy_sys::PolicySys,
-    target::BucketTargetType,
+    target::{BucketTargetType, BucketTargets},
     utils::serialize,
     versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
@@ -117,6 +117,59 @@ fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String>
     }
 
     arns
+}
+
+fn validate_replication_config_targets(targets: &BucketTargets, config: &ReplicationConfiguration) -> S3Result<()> {
+    let configured_arns = targets
+        .targets
+        .iter()
+        .filter(|target| target.target_type == BucketTargetType::ReplicationService)
+        .map(|target| target.arn.as_str())
+        .collect::<HashSet<_>>();
+
+    for rule in &config.rules {
+        if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+            continue;
+        }
+
+        let configured_arn = if config.role.trim().is_empty() {
+            rule.destination.bucket.trim()
+        } else {
+            config.role.trim()
+        };
+
+        if !configured_arn.is_empty() && configured_arns.contains(configured_arn) {
+            continue;
+        }
+
+        return Err(s3_error!(
+            InvalidRequest,
+            "replication config with rule ID {} has a stale target",
+            rule.id.clone().unwrap_or_default()
+        ));
+    }
+
+    Ok(())
+}
+
+async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
+    if !BucketVersioningSys::enabled(bucket).await {
+        return Err(s3_error!(
+            InvalidRequest,
+            "bucket versioning must be enabled before replication can be configured"
+        ));
+    }
+
+    let targets = metadata_sys::get_bucket_targets_config(bucket)
+        .await
+        .map_err(|err| match err {
+            StorageError::ConfigNotFound => {
+                S3Error::with_message(S3ErrorCode::InvalidRequest, "replication target configuration not found".to_string())
+            }
+            other => ApiError::from(other).into(),
+        })?;
+
+    validate_replication_config_targets(&targets, config)
 }
 
 async fn remove_replication_targets_for_config(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
@@ -1615,7 +1668,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        // TODO: check enable, versioning enable
+        validate_bucket_replication_update(&bucket, &replication_configuration).await?;
         let data = serialize_config(&replication_configuration)?;
         metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
             .await
@@ -1977,6 +2030,70 @@ mod tests {
         let arns = replication_target_arns(&config);
 
         assert!(arns.contains(destination));
+    }
+
+    fn replication_targets_with_arn(arns: &[&str]) -> BucketTargets {
+        BucketTargets {
+            targets: arns
+                .iter()
+                .map(|arn| rustfs_ecstore::bucket::target::BucketTarget {
+                    arn: (*arn).to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validate_replication_config_targets_accepts_matching_destination_arns() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let targets = replication_targets_with_arn(&[arn]);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_for_target(arn)],
+        };
+
+        validate_replication_config_targets(&targets, &config).expect("matching target should pass validation");
+    }
+
+    #[test]
+    fn validate_replication_config_targets_rejects_stale_destination_arns() {
+        let targets = replication_targets_with_arn(&["arn:rustfs:replication:us-east-1:target:bucket-a"]);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_for_target(
+                "arn:rustfs:replication:us-east-1:target:bucket-b",
+            )],
+        };
+
+        let err = validate_replication_config_targets(&targets, &config).expect_err("stale target should fail validation");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn validate_replication_config_targets_accepts_matching_role_arn() {
+        let arn = "arn:rustfs:replication:us-east-1:role-target:bucket";
+        let targets = replication_targets_with_arn(&[arn]);
+        let config = ReplicationConfiguration {
+            role: arn.to_string(),
+            rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:ignored:bucket")],
+        };
+
+        validate_replication_config_targets(&targets, &config).expect("matching role ARN should pass validation");
+    }
+
+    #[test]
+    fn validate_replication_config_targets_ignores_disabled_rules() {
+        let targets = replication_targets_with_arn(&[]);
+        let mut rule = replication_rule_for_target("arn:rustfs:replication:us-east-1:stale:bucket");
+        rule.status = ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rule],
+        };
+
+        validate_replication_config_targets(&targets, &config).expect("disabled rules should not require live targets");
     }
 
     #[test]
