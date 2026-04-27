@@ -1444,6 +1444,7 @@ impl DefaultBucketUsecase {
             return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
+        input_cfg.expiry_updated_at = Some(Timestamp::from(time::OffsetDateTime::now_utc()));
         let data = serialize_config(&input_cfg)?;
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
             .await

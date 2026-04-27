@@ -54,8 +54,8 @@ use rustfs_filemeta::{
 use rustfs_s3_common::EventName;
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
-    BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
-    Timestamp,
+    BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,
+    RestoreRequestType, RestoreStatus, Timestamp,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION};
 use sha2::{Digest, Sha256};
@@ -92,6 +92,7 @@ const ENV_STALE_UPLOADS_EXPIRY: &str = "RUSTFS_API_STALE_UPLOADS_EXPIRY";
 const ENV_STALE_UPLOADS_CLEANUP_INTERVAL: &str = "RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL";
 const DEFAULT_STALE_UPLOADS_EXPIRY: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
+const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 
 lazy_static! {
     pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
@@ -1241,6 +1242,21 @@ pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: 
     }
 }
 
+fn lifecycle_rule_has_date_expiration(lc: &BucketLifecycleConfiguration, rule_id: &str) -> bool {
+    lc.rules.iter().any(|rule| {
+        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+            && rule.id.as_deref() == Some(rule_id)
+            && rule.expiration.as_ref().is_some_and(|expiration| expiration.date.is_some())
+    })
+}
+
+fn should_defer_date_expiry_for_recent_config_update(lc: &BucketLifecycleConfiguration, now: OffsetDateTime) -> bool {
+    lc.expiry_updated_at.as_ref().is_some_and(|updated_at| {
+        let updated_at = OffsetDateTime::from(updated_at.clone());
+        now.unix_timestamp().saturating_sub(updated_at.unix_timestamp()) < DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS
+    })
+}
+
 pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     let Ok((lc, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
         return Ok(());
@@ -1269,11 +1285,23 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
                 | IlmAction::DeleteRestoredVersionAction
                 | IlmAction::DeleteAllVersionsAction
                 | IlmAction::DelMarkerDeleteAllVersionsAction => {
-                    if event
-                        .due
-                        .is_some_and(|due| due.unix_timestamp() <= OffsetDateTime::now_utc().unix_timestamp())
-                    {
-                        if object.is_remote() {
+                    let now = OffsetDateTime::now_utc();
+                    if event.due.is_some_and(|due| due.unix_timestamp() <= now.unix_timestamp()) {
+                        let is_date_expiration_rule = lifecycle_rule_has_date_expiration(&lc, &event.rule_id);
+                        if is_date_expiration_rule && should_defer_date_expiry_for_recent_config_update(&lc, now) {
+                            let api = api.clone();
+                            let object = object.clone();
+                            let event = event.clone();
+                            let src = src.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(StdDuration::from_secs(DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS as u64)).await;
+                                if object.is_remote() {
+                                    apply_expiry_on_transitioned_object(api, &object, &event, &src).await;
+                                } else {
+                                    apply_expiry_on_non_transitioned_objects(api, &object, &event, &src).await;
+                                }
+                            });
+                        } else if object.is_remote() {
                             apply_expiry_on_transitioned_object(api.clone(), object, &event, &src).await;
                         } else {
                             apply_expiry_on_non_transitioned_objects(api.clone(), object, &event, &src).await;
@@ -1977,9 +2005,10 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 #[cfg(test)]
 mod tests {
     use super::{
-        StaleMultipartUploadCandidate, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
-        lifecycle_deleted_object, lifecycle_version_purge_state_from_completed_targets,
-        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
+        DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, StaleMultipartUploadCandidate, cleanup_empty_multipart_sha_dirs_on_local_disks,
+        cleanup_stale_multipart_uploads_once_at, lifecycle_deleted_object, lifecycle_rule_has_date_expiration,
+        lifecycle_version_purge_state_from_completed_targets, mark_delete_opts_skip_decommissioned_on_remote_success,
+        merge_stale_multipart_candidate, replication_state_for_delete, should_defer_date_expiry_for_recent_config_update,
         should_reuse_lifecycle_delete_replication_state,
     };
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
@@ -1994,6 +2023,7 @@ mod tests {
         BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader,
     };
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
+    use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -2012,6 +2042,49 @@ mod tests {
         mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, true);
 
         assert!(opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn lifecycle_rule_has_date_expiration_detects_enabled_date_rule() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    date: Some(Timestamp::from(OffsetDateTime::now_utc())),
+                    ..Default::default()
+                }),
+                id: Some("rule-date".to_string()),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        assert!(lifecycle_rule_has_date_expiration(&lc, "rule-date"));
+        assert!(!lifecycle_rule_has_date_expiration(&lc, "missing-rule"));
+    }
+
+    #[test]
+    fn should_defer_date_expiry_for_recent_config_update_respects_grace_window() {
+        let now = OffsetDateTime::now_utc();
+        let recent = BucketLifecycleConfiguration {
+            expiry_updated_at: Some(Timestamp::from(now - time::Duration::seconds(1))),
+            rules: Vec::new(),
+        };
+        let stale = BucketLifecycleConfiguration {
+            expiry_updated_at: Some(Timestamp::from(
+                now - time::Duration::seconds(DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS + 1),
+            )),
+            rules: Vec::new(),
+        };
+
+        assert!(should_defer_date_expiry_for_recent_config_update(&recent, now));
+        assert!(!should_defer_date_expiry_for_recent_config_update(&stale, now));
     }
 
     #[test]
