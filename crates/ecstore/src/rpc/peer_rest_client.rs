@@ -38,7 +38,16 @@ use rustfs_protos::proto_gen::node_service::{
 };
 use rustfs_utils::XHost;
 use serde::{Deserialize, Serialize as _};
-use std::{collections::HashMap, io::Cursor, time::SystemTime};
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::SystemTime,
+};
+use tokio::{net::TcpStream, time::Duration};
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -59,11 +68,18 @@ pub struct PeerLiveEventsBatch {
 pub struct PeerRestClient {
     pub host: XHost,
     pub grid_host: String,
+    offline: Arc<AtomicBool>,
+    recovery_running: Arc<AtomicBool>,
 }
 
 impl PeerRestClient {
     pub fn new(host: XHost, grid_host: String) -> Self {
-        Self { host, grid_host }
+        Self {
+            host,
+            grid_host,
+            offline: Arc::new(AtomicBool::new(false)),
+            recovery_running: Arc::new(AtomicBool::new(false)),
+        }
     }
     pub async fn new_clients(eps: EndpointServerPools) -> (Vec<Option<Self>>, Vec<Option<Self>>) {
         if !is_dist_erasure().await {
@@ -93,9 +109,19 @@ impl PeerRestClient {
     }
 
     pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        if self.offline.load(Ordering::Acquire) {
+            return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
+        }
+
         node_service_time_out_client(&self.grid_host, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+            .map_err(|err| {
+                let storage_err = Error::other(format!("can not get client, err: {err}"));
+                if Self::is_network_like_error(&storage_err) {
+                    self.mark_offline_and_spawn_recovery();
+                }
+                storage_err
+            })
     }
 
     /// Evict the connection to this peer from the global cache.
@@ -103,16 +129,88 @@ impl PeerRestClient {
     pub async fn evict_connection(&self) {
         evict_failed_connection(&self.grid_host).await;
     }
+
+    fn is_network_like_error(err: &Error) -> bool {
+        let message = err.to_string().to_ascii_lowercase();
+        [
+            "temporarily offline",
+            "transport error",
+            "unavailable",
+            "error trying to connect",
+            "connection refused",
+            "connection reset",
+            "broken pipe",
+            "not connected",
+            "unexpected eof",
+            "timed out",
+            "deadline has elapsed",
+            "connection closed",
+            "connection aborted",
+            "tcp connect error",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+    }
+
+    fn mark_offline_and_spawn_recovery(&self) {
+        self.offline.store(true, Ordering::Release);
+
+        if self
+            .recovery_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let grid_host = self.grid_host.clone();
+        let offline = Arc::clone(&self.offline);
+        let recovery_running = Arc::clone(&self.recovery_running);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+
+            loop {
+                interval.tick().await;
+                if Self::perform_connectivity_check(&grid_host).await.is_ok() {
+                    offline.store(false, Ordering::Release);
+                    recovery_running.store(false, Ordering::Release);
+                    return;
+                }
+            }
+        });
+    }
+
+    async fn perform_connectivity_check(addr: &str) -> Result<()> {
+        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {e}")))?;
+        let Some(host) = url.host_str() else {
+            return Err(Error::other("No host in URL".to_string()));
+        };
+
+        let port = url.port_or_known_default().unwrap_or(80);
+        match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host, port))).await {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                Ok(())
+            }
+            _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
+        }
+    }
+
+    async fn finalize_result<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(err) = &result
+            && Self::is_network_like_error(err)
+        {
+            self.mark_offline_and_spawn_recovery();
+            self.evict_connection().await;
+        }
+
+        result
+    }
 }
 
 impl PeerRestClient {
     pub async fn local_storage_info(&self) -> Result<rustfs_madmin::StorageInfo> {
-        let result = self.local_storage_info_inner().await;
-        if result.is_err() {
-            // Evict stale connection on any error for cluster recovery
-            self.evict_connection().await;
-        }
-        result
+        self.finalize_result(self.local_storage_info_inner().await).await
     }
 
     async fn local_storage_info_inner(&self) -> Result<rustfs_madmin::StorageInfo> {
@@ -135,12 +233,7 @@ impl PeerRestClient {
     }
 
     pub async fn server_info(&self) -> Result<ServerProperties> {
-        let result = self.server_info_inner().await;
-        if result.is_err() {
-            // Evict stale connection on any error for cluster recovery
-            self.evict_connection().await;
-        }
-        result
+        self.finalize_result(self.server_info_inner().await).await
     }
 
     async fn server_info_inner(&self) -> Result<ServerProperties> {
@@ -163,6 +256,10 @@ impl PeerRestClient {
     }
 
     pub async fn get_cpus(&self) -> Result<Cpus> {
+        self.finalize_result(self.get_cpus_inner().await).await
+    }
+
+    async fn get_cpus_inner(&self) -> Result<Cpus> {
         let mut client = self.get_client().await?;
         let request = Request::new(GetCpusRequest {});
 
@@ -182,6 +279,10 @@ impl PeerRestClient {
     }
 
     pub async fn get_net_info(&self) -> Result<NetInfo> {
+        self.finalize_result(self.get_net_info_inner().await).await
+    }
+
+    async fn get_net_info_inner(&self) -> Result<NetInfo> {
         let mut client = self.get_client().await?;
         let request = Request::new(GetNetInfoRequest {});
 
@@ -201,6 +302,10 @@ impl PeerRestClient {
     }
 
     pub async fn get_partitions(&self) -> Result<Partitions> {
+        self.finalize_result(self.get_partitions_inner().await).await
+    }
+
+    async fn get_partitions_inner(&self) -> Result<Partitions> {
         let mut client = self.get_client().await?;
         let request = Request::new(GetPartitionsRequest {});
 
@@ -220,6 +325,10 @@ impl PeerRestClient {
     }
 
     pub async fn get_os_info(&self) -> Result<OsInfo> {
+        self.finalize_result(self.get_os_info_inner().await).await
+    }
+
+    async fn get_os_info_inner(&self) -> Result<OsInfo> {
         let mut client = self.get_client().await?;
         let request = Request::new(GetOsInfoRequest {});
 
@@ -701,5 +810,65 @@ impl PeerRestClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_peer_client() -> PeerRestClient {
+        PeerRestClient::new(
+            XHost {
+                name: "127.0.0.1".to_string(),
+                port: 9000,
+                is_port_set: true,
+            },
+            "http://127.0.0.1:9000".to_string(),
+        )
+    }
+
+    #[test]
+    fn peer_rest_client_marks_network_like_errors() {
+        assert!(PeerRestClient::is_network_like_error(&Error::other("transport error")));
+        assert!(PeerRestClient::is_network_like_error(&Error::other("connection refused")));
+        assert!(!PeerRestClient::is_network_like_error(&Error::NotImplemented));
+    }
+
+    #[tokio::test]
+    async fn peer_rest_client_fast_fails_when_marked_offline() {
+        let client = test_peer_client();
+        client.offline.store(true, Ordering::Release);
+
+        let err = client
+            .get_client()
+            .await
+            .expect_err("offline peer should fast-fail before dialing");
+
+        assert!(err.to_string().contains("temporarily offline"));
+    }
+
+    #[tokio::test]
+    async fn peer_rest_client_finalize_result_marks_offline_for_network_errors() {
+        let client = test_peer_client();
+        let err = client
+            .finalize_result::<()>(Err(Error::other("transport error")))
+            .await
+            .expect_err("network error should still be returned");
+
+        assert!(err.to_string().contains("transport error"));
+        assert!(client.offline.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn peer_rest_client_finalize_result_keeps_online_for_business_errors() {
+        let client = test_peer_client();
+        let err = client
+            .finalize_result::<()>(Err(Error::VolumeNotFound))
+            .await
+            .expect_err("business error should still be returned");
+
+        assert!(matches!(err, Error::VolumeNotFound));
+        assert!(!client.offline.load(Ordering::Acquire));
     }
 }
