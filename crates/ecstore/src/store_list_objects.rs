@@ -829,6 +829,7 @@ impl ECStore {
         let (merge_tx, mut merge_rx) = mpsc::channel::<MetaCacheEntry>(100);
 
         let bucket = bucket.to_owned();
+        let bucket_for_merge = bucket.clone();
 
         let vcf = match get_versioning_config(&bucket).await {
             Ok((res, _)) => Some(res),
@@ -839,7 +840,7 @@ impl ECStore {
             let mut sent_err = false;
             while let Some(entry) = merge_rx.recv().await {
                 if opts.latest_only {
-                    let fi = match entry.to_fileinfo(&bucket) {
+                    let fi = match entry.to_fileinfo(&bucket_for_merge) {
                         Ok(res) => res,
                         Err(err) => {
                             if !sent_err {
@@ -864,7 +865,7 @@ impl ECStore {
                     if let Some(filter) = opts.filter {
                         if filter(&fi) {
                             let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(&fi, &bucket, &fi.name, {
+                                item: Some(ObjectInfo::from_file_info(&fi, &bucket_for_merge, &fi.name, {
                                     if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
                                 })),
                                 err: None,
@@ -876,7 +877,7 @@ impl ECStore {
                         }
                     } else {
                         let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(&fi, &bucket, &fi.name, {
+                            item: Some(ObjectInfo::from_file_info(&fi, &bucket_for_merge, &fi.name, {
                                 if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
                             })),
                             err: None,
@@ -889,7 +890,7 @@ impl ECStore {
                     continue;
                 }
 
-                let fvs = match entry.file_info_versions(&bucket) {
+                let fvs = match entry.file_info_versions(&bucket_for_merge) {
                     Ok(res) => res,
                     Err(err) => {
                         let item = ObjectInfoOrErr {
@@ -912,7 +913,7 @@ impl ECStore {
                     if let Some(filter) = opts.filter {
                         if filter(fi) {
                             let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(fi, &bucket, &fi.name, {
+                                item: Some(ObjectInfo::from_file_info(fi, &bucket_for_merge, &fi.name, {
                                     if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
                                 })),
                                 err: None,
@@ -924,7 +925,7 @@ impl ECStore {
                         }
                     } else {
                         let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(fi, &bucket, &fi.name, {
+                            item: Some(ObjectInfo::from_file_info(fi, &bucket_for_merge, &fi.name, {
                                 if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
                             })),
                             err: None,
