@@ -940,7 +940,18 @@ impl ECStore {
 
         tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await });
 
-        join_all(futures).await;
+        let walk_results = join_all(futures).await;
+        for (idx, walk_result) in walk_results.into_iter().enumerate() {
+            if let Err(err) = walk_result {
+                error!(
+                    bucket = %bucket,
+                    prefix = %prefix,
+                    set_task_index = idx,
+                    error = ?err,
+                    "walk_internal list_path_raw task failed"
+                );
+            }
+        }
 
         Ok(())
     }
