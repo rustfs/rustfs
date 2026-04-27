@@ -41,9 +41,9 @@ const ENV_REMOTE_DELETE_BREAKER_THRESHOLD: &str = "RUSTFS_REMOTE_DELETE_BREAKER_
 const ENV_REMOTE_DELETE_BREAKER_WINDOW_SECS: &str = "RUSTFS_REMOTE_DELETE_BREAKER_WINDOW_SECS";
 const DEFAULT_REMOTE_DELETE_BREAKER_THRESHOLD: usize = 50;
 const DEFAULT_REMOTE_DELETE_BREAKER_WINDOW_SECS: usize = 30;
-const METRIC_DELETE_REMOTE_FAILED_TOTAL: &str = "delete.remote.failed_total";
-const METRIC_DELETE_REMOTE_BREAKER_TOTAL: &str = "delete.remote.breaker_total";
-const METRIC_DELETE_REMOTE_INFLIGHT: &str = "delete.remote.inflight";
+const METRIC_DELETE_REMOTE_FAILED_TOTAL: &str = "rustfs_delete_remote_failed_total";
+const METRIC_DELETE_REMOTE_BREAKER_TOTAL: &str = "rustfs_delete_remote_breaker_total";
+const METRIC_DELETE_REMOTE_INFLIGHT: &str = "rustfs_delete_remote_inflight";
 
 static REMOTE_DELETE_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
