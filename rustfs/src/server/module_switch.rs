@@ -260,6 +260,35 @@ mod tests {
 
     #[test]
     #[serial]
+    fn current_module_switch_snapshot_uses_defaults_when_persisted_file_is_absent() {
+        set_persisted_module_switches(
+            PersistedModuleSwitches {
+                notify_enabled: false,
+                audit_enabled: false,
+            },
+            false,
+        );
+
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, None::<&str>),
+                (rustfs_config::ENV_AUDIT_ENABLE, None::<&str>),
+            ],
+            || {
+                let snapshot = current_module_switch_snapshot();
+
+                assert_eq!(snapshot.notify_enabled, rustfs_config::DEFAULT_NOTIFY_ENABLE);
+                assert_eq!(snapshot.audit_enabled, rustfs_config::DEFAULT_AUDIT_ENABLE);
+                assert!(!snapshot.persisted_notify_enabled);
+                assert!(!snapshot.persisted_audit_enabled);
+                assert_eq!(snapshot.notify_source, ModuleSwitchSource::Default);
+                assert_eq!(snapshot.audit_source, ModuleSwitchSource::Default);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
     fn validate_module_switch_update_rejects_env_conflict() {
         with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"), || {
             let err = validate_module_switch_update(PersistedModuleSwitches {
