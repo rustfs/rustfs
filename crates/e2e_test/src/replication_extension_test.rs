@@ -255,6 +255,60 @@ async fn put_bucket_replication(
     Ok(())
 }
 
+async fn put_bucket_replication_rules(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    target_arns: &[&str],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut rules = String::new();
+    for (idx, target_arn) in target_arns.iter().enumerate() {
+        rules.push_str(&format!(
+            r#"
+  <Rule>
+    <ID>rule-{}</ID>
+    <Priority>{}</Priority>
+    <Status>Enabled</Status>
+    <DeleteMarkerReplication>
+      <Status>Enabled</Status>
+    </DeleteMarkerReplication>
+    <ExistingObjectReplication>
+      <Status>Enabled</Status>
+    </ExistingObjectReplication>
+    <Destination>
+      <Bucket>{}</Bucket>
+    </Destination>
+  </Rule>"#,
+            idx + 1,
+            idx + 1,
+            target_arn
+        ));
+    }
+
+    let body = format!(
+        r#"<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Role></Role>{rules}
+</ReplicationConfiguration>"#
+    );
+    let url = format!("{}/{bucket}?replication", env.url);
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(body.into_bytes()),
+        Some("application/xml"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("put bucket replication with multiple rules failed: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
 async fn delete_bucket_replication(
     env: &RustFSTestEnvironment,
     bucket: &str,
@@ -413,6 +467,33 @@ async fn admin_attach_policy_to_group(
     }
 
     Ok(())
+}
+
+async fn wait_for_replicated_object(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    expected_body: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+    loop {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(output) => {
+                let body = output.body.collect().await?.into_bytes();
+                let body = String::from_utf8(body.to_vec())?;
+                if body == expected_body {
+                    return Ok(());
+                }
+                return Err(format!("replicated object body mismatch: expected {expected_body}, got {body}").into());
+            }
+            Err(_err) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 async fn run_replication_check(
@@ -1514,6 +1595,55 @@ async fn test_delete_bucket_replication_removes_remote_target() -> Result<(), Bo
 
     let recreated_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
     put_bucket_replication(&source_env, source_bucket, &recreated_arn).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_single_bucket_replication_fans_out_to_multiple_targets() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env_a = RustFSTestEnvironment::new().await?;
+    target_env_a.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let mut target_env_b = RustFSTestEnvironment::new().await?;
+    target_env_b.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-fanout-src";
+    let target_bucket_a = "replication-fanout-dst-a";
+    let target_bucket_b = "replication-fanout-dst-b";
+    let object_key = "fanout.txt";
+    let body = "payload-fanout";
+
+    let source_client = source_env.create_s3_client();
+    let target_client_a = target_env_a.create_s3_client();
+    let target_client_b = target_env_b.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client_a.create_bucket().bucket(target_bucket_a).send().await?;
+    target_client_b.create_bucket().bucket(target_bucket_b).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env_a, target_bucket_a).await?;
+    enable_bucket_versioning(&target_env_b, target_bucket_b).await?;
+
+    let target_arn_a = set_replication_target(&source_env, source_bucket, &target_env_a, target_bucket_a).await?;
+    let target_arn_b = set_replication_target(&source_env, source_bucket, &target_env_b, target_bucket_b).await?;
+    put_bucket_replication_rules(&source_env, source_bucket, &[target_arn_a.as_str(), target_arn_b.as_str()]).await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from(body.as_bytes().to_vec()))
+        .send()
+        .await?;
+
+    wait_for_replicated_object(&target_client_a, target_bucket_a, object_key, body).await?;
+    wait_for_replicated_object(&target_client_b, target_bucket_b, object_key, body).await?;
 
     Ok(())
 }
