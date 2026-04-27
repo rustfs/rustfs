@@ -777,23 +777,27 @@ impl PeerRestClient {
     }
 
     pub async fn signal_service(&self, sig: u64, sub_sys: &str, dry_run: bool, _exec_at: SystemTime) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let mut vars = HashMap::new();
-        vars.insert(PEER_RESTSIGNAL.to_string(), sig.to_string());
-        vars.insert(PEER_RESTSUB_SYS.to_string(), sub_sys.to_string());
-        vars.insert(PEER_RESTDRY_RUN.to_string(), dry_run.to_string());
-        let request = Request::new(SignalServiceRequest {
-            vars: Some(Mss { value: vars }),
-        });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let mut vars = HashMap::new();
+            vars.insert(PEER_RESTSIGNAL.to_string(), sig.to_string());
+            vars.insert(PEER_RESTSUB_SYS.to_string(), sub_sys.to_string());
+            vars.insert(PEER_RESTDRY_RUN.to_string(), dry_run.to_string());
+            let request = Request::new(SignalServiceRequest {
+                vars: Some(Mss { value: vars }),
+            });
 
-        let response = client.signal_service(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.signal_service(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
+            Ok(())
         }
-        Ok(())
+        .await)
+        .await
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {
@@ -807,65 +811,81 @@ impl PeerRestClient {
     }
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(ReloadPoolMetaRequest {});
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(ReloadPoolMetaRequest {});
 
-        let response = client.reload_pool_meta(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.reload_pool_meta(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
-        }
 
-        Ok(())
+            Ok(())
+        }
+        .await)
+        .await
     }
 
     pub async fn stop_rebalance(&self) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(StopRebalanceRequest {});
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(StopRebalanceRequest {});
 
-        let response = client.stop_rebalance(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.stop_rebalance(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
-        }
 
-        Ok(())
+            Ok(())
+        }
+        .await)
+        .await
     }
 
     pub async fn load_rebalance_meta(&self, start_rebalance: bool) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(LoadRebalanceMetaRequest { start_rebalance });
 
-        let response = client.load_rebalance_meta(request).await?.into_inner();
+            let response = client.load_rebalance_meta(request).await?.into_inner();
 
-        warn!("load_rebalance_meta response {:?}, grid_host: {:?}", response, &self.grid_host);
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            warn!("load_rebalance_meta response {:?}, grid_host: {:?}", response, &self.grid_host);
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
-        }
 
-        Ok(())
+            Ok(())
+        }
+        .await)
+        .await
     }
 
     pub async fn load_transition_tier_config(&self) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(LoadTransitionTierConfigRequest {});
+        self.finalize_result(async {
+            let mut client = self.get_client().await?;
+            let request = Request::new(LoadTransitionTierConfigRequest {});
 
-        let response = client.load_transition_tier_config(request).await?.into_inner();
-        if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
+            let response = client.load_transition_tier_config(request).await?.into_inner();
+            if !response.success {
+                if let Some(msg) = response.error_info {
+                    return Err(Error::other(msg));
+                }
+                return Err(Error::other(""));
             }
-            return Err(Error::other(""));
-        }
 
-        Ok(())
+            Ok(())
+        }
+        .await)
+        .await
     }
 }
 
