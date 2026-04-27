@@ -339,7 +339,7 @@ impl RemoteDisk {
                     && is_network_like_disk_error(err)
                 {
                     counter!(
-                        "rustfs_drive_op_timeout_total",
+                        "rustfs_drive_op_network_error_total",
                         "endpoint" => self.endpoint.to_string(),
                         "op" => op.to_string()
                     )

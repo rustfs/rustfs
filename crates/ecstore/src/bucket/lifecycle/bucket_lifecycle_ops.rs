@@ -1257,6 +1257,14 @@ fn should_defer_date_expiry_for_recent_config_update(lc: &BucketLifecycleConfigu
     })
 }
 
+async fn apply_existing_object_expiry(api: Arc<ECStore>, object: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
+    if object.is_remote() {
+        apply_expiry_on_transitioned_object(api, object, event, src).await;
+    } else {
+        apply_expiry_on_non_transitioned_objects(api, object, event, src).await;
+    }
+}
+
 pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     let Ok((lc, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
         return Ok(());
@@ -1269,6 +1277,7 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
     let mut marker = None;
     let mut version_marker = None;
     let src = LcEventSrc::Scanner;
+    let defer_date_expiry_once = should_defer_date_expiry_for_recent_config_update(&lc, OffsetDateTime::now_utc());
     let mut date_expiry_deferred_once = false;
 
     loop {
@@ -1288,19 +1297,14 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
                 | IlmAction::DelMarkerDeleteAllVersionsAction => {
                     let now = OffsetDateTime::now_utc();
                     if event.due.is_some_and(|due| due.unix_timestamp() <= now.unix_timestamp()) {
-                        let is_date_expiration_rule = lifecycle_rule_has_date_expiration(&lc, &event.rule_id);
-                        if !date_expiry_deferred_once
-                            && is_date_expiration_rule
-                            && should_defer_date_expiry_for_recent_config_update(&lc, now)
+                        if defer_date_expiry_once
+                            && !date_expiry_deferred_once
+                            && lifecycle_rule_has_date_expiration(&lc, &event.rule_id)
                         {
                             tokio::time::sleep(StdDuration::from_secs(DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS as u64)).await;
                             date_expiry_deferred_once = true;
                         }
-                        if object.is_remote() {
-                            apply_expiry_on_transitioned_object(api.clone(), object, &event, &src).await;
-                        } else {
-                            apply_expiry_on_non_transitioned_objects(api.clone(), object, &event, &src).await;
-                        }
+                        apply_existing_object_expiry(api.clone(), object, &event, &src).await;
                     } else {
                         apply_expiry_rule(&event, &src, object).await;
                     }
