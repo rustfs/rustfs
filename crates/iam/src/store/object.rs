@@ -369,9 +369,17 @@ impl ObjectStore {
 
         let path = prefix.to_owned();
         tokio::spawn(async move {
-            store
+            if let Err(err) = store
                 .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, WalkOptions::default())
                 .await
+            {
+                error!(
+                    bucket = Self::BUCKET_NAME,
+                    prefix = %path,
+                    error = ?err,
+                    "list_iam_config_items walk task failed"
+                );
+            }
         });
 
         let prefix = prefix.to_owned();
