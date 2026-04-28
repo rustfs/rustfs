@@ -113,7 +113,7 @@ RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 
  docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
  # 使用指定版本运行
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.68
+ docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:v1.0.0-beta.1
 ```
 
 您也可以使用 Docker Compose。使用根目录下的 `docker-compose.yml` 文件：
