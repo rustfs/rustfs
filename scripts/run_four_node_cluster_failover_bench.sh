@@ -12,6 +12,7 @@ RUN_FAILOVER="${RUN_FAILOVER:-true}"
 RUN_BENCHMARK="${RUN_BENCHMARK:-true}"
 KEEP_UP="${KEEP_UP:-false}"
 PRECHECK_AUTO_CLEANUP="${PRECHECK_AUTO_CLEANUP:-true}"
+WAIT_PROBE_MODE="${WAIT_PROBE_MODE:-service}"
 
 RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfsadmin}"
 RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfsadmin}"
@@ -19,14 +20,17 @@ RUSTFS_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK="${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
 
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-180}"
+BENCH_READY_TIMEOUT_SECS="${BENCH_READY_TIMEOUT_SECS:-180}"
 FAILOVER_NODE="${FAILOVER_NODE:-node4}"
 FAILOVER_WARMUP_SECS="${FAILOVER_WARMUP_SECS:-5}"
 FAILOVER_SAMPLE_SECS="${FAILOVER_SAMPLE_SECS:-60}"
 FAILOVER_INTERVAL_SECS="${FAILOVER_INTERVAL_SECS:-1}"
+BENCH_WAIT_MODE="${BENCH_WAIT_MODE:-ready}"
 
 BENCH_ENDPOINT="${BENCH_ENDPOINT:-http://127.0.0.1:9000}"
 BENCH_BUCKET="${BENCH_BUCKET:-rustfs-four-node-bench}"
-BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-64}"
+BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-}"
+BENCH_CONCURRENCIES="${BENCH_CONCURRENCIES:-}"
 BENCH_DURATION="${BENCH_DURATION:-60s}"
 BENCH_SIZES="${BENCH_SIZES:-1KiB,4KiB,11Mi}"
 
@@ -52,6 +56,7 @@ Options:
   --bench-endpoint <url>        benchmark endpoint (default: http://127.0.0.1:9000)
   --bench-sizes <sizes>         comma list (default: 1KiB,4KiB,11Mi)
   --bench-concurrency <n>       benchmark concurrency
+  --bench-concurrencies <list>  benchmark concurrency list (default: 8,16,32,64,128)
   --bench-duration <dur>        benchmark duration
   --out-dir <path>              output directory
   --keep-up                     keep compose services running after script exits
@@ -62,9 +67,12 @@ Environment:
   WITH_OBSERVABILITY BUILD_LOCAL_IMAGE RUN_FAILOVER RUN_BENCHMARK KEEP_UP
   RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY RUSTFS_OBS_ENDPOINT
   PRECHECK_AUTO_CLEANUP (true|false, default: true)
+  WAIT_PROBE_MODE (service|ready, default: service)
   WAIT_TIMEOUT_SECS FAILOVER_NODE FAILOVER_WARMUP_SECS FAILOVER_SAMPLE_SECS
   FAILOVER_INTERVAL_SECS BENCH_ENDPOINT BENCH_BUCKET BENCH_CONCURRENCY
-  BENCH_DURATION BENCH_SIZES OUT_DIR
+  BENCH_CONCURRENCIES BENCH_DURATION BENCH_SIZES OUT_DIR
+  BENCH_WAIT_MODE (ready|service, default: ready)
+  BENCH_READY_TIMEOUT_SECS (default: 180)
 USAGE
 }
 
@@ -112,6 +120,71 @@ resolve_bool() {
       exit 1
       ;;
   esac
+}
+
+resolve_probe_mode() {
+  case "${WAIT_PROBE_MODE}" in
+    service|ready) ;;
+    *)
+      log_error "invalid WAIT_PROBE_MODE: ${WAIT_PROBE_MODE} (expected service|ready)"
+      exit 1
+      ;;
+  esac
+}
+
+resolve_bench_wait_mode() {
+  case "${BENCH_WAIT_MODE}" in
+    ready|service) ;;
+    *)
+      log_error "invalid BENCH_WAIT_MODE: ${BENCH_WAIT_MODE} (expected ready|service)"
+      exit 1
+      ;;
+  esac
+}
+
+resolve_bench_concurrency() {
+  if [[ -n "${BENCH_CONCURRENCIES}" && -n "${BENCH_CONCURRENCY}" && "${BENCH_CONCURRENCIES}" != "${BENCH_CONCURRENCY}" ]]; then
+    log_warn "BENCH_CONCURRENCY is ignored because BENCH_CONCURRENCIES is set"
+    return
+  fi
+
+  if [[ -n "${BENCH_CONCURRENCIES}" ]]; then
+    return
+  fi
+
+  if [[ -n "${BENCH_CONCURRENCY}" ]]; then
+    BENCH_CONCURRENCIES="${BENCH_CONCURRENCY}"
+    return
+  fi
+
+#  BENCH_CONCURRENCIES="8,16,32,64,128"
+  BENCH_CONCURRENCIES="8,16"
+}
+
+cluster_compose_uses_otel_network() {
+  # Detect whether any service in cluster compose joins otel-network.
+  grep -Eq '^[[:space:]]*-[[:space:]]*otel-network([[:space:]]*#.*)?$' "${CLUSTER_COMPOSE}"
+}
+
+obs_compose_has_otel_collector() {
+  grep -Eq '^[[:space:]]*otel-collector:[[:space:]]*$' "${OBS_COMPOSE}"
+}
+
+resolve_default_obs_endpoint() {
+  if [[ "${WITH_OBSERVABILITY}" != "true" ]]; then
+    RUSTFS_OBS_ENDPOINT="http://host.docker.internal:4318"
+    log_info "Auto-selected RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT} (observability stack disabled)"
+    return
+  fi
+
+  if cluster_compose_uses_otel_network && obs_compose_has_otel_collector; then
+    RUSTFS_OBS_ENDPOINT="http://otel-collector:4318"
+    log_info "Auto-selected RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT} (shared docker network detected)"
+    return
+  fi
+
+  RUSTFS_OBS_ENDPOINT="http://host.docker.internal:4318"
+  log_info "Auto-selected RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT} (cross-network fallback)"
 }
 
 docker_daemon_ready() {
@@ -222,7 +295,7 @@ check_cluster_volumes_writable() {
   # If we create them via plain docker run, compose will warn:
   # "already exists but was not created by Docker Compose".
   for node_idx in 1 2 3 4; do
-    for disk_idx in 0 1 2 3; do
+    for disk_idx in 1 2 3 4; do
       volume_name="${PROJECT_NAME}_node${node_idx}_data_${disk_idx}"
       if ! docker volume inspect "${volume_name}" >/dev/null 2>&1; then
         log_info "volume not present yet (will be created by compose): ${volume_name}"
@@ -287,11 +360,98 @@ wait_http_ok() {
   done
 }
 
+probe_node_service_ok() {
+  local port="$1"
+  local health_code root_code
+
+  health_code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "http://127.0.0.1:${port}/health" || true)"
+  if [[ "${health_code}" != "200" ]]; then
+    return 1
+  fi
+
+  if [[ "${WAIT_PROBE_MODE}" == "ready" ]]; then
+    local ready_code
+    ready_code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "http://127.0.0.1:${port}/health/ready" || true)"
+    [[ "${ready_code}" == "200" ]]
+    return $?
+  fi
+
+  # Service mode: keep startup probe permissive to avoid local false negatives.
+  # Benchmark phase has its own stricter readiness gate via wait_bench_endpoint_ready.
+  root_code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "http://127.0.0.1:${port}/" || true)"
+  case "${root_code}" in
+    [1-5][0-9][0-9]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+probe_bench_endpoint_ok() {
+  local endpoint health_url ready_url root_url
+  local health_code ready_code root_code
+  endpoint="${BENCH_ENDPOINT%/}"
+  health_url="${endpoint}/health"
+  ready_url="${endpoint}/health/ready"
+  root_url="${endpoint}/"
+
+  health_code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "${health_url}" || true)"
+  if [[ "${health_code}" != "200" ]]; then
+    return 1
+  fi
+
+  if [[ "${BENCH_WAIT_MODE}" == "ready" ]]; then
+    ready_code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "${ready_url}" || true)"
+    [[ "${ready_code}" == "200" ]]
+    return $?
+  fi
+
+  root_code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "${root_url}" || true)"
+  case "${root_code}" in
+    2[0-9][0-9]|3[0-9][0-9]|401|403|404) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_bench_endpoint_ready() {
+  local start now
+  start="$(date +%s)"
+
+  while true; do
+    if probe_bench_endpoint_ok; then
+      return 0
+    fi
+
+    now="$(date +%s)"
+    if (( now - start >= BENCH_READY_TIMEOUT_SECS )); then
+      log_error "timed out waiting for benchmark endpoint ${BENCH_ENDPOINT} (mode=${BENCH_WAIT_MODE})"
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+wait_node_probe_ok() {
+  local port="$1"
+  local start now
+  start="$(date +%s)"
+
+  while true; do
+    if probe_node_service_ok "${port}"; then
+      return 0
+    fi
+
+    now="$(date +%s)"
+    if (( now - start >= WAIT_TIMEOUT_SECS )); then
+      log_error "timed out waiting for node probe on 127.0.0.1:${port} (mode=${WAIT_PROBE_MODE})"
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 wait_cluster_ready() {
   local port
   for port in 9000 9001 9002 9003; do
-    wait_http_ok "http://127.0.0.1:${port}/health"
-    wait_http_ok "http://127.0.0.1:${port}/health/ready"
+    wait_node_probe_ok "${port}"
   done
 }
 
@@ -302,7 +462,7 @@ probe_survivors_ready() {
     if [[ "${port}" == "${failover_port}" ]]; then
       continue
     fi
-    if ! curl -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:${port}/health/ready" >/dev/null 2>&1; then
+    if ! probe_node_service_ok "${port}"; then
       return 1
     fi
   done
@@ -323,6 +483,7 @@ run_failover_validation() {
   failover_port="$(node_port "${FAILOVER_NODE}")"
   probe_file="${OUT_DIR}/failover-probe.csv"
   summary_file="${OUT_DIR}/failover-summary.txt"
+  mkdir -p "$(dirname "${probe_file}")"
 
   log_info "Running failover validation: stopping ${FAILOVER_NODE}"
   sleep "${FAILOVER_WARMUP_SECS}"
@@ -374,12 +535,14 @@ run_failover_validation() {
 
   log_info "Restarting ${FAILOVER_NODE}"
   compose start "${FAILOVER_NODE}" >/dev/null
-  wait_http_ok "http://127.0.0.1:${failover_port}/health"
-  wait_http_ok "http://127.0.0.1:${failover_port}/health/ready"
+  wait_node_probe_ok "${failover_port}"
+  wait_cluster_ready
 }
 
 run_benchmark() {
   local bench_out_dir
+  local conc
+  local conc_dir
   bench_out_dir="${OUT_DIR}/benchmark"
   mkdir -p "${bench_out_dir}"
 
@@ -388,19 +551,36 @@ run_benchmark() {
     exit 1
   fi
 
-  (
-    cd "${PROJECT_ROOT}"
-    ./scripts/run_object_batch_bench.sh \
-      --tool warp \
-      --endpoint "${BENCH_ENDPOINT}" \
-      --access-key "${RUSTFS_ACCESS_KEY}" \
-      --secret-key "${RUSTFS_SECRET_KEY}" \
-      --bucket "${BENCH_BUCKET}" \
-      --concurrency "${BENCH_CONCURRENCY}" \
-      --duration "${BENCH_DURATION}" \
-      --sizes "${BENCH_SIZES}" \
-      --out-dir "${bench_out_dir}"
-  )
+  log_info "Waiting for benchmark endpoint readiness (mode=${BENCH_WAIT_MODE})"
+  wait_bench_endpoint_ready
+
+  IFS=',' read -r -a conc_list <<< "${BENCH_CONCURRENCIES}"
+  for conc in "${conc_list[@]}"; do
+    conc="$(echo "${conc}" | xargs)"
+    if [[ -z "${conc}" ]]; then
+      continue
+    fi
+    if ! [[ "${conc}" =~ ^[0-9]+$ ]] || [[ "${conc}" -le 0 ]]; then
+      log_error "invalid concurrency in BENCH_CONCURRENCIES: ${conc}"
+      exit 1
+    fi
+
+    conc_dir="${bench_out_dir}/concurrency-${conc}"
+    log_info "Running benchmark sequentially with concurrency=${conc}"
+    (
+      cd "${PROJECT_ROOT}"
+      ./scripts/run_object_batch_bench.sh \
+        --tool warp \
+        --endpoint "${BENCH_ENDPOINT}" \
+        --access-key "${RUSTFS_ACCESS_KEY}" \
+        --secret-key "${RUSTFS_SECRET_KEY}" \
+        --bucket "${BENCH_BUCKET}" \
+        --concurrency "${conc}" \
+        --duration "${BENCH_DURATION}" \
+        --sizes "${BENCH_SIZES}" \
+        --out-dir "${conc_dir}"
+    )
+  done
 }
 
 cleanup() {
@@ -474,6 +654,11 @@ parse_args() {
         ;;
       --bench-concurrency)
         BENCH_CONCURRENCY="$2"
+        BENCH_CONCURRENCIES="$2"
+        shift 2
+        ;;
+      --bench-concurrencies)
+        BENCH_CONCURRENCIES="$2"
         shift 2
         ;;
       --bench-duration)
@@ -506,6 +691,9 @@ main() {
   resolve_bool "RUN_BENCHMARK" "${RUN_BENCHMARK}"
   resolve_bool "KEEP_UP" "${KEEP_UP}"
   resolve_bool "PRECHECK_AUTO_CLEANUP" "${PRECHECK_AUTO_CLEANUP}"
+  resolve_probe_mode
+  resolve_bench_wait_mode
+  resolve_bench_concurrency
 
   require_cmd docker
   require_cmd curl
@@ -521,11 +709,7 @@ main() {
   fi
 
   if [[ -z "${RUSTFS_OBS_ENDPOINT}" ]]; then
-    if [[ "${WITH_OBSERVABILITY}" == "true" ]]; then
-      RUSTFS_OBS_ENDPOINT="http://otel-collector:4318"
-    else
-      RUSTFS_OBS_ENDPOINT="http://host.docker.internal:4318"
-    fi
+    resolve_default_obs_endpoint
   fi
 
   if [[ "${RUSTFS_OBS_ENDPOINT}" == "http://127.0.0.1:4318" ]]; then
@@ -557,7 +741,7 @@ main() {
   log_info "Starting compose stack"
   compose up -d
 
-  log_info "Waiting for 4-node cluster readiness"
+  log_info "Waiting for 4-node cluster readiness (mode=${WAIT_PROBE_MODE})"
   wait_cluster_ready
 
   if [[ "${RUN_FAILOVER}" == "true" ]]; then

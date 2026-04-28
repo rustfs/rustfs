@@ -21,11 +21,11 @@ services:
     hostname: node1
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
-      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://127.0.0.1:4318}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
     extra_hosts:
@@ -48,11 +48,11 @@ services:
     hostname: node2
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
-      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://127.0.0.1:4318}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
     extra_hosts:
@@ -75,11 +75,11 @@ services:
     hostname: node3
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
-      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://127.0.0.1:4318}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
     extra_hosts:
@@ -102,11 +102,11 @@ services:
     hostname: node4
     environment:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
-      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
-      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://127.0.0.1:4318}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
     extra_hosts:
