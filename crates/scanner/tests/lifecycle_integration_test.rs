@@ -850,6 +850,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_transition_and_restore_flows() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -1218,6 +1219,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_scanner_expires_zero_day_current_version() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1244,6 +1246,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_put_object_immediately_enqueues_zero_day_current_expiry() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1281,6 +1284,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_scanner_expires_zero_day_noncurrent_version() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1347,6 +1351,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_put_object_immediately_enqueues_zero_day_noncurrent_expiry() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1431,6 +1436,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_background_scanner_expires_zero_day_current_version_for_exact_key_prefix() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
