@@ -24,16 +24,16 @@ static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
 pub(crate) static OBSERVABILITY_METRIC_ENABLED: OnceCell<bool> = OnceCell::const_new();
 
 /// Namespaced metrics for cleaner and rolling logging.
-pub(crate) const METRIC_LOG_CLEANER_DELETED_FILES_TOTAL: &str = "rustfs.log_cleaner.deleted_files_total";
-pub(crate) const METRIC_LOG_CLEANER_FREED_BYTES_TOTAL: &str = "rustfs.log_cleaner.freed_bytes_total";
-pub(crate) const METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS: &str = "rustfs.log_cleaner.compress_duration_seconds";
-pub(crate) const METRIC_LOG_CLEANER_STEAL_SUCCESS_RATE: &str = "rustfs.log_cleaner.steal_success_rate";
-pub(crate) const METRIC_LOG_CLEANER_RUNS_TOTAL: &str = "rustfs.log_cleaner.runs_total";
-pub(crate) const METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL: &str = "rustfs.log_cleaner.run_failures_total";
-pub(crate) const METRIC_LOG_CLEANER_ROTATION_TOTAL: &str = "rustfs.log_cleaner.rotation_total";
-pub(crate) const METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL: &str = "rustfs.log_cleaner.rotation_failures_total";
-pub(crate) const METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS: &str = "rustfs.log_cleaner.rotation_duration_seconds";
-pub(crate) const METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES: &str = "rustfs.log_cleaner.active_file_size_bytes";
+pub(crate) const METRIC_LOG_CLEANER_DELETED_FILES_TOTAL: &str = "rustfs_log_cleaner_deleted_files_total";
+pub(crate) const METRIC_LOG_CLEANER_FREED_BYTES_TOTAL: &str = "rustfs_log_cleaner_freed_bytes_total";
+pub(crate) const METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS: &str = "rustfs_log_cleaner_compress_duration_seconds";
+pub(crate) const METRIC_LOG_CLEANER_STEAL_SUCCESS_RATE: &str = "rustfs_log_cleaner_steal_success_rate";
+pub(crate) const METRIC_LOG_CLEANER_RUNS_TOTAL: &str = "rustfs_log_cleaner_runs_total";
+pub(crate) const METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL: &str = "rustfs_log_cleaner_run_failures_total";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_TOTAL: &str = "rustfs_log_cleaner_rotation_total";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL: &str = "rustfs_log_cleaner_rotation_failures_total";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS: &str = "rustfs_log_cleaner_rotation_duration_seconds";
+pub(crate) const METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES: &str = "rustfs_log_cleaner_active_file_size_bytes";
 
 /// Check whether Observability metric is enabled
 pub fn observability_metric_enabled() -> bool {
@@ -198,8 +198,8 @@ mod tests {
 
         for metric in metrics {
             assert!(
-                metric.starts_with("rustfs.log_cleaner."),
-                "metric '{metric}' should use rustfs.log_cleaner.* namespace"
+                metric.starts_with("rustfs_log_cleaner_"),
+                "metric '{metric}' should use rustfs_log_cleaner_* namespace"
             );
         }
     }

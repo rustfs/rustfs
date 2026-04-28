@@ -93,6 +93,18 @@ pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
     Ok(stat1.st_dev == stat2.st_dev)
 }
 
+pub fn get_physical_device_ids(disk: &str) -> std::io::Result<Vec<String>> {
+    let stat = rustix::fs::stat(disk)?;
+    let major = rustix::fs::major(stat.st_dev);
+    let minor = rustix::fs::minor(stat.st_dev);
+
+    Ok(vec![format!("{major}:{minor}")])
+}
+
+pub fn check_cross_device_mounts(_paths: &[String]) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn get_drive_stats(_major: u32, _minor: u32) -> std::io::Result<IOStats> {
     Ok(IOStats::default())

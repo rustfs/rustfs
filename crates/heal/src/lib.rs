@@ -17,6 +17,7 @@ pub mod heal;
 
 pub use error::{Error, Result};
 pub use heal::{HealManager, HealOptions, HealPriority, HealRequest, HealType, channel::HealChannelProcessor};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -55,6 +56,8 @@ static GLOBAL_HEAL_MANAGER: OnceLock<Arc<HealManager>> = OnceLock::new();
 
 /// Global heal channel processor instance
 static GLOBAL_HEAL_CHANNEL_PROCESSOR: OnceLock<Arc<tokio::sync::Mutex<HealChannelProcessor>>> = OnceLock::new();
+static GLOBAL_HEAL_ACTIVE_TASKS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_HEAL_QUEUE_LENGTH: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize and start heal manager with channel processor
 pub async fn init_heal_manager(
@@ -106,4 +109,20 @@ pub fn get_heal_manager() -> Option<&'static Arc<HealManager>> {
 /// Get global heal channel processor instance
 pub fn get_heal_channel_processor() -> Option<&'static Arc<tokio::sync::Mutex<HealChannelProcessor>>> {
     GLOBAL_HEAL_CHANNEL_PROCESSOR.get()
+}
+
+pub fn current_heal_active_tasks() -> u64 {
+    GLOBAL_HEAL_ACTIVE_TASKS.load(Ordering::Relaxed)
+}
+
+pub fn current_heal_queue_length() -> u64 {
+    GLOBAL_HEAL_QUEUE_LENGTH.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_heal_active_tasks(count: usize) {
+    GLOBAL_HEAL_ACTIVE_TASKS.store(count as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn set_heal_queue_length(count: usize) {
+    GLOBAL_HEAL_QUEUE_LENGTH.store(count as u64, Ordering::Relaxed);
 }

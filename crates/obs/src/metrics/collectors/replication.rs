@@ -25,6 +25,14 @@ use crate::metrics::schema::replication::*;
 /// Replication statistics.
 #[derive(Debug, Clone, Default)]
 pub struct ReplicationStats {
+    /// Average number of active replication workers
+    pub average_active_workers: f64,
+    /// Average queued bytes since server start
+    pub average_queued_bytes: i64,
+    /// Average queued objects since server start
+    pub average_queued_count: i64,
+    /// Average data transfer rate in bytes/sec
+    pub average_data_transfer_rate: f64,
     /// Number of active replication workers
     pub active_workers: u64,
     /// Current data transfer rate in bytes/sec
@@ -50,6 +58,10 @@ pub struct ReplicationStats {
 /// Returns a vector of Prometheus metrics for replication statistics.
 pub fn collect_replication_metrics(stats: &ReplicationStats) -> Vec<PrometheusMetric> {
     vec![
+        PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_ACTIVE_WORKERS_MD, stats.average_active_workers),
+        PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_QUEUED_BYTES_MD, stats.average_queued_bytes as f64),
+        PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_QUEUED_COUNT_MD, stats.average_queued_count as f64),
+        PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_DATA_TRANSFER_RATE_MD, stats.average_data_transfer_rate),
         PrometheusMetric::from_descriptor(&REPLICATION_CURRENT_ACTIVE_WORKERS_MD, stats.active_workers as f64),
         PrometheusMetric::from_descriptor(&REPLICATION_CURRENT_DATA_TRANSFER_RATE_MD, stats.current_data_transfer_rate),
         PrometheusMetric::from_descriptor(&REPLICATION_LAST_MINUTE_QUEUED_BYTES_MD, stats.last_minute_queued_bytes as f64),
@@ -70,6 +82,10 @@ mod tests {
     #[test]
     fn test_collect_replication_metrics() {
         let stats = ReplicationStats {
+            average_active_workers: 8.5,
+            average_queued_bytes: 1024 * 1024 * 40,
+            average_queued_count: 240,
+            average_data_transfer_rate: 1024.0 * 1024.0 * 3.0,
             active_workers: 10,
             current_data_transfer_rate: 1024.0 * 1024.0 * 5.0, // 5 MB/s
             last_minute_queued_bytes: 1024 * 1024 * 100,       // 100 MB
@@ -84,13 +100,17 @@ mod tests {
         let metrics = collect_replication_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 9);
+        assert_eq!(metrics.len(), 13);
 
         // Verify active workers
         let active_name = REPLICATION_CURRENT_ACTIVE_WORKERS_MD.get_full_metric_name();
         let active = metrics.iter().find(|m| m.name == active_name);
         assert!(active.is_some());
         assert_eq!(active.map(|m| m.value), Some(10.0));
+
+        let avg_active_name = REPLICATION_AVERAGE_ACTIVE_WORKERS_MD.get_full_metric_name();
+        let avg_active = metrics.iter().find(|m| m.name == avg_active_name);
+        assert_eq!(avg_active.map(|m| m.value), Some(8.5));
     }
 
     #[test]
@@ -98,7 +118,7 @@ mod tests {
         let stats = ReplicationStats::default();
         let metrics = collect_replication_metrics(&stats);
 
-        assert_eq!(metrics.len(), 9);
+        assert_eq!(metrics.len(), 13);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());

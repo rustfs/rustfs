@@ -18,11 +18,11 @@
 //! `openidconnect` crate for standards-compliant discovery, token exchange,
 //! and ID token verification.
 
-use crate::oidc_state::{OidcAuthSession, OidcStateStore};
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata};
+use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
+use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
 use openidconnect::{
-    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
+    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, LogoutRequest, Nonce,
+    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl, Scope,
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
@@ -31,11 +31,11 @@ use rustfs_ecstore::config::{Config as ServerConfig, KVS, get_global_server_conf
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::RwLock;
+use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -44,6 +44,127 @@ use url::Url;
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
 const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
+const OIDC_PLUGIN_AUTHN_WINDOW: StdDuration = StdDuration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OidcPluginAuthnMetricsSnapshot {
+    pub failed_requests_minute: u64,
+    pub last_fail_seconds: u64,
+    pub last_succ_seconds: u64,
+    pub succ_avg_rtt_ms_minute: u64,
+    pub succ_max_rtt_ms_minute: u64,
+    pub total_requests_minute: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OidcPluginAuthnSample {
+    observed_at: Instant,
+    succeeded: bool,
+    rtt_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct OidcPluginAuthnMetrics {
+    samples: Mutex<VecDeque<OidcPluginAuthnSample>>,
+    last_fail_at: Mutex<Option<Instant>>,
+    last_succ_at: Mutex<Option<Instant>>,
+}
+
+fn lock_oidc_plugin_authn_metrics<'a, T>(mutex: &'a Mutex<T>, metric: &'static str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            warn!("recovering poisoned OIDC plugin authn metrics lock: {}", metric);
+            err.into_inner()
+        }
+    }
+}
+
+fn seconds_since(now: Instant, observed_at: Option<Instant>) -> u64 {
+    observed_at
+        .map(|instant| now.duration_since(instant).as_secs())
+        .unwrap_or_default()
+}
+
+impl OidcPluginAuthnMetrics {
+    fn record(&self, rtt_ms: u64, succeeded: bool) {
+        let now = Instant::now();
+        let mut samples = lock_oidc_plugin_authn_metrics(&self.samples, "samples");
+        samples.push_back(OidcPluginAuthnSample {
+            observed_at: now,
+            succeeded,
+            rtt_ms,
+        });
+        while samples
+            .front()
+            .is_some_and(|sample| now.duration_since(sample.observed_at) > OIDC_PLUGIN_AUTHN_WINDOW)
+        {
+            samples.pop_front();
+        }
+        drop(samples);
+
+        if succeeded {
+            *lock_oidc_plugin_authn_metrics(&self.last_succ_at, "last_succ_at") = Some(now);
+        } else {
+            *lock_oidc_plugin_authn_metrics(&self.last_fail_at, "last_fail_at") = Some(now);
+        }
+    }
+
+    fn snapshot(&self) -> OidcPluginAuthnMetricsSnapshot {
+        let now = Instant::now();
+        let (total_requests_minute, failed_requests_minute, succ_avg_rtt_ms_minute, succ_max_rtt_ms_minute) = {
+            let mut samples = lock_oidc_plugin_authn_metrics(&self.samples, "samples");
+            while samples
+                .front()
+                .is_some_and(|sample| now.duration_since(sample.observed_at) > OIDC_PLUGIN_AUTHN_WINDOW)
+            {
+                samples.pop_front();
+            }
+
+            let mut failed_requests_minute = 0u64;
+            let mut successful_requests = 0u64;
+            let mut successful_rtt_sum = 0u64;
+            let mut succ_max_rtt_ms_minute = 0u64;
+
+            for sample in samples.iter() {
+                if sample.succeeded {
+                    successful_requests += 1;
+                    successful_rtt_sum += sample.rtt_ms;
+                    succ_max_rtt_ms_minute = succ_max_rtt_ms_minute.max(sample.rtt_ms);
+                } else {
+                    failed_requests_minute += 1;
+                }
+            }
+
+            let succ_avg_rtt_ms_minute = successful_rtt_sum.checked_div(successful_requests).unwrap_or_default();
+
+            (
+                samples.len() as u64,
+                failed_requests_minute,
+                succ_avg_rtt_ms_minute,
+                succ_max_rtt_ms_minute,
+            )
+        };
+
+        let last_fail_seconds = seconds_since(now, *lock_oidc_plugin_authn_metrics(&self.last_fail_at, "last_fail_at"));
+        let last_succ_seconds = seconds_since(now, *lock_oidc_plugin_authn_metrics(&self.last_succ_at, "last_succ_at"));
+
+        OidcPluginAuthnMetricsSnapshot {
+            failed_requests_minute,
+            last_fail_seconds,
+            last_succ_seconds,
+            succ_avg_rtt_ms_minute,
+            succ_max_rtt_ms_minute,
+            total_requests_minute,
+        }
+    }
+}
+
+static OIDC_PLUGIN_AUTHN_METRICS: LazyLock<OidcPluginAuthnMetrics> = LazyLock::new(OidcPluginAuthnMetrics::default);
+
+pub fn oidc_plugin_authn_metrics_snapshot() -> OidcPluginAuthnMetricsSnapshot {
+    OIDC_PLUGIN_AUTHN_METRICS.snapshot()
+}
 
 // ---- HTTP Client Adapter ----
 
@@ -120,6 +241,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 
     fn call(&'c self, request: http::Request<Vec<u8>>) -> Self::Future {
         Box::pin(async move {
+            let started_at = Instant::now();
             let (parts, body) = request.into_parts();
             let uri = parts.uri.to_string();
             let client = self.client_for_uri(&uri);
@@ -128,8 +250,13 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                 .headers(parts.headers)
                 .body(body)
                 .send()
-                .await
-                .map_err(OidcHttpError::Reqwest)?;
+                .await;
+
+            let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let succeeded = response.as_ref().is_ok_and(|resp| resp.status().is_success());
+            OIDC_PLUGIN_AUTHN_METRICS.record(elapsed_ms, succeeded);
+
+            let response = response.map_err(OidcHttpError::Reqwest)?;
 
             let status = response.status();
             let headers = response.headers().clone();
@@ -216,7 +343,7 @@ pub struct OidcClaims {
 /// on-the-fly from metadata when needed.
 #[derive(Clone)]
 struct ProviderState {
-    metadata: CoreProviderMetadata,
+    metadata: ProviderMetadataWithLogout,
     discovered_at: Instant,
 }
 
@@ -364,7 +491,7 @@ impl OidcSys {
         state: &str,
         code: &str,
         redirect_uri: &str,
-    ) -> Result<(OidcClaims, String, OidcAuthSession), String> {
+    ) -> Result<(OidcClaims, String, OidcAuthSession, String), String> {
         // Retrieve and consume the state (single-use)
         let session = self
             .state_store
@@ -449,7 +576,63 @@ impl OidcSys {
             raw,
         };
 
-        Ok((claims, session.provider_id.clone(), session))
+        Ok((claims, session.provider_id.clone(), session, raw_jwt))
+    }
+
+    /// Store a one-time logout session keyed by an opaque token so the console can
+    /// trigger browser logout without persisting the raw ID token.
+    pub async fn create_logout_token(&self, provider_id: &str, id_token: &str) -> Result<String, String> {
+        if !self.configs.contains_key(provider_id) {
+            return Err(format!("unknown OIDC provider: {provider_id}"));
+        }
+
+        let token = CsrfToken::new_random().secret().clone();
+        self.state_store
+            .insert_logout(
+                token.clone(),
+                OidcLogoutSession {
+                    provider_id: provider_id.to_string(),
+                    id_token: id_token.to_string(),
+                },
+            )
+            .await;
+
+        Ok(token)
+    }
+
+    /// Build the RP-initiated logout URL for a previously issued logout token.
+    /// Returns `Ok(None)` when the provider does not advertise an end-session endpoint.
+    pub async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>, String> {
+        let session = self
+            .state_store
+            .take_logout(logout_token)
+            .await
+            .ok_or_else(|| "invalid or expired OIDC logout token".to_string())?;
+
+        let config = self
+            .configs
+            .get(&session.provider_id)
+            .ok_or_else(|| format!("unknown OIDC provider: {}", session.provider_id))?;
+        let state = self.ensure_provider_state(&session.provider_id, config).await?;
+        let Some(end_session_endpoint) = state.metadata.additional_metadata().end_session_endpoint.clone() else {
+            return Ok(None);
+        };
+
+        let id_token: CoreIdToken = session
+            .id_token
+            .parse()
+            .map_err(|e: serde_json::Error| format!("failed to parse ID token for logout: {e}"))?;
+        let post_logout_redirect_uri = PostLogoutRedirectUrl::new(post_logout_redirect_uri.to_string())
+            .map_err(|e| format!("invalid post logout redirect URI: {e}"))?;
+
+        let logout_url = LogoutRequest::from(end_session_endpoint)
+            .set_id_token_hint(&id_token)
+            .set_client_id(ClientId::new(config.client_id.clone()))
+            .set_post_logout_redirect_uri(post_logout_redirect_uri)
+            .http_get_url()
+            .to_string();
+
+        Ok(Some(logout_url))
     }
 
     /// Map OIDC claims to rustfs policy names.
@@ -930,7 +1113,7 @@ impl OidcSys {
             let issuer_url = IssuerUrl::new(candidate_issuer.clone()).map_err(|e| format!("invalid issuer URL: {e}"))?;
 
             for attempt in 0..OIDC_DISCOVERY_TRANSPORT_RETRIES {
-                match CoreProviderMetadata::discover_async(issuer_url.clone(), http_client)
+                match ProviderMetadataWithLogout::discover_async(issuer_url.clone(), http_client)
                     .await
                     .map_err(|e| format!("discovery failed: {e}"))
                 {
@@ -1416,7 +1599,9 @@ mod tests {
         use std::time::{Duration, Instant};
 
         // After the last completed response, exit if no new connection arrives within this window.
-        const IDLE_SHUTDOWN: Duration = Duration::from_millis(500);
+        // Keep the mock server alive long enough for slower CI/macOS test environments to finish
+        // discovery + JWKS requests without racing the shutdown timer.
+        const IDLE_SHUTDOWN: Duration = Duration::from_secs(1);
         const ABSOLUTE_CAP: Duration = Duration::from_secs(5);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1518,6 +1703,17 @@ mod tests {
         err.contains(base) && err.contains(&format!("{base}/")) && err.contains("discovery failed for all issuer variants")
     }
 
+    async fn validate_mocked_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
+        let http_client = ReqwestHttpClient::new()?;
+        let state = OidcSys::discover_provider(config, &http_client).await?;
+
+        Ok(OidcProviderValidationResult {
+            issuer: state.metadata.issuer().to_string(),
+            authorization_endpoint: state.metadata.authorization_endpoint().to_string(),
+            token_endpoint: state.metadata.token_endpoint().map(ToString::to_string),
+        })
+    }
+
     #[tokio::test]
     async fn test_validate_oidc_provider_config_retries_with_issuer_candidates() {
         // Discovery document must advertise the canonical issuer path. The first candidate has no
@@ -1526,7 +1722,7 @@ mod tests {
         let config_url = format!("{base}/application/o/rustfs");
         let config = build_mocked_oidc_provider_config("default", &config_url);
 
-        let result = validate_oidc_provider_config(&config).await;
+        let result = validate_mocked_oidc_provider_config(&config).await;
 
         let validation_result = result.expect("OIDC provider validation should succeed");
         assert_eq!(validation_result.issuer, format!("{base}/application/o/rustfs/"));
@@ -1539,7 +1735,7 @@ mod tests {
         let config_url = format!("{base}/application/o/rustfs");
         let config = build_mocked_oidc_provider_config("default", &config_url);
 
-        let err = validate_oidc_provider_config(&config)
+        let err = validate_mocked_oidc_provider_config(&config)
             .await
             .expect_err("OIDC provider validation should fail");
         assert!(discovery_error_contains_all_variants(&err, &base));

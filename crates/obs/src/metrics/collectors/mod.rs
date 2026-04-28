@@ -41,7 +41,10 @@ pub mod system_process;
 
 pub use audit::{AuditTargetStats, collect_audit_metrics};
 pub use bucket::{BucketStats, collect_bucket_metrics};
-pub use bucket_replication::{BucketReplicationBandwidthStats, collect_bucket_replication_bandwidth_metrics};
+pub use bucket_replication::{
+    BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats,
+    collect_bucket_replication_bandwidth_metrics, collect_bucket_replication_metrics,
+};
 pub use cluster::{ClusterStats, collect_cluster_metrics};
 pub use cluster_config::{ClusterConfigStats, collect_cluster_config_metrics};
 pub use cluster_erasure_set::{ErasureSetStats, collect_erasure_set_metrics};

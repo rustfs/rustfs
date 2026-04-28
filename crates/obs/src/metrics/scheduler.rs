@@ -35,8 +35,21 @@ use crate::metrics::collectors::{
     collect_audit_metrics,
     collect_bucket_metrics,
     collect_bucket_replication_bandwidth_metrics,
+    collect_bucket_replication_metrics,
+    collect_bucket_usage_metrics,
+    collect_cluster_config_metrics,
+    collect_cluster_health_metrics,
     collect_cluster_metrics,
+    collect_cluster_usage_metrics,
+    collect_cpu_metrics,
+    collect_drive_count_metrics,
+    collect_drive_detailed_metrics,
+    collect_erasure_set_metrics,
     collect_host_network_metrics,
+    collect_iam_metrics,
+    collect_ilm_metrics,
+    collect_memory_metrics,
+    collect_network_metrics,
     collect_node_metrics,
     collect_notification_metrics,
     collect_notification_target_metrics,
@@ -45,7 +58,9 @@ use crate::metrics::collectors::{
     collect_process_disk_metrics,
     collect_process_memory_metrics,
     collect_process_metrics,
+    collect_replication_metrics,
     collect_resource_metrics,
+    collect_scanner_metrics,
 };
 use crate::metrics::config::{
     DEFAULT_AUDIT_METRICS_INTERVAL, DEFAULT_BUCKET_METRICS_INTERVAL, DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
@@ -56,14 +71,18 @@ use crate::metrics::config::{
 };
 use crate::metrics::report::{PrometheusMetric, report_metrics};
 use crate::metrics::stats_collector::{
-    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_stats, collect_cluster_stats,
-    collect_disk_stats, collect_host_network_stats, collect_process_metric_bundle,
+    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_detail_stats,
+    collect_bucket_stats, collect_cluster_and_health_stats, collect_cluster_config_stats, collect_cluster_usage_metric_stats,
+    collect_disk_and_system_drive_stats, collect_erasure_set_stats, collect_host_network_stats, collect_iam_stats,
+    collect_ilm_metric_stats, collect_internode_network_stats, collect_process_metric_bundle, collect_replication_stats,
+    collect_scanner_metric_stats, collect_system_cpu_and_memory_stats_with,
 };
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use std::borrow::Cow;
 use std::time::Duration;
+use sysinfo::System;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -154,12 +173,53 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let stats = collect_cluster_stats().await;
-                    let metrics = collect_cluster_metrics(&stats);
+                    let (stats, cluster_health) = collect_cluster_and_health_stats().await;
+                    let mut metrics = collect_cluster_metrics(&stats);
+                    metrics.extend(collect_cluster_health_metrics(&cluster_health));
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
                     warn!("Metrics collection for cluster stats cancelled.");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Spawn task for supplementary cluster metrics that are defined in schema/collector
+    // but filled by later task-specific runtime sources.
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cluster_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let mut metrics = Vec::new();
+
+                    if let Some(stats) = collect_cluster_config_stats().await {
+                        metrics.extend(collect_cluster_config_metrics(&stats));
+                    }
+
+                    let erasure_sets = collect_erasure_set_stats().await;
+                    if !erasure_sets.is_empty() {
+                        metrics.extend(collect_erasure_set_metrics(&erasure_sets));
+                    }
+
+                    if let Some(stats) = collect_iam_stats().await {
+                        metrics.extend(collect_iam_metrics(&stats));
+                    }
+
+                    if let Some((cluster_usage, bucket_usage)) = collect_cluster_usage_metric_stats().await {
+                        metrics.extend(collect_cluster_usage_metrics(&cluster_usage));
+                        metrics.extend(collect_bucket_usage_metrics(&bucket_usage));
+                    }
+
+                    if !metrics.is_empty() {
+                        report_metrics(&metrics);
+                    }
+                }
+                _ = token_clone.cancelled() => {
+                    warn!("Metrics collection for supplementary cluster stats cancelled.");
                     return;
                 }
             }
@@ -192,8 +252,10 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let stats = collect_disk_stats().await;
-                    let metrics = collect_node_metrics(&stats);
+                    let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_stats().await;
+                    let mut metrics = collect_node_metrics(&disk_stats);
+                    metrics.extend(collect_drive_detailed_metrics(&drive_stats));
+                    metrics.extend(collect_drive_count_metrics(&drive_counts));
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
@@ -212,7 +274,11 @@ pub fn init_metrics_runtime(token: CancellationToken) {
             tokio::select! {
                 _ = interval.tick() => {
                     let stats = collect_bucket_replication_bandwidth_stats();
-                    let metrics = collect_bucket_replication_bandwidth_metrics(&stats);
+                    let mut metrics = collect_bucket_replication_bandwidth_metrics(&stats);
+                    let bucket_replication = collect_bucket_replication_detail_stats().await;
+                    metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
+                    let replication = collect_replication_stats().await;
+                    metrics.extend(collect_replication_metrics(&replication));
                     report_metrics(&metrics);
                 }
                 _ = token_clone.cancelled() => {
@@ -286,6 +352,35 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         }
     });
 
+    // Spawn task for background workflow metrics such as ILM and scanner.
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cluster_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let mut metrics = Vec::new();
+
+                    if let Some(stats) = collect_ilm_metric_stats().await {
+                        metrics.extend(collect_ilm_metrics(&stats));
+                    }
+
+                    if let Some(stats) = collect_scanner_metric_stats().await {
+                        metrics.extend(collect_scanner_metrics(&stats));
+                    }
+
+                    if !metrics.is_empty() {
+                        report_metrics(&metrics);
+                    }
+                }
+                _ = token_clone.cancelled() => {
+                    warn!("Metrics collection for background workflow stats cancelled.");
+                    return;
+                }
+            }
+        }
+    });
+
     // Spawn task for system monitoring metrics (migrated from rustfs-obs::system)
     let system_interval = get_env_opt_u64(ENV_SYSTEM_METRICS_INTERVAL)
         .or_else(|| get_env_opt_u64(LEGACY_SYSTEM_METRICS_INTERVAL).map(|ms| ms / 1000)) // Convert ms to seconds
@@ -294,9 +389,10 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_SYSTEM_METRICS_INTERVAL);
 
-    let token_clone = token;
+    let token_clone = token.clone();
     tokio::spawn(async move {
         let labels = current_process_metric_labels();
+        let mut host_system = System::new_all();
         let process_interval = resource_interval.min(system_interval);
         let mut interval = tokio::time::interval(process_interval);
         let now = Instant::now();
@@ -327,9 +423,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
 
                     if now >= next_system_run {
                         #[cfg(feature = "gpu")]
-                        let mut metrics = collect_system_monitoring_metrics(&bundle, &labels);
+                        let mut metrics = collect_system_monitoring_metrics(&bundle, &labels, &mut host_system);
                         #[cfg(not(feature = "gpu"))]
-                        let metrics = collect_system_monitoring_metrics(&bundle, &labels);
+                        let metrics = collect_system_monitoring_metrics(&bundle, &labels, &mut host_system);
 
                         #[cfg(feature = "gpu")]
                         if let Some(pid) = current_pid {
@@ -356,6 +452,28 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                 }
                 _ = token_clone.cancelled() => {
                     warn!("Process metrics collection cancelled.");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Spawn task for internode/system network metrics.
+    let token_clone = token;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(system_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Some(stats) = collect_internode_network_stats() {
+                        let metrics = collect_network_metrics(&stats);
+                        if !metrics.is_empty() {
+                            report_metrics(&metrics);
+                        }
+                    }
+                }
+                _ = token_clone.cancelled() => {
+                    warn!("Metrics collection for internode network stats cancelled.");
                     return;
                 }
             }
@@ -418,6 +536,7 @@ fn fallback_process_metric_labels(err: ProcessAttributeError) -> Vec<(&'static s
 fn collect_system_monitoring_metrics(
     bundle: &ProcessMetricBundle,
     labels: &[(&'static str, Cow<'static, str>)],
+    host_system: &mut System,
 ) -> Vec<PrometheusMetric> {
     let cpu_stats = ProcessCpuStats {
         usage: bundle.resource.cpu_percent,
@@ -432,8 +551,11 @@ fn collect_system_monitoring_metrics(
         written_bytes: bundle.disk_write_bytes,
     };
     let network_stats = collect_host_network_stats();
+    let (system_cpu_stats, system_memory_stats) = collect_system_cpu_and_memory_stats_with(host_system);
 
     let mut metrics = Vec::new();
+    metrics.extend(collect_cpu_metrics(&system_cpu_stats));
+    metrics.extend(collect_memory_metrics(&system_memory_stats));
     metrics.extend(collect_process_cpu_metrics(&cpu_stats, Some(labels)));
     metrics.extend(collect_process_memory_metrics(&memory_stats, Some(labels)));
     metrics.extend(collect_process_disk_metrics(&disk_stats, Some(labels)));

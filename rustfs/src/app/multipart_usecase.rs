@@ -432,7 +432,6 @@ impl DefaultMultipartUsecase {
         let mt2 = HashMap::new();
         let replicate_options =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-
         let dsc = must_replicate(&bucket, &key, replicate_options).await;
 
         if dsc.replicate_any() {
