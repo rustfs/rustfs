@@ -80,7 +80,9 @@ The library selects a backend automatically based on configuration:
 
 ```
 1. Any OTLP endpoint set?
-   └─ YES → Full OTLP/HTTP pipeline (traces + metrics + logs + profiling)
+   └─ YES → Full OTLP/HTTP pipeline (traces + metrics + logs)
+            + Profiling (Pyroscope) only if:
+              - RUSTFS_OBS_PROFILING_EXPORT_ENABLED=true (explicit opt-in, default: false)
 
 2. RUSTFS_OBS_LOG_DIRECTORY set to a non-empty path?
    └─ YES → Rolling-file JSON logging
@@ -117,7 +119,7 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_TRACES_EXPORT_ENABLED`    | `true`    | Toggle trace export                                        |
 | `RUSTFS_OBS_METRICS_EXPORT_ENABLED`   | `true`    | Toggle metrics export                                      |
 | `RUSTFS_OBS_LOGS_EXPORT_ENABLED`      | `true`    | Toggle OTLP log export                                     |
-| `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `true`    | Toggle profiling export                                    |
+| `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `false`   | Toggle profiling export                                    |
 | `RUSTFS_OBS_USE_STDOUT`               | `false`   | Mirror all signals to stdout alongside OTLP                |
 | `RUSTFS_OBS_SAMPLE_RATIO`             | `0.1`     | Trace sampling ratio `0.0`–`1.0`                           |
 | `RUSTFS_OBS_METER_INTERVAL`           | `15`      | Metrics export interval (seconds)                          |

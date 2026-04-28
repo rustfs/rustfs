@@ -65,9 +65,10 @@ data:
     {{- end }}
     {{- if .profiling.enabled }}
   RUSTFS_OBS_PROFILING_ENDPOINT: {{ .profiling.endpoint | quote }}
+  RUSTFS_OBS_PROFILING_EXPORT_ENABLED: "true"
     {{- else }}
   RUSTFS_OBS_PROFILING_ENDPOINT: ""
-  RUSTFS_OBS_PROFILING_ENABLED: "false"
+  RUSTFS_OBS_PROFILING_EXPORT_ENABLED: "false"
     {{- end }}
   {{- end }}
   {{- end }}
