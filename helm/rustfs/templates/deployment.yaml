@@ -14,9 +14,10 @@ metadata:
 spec:
   replicas: 1
   {{- with .Values.mode.standalone.strategy }}
+  {{- $type := default "RollingUpdate" .type }}
   strategy:
-    type: {{ .type }}
-    {{- if and (eq .type "RollingUpdate") .rollingUpdate }}
+    type: {{ $type }}
+    {{- if and (eq $type "RollingUpdate") .rollingUpdate }}
     rollingUpdate:
       {{- toYaml .rollingUpdate | nindent 6 }}
     {{- end }}
