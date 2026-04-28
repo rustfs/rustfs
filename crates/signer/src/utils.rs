@@ -60,3 +60,56 @@ where
 {
     v.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{HostAddrError, try_get_host_addr};
+    use http::HeaderValue;
+    use http::request;
+    use s3s::Body;
+
+    #[test]
+    fn try_get_host_addr_prefers_explicit_host_header_when_it_differs_from_uri() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://bucket.example.com/object")
+            .body(Body::empty())
+            .expect("request should build");
+        req.headers_mut()
+            .insert("host", HeaderValue::from_static("proxy.internal:9443"));
+
+        let host = try_get_host_addr(&req).expect("host lookup should succeed");
+
+        assert_eq!(host, "proxy.internal:9443");
+    }
+
+    #[test]
+    fn try_get_host_addr_rejects_non_utf8_host_header_value() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://bucket.example.com/object")
+            .body(Body::empty())
+            .expect("request should build");
+        req.headers_mut().insert(
+            "host",
+            HeaderValue::from_bytes(&[0xFF]).expect("invalid utf8 bytes should be accepted by HeaderValue"),
+        );
+
+        let err = try_get_host_addr(&req).expect_err("invalid host header should fail");
+
+        assert!(matches!(err, HostAddrError::InvalidHostHeader));
+    }
+
+    #[test]
+    fn try_get_host_addr_rejects_relative_uri_without_host() {
+        let req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("/object")
+            .body(Body::empty())
+            .expect("request should build");
+
+        let err = try_get_host_addr(&req).expect_err("relative uri should fail");
+
+        assert!(matches!(err, HostAddrError::MissingUriHost));
+    }
+}

@@ -72,3 +72,34 @@ pub(crate) fn error_chain_contains_signer_header_marker(err: &(dyn StdError + 's
 
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{error_chain_contains_signer_header_marker, invalid_utf8_header_error, signer_error_to_io_error};
+
+    #[test]
+    fn invalid_utf8_header_error_is_detected_through_error_chain() {
+        let err = invalid_utf8_header_error("failed to sign request", "x-amz-meta-invalid");
+
+        assert!(error_chain_contains_signer_header_marker(&err));
+    }
+
+    #[test]
+    fn mapped_signer_header_error_is_detected_through_error_chain() {
+        let err = signer_error_to_io_error(
+            "failed to sign request",
+            rustfs_signer::SignV4Error::InvalidHeaderValue {
+                name: "x-amz-meta-invalid".to_string(),
+            },
+        );
+
+        assert!(error_chain_contains_signer_header_marker(&err));
+    }
+
+    #[test]
+    fn generic_io_errors_do_not_match_signer_header_marker() {
+        let err = std::io::Error::other("unrelated failure");
+
+        assert!(!error_chain_contains_signer_header_marker(&err));
+    }
+}
