@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM rust:1.91-trixie
+FROM rust:1.93-trixie
 
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \

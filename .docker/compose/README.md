@@ -36,6 +36,24 @@ To start a 4-node cluster for distributed testing:
 docker compose -f .docker/compose/docker-compose.cluster.yaml up -d
 ```
 
+### Script-Based 4-Node Validation (Recommended)
+
+Use the local validation script when you need local-source image build, failover checks,
+and benchmark workflow in one command:
+
+```bash
+# Default mode: WAIT_PROBE_MODE=service
+# This avoids false negatives where /health/ready remains 503 locally
+# while the service path is already available.
+./scripts/run_four_node_cluster_failover_bench.sh
+```
+
+Strict mode is available when you explicitly want `/health/ready == 200` as the gate:
+
+```bash
+WAIT_PROBE_MODE=ready ./scripts/run_four_node_cluster_failover_bench.sh
+```
+
 ### (Deprecated) Minimal Observability
 
 ```bash

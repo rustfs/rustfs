@@ -16,15 +16,17 @@ use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
     FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     disk_store::{
-        CHECK_EVERY, CHECK_TIMEOUT_DURATION, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING,
-        SKIP_IF_SUCCESS_BEFORE, get_drive_disk_info_timeout, get_drive_list_dir_timeout, get_drive_metadata_timeout,
-        get_drive_walkdir_stall_timeout, get_drive_walkdir_timeout, get_max_timeout_duration,
+        DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
+        get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
+        get_drive_metadata_timeout, get_drive_walkdir_stall_timeout, get_drive_walkdir_timeout, get_max_timeout_duration,
     },
     endpoint::Endpoint,
     health_state::{RuntimeDriveHealthState, get_drive_returning_probe_interval, record_drive_runtime_state},
 };
 use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
-use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::rpc::client::{
+    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
+};
 use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use crate::{
     disk::error::{Error, Result},
@@ -47,7 +49,7 @@ use rustfs_protos::proto_gen::node_service::{
 use rustfs_rio::{HttpReader, HttpWriter};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
-    io::{Cursor, ErrorKind},
+    io::Cursor,
     path::PathBuf,
     sync::{
         Arc,
@@ -176,7 +178,7 @@ impl RemoteDisk {
         health: Arc<DiskHealthTracker>,
         cancel_token: CancellationToken,
     ) {
-        let mut interval = time::interval(CHECK_EVERY);
+        let mut interval = time::interval(get_drive_active_check_interval());
 
         // Perform basic connectivity check
         if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_offline(&endpoint, "connectivity_probe_failed") {
@@ -281,7 +283,7 @@ impl RemoteDisk {
         let port = url.port_or_known_default().unwrap_or(80);
 
         // Try to establish TCP connection
-        match timeout(CHECK_TIMEOUT_DURATION, TcpStream::connect((host, port))).await {
+        match timeout(get_drive_active_check_timeout(), TcpStream::connect((host, port))).await {
             Ok(Ok(stream)) => {
                 drop(stream);
                 Ok(())
@@ -334,10 +336,10 @@ impl RemoteDisk {
                 }
                 self.health.decrement_waiting();
                 if let Err(err) = &operation_result
-                    && Self::is_timeout_like_error(err)
+                    && is_network_like_disk_error(err)
                 {
                     counter!(
-                        "rustfs_drive_op_timeout_total",
+                        "rustfs_drive_op_network_error_total",
                         "endpoint" => self.endpoint.to_string(),
                         "op" => op.to_string()
                     )
@@ -347,9 +349,9 @@ impl RemoteDisk {
                         addr = %self.addr,
                         op,
                         timeout_ms = timeout_duration.as_millis(),
-                        "Remote disk operation returned a timeout-like error"
+                        "Remote disk operation returned a network-like error"
                     );
-                    self.mark_faulty_and_evict("operation_timeout_error").await;
+                    self.mark_faulty_and_evict("operation_network_error").await;
                 }
                 operation_result
             }
@@ -373,10 +375,6 @@ impl RemoteDisk {
                 Err(Error::other(format!("Remote disk operation timeout after {timeout_duration:?}")))
             }
         }
-    }
-
-    fn is_timeout_like_error(err: &Error) -> bool {
-        matches!(err, DiskError::Timeout) || matches!(err, DiskError::Io(io_err) if io_err.kind() == ErrorKind::TimedOut)
     }
 
     async fn mark_faulty_and_evict(&self, reason: &'static str) {
@@ -2070,6 +2068,96 @@ mod tests {
         assert!(
             !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
             "timeout-like errors should evict cached connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_marks_faulty_on_network_like_error() {
+        let addr = "http://127.0.0.1:59993".to_string();
+        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+
+        let err = remote_disk
+            .execute_with_timeout(
+                || async {
+                    Err::<(), Error>(DiskError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    )))
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("network-like operation error should fail");
+
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io network error, got {other:?}"),
+            },
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert!(!remote_disk.is_online().await, "network-like errors should mark remote disk faulty");
+        assert!(
+            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "network-like errors should evict cached connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_keeps_remote_disk_online_for_business_error() {
+        let addr = "http://127.0.0.1:59994".to_string();
+        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+
+        let err = remote_disk
+            .execute_with_timeout(|| async { Err::<(), Error>(DiskError::FileNotFound) }, Duration::from_secs(1))
+            .await
+            .expect_err("business error should still fail the operation");
+
+        assert_eq!(err, DiskError::FileNotFound);
+        assert!(remote_disk.is_online().await, "business errors should not mark remote disk faulty");
+        assert!(
+            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "business errors should not evict cached connection"
         );
     }
 
