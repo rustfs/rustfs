@@ -20,7 +20,7 @@ services:
       dockerfile: Dockerfile.source
     hostname: node1
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{1...4}
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
@@ -31,7 +31,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - node1_data:/data
+      - node1_data_0:/data/rustfs0
+      - node1_data_1:/data/rustfs1
+      - node1_data_2:/data/rustfs2
+      - node1_data_3:/data/rustfs3
     ports:
       - "9000:9000"
     networks:
@@ -44,7 +47,7 @@ services:
       dockerfile: Dockerfile.source
     hostname: node2
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{1...4}
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
@@ -55,7 +58,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - node2_data:/data
+      - node2_data_0:/data/rustfs0
+      - node2_data_1:/data/rustfs1
+      - node2_data_2:/data/rustfs2
+      - node2_data_3:/data/rustfs3
     ports:
       - "9001:9000"
     networks:
@@ -68,7 +74,7 @@ services:
       dockerfile: Dockerfile.source
     hostname: node3
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{1...4}
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
@@ -79,7 +85,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - node3_data:/data
+      - node3_data_0:/data/rustfs0
+      - node3_data_1:/data/rustfs1
+      - node3_data_2:/data/rustfs2
+      - node3_data_3:/data/rustfs3
     ports:
       - "9002:9000"
     networks:
@@ -92,7 +101,7 @@ services:
       dockerfile: Dockerfile.source
     hostname: node4
     environment:
-      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{1...4}
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
@@ -103,17 +112,32 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - node4_data:/data
+      - node4_data_0:/data/rustfs0
+      - node4_data_1:/data/rustfs1
+      - node4_data_2:/data/rustfs2
+      - node4_data_3:/data/rustfs3
     ports:
       - "9003:9000"
     networks:
       - rustfs-cluster-net
 
 volumes:
-  node1_data:
-  node2_data:
-  node3_data:
-  node4_data:
+  node1_data_0:
+  node1_data_1:
+  node1_data_2:
+  node1_data_3:
+  node2_data_0:
+  node2_data_1:
+  node2_data_2:
+  node2_data_3:
+  node3_data_0:
+  node3_data_1:
+  node3_data_2:
+  node3_data_3:
+  node4_data_0:
+  node4_data_1:
+  node4_data_2:
+  node4_data_3:
 
 networks:
   rustfs-cluster-net:

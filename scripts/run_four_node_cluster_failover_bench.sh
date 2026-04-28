@@ -11,10 +11,11 @@ BUILD_LOCAL_IMAGE="${BUILD_LOCAL_IMAGE:-true}"
 RUN_FAILOVER="${RUN_FAILOVER:-true}"
 RUN_BENCHMARK="${RUN_BENCHMARK:-true}"
 KEEP_UP="${KEEP_UP:-false}"
+PRECHECK_AUTO_CLEANUP="${PRECHECK_AUTO_CLEANUP:-true}"
 
 RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfsadmin}"
 RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfsadmin}"
-RUSTFS_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-http://127.0.0.1:4318}"
+RUSTFS_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK="${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
 
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-180}"
@@ -47,7 +48,7 @@ Options:
   --skip-failover               skip failover recovery validation
   --skip-bench                  skip benchmark phase
   --failover-node <nodeN>       node to stop during failover test (default: node4)
-  --obs-endpoint <url>          RUSTFS_OBS_ENDPOINT (default: http://127.0.0.1:4318)
+  --obs-endpoint <url>          RUSTFS_OBS_ENDPOINT (default: auto-select by mode)
   --bench-endpoint <url>        benchmark endpoint (default: http://127.0.0.1:9000)
   --bench-sizes <sizes>         comma list (default: 1KiB,4KiB,11Mi)
   --bench-concurrency <n>       benchmark concurrency
@@ -60,6 +61,7 @@ Environment:
   CLUSTER_COMPOSE OBS_COMPOSE PROJECT_NAME IMAGE_TAG
   WITH_OBSERVABILITY BUILD_LOCAL_IMAGE RUN_FAILOVER RUN_BENCHMARK KEEP_UP
   RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY RUSTFS_OBS_ENDPOINT
+  PRECHECK_AUTO_CLEANUP (true|false, default: true)
   WAIT_TIMEOUT_SECS FAILOVER_NODE FAILOVER_WARMUP_SECS FAILOVER_SAMPLE_SECS
   FAILOVER_INTERVAL_SECS BENCH_ENDPOINT BENCH_BUCKET BENCH_CONCURRENCY
   BENCH_DURATION BENCH_SIZES OUT_DIR
@@ -89,14 +91,12 @@ compose() {
   if [[ "${WITH_OBSERVABILITY}" == "true" ]]; then
     docker compose \
       --project-name "${PROJECT_NAME}" \
-      --project-directory "${PROJECT_ROOT}" \
       -f "${OBS_COMPOSE}" \
       -f "${CLUSTER_COMPOSE}" \
       "$@"
   else
     docker compose \
       --project-name "${PROJECT_NAME}" \
-      --project-directory "${PROJECT_ROOT}" \
       -f "${CLUSTER_COMPOSE}" \
       "$@"
   fi
@@ -112,6 +112,147 @@ resolve_bool() {
       exit 1
       ;;
   esac
+}
+
+docker_daemon_ready() {
+  docker info >/dev/null 2>&1
+}
+
+port_is_occupied() {
+  local port="$1"
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn "sport = :${port}" 2>/dev/null | awk 'NR>1 {found=1} END{exit found?0:1}'
+    return $?
+  fi
+
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -an 2>/dev/null | grep -E "[\.\:]${port}[[:space:]].*LISTEN" >/dev/null 2>&1
+    return $?
+  fi
+
+  # Fallback: no tool available; treat as unknown (not occupied) and rely on compose failure.
+  return 1
+}
+
+print_port_owner() {
+  local port="$1"
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | awk 'NR==1 || NR==2 {print "    " $0}'
+    return
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp "sport = :${port}" 2>/dev/null | awk 'NR==1 || NR==2 {print "    " $0}'
+  fi
+}
+
+cleanup_existing_project_containers() {
+  local existing_ids
+  existing_ids="$(docker ps -aq --filter "label=com.docker.compose.project=${PROJECT_NAME}")"
+
+  if [[ -z "${existing_ids}" ]]; then
+    return 0
+  fi
+
+  log_warn "Found existing containers for project ${PROJECT_NAME}."
+  docker ps -a --filter "label=com.docker.compose.project=${PROJECT_NAME}" --format '  - {{.Names}} ({{.Status}})'
+
+  if [[ "${PRECHECK_AUTO_CLEANUP}" == "true" ]]; then
+    log_info "PRECHECK_AUTO_CLEANUP=true, removing existing project containers."
+    # shellcheck disable=SC2086
+    docker rm -f ${existing_ids} >/dev/null
+  else
+    log_error "existing project containers detected and PRECHECK_AUTO_CLEANUP=false"
+    log_error "run docker compose down --remove-orphans first, or set PRECHECK_AUTO_CLEANUP=true"
+    exit 1
+  fi
+}
+
+check_required_ports_free() {
+  local required_ports=(
+    9000 9001 9002 9003
+  )
+  local occupied_ports=()
+  local port
+
+  if [[ "${WITH_OBSERVABILITY}" == "true" ]]; then
+    required_ports+=(
+      1888 3000 3100 3200 4040 4317 4318 55679 8888 8889 9090 13133 14269 16686
+    )
+  fi
+
+  for port in "${required_ports[@]}"; do
+    if port_is_occupied "${port}"; then
+      occupied_ports+=("${port}")
+    fi
+  done
+
+  if [[ "${#occupied_ports[@]}" -gt 0 ]]; then
+    log_error "required host ports are occupied: ${occupied_ports[*]}"
+    for port in "${occupied_ports[@]}"; do
+      print_port_owner "${port}" || true
+    done
+    log_error "free these ports or run with a different compose/profile before retrying"
+    exit 1
+  fi
+}
+
+ensure_runtime_image_exists() {
+  if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+    log_error "image not found: ${IMAGE_TAG}"
+    log_error "build it first or rerun without --skip-build"
+    exit 1
+  fi
+}
+
+check_cluster_volumes_writable() {
+  local node_idx
+  local disk_idx
+  local volume_name
+
+  log_info "Checking cluster data volumes writable"
+  # Do not pre-create compose-managed volumes here.
+  # If we create them via plain docker run, compose will warn:
+  # "already exists but was not created by Docker Compose".
+  for node_idx in 1 2 3 4; do
+    for disk_idx in 0 1 2 3; do
+      volume_name="${PROJECT_NAME}_node${node_idx}_data_${disk_idx}"
+      if ! docker volume inspect "${volume_name}" >/dev/null 2>&1; then
+        log_info "volume not present yet (will be created by compose): ${volume_name}"
+        continue
+      fi
+      if ! docker run --rm --entrypoint sh -v "${volume_name}:/probe" "${IMAGE_TAG}" -c \
+        'set -e; touch /probe/.rwtest; rm -f /probe/.rwtest' >/dev/null 2>&1; then
+        log_error "volume write check failed: ${volume_name}"
+        exit 1
+      fi
+    done
+  done
+}
+
+run_precheck_before_build() {
+  log_info "Running precheck: docker daemon, residue containers, host ports"
+
+  if ! docker_daemon_ready; then
+    log_error "cannot connect to docker daemon (permission or runtime not ready)"
+    exit 1
+  fi
+
+  cleanup_existing_project_containers
+  check_required_ports_free
+}
+
+run_precheck_after_build() {
+  log_info "Running precheck: image exists, cluster volumes writable"
+  ensure_runtime_image_exists
+  check_cluster_volumes_writable
 }
 
 node_port() {
@@ -364,6 +505,7 @@ main() {
   resolve_bool "RUN_FAILOVER" "${RUN_FAILOVER}"
   resolve_bool "RUN_BENCHMARK" "${RUN_BENCHMARK}"
   resolve_bool "KEEP_UP" "${KEEP_UP}"
+  resolve_bool "PRECHECK_AUTO_CLEANUP" "${PRECHECK_AUTO_CLEANUP}"
 
   require_cmd docker
   require_cmd curl
@@ -376,6 +518,14 @@ main() {
   if [[ "${WITH_OBSERVABILITY}" == "true" && ! -f "${OBS_COMPOSE}" ]]; then
     log_error "observability compose file not found: ${OBS_COMPOSE}"
     exit 1
+  fi
+
+  if [[ -z "${RUSTFS_OBS_ENDPOINT}" ]]; then
+    if [[ "${WITH_OBSERVABILITY}" == "true" ]]; then
+      RUSTFS_OBS_ENDPOINT="http://otel-collector:4318"
+    else
+      RUSTFS_OBS_ENDPOINT="http://host.docker.internal:4318"
+    fi
   fi
 
   if [[ "${RUSTFS_OBS_ENDPOINT}" == "http://127.0.0.1:4318" ]]; then
@@ -393,12 +543,16 @@ main() {
   export RUSTFS_OBS_ENDPOINT
   export RUSTFS_UNSAFE_BYPASS_DISK_CHECK
 
+  run_precheck_before_build
+
   if [[ "${BUILD_LOCAL_IMAGE}" == "true" ]]; then
     log_info "Building local image from Dockerfile.source: ${IMAGE_TAG}"
     docker build -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
   else
     log_info "Skipping image build"
   fi
+
+  run_precheck_after_build
 
   log_info "Starting compose stack"
   compose up -d
