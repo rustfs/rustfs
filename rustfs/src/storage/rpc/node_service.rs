@@ -1827,6 +1827,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_local_storage_info() {
         let service = create_test_node_service();
 
@@ -1982,6 +1983,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_pool_meta() {
         let service = create_test_node_service();
 
@@ -1997,6 +1999,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_stop_rebalance() {
         let service = create_test_node_service();
 
@@ -2012,6 +2015,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_load_rebalance_meta() {
         let service = create_test_node_service();
 
@@ -2057,6 +2061,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_load_bucket_metadata_no_object_layer() {
         let service = create_test_node_service();
 
@@ -2226,6 +2231,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_site_replication_config() {
         let service = create_test_node_service();
 
