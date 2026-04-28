@@ -48,23 +48,14 @@ use rustfs_config::{
     DEFAULT_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
     SERVICE_VERSION, USE_STDOUT,
 };
-use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_opt_u64, get_env_str, get_env_u64, get_env_usize};
+use rustfs_utils::{
+    get_env_bool, get_env_bool_with_aliases, get_env_f64, get_env_opt_str, get_env_opt_u64, get_env_str, get_env_u64,
+    get_env_usize,
+};
 use serde::{Deserialize, Serialize};
 use std::env;
 
 const LEGACY_ENV_OBS_PROFILING_ENABLED: &str = "RUSTFS_OBS_PROFILING_ENABLED";
-
-fn read_profiling_export_enabled() -> bool {
-    if env::var_os(ENV_OBS_PROFILING_EXPORT_ENABLED).is_some() {
-        return get_env_bool(ENV_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED);
-    }
-
-    if env::var_os(LEGACY_ENV_OBS_PROFILING_ENABLED).is_some() {
-        return get_env_bool(LEGACY_ENV_OBS_PROFILING_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED);
-    }
-
-    DEFAULT_OBS_PROFILING_EXPORT_ENABLED
-}
 
 /// Full observability configuration used by all telemetry backends.
 ///
@@ -148,7 +139,7 @@ pub struct OtelConfig {
     pub metrics_export_enabled: Option<bool>,
     /// Whether to export logs via OTLP (default: `true`).
     pub logs_export_enabled: Option<bool>,
-    /// Whether to export profiles via pyroscope (default: `true`).
+    /// Whether to export profiles via pyroscope (default: `false`).
     pub profiling_export_enabled: Option<bool>,
     /// **[OTLP-only]** Mirror all signals to stdout in addition to OTLP export.
     /// Only applies when an OTLP endpoint is configured.
@@ -296,7 +287,11 @@ impl OtelConfig {
             traces_export_enabled: Some(get_env_bool(ENV_OBS_TRACES_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED)),
             metrics_export_enabled: Some(get_env_bool(ENV_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED)),
             logs_export_enabled: Some(get_env_bool(ENV_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED)),
-            profiling_export_enabled: Some(read_profiling_export_enabled()),
+            profiling_export_enabled: Some(get_env_bool_with_aliases(
+                ENV_OBS_PROFILING_EXPORT_ENABLED,
+                &[LEGACY_ENV_OBS_PROFILING_ENABLED],
+                DEFAULT_OBS_PROFILING_EXPORT_ENABLED,
+            )),
             use_stdout: Some(use_stdout),
             sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
             meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
