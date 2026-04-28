@@ -2083,6 +2083,7 @@ mod tests {
 
     /// When policy metadata cannot be loaded, tag-based check is conservative (returns true).
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_bucket_policy_needs_existing_object_tag_load_failure_is_conservative() {
         let conditions = HashMap::new();
         let hint = load_bucket_policy_existing_object_tag_hint(

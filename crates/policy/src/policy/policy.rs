@@ -357,7 +357,7 @@ pub mod default {
 
     use crate::policy::{
         ActionSet, DEFAULT_VERSION, Effect, Functions, ResourceSet, Statement,
-        action::{Action, AdminAction, KmsAction, S3Action},
+        action::{Action, AdminAction, KmsAction, S3Action, StsAction},
         resource::Resource,
     };
 
@@ -377,6 +377,7 @@ pub mod default {
                         actions: ActionSet({
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Action::S3Action(S3Action::AllActions));
+                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
@@ -403,6 +404,7 @@ pub mod default {
                             hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
                             hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
                             hash_set.insert(Action::S3Action(S3Action::GetBucketQuotaAction));
+                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
@@ -427,6 +429,7 @@ pub mod default {
                         actions: ActionSet({
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
+                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
@@ -451,6 +454,7 @@ pub mod default {
                         actions: ActionSet({
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
+                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
@@ -482,6 +486,7 @@ pub mod default {
                             hash_set.insert(Action::AdminAction(AdminAction::HealthInfoAdminAction));
                             hash_set.insert(Action::AdminAction(AdminAction::PrometheusAdminAction));
                             hash_set.insert(Action::AdminAction(AdminAction::BandwidthMonitorAction));
+                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
@@ -507,6 +512,7 @@ pub mod default {
                             actions: ActionSet({
                                 let mut hash_set = HashSet::new();
                                 hash_set.insert(Action::AdminAction(AdminAction::AllAdminActions));
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),
@@ -520,6 +526,7 @@ pub mod default {
                             actions: ActionSet({
                                 let mut hash_set = HashSet::new();
                                 hash_set.insert(Action::KmsAction(KmsAction::AllActions));
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),
@@ -533,6 +540,7 @@ pub mod default {
                             actions: ActionSet({
                                 let mut hash_set = HashSet::new();
                                 hash_set.insert(Action::S3Action(S3Action::AllActions));
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),
@@ -682,6 +690,27 @@ mod test {
         assert_eq!(p.statements[0].resources.len(), 1, "ResourceSet should contain exactly one resource");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_default_policies_allow_sts_assume_role() {
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::StsAction(crate::policy::action::StsAction::AssumeRoleAction),
+            bucket: "",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        for (name, policy) in default::DEFAULT_POLICIES.iter() {
+            assert!(policy.is_allowed(&args).await, "default policy {name} should allow sts:AssumeRole");
+        }
     }
 
     #[tokio::test]
