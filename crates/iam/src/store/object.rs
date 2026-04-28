@@ -227,20 +227,13 @@ impl ObjectStore {
         Ok(encrypted)
     }
 
-    fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
+    fn prepare_data_for_storage(data: &[u8]) -> Result<Vec<u8>> {
         if keyring::encrypt_key().is_some() {
             let encrypted = Self::encrypt_data_with_master_key(data)?;
             return Ok(encrypted);
         }
 
-        let cred = get_global_action_cred().unwrap_or_default();
-        let password = if !cred.access_key.is_empty() && !cred.secret_key.is_empty() {
-            format!("{}:{}", cred.access_key, cred.secret_key).into_bytes()
-        } else {
-            cred.secret_key.into_bytes()
-        };
-        let en = rustfs_crypto::encrypt_stream_io(&password, data)?;
-        Ok(en)
+        Ok(data.to_vec())
     }
 
     fn should_lazy_rewrite(source: DecryptSource) -> bool {
@@ -343,8 +336,8 @@ impl ObjectStore {
     }
 
     #[cfg(test)]
-    fn encrypt_data_for_test(data: &[u8]) -> Result<Vec<u8>> {
-        Self::encrypt_data(data)
+    fn prepare_data_for_storage_for_test(data: &[u8]) -> Result<Vec<u8>> {
+        Self::prepare_data_for_storage(data)
     }
 
     async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, ObjectInfo)> {
@@ -656,7 +649,7 @@ impl Store for ObjectStore {
     #[tracing::instrument(skip(self, item, path))]
     async fn save_iam_config<Item: Serialize + Send>(&self, item: Item, path: impl AsRef<str> + Send) -> Result<()> {
         let mut data = serde_json::to_vec(&item)?;
-        data = Self::encrypt_data(&data)?;
+        data = Self::prepare_data_for_storage(&data)?;
 
         let mut attempts = 0;
         let max_attempts = 5;
@@ -1458,28 +1451,29 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_data_produces_stream_io_format() {
-        let _ = test_cred();
+    #[serial]
+    fn test_prepare_data_defaults_to_plaintext_without_iam_master_key() {
         let plain = br#"{"Version":1,"policy":"readonly"}"#;
-        let encrypted = ObjectStore::encrypt_data_for_test(plain).expect("encrypt should succeed");
-        // stream_io header: salt(32) + alg_id(1) + nonce_prefix(8) = 41 bytes
-        const STREAM_IO_HEADER_LEN: usize = 41;
-        assert!(
-            encrypted.len() >= STREAM_IO_HEADER_LEN,
-            "encrypted should have at least 41-byte stream_io header"
+
+        with_vars(
+            [
+                (keyring::ENV_IAM_MASTER_KEY, None::<&str>),
+                (keyring::ENV_IAM_MASTER_KEY_OLD_KEYS, None::<&str>),
+            ],
+            || {
+                let stored = ObjectStore::prepare_data_for_storage_for_test(plain).expect("store bytes should build");
+                assert_eq!(stored, plain);
+
+                let decrypted = ObjectStore::decrypt_data_with_source(&stored).expect("plaintext should load");
+                assert_eq!(plain, decrypted.plain.as_slice());
+                assert_eq!(decrypted.source, DecryptSource::Plaintext);
+            },
         );
-        assert!(
-            encrypted[32] == 0x00 || encrypted[32] == 0x01 || encrypted[32] == 0x02,
-            "alg_id should be 0x00, 0x01, or 0x02"
-        );
-        // Round-trip: encrypt then decrypt
-        let decrypted = ObjectStore::decrypt_data_with_source(&encrypted).expect("decrypt should succeed");
-        assert_eq!(plain, decrypted.plain.as_slice());
     }
 
     #[test]
     #[serial]
-    fn test_encrypt_data_prefers_iam_master_key_roundtrip() {
+    fn test_prepare_data_uses_iam_master_key_roundtrip() {
         let _ = test_cred();
         let plain = br#"{"Version":1,"policy":"master-key"}"#;
         let master_key = "iam-master-key-roundtrip";
@@ -1490,7 +1484,7 @@ mod tests {
                 (keyring::ENV_IAM_MASTER_KEY_OLD_KEYS, None),
             ],
             || {
-                let encrypted = ObjectStore::encrypt_data_for_test(plain).expect("encrypt with iam master key");
+                let encrypted = ObjectStore::prepare_data_for_storage_for_test(plain).expect("encrypt with iam master key");
 
                 let by_master =
                     rustfs_crypto::decrypt_stream_io(master_key.as_bytes(), &encrypted).expect("decrypt via master key");

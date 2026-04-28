@@ -181,7 +181,7 @@ impl RemoteDisk {
         let mut interval = time::interval(get_drive_active_check_interval());
 
         // Perform basic connectivity check
-        if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_failure(&endpoint, "connectivity_probe_failed") {
+        if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_offline(&endpoint, "connectivity_probe_failed") {
             warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
             // Start recovery monitoring
@@ -224,7 +224,7 @@ impl RemoteDisk {
                     }
 
                     // Perform basic connectivity check
-                    if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_failure(&endpoint, "connectivity_probe_failed") {
+                    if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_offline(&endpoint, "connectivity_probe_failed") {
                         warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
                         // Start recovery monitoring
@@ -265,7 +265,7 @@ impl RemoteDisk {
                             return;
                         }
                     } else {
-                        health.mark_failure(&endpoint, "connectivity_probe_failed");
+                        health.mark_offline(&endpoint, "connectivity_probe_failed");
                     }
                 }
             }
@@ -378,7 +378,7 @@ impl RemoteDisk {
     }
 
     async fn mark_faulty_and_evict(&self, reason: &'static str) {
-        if self.health.mark_failure(&self.endpoint, reason) {
+        if self.health.mark_offline(&self.endpoint, reason) {
             self.spawn_recovery_monitor_if_needed();
             counter!(
                 "rustfs_drive_faulty_mark_total",
