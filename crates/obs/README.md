@@ -117,7 +117,7 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_TRACES_EXPORT_ENABLED`    | `true`    | Toggle trace export                                        |
 | `RUSTFS_OBS_METRICS_EXPORT_ENABLED`   | `true`    | Toggle metrics export                                      |
 | `RUSTFS_OBS_LOGS_EXPORT_ENABLED`      | `true`    | Toggle OTLP log export                                     |
-| `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `true`    | Toggle profiling export                                    |
+| `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `false`   | Toggle profiling export                                    |
 | `RUSTFS_OBS_USE_STDOUT`               | `false`   | Mirror all signals to stdout alongside OTLP                |
 | `RUSTFS_OBS_SAMPLE_RATIO`             | `0.1`     | Trace sampling ratio `0.0`–`1.0`                           |
 | `RUSTFS_OBS_METER_INTERVAL`           | `15`      | Metrics export interval (seconds)                          |

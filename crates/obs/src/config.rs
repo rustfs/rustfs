@@ -52,6 +52,20 @@ use rustfs_utils::{get_env_bool, get_env_f64, get_env_opt_str, get_env_opt_u64, 
 use serde::{Deserialize, Serialize};
 use std::env;
 
+const LEGACY_ENV_OBS_PROFILING_ENABLED: &str = "RUSTFS_OBS_PROFILING_ENABLED";
+
+fn read_profiling_export_enabled() -> bool {
+    if env::var_os(ENV_OBS_PROFILING_EXPORT_ENABLED).is_some() {
+        return get_env_bool(ENV_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED);
+    }
+
+    if env::var_os(LEGACY_ENV_OBS_PROFILING_ENABLED).is_some() {
+        return get_env_bool(LEGACY_ENV_OBS_PROFILING_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED);
+    }
+
+    DEFAULT_OBS_PROFILING_EXPORT_ENABLED
+}
+
 /// Full observability configuration used by all telemetry backends.
 ///
 /// Fields are grouped into three logical sections:
@@ -282,7 +296,7 @@ impl OtelConfig {
             traces_export_enabled: Some(get_env_bool(ENV_OBS_TRACES_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED)),
             metrics_export_enabled: Some(get_env_bool(ENV_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED)),
             logs_export_enabled: Some(get_env_bool(ENV_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED)),
-            profiling_export_enabled: Some(get_env_bool(ENV_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED)),
+            profiling_export_enabled: Some(read_profiling_export_enabled()),
             use_stdout: Some(use_stdout),
             sample_ratio: Some(get_env_f64(ENV_OBS_SAMPLE_RATIO, SAMPLE_RATIO)),
             meter_interval: Some(get_env_u64(ENV_OBS_METER_INTERVAL, METER_INTERVAL)),
@@ -414,4 +428,39 @@ impl Default for AppConfig {
 /// case-insensitively against the string `"production"`.
 pub fn is_production_environment() -> bool {
     get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT).eq_ignore_ascii_case(DEFAULT_OBS_ENVIRONMENT_PRODUCTION)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiling_export_defaults_to_disabled_when_unset() {
+        temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
+            temp_env::with_var_unset(LEGACY_ENV_OBS_PROFILING_ENABLED, || {
+                let config = OtelConfig::extract_otel_config_from_env(None);
+                assert_eq!(config.profiling_export_enabled, Some(false));
+            });
+        });
+    }
+
+    #[test]
+    fn profiling_export_accepts_legacy_env_alias() {
+        temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
+            temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
+                let config = OtelConfig::extract_otel_config_from_env(None);
+                assert_eq!(config.profiling_export_enabled, Some(true));
+            });
+        });
+    }
+
+    #[test]
+    fn canonical_profiling_toggle_has_priority_over_legacy_alias() {
+        temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
+            temp_env::with_var(ENV_OBS_PROFILING_EXPORT_ENABLED, Some("false"), || {
+                let config = OtelConfig::extract_otel_config_from_env(None);
+                assert_eq!(config.profiling_export_enabled, Some(false));
+            });
+        });
+    }
 }
