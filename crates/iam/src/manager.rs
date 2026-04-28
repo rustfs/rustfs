@@ -588,6 +588,20 @@ where
             }
         }
 
+        let sts_accounts = self.cache.sts_accounts.load();
+        for (_, v) in sts_accounts.iter() {
+            if v.credentials.parent_user == access_key {
+                user_exists = true;
+                if v.credentials.is_temp() && !v.credentials.is_service_account() {
+                    let mut u = v.clone();
+                    u.credentials.secret_key = String::new();
+                    u.credentials.session_token = String::new();
+
+                    ret.push(u);
+                }
+            }
+        }
+
         if !user_exists {
             return Err(Error::NoSuchUser(access_key.to_string()));
         }
@@ -596,8 +610,8 @@ where
     }
 
     pub async fn list_sts_accounts(&self, access_key: &str) -> Result<Vec<Credentials>> {
-        let users = self.cache.users.load();
-        Ok(users
+        let sts_accounts = self.cache.sts_accounts.load();
+        Ok(sts_accounts
             .values()
             .filter_map(|x| {
                 if !access_key.is_empty()
@@ -1364,14 +1378,13 @@ where
     }
 
     pub async fn is_temp_user(&self, access_key: &str) -> Result<(bool, String)> {
-        let users = self.cache.users.load();
-        let u = match users.get(access_key) {
+        let u = match self.get_user(access_key).await {
             Some(u) => u,
             None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
 
         if u.credentials.is_temp() {
-            Ok((true, u.credentials.parent_user.clone()))
+            Ok((true, u.credentials.parent_user))
         } else {
             Ok((false, String::new()))
         }
