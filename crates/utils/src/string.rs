@@ -506,13 +506,12 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
 /// ```
 ///
 pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
-    if s.len() < prefix.len() {
-        return false;
+    if s.starts_with(prefix) {
+        return true;
     }
 
-    let s_prefix = &s[..prefix.len()];
-    // Test match with case first, then case-insensitive
-    s_prefix == prefix || s_prefix.to_lowercase() == prefix.to_lowercase()
+    s.get(..prefix.len())
+        .is_some_and(|s_prefix| s_prefix.eq_ignore_ascii_case(prefix))
 }
 
 #[cfg(test)]
@@ -871,5 +870,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_strings_has_prefix_fold_handles_unicode_without_panicking() {
+        assert!(!strings_has_prefix_fold(
+            "s3-test-bucket/中文/日本語/한글-9cd5599a-f8eb-4e24-9df7-32ecd8d8ad1f",
+            "D:\\Github\\rustfs\\target\\volumes\\test1",
+        ));
     }
 }
