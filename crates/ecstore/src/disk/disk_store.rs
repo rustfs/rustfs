@@ -231,9 +231,26 @@ impl DiskHealthTracker {
             RuntimeDriveHealthState::Offline => RuntimeDriveHealthState::Offline,
         };
 
-        self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
+        let became_offline = next == RuntimeDriveHealthState::Offline && current != RuntimeDriveHealthState::Offline;
+        if next == RuntimeDriveHealthState::Offline {
+            self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
+        } else {
+            self.status.store(DISK_HEALTH_OK, Ordering::Release);
+        }
         self.transition_state(endpoint, current, next, reason);
-        current == RuntimeDriveHealthState::Online
+        became_offline
+    }
+
+    pub fn mark_offline(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
+        let current = self.runtime_state();
+        if current == RuntimeDriveHealthState::Offline {
+            return false;
+        }
+
+        self.consecutive_successes.store(0, Ordering::Release);
+        self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
+        self.transition_state(endpoint, current, RuntimeDriveHealthState::Offline, reason);
+        true
     }
 
     pub fn mark_recovery_success(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
@@ -266,6 +283,14 @@ impl DiskHealthTracker {
             self.log_success();
         }
         became_online
+    }
+
+    pub fn record_operation_success(&self, endpoint: &Endpoint, reason: &'static str) {
+        if self.runtime_state() == RuntimeDriveHealthState::Online {
+            self.log_success();
+        } else {
+            self.mark_recovery_success(endpoint, reason);
+        }
     }
 
     fn transition_state(
@@ -707,7 +732,7 @@ impl LocalDiskWrapper {
             let result = operation().await;
             self.health.decrement_waiting();
             if result.is_ok() {
-                self.health.log_success();
+                self.health.record_operation_success(&self.endpoint(), "operation_success");
             }
             return result;
         }
@@ -718,7 +743,7 @@ impl LocalDiskWrapper {
             Ok(operation_result) => {
                 // Log success and decrement waiting counter
                 if operation_result.is_ok() {
-                    self.health.log_success();
+                    self.health.record_operation_success(&self.endpoint(), "operation_success");
                 }
                 self.health.decrement_waiting();
                 operation_result
@@ -919,7 +944,7 @@ impl DiskAPI for LocalDiskWrapper {
         let has_err = result.iter().any(|e| e.is_some());
         if !has_err {
             // Log success and decrement waiting counter
-            self.health.log_success();
+            self.health.record_operation_success(&self.endpoint(), "operation_success");
         }
 
         result
@@ -1114,35 +1139,56 @@ mod tests {
 
     #[test]
     fn runtime_state_transitions_from_online_to_suspect_then_offline() {
-        let endpoint = Endpoint::try_from("/tmp/runtime-state-disk").expect("endpoint should parse");
-        let health = DiskHealthTracker::new();
+        temp_env::with_var(rustfs_config::ENV_DRIVE_SUSPECT_FAILURE_THRESHOLD, Some("2"), || {
+            let endpoint = Endpoint::try_from("/tmp/runtime-state-disk").expect("endpoint should parse");
+            let health = DiskHealthTracker::new();
 
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
-        assert!(health.mark_failure(&endpoint, "timeout"));
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Suspect);
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!health.mark_failure(&endpoint, "timeout"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Suspect);
+            assert!(!health.is_faulty());
 
-        assert!(!health.mark_failure(&endpoint, "timeout"));
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
-        assert!(health.offline_duration().is_some());
+            assert!(health.mark_failure(&endpoint, "timeout"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+            assert!(health.is_faulty());
+            assert!(health.offline_duration().is_some());
+        });
     }
 
     #[test]
     fn runtime_state_transitions_back_online_after_recovery_threshold() {
-        let endpoint = Endpoint::try_from("/tmp/runtime-state-recovery").expect("endpoint should parse");
+        temp_env::with_var(rustfs_config::ENV_DRIVE_SUSPECT_FAILURE_THRESHOLD, Some("2"), || {
+            let endpoint = Endpoint::try_from("/tmp/runtime-state-recovery").expect("endpoint should parse");
+            let health = DiskHealthTracker::new();
+
+            health.mark_failure(&endpoint, "timeout");
+            health.mark_failure(&endpoint, "timeout");
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+
+            assert!(!health.mark_recovery_success(&endpoint, "probe"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Returning);
+
+            assert!(!health.mark_recovery_success(&endpoint, "probe"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Returning);
+
+            assert!(health.mark_recovery_success(&endpoint, "probe"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(health.offline_duration().is_none());
+        });
+    }
+
+    #[test]
+    fn operation_success_recovers_suspect_drive_without_faulting() {
+        let endpoint = Endpoint::try_from("/tmp/runtime-state-suspect-success").expect("endpoint should parse");
         let health = DiskHealthTracker::new();
 
-        health.mark_failure(&endpoint, "timeout");
-        health.mark_failure(&endpoint, "timeout");
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+        assert!(!health.mark_failure(&endpoint, "timeout"));
+        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Suspect);
+        assert!(!health.is_faulty());
 
-        assert!(!health.mark_recovery_success(&endpoint, "probe"));
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Returning);
-
-        assert!(!health.mark_recovery_success(&endpoint, "probe"));
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Returning);
-
-        assert!(health.mark_recovery_success(&endpoint, "probe"));
+        health.record_operation_success(&endpoint, "operation_success");
         assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+        assert!(!health.is_faulty());
         assert!(health.offline_duration().is_none());
     }
 }
