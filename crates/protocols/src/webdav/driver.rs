@@ -436,7 +436,7 @@ where
         let decoded_path = percent_decode_str(&path_str)
             .decode_utf8()
             .map_err(|_| FsError::GeneralFailure)?;
-        let cleaned_path = path::clean(&path_str);
+        let cleaned_path = path::clean(&decoded_path);
         let (bucket, object) = path::path_to_bucket_object(&cleaned_path);
 
         if bucket.is_empty() {
