@@ -1,5 +1,54 @@
 use super::*;
 
+fn restore_request_active(opts: &ObjectOptions) -> bool {
+    let restore = &opts.transition.restore_request;
+    restore.type_.is_some() || restore.days.is_some() || restore.output_location.is_some() || restore.select_parameters.is_some()
+}
+
+fn decode_compression_index(index: Option<&bytes::Bytes>) -> Option<rustfs_rio::Index> {
+    let bytes = index?;
+    let mut decoded = rustfs_rio::Index::new();
+    if decoded.load(bytes.as_ref()).is_ok() {
+        Some(decoded)
+    } else {
+        None
+    }
+}
+
+fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64, u64) {
+    let mut skip_length = 0_i64;
+    let mut cumulative_actual_size = 0_i64;
+    let mut first_part_idx = 0_usize;
+    let mut compressed_offset = 0_i64;
+
+    for (i, part) in oi.parts.iter().enumerate() {
+        cumulative_actual_size += part.actual_size;
+        if cumulative_actual_size <= offset {
+            compressed_offset += part.size as i64;
+        } else {
+            first_part_idx = i;
+            skip_length = cumulative_actual_size - part.actual_size;
+            break;
+        }
+    }
+
+    let mut part_skip = offset - skip_length;
+    let decrypt_skip = 0_i64;
+    let seq_num = 0_u64;
+
+    if part_skip > 0
+        && let Some(part) = oi.parts.get(first_part_idx)
+        && let Some(index) = decode_compression_index(part.index.as_ref())
+        && let Ok((comp_off, uncomp_off)) = index.find(part_skip)
+        && comp_off > 0
+    {
+        compressed_offset += comp_off;
+        part_skip -= uncomp_off;
+    }
+
+    (compressed_offset, part_skip, first_part_idx, decrypt_skip, seq_num)
+}
+
 pub struct PutObjReader {
     pub stream: HashReader,
 }
@@ -63,25 +112,27 @@ impl GetObjectReader {
             rs = HTTPRangeSpec::from_object_info(oi, part_number);
         }
 
-        // TODO:Encrypted
+        let mut is_encrypted = oi.is_encrypted();
+        let (algo, mut is_compressed) = oi.is_compressed_ok()?;
 
-        let (algo, is_compressed) = oi.is_compressed_ok()?;
-
-        // TODO: check TRANSITION
+        if restore_request_active(opts) {
+            is_encrypted = false;
+            is_compressed = false;
+        }
 
         if is_compressed {
             let actual_size = oi.get_actual_size()?;
             let (off, length, dec_off, dec_length) = if let Some(rs) = rs {
-                // Support range requests for compressed objects
-                let (dec_off, dec_length) = rs.get_offset_length(actual_size)?;
-                (0, oi.size, dec_off, dec_length)
+                let (req_off, req_length) = rs.get_offset_length(actual_size)?;
+                let (physical_off, decompressed_skip, _, _, _) = get_compressed_offsets(oi, req_off as i64);
+                (physical_off as usize, oi.size - physical_off, decompressed_skip as usize, req_length)
             } else {
                 (0, oi.size, 0, actual_size)
             };
 
             let dec_reader = DecompressReader::new(reader, algo);
 
-            let actual_size_usize = if actual_size > 0 {
+            let actual_size_usize = if actual_size >= 0 {
                 actual_size as usize
             } else {
                 return Err(Error::other(format!("invalid decompressed size {actual_size}")));
@@ -120,6 +171,14 @@ impl GetObjectReader {
                 off,
                 length,
             ));
+        }
+
+        if is_encrypted {
+            let decrypted_size = oi.decrypted_size()?;
+            if let Some(rs) = rs {
+                let _ = rs.get_offset_length(decrypted_size)?;
+            }
+            return Err(Error::other("encrypted object reads are not implemented"));
         }
 
         if let Some(rs) = rs {
@@ -188,7 +247,7 @@ impl HTTPRangeSpec {
         for i in 0..part_number {
             let part = &oi.parts[i];
             start = end + 1;
-            end = start + (part.size as i64) - 1;
+            end = start + part.actual_size - 1;
         }
 
         Some(HTTPRangeSpec {
@@ -626,6 +685,41 @@ mod tests {
         assert!(HTTPRangeSpec::from_object_info(&object_info, 4).is_none());
     }
 
+    #[test]
+    fn test_http_range_spec_from_object_info_uses_actual_size() {
+        let object_info = ObjectInfo {
+            size: 90,
+            parts: vec![
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 1,
+                    size: 20,
+                    actual_size: 30,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 2,
+                    size: 30,
+                    actual_size: 40,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 3,
+                    size: 40,
+                    actual_size: 50,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let spec = HTTPRangeSpec::from_object_info(&object_info, 2).unwrap();
+        assert_eq!(spec.start, 30);
+        assert_eq!(spec.end, 69);
+    }
+
     #[tokio::test]
     async fn test_ranged_decompress_reader_zero_length() {
         let original_data = b"Hello, World!";
@@ -677,10 +771,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_object_reader_range_uses_stored_size_for_encrypted_metadata() {
+    fn test_get_object_reader_rejects_encrypted_range_without_decryption_support() {
         let object_info = ObjectInfo {
             size: 10,
-            user_defined: HashMap::from([("x-amz-server-side-encryption-customer-original-size".to_string(), "20".to_string())]),
+            user_defined: HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+                ("x-amz-server-side-encryption-customer-original-size".to_string(), "20".to_string()),
+            ]),
             ..Default::default()
         };
 
@@ -690,24 +787,28 @@ mod tests {
             end: -1,
         };
 
-        let (_, offset, length) = GetObjectReader::new(
+        let result = GetObjectReader::new(
             Box::new(Cursor::new(b"0123456789".to_vec())),
             Some(range),
             &object_info,
             &ObjectOptions::default(),
             &HeaderMap::new(),
-        )
-        .unwrap();
+        );
 
-        assert_eq!(offset, 8);
-        assert_eq!(length, 2);
+        match result {
+            Ok(_) => panic!("encrypted range read should not fall back to plain object semantics"),
+            Err(err) => assert!(err.to_string().contains("encrypted object reads are not implemented")),
+        }
     }
 
     #[test]
-    fn test_get_object_reader_suffix_range_uses_stored_size_for_encrypted_metadata() {
+    fn test_get_object_reader_restore_request_bypasses_encryption_range_rewrite() {
         let object_info = ObjectInfo {
             size: 10,
-            user_defined: HashMap::from([("x-rustfs-encryption-original-size".to_string(), "20".to_string())]),
+            user_defined: HashMap::from([
+                ("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string()),
+                ("x-rustfs-encryption-original-size".to_string(), "20".to_string()),
+            ]),
             ..Default::default()
         };
 
@@ -717,8 +818,53 @@ mod tests {
             end: -1,
         };
 
+        let mut opts = ObjectOptions::default();
+        opts.transition.restore_request.days = Some(1);
+
         let (_, offset, length) = GetObjectReader::new(
             Box::new(Cursor::new(b"0123456789".to_vec())),
+            Some(range),
+            &object_info,
+            &opts,
+            &HeaderMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(offset, 6);
+        assert_eq!(length, 4);
+    }
+
+    #[test]
+    fn test_get_object_reader_compressed_range_returns_physical_offset_from_index() {
+        let mut index = rustfs_rio::Index::new();
+        index.add(0, 0).unwrap();
+        index.add(1_048_576, 2_097_152).unwrap();
+
+        let object_info = ObjectInfo {
+            size: 3_000_000,
+            parts: vec![ObjectPartInfo {
+                etag: String::new(),
+                number: 1,
+                size: 3_000_000,
+                actual_size: 4_194_304,
+                index: Some(index.into_vec()),
+                ..Default::default()
+            }],
+            user_defined: HashMap::from([
+                ("x-minio-internal-compression".to_string(), "gzip".to_string()),
+                ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 2_097_152,
+            end: 2_097_161,
+        };
+
+        let (reader, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(Vec::<u8>::new())),
             Some(range),
             &object_info,
             &ObjectOptions::default(),
@@ -726,7 +872,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(offset, 6);
-        assert_eq!(length, 4);
+        assert!(offset > 0);
+        assert!(offset < 2_097_152);
+        assert_eq!(length, object_info.size - offset as i64);
+        assert_eq!(reader.object_info.size, 10);
     }
 }
