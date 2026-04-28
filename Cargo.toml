@@ -169,7 +169,7 @@ hmac = { version = "0.13.0" }
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0"
-rsa = { version = "0.10.0-rc.17" }
+rsa = { version = "0.10.0-rc.18" }
 rustls = { version = "0.23.39", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = "1.14.1"
 sha1 = "0.11.0"
