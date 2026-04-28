@@ -21,6 +21,7 @@ use dav_server::fs::{
     DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, FsStream, OpenOptions, ReadDirMeta,
 };
 use futures_util::{FutureExt, StreamExt, stream};
+use percent_encoding::percent_decode_str;
 use rustfs_utils::path;
 use s3s::dto::*;
 use std::fmt::Debug;
@@ -432,7 +433,10 @@ where
     /// Parse WebDAV path to bucket and object key
     fn parse_path(&self, path: &DavPath) -> Result<(String, Option<String>), FsError> {
         let path_str = path.as_url_string();
-        let cleaned_path = path::clean(&path_str);
+        let decoded_path = percent_decode_str(&path_str)
+            .decode_utf8()
+            .map_err(|_| FsError::GeneralFailure)?;
+        let cleaned_path = path::clean(&decoded_path);
         let (bucket, object) = path::path_to_bucket_object(&cleaned_path);
 
         if bucket.is_empty() {
