@@ -80,7 +80,9 @@ The library selects a backend automatically based on configuration:
 
 ```
 1. Any OTLP endpoint set?
-   └─ YES → Full OTLP/HTTP pipeline (traces + metrics + logs + profiling)
+   └─ YES → Full OTLP/HTTP pipeline (traces + metrics + logs)
+            + Profiling (Pyroscope) only if:
+              - RUSTFS_OBS_PROFILING_EXPORT_ENABLED=true (explicit opt-in, default: false)
 
 2. RUSTFS_OBS_LOG_DIRECTORY set to a non-empty path?
    └─ YES → Rolling-file JSON logging
