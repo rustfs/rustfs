@@ -12,15 +12,29 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store};
 use crate::app::context::resolve_server_config;
 use rustfs_ecstore::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
 use rustfs_notify::EventArgs as NotifyEventArgs;
 use rustfs_s3_common::EventName;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::spawn;
 use tracing::{error, info, instrument, warn};
 
+static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
+
 fn server_config_from_context() -> Option<rustfs_ecstore::config::Config> {
     resolve_server_config()
+}
+
+pub fn refresh_notify_module_enabled() -> bool {
+    let enabled = resolve_notify_module_state().enabled;
+    NOTIFY_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+pub fn is_notify_module_enabled() -> bool {
+    NOTIFY_MODULE_ENABLED.load(Ordering::Relaxed)
 }
 
 fn convert_ecstore_event_args(args: EcstoreEventArgs) -> NotifyEventArgs {
@@ -85,6 +99,19 @@ pub async fn shutdown_event_notifier() {
 
 #[instrument]
 pub async fn init_event_notifier() {
+    if let Err(err) = refresh_persisted_module_switches_from_store().await {
+        warn!("Failed to refresh persisted notify module switch from store: {}", err);
+    }
+
+    let enabled = refresh_notify_module_enabled();
+    if !enabled {
+        info!(
+            target: "rustfs::main::init_event_notifier",
+            "Notify module is disabled, event notifier initialization is skipped. Enable the notify module first."
+        );
+        return;
+    }
+
     info!(
         target: "rustfs::main::init_event_notifier",
         "Initializing event notifier..."
@@ -104,9 +131,18 @@ pub async fn init_event_notifier() {
         "Event notifier configuration found, proceeding with initialization."
     );
 
-    // 2. Initialize the notification system asynchronously with a global configuration
-    // Use direct await for better error handling and faster initialization
-    if let Err(e) = rustfs_notify::initialize(server_config).await {
+    if let Some(system) = rustfs_notify::notification_system() {
+        // Reuse the existing global system on re-enable so bucket rules, metrics,
+        // and stream lifecycle stay aligned with the current process singleton.
+        if let Err(e) = system.reload_config(server_config).await {
+            error!("Failed to reload event notifier system: {}", e);
+        } else {
+            info!(
+                target: "rustfs::main::init_event_notifier",
+                "Event notifier system reloaded successfully."
+            );
+        }
+    } else if let Err(e) = rustfs_notify::initialize(server_config).await {
         error!("Failed to initialize event notifier system: {}", e);
     } else {
         install_ecstore_event_dispatch_hook();

@@ -175,6 +175,7 @@ impl S3Auth for IAMAuth {
                 }
                 Err(e) => {
                     warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
+                    return Err(iam_lookup_error_to_s3_error(&e));
                 }
             }
         } else {
@@ -186,6 +187,10 @@ impl S3Auth for IAMAuth {
             "The Access Key Id you provided does not exist in our records."
         ))
     }
+}
+
+fn iam_lookup_error_to_s3_error(_err: &IamError) -> S3Error {
+    s3_error!(InternalError, "IAM user lookup failed")
 }
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
@@ -966,6 +971,14 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.code(), &S3ErrorCode::UnauthorizedAccess);
         assert!(error.message().unwrap_or("").contains("Your account is not signed up"));
+    }
+
+    #[test]
+    fn test_iam_lookup_error_maps_to_internal_error() {
+        let result = iam_lookup_error_to_s3_error(&IamError::Io(std::io::Error::other("load user failed")));
+
+        assert_eq!(result.code(), &S3ErrorCode::InternalError);
+        assert_eq!(result.message(), Some("IAM user lookup failed"));
     }
 
     #[test]

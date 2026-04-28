@@ -26,6 +26,30 @@ use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tracing::error;
 
+const ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: &str = "RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES";
+const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 8;
+
+fn encode_channel_capacity(expanded_block_bytes: usize, max_inflight_bytes: usize) -> usize {
+    if expanded_block_bytes == 0 {
+        return 1;
+    }
+
+    max_inflight_bytes
+        .saturating_div(expanded_block_bytes)
+        .clamp(1, DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS)
+}
+
+fn queued_block_bytes(block: &[Bytes]) -> usize {
+    block.iter().map(Bytes::len).sum()
+}
+
+async fn drain_queued_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Bytes>>) {
+    while let Some(block) = rx.recv().await {
+        rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_block_bytes(&block));
+    }
+}
+
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
     write_quorum: usize,
@@ -185,7 +209,14 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
-        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(8);
+        // Bound queued encoded blocks by memory budget to avoid per-request spikes.
+        let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
+        let max_inflight_bytes = rustfs_utils::get_env_usize(
+            ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
+            DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
+        );
+        let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
+        let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(inflight_blocks);
 
         let task = tokio::spawn(async move {
             let block_size = self.block_size;
@@ -196,7 +227,10 @@ impl Erasure {
                     Ok(n) if n > 0 => {
                         total += n;
                         let res = self.encode_data(&buf[..n])?;
+                        let queued_bytes = queued_block_bytes(&res);
+                        rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
                         if let Err(err) = tx.send(res).await {
+                            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
                             return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                         }
                     }
@@ -229,6 +263,8 @@ impl Erasure {
             if block.is_empty() {
                 break;
             }
+            let queued_bytes = queued_block_bytes(&block);
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_bytes);
             if let Err(err) = writers.write(block).await {
                 write_err = Some(err);
                 break;
@@ -238,6 +274,7 @@ impl Erasure {
         if let Some(err) = write_err {
             task.abort();
             let _ = task.await;
+            drain_queued_inflight_bytes(&mut rx).await;
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
             }
@@ -309,5 +346,19 @@ mod tests {
 
         assert_eq!(written, b"small payload".len());
         assert!(!committed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn encode_channel_capacity_never_returns_zero() {
+        assert_eq!(encode_channel_capacity(0, 1024), 1);
+        assert_eq!(encode_channel_capacity(4096, 0), 1);
+        assert_eq!(encode_channel_capacity(4096, 1024), 1);
+    }
+
+    #[test]
+    fn encode_channel_capacity_respects_budget_and_hard_cap() {
+        assert_eq!(encode_channel_capacity(4 * 1024 * 1024, 32 * 1024 * 1024), 8);
+        assert_eq!(encode_channel_capacity(16 * 1024 * 1024, 32 * 1024 * 1024), 2);
+        assert_eq!(encode_channel_capacity(1, usize::MAX), DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS);
     }
 }

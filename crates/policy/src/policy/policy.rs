@@ -799,6 +799,139 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_list_bucket_prefix_condition_uses_bucket_resource() -> Result<()> {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "polaris_test/snowflake_catalog/db1/schema/iceberg_table/*"
+          ]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert(
+            "prefix".to_string(),
+            vec!["polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/".to_string()],
+        );
+        let claims = HashMap::new();
+        let args = Args {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(
+            policy.is_allowed(&args).await,
+            "ListBucket should match the bucket resource and apply the prefix through the condition, not by converting the prefix into an object resource"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket_versions_prefix_condition_uses_bucket_resource() -> Result<()> {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucketVersions"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "polaris_test/snowflake_catalog/db1/schema/iceberg_table/*"
+          ]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert(
+            "prefix".to_string(),
+            vec!["polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/".to_string()],
+        );
+        let claims = HashMap::new();
+        let args = Args {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketVersionsAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(
+            policy.is_allowed(&args).await,
+            "ListBucketVersions should match the bucket resource and apply the prefix through the condition"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_bucket_gateway_prefix_uses_object_resource_when_condition_missing() -> Result<()> {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket/home/alice/*"]
+    }
+  ]
+}"#,
+        )?;
+
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = Args {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "home/alice/projects/",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(
+            policy.is_allowed(&args).await,
+            "Gateway ListBucket auth without an s3:prefix condition should continue matching prefix-scoped resources via args.object"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_aws_username_policy_variable() -> Result<()> {
         let data = r#"
 {
@@ -1409,6 +1542,52 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_bucket_policy_list_bucket_prefix_condition_uses_bucket_resource() -> Result<()> {
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "polaris_test/snowflake_catalog/db1/schema/iceberg_table/*"
+          ]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert(
+            "prefix".to_string(),
+            vec!["polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/".to_string()],
+        );
+        let args = BucketPolicyArgs {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "polaris_test/snowflake_catalog/db1/schema/iceberg_table/metadata/",
+        };
+
+        assert!(
+            bucket_policy.is_allowed(&args).await,
+            "Bucket policy ListBucket should match the bucket resource and apply the prefix through the condition"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_bucket_policy_deny_with_string_not_equals() -> Result<()> {
         let data = r#"
 {
@@ -1760,5 +1939,29 @@ mod test {
         let (policies, found) = get_policies_from_claims(&claims, "POLICY");
         assert!(!found);
         assert!(policies.is_empty());
+    }
+
+    #[test]
+    fn test_policy_round_trips_through_json_value() {
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    }
+  ]
+}"#,
+        )
+        .expect("policy should parse");
+
+        let value = serde_json::to_value(&policy).expect("policy should serialize");
+        let round_trip: Policy = serde_json::from_value(value).expect("policy should deserialize from serde_json::Value");
+
+        assert_eq!(round_trip.version, policy.version);
+        assert_eq!(round_trip.statements.len(), policy.statements.len());
+        assert_eq!(round_trip.statements[0].effect, policy.statements[0].effect);
     }
 }

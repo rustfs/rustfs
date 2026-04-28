@@ -599,15 +599,13 @@ impl AdminAction {
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[serde(try_from = "&str", into = "&str")]
-pub enum StsAction {}
-
-impl TryFrom<&str> for StsAction {
-    type Error = strum::ParseError;
-    fn try_from(_value: &str) -> std::result::Result<Self, Self::Error> {
-        Err(strum::ParseError::VariantNotFound)
-    }
+pub enum StsAction {
+    #[strum(serialize = "sts:*")]
+    AllActions,
+    #[strum(serialize = "sts:AssumeRole")]
+    AssumeRoleAction,
 }
 
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
@@ -627,6 +625,16 @@ mod tests {
         // Test that "*" parses to S3Action::AllActions
         let action = Action::try_from("*").expect("Should parse wildcard");
         assert!(matches!(action, Action::S3Action(S3Action::AllActions)));
+    }
+
+    #[test]
+    fn test_sts_action_parsing() {
+        let action = Action::try_from("sts:AssumeRole").expect("Should parse STS AssumeRole action");
+        assert!(matches!(action, Action::StsAction(StsAction::AssumeRoleAction)));
+
+        let wildcard = Action::try_from("sts:*").expect("Should parse STS wildcard action");
+        assert!(matches!(wildcard, Action::StsAction(StsAction::AllActions)));
+        assert!(wildcard.is_match(&action));
     }
 
     #[test]

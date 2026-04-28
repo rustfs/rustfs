@@ -16,10 +16,8 @@ services:
 
   # --- Tracing ---
   tempo:
-    image: grafana/tempo:2.10.3
+    image: grafana/tempo:2.10.5
     container_name: tempo
-    depends_on:
-      - redpanda
     command: [ "-config.file=/etc/tempo.yaml" ]
     volumes:
       - ./tempo.yaml:/etc/tempo.yaml:ro
@@ -33,31 +31,11 @@ services:
       - otel-network
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3200/ready" ]
+      test: [ "CMD", "/tempo", "-version" ]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 15s
-  redpanda:
-    image: redpandadata/redpanda:latest
-    ports:
-      - "9092:9092" # Kafka API for clients
-    command: >
-      redpanda start --overprovisioned
-      --mode=dev-container
-      --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      --advertise-kafka-addr=PLAINTEXT://redpanda:9092
-
-  redpanda-console:
-    image: docker.redpanda.com/redpandadata/console:latest
-    environment:
-      - CONFIG_FILEPATH=/etc/redpanda/redpanda-console-config.yaml
-    volumes:
-      - ./redpanda-console.yaml:/etc/redpanda/redpanda-console-config.yaml
-    ports:
-      - "8080:8080"
-    depends_on:
-      - redpanda
 
   vulture:
     image: grafana/tempo-vulture:latest
@@ -106,6 +84,7 @@ services:
     container_name: prometheus
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     ports:
       - "9090:9090"
@@ -168,7 +147,7 @@ services:
       - prometheus
       - loki
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:13133" ]
+      test: [ "CMD", "/otelcol-contrib", "--version" ]
       interval: 10s
       timeout: 5s
       retries: 3

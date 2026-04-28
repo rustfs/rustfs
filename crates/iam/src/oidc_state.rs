@@ -32,11 +32,20 @@ pub struct OidcAuthSession {
     pub redirect_after: Option<String>,
 }
 
+/// Stores an ID token behind a one-time opaque handle so the console can trigger
+/// RP-initiated logout without persisting the raw token in browser storage.
+#[derive(Debug, Clone)]
+pub struct OidcLogoutSession {
+    pub provider_id: String,
+    pub id_token: String,
+}
+
 /// TTL cache for OIDC auth state (PKCE verifiers + nonces) during the authorization flow.
 /// Entries expire after 5 minutes and are single-use (removed on retrieval).
 #[derive(Clone)]
 pub struct OidcStateStore {
     cache: Cache<String, OidcAuthSession>,
+    logout_cache: Cache<String, OidcLogoutSession>,
     last_capacity_log_at: Arc<AtomicU64>,
 }
 
@@ -46,8 +55,13 @@ impl OidcStateStore {
             .max_capacity(OIDC_STATE_CAPACITY)
             .time_to_live(Duration::from_secs(300)) // 5 minute TTL
             .build();
+        let logout_cache = Cache::builder()
+            .max_capacity(OIDC_STATE_CAPACITY)
+            .time_to_live(Duration::from_secs(3600)) // 1 hour TTL to match console OIDC sessions
+            .build();
         Self {
             cache,
+            logout_cache,
             last_capacity_log_at: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -97,6 +111,21 @@ impl OidcStateStore {
     /// Check if a state key exists (without consuming it).
     pub async fn contains(&self, state: &str) -> bool {
         self.cache.get(state).await.is_some()
+    }
+
+    /// Store a new one-time logout session keyed by an opaque logout token.
+    pub async fn insert_logout(&self, token: String, session: OidcLogoutSession) {
+        self.logout_cache.insert(token, session).await;
+    }
+
+    /// Retrieve and remove a logout session (single-use). Returns None if expired or not found.
+    pub async fn take_logout(&self, token: &str) -> Option<OidcLogoutSession> {
+        self.logout_cache.remove(token).await
+    }
+
+    /// Check if a logout token exists (without consuming it).
+    pub async fn contains_logout(&self, token: &str) -> bool {
+        self.logout_cache.get(token).await.is_some()
     }
 }
 
@@ -166,5 +195,25 @@ mod tests {
         for i in 0..5 {
             assert!(store.take(&format!("state_{i}")).await.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_logout_state_store_insert_and_take() {
+        let store = OidcStateStore::new();
+        let session = OidcLogoutSession {
+            provider_id: "okta".to_string(),
+            id_token: "jwt-token".to_string(),
+        };
+
+        store.insert_logout("logout_abc".to_string(), session.clone()).await;
+        assert!(store.contains_logout("logout_abc").await);
+
+        let retrieved = store.take_logout("logout_abc").await;
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.provider_id, "okta");
+        assert_eq!(retrieved.id_token, "jwt-token");
+
+        assert!(store.take_logout("logout_abc").await.is_none());
     }
 }

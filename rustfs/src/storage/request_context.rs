@@ -43,6 +43,7 @@
 //! - Canonical source: HTTP ingress `x-request-id` header (set by `SetRequestIdLayer`)
 //! - `x-amz-request_id` is an alias for S3 compatibility, always equal to `request_id`
 //! - Internal modules MUST NOT generate a second request-id under the name `request_id`
+//!   except for orphan/non-ingress fallback paths where no canonical request-id exists.
 //! - Internal identifiers for sub-operations should use `operation_id` or `subtask_id`
 //!
 //! ## tokio::spawn usage
@@ -56,8 +57,14 @@
 //! - NEVER use bare `tokio::spawn` in request-handling code paths
 
 use http::HeaderMap;
+use metrics::counter;
+use opentelemetry::trace::TraceContextExt;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use std::time::Instant;
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Canonical request context carried through the entire request lifecycle.
 ///
@@ -79,17 +86,41 @@ pub struct RequestContext {
 
 impl RequestContext {
     /// Create a fallback `RequestContext` for paths that bypass HTTP ingress.
-    /// Generates a `req-{uuid}` format request-id.
+    /// Generates a `trace-{trace_id}` or `req-{uuid}` format request-id.
     pub fn fallback() -> Self {
-        let id = format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let trace_ctx = current_trace_context_ids();
+        let id = build_fallback_request_id(trace_ctx.as_ref());
+        counter!("rustfs_log_chain_fallback_request_id_total", "source" => "request_context_fallback").increment(1);
         Self {
             request_id: id.clone(),
             x_amz_request_id: id,
-            trace_id: None,
-            span_id: None,
+            trace_id: trace_ctx.as_ref().map(|(trace_id, _)| trace_id.clone()),
+            span_id: trace_ctx.as_ref().map(|(_, span_id)| span_id.clone()),
             start_time: Instant::now(),
         }
     }
+}
+
+fn current_trace_context_ids() -> Option<(String, String)> {
+    let current_context = Span::current().context();
+    let current_span = current_context.span();
+    let span_context = current_span.span_context();
+    if !span_context.is_valid() {
+        return None;
+    }
+
+    Some((span_context.trace_id().to_string(), span_context.span_id().to_string()))
+}
+
+fn build_fallback_request_id(trace_ctx: Option<&(String, String)>) -> String {
+    trace_ctx
+        .map(|(trace_id, _)| format!("trace-{trace_id}"))
+        .unwrap_or_else(|| format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8]))
+}
+
+fn generate_fallback_request_id() -> String {
+    let trace_ctx = current_trace_context_ids();
+    build_fallback_request_id(trace_ctx.as_ref())
 }
 
 /// Extract the canonical request ID from HTTP headers.
@@ -97,14 +128,20 @@ impl RequestContext {
 /// Priority:
 /// 1. `x-request-id` (primary, set by `SetRequestIdLayer`)
 /// 2. `x-amz-request-id` (fallback, from S3 client forwarding)
-/// 3. `"unknown"` (no header present)
+/// 3. generated fallback id (`trace-{trace_id}` or `req-{uuid}`)
 pub fn extract_request_id_from_headers(headers: &HeaderMap) -> String {
-    headers
-        .get("x-request-id")
+    let request_id = headers
+        .get(REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(String::from)
         .or_else(|| headers.get(AMZ_REQUEST_ID).and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(generate_fallback_request_id);
+
+    if !headers.contains_key(REQUEST_ID_HEADER) && !headers.contains_key(AMZ_REQUEST_ID) {
+        counter!("rustfs_log_chain_fallback_request_id_total", "source" => "headers_missing").increment(1);
+    }
+
+    request_id
 }
 
 /// Spawn a request-internal task that inherits the current tracing span.
@@ -126,6 +163,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::trace::{SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider as _};
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+    fn with_trace_parent<F>(trace_id_hex: &str, f: F)
+    where
+        F: FnOnce(),
+    {
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("request-context-tests");
+        let subscriber = Registry::default().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("request-context-test-span");
+
+            let trace_id = TraceId::from_hex(trace_id_hex).expect("trace id should be valid hex");
+            let span_id = opentelemetry::trace::SpanId::from_hex("0102030405060708").expect("span id should be valid hex");
+            let parent = SpanContext::new(trace_id, span_id, TraceFlags::SAMPLED, true, TraceState::default());
+            span.set_parent(opentelemetry::Context::new().with_remote_span_context(parent))
+                .expect("failed to set parent context");
+            let _guard = span.enter();
+
+            f();
+        });
+        let _ = provider.shutdown();
+    }
 
     #[test]
     fn test_request_context_clone_send_sync() {
@@ -140,6 +204,17 @@ mod tests {
         assert_eq!(ctx.request_id, ctx.x_amz_request_id);
         assert!(ctx.trace_id.is_none());
         assert!(ctx.span_id.is_none());
+    }
+
+    #[test]
+    fn test_request_context_fallback_uses_trace_prefix_when_span_context_valid() {
+        let trace_id = "70f5f77e2f0a4f24be343b59f8b66f8f";
+        with_trace_parent(trace_id, || {
+            let ctx = RequestContext::fallback();
+            assert_eq!(ctx.request_id, format!("trace-{trace_id}"));
+            assert_eq!(ctx.trace_id.as_deref(), Some(trace_id));
+            assert!(ctx.span_id.is_some());
+        });
     }
 
     #[test]
@@ -171,6 +246,20 @@ mod tests {
     fn test_extract_request_id_no_headers() {
         let headers = HeaderMap::new();
         let id = extract_request_id_from_headers(&headers);
-        assert_eq!(id, "unknown");
+        assert!(
+            id.starts_with("req-") || id.starts_with("trace-"),
+            "fallback request id should use req-/trace- prefix, got: {}",
+            id
+        );
+    }
+
+    #[test]
+    fn test_extract_request_id_no_headers_uses_trace_prefix_when_span_context_valid() {
+        let trace_id = "8d8b7d58055d45f793b8ca7fcb91bc17";
+        with_trace_parent(trace_id, || {
+            let headers = HeaderMap::new();
+            let id = extract_request_id_from_headers(&headers);
+            assert_eq!(id, format!("trace-{trace_id}"));
+        });
     }
 }

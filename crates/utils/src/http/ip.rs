@@ -20,10 +20,10 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 /// De-facto standard header keys.
-const X_FORWARDED_FOR: &str = "x-forwarded-for";
-const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
-const X_FORWARDED_SCHEME: &str = "x-forwarded-scheme";
-const X_REAL_IP: &str = "x-real-ip";
+pub const X_FORWARDED_FOR: &str = "x-forwarded-for";
+pub const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
+pub const X_FORWARDED_SCHEME: &str = "x-forwarded-scheme";
+pub const X_REAL_IP: &str = "x-real-ip";
 
 /// RFC7239 defines a new "Forwarded: " header designed to replace the
 /// existing use of X-Forwarded-* headers.

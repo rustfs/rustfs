@@ -14,7 +14,9 @@
 
 use crate::{
     AuditEntry, AuditError, AuditResult,
-    factory::{MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory, WebhookTargetFactory},
+    factory::{
+        KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory, WebhookTargetFactory,
+    },
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -53,6 +55,7 @@ impl AuditRegistry {
         registry.register(ChannelTargetType::Mqtt.as_str(), Box::new(MQTTTargetFactory));
         registry.register(ChannelTargetType::Nats.as_str(), Box::new(NATSTargetFactory));
         registry.register(ChannelTargetType::Pulsar.as_str(), Box::new(PulsarTargetFactory));
+        registry.register(ChannelTargetType::Kafka.as_str(), Box::new(KafkaTargetFactory));
 
         registry
     }
@@ -197,8 +200,8 @@ impl AuditRegistry {
             }
         }
 
-        if !errors.is_empty() {
-            return Err(AuditError::Target(errors.into_iter().next().unwrap()));
+        if let Some(error) = errors.into_iter().next() {
+            return Err(AuditError::Target(error));
         }
 
         Ok(())

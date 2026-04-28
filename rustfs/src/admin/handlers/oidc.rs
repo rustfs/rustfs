@@ -41,6 +41,7 @@ use url::Url;
 const OIDC_PUBLIC_PROVIDERS_SUFFIX: &str = "/v3/oidc/providers";
 const OIDC_AUTHORIZE_SUFFIX: &str = "/v3/oidc/authorize/";
 const OIDC_CALLBACK_SUFFIX: &str = "/v3/oidc/callback/";
+const OIDC_LOGOUT_SUFFIX: &str = "/v3/oidc/logout";
 
 /// Validate that a provider ID contains only safe characters (alphanumeric, underscore, hyphen).
 fn is_valid_provider_id(id: &str) -> bool {
@@ -76,6 +77,11 @@ pub fn register_oidc_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
     )?;
     r.insert(
         Method::GET,
+        &format!("{ADMIN_PREFIX}{OIDC_LOGOUT_SUFFIX}"),
+        AdminOperation(&OidcLogoutHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
         &format!("{ADMIN_PREFIX}/v3/oidc/config"),
         AdminOperation(&GetOidcConfigHandler {}),
     )?;
@@ -106,6 +112,7 @@ pub fn is_oidc_path(path: &str) -> bool {
         path == format!("{prefix}{OIDC_PUBLIC_PROVIDERS_SUFFIX}")
             || path.starts_with(&format!("{prefix}{OIDC_AUTHORIZE_SUFFIX}"))
             || path.starts_with(&format!("{prefix}{OIDC_CALLBACK_SUFFIX}"))
+            || path == format!("{prefix}{OIDC_LOGOUT_SUFFIX}")
     })
 }
 
@@ -484,10 +491,11 @@ impl Operation for OidcCallbackHandler {
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
 
         // Exchange authorization code for tokens and extract claims
-        let (claims, actual_provider_id, session) = oidc_sys.exchange_code(&state, &code, &redirect_uri).await.map_err(|e| {
-            error!("OIDC code exchange failed: {}", e);
-            S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {e}"))
-        })?;
+        let (claims, actual_provider_id, session, id_token) =
+            oidc_sys.exchange_code(&state, &code, &redirect_uri).await.map_err(|e| {
+                error!("OIDC code exchange failed: {}", e);
+                S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {e}"))
+            })?;
 
         info!(
             "OIDC login successful: username='{}', email='{}', sub='{}' (provider: {})",
@@ -508,6 +516,11 @@ impl Operation for OidcCallbackHandler {
         // through AssumeRoleWithWebIdentity.
         let new_cred = create_oidc_sts_credentials(&claims, &actual_provider_id, &policies, &groups, 3600, None).await?;
 
+        let logout_token = oidc_sys
+            .create_logout_token(&actual_provider_id, &id_token)
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("logout session creation failed: {e}")))?;
+
         // Build redirect URL to console with credentials in the fragment
         let console_redirect = build_console_redirect(
             &req,
@@ -516,6 +529,7 @@ impl Operation for OidcCallbackHandler {
             &new_cred.session_token,
             new_cred.expiration,
             session.redirect_after.as_deref(),
+            Some(logout_token.as_str()),
         )?;
 
         let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
@@ -526,6 +540,35 @@ impl Operation for OidcCallbackHandler {
                 .map_err(|_| s3_error!(InternalError, "failed to construct console redirect URL"))?,
         );
         Ok(resp)
+    }
+}
+
+/// Handler: GET /rustfs/admin/v3/oidc/logout?logout_token=...
+/// Consumes the logout token and redirects either to the IdP end-session URL
+/// or back to the console login page when federated logout is unavailable.
+pub struct OidcLogoutHandler {}
+
+#[async_trait::async_trait]
+impl Operation for OidcLogoutHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let fallback_location = build_console_login_redirect(&req)?;
+        let Some(logout_token) = extract_query_param(&req.uri, "logout_token") else {
+            return redirect_response(&fallback_location);
+        };
+
+        let location = match rustfs_iam::get_oidc() {
+            Some(oidc_sys) => match oidc_sys.build_logout_url(&logout_token, &fallback_location).await {
+                Ok(Some(url)) => url,
+                Ok(None) => fallback_location.clone(),
+                Err(err) => {
+                    warn!("OIDC logout fallback triggered: {}", err);
+                    fallback_location.clone()
+                }
+            },
+            None => fallback_location.clone(),
+        };
+
+        redirect_response(&location)
     }
 }
 
@@ -589,25 +632,20 @@ fn extract_safe_redirect_after(uri: &http::Uri) -> S3Result<Option<String>> {
 }
 
 /// Build the console redirect URL with STS credentials in the hash fragment.
-fn build_console_redirect(
-    req: &S3Request<Body>,
+fn build_console_callback_fragment(
     access_key: &str,
     secret_key: &str,
     session_token: &str,
     expiration: Option<OffsetDateTime>,
     redirect_after: Option<&str>,
-) -> S3Result<String> {
-    let scheme = extract_request_scheme(req)?;
-    let host = extract_request_host(req)?;
-
-    let console_prefix = "/rustfs/console";
+    logout_token: Option<&str>,
+) -> String {
     let page = redirect_after.filter(|p| is_safe_redirect_path(p)).unwrap_or("/");
-
     let exp_str = expiration
         .map(|e| e.format(&time::format_description::well_known::Rfc3339).unwrap_or_default())
         .unwrap_or_default();
 
-    let fragment = format!(
+    let mut fragment = format!(
         "accessKey={}&secretKey={}&sessionToken={}&expiration={}&redirect={}",
         urlencoding::encode(access_key),
         urlencoding::encode(secret_key),
@@ -616,7 +654,48 @@ fn build_console_redirect(
         urlencoding::encode(page),
     );
 
+    if let Some(logout_token) = logout_token.filter(|value| !value.is_empty()) {
+        fragment.push_str("&logoutToken=");
+        fragment.push_str(&urlencoding::encode(logout_token));
+    }
+
+    fragment
+}
+
+/// Build the console redirect URL with STS credentials in the hash fragment.
+fn build_console_redirect(
+    req: &S3Request<Body>,
+    access_key: &str,
+    secret_key: &str,
+    session_token: &str,
+    expiration: Option<OffsetDateTime>,
+    redirect_after: Option<&str>,
+    logout_token: Option<&str>,
+) -> S3Result<String> {
+    let scheme = extract_request_scheme(req)?;
+    let host = extract_request_host(req)?;
+    let console_prefix = "/rustfs/console";
+    let fragment =
+        build_console_callback_fragment(access_key, secret_key, session_token, expiration, redirect_after, logout_token);
+
     Ok(format!("{scheme}://{host}{console_prefix}/auth/oidc-callback/#{fragment}"))
+}
+
+fn build_console_login_redirect(req: &S3Request<Body>) -> S3Result<String> {
+    let scheme = extract_request_scheme(req)?;
+    let host = extract_request_host(req)?;
+    Ok(format!("{scheme}://{host}/rustfs/console/auth/login"))
+}
+
+fn redirect_response(location: &str) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
+    resp.headers.insert(
+        http::header::LOCATION,
+        location
+            .parse()
+            .map_err(|_| s3_error!(InternalError, "failed to construct redirect URL"))?,
+    );
+    Ok(resp)
 }
 
 async fn authorize_oidc_config_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
@@ -1085,6 +1164,22 @@ mod tests {
             .parse()
             .unwrap();
         assert!(extract_safe_redirect_after(&uri).is_err());
+    }
+
+    #[test]
+    fn test_build_console_callback_fragment_includes_logout_token() {
+        let fragment =
+            build_console_callback_fragment("access", "secret", "token", None, Some("/dashboard"), Some("logout-token"));
+
+        assert!(fragment.contains("accessKey=access"));
+        assert!(fragment.contains("redirect=%2Fdashboard"));
+        assert!(fragment.contains("logoutToken=logout-token"));
+    }
+
+    #[test]
+    fn test_is_oidc_path_includes_logout() {
+        assert!(is_oidc_path("/rustfs/admin/v3/oidc/logout"));
+        assert!(is_oidc_path("/minio/admin/v3/oidc/logout"));
     }
 
     #[test]

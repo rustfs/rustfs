@@ -16,6 +16,7 @@
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::config::RustFSBufferConfig;
+use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{
@@ -23,7 +24,7 @@ use crate::storage::concurrency::{
 };
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::{OperationHelper, spawn_background, spawn_background_with_context};
+use crate::storage::helper::{OperationHelper, spawn_background_with_context};
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
@@ -36,7 +37,7 @@ use bytes::Bytes;
 use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
 use metrics::{counter, histogram};
@@ -118,7 +119,7 @@ use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -213,6 +214,7 @@ async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &
     let Some(existing) = existing else {
         return;
     };
+    let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
         rustfs_ecstore::bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
@@ -252,6 +254,38 @@ pin_project! {
         md5: Md5Context,
         finished: bool,
         etag: Arc<Mutex<Option<String>>>,
+    }
+}
+
+pin_project! {
+    struct MemoryTrackedBytesStream {
+        bytes: Bytes,
+        emitted: bool,
+        _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+    }
+}
+
+impl MemoryTrackedBytesStream {
+    fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>) -> Self {
+        Self {
+            bytes,
+            emitted: false,
+            _guard: guard,
+        }
+    }
+}
+
+impl futures::Stream for MemoryTrackedBytesStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        if *this.emitted {
+            return std::task::Poll::Ready(None);
+        }
+
+        *this.emitted = true;
+        std::task::Poll::Ready(Some(Ok(this.bytes.clone())))
     }
 }
 
@@ -346,6 +380,16 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
     }
 
     true
+}
+
+fn object_seek_support_threshold() -> usize {
+    static OBJECT_SEEK_SUPPORT_THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *OBJECT_SEEK_SUPPORT_THRESHOLD.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -994,8 +1038,10 @@ impl DefaultObjectUsecase {
     }
 
     fn build_memory_blob(buf: Vec<u8>, response_content_length: i64, _optimal_buffer_size: usize) -> Option<StreamingBlob> {
+        let guard = rustfs_io_metrics::track_get_object_buffered_bytes(buf.len());
+        let bytes = Bytes::from(buf);
         Some(StreamingBlob::wrap(bytes_stream(
-            stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(buf)) }),
+            MemoryTrackedBytesStream::new(bytes, guard),
             response_content_length as usize,
         )))
     }
@@ -1211,11 +1257,9 @@ impl DefaultObjectUsecase {
 
         let info = reader.object_info;
 
-        use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
+        use rustfs_io_metrics::record_zero_copy_read;
         let read_duration = read_start.elapsed();
-        let estimated_saved = (info.size * 2) as usize;
         record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
-        record_memory_copy_saved(estimated_saved);
 
         manager.record_disk_operation(info.size as u64, read_duration, true).await;
 
@@ -1483,7 +1527,7 @@ impl DefaultObjectUsecase {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         if encryption_applied {
-            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+            let seekable_object_size_threshold = object_seek_support_threshold();
             let should_buffer_encrypted_object = response_content_length > 0
                 && response_content_length <= seekable_object_size_threshold as i64
                 && part_number.is_none()
@@ -1514,7 +1558,7 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size));
         }
 
-        let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
+        let seekable_object_size_threshold = object_seek_support_threshold();
         let should_provide_seek_support = response_content_length > 0
             && response_content_length <= seekable_object_size_threshold as i64
             && part_number.is_none()
@@ -1651,8 +1695,8 @@ impl DefaultObjectUsecase {
 
         if enable_zero_copy {
             // Record zero-copy write attempt
-            counter!("rustfs.zero_copy.write.attempts.total").increment(1);
-            histogram!("rustfs.zero_copy.write.size.bytes").record(size as f64);
+            counter!("rustfs_zero_copy_write_attempts_total").increment(1);
+            histogram!("rustfs_zero_copy_write_size_bytes").record(size as f64);
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
@@ -1837,7 +1881,6 @@ impl DefaultObjectUsecase {
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-
         let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
@@ -2115,9 +2158,9 @@ impl DefaultObjectUsecase {
 
         let request_id = req
             .extensions
-            .get::<crate::storage::request_context::RequestContext>()
+            .get::<request_context::RequestContext>()
             .map(|ctx| ctx.request_id.clone())
-            .unwrap_or_else(|| crate::storage::request_context::RequestContext::fallback().request_id);
+            .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
         let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
@@ -3084,6 +3127,7 @@ impl DefaultObjectUsecase {
                 && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
                     || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
             {
+                let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
                 let mut dobj = dobj.clone();
                 if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
                     dobj.version_id = Some(Uuid::nil());
@@ -3105,7 +3149,9 @@ impl DefaultObjectUsecase {
             .as_ref()
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
-        spawn_background(async move {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        spawn_background_with_context(request_context, async move {
+            let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
                     let event_name = if dobj.delete_marker {
@@ -3295,6 +3341,7 @@ impl DefaultObjectUsecase {
         let deleted_replication_info = existing_object_info
             .as_ref()
             .filter(|_| should_use_existing_delete_replication_info(&opts));
+        let _delete_tail_guard = DeleteTailActivityGuard::new(DeleteTailStage::Tail);
         let deleted_object_source = deleted_replication_info.unwrap_or(&obj_info);
         let replication_state_source =
             delete_replication_state_source(&opts, existing_object_info.as_ref(), deleted_object_source);
@@ -3308,6 +3355,7 @@ impl DefaultObjectUsecase {
         };
 
         if schedule_delete_replication {
+            let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
             let mut deleted_object = DeletedObjectReplicationInfo {
                 delete_object: rustfs_ecstore::store_api::DeletedObject {
                     delete_marker: deleted_object_source.delete_marker && !deleted_delete_marker_version,
@@ -4318,10 +4366,7 @@ impl DefaultObjectUsecase {
             };
 
             let notify = notify.clone();
-            let request_context = req
-                .extensions
-                .get::<crate::storage::request_context::RequestContext>()
-                .cloned();
+            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
             spawn_background_with_context(request_context, async move {
                 notify.notify(event_args).await;
             });

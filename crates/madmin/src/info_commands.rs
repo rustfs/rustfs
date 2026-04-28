@@ -97,6 +97,9 @@ pub struct Disk {
     pub runtime_state: Option<String>,
     #[serde(rename = "offlineDurationSeconds", default, skip_serializing_if = "Option::is_none")]
     pub offline_duration_seconds: Option<u64>,
+    /// Leaf physical block devices backing this disk path when the platform can resolve them.
+    #[serde(rename = "physicalDeviceIds", default, skip_serializing_if = "Option::is_none")]
+    pub physical_device_ids: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -481,6 +484,7 @@ mod tests {
         assert!(disk.heal_info.is_none());
         assert_eq!(disk.used_inodes, 0);
         assert_eq!(disk.free_inodes, 0);
+        assert!(disk.physical_device_ids.is_none());
         assert!(!disk.local);
         assert_eq!(disk.pool_index, 0);
         assert_eq!(disk.set_index, 0);
@@ -514,6 +518,7 @@ mod tests {
             heal_info: None,
             used_inodes: 1000000,
             free_inodes: 9000000,
+            physical_device_ids: Some(vec!["nvme0n1".to_string()]),
             local: true,
             pool_index: 0,
             set_index: 1,
@@ -533,6 +538,7 @@ mod tests {
         assert!(disk.metrics.is_some());
         assert_eq!(disk.runtime_state.as_deref(), Some("online"));
         assert_eq!(disk.offline_duration_seconds, Some(0));
+        assert_eq!(disk.physical_device_ids, Some(vec!["nvme0n1".to_string()]));
         assert!(disk.local);
     }
 
@@ -575,6 +581,7 @@ mod tests {
         assert_eq!(decoded.used_inodes, 11_125);
         assert_eq!(decoded.runtime_state, None);
         assert_eq!(decoded.offline_duration_seconds, None);
+        assert_eq!(decoded.physical_device_ids, None);
     }
 
     #[test]
@@ -606,6 +613,7 @@ mod tests {
             pool_index: 1,
             set_index: 2,
             disk_index: 3,
+            physical_device_ids: Some(vec!["nvme0n1".to_string(), "nvme1n1".to_string()]),
             runtime_state: Some("online".to_string()),
             offline_duration_seconds: Some(0),
         };
@@ -620,6 +628,19 @@ mod tests {
         assert_eq!(decoded.used_inodes, 22_250);
         assert_eq!(decoded.disk_index, 3);
         assert_eq!(decoded.endpoint, "http://current-node:9000");
+    }
+
+    #[test]
+    fn test_disk_serializes_physical_device_ids_when_present() {
+        let disk = Disk {
+            physical_device_ids: Some(vec!["nvme0n1".to_string(), "nvme1n1".to_string()]),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&disk).unwrap();
+        assert!(json.contains("physicalDeviceIds"));
+        assert!(json.contains("nvme0n1"));
+        assert!(json.contains("nvme1n1"));
     }
 
     #[test]

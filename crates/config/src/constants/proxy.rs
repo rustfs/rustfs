@@ -20,6 +20,11 @@ pub const ENV_TRUSTED_PROXY_ENABLED: &str = "RUSTFS_TRUSTED_PROXY_ENABLED";
 /// Trusted proxy middleware is enabled by default.
 pub const DEFAULT_TRUSTED_PROXY_ENABLED: bool = true;
 
+/// Environment variable to select the trusted proxy implementation.
+pub const ENV_TRUSTED_PROXY_IMPLEMENTATION: &str = "RUSTFS_TRUSTED_PROXY_IMPLEMENTATION";
+/// The simplified implementation is used by default.
+pub const DEFAULT_TRUSTED_PROXY_IMPLEMENTATION: &str = "simple";
+
 /// Environment variable for the proxy validation mode.
 pub const ENV_TRUSTED_PROXY_VALIDATION_MODE: &str = "RUSTFS_TRUSTED_PROXY_VALIDATION_MODE";
 /// Default validation mode is "hop_by_hop".

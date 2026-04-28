@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+pub mod kafka;
 pub mod mqtt;
 pub mod nats;
 pub mod pulsar;

@@ -22,7 +22,7 @@ pub const BUCKET_L: &str = "bucket";
 /// Replication operation
 pub const OPERATION_L: &str = "operation";
 /// Replication target ARN
-pub const TARGET_ARN_L: &str = "targetArn";
+pub const TARGET_ARN_L: &str = "target_arn";
 /// Replication range
 pub const RANGE_L: &str = "range";
 
