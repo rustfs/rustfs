@@ -22,9 +22,6 @@ on:
 permissions:
   contents: read
 
-env:
-  new_version: ${{ github.event.workflow_run.head_branch }}
-
 jobs:
   build-helm-package:
     runs-on: ubicloud-standard-2
@@ -34,16 +31,47 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       contains(github.event.workflow_run.head_branch, '.')
 
+    outputs:
+      raw_tag: ${{ steps.version.outputs.raw_tag }}
+      version: ${{ steps.version.outputs.version }}
+
     steps:
       - name: Checkout helm chart repo
         uses: actions/checkout@v6
 
+      - name: Normalize release version
+        id: version
+        run: |
+          set -eux
+
+          RAW="${{ github.event.workflow_run.head_branch }}"
+
+          case "$RAW" in
+            refs/tags/*)
+              RAW_TAG="${RAW#refs/tags/}"
+              ;;
+            *)
+              RAW_TAG="$RAW"
+              ;;
+          esac
+
+          VERSION="$RAW_TAG"
+          case "$VERSION" in
+            v*)
+              VERSION="${VERSION#v}"
+              ;;
+          esac
+
+          echo "raw_tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          echo "raw_tag=$RAW_TAG"
+          echo "version=$VERSION"
+
       - name: Replace chart app version
         run: |
-          set -e
-          set -x
-          old_version=$(grep "^appVersion:" helm/rustfs/Chart.yaml | awk '{print $2}')
-          sed -i "s/$old_version/$new_version/g" helm/rustfs/Chart.yaml
+          set -eux
+          sed -i -E 's/^appVersion:.*/appVersion: "${{ steps.version.outputs.version }}"/' helm/rustfs/Chart.yaml
 
       - name: Set up Helm
         uses: azure/setup-helm@v4.3.0
@@ -51,8 +79,9 @@ jobs:
       - name: Package Helm Chart
         run: |
           cp helm/README.md helm/rustfs/
-          package_version=$(echo $new_version | awk -F '-' '{print $2}' | awk -F '.' '{print $NF}') 
-          helm package ./helm/rustfs --destination helm/rustfs/ --version "0.0.$package_version"
+          helm package ./helm/rustfs \
+            --destination helm/rustfs/ \
+            --version "${{ steps.version.outputs.version }}"
 
       - name: Upload helm package as artifact
         uses: actions/upload-artifact@v6
@@ -64,6 +93,7 @@ jobs:
   publish-helm-package:
     runs-on: ubicloud-standard-2
     needs: [ build-helm-package ]
+    if: needs.build-helm-package.result == 'success'
 
     steps:
       - name: Checkout helm package repo
@@ -90,5 +120,5 @@ jobs:
           git config --global user.email "${{ secrets.EMAIL_ADDRESS }}"
           git status .
           git add .
-          git commit -m "Update rustfs helm package with $new_version."
+          git commit -m "Update rustfs helm package with ${{ needs.build-helm-package.outputs.version }}."
           git push origin main
