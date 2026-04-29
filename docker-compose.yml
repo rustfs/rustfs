@@ -42,11 +42,22 @@ services:
     volumes:
       - ./deploy/data/pro:/data
       - ./deploy/logs:/app/logs
-      - ./deploy/data/certs/:/opt/tls # TLS configuration, you should create tls directory and put your tls files in it and then specify the path here
+      # TLS configuration directory.
+      # Place at least:
+      # - /opt/tls/ca.crt
+      # - /opt/tls/rustfs_cert.pem
+      # - /opt/tls/rustfs_key.pem
+      - ./deploy/data/certs/:/opt/tls
+      # Permission baseline:
+      # - default RustFS runtime user is 10001:10001
+      # - ensure host mounts are writable by that user, or run with host-matched user
     networks:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
+      # Production strict TLS example (SAN/FQDN aligned, no `-k`):
+      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9000:127.0.0.1 https://rustfs-a.example.com:9000/health
+      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9001:127.0.0.1 https://rustfs-a.example.com:9001/rustfs/console/health
       test:
         [
           "CMD",
