@@ -1084,3 +1084,161 @@ where
         async move { Err(FsError::NotImplemented) }.boxed()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::WebDavDriver;
+    use crate::common::client::s3::StorageBackend as S3StorageBackend;
+    use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+    use async_trait::async_trait;
+    use dav_server::davpath::DavPath;
+    use dav_server::fs::FsError;
+    use rustfs_credentials::Credentials;
+    use rustfs_policy::auth::UserIdentity;
+    use s3s::dto::*;
+    use std::fmt::{Debug, Formatter};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct DummyStorage;
+
+    impl Debug for DummyStorage {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str("DummyStorage")
+        }
+    }
+
+    #[async_trait]
+    impl S3StorageBackend for DummyStorage {
+        type Error = std::io::Error;
+
+        async fn get_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+            _start_pos: Option<u64>,
+        ) -> Result<GetObjectOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn get_object_range(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+            _start_pos: u64,
+            _length: u64,
+        ) -> Result<GetObjectOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn put_object(
+            &self,
+            _input: PutObjectInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<PutObjectOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn delete_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<DeleteObjectOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn head_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<HeadObjectOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn head_bucket(
+            &self,
+            _bucket: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<HeadBucketOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn list_objects_v2(
+            &self,
+            _input: ListObjectsV2Input,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<ListObjectsV2Output, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn create_bucket(
+            &self,
+            _bucket: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<CreateBucketOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn delete_bucket(
+            &self,
+            _bucket: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<DeleteBucketOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+    }
+
+    fn driver() -> WebDavDriver<DummyStorage> {
+        let identity = UserIdentity::new(Credentials {
+            access_key: "ak".to_string(),
+            secret_key: "sk".to_string(),
+            ..Default::default()
+        });
+        let session_context = SessionContext::new(
+            ProtocolPrincipal::new(Arc::new(identity)),
+            Protocol::WebDav,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+
+        WebDavDriver::new(DummyStorage, Arc::new(session_context))
+    }
+
+    #[test]
+    fn parse_path_decodes_url_encoded_object_names() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/%E6%96%87%E4%BB%B6%20name.txt").expect("path should parse");
+
+        let (bucket, key) = driver.parse_path(&path).expect("path should decode");
+
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key.as_deref(), Some("文件 name.txt"));
+    }
+
+    #[test]
+    fn parse_path_rejects_invalid_utf8_percent_encoding() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/%FFreport.txt").expect("path should parse");
+
+        let err = driver.parse_path(&path).expect_err("invalid utf8 should be rejected");
+
+        assert_eq!(err, FsError::GeneralFailure);
+    }
+}
