@@ -83,6 +83,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+use tracing::warn;
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -1598,6 +1599,26 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
     state
 }
 
+fn site_replication_remove_status(peer_errors: &[String]) -> ReplicateRemoveStatus {
+    ReplicateRemoveStatus {
+        status: SITE_REPL_REMOVE_SUCCESS.to_string(),
+        err_detail: if peer_errors.is_empty() {
+            String::new()
+        } else {
+            format!("failed to notify {} peer(s): {}", peer_errors.len(), peer_errors.join("; "))
+        },
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+    }
+}
+
+fn finalize_site_replication_remove(
+    current_state: SiteReplicationState,
+    remove_req: SRRemoveReq,
+    peer_errors: &[String],
+) -> (SiteReplicationState, ReplicateRemoveStatus) {
+    (remove_sites(current_state, remove_req), site_replication_remove_status(peer_errors))
+}
+
 fn resync_status_for_state(
     state: &mut SiteReplicationState,
     op_type: &str,
@@ -2417,13 +2438,16 @@ impl Operation for SiteReplicationRemoveHandler {
         let current_state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &current_state);
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
+        let (state, mut status) = finalize_site_replication_remove(current_state.clone(), remove_req.clone(), &[]);
+        persist_site_replication_state(&state).await?;
 
+        let mut peer_errors = Vec::new();
         if !current_state.service_account_access_key.is_empty() && !current_state.service_account_secret_key.is_empty() {
             for peer in current_state.peers.values() {
                 if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
                     continue;
                 }
-                send_peer_admin_request(
+                if let Err(err) = send_peer_admin_request(
                     &peer.endpoint,
                     SITE_REPLICATION_PEER_REMOVE_PATH,
                     &current_state.service_account_access_key,
@@ -2434,17 +2458,20 @@ impl Operation for SiteReplicationRemoveHandler {
                         remove_all: remove_req.remove_all,
                     },
                 )
-                .await?;
+                .await
+                {
+                    let err_detail = format!("{}: {err}", peer.endpoint);
+                    warn!(peer = %peer.endpoint, error = ?err, "site replication peer remove notification failed");
+                    peer_errors.push(err_detail);
+                }
             }
         }
 
-        let state = remove_sites(current_state, remove_req);
-        persist_site_replication_state(&state).await?;
-        json_response(&ReplicateRemoveStatus {
-            status: SITE_REPL_REMOVE_SUCCESS.to_string(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
+        if !peer_errors.is_empty() {
+            status = site_replication_remove_status(&peer_errors);
+        }
+
+        json_response(&status)
     }
 }
 
@@ -3211,6 +3238,39 @@ mod tests {
 
         assert!(req.remove_all);
         assert!(req.site_names.is_empty());
+    }
+
+    #[test]
+    fn test_finalize_site_replication_remove_keeps_local_success_with_peer_errors() {
+        let mut state = SiteReplicationState::default();
+        state.peers.insert(
+            "local".to_string(),
+            PeerInfo {
+                deployment_id: "local".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote".to_string(),
+            PeerInfo {
+                deployment_id: "remote".to_string(),
+                ..peer("remote", "https://remote.example.com")
+            },
+        );
+
+        let (state, status) = finalize_site_replication_remove(
+            state,
+            SRRemoveReq {
+                remove_all: true,
+                ..Default::default()
+            },
+            &["peer request to https://remote.example.com failed with 403 Forbidden".to_string()],
+        );
+
+        assert!(state.peers.is_empty());
+        assert_eq!(status.status, SITE_REPL_REMOVE_SUCCESS);
+        assert!(status.err_detail.contains("failed to notify 1 peer"));
+        assert!(status.err_detail.contains("403 Forbidden"));
     }
 
     #[test]
