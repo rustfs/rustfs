@@ -37,7 +37,10 @@ fn normalize_peers_map(peers: &Map<String, Value>) -> Map<String, Value> {
                 if peer.deployment_id.is_empty() {
                     peer.deployment_id = deployment_id_for_endpoint(&peer.endpoint);
                 }
-                valid_peers.insert(peer.deployment_id.clone(), peer);
+                // Keep all parsed entries for identity-level normalization. Using the
+                // original JSON key avoids dropping records early on temporary
+                // deployment_id collisions.
+                valid_peers.insert(key.clone(), peer);
             }
             Err(_) => passthrough_invalid.push((key.clone(), value.clone())),
         }
@@ -191,5 +194,25 @@ mod tests {
 
         assert!(peers.contains_key("broken"));
         assert!(!peers.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_state_json_preserves_entries_before_identity_dedupe() {
+        let data = serde_json::to_vec(&serde_json::json!({
+            "name": "local",
+            "peers": {
+                "peer-a": peer_value("remote-a", "https://node-a.example.com:9000", "dup"),
+                "peer-b": peer_value("remote-b", "https://node-b.example.com:9000", "dup")
+            }
+        }))
+        .unwrap();
+
+        let normalized = normalize_site_replication_state_json(&data)
+            .unwrap()
+            .expect("state should be normalized");
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        let peers = value.get("peers").and_then(Value::as_object).unwrap();
+
+        assert_eq!(peers.len(), 2);
     }
 }

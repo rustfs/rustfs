@@ -20,6 +20,7 @@ AWS_PROFILE="${AWS_PROFILE:-}"
 
 AWSCURL_BIN="${AWSCURL_BIN:-awscurl}"
 AWS_BIN="${AWS_BIN:-aws}"
+HEALTHCHECK_FORCE_LOOPBACK_RESOLVE="${HEALTHCHECK_FORCE_LOOPBACK_RESOLVE:-false}"
 
 usage() {
   cat <<'USAGE'
@@ -44,6 +45,9 @@ Optional:
   --awscurl-bin <path>         awscurl binary (default: awscurl)
   --aws-bin <path>             aws cli binary (default: aws)
   --aws-profile <profile>      AWS CLI profile for object-flow checks
+  --healthcheck-force-loopback-resolve
+                               Force HTTPS healthcheck `--resolve host:port:127.0.0.1`
+                               (default: false; intended for single-host local Docker)
   -h, --help                   Show help
 
 Notes:
@@ -86,6 +90,7 @@ parse_args() {
       --awscurl-bin) AWSCURL_BIN="$2"; shift 2 ;;
       --aws-bin) AWS_BIN="$2"; shift 2 ;;
       --aws-profile) AWS_PROFILE="$2"; shift 2 ;;
+      --healthcheck-force-loopback-resolve) HEALTHCHECK_FORCE_LOOPBACK_RESOLVE="true"; shift ;;
       -h|--help) usage; exit 0 ;;
       *)
         fail "unknown argument: $1"
@@ -119,7 +124,12 @@ admin_get() {
   local path="$2"
   local out_file="$3"
   local url="${endpoint%/}${path}"
-  "$AWSCURL_BIN" --service s3 --region "$REGION" --access_key "$ACCESS_KEY" --secret_key "$SECRET_KEY" "$url" >"$out_file"
+  if [[ -n "$CA_CERT" ]]; then
+    REQUESTS_CA_BUNDLE="$CA_CERT" SSL_CERT_FILE="$CA_CERT" \
+      "$AWSCURL_BIN" --service s3 --region "$REGION" --access_key "$ACCESS_KEY" --secret_key "$SECRET_KEY" "$url" >"$out_file"
+  else
+    "$AWSCURL_BIN" --service s3 --region "$REGION" --access_key "$ACCESS_KEY" --secret_key "$SECRET_KEY" "$url" >"$out_file"
+  fi
 }
 
 strict_healthcheck() {
@@ -140,7 +150,11 @@ strict_healthcheck() {
     if [[ -z "$CA_CERT" ]]; then
       fail "HTTPS endpoint requires --ca-cert for strict validation: $endpoint"
     fi
-    curl -fsS --cacert "$CA_CERT" --resolve "${host}:${port}:127.0.0.1" "$url" >"$out_file"
+    if [[ "$HEALTHCHECK_FORCE_LOOPBACK_RESOLVE" == "true" ]]; then
+      curl -fsS --cacert "$CA_CERT" --resolve "${host}:${port}:127.0.0.1" "$url" >"$out_file"
+    else
+      curl -fsS --cacert "$CA_CERT" "$url" >"$out_file"
+    fi
   else
     curl -fsS "$url" >"$out_file"
   fi
@@ -186,6 +200,9 @@ optional_object_flow_check() {
   )
   if [[ -n "$AWS_PROFILE" ]]; then
     common+=(--profile "$AWS_PROFILE")
+  fi
+  if [[ -n "$CA_CERT" ]]; then
+    common+=(--ca-bundle "$CA_CERT")
   fi
 
   AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
