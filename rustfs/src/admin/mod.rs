@@ -17,6 +17,7 @@ pub mod console;
 pub mod handlers;
 pub mod router;
 pub mod service;
+pub mod site_replication_identity;
 pub mod utils;
 
 #[cfg(test)]
