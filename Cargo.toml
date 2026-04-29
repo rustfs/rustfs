@@ -248,6 +248,7 @@ reed-solomon-erasure = { version = "6.0", default-features = false, features = [
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.3" }
 rumqttc = { package = "rumqttc-next", version = "0.30.1", features = ["websocket"] }
+redis = { version = "1.2.0", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }

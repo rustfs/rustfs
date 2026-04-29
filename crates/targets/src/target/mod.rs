@@ -29,6 +29,7 @@ pub mod kafka;
 pub mod mqtt;
 pub mod nats;
 pub mod pulsar;
+pub mod redis;
 pub mod webhook;
 
 /// A read-only snapshot of delivery counters for a target.
@@ -291,6 +292,7 @@ pub enum ChannelTargetType {
     Mqtt,
     Nats,
     Pulsar,
+    Redis,
 }
 
 impl ChannelTargetType {
@@ -301,6 +303,7 @@ impl ChannelTargetType {
             ChannelTargetType::Mqtt => "mqtt",
             ChannelTargetType::Nats => "nats",
             ChannelTargetType::Pulsar => "pulsar",
+            ChannelTargetType::Redis => "redis",
         }
     }
 }
@@ -313,6 +316,7 @@ impl std::fmt::Display for ChannelTargetType {
             ChannelTargetType::Mqtt => write!(f, "mqtt"),
             ChannelTargetType::Nats => write!(f, "nats"),
             ChannelTargetType::Pulsar => write!(f, "pulsar"),
+            ChannelTargetType::Redis => write!(f, "redis"),
         }
     }
 }

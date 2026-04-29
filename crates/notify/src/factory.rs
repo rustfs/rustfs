@@ -15,13 +15,17 @@
 use crate::Event;
 use async_trait::async_trait;
 use rustfs_config::EVENT_DEFAULT_DIR;
-use rustfs_config::notify::{NOTIFY_KAFKA_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_NATS_KEYS, NOTIFY_PULSAR_KEYS, NOTIFY_WEBHOOK_KEYS};
+use rustfs_config::notify::{
+    NOTIFY_KAFKA_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_NATS_KEYS, NOTIFY_PULSAR_KEYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_REDIS_KEYS,
+    NOTIFY_WEBHOOK_KEYS,
+};
 use rustfs_ecstore::config::KVS;
 use rustfs_targets::{
     Target,
     config::{
-        build_kafka_args, build_mqtt_args, build_nats_args, build_pulsar_args, build_webhook_args, validate_kafka_config,
-        validate_mqtt_config, validate_nats_config, validate_pulsar_config, validate_webhook_config,
+        build_kafka_args, build_mqtt_args, build_nats_args, build_pulsar_args, build_redis_args, build_webhook_args,
+        validate_kafka_config, validate_mqtt_config, validate_nats_config, validate_pulsar_config, validate_redis_config,
+        validate_webhook_config,
     },
     error::TargetError,
     target::TargetType,
@@ -136,5 +140,24 @@ impl TargetFactory for KafkaTargetFactory {
 
     fn get_valid_fields(&self) -> HashSet<String> {
         NOTIFY_KAFKA_KEYS.iter().map(|s| s.to_string()).collect()
+    }
+}
+
+pub struct RedisTargetFactory;
+
+#[async_trait]
+impl TargetFactory for RedisTargetFactory {
+    async fn create_target(&self, id: String, config: &KVS) -> Result<Box<dyn Target<Event> + Send + Sync>, TargetError> {
+        let args = build_redis_args(config, EVENT_DEFAULT_DIR, NOTIFY_REDIS_DEFAULT_CHANNEL, TargetType::NotifyEvent)?;
+        let target = rustfs_targets::target::redis::RedisTarget::new(id, args)?;
+        Ok(Box::new(target))
+    }
+
+    fn validate_config(&self, _id: &str, config: &KVS) -> Result<(), TargetError> {
+        validate_redis_config(config, EVENT_DEFAULT_DIR, NOTIFY_REDIS_DEFAULT_CHANNEL)
+    }
+
+    fn get_valid_fields(&self) -> HashSet<String> {
+        NOTIFY_REDIS_KEYS.iter().map(|s| s.to_string()).collect()
     }
 }
