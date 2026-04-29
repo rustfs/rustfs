@@ -42,7 +42,8 @@ jobs:
 
     outputs:
       raw_tag: ${{ steps.version.outputs.raw_tag }}
-      version: ${{ steps.version.outputs.version }}
+      app_version: ${{ steps.version.outputs.app_version }}
+      chart_version: ${{ steps.version.outputs.chart_version }}
 
     steps:
       - name: Checkout helm chart repo
@@ -74,15 +75,20 @@ jobs:
               VERSION="${VERSION#v}"
               ;;
           esac
+          
+          APP_VERSION="${RAW_TAG#v}"
+          BETA_NUM=$(echo "$APP_VERSION" | sed -E 's/.*-beta\.([0-9]+).*/\1/')
+          CHART_VERSION="0.${BETA_NUM}.0"
 
           echo "raw_tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "chart_version=$CHART_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Replace chart version and app version
         run: |
           set -eux
-          sed -i -E 's/^version:.*/version: "${{ steps.version.outputs.version }}"/' helm/rustfs/Chart.yaml
-          sed -i -E 's/^appVersion:.*/appVersion: "${{ steps.version.outputs.version }}"/' helm/rustfs/Chart.yaml
+          sed -i -E 's/^version:.*/version: "${{ steps.version.outputs.chart_version }}"/' helm/rustfs/Chart.yaml
+          sed -i -E 's/^appVersion:.*/appVersion: "${{ steps.version.outputs.app_version }}"/' helm/rustfs/Chart.yaml
 
       - name: Set up Helm
         uses: azure/setup-helm@v4.3.0
@@ -93,7 +99,7 @@ jobs:
           cp helm/README.md helm/rustfs/
           helm package ./helm/rustfs \
             --destination helm/rustfs/ \
-            --version "${{ steps.version.outputs.version }}"
+            --version "${{ steps.version.outputs.chart_version }}"
 
       - name: Upload helm package as artifact
         uses: actions/upload-artifact@v6
@@ -132,5 +138,5 @@ jobs:
           git config --global user.name "${{ secrets.USERNAME }}"
           git config --global user.email "${{ secrets.EMAIL_ADDRESS }}"
           git add .
-          git commit -m "Update rustfs helm package with ${{ needs.build-helm-package.outputs.version }}." || echo "No changes to commit"
+          git commit -m "Update rustfs helm package with ${{ needs.build-helm-package.outputs.app_version }}." || echo "No changes to commit"
           git push origin main
