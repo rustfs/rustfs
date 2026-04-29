@@ -153,7 +153,7 @@ analyze_duplicates() {
   jq -r '
     def identity_key($e):
       ($e | sub("^https?://";"") | sub("/$";"") | ascii_downcase);
-    .sites
+    (.sites // {})
     | to_entries
     | map(.value.endpoint // "")
     | map(select(. != ""))
