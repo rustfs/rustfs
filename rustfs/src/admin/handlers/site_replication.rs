@@ -14,6 +14,10 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::site_replication_identity::{
+    canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
+    site_identity_key,
+};
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -75,8 +79,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -704,12 +707,6 @@ fn infer_site_name(endpoint: &str) -> String {
         .to_string()
 }
 
-fn deployment_id_for_endpoint(endpoint: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    endpoint.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 fn qstat(count: i64, bytes: i64) -> QStat {
     QStat {
         count: count as f64,
@@ -769,117 +766,8 @@ fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
     }
 }
 
-fn canonical_endpoint(endpoint: &str) -> String {
-    let trimmed = endpoint.trim().trim_end_matches('/');
-    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{trimmed}")
-    };
-
-    Url::parse(&candidate)
-        .ok()
-        .map(|url| {
-            let scheme = url.scheme().to_ascii_lowercase();
-            let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-            let port = url.port_or_known_default();
-            match port {
-                Some(port) => format!("{scheme}://{host}:{port}"),
-                None => format!("{scheme}://{host}"),
-            }
-        })
-        .unwrap_or_else(|| trimmed.to_ascii_lowercase())
-}
-
-fn site_identity_key(endpoint: &str) -> String {
-    let trimmed = endpoint.trim().trim_end_matches('/');
-    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{trimmed}")
-    };
-
-    Url::parse(&candidate)
-        .ok()
-        .map(|url| {
-            let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-            match url.port_or_known_default() {
-                Some(port) => format!("{host}:{port}"),
-                None => host,
-            }
-        })
-        .unwrap_or_else(|| trimmed.to_ascii_lowercase())
-}
-
-fn is_https_endpoint(endpoint: &str) -> bool {
-    canonical_endpoint(endpoint).starts_with("https://")
-}
-
-fn same_identity_endpoint(left: &str, right: &str) -> bool {
-    site_identity_key(left) == site_identity_key(right)
-}
-
-fn merge_identity_peer(existing: PeerInfo, incoming: PeerInfo) -> PeerInfo {
-    let existing_https = is_https_endpoint(&existing.endpoint);
-    let incoming_https = is_https_endpoint(&incoming.endpoint);
-    let mut merged = if incoming_https && !existing_https {
-        incoming.clone()
-    } else {
-        existing.clone()
-    };
-    let fallback = if merged.deployment_id == incoming.deployment_id {
-        existing
-    } else {
-        incoming
-    };
-
-    if merged.deployment_id.is_empty() {
-        merged.deployment_id = fallback.deployment_id;
-    }
-    if merged.name.is_empty() {
-        merged.name = fallback.name;
-    }
-    if merged.api_version.is_none() {
-        merged.api_version = fallback.api_version;
-    }
-    merged.replicate_ilm_expiry |= fallback.replicate_ilm_expiry;
-    normalize_peer_info(merged)
-}
-
 fn normalize_peer_map_by_identity(peers: BTreeMap<String, PeerInfo>) -> BTreeMap<String, PeerInfo> {
-    let mut peers_by_identity = BTreeMap::<String, PeerInfo>::new();
-    for (_, peer) in peers {
-        let normalized_peer = normalize_peer_info(peer);
-        let identity = site_identity_key(&normalized_peer.endpoint);
-        if let Some(existing) = peers_by_identity.remove(&identity) {
-            peers_by_identity.insert(identity, merge_identity_peer(existing, normalized_peer));
-        } else {
-            peers_by_identity.insert(identity, normalized_peer);
-        }
-    }
-
-    let mut normalized = BTreeMap::<String, PeerInfo>::new();
-    for (_, mut peer) in peers_by_identity {
-        if peer.deployment_id.is_empty() {
-            peer.deployment_id = deployment_id_for_endpoint(&peer.endpoint);
-        }
-
-        let mut deployment_id = peer.deployment_id.clone();
-        if let Some(existing) = normalized.get(&deployment_id)
-            && site_identity_key(&existing.endpoint) != site_identity_key(&peer.endpoint)
-        {
-            deployment_id = format!("{deployment_id}-{}", deployment_id_for_endpoint(&peer.endpoint));
-            peer.deployment_id = deployment_id.clone();
-        }
-
-        if let Some(existing) = normalized.get(&deployment_id).cloned() {
-            normalized.insert(deployment_id, merge_identity_peer(existing, peer));
-        } else {
-            normalized.insert(deployment_id, peer);
-        }
-    }
-
-    normalized
+    normalize_peer_map_by_identity_with(peers, normalize_peer_info)
 }
 
 fn existing_peer_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> Option<PeerInfo> {
