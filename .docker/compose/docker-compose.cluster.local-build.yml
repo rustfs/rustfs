@@ -1,0 +1,144 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  node1:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:local-4node}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.source
+    hostname: node1
+    environment:
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - node1_data_0:/data/rustfs0
+      - node1_data_1:/data/rustfs1
+      - node1_data_2:/data/rustfs2
+      - node1_data_3:/data/rustfs3
+    ports:
+      - "9000:9000"
+    networks:
+      - rustfs-cluster-net
+
+  node2:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:local-4node}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.source
+    hostname: node2
+    environment:
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - node2_data_0:/data/rustfs0
+      - node2_data_1:/data/rustfs1
+      - node2_data_2:/data/rustfs2
+      - node2_data_3:/data/rustfs3
+    ports:
+      - "9001:9000"
+    networks:
+      - rustfs-cluster-net
+
+  node3:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:local-4node}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.source
+    hostname: node3
+    environment:
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - node3_data_0:/data/rustfs0
+      - node3_data_1:/data/rustfs1
+      - node3_data_2:/data/rustfs2
+      - node3_data_3:/data/rustfs3
+    ports:
+      - "9002:9000"
+    networks:
+      - rustfs-cluster-net
+
+  node4:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:local-4node}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.source
+    hostname: node4
+    environment:
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - node4_data_0:/data/rustfs0
+      - node4_data_1:/data/rustfs1
+      - node4_data_2:/data/rustfs2
+      - node4_data_3:/data/rustfs3
+    ports:
+      - "9003:9000"
+    networks:
+      - rustfs-cluster-net
+
+volumes:
+  node1_data_0:
+  node1_data_1:
+  node1_data_2:
+  node1_data_3:
+  node2_data_0:
+  node2_data_1:
+  node2_data_2:
+  node2_data_3:
+  node3_data_0:
+  node3_data_1:
+  node3_data_2:
+  node3_data_3:
+  node4_data_0:
+  node4_data_1:
+  node4_data_2:
+  node4_data_3:
+
+networks:
+  rustfs-cluster-net:
+    driver: bridge

@@ -18,41 +18,75 @@ on:
   workflow_run:
     workflows: [ "Build and Release" ]
     types: [ completed ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to publish, e.g. 1.0.0-beta.1 or v1.0.0-beta.1"
+        required: true
+        default: "1.0.0-beta.1"
+        type: string
 
 permissions:
   contents: read
 
-env:
-  new_version: ${{ github.event.workflow_run.head_branch }}
-
 jobs:
   build-helm-package:
     runs-on: ubicloud-standard-2
-    # Only run on successful builds triggered by tag pushes (version format: x.y.z or x.y.z-suffix)
     if: |
-      github.event.workflow_run.conclusion == 'success' && 
-      github.event.workflow_run.event == 'push' &&
-      contains(github.event.workflow_run.head_branch, '.')
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        contains(github.event.workflow_run.head_branch, '.')
+      )
+
+    outputs:
+      raw_tag: ${{ steps.version.outputs.raw_tag }}
+      app_version: ${{ steps.version.outputs.app_version }}
+      chart_version: ${{ steps.version.outputs.chart_version }}
 
     steps:
       - name: Checkout helm chart repo
         uses: actions/checkout@v6
 
-      - name: Replace chart app version
+      - name: Normalize release version
+        id: version
         run: |
-          set -e
-          set -x
-          old_version=$(grep "^appVersion:" helm/rustfs/Chart.yaml | awk '{print $2}')
-          sed -i "s/$old_version/$new_version/g" helm/rustfs/Chart.yaml
+          set -eux
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ github.event.inputs.version }}"
+          else
+            RAW="${{ github.event.workflow_run.head_branch }}"
+          fi
+
+          case "$RAW" in
+            refs/tags/*)
+              RAW_TAG="${RAW#refs/tags/}"
+              ;;
+            *)
+              RAW_TAG="$RAW"
+              ;;
+          esac
+
+          ./scripts/helm_chart_version.sh "$RAW_TAG"
+
+      - name: Replace chart version and app version
+        run: |
+          set -eux
+          sed -i -E 's/^version:.*/version: "${{ steps.version.outputs.chart_version }}"/' helm/rustfs/Chart.yaml
+          sed -i -E 's/^appVersion:.*/appVersion: "${{ steps.version.outputs.app_version }}"/' helm/rustfs/Chart.yaml
 
       - name: Set up Helm
         uses: azure/setup-helm@v4.3.0
 
       - name: Package Helm Chart
         run: |
+          set -eux
           cp helm/README.md helm/rustfs/
-          package_version=$(echo $new_version | awk -F '-' '{print $2}' | awk -F '.' '{print $NF}') 
-          helm package ./helm/rustfs --destination helm/rustfs/ --version "0.0.$package_version"
+          helm package ./helm/rustfs \
+            --destination helm/rustfs/ \
+            --version "${{ steps.version.outputs.chart_version }}"
 
       - name: Upload helm package as artifact
         uses: actions/upload-artifact@v6
@@ -64,6 +98,7 @@ jobs:
   publish-helm-package:
     runs-on: ubicloud-standard-2
     needs: [ build-helm-package ]
+    if: needs.build-helm-package.result == 'success'
 
     steps:
       - name: Checkout helm package repo
@@ -86,9 +121,9 @@ jobs:
 
       - name: Push helm package and index file
         run: |
+          set -eux
           git config --global user.name "${{ secrets.USERNAME }}"
           git config --global user.email "${{ secrets.EMAIL_ADDRESS }}"
-          git status .
           git add .
-          git commit -m "Update rustfs helm package with $new_version."
+          git commit -m "Update rustfs helm package with ${{ needs.build-helm-package.outputs.app_version }}." || echo "No changes to commit"
           git push origin main

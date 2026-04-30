@@ -13,6 +13,87 @@
 // limitations under the License.
 
 use super::*;
+use std::future::Future;
+use std::time::Duration;
+use tokio::task::JoinSet;
+
+async fn collect_list_parts_results<F>(
+    tasks: Vec<F>,
+    read_quorum: usize,
+) -> disk::error::Result<(Vec<Option<DiskError>>, Vec<Vec<String>>)>
+where
+    F: Future<Output = disk::error::Result<Vec<String>>> + Send + 'static,
+{
+    let mut errs = vec![Some(DiskError::DiskNotFound); tasks.len()];
+    let mut object_parts = vec![Vec::new(); tasks.len()];
+    let mut successful_responses = 0usize;
+    let mut pending = tasks.len();
+    let mut join_set = JoinSet::new();
+
+    for (index, task) in tasks.into_iter().enumerate() {
+        join_set.spawn(async move { (index, task.await) });
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        pending = pending.saturating_sub(1);
+
+        match join_result {
+            Ok((index, Ok(parts))) => {
+                errs[index] = None;
+                object_parts[index] = parts;
+                successful_responses += 1;
+            }
+            Ok((index, Err(err))) => {
+                errs[index] = Some(err);
+            }
+            Err(_) => {}
+        }
+
+        if successful_responses + pending < read_quorum {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+    }
+
+    Ok((errs, object_parts))
+}
+
+fn reduce_quorum_part_numbers(object_parts: Vec<Vec<String>>, read_quorum: usize) -> Vec<usize> {
+    let mut part_quorum_map: HashMap<usize, usize> = HashMap::new();
+
+    for drive_parts in object_parts {
+        let mut parts_with_meta_count: HashMap<usize, usize> = HashMap::new();
+
+        // part files can be either part.N or part.N.meta
+        for part_path in drive_parts {
+            if let Some(num_str) = part_path.strip_prefix("part.") {
+                if let Some(meta_idx) = num_str.find(".meta") {
+                    if let Ok(part_num) = num_str[..meta_idx].parse::<usize>() {
+                        *parts_with_meta_count.entry(part_num).or_insert(0) += 1;
+                    }
+                } else if let Ok(part_num) = num_str.parse::<usize>() {
+                    *parts_with_meta_count.entry(part_num).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Include only part.N.meta files with corresponding part.N
+        for (&part_num, &cnt) in &parts_with_meta_count {
+            if cnt >= 2 {
+                *part_quorum_map.entry(part_num).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut part_numbers = Vec::with_capacity(part_quorum_map.len());
+    for (part_num, count) in part_quorum_map {
+        if count >= read_quorum {
+            part_numbers.push(part_num);
+        }
+    }
+
+    part_numbers.sort();
+    part_numbers
+}
 
 impl SetDisks {
     pub(super) async fn list_parts(
@@ -21,10 +102,13 @@ impl SetDisks {
         read_quorum: usize,
     ) -> disk::error::Result<Vec<usize>> {
         let mut futures = Vec::with_capacity(disks.len());
-        for (i, disk) in disks.iter().enumerate() {
+        let part_path = part_path.to_string();
+        for disk in disks.iter() {
+            let disk = disk.clone();
+            let part_path = part_path.clone();
             futures.push(async move {
                 if let Some(disk) = disk {
-                    disk.list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, part_path, -1)
+                    disk.list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, part_path.as_str(), -1)
                         .await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -35,60 +119,15 @@ impl SetDisks {
         let mut errs = Vec::with_capacity(disks.len());
         let mut object_parts = Vec::with_capacity(disks.len());
 
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(res) => {
-                    errs.push(None);
-                    object_parts.push(res);
-                }
-                Err(e) => {
-                    errs.push(Some(e));
-                    object_parts.push(vec![]);
-                }
-            }
-        }
+        let (collected_errs, collected_parts) = collect_list_parts_results(futures, read_quorum).await?;
+        errs.extend(collected_errs);
+        object_parts.extend(collected_parts);
 
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             return Err(err);
         }
 
-        let mut part_quorum_map: HashMap<usize, usize> = HashMap::new();
-
-        for drive_parts in object_parts {
-            let mut parts_with_meta_count: HashMap<usize, usize> = HashMap::new();
-
-            // part files can be either part.N or part.N.meta
-            for part_path in drive_parts {
-                if let Some(num_str) = part_path.strip_prefix("part.") {
-                    if let Some(meta_idx) = num_str.find(".meta") {
-                        if let Ok(part_num) = num_str[..meta_idx].parse::<usize>() {
-                            *parts_with_meta_count.entry(part_num).or_insert(0) += 1;
-                        }
-                    } else if let Ok(part_num) = num_str.parse::<usize>() {
-                        *parts_with_meta_count.entry(part_num).or_insert(0) += 1;
-                    }
-                }
-            }
-
-            // Include only part.N.meta files with corresponding part.N
-            for (&part_num, &cnt) in &parts_with_meta_count {
-                if cnt >= 2 {
-                    *part_quorum_map.entry(part_num).or_insert(0) += 1;
-                }
-            }
-        }
-
-        let mut part_numbers = Vec::with_capacity(part_quorum_map.len());
-        for (part_num, count) in part_quorum_map {
-            if count >= read_quorum {
-                part_numbers.push(part_num);
-            }
-        }
-
-        part_numbers.sort();
-
-        Ok(part_numbers)
+        Ok(reduce_quorum_part_numbers(object_parts, read_quorum))
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -143,5 +182,80 @@ impl SetDisks {
         let fi = Self::pick_valid_fileinfo(&parts_metadata, mod_time, etag, quorum)?;
 
         Ok((fi, parts_metadata))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collect_list_parts_results_fails_early_when_quorum_is_impossible() {
+        let started = std::time::Instant::now();
+        let tasks: Vec<_> = vec![
+            (10_u64, Err(DiskError::DiskNotFound)),
+            (15, Err(DiskError::DiskNotFound)),
+            (250, Ok::<Vec<String>, DiskError>(vec!["part.1".to_string(), "part.1.meta".to_string()])),
+        ]
+        .into_iter()
+        .map(|(delay_ms, outcome)| async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            outcome
+        })
+        .collect();
+
+        let err = collect_list_parts_results(tasks, 2)
+            .await
+            .expect_err("quorum should become impossible before slow tail completes");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+        assert!(started.elapsed() < Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn collect_list_parts_results_tolerates_single_panicked_task_when_quorum_is_met() {
+        let tasks: Vec<_> = vec![(5_u64, true), (10, false), (12, false)]
+            .into_iter()
+            .map(|(delay_ms, should_panic)| async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                if should_panic {
+                    panic!("simulated task panic");
+                }
+                Ok::<Vec<String>, DiskError>(vec!["part.1".to_string(), "part.1.meta".to_string()])
+            })
+            .collect();
+
+        let (errs, object_parts) = collect_list_parts_results(tasks, 2)
+            .await
+            .expect("quorum should still succeed");
+        assert_eq!(errs.iter().filter(|err| err.is_none()).count(), 2);
+        assert_eq!(object_parts.iter().filter(|parts| !parts.is_empty()).count(), 2);
+    }
+
+    #[test]
+    fn reduce_quorum_part_numbers_only_keeps_parts_present_on_quorum_of_drives() {
+        let object_parts = vec![
+            vec![
+                "part.1".to_string(),
+                "part.1.meta".to_string(),
+                "part.2".to_string(),
+                "part.2.meta".to_string(),
+            ],
+            vec![
+                "part.1".to_string(),
+                "part.1.meta".to_string(),
+                "part.3".to_string(),
+                "part.3.meta".to_string(),
+            ],
+            vec![
+                "part.1".to_string(),
+                "part.1.meta".to_string(),
+                "part.2".to_string(),
+                "part.2.meta".to_string(),
+            ],
+        ];
+
+        let parts = reduce_quorum_part_numbers(object_parts, 2);
+        assert_eq!(parts, vec![1, 2]);
     }
 }

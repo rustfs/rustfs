@@ -14,7 +14,8 @@
 
 use super::{
     ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
-    action::Action,
+    action::{Action, S3Action},
+    function::key_name::{KeyName, S3KeyName},
     variables::{VariableContext, VariableResolver},
 };
 use crate::error::{Error, Result};
@@ -56,6 +57,27 @@ pub(crate) fn variable_resolver_for_policy_args(args: &Args<'_>) -> VariableReso
     VariableResolver::new(context)
 }
 
+fn build_resource(action: &Action, bucket: &str, object: &str, bucket_resource_only: bool) -> String {
+    let bucket_resource_only = matches!(
+        action,
+        Action::S3Action(
+            S3Action::ListBucketAction | S3Action::ListBucketVersionsAction | S3Action::ListBucketMultipartUploadsAction
+        )
+    ) && bucket_resource_only;
+
+    let mut resource = String::from(bucket);
+    if bucket_resource_only || object.is_empty() {
+        resource.push('/');
+        return resource;
+    }
+
+    if !object.starts_with('/') {
+        resource.push('/');
+    }
+    resource.push_str(object);
+    resource
+}
+
 impl Statement {
     fn is_kms(&self) -> bool {
         for act in self.actions.iter() {
@@ -94,16 +116,12 @@ impl Statement {
             return false;
         }
 
-        let mut resource = String::from(args.bucket);
-        if !args.object.is_empty() {
-            if !args.object.starts_with('/') {
-                resource.push('/');
-            }
-
-            resource.push_str(args.object);
-        } else {
-            resource.push('/');
-        }
+        let resource = build_resource(
+            &args.action,
+            args.bucket,
+            args.object,
+            self.conditions.references_key_name(&KeyName::S3(S3KeyName::S3Prefix)),
+        );
 
         if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
             return true;
@@ -230,16 +248,12 @@ impl BPStatement {
             return false;
         }
 
-        let mut resource = String::from(args.bucket);
-        if !args.object.is_empty() {
-            if !args.object.starts_with('/') {
-                resource.push('/');
-            }
-
-            resource.push_str(args.object);
-        } else {
-            resource.push('/');
-        }
+        let resource = build_resource(
+            &args.action,
+            args.bucket,
+            args.object,
+            self.conditions.references_key_name(&KeyName::S3(S3KeyName::S3Prefix)),
+        );
 
         if !self.resources.is_empty() && !self.resources.is_match(&resource, args.conditions).await {
             return false;

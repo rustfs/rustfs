@@ -35,6 +35,9 @@ services:
       - RUSTFS_SECRET_KEY=rustfsadmin # CHANGEME
       - RUSTFS_OBS_LOGGER_LEVEL=info
       - RUSTFS_TLS_PATH=/opt/tls
+      # Keep strict disk topology checks enabled by default.
+      # For local testing only, set `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true` explicitly.
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-false}
 
     volumes:
       - rustfs_data_0:/data/rustfs0
@@ -46,6 +49,9 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
+      # Production strict TLS example (SAN/FQDN aligned, no `-k`):
+      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9000:127.0.0.1 https://rustfs-a.example.com:9000/health
+      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9001:127.0.0.1 https://rustfs-a.example.com:9001/rustfs/console/health
       test:
         [
           "CMD",
@@ -72,6 +78,9 @@ services:
         echo 'Volume Permissions fixed' &&
         exit 0
       "
+    # Permission baseline:
+    # - default RustFS runtime user is 10001:10001
+    # - alternatively, run rustfs service with host-matched `user: \"<uid>:<gid>\"`
     restart: "no"
 
 networks:

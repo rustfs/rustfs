@@ -30,7 +30,7 @@ ARG BUILDPLATFORM
 # -----------------------------
 # Build stage
 # -----------------------------
-FROM rust:1.91-trixie AS builder
+FROM rust:1.93-trixie AS builder
 
 # Re-declare args after FROM
 ARG TARGETPLATFORM
@@ -60,7 +60,15 @@ RUN set -eux; \
 
 # Optional: cross toolchain for aarch64 (only when targeting linux/arm64)
 RUN set -eux; \
-    if [ "${TARGETPLATFORM:-linux/amd64}" = "linux/arm64" ]; then \
+    target_platform="${TARGETPLATFORM:-}"; \
+    if [ -z "${target_platform}" ]; then \
+    case "$(uname -m)" in \
+    x86_64) target_platform="linux/amd64" ;; \
+    aarch64|arm64) target_platform="linux/arm64" ;; \
+    *) target_platform="linux/amd64" ;; \
+    esac; \
+    fi; \
+    if [ "${target_platform}" = "linux/arm64" ]; then \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
     apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu; \
@@ -120,7 +128,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/rustfs/target \
     set -eux; \
-    case "${TARGETPLATFORM:-linux/amd64}" in \
+    rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; \
+    target_platform="${TARGETPLATFORM:-}"; \
+    if [ -z "${target_platform}" ]; then \
+    case "$(uname -m)" in \
+    x86_64) target_platform="linux/amd64" ;; \
+    aarch64|arm64) target_platform="linux/arm64" ;; \
+    *) target_platform="linux/amd64" ;; \
+    esac; \
+    fi; \
+    case "${target_platform}" in \
     linux/amd64) \
     echo "Building for x86_64-unknown-linux-gnu"; \
     cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
@@ -132,7 +149,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     install -m 0755 target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
     ;; \
     *) \
-    echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; exit 1 \
+    echo "Unsupported target platform=${target_platform}" >&2; exit 1 \
     ;; \
     esac
 
@@ -178,7 +195,7 @@ CMD ["cargo", "run", "--bin", "rustfs", "--"]
 # -----------------------------
 # Runtime stage (Ubuntu minimal)
 # -----------------------------
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ARG BUILD_DATE
 ARG VCS_REF

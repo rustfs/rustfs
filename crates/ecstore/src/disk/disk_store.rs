@@ -46,9 +46,7 @@ const DISK_HEALTH_FAULTY: u32 = 1;
 
 pub const ENV_RUSTFS_DRIVE_ACTIVE_MONITORING: &str = "RUSTFS_DRIVE_ACTIVE_MONITORING";
 pub const DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING: bool = true;
-pub const CHECK_EVERY: Duration = Duration::from_secs(15);
 pub const SKIP_IF_SUCCESS_BEFORE: Duration = Duration::from_secs(5);
-pub const CHECK_TIMEOUT_DURATION: Duration = Duration::from_secs(5);
 
 lazy_static::lazy_static! {
     static ref TEST_DATA: Bytes = Bytes::from(vec![42u8; 2048]);
@@ -102,6 +100,20 @@ pub fn get_drive_walkdir_stall_timeout() -> Duration {
         rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS,
         rustfs_config::DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS,
     )
+}
+
+pub fn get_drive_active_check_interval() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS,
+        rustfs_config::DEFAULT_DRIVE_ACTIVE_CHECK_INTERVAL_SECS,
+    ))
+}
+
+pub fn get_drive_active_check_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS,
+    ))
 }
 
 /// DiskHealthTracker tracks the health status of a disk.
@@ -231,9 +243,26 @@ impl DiskHealthTracker {
             RuntimeDriveHealthState::Offline => RuntimeDriveHealthState::Offline,
         };
 
-        self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
+        let became_offline = next == RuntimeDriveHealthState::Offline && current != RuntimeDriveHealthState::Offline;
+        if next == RuntimeDriveHealthState::Offline {
+            self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
+        } else {
+            self.status.store(DISK_HEALTH_OK, Ordering::Release);
+        }
         self.transition_state(endpoint, current, next, reason);
-        current == RuntimeDriveHealthState::Online
+        became_offline
+    }
+
+    pub fn mark_offline(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
+        let current = self.runtime_state();
+        if current == RuntimeDriveHealthState::Offline {
+            return false;
+        }
+
+        self.consecutive_successes.store(0, Ordering::Release);
+        self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
+        self.transition_state(endpoint, current, RuntimeDriveHealthState::Offline, reason);
+        true
     }
 
     pub fn mark_recovery_success(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
@@ -266,6 +295,14 @@ impl DiskHealthTracker {
             self.log_success();
         }
         became_online
+    }
+
+    pub fn record_operation_success(&self, endpoint: &Endpoint, reason: &'static str) {
+        if self.runtime_state() == RuntimeDriveHealthState::Online {
+            self.log_success();
+        } else {
+            self.mark_recovery_success(endpoint, reason);
+        }
     }
 
     fn transition_state(
@@ -449,7 +486,7 @@ impl LocalDiskWrapper {
     async fn monitor_disk_writable(disk: Arc<LocalDisk>, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
         // TODO: config interval
 
-        let mut interval = time::interval(CHECK_EVERY);
+        let mut interval = time::interval(get_drive_active_check_interval());
 
         loop {
             tokio::select! {
@@ -482,7 +519,16 @@ impl LocalDiskWrapper {
 
 
                     let test_obj = format!("health-check-{}", Uuid::new_v4());
-                    if Self::perform_health_check(disk.clone(), &TEST_BUCKET, &test_obj, &TEST_DATA, true, CHECK_TIMEOUT_DURATION).await.is_err()
+                    if Self::perform_health_check(
+                        disk.clone(),
+                        &TEST_BUCKET,
+                        &test_obj,
+                        &TEST_DATA,
+                        true,
+                        get_drive_active_check_timeout(),
+                    )
+                    .await
+                    .is_err()
                         && health.mark_failure(&disk.endpoint(), "active_health_check_failed")
                     {
                         // Health check failed, disk is considered faulty
@@ -588,7 +634,16 @@ impl LocalDiskWrapper {
                     }
 
                     let test_obj = format!("health-check-{}", Uuid::new_v4());
-                    match Self::perform_health_check(disk.clone(), &TEST_BUCKET, &test_obj, &TEST_DATA, false, CHECK_TIMEOUT_DURATION).await {
+                    match Self::perform_health_check(
+                        disk.clone(),
+                        &TEST_BUCKET,
+                        &test_obj,
+                        &TEST_DATA,
+                        false,
+                        get_drive_active_check_timeout(),
+                    )
+                    .await
+                    {
                         Ok(_) => {
                             let state_before = health.runtime_state();
                             let is_online = health.mark_recovery_success(&disk.endpoint(), "recovery_probe_success");
@@ -707,7 +762,7 @@ impl LocalDiskWrapper {
             let result = operation().await;
             self.health.decrement_waiting();
             if result.is_ok() {
-                self.health.log_success();
+                self.health.record_operation_success(&self.endpoint(), "operation_success");
             }
             return result;
         }
@@ -718,7 +773,7 @@ impl LocalDiskWrapper {
             Ok(operation_result) => {
                 // Log success and decrement waiting counter
                 if operation_result.is_ok() {
-                    self.health.log_success();
+                    self.health.record_operation_success(&self.endpoint(), "operation_success");
                 }
                 self.health.decrement_waiting();
                 operation_result
@@ -919,7 +974,7 @@ impl DiskAPI for LocalDiskWrapper {
         let has_err = result.iter().any(|e| e.is_some());
         if !has_err {
             // Log success and decrement waiting counter
-            self.health.log_success();
+            self.health.record_operation_success(&self.endpoint(), "operation_success");
         }
 
         result
@@ -1113,36 +1168,91 @@ mod tests {
     }
 
     #[test]
+    fn drive_active_check_interval_uses_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS, || {
+            assert_eq!(
+                get_drive_active_check_interval(),
+                Duration::from_secs(rustfs_config::DEFAULT_DRIVE_ACTIVE_CHECK_INTERVAL_SECS)
+            );
+        });
+    }
+
+    #[test]
+    fn drive_active_check_interval_reads_env_override() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS, Some("3"), || {
+            assert_eq!(get_drive_active_check_interval(), Duration::from_secs(3));
+        });
+    }
+
+    #[test]
+    fn drive_active_check_timeout_uses_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, || {
+            assert_eq!(
+                get_drive_active_check_timeout(),
+                Duration::from_secs(rustfs_config::DEFAULT_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS)
+            );
+        });
+    }
+
+    #[test]
+    fn drive_active_check_timeout_reads_env_override() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1"), || {
+            assert_eq!(get_drive_active_check_timeout(), Duration::from_secs(1));
+        });
+    }
+
+    #[test]
     fn runtime_state_transitions_from_online_to_suspect_then_offline() {
-        let endpoint = Endpoint::try_from("/tmp/runtime-state-disk").expect("endpoint should parse");
-        let health = DiskHealthTracker::new();
+        temp_env::with_var(rustfs_config::ENV_DRIVE_SUSPECT_FAILURE_THRESHOLD, Some("2"), || {
+            let endpoint = Endpoint::try_from("/tmp/runtime-state-disk").expect("endpoint should parse");
+            let health = DiskHealthTracker::new();
 
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
-        assert!(health.mark_failure(&endpoint, "timeout"));
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Suspect);
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!health.mark_failure(&endpoint, "timeout"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Suspect);
+            assert!(!health.is_faulty());
 
-        assert!(!health.mark_failure(&endpoint, "timeout"));
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
-        assert!(health.offline_duration().is_some());
+            assert!(health.mark_failure(&endpoint, "timeout"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+            assert!(health.is_faulty());
+            assert!(health.offline_duration().is_some());
+        });
     }
 
     #[test]
     fn runtime_state_transitions_back_online_after_recovery_threshold() {
-        let endpoint = Endpoint::try_from("/tmp/runtime-state-recovery").expect("endpoint should parse");
+        temp_env::with_var(rustfs_config::ENV_DRIVE_SUSPECT_FAILURE_THRESHOLD, Some("2"), || {
+            let endpoint = Endpoint::try_from("/tmp/runtime-state-recovery").expect("endpoint should parse");
+            let health = DiskHealthTracker::new();
+
+            health.mark_failure(&endpoint, "timeout");
+            health.mark_failure(&endpoint, "timeout");
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+
+            assert!(!health.mark_recovery_success(&endpoint, "probe"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Returning);
+
+            assert!(!health.mark_recovery_success(&endpoint, "probe"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Returning);
+
+            assert!(health.mark_recovery_success(&endpoint, "probe"));
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(health.offline_duration().is_none());
+        });
+    }
+
+    #[test]
+    fn operation_success_recovers_suspect_drive_without_faulting() {
+        let endpoint = Endpoint::try_from("/tmp/runtime-state-suspect-success").expect("endpoint should parse");
         let health = DiskHealthTracker::new();
 
-        health.mark_failure(&endpoint, "timeout");
-        health.mark_failure(&endpoint, "timeout");
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+        assert!(!health.mark_failure(&endpoint, "timeout"));
+        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Suspect);
+        assert!(!health.is_faulty());
 
-        assert!(!health.mark_recovery_success(&endpoint, "probe"));
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Returning);
-
-        assert!(!health.mark_recovery_success(&endpoint, "probe"));
-        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Returning);
-
-        assert!(health.mark_recovery_success(&endpoint, "probe"));
+        health.record_operation_success(&endpoint, "operation_success");
         assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+        assert!(!health.is_faulty());
         assert!(health.offline_duration().is_none());
     }
 }
