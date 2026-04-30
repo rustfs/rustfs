@@ -96,6 +96,7 @@ const SITE_REPL_RESYNC_CANCEL: &str = "cancel";
 const SITE_REPL_MIN_NETPERF_DURATION: Duration = Duration::from_secs(1);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
 const IDENTITY_LDAP_SUB_SYS: &str = "identity_ldap";
 const LEGACY_LDAP_SUB_SYS: &str = "ldapserverconfig";
 const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
@@ -1599,13 +1600,23 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
     state
 }
 
+fn summarize_peer_error_detail(detail: &str) -> String {
+    let detail = detail.trim();
+    let mut summary: String = detail.chars().take(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT).collect();
+    if summary.len() < detail.len() {
+        summary.push_str("... (truncated)");
+    }
+    summary
+}
+
 fn site_replication_remove_status(peer_errors: &[String]) -> ReplicateRemoveStatus {
     ReplicateRemoveStatus {
         status: SITE_REPL_REMOVE_SUCCESS.to_string(),
         err_detail: if peer_errors.is_empty() {
             String::new()
         } else {
-            format!("failed to notify {} peer(s): {}", peer_errors.len(), peer_errors.join("; "))
+            let summaries: Vec<String> = peer_errors.iter().map(|error| summarize_peer_error_detail(error)).collect();
+            format!("failed to notify {} peer(s): {}", summaries.len(), summaries.join("; "))
         },
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     }
@@ -2460,8 +2471,8 @@ impl Operation for SiteReplicationRemoveHandler {
                 )
                 .await
                 {
-                    let err_detail = format!("{}: {err}", peer.endpoint);
-                    warn!(peer = %peer.endpoint, error = ?err, "site replication peer remove notification failed");
+                    let err_detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
+                    warn!(peer = %peer.endpoint, error = %err_detail, "site replication peer remove notification failed");
                     peer_errors.push(err_detail);
                 }
             }
@@ -3271,6 +3282,18 @@ mod tests {
         assert_eq!(status.status, SITE_REPL_REMOVE_SUCCESS);
         assert!(status.err_detail.contains("failed to notify 1 peer"));
         assert!(status.err_detail.contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn test_site_replication_remove_status_truncates_peer_error_detail() {
+        let long_peer_body = "peer response body ".repeat(40);
+        let status = site_replication_remove_status(&[format!(
+            "https://remote.example.com: peer request failed with 403 Forbidden: {long_peer_body}"
+        )]);
+
+        assert!(status.err_detail.contains("403 Forbidden"));
+        assert!(status.err_detail.contains("truncated"));
+        assert!(!status.err_detail.contains(&long_peer_body));
     }
 
     #[test]
