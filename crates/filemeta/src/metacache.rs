@@ -1004,6 +1004,29 @@ mod tests {
         run_cache_workload(cache, 32, 120, 2048).await;
     }
 
+    #[tokio::test]
+    async fn test_cache_get_shared_reuses_fresh_value() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(Cache::new(
+            Box::new({
+                let calls = Arc::clone(&calls);
+                move || {
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) })
+                }
+            }),
+            Duration::from_secs(60),
+            Opts::default(),
+        ));
+
+        let first = Arc::clone(&cache).get_shared().await.expect("prime cache should succeed");
+        let second = Arc::clone(&cache).get_shared().await.expect("fresh cache hit should succeed");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(*first, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_cache_no_wait_returns_stale_and_refreshes_in_background() {
         let calls = Arc::new(AtomicUsize::new(0));
