@@ -1027,6 +1027,35 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn test_cache_future_last_update_refreshes_instead_of_underflowing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(Cache::new(
+            Box::new({
+                let calls = Arc::clone(&calls);
+                move || {
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) })
+                }
+            }),
+            Duration::from_secs(60),
+            Opts::default(),
+        ));
+
+        let prime = Arc::clone(&cache).get().await.expect("prime cache should succeed");
+        assert_eq!(prime, 0);
+
+        let now = Cache::<usize>::current_unix_secs();
+        cache.last_update_secs.store(now.saturating_add(60), AtomicOrdering::SeqCst);
+
+        let refreshed = Arc::clone(&cache)
+            .get()
+            .await
+            .expect("future timestamp should force refresh instead of underflowing");
+        assert_eq!(refreshed, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_cache_no_wait_returns_stale_and_refreshes_in_background() {
         let calls = Arc::new(AtomicUsize::new(0));
