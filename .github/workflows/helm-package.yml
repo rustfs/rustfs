@@ -80,6 +80,9 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@v4.3.0
 
+      - name: Test Helm Chart Templates
+        run: ./scripts/test_helm_templates.sh
+
       - name: Package Helm Chart
         run: |
           set -eux
