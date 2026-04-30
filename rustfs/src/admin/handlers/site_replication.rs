@@ -1602,10 +1602,15 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
 
 fn summarize_peer_error_detail(detail: &str) -> String {
     let detail = detail.trim();
-    let mut summary: String = detail.chars().take(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT).collect();
-    if summary.len() < detail.len() {
-        summary.push_str("... (truncated)");
+    let detail_chars = detail.chars().count();
+    if detail_chars <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT {
+        return detail.to_string();
     }
+
+    let suffix = "... (truncated)";
+    let take_chars = SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT.saturating_sub(suffix.chars().count());
+    let mut summary: String = detail.chars().take(take_chars).collect();
+    summary.push_str(suffix);
     summary
 }
 
@@ -1616,18 +1621,10 @@ fn site_replication_remove_status(peer_errors: &[String]) -> ReplicateRemoveStat
             String::new()
         } else {
             let summaries: Vec<String> = peer_errors.iter().map(|error| summarize_peer_error_detail(error)).collect();
-            format!("failed to notify {} peer(s): {}", summaries.len(), summaries.join("; "))
+            summarize_peer_error_detail(&format!("failed to notify {} peer(s): {}", summaries.len(), summaries.join("; ")))
         },
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     }
-}
-
-fn finalize_site_replication_remove(
-    current_state: SiteReplicationState,
-    remove_req: SRRemoveReq,
-    peer_errors: &[String],
-) -> (SiteReplicationState, ReplicateRemoveStatus) {
-    (remove_sites(current_state, remove_req), site_replication_remove_status(peer_errors))
 }
 
 fn resync_status_for_state(
@@ -2449,8 +2446,9 @@ impl Operation for SiteReplicationRemoveHandler {
         let current_state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &current_state);
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
-        let (state, mut status) = finalize_site_replication_remove(current_state.clone(), remove_req.clone(), &[]);
+        let state = remove_sites(current_state.clone(), remove_req.clone());
         persist_site_replication_state(&state).await?;
+        let mut status = site_replication_remove_status(&[]);
 
         let mut peer_errors = Vec::new();
         if !current_state.service_account_access_key.is_empty() && !current_state.service_account_secret_key.is_empty() {
@@ -3252,7 +3250,7 @@ mod tests {
     }
 
     #[test]
-    fn test_finalize_site_replication_remove_keeps_local_success_with_peer_errors() {
+    fn test_remove_sites_keeps_local_success_with_peer_errors() {
         let mut state = SiteReplicationState::default();
         state.peers.insert(
             "local".to_string(),
@@ -3269,14 +3267,15 @@ mod tests {
             },
         );
 
-        let (state, status) = finalize_site_replication_remove(
+        let state = remove_sites(
             state,
             SRRemoveReq {
                 remove_all: true,
                 ..Default::default()
             },
-            &["peer request to https://remote.example.com failed with 403 Forbidden".to_string()],
         );
+        let status =
+            site_replication_remove_status(&["peer request to https://remote.example.com failed with 403 Forbidden".to_string()]);
 
         assert!(state.peers.is_empty());
         assert_eq!(status.status, SITE_REPL_REMOVE_SUCCESS);
@@ -3294,6 +3293,17 @@ mod tests {
         assert!(status.err_detail.contains("403 Forbidden"));
         assert!(status.err_detail.contains("truncated"));
         assert!(!status.err_detail.contains(&long_peer_body));
+    }
+
+    #[test]
+    fn test_site_replication_remove_status_caps_final_error_detail() {
+        let peer_errors: Vec<String> = (0..8)
+            .map(|idx| format!("https://remote-{idx}.example.com: {}", "peer response body ".repeat(40)))
+            .collect();
+        let status = site_replication_remove_status(&peer_errors);
+
+        assert!(status.err_detail.chars().count() <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT);
+        assert!(status.err_detail.contains("truncated"));
     }
 
     #[test]
