@@ -69,24 +69,7 @@ jobs:
               ;;
           esac
 
-          VERSION="$RAW_TAG"
-          case "$VERSION" in
-            v*)
-              VERSION="${VERSION#v}"
-              ;;
-          esac
-          
-          APP_VERSION="${RAW_TAG#v}"
-          BETA_NUM=$(echo "$APP_VERSION" | sed -n -E 's/^.*-beta\.([0-9]+)$/\1/p')
-          if [ -n "$BETA_NUM" ]; then
-            CHART_VERSION="0.${BETA_NUM}.0"
-          else
-            CHART_VERSION="$APP_VERSION"
-          fi
-
-          echo "raw_tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
-          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
-          echo "chart_version=$CHART_VERSION" >> "$GITHUB_OUTPUT"
+          ./scripts/helm_chart_version.sh "$RAW_TAG"
 
       - name: Replace chart version and app version
         run: |
