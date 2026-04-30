@@ -1102,6 +1102,7 @@ mod tests {
     async fn test_cache_no_wait_coalesces_background_refreshes() {
         let calls = Arc::new(AtomicUsize::new(0));
         let release_refresh = Arc::new(Notify::new());
+        let ttl = Duration::from_secs(60);
         let cache = Arc::new(Cache::new(
             Box::new({
                 let calls = Arc::clone(&calls);
@@ -1118,7 +1119,7 @@ mod tests {
                     })
                 }
             }),
-            Duration::from_secs(1),
+            ttl,
             Opts {
                 return_last_good: true,
                 no_wait: true,
@@ -1129,7 +1130,9 @@ mod tests {
         assert_eq!(prime, 0);
 
         let now = Cache::<usize>::current_unix_secs();
-        cache.last_update_secs.store(now.saturating_sub(1), AtomicOrdering::SeqCst);
+        cache
+            .last_update_secs
+            .store(now.saturating_sub(ttl.as_secs()), AtomicOrdering::SeqCst);
 
         let stale = Arc::clone(&cache).get().await.expect("stale get should succeed");
         assert_eq!(stale, 0);
