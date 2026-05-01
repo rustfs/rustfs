@@ -61,8 +61,7 @@ mod tests {
             count: 42,
         };
         let buf = encode_msgpack_map(&val).unwrap();
-        let decoded: Simple =
-            Deserialize::deserialize(&mut Deserializer::new(Cursor::new(&buf))).unwrap();
+        let decoded: Simple = Deserialize::deserialize(&mut Deserializer::new(Cursor::new(&buf))).unwrap();
         assert_eq!(val, decoded);
     }
 
@@ -88,8 +87,7 @@ mod tests {
             optional: None,
         };
         let buf = encode_msgpack_map(&val).unwrap();
-        let decoded: Nested =
-            Deserialize::deserialize(&mut Deserializer::new(Cursor::new(&buf))).unwrap();
+        let decoded: Nested = Deserialize::deserialize(&mut Deserializer::new(Cursor::new(&buf))).unwrap();
         assert_eq!(val, decoded);
     }
 }
