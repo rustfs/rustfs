@@ -17,9 +17,16 @@ use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use url::Url;
 
+fn has_http_scheme(endpoint: &str) -> bool {
+    endpoint.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || endpoint
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
 pub fn canonical_endpoint(endpoint: &str) -> String {
     let trimmed = endpoint.trim().trim_end_matches('/');
-    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    let candidate = if has_http_scheme(trimmed) {
         trimmed.to_string()
     } else {
         format!("http://{trimmed}")
@@ -41,7 +48,7 @@ pub fn canonical_endpoint(endpoint: &str) -> String {
 
 pub fn site_identity_key(endpoint: &str) -> String {
     let trimmed = endpoint.trim().trim_end_matches('/');
-    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    let candidate = if has_http_scheme(trimmed) {
         trimmed.to_string()
     } else {
         format!("http://{trimmed}")
@@ -137,4 +144,26 @@ where
     }
 
     normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_endpoint_accepts_case_insensitive_scheme() {
+        assert_eq!(
+            canonical_endpoint(" HTTPS://Node-A.Example.Com:9000/ "),
+            "https://node-a.example.com:9000"
+        );
+    }
+
+    #[test]
+    fn site_identity_key_accepts_case_insensitive_scheme() {
+        assert_eq!(site_identity_key("HTTPS://Node-A.Example.Com:9000/"), "node-a.example.com:9000");
+        assert!(same_identity_endpoint(
+            "HTTPS://Node-A.Example.Com:9000/",
+            "http://node-a.example.com:9000"
+        ));
+    }
 }
