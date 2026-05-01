@@ -17,6 +17,16 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
+fn empty_upload_fallback_possible(successful_responses: usize, errs: &[Option<DiskError>]) -> bool {
+    successful_responses == 0
+        && errs.iter().any(|err| matches!(err, Some(DiskError::FileNotFound)))
+        && errs.iter().all(|err| match err {
+            Some(DiskError::FileNotFound) => true,
+            Some(err) => OBJECT_OP_IGNORED_ERRS.contains(err),
+            None => false,
+        })
+}
+
 async fn collect_list_parts_results<F>(
     tasks: Vec<F>,
     read_quorum: usize,
@@ -49,20 +59,13 @@ where
             Err(_) => {}
         }
 
-        if successful_responses + pending < read_quorum && !errs.iter().any(|err| matches!(err, Some(DiskError::FileNotFound))) {
+        if successful_responses + pending < read_quorum && !empty_upload_fallback_possible(successful_responses, &errs) {
             return Err(DiskError::ErasureReadQuorum);
         }
     }
 
     if successful_responses < read_quorum {
-        let saw_file_not_found = errs.iter().any(|err| matches!(err, Some(DiskError::FileNotFound)));
-        let only_missing_or_ignored = errs.iter().all(|err| match err {
-            Some(DiskError::FileNotFound) => true,
-            Some(err) => OBJECT_OP_IGNORED_ERRS.contains(err),
-            None => false,
-        });
-
-        if successful_responses == 0 && saw_file_not_found && only_missing_or_ignored {
+        if empty_upload_fallback_possible(successful_responses, &errs) {
             return Err(DiskError::FileNotFound);
         }
 
@@ -266,6 +269,29 @@ mod tests {
             .expect_err("missing multipart directories should be treated as empty uploads");
 
         assert_eq!(err, DiskError::FileNotFound);
+    }
+
+    #[tokio::test]
+    async fn collect_list_parts_results_fails_early_when_file_not_found_fallback_is_impossible() {
+        let started = std::time::Instant::now();
+        let tasks: Vec<_> = vec![
+            (5_u64, Err(DiskError::FileNotFound)),
+            (10, Err(DiskError::FileCorrupt)),
+            (250, Err(DiskError::DiskNotFound)),
+        ]
+        .into_iter()
+        .map(|(delay_ms, outcome)| async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            outcome
+        })
+        .collect();
+
+        let err = collect_list_parts_results(tasks, 2)
+            .await
+            .expect_err("non-ignored errors should preserve early quorum failure");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+        assert!(started.elapsed() < Duration::from_millis(120));
     }
 
     #[test]
