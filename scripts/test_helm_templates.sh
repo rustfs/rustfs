@@ -83,3 +83,34 @@ if grep -q "RUSTFS_ACCESS_KEY:" <<<"$existing_output"; then
   echo "existingSecret must suppress chart-managed Secret rendering" >&2
   exit 1
 fi
+
+# Partial-default credentials (one key set to the well-known default) must
+# fail rendering even when the other key is non-default.
+partial_default_status=0
+helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set mode.distributed.enabled=false \
+  --set mode.standalone.enabled=true \
+  --set secret.rustfs.access_key=rustfsadmin \
+  --set secret.rustfs.secret_key=some-other-secret \
+  >/dev/null 2>&1 || partial_default_status=$?
+if [[ $partial_default_status -eq 0 ]]; then
+  echo "Partial-default credentials (access_key=rustfsadmin) must fail rendering" >&2
+  exit 1
+fi
+
+# Partial-empty credentials (only one of the two keys set) must fail rendering
+# even when allowInsecureDefaults=true — never silently auto-fill a single
+# missing key with the well-known default.
+partial_empty_status=0
+helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set mode.distributed.enabled=false \
+  --set mode.standalone.enabled=true \
+  --set secret.allowInsecureDefaults=true \
+  --set secret.rustfs.access_key=user-supplied-access-key \
+  >/dev/null 2>&1 || partial_empty_status=$?
+if [[ $partial_empty_status -eq 0 ]]; then
+  echo "Partial-empty credentials (only access_key set) must fail rendering" >&2
+  exit 1
+fi

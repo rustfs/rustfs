@@ -624,7 +624,7 @@ pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
         .allow_headers(Any);
 
     match origins {
-        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
+        Some(origins_str) if origins_str.trim() == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
         Some(origins_str) if !origins_str.trim().is_empty() => {
             let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
             let mut valid_origins = Vec::new();
@@ -780,6 +780,35 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("*"),
             "explicit `*` origin must produce wildcard Allow-Origin"
+        );
+    }
+
+    /// Whitespace-padded wildcard ("` * `") must still be treated as wildcard
+    /// rather than falling into the comma-separated parser. Common when the
+    /// origin string is templated through env vars.
+    #[tokio::test]
+    #[serial]
+    async fn whitespace_padded_wildcard_console_cors_allows_any_origin() {
+        let star = " * ".to_string();
+        let app = setup_console_middleware_stack(parse_cors_origins(Some(&star)), false, 0, 30);
+
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri(format!("{CONSOLE_PREFIX}/license"))
+            .header("origin", "https://example.com")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .expect("build preflight");
+
+        let response = app.oneshot(request).await.expect("preflight should complete");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "whitespace-padded `*` origin must produce wildcard Allow-Origin"
         );
     }
 
