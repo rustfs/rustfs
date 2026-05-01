@@ -149,6 +149,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_madmin::{BucketBandwidth, SyncStatus};
+
+    fn peer(name: &str, endpoint: &str) -> PeerInfo {
+        PeerInfo {
+            name: name.to_string(),
+            endpoint: endpoint.to_string(),
+            deployment_id: name.to_string(),
+            sync_state: SyncStatus::Unknown,
+            default_bandwidth: BucketBandwidth::default(),
+            replicate_ilm_expiry: false,
+            object_naming_mode: String::new(),
+            api_version: None,
+        }
+    }
 
     #[test]
     fn canonical_endpoint_accepts_case_insensitive_scheme() {
@@ -165,5 +179,20 @@ mod tests {
             "HTTPS://Node-A.Example.Com:9000/",
             "http://node-a.example.com:9000"
         ));
+    }
+
+    #[test]
+    fn normalize_peer_map_deduplicates_case_insensitive_scheme() {
+        let peers = BTreeMap::from([
+            ("remote-http".to_string(), peer("remote-http", "http://node-a.example.com:9000")),
+            ("remote-https".to_string(), peer("remote-https", "HTTPS://Node-A.Example.Com:9000/")),
+        ]);
+
+        let normalized = normalize_peer_map_by_identity_with(peers, |peer| peer);
+
+        assert_eq!(normalized.len(), 1);
+        let peer = normalized.values().next().expect("normalized peer should exist");
+        assert_eq!(peer.endpoint, "HTTPS://Node-A.Example.Com:9000/");
+        assert_eq!(peer.deployment_id, "remote-https");
     }
 }
