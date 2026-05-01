@@ -49,9 +49,24 @@ where
             Err(_) => {}
         }
 
-        if successful_responses + pending < read_quorum {
+        if successful_responses + pending < read_quorum && !errs.iter().any(|err| matches!(err, Some(DiskError::FileNotFound))) {
             return Err(DiskError::ErasureReadQuorum);
         }
+    }
+
+    if successful_responses < read_quorum {
+        let saw_file_not_found = errs.iter().any(|err| matches!(err, Some(DiskError::FileNotFound)));
+        let only_missing_or_ignored = errs.iter().all(|err| match err {
+            Some(DiskError::FileNotFound) => true,
+            Some(err) => OBJECT_OP_IGNORED_ERRS.contains(err),
+            None => false,
+        });
+
+        if successful_responses == 0 && saw_file_not_found && only_missing_or_ignored {
+            return Err(DiskError::FileNotFound);
+        }
+
+        return Err(DiskError::ErasureReadQuorum);
     }
 
     Ok((errs, object_parts))
@@ -230,6 +245,27 @@ mod tests {
             .expect("quorum should still succeed");
         assert_eq!(errs.iter().filter(|err| err.is_none()).count(), 2);
         assert_eq!(object_parts.iter().filter(|parts| !parts.is_empty()).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_list_parts_results_returns_file_not_found_for_empty_upload_dirs() {
+        let tasks: Vec<_> = vec![
+            (5_u64, Err(DiskError::FileNotFound)),
+            (10, Err(DiskError::DiskNotFound)),
+            (12, Err(DiskError::DiskNotFound)),
+        ]
+        .into_iter()
+        .map(|(delay_ms, outcome)| async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            outcome
+        })
+        .collect();
+
+        let err = collect_list_parts_results(tasks, 2)
+            .await
+            .expect_err("missing multipart directories should be treated as empty uploads");
+
+        assert_eq!(err, DiskError::FileNotFound);
     }
 
     #[test]
