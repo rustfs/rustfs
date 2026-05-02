@@ -253,8 +253,8 @@ pub fn try_get_rpc_token() -> std::io::Result<String> {
 }
 
 #[deprecated(note = "use try_get_rpc_token to handle missing RPC secrets explicitly")]
-pub fn get_rpc_token() -> std::io::Result<String> {
-    try_get_rpc_token()
+pub fn get_rpc_token() -> String {
+    try_get_rpc_token().expect(RPC_SECRET_REQUIRED_MESSAGE)
 }
 
 /// A wrapper struct for masking sensitive strings in Debug implementations.
