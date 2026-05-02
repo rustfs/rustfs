@@ -29,8 +29,11 @@ static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 /// Global RPC authentication token
 pub static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
 
-/// Error returned when RPC authentication would otherwise use an unsafe fallback secret.
-pub const RPC_SECRET_REQUIRED_MESSAGE: &str = "RUSTFS_RPC_SECRET must be set to a non-default value or RUSTFS_SECRET_KEY must be changed from the default for RPC authentication";
+/// Public error returned when RPC authentication is not safely configured.
+pub const RPC_SECRET_REQUIRED_MESSAGE: &str = "RPC authentication secret is not configured";
+
+/// Operator-facing guidance for configuring RPC authentication safely.
+pub const RPC_SECRET_REQUIRED_OPERATOR_MESSAGE: &str = "RUSTFS_RPC_SECRET must be set to a non-default value or RUSTFS_SECRET_KEY must be changed from the default for RPC authentication";
 
 /// Error type for credentials operations
 #[derive(Debug)]
@@ -249,8 +252,9 @@ pub fn try_get_rpc_token() -> std::io::Result<String> {
     }
 }
 
-pub fn get_rpc_token() -> String {
-    try_get_rpc_token().unwrap_or_default()
+#[deprecated(note = "use try_get_rpc_token to handle missing RPC secrets explicitly")]
+pub fn get_rpc_token() -> std::io::Result<String> {
+    try_get_rpc_token()
 }
 
 /// A wrapper struct for masking sensitive strings in Debug implementations.
@@ -528,6 +532,13 @@ mod tests {
         assert!(resolve_rpc_secret(None, None).is_none());
         assert!(resolve_rpc_secret(None, Some(DEFAULT_SECRET_KEY)).is_none());
         assert!(resolve_rpc_secret(Some(DEFAULT_SECRET_KEY), Some("custom-global-secret")).is_none());
+    }
+
+    #[test]
+    fn test_rpc_secret_public_error_omits_configuration_details() {
+        assert!(!RPC_SECRET_REQUIRED_MESSAGE.contains("RUSTFS_"));
+        assert!(!RPC_SECRET_REQUIRED_MESSAGE.contains(DEFAULT_SECRET_KEY));
+        assert!(RPC_SECRET_REQUIRED_OPERATOR_MESSAGE.contains("RUSTFS_RPC_SECRET"));
     }
 
     #[test]

@@ -209,8 +209,26 @@ impl Operation for ProfileStatusHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_query_params;
-    use http::Uri;
+    use super::{ProfileHandler, ProfileStatusHandler, extract_query_params};
+    use crate::admin::router::Operation;
+    use http::{Extensions, HeaderMap, Uri};
+    use hyper::Method;
+    use matchit::Params;
+    use s3s::{Body, S3ErrorCode, S3Request};
+
+    fn build_profile_request(uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
 
     #[test]
     fn test_extract_query_params_decodes_percent_encoded_values() {
@@ -223,12 +241,29 @@ mod tests {
         assert_eq!(params.get("note"), Some(&"a+b value".to_string()));
     }
 
-    #[test]
-    fn profile_handlers_require_profiling_admin_authorization() {
-        let src = include_str!("profile_admin.rs");
-        assert!(
-            src.matches("authorize_profile_request(&req).await?;").count() >= 2,
-            "profile and profile status handlers must require admin:Profiling authorization"
-        );
+    #[tokio::test]
+    async fn profile_handler_rejects_missing_credentials() {
+        let result = ProfileHandler {}
+            .call(build_profile_request("/rustfs/admin/debug/pprof/profile?format=protobuf"), Params::new())
+            .await;
+        let err = match result {
+            Ok(_) => panic!("profile handler must reject unauthenticated requests"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn profile_status_handler_rejects_missing_credentials() {
+        let result = ProfileStatusHandler {}
+            .call(build_profile_request("/rustfs/admin/debug/pprof/status"), Params::new())
+            .await;
+        let err = match result {
+            Ok(_) => panic!("profile status handler must reject unauthenticated requests"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 }

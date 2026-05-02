@@ -139,6 +139,8 @@ fn imported_service_account_status(status: &str) -> Option<String> {
     None
 }
 
+const SERVICE_ACCOUNT_PARENT_SCOPE_ERROR: &str = "service account parent is outside requester scope";
+
 fn imported_service_account_parent_allowed(parent: &str, requester: &Credentials, owner: bool) -> bool {
     if parent.is_empty() {
         return false;
@@ -153,6 +155,18 @@ fn imported_service_account_parent_allowed(parent: &str, requester: &Credentials
     }
 
     requester.parent_user.is_empty() && requester.access_key == parent
+}
+
+fn imported_service_account_parent_scope_failure(
+    access_key: &str,
+    parent: &str,
+    requester: &Credentials,
+    owner: bool,
+) -> Option<IAMErrEntity> {
+    (!imported_service_account_parent_allowed(parent, requester, owner)).then(|| IAMErrEntity {
+        name: access_key.to_string(),
+        error: SERVICE_ACCOUNT_PARENT_SCOPE_ERROR.to_string(),
+    })
 }
 
 pub struct AddUser {}
@@ -1000,6 +1014,11 @@ impl Operation for ImportIam {
                         return Err(s3_error!(InvalidArgument, "has space be {ak}"));
                     }
 
+                    if let Some(err) = imported_service_account_parent_scope_failure(&ak, &req.parent, &cred, owner) {
+                        failed.service_accounts.push(err);
+                        continue;
+                    }
+
                     let mut update = true;
 
                     if let Err(e) = iam_store.get_service_account(&req.access_key).await {
@@ -1030,14 +1049,6 @@ impl Operation for ImportIam {
                     };
 
                     let groups = if req.groups.is_empty() { None } else { Some(req.groups) };
-
-                    if !imported_service_account_parent_allowed(&req.parent, &cred, owner) {
-                        failed.service_accounts.push(IAMErrEntity {
-                            name: ak.clone(),
-                            error: "service account parent is outside requester scope".to_string(),
-                        });
-                        continue;
-                    }
 
                     if let Err(e) = iam_store.new_service_account(&req.parent, groups, opts).await {
                         failed.service_accounts.push(IAMErrEntity {
@@ -1240,8 +1251,9 @@ impl Operation for ImportIam {
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUP_POLICY_MAPPING_USER_TYPE, imported_service_account_parent_allowed, imported_service_account_status,
-        should_check_deny_only, should_reject_group_import_name, should_restore_group_as_disabled,
+        GROUP_POLICY_MAPPING_USER_TYPE, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR, imported_service_account_parent_allowed,
+        imported_service_account_parent_scope_failure, imported_service_account_status, should_check_deny_only,
+        should_reject_group_import_name, should_restore_group_as_disabled,
     };
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_iam::error::Error as IamError;
@@ -1369,6 +1381,22 @@ mod tests {
         };
 
         assert!(!imported_service_account_parent_allowed("root-access-key", &requester, false));
+    }
+
+    #[test]
+    fn test_service_account_parent_scope_failure_records_import_error() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+        let err = imported_service_account_parent_scope_failure("svc-access-key", "root-access-key", &requester, false)
+            .expect("non-owner must not import a service account for another parent");
+
+        assert_eq!(err.name, "svc-access-key");
+        assert_eq!(err.error, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR);
+        assert!(
+            imported_service_account_parent_scope_failure("svc-access-key", "delegated-importer", &requester, false).is_none()
+        );
     }
 
     #[test]

@@ -17,9 +17,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose;
 use hmac::{Hmac, KeyInit, Mac};
 use http::{HeaderMap, HeaderValue, Method, Uri};
-use rustfs_credentials::try_get_rpc_token;
 #[cfg(test)]
 use rustfs_credentials::{DEFAULT_SECRET_KEY, RPC_SECRET_REQUIRED_MESSAGE};
+use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use sha2::Sha256;
 use time::OffsetDateTime;
 use tracing::error;
@@ -48,7 +48,10 @@ fn resolve_shared_secret(env_secret: Option<&str>, global_secret: Option<&str>) 
 }
 
 fn get_shared_secret() -> std::io::Result<String> {
-    try_get_rpc_token()
+    try_get_rpc_token().map_err(|err| {
+        error!("RPC auth secret resolution failed: {}; {}", err, RPC_SECRET_REQUIRED_OPERATOR_MESSAGE);
+        err
+    })
 }
 
 /// Generate HMAC-SHA256 signature for the given data
