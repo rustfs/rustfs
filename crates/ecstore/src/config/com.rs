@@ -1783,6 +1783,15 @@ mod tests {
                 "acks":"all",
                 "tls_enable":true
               }
+            },
+            "mysql":{
+              "primary":{
+                "enable":true,
+                "dsn_string":"rustfs:password@tcp(127.0.0.1:3306)/rustfs_events",
+                "table":"rustfs_events",
+                "queue_dir":"/tmp/mysql-queue",
+                "max_open_connections":"2"
+              }
             }
           }
         }"#;
@@ -1819,27 +1828,7 @@ mod tests {
         assert_eq!(kafka.get(rustfs_config::KAFKA_TOPIC), "events-kafka");
         assert_eq!(kafka.get(rustfs_config::KAFKA_ACKS), "all");
         assert_eq!(kafka.get(rustfs_config::KAFKA_TLS_ENABLE), "true");
-    }
 
-    #[test]
-    fn test_decode_server_config_reads_mysql_target() {
-        let input = r#"{
-          "version":"33",
-          "storageclass":{"standard":"EC:2","rrs":"EC:1"},
-          "notify":{
-            "mysql":{
-              "primary":{
-                "enable":true,
-                "dsn_string":"rustfs:password@tcp(127.0.0.1:3306)/rustfs_events",
-                "table":"rustfs_events",
-                "queue_dir":"/tmp/mysql-queue",
-                "max_open_connections":"2"
-              }
-            }
-          }
-        }"#;
-
-        let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
         let mysql = cfg
             .get_value(NOTIFY_MYSQL_SUB_SYS, "primary")
             .expect("mysql target should be decoded");
