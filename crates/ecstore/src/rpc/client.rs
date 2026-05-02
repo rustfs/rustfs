@@ -19,7 +19,7 @@ use rustfs_common::GLOBAL_CONN_MAP;
 use rustfs_protos::{create_new_channel, proto_gen::node_service::node_service_client::NodeServiceClient};
 use std::{error::Error, io::ErrorKind};
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
-use tracing::{debug, error};
+use tracing::debug;
 
 use super::context_propagation::{inject_request_id_into_metadata, inject_trace_context_into_metadata};
 

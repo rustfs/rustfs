@@ -541,6 +541,14 @@ mod tests {
         assert!(RPC_SECRET_REQUIRED_OPERATOR_MESSAGE.contains("RUSTFS_RPC_SECRET"));
     }
 
+    #[allow(deprecated)]
+    #[test]
+    fn test_get_rpc_token_preserves_string_return_type() {
+        fn assert_string_return(_: fn() -> String) {}
+
+        assert_string_return(get_rpc_token);
+    }
+
     #[test]
     fn test_resolve_rpc_secret_accepts_non_default_secret() {
         assert_eq!(resolve_rpc_secret(Some("custom-rpc-secret"), None).as_deref(), Some("custom-rpc-secret"));

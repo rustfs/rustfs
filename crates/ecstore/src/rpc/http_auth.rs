@@ -21,6 +21,7 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use rustfs_credentials::{DEFAULT_SECRET_KEY, RPC_SECRET_REQUIRED_MESSAGE};
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use sha2::Sha256;
+use std::sync::Once;
 use time::OffsetDateTime;
 use tracing::error;
 
@@ -30,6 +31,7 @@ const SIGNATURE_HEADER: &str = "x-rustfs-signature";
 const TIMESTAMP_HEADER: &str = "x-rustfs-timestamp";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
+static RPC_SECRET_RESOLUTION_LOG_ONCE: Once = Once::new();
 
 /// Get the shared secret for HMAC signing
 #[cfg(test)]
@@ -49,7 +51,9 @@ fn resolve_shared_secret(env_secret: Option<&str>, global_secret: Option<&str>) 
 
 fn get_shared_secret() -> std::io::Result<String> {
     try_get_rpc_token().map_err(|err| {
-        error!("RPC auth secret resolution failed: {}; {}", err, RPC_SECRET_REQUIRED_OPERATOR_MESSAGE);
+        RPC_SECRET_RESOLUTION_LOG_ONCE.call_once(|| {
+            error!("RPC auth secret resolution failed: {}; {}", err, RPC_SECRET_REQUIRED_OPERATOR_MESSAGE);
+        });
         err
     })
 }
