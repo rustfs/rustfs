@@ -120,7 +120,9 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
     // Check timestamp validity (prevent replay attacks)
     let current_time = OffsetDateTime::now_utc().unix_timestamp();
 
-    if current_time.saturating_sub(timestamp) > SIGNATURE_VALID_DURATION {
+    if current_time.saturating_sub(timestamp) > SIGNATURE_VALID_DURATION
+        || timestamp.saturating_sub(current_time) > SIGNATURE_VALID_DURATION
+    {
         return Err(std::io::Error::other("Request timestamp expired"));
     }
 
@@ -149,7 +151,54 @@ mod tests {
     use super::*;
     use crate::rpc::context_propagation::REQUEST_ID_HEADER;
     use http::{HeaderMap, Method};
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let buffer = self
+                .buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clone();
+            String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
 
     fn ensure_test_rpc_secret() {
         let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
@@ -308,17 +357,35 @@ mod tests {
 
     #[test]
     fn test_invalid_signature_log_contract_excludes_secrets() {
-        let src = include_str!("http_auth.rs");
-        let invalid_signature_block = src
-            .split("if signature != expected_signature")
-            .nth(1)
-            .expect("invalid signature branch should exist")
-            .split("return Err(std::io::Error::other(\"Invalid signature\"))")
-            .next()
-            .expect("invalid signature branch should return invalid signature");
+        ensure_test_rpc_secret();
+        let url = "http://example.com/api/test";
+        let method = Method::GET;
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+        let secret = get_shared_secret().expect("test RPC secret should resolve");
+        let expected_signature = generate_signature(&secret, url, &method, timestamp);
+        let invalid_signature = "invalid-signature";
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
 
-        assert!(!invalid_signature_block.contains("secret"));
-        assert!(!invalid_signature_block.contains("expected_signature"));
+        let mut headers = HeaderMap::new();
+        headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(invalid_signature).unwrap());
+        headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&timestamp.to_string()).unwrap());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let result = verify_rpc_signature(url, &method, &headers);
+            assert!(result.is_err(), "Invalid signature should fail verification");
+        });
+
+        let captured = logs.contents();
+        assert!(captured.contains("Invalid signature"));
+        assert!(!captured.contains(&secret));
+        assert!(!captured.contains(&expected_signature));
+        assert!(!captured.contains(invalid_signature));
     }
 
     #[test]
@@ -339,6 +406,27 @@ mod tests {
         // Verify should fail due to expired timestamp
         let result = verify_rpc_signature(url, &method, &headers);
         assert!(result.is_err(), "Expired timestamp should fail verification");
+
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "Request timestamp expired");
+    }
+
+    #[test]
+    fn test_verify_rpc_signature_future_timestamp_outside_window() {
+        ensure_test_rpc_secret();
+        let url = "http://example.com/api/test";
+        let method = Method::GET;
+        let mut headers = HeaderMap::new();
+
+        let future_timestamp = OffsetDateTime::now_utc().unix_timestamp() + SIGNATURE_VALID_DURATION + 10;
+        let secret = get_shared_secret().expect("test RPC secret should resolve");
+        let signature = generate_signature(&secret, url, &method, future_timestamp);
+
+        headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).unwrap());
+        headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&future_timestamp.to_string()).unwrap());
+
+        let result = verify_rpc_signature(url, &method, &headers);
+        assert!(result.is_err(), "Future timestamp outside valid window should fail verification");
 
         let error = result.unwrap_err();
         assert_eq!(error.to_string(), "Request timestamp expired");
