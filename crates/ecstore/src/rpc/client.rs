@@ -97,7 +97,7 @@ pub struct TonicSignatureInterceptor;
 impl tonic::service::Interceptor for TonicSignatureInterceptor {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         let headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).map_err(|err| {
-            error!("RPC signature generation failed: {}", err);
+            debug!("RPC signature generation failed: {}", err);
             tonic::Status::unauthenticated("No valid auth token")
         })?;
         req.metadata_mut().as_mut().extend(headers);
