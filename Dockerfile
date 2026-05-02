@@ -99,8 +99,7 @@ RUN addgroup -g 10001 -S rustfs && \
     chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 
-ENV RUSTFS_CORS_ALLOWED_ORIGINS="*" \
-    RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
+ENV RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_VOLUMES="/data" \
     RUSTFS_OBS_LOGGER_LEVEL=warn \
     RUSTFS_OBS_LOG_DIRECTORY=/logs \

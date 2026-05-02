@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::handlers::health::{HealthProbe, build_health_payload, collect_dependency_readiness, health_check_state};
-use crate::license::get_license;
+use crate::license::has_valid_license;
 use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, RUSTFS_ADMIN_PREFIX, VERSION};
 use crate::version::build;
 use axum::{
@@ -250,7 +250,7 @@ struct LicensePublicStatus {
 #[instrument]
 async fn license_handler() -> impl IntoResponse {
     Json(LicensePublicStatus {
-        licensed: get_license().is_some(),
+        licensed: has_valid_license(),
     })
 }
 
