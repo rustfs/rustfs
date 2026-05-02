@@ -195,4 +195,73 @@ mod tests {
         assert_eq!(peer.endpoint, "HTTPS://Node-A.Example.Com:9000/");
         assert_eq!(peer.deployment_id, "remote-https");
     }
+
+    #[test]
+    fn normalize_peer_map_backfills_metadata_when_https_peer_wins() {
+        let peers = BTreeMap::from([
+            (
+                "remote-http".to_string(),
+                PeerInfo {
+                    api_version: Some("v1".to_string()),
+                    replicate_ilm_expiry: true,
+                    ..peer("remote-http", "http://node-a.example.com:9000")
+                },
+            ),
+            (
+                "remote-https".to_string(),
+                PeerInfo {
+                    name: String::new(),
+                    deployment_id: String::new(),
+                    ..peer("remote-https", "https://node-a.example.com:9000")
+                },
+            ),
+        ]);
+
+        let normalized = normalize_peer_map_by_identity_with(peers, |peer| peer);
+
+        assert_eq!(normalized.len(), 1);
+        let peer = normalized.values().next().expect("normalized peer should exist");
+        assert_eq!(peer.endpoint, "https://node-a.example.com:9000");
+        assert_eq!(peer.name, "remote-http");
+        assert_eq!(peer.deployment_id, "remote-http");
+        assert_eq!(peer.api_version.as_deref(), Some("v1"));
+        assert!(peer.replicate_ilm_expiry);
+    }
+
+    #[test]
+    fn normalize_peer_map_generates_missing_deployment_id() {
+        let endpoint = "https://node-a.example.com:9000";
+        let peers = BTreeMap::from([(
+            "remote".to_string(),
+            PeerInfo {
+                deployment_id: String::new(),
+                ..peer("remote", endpoint)
+            },
+        )]);
+
+        let normalized = normalize_peer_map_by_identity_with(peers, |peer| peer);
+
+        let expected_deployment_id = deployment_id_for_endpoint(endpoint);
+        assert!(normalized.contains_key(&expected_deployment_id));
+        assert_eq!(normalized[&expected_deployment_id].deployment_id, expected_deployment_id);
+    }
+
+    #[test]
+    fn normalize_peer_map_suffixes_colliding_deployment_id_for_distinct_identity() {
+        let first = peer("shared", "https://node-a.example.com:9000");
+        let second_endpoint = "https://node-b.example.com:9000";
+        let second = PeerInfo {
+            deployment_id: "shared".to_string(),
+            ..peer("remote-b", second_endpoint)
+        };
+        let peers = BTreeMap::from([("first".to_string(), first), ("second".to_string(), second)]);
+
+        let normalized = normalize_peer_map_by_identity_with(peers, |peer| peer);
+
+        let expected_second_id = format!("shared-{}", deployment_id_for_endpoint(second_endpoint));
+        assert_eq!(normalized.len(), 2);
+        assert!(normalized.contains_key("shared"));
+        assert!(normalized.contains_key(&expected_second_id));
+        assert_eq!(normalized[&expected_second_id].deployment_id, expected_second_id);
+    }
 }
