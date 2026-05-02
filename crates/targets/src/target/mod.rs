@@ -27,6 +27,7 @@ use tracing::warn;
 
 pub mod kafka;
 pub mod mqtt;
+pub mod mysql;
 pub mod nats;
 pub mod pulsar;
 pub mod webhook;
