@@ -18,9 +18,10 @@ use rustfs_config::{
     KAFKA_QUEUE_LIMIT, KAFKA_TLS_CA, KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY, KAFKA_TLS_ENABLE, KAFKA_TOPIC, MQTT_BROKER,
     MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA,
     MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
-    MQTT_WS_PATH_ALLOWLIST, NATS_ADDRESS, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT,
-    NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN,
-    PULSAR_BROKER, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA,
+    MQTT_WS_PATH_ALLOWLIST, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT, MYSQL_TABLE,
+    NATS_ADDRESS, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA,
+    NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_BROKER,
+    PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA,
     PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT,
     WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
@@ -366,6 +367,47 @@ pub static DEFAULT_NOTIFY_KAFKA_KVS: LazyLock<KVS> = LazyLock::new(|| {
         KV {
             key: KAFKA_QUEUE_LIMIT.to_owned(),
             value: DEFAULT_LIMIT.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: COMMENT_KEY.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+    ])
+});
+
+/// MySQL notification target default configuration
+pub static DEFAULT_NOTIFY_MYSQL_KVS: LazyLock<KVS> = LazyLock::new(|| {
+    KVS(vec![
+        KV {
+            key: ENABLE_KEY.to_owned(),
+            value: EnableState::Off.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MYSQL_DSN_STRING.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: MYSQL_TABLE.to_owned(),
+            value: "rustfs_events".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MYSQL_QUEUE_DIR.to_owned(),
+            value: EVENT_DEFAULT_DIR.to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MYSQL_QUEUE_LIMIT.to_owned(),
+            value: DEFAULT_LIMIT.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: MYSQL_MAX_OPEN_CONNECTIONS.to_owned(),
+            value: "2".to_owned(),
             hidden_if_empty: false,
         },
         KV {
