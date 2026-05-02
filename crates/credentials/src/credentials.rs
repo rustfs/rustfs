@@ -29,6 +29,9 @@ static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 /// Global RPC authentication token
 pub static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
 
+/// Error returned when RPC authentication would otherwise use an unsafe fallback secret.
+pub const RPC_SECRET_REQUIRED_MESSAGE: &str = "RUSTFS_RPC_SECRET must be set to a non-default value or RUSTFS_SECRET_KEY must be changed from the default for RPC authentication";
+
 /// Error type for credentials operations
 #[derive(Debug)]
 pub enum CredentialsError {
@@ -216,13 +219,38 @@ pub fn gen_secret_key(length: usize) -> std::io::Result<String> {
 /// # Returns
 /// * `String` - The RPC authentication token
 ///
+fn resolve_rpc_secret(env_secret: Option<&str>, global_secret: Option<&str>) -> Option<String> {
+    if let Some(secret) = env_secret.map(str::trim).filter(|secret| !secret.is_empty()) {
+        return (secret != DEFAULT_SECRET_KEY).then(|| secret.to_string());
+    }
+
+    global_secret
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty() && *secret != DEFAULT_SECRET_KEY)
+        .map(ToOwned::to_owned)
+}
+
+pub fn try_get_rpc_token() -> std::io::Result<String> {
+    if let Some(secret) = GLOBAL_RUSTFS_RPC_SECRET.get() {
+        return resolve_rpc_secret(None, Some(secret)).ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE));
+    }
+
+    let env_secret = env::var(ENV_RPC_SECRET).ok();
+    let global_secret = get_global_secret_key_opt();
+    let secret = resolve_rpc_secret(env_secret.as_deref(), global_secret.as_deref())
+        .ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE))?;
+
+    match GLOBAL_RUSTFS_RPC_SECRET.set(secret.clone()) {
+        Ok(()) => Ok(secret),
+        Err(_) => GLOBAL_RUSTFS_RPC_SECRET
+            .get()
+            .and_then(|stored| resolve_rpc_secret(None, Some(stored)))
+            .ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE)),
+    }
+}
+
 pub fn get_rpc_token() -> String {
-    GLOBAL_RUSTFS_RPC_SECRET
-        .get_or_init(|| {
-            env::var(ENV_RPC_SECRET)
-                .unwrap_or_else(|_| get_global_secret_key_opt().unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string()))
-        })
-        .clone()
+    try_get_rpc_token().unwrap_or_default()
 }
 
 /// A wrapper struct for masking sensitive strings in Debug implementations.
@@ -301,7 +329,7 @@ impl fmt::Debug for Credentials {
         f.debug_struct("Credentials")
             .field("access_key", &self.access_key)
             .field("secret_key", &Masked(Some(&self.secret_key)))
-            .field("session_token", &self.session_token)
+            .field("session_token", &Masked(Some(&self.session_token)))
             .field("expiration", &self.expiration)
             .field("status", &self.status)
             .field("parent_user", &self.parent_user)
@@ -496,6 +524,22 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_rpc_secret_rejects_default_fallback() {
+        assert!(resolve_rpc_secret(None, None).is_none());
+        assert!(resolve_rpc_secret(None, Some(DEFAULT_SECRET_KEY)).is_none());
+        assert!(resolve_rpc_secret(Some(DEFAULT_SECRET_KEY), Some("custom-global-secret")).is_none());
+    }
+
+    #[test]
+    fn test_resolve_rpc_secret_accepts_non_default_secret() {
+        assert_eq!(resolve_rpc_secret(Some("custom-rpc-secret"), None).as_deref(), Some("custom-rpc-secret"));
+        assert_eq!(
+            resolve_rpc_secret(None, Some("custom-global-secret")).as_deref(),
+            Some("custom-global-secret")
+        );
+    }
+
+    #[test]
     fn test_masked_debug() {
         // Test None
         assert_eq!(format!("{:?}", Masked(None)), "");
@@ -522,6 +566,24 @@ mod tests {
         assert_eq!(format!("{:?}", Masked(Some("中"))), "***");
         assert_eq!(format!("{:?}", Masked(Some("中文"))), "中***|2");
         assert_eq!(format!("{:?}", Masked(Some("中文测试"))), "中***试|4");
+    }
+
+    #[test]
+    fn test_credentials_debug_masks_sensitive_fields() {
+        let cred = Credentials {
+            access_key: "debug-access-key".to_string(),
+            secret_key: "debug-secret-key".to_string(),
+            session_token: "debug-session-token".to_string(),
+            parent_user: "parent-user".to_string(),
+            ..Default::default()
+        };
+
+        let output = format!("{cred:?}");
+
+        assert!(output.contains("debug-access-key"));
+        assert!(output.contains("parent-user"));
+        assert!(!output.contains("debug-secret-key"));
+        assert!(!output.contains("debug-session-token"));
     }
 
     #[test]
