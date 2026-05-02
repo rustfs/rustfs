@@ -687,35 +687,30 @@ impl ConditionalCorsLayer {
     }
 
     fn apply_cors_headers(&self, request_headers: &HeaderMap, response_headers: &mut HeaderMap) {
-        let origin = request_headers
-            .get(cors::standard::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let allowed_origin = match (origin, &self.cors_origins) {
-            (Some(orig), Some(config)) if config == "*" => Some(orig),
-            (Some(orig), Some(config)) => {
-                if config.split(',').map(|s| s.trim()).any(|x| x == orig.as_str()) {
-                    Some(orig)
-                } else {
-                    None
-                }
-            }
-            (Some(orig), None) => Some(orig), // Default: allow all if not configured
-            _ => None,
+        let Some(origin) = request_headers.get(cors::standard::ORIGIN).and_then(|v| v.to_str().ok()) else {
+            return;
+        };
+        let Some(config) = self
+            .cors_origins
+            .as_deref()
+            .map(str::trim)
+            .filter(|config| !config.is_empty())
+        else {
+            return;
         };
 
-        // Track whether we're using a specific origin (not wildcard)
-        let using_specific_origin = if let Some(origin) = &allowed_origin {
-            if let Ok(header_value) = HeaderValue::from_str(origin) {
-                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, header_value);
-                true // Using specific origin, credentials allowed
-            } else {
-                false
-            }
+        let (allow_origin, allow_credentials) = if config == "*" {
+            (HeaderValue::from_static("*"), false)
+        } else if config.split(',').map(str::trim).any(|allowed| allowed == origin) {
+            let Ok(origin) = HeaderValue::from_str(origin) else {
+                return;
+            };
+            (origin, true)
         } else {
-            false
+            return;
         };
+
+        response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
 
         // Allow all methods by default (S3-compatible set)
         response_headers.insert(
@@ -732,9 +727,8 @@ impl ConditionalCorsLayer {
             HeaderValue::from_static("x-request-id, content-type, content-length, etag"),
         );
 
-        // Only set credentials when using a specific origin (not wildcard)
-        // CORS spec: credentials cannot be used with wildcard origins
-        if using_specific_origin {
+        // Credentials are only safe for origins matched from an explicit allow-list.
+        if allow_credentials {
             response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
         }
     }
@@ -1077,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_cors_layer_echoes_allowed_origin() {
+    fn test_generic_cors_layer_omits_headers_without_configured_origins() {
         let cors = ConditionalCorsLayer { cors_origins: None };
         let mut req_headers = HeaderMap::new();
         req_headers.insert("origin", "https://example.com".parse().unwrap());
@@ -1085,10 +1079,11 @@ mod tests {
         let mut resp_headers = HeaderMap::new();
         cors.apply_cors_headers(&req_headers, &mut resp_headers);
 
-        assert_eq!(
-            resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
-            "https://example.com"
-        );
+        assert!(resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).is_none());
+        assert!(resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).is_none());
+        assert!(resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_HEADERS).is_none());
+        assert!(resp_headers.get(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS).is_none());
     }
 
     #[test]
@@ -1111,6 +1106,22 @@ mod tests {
             resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "https://allowed.com"
         );
+        assert_eq!(resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(), "true");
+    }
+
+    #[test]
+    fn test_generic_cors_layer_wildcard_does_not_allow_credentials() {
+        let cors = ConditionalCorsLayer {
+            cors_origins: Some("*".to_string()),
+        };
+
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("origin", "https://example.com".parse().unwrap());
+        let mut resp_headers = HeaderMap::new();
+        cors.apply_cors_headers(&req_headers, &mut resp_headers);
+
+        assert_eq!(resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*");
+        assert!(resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).is_none());
     }
 
     #[test]
