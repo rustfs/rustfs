@@ -23,7 +23,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use mysql_async::{Conn, Opts, OptsBuilder, Pool, SslOpts, prelude::Queryable};
+use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, prelude::Queryable};
 use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -516,6 +516,17 @@ where
                 "MySQL target '{}' is configured without TLS verification. This is insecure and should not be used in production.",
                 self.id
             );
+        }
+
+        if self.args.max_open_connections > 0 {
+            let constraints = PoolConstraints::new(1, self.args.max_open_connections)
+                .ok_or_else(|| {
+                    TargetError::Configuration(format!(
+                        "MySQL max_open_connections must be >= 1, got {}",
+                        self.args.max_open_connections
+                    ))
+                })?;
+            builder = builder.pool_opts(PoolOpts::default().with_constraints(constraints));
         }
 
         let opts = Opts::from(builder);
