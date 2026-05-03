@@ -25,7 +25,7 @@ use crate::{
 use hashbrown::HashMap;
 use rustfs_config::notify::{
     DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS,
-    NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
@@ -48,6 +48,7 @@ fn subsystem_target_type(target_type: &str) -> &str {
         NOTIFY_KAFKA_SUB_SYS => "kafka",
         NOTIFY_MQTT_SUB_SYS => "mqtt",
         NOTIFY_NATS_SUB_SYS => "nats",
+        NOTIFY_POSTGRES_SUB_SYS => "postgres",
         NOTIFY_PULSAR_SUB_SYS => "pulsar",
         _ => target_type,
     }
@@ -785,5 +786,12 @@ mod tests {
         let target_id = runtime_target_id_for_subsystem(NOTIFY_PULSAR_SUB_SYS, "Ledger");
         assert_eq!(target_id.id, "ledger");
         assert_eq!(target_id.name, "pulsar");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_postgres_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_POSTGRES_SUB_SYS, "AuditTrail");
+        assert_eq!(target_id.id, "audittrail");
+        assert_eq!(target_id.name, "postgres");
     }
 }
