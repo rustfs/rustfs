@@ -19,10 +19,12 @@ use rustfs_config::{
     MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA,
     MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
     MQTT_WS_PATH_ALLOWLIST, NATS_ADDRESS, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT,
-    NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN,
-    PULSAR_BROKER, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA,
-    PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT,
-    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
+    NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, POSTGRES_DATABASE,
+    POSTGRES_FORMAT, POSTGRES_HOST, POSTGRES_PASSWORD, POSTGRES_PORT, POSTGRES_QUEUE_DIR, POSTGRES_QUEUE_LIMIT, POSTGRES_SCHEMA,
+    POSTGRES_TABLE, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_TLS_REQUIRED, POSTGRES_USER,
+    PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE,
+    PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA,
+    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
 use std::sync::LazyLock;
 
@@ -305,6 +307,91 @@ pub static DEFAULT_NOTIFY_PULSAR_KVS: LazyLock<KVS> = LazyLock::new(|| {
         },
         KV {
             key: PULSAR_QUEUE_LIMIT.to_owned(),
+            value: DEFAULT_LIMIT.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: COMMENT_KEY.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+    ])
+});
+
+pub static DEFAULT_NOTIFY_POSTGRES_KVS: LazyLock<KVS> = LazyLock::new(|| {
+    KVS(vec![
+        KV {
+            key: ENABLE_KEY.to_owned(),
+            value: EnableState::Off.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_HOST.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_PORT.to_owned(),
+            value: "5432".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_USER.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_PASSWORD.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: POSTGRES_DATABASE.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_SCHEMA.to_owned(),
+            value: "public".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_TABLE.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_FORMAT.to_owned(),
+            value: "namespace".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_TLS_REQUIRED.to_owned(),
+            value: EnableState::Off.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_TLS_CA.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: POSTGRES_TLS_CLIENT_CERT.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: POSTGRES_TLS_CLIENT_KEY.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: POSTGRES_QUEUE_DIR.to_owned(),
+            value: EVENT_DEFAULT_DIR.to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: POSTGRES_QUEUE_LIMIT.to_owned(),
             value: DEFAULT_LIMIT.to_string(),
             hidden_if_empty: false,
         },
