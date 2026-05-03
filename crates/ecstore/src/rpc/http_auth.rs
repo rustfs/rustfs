@@ -58,19 +58,35 @@ fn get_shared_secret() -> std::io::Result<String> {
     })
 }
 
-/// Generate HMAC-SHA256 signature for the given data
-fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) -> String {
+/// Build the canonical payload covered by the RPC HMAC.
+fn signature_payload(url: &str, method: &Method, timestamp: i64) -> String {
     let uri: Uri = url.parse().expect("Invalid URL");
 
     let path_and_query = uri.path_and_query().unwrap();
 
     let url = path_and_query.to_string();
 
-    let data = format!("{url}|{method}|{timestamp}");
+    format!("{url}|{method}|{timestamp}")
+}
+
+/// Generate HMAC-SHA256 signature for the given data
+fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) -> String {
+    let data = signature_payload(url, method, timestamp);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
     general_purpose::STANDARD.encode(result.into_bytes())
+}
+
+fn verify_signature(secret: &str, url: &str, method: &Method, timestamp: i64, signature: &str) -> bool {
+    let Ok(signature) = general_purpose::STANDARD.decode(signature) else {
+        return false;
+    };
+
+    let data = signature_payload(url, method, timestamp);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+    mac.update(data.as_bytes());
+    mac.verify_slice(&signature).is_ok()
 }
 
 /// Build headers with authentication signature
@@ -126,12 +142,10 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
         return Err(std::io::Error::other("Request timestamp expired"));
     }
 
-    // Generate expected signature
+    // Verify signature with constant-time HMAC comparison.
     let secret = get_shared_secret()?;
-    let expected_signature = generate_signature(&secret, url, method, timestamp);
 
-    // Compare signatures
-    if signature != expected_signature {
+    if !verify_signature(&secret, url, method, timestamp, signature) {
         error!(
             "verify_rpc_signature: Invalid signature: url {}, method {}, timestamp {}, signature_len {}",
             url,
@@ -353,6 +367,22 @@ mod tests {
 
         let error = result.unwrap_err();
         assert_eq!(error.to_string(), "Invalid signature");
+    }
+
+    #[test]
+    fn test_verify_signature_uses_hmac_verification() {
+        let secret = "test-secret";
+        let url = "http://example.com/api/test";
+        let method = Method::GET;
+        let timestamp = 1640995200;
+        let signature = generate_signature(secret, url, &method, timestamp);
+        let mut tampered = general_purpose::STANDARD.decode(&signature).unwrap();
+        tampered[0] ^= 1;
+        let tampered_signature = general_purpose::STANDARD.encode(tampered);
+
+        assert!(verify_signature(secret, url, &method, timestamp, &signature));
+        assert!(!verify_signature(secret, url, &method, timestamp, &tampered_signature));
+        assert!(!verify_signature(secret, url, &method, timestamp, "invalid-signature"));
     }
 
     #[test]
