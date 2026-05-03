@@ -223,7 +223,6 @@ impl MySqlDsn {
 }
 
 /// Returns a redacted version of the DSN string with the password replaced by `***`.
-#[allow(dead_code)]
 pub(crate) fn redact_mysql_dsn(dsn_string: &str) -> String {
     let input = dsn_string.trim();
     if input.is_empty() {
