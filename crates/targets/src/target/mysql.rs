@@ -49,7 +49,7 @@ pub struct MySqlArgs {
     pub queue_dir: String,
     /// Maximum number of events stored in the local queue
     pub queue_limit: u64,
-    /// Maximum number of open MySQL connections in the pool (0 = unlimited)
+    /// Maximum number of open MySQL connections in the pool (0 relies on the underlying library default)
     pub max_open_connections: usize,
     /// The target type (notify or audit)
     pub target_type: TargetType,
@@ -223,6 +223,7 @@ impl MySqlDsn {
 }
 
 /// Returns a redacted version of the DSN string with the password replaced by `***`.
+#[allow(dead_code)]
 pub(crate) fn redact_mysql_dsn(dsn_string: &str) -> String {
     let input = dsn_string.trim();
     if input.is_empty() {
@@ -494,6 +495,16 @@ where
     }
 
     /// Returns or lazily initializes the MySQL connection pool.
+    ///
+    /// # Errors
+    ///
+    /// | Scenario | Error variant |
+    /// |---|---|
+    /// | Connection refused / host unreachable / TLS handshake failed | `NotConnected` |
+    /// | `SELECT 1` health check failed | `NotConnected` |
+    /// | DDL permission denied / `CREATE TABLE` failed | `Initialization` |
+    /// | Existing table has incompatible schema | `Initialization` |
+    /// | DSN parse failure / invalid config | `Configuration` |
     async fn get_or_init_pool(&self) -> Result<Pool, TargetError> {
         {
             let guard = self.pool.lock().await;
@@ -533,20 +544,21 @@ where
             builder = builder.pool_opts(PoolOpts::default().with_constraints(constraints));
         }
 
+        let opts = Opts::from(builder);
+        let pool = Pool::new(opts);
+
         // Uses a double-check pattern: the mutex guard is only held for
         // short reads/writes to the pool cache. All I/O (connecting,
         // DDL, schema validation) happens outside the lock so that
         // concurrent callers are not blocked by a slow MySQL server.
-        let opts = Opts::from(builder);
-        let pool = Pool::new(opts);
         let mut conn = pool
             .get_conn()
             .await
-            .map_err(|e| TargetError::Initialization(format!("Failed to connect to MySQL: {e}")))?;
+            .map_err(|_| TargetError::NotConnected)?;
 
         conn.query_drop("SELECT 1")
             .await
-            .map_err(|e| TargetError::Initialization(format!("MySQL health check failed: {e}")))?;
+            .map_err(|_| TargetError::NotConnected)?;
 
         let ddl = format!(
             "CREATE TABLE IF NOT EXISTS {} (event_time DATETIME(6) NOT NULL, event_data JSON NOT NULL)",

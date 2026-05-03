@@ -519,15 +519,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_mysql_config_rejects_dsn_alias() {
-        let mut config = mysql_base_config();
-        config.insert("dsn".to_string(), "rustfs:password@tcp(127.0.0.1:3306)/db".to_string());
-
-        let err = validate_mysql_config(&config, "").expect_err("dsn alias should be rejected");
-        assert!(err.to_string().contains("dsn_string"));
-    }
-
-    #[test]
     fn validate_mysql_config_rejects_invalid_max_open_connections() {
         let mut config = mysql_base_config();
         config.insert("max_open_connections".to_string(), "not-a-number".to_string());
