@@ -29,6 +29,7 @@ pub mod kafka;
 pub mod mqtt;
 pub mod nats;
 pub mod pulsar;
+pub mod redis;
 pub mod webhook;
 
 /// A read-only snapshot of delivery counters for a target.
