@@ -422,13 +422,6 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
         return Err(TargetError::Configuration("MySQL queue_dir must be an absolute path".to_string()));
     }
 
-    // Reject 'dsn' alias
-    if config.lookup("dsn").is_some() {
-        return Err(TargetError::Configuration(
-            "MySQL 'dsn' is not supported; use 'dsn_string' instead".to_string(),
-        ));
-    }
-
     if let Some(max_conn_str) = config.lookup(MYSQL_MAX_OPEN_CONNECTIONS) {
         let _: usize = max_conn_str.trim().parse().map_err(|_| {
             TargetError::Configuration(format!("MySQL max_open_connections value '{}' is not a valid number", max_conn_str))
