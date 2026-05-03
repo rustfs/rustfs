@@ -21,6 +21,7 @@ use crate::admin::{
 };
 use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use hyper::Method;
+use serial_test::serial;
 use temp_env::with_var;
 
 fn admin_path(path: &str) -> String {
@@ -60,7 +61,11 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     oidc::register_oidc_route(router).expect("register oidc route");
 }
 
+// register_admin_routes reads ENV_HEALTH_ENDPOINT_ENABLE to decide whether
+// to register /health; serialise with the env-mutating test below to avoid
+// cross-thread leakage of that override.
 #[test]
+#[serial]
 fn test_register_routes_cover_representative_admin_paths() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
     register_admin_routes(&mut router);
@@ -171,6 +176,7 @@ fn test_register_routes_cover_representative_admin_paths() {
 }
 
 #[test]
+#[serial]
 fn test_admin_alias_paths_match_existing_admin_routes() {
     let mut router: S3Router<AdminOperation> = S3Router::new(false);
     register_admin_routes(&mut router);
@@ -233,6 +239,7 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
 }
 
 #[test]
+#[serial]
 fn test_health_routes_not_registered_when_disabled_by_env() {
     with_var(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"), || {
         let mut router: S3Router<AdminOperation> = S3Router::new(false);
