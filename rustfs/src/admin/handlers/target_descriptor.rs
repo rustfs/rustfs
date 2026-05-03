@@ -22,7 +22,7 @@ use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     TargetError, check_kafka_broker_available, check_mqtt_broker_available_with_tls, check_nats_server_available,
     check_pulsar_broker_available,
-    config::{build_kafka_args, build_nats_args, build_pulsar_args, collect_env_target_instance_ids},
+    config::{build_kafka_args, build_nats_args, build_pulsar_args, collect_env_target_instance_ids, validate_mysql_config},
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
 use s3s::{S3Result, s3_error};
@@ -71,6 +71,7 @@ pub(crate) enum AdminTargetValidator {
     Webhook,
     Mqtt,
     Kafka(TargetDomain),
+    MySql,
     Nats(TargetDomain),
     Pulsar(TargetDomain),
 }
@@ -336,6 +337,7 @@ pub(crate) async fn validate_target_request(
         AdminTargetValidator::Webhook => validate_webhook_request(kv_map).await,
         AdminTargetValidator::Mqtt => validate_mqtt_request(kv_map).await,
         AdminTargetValidator::Kafka(domain) => validate_kafka_request(kv_map, default_queue_dir, domain).await,
+        AdminTargetValidator::MySql => validate_mysql_request(kv_map, default_queue_dir).await,
         AdminTargetValidator::Nats(domain) => validate_nats_request(kv_map, default_queue_dir, domain).await,
         AdminTargetValidator::Pulsar(domain) => validate_pulsar_request(kv_map, default_queue_dir, domain).await,
     }
@@ -485,6 +487,16 @@ async fn validate_pulsar_request(
         TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
         _ => s3_error!(InvalidArgument, "Pulsar broker check failed: {}", e),
     })
+}
+
+async fn validate_mysql_request(kv_map: &HashMap<String, String>, default_queue_dir: &str) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get(rustfs_config::MYSQL_QUEUE_DIR) {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+
+    validate_mysql_config(&to_kvs(kv_map), default_queue_dir).map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+
+    Ok(())
 }
 
 fn to_kvs(kv_map: &HashMap<String, String>) -> rustfs_ecstore::config::KVS {

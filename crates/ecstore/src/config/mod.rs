@@ -251,6 +251,10 @@ pub fn init() {
     kvs.insert(AUDIT_PULSAR_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_PULSAR_KVS.clone());
     kvs.insert(NOTIFY_KAFKA_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_KAFKA_KVS.clone());
     kvs.insert(AUDIT_KAFKA_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_KAFKA_KVS.clone());
+    kvs.insert(
+        rustfs_config::notify::NOTIFY_MYSQL_SUB_SYS.to_owned(),
+        notify::DEFAULT_NOTIFY_MYSQL_KVS.clone(),
+    );
     kvs.insert(IDENTITY_OPENID_SUB_SYS.to_owned(), oidc::DEFAULT_IDENTITY_OPENID_KVS.clone());
 
     // Register all default configurations

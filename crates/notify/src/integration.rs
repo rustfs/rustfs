@@ -25,7 +25,7 @@ use crate::{
 use hashbrown::HashMap;
 use rustfs_config::notify::{
     DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS,
-    NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
@@ -47,6 +47,7 @@ fn subsystem_target_type(target_type: &str) -> &str {
         NOTIFY_WEBHOOK_SUB_SYS => "webhook",
         NOTIFY_KAFKA_SUB_SYS => "kafka",
         NOTIFY_MQTT_SUB_SYS => "mqtt",
+        NOTIFY_MYSQL_SUB_SYS => "mysql",
         NOTIFY_NATS_SUB_SYS => "nats",
         NOTIFY_PULSAR_SUB_SYS => "pulsar",
         _ => target_type,

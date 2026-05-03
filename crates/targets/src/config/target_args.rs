@@ -18,6 +18,7 @@ use crate::target::{
     TargetType,
     kafka::KafkaArgs,
     mqtt::{MQTTArgs, MQTTTlsConfig, validate_mqtt_broker_url},
+    mysql::MySqlArgs,
     nats::{NATSArgs, validate_nats_address},
     pulsar::{PulsarArgs, validate_pulsar_broker},
     webhook::WebhookArgs,
@@ -27,12 +28,13 @@ use rustfs_config::{
     DEFAULT_LIMIT, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_QUEUE_LIMIT, KAFKA_TLS_CA, KAFKA_TLS_CLIENT_CERT,
     KAFKA_TLS_CLIENT_KEY, KAFKA_TLS_ENABLE, KAFKA_TOPIC, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS,
     MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY,
-    MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, NATS_ADDRESS,
-    NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
-    NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD,
-    PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION,
-    PULSAR_TOPIC, PULSAR_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA,
-    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
+    MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_DSN_STRING,
+    MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT, MYSQL_TABLE, NATS_ADDRESS, NATS_CREDENTIALS_FILE,
+    NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY,
+    NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD, PULSAR_QUEUE_DIR,
+    PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC,
+    PULSAR_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT,
+    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
 use rustfs_ecstore::config::KVS;
 use std::path::Path;
@@ -355,17 +357,101 @@ pub fn validate_kafka_config(config: &KVS, default_queue_dir: &str) -> Result<()
     Ok(())
 }
 
+/// Builds `MySqlArgs` from a KVS configuration.
+///
+/// Parses all MySQL target configuration keys, applies defaults for
+/// missing optional values, and validates that all required fields
+/// are present and well-formed.
+pub fn build_mysql_args(config: &KVS, default_queue_dir: &str, target_type: TargetType) -> Result<MySqlArgs, TargetError> {
+    let dsn_string = config
+        .lookup(MYSQL_DSN_STRING)
+        .ok_or_else(|| TargetError::Configuration("Missing MySQL dsn_string".to_string()))?;
+
+    let table = config
+        .lookup(MYSQL_TABLE)
+        .ok_or_else(|| TargetError::Configuration("Missing MySQL table".to_string()))?;
+
+    let args = MySqlArgs {
+        enable: true,
+        dsn_string,
+        table,
+        queue_dir: config
+            .lookup(MYSQL_QUEUE_DIR)
+            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_limit: config
+            .lookup(MYSQL_QUEUE_LIMIT)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LIMIT),
+        max_open_connections: config
+            .lookup(MYSQL_MAX_OPEN_CONNECTIONS)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2),
+        target_type,
+    };
+
+    args.validate()?;
+    Ok(args)
+}
+
+/// Validates MySQL target configuration from a KVS without building args.
+///
+/// Performs the same checks as `build_mysql_args` but discards the result,
+/// used for pre-validation before target creation.
+pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<(), TargetError> {
+    let dsn_string = config
+        .lookup(MYSQL_DSN_STRING)
+        .ok_or_else(|| TargetError::Configuration("Missing MySQL dsn_string".to_string()))?;
+
+    if dsn_string.trim().is_empty() {
+        return Err(TargetError::Configuration("MySQL dsn_string cannot be empty".to_string()));
+    }
+
+    let _ = crate::target::mysql::MySqlDsn::parse(&dsn_string)?;
+
+    let table = config
+        .lookup(MYSQL_TABLE)
+        .ok_or_else(|| TargetError::Configuration("Missing MySQL table".to_string()))?;
+
+    crate::target::mysql::validate_table_name(&table)?;
+
+    let queue_dir = config
+        .lookup(MYSQL_QUEUE_DIR)
+        .unwrap_or_else(|| default_queue_dir.to_string());
+
+    if !queue_dir.is_empty() && !std::path::Path::new(&queue_dir).is_absolute() {
+        return Err(TargetError::Configuration("MySQL queue_dir must be an absolute path".to_string()));
+    }
+
+    if let Some(max_conn_str) = config.lookup(MYSQL_MAX_OPEN_CONNECTIONS) {
+        let _: usize = max_conn_str.trim().parse().map_err(|_| {
+            TargetError::Configuration(format!("MySQL max_open_connections value '{}' is not a valid number", max_conn_str))
+        })?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_kafka_args, validate_kafka_config};
+    use super::{build_kafka_args, build_mysql_args, validate_kafka_config, validate_mysql_config};
     use crate::target::TargetType;
-    use rustfs_config::{KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC};
+    use rustfs_config::{KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_QUEUE_DIR, MYSQL_TABLE};
     use rustfs_ecstore::config::KVS;
 
     fn kafka_base_config() -> KVS {
         let mut config = KVS::new();
         config.insert(KAFKA_BROKERS.to_string(), "127.0.0.1:9092".to_string());
         config.insert(KAFKA_TOPIC.to_string(), "events".to_string());
+        config
+    }
+
+    fn mysql_base_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(
+            MYSQL_DSN_STRING.to_string(),
+            "rustfs:password@tcp(127.0.0.1:3306)/rustfs_events".to_string(),
+        );
+        config.insert(MYSQL_TABLE.to_string(), "rustfs_events".to_string());
         config
     }
 
@@ -394,5 +480,68 @@ mod tests {
 
         let err = validate_kafka_config(&config, "").expect_err("invalid acks should fail");
         assert!(err.to_string().contains("Kafka acks must be one of"));
+    }
+
+    #[test]
+    fn build_mysql_args_accepts_minimal_config() {
+        let args = build_mysql_args(&mysql_base_config(), "", TargetType::NotifyEvent).expect("valid mysql args");
+        assert!(args.enable);
+        assert_eq!(args.dsn_string, "rustfs:password@tcp(127.0.0.1:3306)/rustfs_events");
+        assert_eq!(args.table, "rustfs_events");
+        assert_eq!(args.max_open_connections, 2);
+        assert_eq!(args.queue_limit, rustfs_config::DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn build_mysql_args_applies_defaults() {
+        let args = build_mysql_args(&mysql_base_config(), "/custom/queue", TargetType::NotifyEvent).expect("valid mysql args");
+        assert_eq!(args.queue_dir, "/custom/queue");
+        assert_eq!(args.queue_limit, 100000);
+        assert_eq!(args.max_open_connections, 2);
+    }
+
+    #[test]
+    fn build_mysql_args_rejects_missing_dsn() {
+        let mut config = KVS::new();
+        config.insert(MYSQL_TABLE.to_string(), "events".to_string());
+
+        let err = build_mysql_args(&config, "", TargetType::NotifyEvent).expect_err("missing dsn should fail");
+        assert!(err.to_string().contains("dsn_string"));
+    }
+
+    #[test]
+    fn build_mysql_args_rejects_relative_queue_dir() {
+        let mut config = mysql_base_config();
+        config.insert(MYSQL_QUEUE_DIR.to_string(), "relative/path".to_string());
+
+        let err = build_mysql_args(&config, "", TargetType::NotifyEvent).expect_err("relative path should fail");
+        assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn validate_mysql_config_rejects_dsn_alias() {
+        let mut config = mysql_base_config();
+        config.insert("dsn".to_string(), "rustfs:password@tcp(127.0.0.1:3306)/db".to_string());
+
+        let err = validate_mysql_config(&config, "").expect_err("dsn alias should be rejected");
+        assert!(err.to_string().contains("dsn_string"));
+    }
+
+    #[test]
+    fn validate_mysql_config_rejects_invalid_max_open_connections() {
+        let mut config = mysql_base_config();
+        config.insert("max_open_connections".to_string(), "not-a-number".to_string());
+
+        let err = validate_mysql_config(&config, "").expect_err("invalid max_open_connections should be rejected");
+        assert!(err.to_string().contains("max_open_connections"));
+    }
+
+    #[test]
+    fn validate_mysql_config_rejects_empty_dsn() {
+        let mut config = mysql_base_config();
+        config.insert(MYSQL_DSN_STRING.to_string(), "".to_string());
+
+        let err = validate_mysql_config(&config, "").expect_err("empty dsn should fail");
+        assert!(err.to_string().contains("empty"));
     }
 }

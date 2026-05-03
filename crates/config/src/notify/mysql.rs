@@ -1,0 +1,41 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// A list of all valid configuration keys for a MySQL target.
+pub const NOTIFY_MYSQL_KEYS: &[&str] = &[
+    crate::ENABLE_KEY,
+    crate::MYSQL_DSN_STRING,
+    crate::MYSQL_TABLE,
+    crate::MYSQL_QUEUE_DIR,
+    crate::MYSQL_QUEUE_LIMIT,
+    crate::MYSQL_MAX_OPEN_CONNECTIONS,
+    crate::COMMENT_KEY,
+];
+
+// MySQL Environment Variables
+pub const ENV_NOTIFY_MYSQL_ENABLE: &str = "RUSTFS_NOTIFY_MYSQL_ENABLE";
+pub const ENV_NOTIFY_MYSQL_DSN_STRING: &str = "RUSTFS_NOTIFY_MYSQL_DSN_STRING";
+pub const ENV_NOTIFY_MYSQL_TABLE: &str = "RUSTFS_NOTIFY_MYSQL_TABLE";
+pub const ENV_NOTIFY_MYSQL_QUEUE_DIR: &str = "RUSTFS_NOTIFY_MYSQL_QUEUE_DIR";
+pub const ENV_NOTIFY_MYSQL_QUEUE_LIMIT: &str = "RUSTFS_NOTIFY_MYSQL_QUEUE_LIMIT";
+pub const ENV_NOTIFY_MYSQL_MAX_OPEN_CONNECTIONS: &str = "RUSTFS_NOTIFY_MYSQL_MAX_OPEN_CONNECTIONS";
+
+pub const ENV_NOTIFY_MYSQL_KEYS: &[&str; 6] = &[
+    ENV_NOTIFY_MYSQL_ENABLE,
+    ENV_NOTIFY_MYSQL_DSN_STRING,
+    ENV_NOTIFY_MYSQL_TABLE,
+    ENV_NOTIFY_MYSQL_QUEUE_DIR,
+    ENV_NOTIFY_MYSQL_QUEUE_LIMIT,
+    ENV_NOTIFY_MYSQL_MAX_OPEN_CONNECTIONS,
+];
