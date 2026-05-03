@@ -16,7 +16,7 @@ use crate::admin::service::site_replication::reload_site_replication_runtime_sta
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
-use rmp_serde::{Deserializer, Serializer};
+use rmp_serde::Deserializer;
 use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
 use rustfs_ecstore::{
     admin_server_info::get_local_server_property,
@@ -43,7 +43,7 @@ use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{io::Cursor, pin::Pin, sync::Arc};
 use tokio::spawn;
 use tokio::sync::mpsc;
