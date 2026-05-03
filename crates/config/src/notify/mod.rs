@@ -82,7 +82,6 @@ pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[
 
 pub const NOTIFY_KAFKA_SUB_SYS: &str = "notify_kafka";
 pub const NOTIFY_MQTT_SUB_SYS: &str = "notify_mqtt";
-#[allow(dead_code)]
 pub const NOTIFY_MYSQL_SUB_SYS: &str = "notify_mysql";
 #[allow(dead_code)]
 pub const NOTIFY_NATS_SUB_SYS: &str = "notify_nats";

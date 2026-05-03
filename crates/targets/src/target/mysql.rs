@@ -220,7 +220,6 @@ pub fn parse_mysql_dsn(dsn_string: &str) -> Result<MySqlDsn, TargetError> {
 }
 
 /// Returns a redacted version of the DSN string with the password replaced by `***`.
-#[allow(dead_code)]
 pub(crate) fn redact_mysql_dsn(dsn_string: &str) -> String {
     let input = dsn_string.trim();
     if input.is_empty() {
@@ -308,7 +307,6 @@ pub(crate) fn validate_table_name(table: &str) -> Result<(), TargetError> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) fn quote_table_name(table: &str) -> Result<String, TargetError> {
     let table = table.trim();
 
