@@ -12,8 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::TargetError;
-use crate::target::TargetType;
+use crate::{
+    Target, TargetLog,
+    arn::TargetID,
+    error::TargetError,
+    store::{Key, Store},
+    target::{
+        ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
+        TargetType,
+    },
+};
+use async_trait::async_trait;
+use mysql_async::{Conn, Opts, OptsBuilder, Pool, SslOpts, prelude::Queryable};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 
 /// Arguments for configuring a MySQL notification target.
 ///
@@ -23,7 +39,7 @@ use crate::target::TargetType;
 pub struct MySqlArgs {
     /// Whether the target is enabled
     pub enable: bool,
-    /// MySQL data source name in format: `<user>:<password>@tcp(<host>:<port>)/<database>`
+    /// MySQL data source name in MinIO format: `<user>:<password>@tcp(<host>:<port>)/<database>`
     pub dsn_string: String,
     /// Target table name, accepts `identifier` or `database.identifier`
     pub table: String,
@@ -222,7 +238,6 @@ pub(crate) fn redact_mysql_dsn(dsn_string: &str) -> String {
         ""
     };
 
-    // This is a best-effort redaction that looks for the first '@' and then the last ':' before it to identify the password.
     match remainder.split_once('@') {
         Some((credentials, host_part)) => match credentials.split_once(':') {
             Some((user, _)) => format!("{}{}:***@{}", prefix, user.trim(), host_part.trim()),
@@ -281,13 +296,11 @@ pub(crate) fn validate_table_name(table: &str) -> Result<(), TargetError> {
                 parts[1], table
             )));
         }
-    } else {
-        if !is_valid_identifier_segment(table) {
-            return Err(TargetError::Configuration(format!(
-                "MySQL table name '{}' is not a valid identifier",
-                table
-            )));
-        }
+    } else if !is_valid_identifier_segment(table) {
+        return Err(TargetError::Configuration(format!(
+            "MySQL table name '{}' is not a valid identifier",
+            table
+        )));
     }
 
     Ok(())
@@ -302,6 +315,354 @@ pub(crate) fn quote_table_name(table: &str) -> Result<String, TargetError> {
         Ok(format!("`{}`.`{}`", parts[0].trim(), parts[1].trim()))
     } else {
         Ok(format!("`{}`", table))
+    }
+}
+
+/// Extracts `event_time` from a serialized event JSON body.
+///
+/// Reads `Records[0].eventTime` from the JSON payload, parses it as an
+/// RFC 3339 timestamp, and returns it formatted as a MySQL DATETIME(6)
+/// string (`YYYY-MM-DD HH:MM:SS.ffffff`).
+///
+/// Returns an error if the field is missing, not a string, or cannot
+/// be parsed; never falls back to the current time.
+pub(crate) fn extract_event_time(body: &[u8]) -> Result<String, TargetError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| TargetError::Serialization(format!("Failed to parse event_data JSON: {e}")))?;
+
+    let event_time = value
+        .get("Records")
+        .and_then(|r| r.get(0))
+        .and_then(|r| r.get("eventTime"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TargetError::Serialization("event_data is missing Records[0].eventTime".to_string()))?;
+
+    let dt = chrono::DateTime::parse_from_rfc3339(event_time)
+        .map_err(|e| TargetError::Serialization(format!("Failed to parse eventTime '{}': {}", event_time, e)))?;
+
+    Ok(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+}
+
+async fn validate_existing_schema(conn: &mut Conn, table: &str) -> Result<(), TargetError> {
+    let quoted = quote_table_name(table)?;
+    let sql = format!("SHOW COLUMNS FROM {quoted}");
+
+    let columns: Vec<mysql_async::Row> = conn
+        .query(sql)
+        .await
+        .map_err(|e| TargetError::Initialization(format!("Failed to check MySQL table schema: {e}")))?;
+
+    let mut has_event_time = false;
+    let mut has_event_data = false;
+
+    for row in &columns {
+        let field: String = row.get(0).unwrap_or_default();
+        let col_type: String = row.get(1).unwrap_or_default();
+        let nullable: String = row.get(2).unwrap_or_default();
+
+        if field == "event_time" {
+            has_event_time = true;
+            if !col_type.to_lowercase().starts_with("datetime") {
+                return Err(TargetError::Initialization(
+                    "MySQL table column 'event_time' must be DATETIME type".to_string(),
+                ));
+            }
+            if nullable.to_lowercase() != "no" {
+                return Err(TargetError::Initialization(
+                    "MySQL table column 'event_time' must be NOT NULL".to_string(),
+                ));
+            }
+        } else if field == "event_data" {
+            has_event_data = true;
+            if col_type.to_lowercase() != "json" {
+                return Err(TargetError::Initialization(
+                    "MySQL table column 'event_data' must be JSON type".to_string(),
+                ));
+            }
+            if nullable.to_lowercase() != "no" {
+                return Err(TargetError::Initialization(
+                    "MySQL table column 'event_data' must be NOT NULL".to_string(),
+                ));
+            }
+        }
+    }
+
+    if !has_event_time {
+        return Err(TargetError::Initialization(
+            "MySQL table is missing required column 'event_time'".to_string(),
+        ));
+    }
+    if !has_event_data {
+        return Err(TargetError::Initialization(
+            "MySQL table is missing required column 'event_data'".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// A notification target that writes events to a MySQL/TiDB table.
+///
+/// Each event is appended as a new row with `event_time` and `event_data`
+/// columns. The target supports at-least-once delivery semantics.
+pub struct MySqlTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    /// Unique target identifier (name + type)
+    id: TargetID,
+    /// Parsed configuration for this MySQL target
+    args: MySqlArgs,
+    /// Lazily-initialized MySQL connection pool
+    pool: Arc<Mutex<Option<Pool>>>,
+    /// Success/failure counters exposed via `delivery_snapshot`
+    delivery_counters: Arc<TargetDeliveryCounters>,
+    /// Zero-sized marker for the event type `E`
+    _phantom: PhantomData<E>,
+}
+
+impl<E> MySqlTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    /// Creates a new MySqlTarget. The MySQL connection pool is lazily
+    /// initialized on the first `init()` or `save()` call.
+    pub fn new(id: String, args: MySqlArgs) -> Result<Self, TargetError> {
+        // Validate configuration early to fail fast on misconfiguration
+        args.validate()?;
+
+        // Create a unique TargetID
+        let target_id = TargetID::new(id, ChannelTargetType::MySql.as_str().to_string());
+
+        // TODO: Build storage for retry queue if queue_dir is configured
+
+        // TODO: Do we need a cancel channel?
+
+        info!(target_id = %target_id.id, table = %args.table, "MySQL target created");
+
+        Ok(MySqlTarget {
+            id: target_id,
+            args,
+            // Pool is lazily initialized on first use to avoid unnecessary connections at startup and allow for better error handling
+            pool: Arc::new(Mutex::new(None)),
+            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Returns or lazily initializes the MySQL connection pool.
+    async fn get_or_init_pool(&self) -> Result<Pool, TargetError> {
+        let mut guard = self.pool.lock().await;
+        // If the pool is already initialized, return it
+        if let Some(pool) = guard.as_ref() {
+            return Ok(pool.clone());
+        }
+
+        // On first call, this parses the DSN, creates the pool
+        let dsn = parse_mysql_dsn(&self.args.dsn_string)?;
+
+        let mut builder = OptsBuilder::default()
+            .user(Some(dsn.user.clone()))
+            .pass(Some(dsn.password.clone()))
+            .ip_or_hostname(dsn.host.clone())
+            .tcp_port(dsn.port)
+            .db_name(Some(dsn.database.clone()));
+
+        if dsn.tls {
+            rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+            builder = builder.ssl_opts(Some(SslOpts::default()));
+        } else {
+            warn!(
+                "MySQL target '{}' is configured without TLS verification. This is insecure and should not be used in production.",
+                self.id
+            );
+        }
+
+        let opts = Opts::from(builder);
+        let pool = Pool::new(opts);
+
+        // Verifies connectivity with `SELECT 1`, executes `CREATE TABLE IF NOT EXISTS`,
+        // and validates the existing table schema.
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| TargetError::Initialization(format!("Failed to connect to MySQL: {e}")))?;
+
+        conn.query_drop("SELECT 1")
+            .await
+            .map_err(|e| TargetError::Initialization(format!("MySQL health check failed: {e}")))?;
+
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {} (event_time DATETIME(6) NOT NULL, event_data JSON NOT NULL)",
+            quote_table_name(&self.args.table)?
+        );
+        conn.query_drop(ddl)
+            .await
+            .map_err(|e| TargetError::Initialization(format!("Failed to create MySQL table: {e}")))?;
+
+        // If the table already exists or was just created, validate that it has the expected schema before accepting events.
+        validate_existing_schema(&mut conn, &self.args.table).await?;
+
+        *guard = Some(pool.clone());
+        Ok(pool)
+    }
+
+    /// Serializes an event into a `QueuedPayload` using `TargetLog` for
+    /// the JSON body with `EventName`, `Key`, and `Records`.
+    fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
+        let object_name = crate::target::decode_object_name(&event.object_name)?;
+        let key = format!("{}/{}", event.bucket_name, object_name);
+
+        let log = TargetLog {
+            event_name: event.event_name,
+            key,
+            records: vec![event.data.clone()],
+        };
+
+        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
+
+        let meta = QueuedPayloadMeta::new(
+            event.event_name,
+            event.bucket_name.clone(),
+            event.object_name.clone(),
+            "application/json",
+            body.len(),
+        );
+
+        Ok(QueuedPayload::new(meta, body))
+    }
+
+    /// Inserts an event directly into the MySQL table.
+    async fn insert_event(&self, body: &[u8], meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
+        debug!(
+            target_id = %self.id,
+            bucket = %meta.bucket_name,
+            object = %meta.object_name,
+            event = %meta.event_name,
+            payload_len = body.len(),
+            "Inserting MySQL event"
+        );
+
+        let pool = self.get_or_init_pool().await?;
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| TargetError::Network(format!("Failed to get MySQL connection: {e}")))?;
+
+        let event_time = extract_event_time(body)?;
+        let event_data =
+            std::str::from_utf8(body).map_err(|e| TargetError::Serialization(format!("Event body is not valid UTF-8: {e}")))?;
+
+        let sql = format!(
+            "INSERT INTO {} (event_time, event_data) VALUES (?, CAST(? AS JSON))",
+            quote_table_name(&self.args.table)?
+        );
+
+        conn.exec_drop(sql, (event_time.as_str(), event_data)).await.map_err(|e| {
+            error!(target_id = %self.id, error = %e, "Failed to insert MySQL event");
+            TargetError::Request(format!("Failed to insert event: {e}"))
+        })?;
+
+        self.delivery_counters.record_success();
+        debug!(target_id = %self.id, "MySQL event inserted");
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
+        Box::new(MySqlTarget::<E> {
+            id: self.id.clone(),
+            args: self.args.clone(),
+            pool: Arc::clone(&self.pool),
+            delivery_counters: Arc::clone(&self.delivery_counters),
+            _phantom: PhantomData,
+        })
+    }
+}
+
+#[async_trait]
+impl<E> Target<E> for MySqlTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    fn id(&self) -> TargetID {
+        self.id.clone()
+    }
+
+    async fn is_active(&self) -> Result<bool, TargetError> {
+        if !self.args.enable {
+            return Ok(false);
+        }
+
+        // TODO: should we add a timeout here to avoid hanging if the database is unreachable?
+        let pool = self.get_or_init_pool().await?;
+        let mut conn = pool.get_conn().await.map_err(|_| TargetError::NotConnected)?;
+        conn.query_drop("SELECT 1").await.map_err(|_| TargetError::NotConnected)?;
+        debug!("MySQL target '{}' is reachable", self.id);
+        Ok(true)
+    }
+
+    async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
+        let queued = match self.build_queued_payload(&event) {
+            Ok(queued) => queued,
+            Err(err) => {
+                self.delivery_counters.record_final_failure();
+                return Err(err);
+            }
+        };
+
+        // TODO: persist the event to a local queue before attempting to insert into MySQL, and implement replay from the queue in `send_raw_from_store`. This will allow us to guarantee at-least-once delivery even if the database is temporarily unreachable or if the process crashes after acknowledging receipt but before writing to the database.
+
+        if let Err(err) = self.insert_event(&queued.body, &queued.meta).await {
+            error!("Failed to insert event into MySQL target '{}': {}", self.id, err);
+            self.delivery_counters.record_final_failure();
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+        Err(TargetError::Configuration(
+            "MySQL target queue store replay is not yet implemented".to_string(),
+        ))
+    }
+
+    async fn close(&self) -> Result<(), TargetError> {
+        let mut guard = self.pool.lock().await;
+        *guard = None;
+        info!("MySQL target closed: {}", self.id);
+        Ok(())
+    }
+
+    fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = crate::StoreError, Key = Key> + Send + Sync)> {
+        // TODO: return a reference to the local queue store
+        None
+    }
+
+    fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
+        self.clone_box()
+    }
+
+    async fn init(&self) -> Result<(), TargetError> {
+        if !self.args.enable {
+            debug!("MySQL target '{}' is disabled, skipping initialization", self.id);
+            return Ok(());
+        }
+        self.get_or_init_pool().await?;
+        Ok(())
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.args.enable
+    }
+
+    fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
+        // TODO: set the queue_length in the snapshot based on the number of events in the local queue store
+        self.delivery_counters.snapshot(0)
+    }
+
+    fn record_final_failure(&self) {
+        self.delivery_counters.record_final_failure();
     }
 }
 
@@ -423,5 +784,41 @@ mod tests {
     fn quote_table_name_quotes_database_table() {
         let quoted = quote_table_name("my_db.events").expect("valid");
         assert_eq!(quoted, "`my_db`.`events`");
+    }
+
+    #[test]
+    fn extract_event_time_parses_valid_rfc3339() {
+        let body =
+            br#"{"EventName":"s3:ObjectCreated:Put","Key":"bucket/obj.txt","Records":[{"eventTime":"2026-05-03T10:00:00Z"}]}"#;
+        let result = extract_event_time(body).expect("valid event_time");
+        assert!(result.starts_with("2026-05-03 10:00:00"));
+    }
+
+    #[test]
+    fn extract_event_time_missing_field_errors() {
+        let body = br#"{"EventName":"s3:ObjectCreated:Put","Key":"bucket/obj.txt","Records":[]}"#;
+        let err = extract_event_time(body).expect_err("missing eventTime should fail");
+        assert!(err.to_string().contains("missing Records[0].eventTime"));
+    }
+
+    #[test]
+    fn extract_event_time_non_string_errors() {
+        let body = br#"{"EventName":"s3:ObjectCreated:Put","Records":[{"eventTime":123}]}"#;
+        let err = extract_event_time(body).expect_err("non-string eventTime should fail");
+        assert!(err.to_string().contains("missing Records[0].eventTime"));
+    }
+
+    #[test]
+    fn extract_event_time_malformed_rfc3339_errors() {
+        let body = br#"{"Records":[{"eventTime":"not-a-date"}]}"#;
+        let err = extract_event_time(body).expect_err("malformed date should fail");
+        assert!(err.to_string().contains("Failed to parse eventTime"));
+    }
+
+    #[test]
+    fn extract_event_time_missing_records_errors() {
+        let body = br#"{"EventName":"s3:ObjectCreated:Put"}"#;
+        let err = extract_event_time(body).expect_err("missing Records should fail");
+        assert!(err.to_string().contains("missing Records[0].eventTime"));
     }
 }

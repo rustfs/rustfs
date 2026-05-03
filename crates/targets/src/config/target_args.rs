@@ -28,13 +28,13 @@ use rustfs_config::{
     DEFAULT_LIMIT, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_QUEUE_LIMIT, KAFKA_TLS_CA, KAFKA_TLS_CLIENT_CERT,
     KAFKA_TLS_CLIENT_KEY, KAFKA_TLS_ENABLE, KAFKA_TOPIC, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS,
     MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY,
-    MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, NATS_ADDRESS,
-    NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
-    NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD,
-    PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION,
-    PULSAR_TOPIC, PULSAR_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA,
-    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
-    MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT, MYSQL_TABLE,
+    MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_DSN_STRING,
+    MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT, MYSQL_TABLE, NATS_ADDRESS, NATS_CREDENTIALS_FILE,
+    NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY,
+    NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD, PULSAR_QUEUE_DIR,
+    PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC,
+    PULSAR_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT,
+    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
 use rustfs_ecstore::config::KVS;
 use std::path::Path;
@@ -430,13 +430,9 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
     }
 
     if let Some(max_conn_str) = config.lookup(MYSQL_MAX_OPEN_CONNECTIONS) {
-        let _: usize = max_conn_str
-            .trim()
-            .parse()
-            .map_err(|_| TargetError::Configuration(format!(
-                "MySQL max_open_connections value '{}' is not a valid number",
-                max_conn_str
-            )))?;
+        let _: usize = max_conn_str.trim().parse().map_err(|_| {
+            TargetError::Configuration(format!("MySQL max_open_connections value '{}' is not a valid number", max_conn_str))
+        })?;
     }
 
     Ok(())
@@ -505,8 +501,7 @@ mod tests {
 
     #[test]
     fn build_mysql_args_applies_defaults() {
-        let args = build_mysql_args(&mysql_base_config(), "/custom/queue", TargetType::NotifyEvent)
-            .expect("valid mysql args");
+        let args = build_mysql_args(&mysql_base_config(), "/custom/queue", TargetType::NotifyEvent).expect("valid mysql args");
         assert_eq!(args.queue_dir, "/custom/queue");
         assert_eq!(args.queue_limit, 100000);
         assert_eq!(args.max_open_connections, 2);

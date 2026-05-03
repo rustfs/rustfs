@@ -290,6 +290,7 @@ pub enum ChannelTargetType {
     Webhook,
     Kafka,
     Mqtt,
+    MySql,
     Nats,
     Pulsar,
 }
@@ -300,6 +301,7 @@ impl ChannelTargetType {
             ChannelTargetType::Webhook => "webhook",
             ChannelTargetType::Kafka => "kafka",
             ChannelTargetType::Mqtt => "mqtt",
+            ChannelTargetType::MySql => "mysql",
             ChannelTargetType::Nats => "nats",
             ChannelTargetType::Pulsar => "pulsar",
         }
@@ -312,6 +314,7 @@ impl std::fmt::Display for ChannelTargetType {
             ChannelTargetType::Webhook => write!(f, "webhook"),
             ChannelTargetType::Kafka => write!(f, "kafka"),
             ChannelTargetType::Mqtt => write!(f, "mqtt"),
+            ChannelTargetType::MySql => write!(f, "mysql"),
             ChannelTargetType::Nats => write!(f, "nats"),
             ChannelTargetType::Pulsar => write!(f, "pulsar"),
         }

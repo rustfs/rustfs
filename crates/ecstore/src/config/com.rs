@@ -24,7 +24,8 @@ use rustfs_config::audit::{
 };
 use rustfs_config::notify::{
     NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
-    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS,
+    NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
@@ -1833,10 +1834,7 @@ mod tests {
             .get_value(NOTIFY_MYSQL_SUB_SYS, "primary")
             .expect("mysql target should be decoded");
         assert_eq!(mysql.get(ENABLE_KEY), EnableState::On.to_string());
-        assert_eq!(
-            mysql.get(MYSQL_DSN_STRING),
-            "rustfs:password@tcp(127.0.0.1:3306)/rustfs_events"
-        );
+        assert_eq!(mysql.get(MYSQL_DSN_STRING), "rustfs:password@tcp(127.0.0.1:3306)/rustfs_events");
         assert_eq!(mysql.get(MYSQL_TABLE), "rustfs_events");
         assert_eq!(mysql.get(MYSQL_QUEUE_DIR), "/tmp/mysql-queue");
         assert_eq!(mysql.get(MYSQL_MAX_OPEN_CONNECTIONS), "2");
