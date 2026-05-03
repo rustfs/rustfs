@@ -13,20 +13,22 @@
 // limitations under the License.
 
 use crate::{
-    Target, TargetLog,
+    StoreError, Target, TargetLog,
     arn::TargetID,
     error::TargetError,
-    store::{Key, Store},
+    store::{Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType,
+        TargetType, delete_stored_payload,
     },
 };
 use async_trait::async_trait;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, SslOpts, prelude::Queryable};
+use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -39,7 +41,7 @@ use tracing::{debug, error, info, warn};
 pub struct MySqlArgs {
     /// Whether the target is enabled
     pub enable: bool,
-    /// MySQL data source name in MinIO format: `<user>:<password>@tcp(<host>:<port>)/<database>`
+    /// MySQL data source name in format: `<user>:<password>@tcp(<host>:<port>)/<database>`
     pub dsn_string: String,
     /// Target table name, accepts `identifier` or `database.identifier`
     pub table: String,
@@ -413,6 +415,8 @@ where
     id: TargetID,
     /// Parsed configuration for this MySQL target
     args: MySqlArgs,
+    /// Optional persistent queue store for at-least-once delivery
+    store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     /// Lazily-initialized MySQL connection pool
     pool: Arc<Mutex<Option<Pool>>>,
     /// Success/failure counters exposed via `delivery_snapshot`
@@ -425,24 +429,38 @@ impl<E> MySqlTarget<E>
 where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
-    /// Creates a new MySqlTarget. The MySQL connection pool is lazily
-    /// initialized on the first `init()` or `save()` call.
+    /// Creates a new MySqlTarget.
     pub fn new(id: String, args: MySqlArgs) -> Result<Self, TargetError> {
-        // Validate configuration early to fail fast on misconfiguration
         args.validate()?;
 
-        // Create a unique TargetID
         let target_id = TargetID::new(id, ChannelTargetType::MySql.as_str().to_string());
 
-        // TODO: Build storage for retry queue if queue_dir is configured
+        // If `queue_dir` is non-empty, a `QueueStore` is created for persistent at-least-once delivery.
+        let queue_store = if !args.queue_dir.is_empty() {
+            let queue_dir =
+                PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::MySql.as_str(), target_id.id));
 
-        // TODO: Do we need a cancel channel?
+            let extension = match args.target_type {
+                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
+                TargetType::NotifyEvent => NOTIFY_STORE_EXTENSION,
+            };
+
+            let store = QueueStore::<QueuedPayload>::new(queue_dir, args.queue_limit, extension);
+            if let Err(e) = store.open() {
+                return Err(TargetError::Storage(format!("Failed to open MySQL queue store: {e}")));
+            }
+
+            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
+        } else {
+            None
+        };
 
         info!(target_id = %target_id.id, table = %args.table, "MySQL target created");
 
         Ok(MySqlTarget {
             id: target_id,
             args,
+            store: queue_store,
             // Pool is lazily initialized on first use to avoid unnecessary connections at startup and allow for better error handling
             pool: Arc::new(Mutex::new(None)),
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
@@ -572,6 +590,7 @@ where
         Box::new(MySqlTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
+            store: self.store.as_ref().map(|s| s.boxed_clone()),
             pool: Arc::clone(&self.pool),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
@@ -610,21 +629,77 @@ where
             }
         };
 
-        // TODO: persist the event to a local queue before attempting to insert into MySQL, and implement replay from the queue in `send_raw_from_store`. This will allow us to guarantee at-least-once delivery even if the database is temporarily unreachable or if the process crashes after acknowledging receipt but before writing to the database.
+        if let Some(store) = &self.store {
+            // persist the event to a local queue before attempting to insert into MySQL. This will allow us to guarantee at-least-once delivery even if the database is temporarily unreachable or if the process crashes after acknowledging receipt but before writing to the database.
+            let encoded = match queued.encode() {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    self.delivery_counters.record_final_failure();
+                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
+                }
+            };
 
-        if let Err(err) = self.insert_event(&queued.body, &queued.meta).await {
-            error!("Failed to insert event into MySQL target '{}': {}", self.id, err);
-            self.delivery_counters.record_final_failure();
-            return Err(err);
+            if let Err(e) = store.put_raw(&encoded) {
+                self.delivery_counters.record_final_failure();
+                return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+            }
+
+            debug!("Event saved to queue store for MySQL target: {}", self.id);
+            Ok(())
+        } else {
+            if let Err(err) = self.insert_event(&queued.body, &queued.meta).await {
+                self.delivery_counters.record_final_failure();
+                return Err(err);
+            }
+
+            Ok(())
         }
-
-        Ok(())
     }
 
-    async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-        Err(TargetError::Configuration(
-            "MySQL target queue store replay is not yet implemented".to_string(),
-        ))
+    async fn send_raw_from_store(&self, key: Key, body: Vec<u8>, meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+        debug!(target_id = %self.id, key = %key, payload_len = body.len(), "Sending queued payload from store to MySQL target");
+
+        match extract_event_time(&body) {
+            Ok(_) => {}
+            Err(_) => {
+                // If the payload is missing the required eventTime field or it cannot be parsed, we consider it corrupted and drop it to avoid blocking the queue with undeliverable entries.
+                // - log a warning with the target ID and key, but do not include the body in the log to avoid exposing potentially sensitive information
+                // - attempt to delete the corrupted entry from the store if possible
+                // - record a final failure in the delivery counters.
+                error!(
+                    target_id = %self.id,
+                    key = %key,
+                    "Corrupted queued MySQL payload: missing or invalid Records[0].eventTime; dropping entry"
+                );
+
+                if let Some(store) = &self.store {
+                    if let Err(e) = delete_stored_payload(store.as_ref(), &key) {
+                        error!(target_id = %self.id, key=%key, error = %e, "Failed to delete corrupted queue entry");
+                    }
+                }
+
+                self.delivery_counters.record_final_failure();
+                return Err(TargetError::Dropped(format!(
+                    "Dropped corrupted queued MySQL payload {key}: missing or invalid Records[0].eventTime"
+                )));
+            }
+        }
+
+        if let Err(e) = self.insert_event(&body, &meta).await {
+            if matches!(e, TargetError::NotConnected) {
+                warn!(target_id = %self.id, "MySQL not reachable, event remains in queue store");
+                return Err(TargetError::NotConnected);
+            }
+            if matches!(e, TargetError::Timeout(_)) {
+                warn!(target_id = %self.id, "MySQL timeout, event remains in queue store");
+                return Err(e);
+            }
+            error!(target_id = %self.id, error = %e, "Failed to send event from store");
+            return Err(e);
+        }
+
+        debug!(target_id = %self.id, key = %key, "MySQL event replayed from store");
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), TargetError> {
@@ -635,8 +710,7 @@ where
     }
 
     fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = crate::StoreError, Key = Key> + Send + Sync)> {
-        // TODO: return a reference to the local queue store
-        None
+        self.store.as_deref()
     }
 
     fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
@@ -657,8 +731,8 @@ where
     }
 
     fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
-        // TODO: set the queue_length in the snapshot based on the number of events in the local queue store
-        self.delivery_counters.snapshot(0)
+        self.delivery_counters
+            .snapshot(self.store.as_deref().map_or(0, |store| store.len() as u64))
     }
 
     fn record_final_failure(&self) {
