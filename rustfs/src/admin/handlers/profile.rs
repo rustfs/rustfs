@@ -24,7 +24,7 @@ use tracing::info;
 
 pub(super) async fn authorize_profile_request(req: &S3Request<Body>) -> S3Result<()> {
     let Some(input_cred) = req.credentials.as_ref() else {
-        return Err(s3_error!(InvalidRequest, "get cred failed"));
+        return Err(s3_error!(AccessDenied, "Signature is required"));
     };
 
     let (cred, owner) =

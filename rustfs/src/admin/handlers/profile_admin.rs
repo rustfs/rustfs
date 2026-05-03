@@ -251,7 +251,8 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Signature is required"));
     }
 
     #[tokio::test]
@@ -264,6 +265,7 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Signature is required"));
     }
 }
