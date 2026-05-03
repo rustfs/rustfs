@@ -39,6 +39,7 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "queue_store_benchmark"

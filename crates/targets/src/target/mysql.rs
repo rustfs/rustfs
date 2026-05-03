@@ -406,7 +406,31 @@ async fn validate_existing_schema(conn: &mut Conn, table: &str) -> Result<(), Ta
 /// A notification target that writes events to a MySQL/TiDB table.
 ///
 /// Each event is appended as a new row with `event_time` and `event_data`
-/// columns. The target supports at-least-once delivery semantics.
+/// columns. The target supports at-least-once delivery semantics via a
+/// local `QueueStore` that replays events after transient MySQL outages.
+///
+/// # Configuration example using `rc`
+///
+/// ```bash
+/// rc admin config set ALIAS notify_mysql:primary \
+///   enable=on \
+///   dsn_string="rustfs:password@tcp(mysql.example.com:3306)/rustfs_events?tls=true" \
+///   table="rustfs_events" \
+///   queue_dir="/var/lib/rustfs/events" \
+///   queue_limit="100000" \
+///   max_open_connections="2"
+/// ```
+///
+/// # Environment variables
+///
+/// ```bash
+/// RUSTFS_NOTIFY_MYSQL_ENABLE=on
+/// RUSTFS_NOTIFY_MYSQL_DSN_STRING=rustfs:password@tcp(127.0.0.1:3306)/rustfs_events
+/// RUSTFS_NOTIFY_MYSQL_TABLE=rustfs_events
+/// RUSTFS_NOTIFY_MYSQL_QUEUE_DIR=/opt/rustfs/events
+/// RUSTFS_NOTIFY_MYSQL_QUEUE_LIMIT=100000
+/// RUSTFS_NOTIFY_MYSQL_MAX_OPEN_CONNECTIONS=2
+/// ```
 pub struct MySqlTarget<E>
 where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
@@ -894,5 +918,151 @@ mod tests {
         let body = br#"{"EventName":"s3:ObjectCreated:Put"}"#;
         let err = extract_event_time(body).expect_err("missing Records should fail");
         assert!(err.to_string().contains("missing Records[0].eventTime"));
+    }
+
+    #[test]
+    fn queued_payload_round_trip_preserves_event_data() {
+        let target: MySqlTarget<serde_json::Value> = MySqlTarget::new(
+            "test".to_string(),
+            MySqlArgs {
+                enable: false,
+                dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
+                table: "events".to_string(),
+                queue_dir: String::new(),
+                queue_limit: 0,
+                max_open_connections: 2,
+                target_type: TargetType::NotifyEvent,
+            },
+        )
+        .expect("valid args");
+
+        let entity = EntityTarget {
+            object_name: "bucket%2Fobj.txt".to_string(),
+            bucket_name: "testbucket".to_string(),
+            event_name: rustfs_s3_common::EventName::ObjectCreatedPut,
+            data: serde_json::json!({"eventTime": "2026-05-03T10:00:00Z"}),
+        };
+
+        let payload = target.build_queued_payload(&entity).expect("build payload");
+        let encoded = payload.encode().expect("encode");
+        let decoded = QueuedPayload::decode(&encoded).expect("decode");
+
+        assert_eq!(decoded.meta.event_name, payload.meta.event_name);
+        assert_eq!(decoded.meta.bucket_name, "testbucket");
+        assert_eq!(decoded.meta.object_name, "bucket%2Fobj.txt");
+        assert_eq!(decoded.meta.content_type, "application/json");
+
+        let body_str = std::str::from_utf8(&decoded.body).expect("utf8 body");
+        assert!(body_str.contains("\"EventName\""));
+        assert!(body_str.contains("\"Key\""));
+        assert!(body_str.contains("testbucket"));
+        assert!(body_str.contains("\"Records\""));
+        assert!(body_str.contains("\"eventTime\""));
+    }
+
+    #[test]
+    fn send_raw_from_store_drops_corrupted_payload() {
+        let tmpdir = tempfile::TempDir::new().expect("temp dir");
+        let queue_dir = tmpdir.path().to_str().expect("valid path").to_string();
+
+        let target: MySqlTarget<serde_json::Value> = MySqlTarget::new(
+            "test-corrupted".to_string(),
+            MySqlArgs {
+                enable: false,
+                dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
+                table: "events".to_string(),
+                queue_dir,
+                queue_limit: 10,
+                max_open_connections: 2,
+                target_type: TargetType::NotifyEvent,
+            },
+        )
+        .expect("valid args");
+
+        let body = br#"{"Records":[]}"#.to_vec();
+        let meta = QueuedPayloadMeta::new(
+            rustfs_s3_common::EventName::ObjectCreatedPut,
+            "testbucket".to_string(),
+            "obj.txt".to_string(),
+            "application/json",
+            body.len(),
+        );
+
+        let encoded = QueuedPayload::new(meta.clone(), body.clone())
+            .encode()
+            .expect("encode queued payload");
+
+        let stored_key = target.store().unwrap().put_raw(&encoded).expect("put raw");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let result = rt.block_on(target.send_raw_from_store(stored_key.clone(), body, meta));
+
+        match result {
+            Err(TargetError::Dropped(msg)) => {
+                assert!(msg.contains("Dropped"));
+                assert!(msg.contains("eventTime"));
+            }
+            other => panic!("expected TargetError::Dropped, got {:?}", other),
+        }
+
+        assert!(
+            target.store().unwrap().get_raw(&stored_key).is_err(),
+            "corrupted entry should have been deleted from store"
+        );
+
+        assert_eq!(target.delivery_snapshot().failed_messages, 1);
+    }
+
+    #[test]
+    fn send_raw_from_store_replays_valid_payload() {
+        let tmpdir = tempfile::TempDir::new().expect("temp dir");
+        let queue_dir = tmpdir.path().to_str().expect("valid path").to_string();
+
+        let target: MySqlTarget<serde_json::Value> = MySqlTarget::new(
+            "test-valid-replay".to_string(),
+            MySqlArgs {
+                enable: false,
+                dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
+                table: "events".to_string(),
+                queue_dir,
+                queue_limit: 10,
+                max_open_connections: 2,
+                target_type: TargetType::NotifyEvent,
+            },
+        )
+        .expect("valid args");
+
+        let body = br#"{"EventName":"s3:ObjectCreated:Put","Key":"bucket/obj.txt","Records":[{"eventTime":"2026-05-03T10:00:00Z"}]}"#.to_vec();
+        let meta = QueuedPayloadMeta::new(
+            rustfs_s3_common::EventName::ObjectCreatedPut,
+            "testbucket".to_string(),
+            "obj.txt".to_string(),
+            "application/json",
+            body.len(),
+        );
+
+        let encoded = QueuedPayload::new(meta.clone(), body.clone())
+            .encode()
+            .expect("encode queued payload");
+
+        let stored_key = target.store().unwrap().put_raw(&encoded).expect("put raw");
+
+        // With enable=false and no real MySQL, the insert will fail at
+        // pool init. But send_raw_from_store validates event_time before
+        // insert, so valid payloads pass the time check. We verify the
+        // payload is NOT treated as corrupted.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let result = rt.block_on(target.send_raw_from_store(stored_key.clone(), body, meta));
+
+        assert!(
+            !matches!(result, Err(TargetError::Dropped(_))),
+            "valid payload should not return Dropped"
+        );
+
+        // Verify entry is NOT deleted on non-Dropped errors
+        assert!(
+            target.store().unwrap().get_raw(&stored_key).is_ok(),
+            "valid entry should remain in store"
+        );
     }
 }
