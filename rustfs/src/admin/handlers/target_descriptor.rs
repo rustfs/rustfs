@@ -21,8 +21,8 @@ use rustfs_config::{
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     TargetError, check_kafka_broker_available, check_mqtt_broker_available_with_tls, check_nats_server_available,
-    check_pulsar_broker_available,
-    config::{build_kafka_args, build_nats_args, build_pulsar_args, collect_env_target_instance_ids},
+    check_postgres_server_available, check_pulsar_broker_available,
+    config::{build_kafka_args, build_nats_args, build_postgres_args, build_pulsar_args, collect_env_target_instance_ids},
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
 use s3s::{S3Result, s3_error};
@@ -72,6 +72,7 @@ pub(crate) enum AdminTargetValidator {
     Mqtt,
     Kafka(TargetDomain),
     Nats(TargetDomain),
+    Postgres(TargetDomain),
     Pulsar(TargetDomain),
 }
 
@@ -338,6 +339,7 @@ pub(crate) async fn validate_target_request(
         AdminTargetValidator::Kafka(domain) => validate_kafka_request(kv_map, default_queue_dir, domain).await,
         AdminTargetValidator::Nats(domain) => validate_nats_request(kv_map, default_queue_dir, domain).await,
         AdminTargetValidator::Pulsar(domain) => validate_pulsar_request(kv_map, default_queue_dir, domain).await,
+        AdminTargetValidator::Postgres(domain) => validate_postgres_request(kv_map, default_queue_dir, domain).await,
     }
 }
 
@@ -484,6 +486,22 @@ async fn validate_pulsar_request(
     check_pulsar_broker_available(&args).await.map_err(|e| match e {
         TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
         _ => s3_error!(InvalidArgument, "Pulsar broker check failed: {}", e),
+    })
+}
+
+async fn validate_postgres_request(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get("queue_dir") {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+    let args = build_postgres_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
+        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    check_postgres_server_available(&args).await.map_err(|e| match e {
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+        _ => s3_error!(InvalidArgument, "PostgreSQL server check failed: {}", e),
     })
 }
 
