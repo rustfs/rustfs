@@ -17,9 +17,8 @@
 pub const ENV_CORS_ALLOWED_ORIGINS: &str = "RUSTFS_CORS_ALLOWED_ORIGINS";
 
 /// Default CORS allowed origins for the endpoint service
-/// Comes from the console service default
-/// See DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS
-pub const DEFAULT_CORS_ALLOWED_ORIGINS: &str = DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS;
+/// Empty means the S3 endpoint emits no generic CORS headers unless configured.
+pub const DEFAULT_CORS_ALLOWED_ORIGINS: &str = "";
 
 /// CORS allowed origins for the console service
 /// Comma-separated list of origins or "*" for all origins
@@ -89,3 +88,20 @@ pub const ENV_UPDATE_CHECK: &str = "RUSTFS_CHECK_UPDATE";
 
 /// Default value for update toggle
 pub const DEFAULT_UPDATE_CHECK: bool = true;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_cors_default_is_restrictive() {
+        assert_eq!(ENV_CORS_ALLOWED_ORIGINS, "RUSTFS_CORS_ALLOWED_ORIGINS");
+        assert_eq!(DEFAULT_CORS_ALLOWED_ORIGINS, "");
+    }
+
+    #[test]
+    fn console_cors_default_remains_wildcard() {
+        assert_eq!(ENV_CONSOLE_CORS_ALLOWED_ORIGINS, "RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS");
+        assert_eq!(DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS, "*");
+    }
+}
