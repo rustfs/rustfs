@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::profile::authorize_profile_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::ADMIN_PREFIX;
 use http::{HeaderMap, HeaderValue, Uri};
@@ -56,6 +57,8 @@ pub struct ProfileHandler {}
 #[async_trait::async_trait]
 impl Operation for ProfileHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_profile_request(&req).await?;
+
         #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         {
             let requested_url = req.uri.to_string();
@@ -151,7 +154,9 @@ pub struct ProfileStatusHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ProfileStatusHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_profile_request(&req).await?;
+
         #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         let message = format!("CPU profiling is not supported on {} platform", std::env::consts::OS);
         #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
@@ -204,8 +209,26 @@ impl Operation for ProfileStatusHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_query_params;
-    use http::Uri;
+    use super::{ProfileHandler, ProfileStatusHandler, extract_query_params};
+    use crate::admin::router::Operation;
+    use http::{Extensions, HeaderMap, Uri};
+    use hyper::Method;
+    use matchit::Params;
+    use s3s::{Body, S3ErrorCode, S3Request};
+
+    fn build_profile_request(uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
 
     #[test]
     fn test_extract_query_params_decodes_percent_encoded_values() {
@@ -216,5 +239,33 @@ mod tests {
 
         assert_eq!(params.get("format"), Some(&"flamegraph".to_string()));
         assert_eq!(params.get("note"), Some(&"a+b value".to_string()));
+    }
+
+    #[tokio::test]
+    async fn profile_handler_rejects_missing_credentials() {
+        let result = ProfileHandler {}
+            .call(build_profile_request("/rustfs/admin/debug/pprof/profile?format=protobuf"), Params::new())
+            .await;
+        let err = match result {
+            Ok(_) => panic!("profile handler must reject unauthenticated requests"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Signature is required"));
+    }
+
+    #[tokio::test]
+    async fn profile_status_handler_rejects_missing_credentials() {
+        let result = ProfileStatusHandler {}
+            .call(build_profile_request("/rustfs/admin/debug/pprof/status"), Params::new())
+            .await;
+        let err = match result {
+            Ok(_) => panic!("profile status handler must reject unauthenticated requests"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Signature is required"));
     }
 }

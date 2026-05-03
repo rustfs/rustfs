@@ -235,6 +235,9 @@ pub const ENV_RUSTFS_REGION: &str = "RUSTFS_REGION";
 /// Environment variable for server license.
 pub const ENV_RUSTFS_LICENSE: &str = "RUSTFS_LICENSE";
 
+/// Environment variable for the RSA public key used to verify server licenses.
+pub const ENV_RUSTFS_LICENSE_PUBLIC_KEY: &str = "RUSTFS_LICENSE_PUBLIC_KEY";
+
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.
 /// It is used to store the logs of the application.
@@ -348,6 +351,7 @@ mod tests {
     fn test_environment_constants() {
         // Test environment related constants
         assert_eq!(ENVIRONMENT, "production");
+        assert_eq!(ENV_RUSTFS_LICENSE_PUBLIC_KEY, "RUSTFS_LICENSE_PUBLIC_KEY");
         assert!(
             ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
             "Environment should be a standard environment name"

@@ -3129,6 +3129,18 @@ mod tests {
     }
 
     #[test]
+    fn test_request_endpoint_uses_absolute_uri_without_host_header() {
+        let uri: Uri = "https://node-a.example.com:9443/rustfs/admin/v3/site-replication/status"
+            .parse()
+            .unwrap();
+        let headers = HeaderMap::new();
+
+        let endpoint = request_endpoint(&uri, &headers);
+
+        assert_eq!(endpoint, "https://node-a.example.com:9443");
+    }
+
+    #[test]
     fn test_request_endpoint_falls_back_to_https_when_tls_path_is_configured() {
         with_var(ENV_RUSTFS_TLS_PATH, Some("/tmp/tls"), || {
             let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();

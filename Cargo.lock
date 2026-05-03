@@ -7804,6 +7804,7 @@ dependencies = [
  "pkcs1 0.8.0-rc.4",
  "pkcs8 0.11.0",
  "rand_core 0.10.1",
+ "sha2 0.11.0",
  "signature 3.0.0-rc.10",
  "spki 0.8.0",
  "zeroize",
@@ -8250,6 +8251,7 @@ dependencies = [
 name = "rustfs-filemeta"
 version = "1.0.0-beta.1"
 dependencies = [
+ "arc-swap",
  "byteorder",
  "bytes",
  "crc-fast",
