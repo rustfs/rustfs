@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::admin::handlers::health::{HealthProbe, build_health_payload, collect_dependency_readiness, health_check_state};
-use crate::license::get_license;
+use crate::license::has_valid_license;
 use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, RUSTFS_ADMIN_PREFIX, VERSION};
 use crate::version::build;
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::Request,
     middleware,
@@ -241,20 +241,17 @@ pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
     });
 }
 
-/// License handler
-/// Returns the current license information of the console.
-///
-/// # Returns:
-/// - 200 OK with JSON body containing license details.
+#[derive(Serialize)]
+struct LicensePublicStatus {
+    licensed: bool,
+}
+
+/// Returns coarse public license status without exposing license metadata.
 #[instrument]
 async fn license_handler() -> impl IntoResponse {
-    let license = get_license().unwrap_or_default();
-
-    Response::builder()
-        .header("content-type", "application/json")
-        .status(StatusCode::OK)
-        .body(Body::from(serde_json::to_string(&license).unwrap_or_default()))
-        .unwrap()
+    Json(LicensePublicStatus {
+        licensed: has_valid_license(),
+    })
 }
 
 /// Check if the given IP address is a private IP
@@ -678,6 +675,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http::{Request, StatusCode};
+    use http_body_util::BodyExt;
     use std::net::{IpAddr, Ipv4Addr};
     use temp_env::async_with_vars;
     use tower::ServiceExt;
@@ -756,5 +754,29 @@ mod tests {
             assert_eq!(readiness_response.status(), StatusCode::NOT_FOUND);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn console_license_route_returns_public_status_only() {
+        let app = setup_console_middleware_stack(parse_cors_origins(None), false, 0, 30);
+        let request = Request::builder()
+            .uri(format!("{CONSOLE_PREFIX}{LICENSE}"))
+            .body(Body::empty())
+            .expect("failed to build license request");
+
+        let response = app.oneshot(request).await.expect("license request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("license body should collect")
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("license response should be valid JSON");
+
+        assert_eq!(value, serde_json::json!({ "licensed": false }));
+        assert!(value.get("name").is_none());
+        assert!(value.get("expired").is_none());
     }
 }
