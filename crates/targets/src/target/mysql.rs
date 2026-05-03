@@ -492,13 +492,13 @@ where
 
     /// Returns or lazily initializes the MySQL connection pool.
     async fn get_or_init_pool(&self) -> Result<Pool, TargetError> {
-        let mut guard = self.pool.lock().await;
-        // If the pool is already initialized, return it
-        if let Some(pool) = guard.as_ref() {
-            return Ok(pool.clone());
+        {
+            let guard = self.pool.lock().await;
+            if let Some(pool) = guard.as_ref() {
+                return Ok(pool.clone());
+            }
         }
 
-        // On first call, this parses the DSN, creates the pool
         let dsn = parse_mysql_dsn(&self.args.dsn_string)?;
 
         let mut builder = OptsBuilder::default()
@@ -513,7 +513,7 @@ where
             builder = builder.ssl_opts(Some(SslOpts::default()));
         } else {
             warn!(
-                "MySQL target '{}' is configured without TLS verification. This is insecure and should not be used in production.",
+                "MySQL target '{}' is configured without TLS. This is insecure and should not be used in production.",
                 self.id
             );
         }
@@ -521,21 +521,21 @@ where
         // When max_open_connections is 0, no explicit upper bound is set —
         // mysql_async uses its default pool constraints (10–100).
         if self.args.max_open_connections > 0 {
-            let constraints = PoolConstraints::new(1, self.args.max_open_connections)
-                .ok_or_else(|| {
-                    TargetError::Configuration(format!(
-                        "MySQL max_open_connections must be >= 1, got {}",
-                        self.args.max_open_connections
-                    ))
-                })?;
+            let constraints = PoolConstraints::new(1, self.args.max_open_connections).ok_or_else(|| {
+                TargetError::Configuration(format!(
+                    "MySQL max_open_connections must be >= 1, got {}",
+                    self.args.max_open_connections
+                ))
+            })?;
             builder = builder.pool_opts(PoolOpts::default().with_constraints(constraints));
         }
 
+        // Uses a double-check pattern: the mutex guard is only held for
+        // short reads/writes to the pool cache. All I/O (connecting,
+        // DDL, schema validation) happens outside the lock so that
+        // concurrent callers are not blocked by a slow MySQL server.
         let opts = Opts::from(builder);
         let pool = Pool::new(opts);
-
-        // Verifies connectivity with `SELECT 1`, executes `CREATE TABLE IF NOT EXISTS`,
-        // and validates the existing table schema.
         let mut conn = pool
             .get_conn()
             .await
@@ -553,9 +553,18 @@ where
             .await
             .map_err(|e| TargetError::Initialization(format!("Failed to create MySQL table: {e}")))?;
 
-        // If the table already exists or was just created, validate that it has the expected schema before accepting events.
         validate_existing_schema(&mut conn, &self.args.table).await?;
 
+        // Double-check: another caller may have initialized the pool
+        // while we were doing I/O.
+        let mut guard = self.pool.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            debug!(
+                "MySQL pool for target '{}' was initialized by another task during setup; using existing pool",
+                self.id
+            );
+            return Ok(existing.clone());
+        }
         *guard = Some(pool.clone());
         Ok(pool)
     }
@@ -1043,7 +1052,9 @@ mod tests {
         )
         .expect("valid args");
 
-        let body = br#"{"EventName":"s3:ObjectCreated:Put","Key":"bucket/obj.txt","Records":[{"eventTime":"2026-05-03T10:00:00Z"}]}"#.to_vec();
+        let body =
+            br#"{"EventName":"s3:ObjectCreated:Put","Key":"bucket/obj.txt","Records":[{"eventTime":"2026-05-03T10:00:00Z"}]}"#
+                .to_vec();
         let meta = QueuedPayloadMeta::new(
             rustfs_s3_common::EventName::ObjectCreatedPut,
             "testbucket".to_string(),
@@ -1065,15 +1076,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let result = rt.block_on(target.send_raw_from_store(stored_key.clone(), body, meta));
 
-        assert!(
-            !matches!(result, Err(TargetError::Dropped(_))),
-            "valid payload should not return Dropped"
-        );
+        assert!(!matches!(result, Err(TargetError::Dropped(_))), "valid payload should not return Dropped");
 
         // Verify entry is NOT deleted on non-Dropped errors
-        assert!(
-            target.store().unwrap().get_raw(&stored_key).is_ok(),
-            "valid entry should remain in store"
-        );
+        assert!(target.store().unwrap().get_raw(&stored_key).is_ok(), "valid entry should remain in store");
     }
 }
