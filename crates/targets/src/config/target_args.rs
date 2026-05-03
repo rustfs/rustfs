@@ -406,7 +406,7 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
         return Err(TargetError::Configuration("MySQL dsn_string cannot be empty".to_string()));
     }
 
-    let _ = crate::target::mysql::parse_mysql_dsn(&dsn_string)?;
+    let _ = crate::target::mysql::MySqlDsn::parse(&dsn_string)?;
 
     let table = config
         .lookup(MYSQL_TABLE)

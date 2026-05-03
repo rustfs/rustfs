@@ -67,7 +67,7 @@ impl MySqlArgs {
             return Err(TargetError::Configuration("MySQL dsn_string cannot be empty".to_string()));
         }
 
-        let _ = parse_mysql_dsn(&self.dsn_string)?;
+        let _ = MySqlDsn::parse(&self.dsn_string)?;
 
         validate_table_name(&self.table)?;
 
@@ -84,7 +84,7 @@ impl MySqlArgs {
 
 /// Parsed representation of a MySQL DSN string.
 ///
-/// Produced by [`parse_mysql_dsn`] and consumed by the MySQL
+/// Produced by [`MySqlDsn::parse`] and consumed by the MySQL
 /// target runtime to build connection options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlDsn {
@@ -102,122 +102,124 @@ pub struct MySqlDsn {
     pub tls: bool,
 }
 
-/// Parses a MySQL DSN string into its components.
-///
-/// Supported formats:
-/// ```text
-/// <user>:<password>@tcp(<host>:<port>)/<database>
-/// mysql://<user>:<password>@tcp(<host>:<port>)/<database>
-/// ```
-///
-/// Only `?tls=true`, `?tls=false`, and bare `?tls` are accepted;
-/// other TLS query parameters (`verify_ca`, etc.) are rejected.
-pub fn parse_mysql_dsn(dsn_string: &str) -> Result<MySqlDsn, TargetError> {
-    let input = dsn_string.trim();
-    if input.is_empty() {
-        return Err(TargetError::Configuration("MySQL dsn_string cannot be empty".to_string()));
-    }
+impl MySqlDsn {
+    /// Parses a MySQL DSN string into its components.
+    ///
+    /// Supported formats:
+    /// ```text
+    /// <user>:<password>@tcp(<host>:<port>)/<database>
+    /// mysql://<user>:<password>@tcp(<host>:<port>)/<database>
+    /// ```
+    ///
+    /// Only `?tls=true`, `?tls=false`, and bare `?tls` are accepted;
+    /// other TLS query parameters (`verify_ca`, etc.) are rejected.
+    pub fn parse(dsn_string: &str) -> Result<MySqlDsn, TargetError> {
+        let input = dsn_string.trim();
+        if input.is_empty() {
+            return Err(TargetError::Configuration("MySQL dsn_string cannot be empty".to_string()));
+        }
 
-    let remainder = input
-        .strip_prefix("mysql://")
-        .or_else(|| input.strip_prefix("MYSQL://"))
-        .unwrap_or(input);
+        let remainder = input
+            .strip_prefix("mysql://")
+            .or_else(|| input.strip_prefix("MYSQL://"))
+            .unwrap_or(input);
 
-    let (body, query) = match remainder.split_once('?') {
-        Some((b, q)) => (b, Some(q)),
-        None => (remainder, None),
-    };
+        let (body, query) = match remainder.split_once('?') {
+            Some((b, q)) => (b, Some(q)),
+            None => (remainder, None),
+        };
 
-    let mut tls = false;
-    if let Some(query) = query {
-        for param in query.split('&') {
-            let param = param.trim();
-            if param.is_empty() {
-                continue;
-            }
-            let (key, value) = param.split_once('=').unwrap_or((param, ""));
-            match key.trim().to_ascii_lowercase().as_str() {
-                "tls" => {
-                    let val = value.trim().to_ascii_lowercase();
-                    if val == "true" || val == "tls" || val.is_empty() {
-                        tls = true;
-                    } else if val == "false" {
-                        tls = false;
-                    } else {
-                        return Err(TargetError::Configuration(format!(
-                            "unsupported value '{}' for TLS query parameter; use tls=true",
-                            val
-                        )));
-                    }
+        let mut tls = false;
+        if let Some(query) = query {
+            for param in query.split('&') {
+                let param = param.trim();
+                if param.is_empty() {
+                    continue;
                 }
-                _ => {
-                    return Err(TargetError::Configuration(format!("unsupported MySQL DSN query parameter '{}'", key)));
+                let (key, value) = param.split_once('=').unwrap_or((param, ""));
+                match key.trim().to_ascii_lowercase().as_str() {
+                    "tls" => {
+                        let val = value.trim().to_ascii_lowercase();
+                        if val == "true" || val == "tls" || val.is_empty() {
+                            tls = true;
+                        } else if val == "false" {
+                            tls = false;
+                        } else {
+                            return Err(TargetError::Configuration(format!(
+                                "unsupported value '{}' for TLS query parameter; use tls=true",
+                                val
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(TargetError::Configuration(format!("unsupported MySQL DSN query parameter '{}'", key)));
+                    }
                 }
             }
         }
+
+        let Some((credentials, host_part)) = body.split_once('@') else {
+            return Err(TargetError::Configuration(
+                "MySQL dsn_string must contain user:password@tcp(host:port)/database".to_string(),
+            ));
+        };
+
+        let Some((user, password)) = credentials.split_once(':') else {
+            return Err(TargetError::Configuration("MySQL dsn_string must contain user:password".to_string()));
+        };
+
+        let user = user.trim();
+        let password = password.trim();
+
+        if user.is_empty() {
+            return Err(TargetError::Configuration("MySQL dsn_string user is empty".to_string()));
+        }
+
+        let host_part = host_part.trim();
+
+        let Some(host_part_rest) = host_part.strip_prefix("tcp(") else {
+            return Err(TargetError::Configuration("MySQL dsn_string must use tcp(host:port) format".to_string()));
+        };
+
+        let Some((host_port, rest)) = host_part_rest.split_once(')') else {
+            return Err(TargetError::Configuration(
+                "MySQL dsn_string missing closing ')' after host:port".to_string(),
+            ));
+        };
+
+        let (host, port_str) = host_port
+            .split_once(':')
+            .ok_or_else(|| TargetError::Configuration("MySQL dsn_string host:port is required".to_string()))?;
+
+        let host = host.trim();
+        let port_str = port_str.trim();
+
+        if host.is_empty() {
+            return Err(TargetError::Configuration("MySQL dsn_string host is empty".to_string()));
+        }
+
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| TargetError::Configuration(format!("MySQL dsn_string port '{}' is not a valid u16", port_str)))?;
+
+        let database = rest
+            .strip_prefix('/')
+            .ok_or_else(|| TargetError::Configuration("MySQL dsn_string must include /database after host:port".to_string()))?
+            .trim();
+
+        if database.is_empty() {
+            return Err(TargetError::Configuration("MySQL dsn_string database is empty".to_string()));
+        }
+
+        Ok(MySqlDsn {
+            user: user.to_string(),
+            password: password.to_string(),
+            host: host.to_string(),
+            port,
+            database: database.to_string(),
+            tls,
+        })
     }
-
-    let Some((credentials, host_part)) = body.split_once('@') else {
-        return Err(TargetError::Configuration(
-            "MySQL dsn_string must contain user:password@tcp(host:port)/database".to_string(),
-        ));
-    };
-
-    let Some((user, password)) = credentials.split_once(':') else {
-        return Err(TargetError::Configuration("MySQL dsn_string must contain user:password".to_string()));
-    };
-
-    let user = user.trim();
-    let password = password.trim();
-
-    if user.is_empty() {
-        return Err(TargetError::Configuration("MySQL dsn_string user is empty".to_string()));
-    }
-
-    let host_part = host_part.trim();
-
-    let Some(host_part_rest) = host_part.strip_prefix("tcp(") else {
-        return Err(TargetError::Configuration("MySQL dsn_string must use tcp(host:port) format".to_string()));
-    };
-
-    let Some((host_port, rest)) = host_part_rest.split_once(')') else {
-        return Err(TargetError::Configuration(
-            "MySQL dsn_string missing closing ')' after host:port".to_string(),
-        ));
-    };
-
-    let (host, port_str) = host_port
-        .split_once(':')
-        .ok_or_else(|| TargetError::Configuration("MySQL dsn_string host:port is required".to_string()))?;
-
-    let host = host.trim();
-    let port_str = port_str.trim();
-
-    if host.is_empty() {
-        return Err(TargetError::Configuration("MySQL dsn_string host is empty".to_string()));
-    }
-
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| TargetError::Configuration(format!("MySQL dsn_string port '{}' is not a valid u16", port_str)))?;
-
-    let database = rest
-        .strip_prefix('/')
-        .ok_or_else(|| TargetError::Configuration("MySQL dsn_string must include /database after host:port".to_string()))?
-        .trim();
-
-    if database.is_empty() {
-        return Err(TargetError::Configuration("MySQL dsn_string database is empty".to_string()));
-    }
-
-    Ok(MySqlDsn {
-        user: user.to_string(),
-        password: password.to_string(),
-        host: host.to_string(),
-        port,
-        database: database.to_string(),
-        tls,
-    })
 }
 
 /// Returns a redacted version of the DSN string with the password replaced by `***`.
@@ -500,7 +502,7 @@ where
             }
         }
 
-        let dsn = parse_mysql_dsn(&self.args.dsn_string)?;
+        let dsn = MySqlDsn::parse(&self.args.dsn_string)?;
 
         let mut builder = OptsBuilder::default()
             .user(Some(dsn.user.clone()))
@@ -791,7 +793,7 @@ mod tests {
 
     #[test]
     fn parse_dsn_format() {
-        let dsn = parse_mysql_dsn("rustfs:secret123@tcp(mysql.example.com:3306)/rustfs_events").expect("valid DSN");
+        let dsn = MySqlDsn::parse("rustfs:secret123@tcp(mysql.example.com:3306)/rustfs_events").expect("valid DSN");
         assert_eq!(dsn.user, "rustfs");
         assert_eq!(dsn.password, "secret123");
         assert_eq!(dsn.host, "mysql.example.com");
@@ -802,7 +804,7 @@ mod tests {
 
     #[test]
     fn parse_dsn_with_mysql_prefix() {
-        let dsn = parse_mysql_dsn("mysql://rustfs:password@tcp(127.0.0.1:3306)/mydb").expect("valid DSN with prefix");
+        let dsn = MySqlDsn::parse("mysql://rustfs:password@tcp(127.0.0.1:3306)/mydb").expect("valid DSN with prefix");
         assert_eq!(dsn.user, "rustfs");
         assert_eq!(dsn.password, "password");
         assert_eq!(dsn.host, "127.0.0.1");
@@ -812,46 +814,46 @@ mod tests {
 
     #[test]
     fn parse_dsn_with_tls_true() {
-        let dsn = parse_mysql_dsn("rustfs:password@tcp(127.0.0.1:3306)/mydb?tls=true").expect("valid DSN with TLS");
+        let dsn = MySqlDsn::parse("rustfs:password@tcp(127.0.0.1:3306)/mydb?tls=true").expect("valid DSN with TLS");
         assert!(dsn.tls);
     }
 
     #[test]
     fn parse_dsn_with_tls_bare() {
-        let dsn = parse_mysql_dsn("rustfs:password@tcp(127.0.0.1:3306)/mydb?tls").expect("bare tls param");
+        let dsn = MySqlDsn::parse("rustfs:password@tcp(127.0.0.1:3306)/mydb?tls").expect("bare tls param");
         assert!(dsn.tls);
     }
 
     #[test]
     fn parse_dsn_rejects_unsupported_tls_params() {
         let err =
-            parse_mysql_dsn("rustfs:password@tcp(127.0.0.1:3306)/mydb?verify_ca=true").expect_err("verify_ca should be rejected");
+            MySqlDsn::parse("rustfs:password@tcp(127.0.0.1:3306)/mydb?verify_ca=true").expect_err("verify_ca should be rejected");
         assert!(err.to_string().contains("verify_ca"));
 
-        let err = parse_mysql_dsn("rustfs:password@tcp(127.0.0.1:3306)/mydb?verify_identity=true")
+        let err = MySqlDsn::parse("rustfs:password@tcp(127.0.0.1:3306)/mydb?verify_identity=true")
             .expect_err("verify_identity should be rejected");
         assert!(err.to_string().contains("verify_identity"));
 
-        let err = parse_mysql_dsn("rustfs:password@tcp(127.0.0.1:3306)/mydb?built_in_roots=true")
+        let err = MySqlDsn::parse("rustfs:password@tcp(127.0.0.1:3306)/mydb?built_in_roots=true")
             .expect_err("built_in_roots should be rejected");
         assert!(err.to_string().contains("built_in_roots"));
     }
 
     #[test]
     fn parse_dsn_rejects_empty() {
-        let err = parse_mysql_dsn("").expect_err("empty DSN");
+        let err = MySqlDsn::parse("").expect_err("empty DSN");
         assert!(err.to_string().contains("empty"));
     }
 
     #[test]
     fn parse_dsn_rejects_missing_at() {
-        let err = parse_mysql_dsn("rustfs:password").expect_err("missing @");
+        let err = MySqlDsn::parse("rustfs:password").expect_err("missing @");
         assert!(err.to_string().contains("must contain user:password@"));
     }
 
     #[test]
     fn parse_dsn_rejects_non_tcp() {
-        let err = parse_mysql_dsn("rustfs:password@unix(/tmp/mysql.sock)/mydb").expect_err("non-tcp should be rejected");
+        let err = MySqlDsn::parse("rustfs:password@unix(/tmp/mysql.sock)/mydb").expect_err("non-tcp should be rejected");
         assert!(err.to_string().contains("tcp("));
     }
 

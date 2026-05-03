@@ -23,7 +23,7 @@
 //! ```
 
 use mysql_async::{Opts, OptsBuilder, Pool, SslOpts, prelude::Queryable};
-use rustfs_targets::{Target, TargetError, target::*, target::mysql::*};
+use rustfs_targets::{Target, TargetError, target::mysql::*, target::*};
 use std::env;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -62,7 +62,7 @@ fn make_entity(bucket: &str, object: &str, event_name: rustfs_s3_common::EventNa
 }
 
 fn build_test_pool(dsn_string: &str) -> Pool {
-    let parsed = parse_mysql_dsn(dsn_string).expect("parse test DSN");
+    let parsed = MySqlDsn::parse(dsn_string).expect("parse test DSN");
 
     let mut builder = OptsBuilder::default()
         .user(Some(parsed.user))
@@ -163,10 +163,7 @@ async fn queue_store_saves_entry_and_replays() {
     }
 
     for key in store.list() {
-        target
-            .send_from_store(key)
-            .await
-            .expect("replay should succeed");
+        target.send_from_store(key).await.expect("replay should succeed");
     }
 
     let pool = build_test_pool(&dsn);
@@ -228,15 +225,12 @@ async fn incompatible_schema_init_fails() {
     {
         let pool = build_test_pool(&dsn);
         let mut conn = pool.get_conn().await.expect("get conn");
-        conn.query_drop(format!(
-            "CREATE TABLE IF NOT EXISTS `{table}` (wrong_col INT NOT NULL)"
-        ))
-        .await
-        .expect("create incompatible table");
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS `{table}` (wrong_col INT NOT NULL)"))
+            .await
+            .expect("create incompatible table");
     }
 
-    let target =
-        MySqlTarget::<serde_json::Value>::new("schema".to_string(), make_args(&dsn, &table, "")).expect("create target");
+    let target = MySqlTarget::<serde_json::Value>::new("schema".to_string(), make_args(&dsn, &table, "")).expect("create target");
 
     let result = target.init().await;
 
