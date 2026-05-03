@@ -49,12 +49,10 @@
 //!     sse_customer_key: sse_customer_key.as_deref(),
 //!     sse_customer_key_md5: sse_customer_key_md5.as_deref(),
 //!     content_size: actual_size,
-//!     part_number: None,
 //! };
 //!
 //! if let Some(material) = sse_encryption(request).await? {
-//!     reader = material.wrap_reader(reader);
-//!     metadata.extend(material.metadata);
+//!     metadata.extend(encryption_material_to_metadata(&material));
 //! }
 //!
 //! // Unified decryption API
@@ -64,13 +62,10 @@
 //!     metadata: &metadata,
 //!     sse_customer_key: sse_customer_key.as_deref(),
 //!     sse_customer_key_md5: sse_customer_key_md5.as_deref(),
-//!     part_number: None,
 //! };
 //!
 //! if let Some(material) = sse_decryption(request).await? {
-//!     let (decrypted_reader, plaintext_size) = material.wrap_reader(reader, actual_size).await?;
-//!     reader = decrypted_reader;
-//!     content_size = plaintext_size;
+//!     content_size = material.original_size.unwrap_or(actual_size);
 //! }
 //! ```
 
@@ -83,13 +78,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use http::HeaderMap;
 use rand::Rng;
 use rustfs_ecstore::error::StorageError;
-use rustfs_filemeta::ObjectPartInfo;
-use rustfs_kms::{
-    DataKey,
-    service_manager::get_global_encryption_service,
-    types::{EncryptionMetadata, ObjectEncryptionContext},
-};
-use rustfs_rio::{DecryptReader, DynReader, EncryptReader, HardLimitReader, ReadStream, boxed_reader, wrap_reader};
+use rustfs_kms::{DataKey, service_manager::get_global_encryption_service, types::ObjectEncryptionContext};
 use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
@@ -347,11 +336,6 @@ pub struct EncryptionRequest<'a> {
     pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
     /// Content size (for metadata)
     pub content_size: i64,
-
-    /// Part number (for multipart upload, None for single-part)
-    pub part_number: Option<usize>,
-    pub part_key: Option<String>,
-    pub part_nonce: Option<String>,
 }
 
 impl EncryptionRequest<'_> {
@@ -546,15 +530,9 @@ pub struct DecryptionRequest<'a> {
     pub sse_customer_key: Option<&'a SSECustomerKey>,
     /// SSE-C key MD5 (Base64-encoded) - required if object was encrypted with SSE-C
     pub sse_customer_key_md5: Option<&'a SSECustomerKeyMD5>,
-    /// Part number (for multipart upload, None for single-part)
-    pub part_number: Option<usize>, // Unused Fields
-    /// Parts information for multipart objects
-    pub parts: &'a [ObjectPartInfo],
-    /// Object-level ETag, used to distinguish multipart objects from single-part objects.
-    pub etag: Option<&'a str>,
 }
 
-/// Unified encryption material returned by `apply_encryption()`
+/// Encryption material returned by `sse_encryption()` / `sse_prepare_encryption()`.
 #[derive(Debug)]
 pub struct EncryptionMaterial {
     #[allow(unused)]
@@ -567,13 +545,17 @@ pub struct EncryptionMaterial {
 
     /// Encryption key bytes
     pub key_bytes: [u8; 32],
-    /// Nonce/IV for encryption
-    pub nonce: [u8; 12],
-    /// Metadata to store with the object
-    pub metadata: HashMap<String, String>,
+    /// Base nonce/IV used by rio to derive block/part nonces.
+    pub base_nonce: [u8; 12],
+    /// Encrypted DEK for managed SSE. Absent for SSE-C.
+    pub encrypted_data_key: Option<Vec<u8>>,
+    /// SSE-C key MD5 if customer-managed encryption is in use.
+    pub customer_key_md5: Option<SSECustomerKeyMD5>,
+    /// Original plaintext size when it should be persisted alongside metadata.
+    pub original_size: Option<i64>,
 }
 
-/// Unified decryption material returned by `apply_decryption()`
+/// Decryption material returned by `sse_decryption()`.
 #[derive(Debug)]
 pub struct DecryptionMaterial {
     #[allow(unused)]
@@ -585,23 +567,10 @@ pub struct DecryptionMaterial {
 
     /// Decryption key bytes
     pub key_bytes: [u8; 32],
-    /// Nonce/IV for decryption
-    pub nonce: [u8; 12],
+    /// Base nonce/IV used by rio to derive block/part nonces.
+    pub base_nonce: [u8; 12],
     /// Original unencrypted size (if available)
     pub original_size: Option<i64>,
-
-    /// Whether this is a multipart object
-    pub is_multipart: bool,
-    /// Part information for multipart objects
-    pub parts: Vec<ObjectPartInfo>,
-}
-
-fn is_multipart_object(etag: Option<&str>, parts: &[ObjectPartInfo]) -> bool {
-    if parts.len() > 1 {
-        return true;
-    }
-
-    etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)
 }
 
 /// Type of encryption used
@@ -615,65 +584,52 @@ pub enum SSEType {
     SseC,
 }
 
-impl EncryptionMaterial {
-    /// Wrap a reader with encryption
-    pub fn wrap_reader<R>(&self, reader: R) -> Box<EncryptReader<R>>
-    where
-        R: rustfs_rio::ReadStream + 'static,
-    {
-        Box::new(EncryptReader::new(reader, self.key_bytes, self.nonce))
+pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap<String, String> {
+    let mut metadata = HashMap::new();
+
+    match material.sse_type {
+        SSEType::SseC => {
+            metadata.insert(
+                "x-amz-server-side-encryption".to_string(),
+                material.server_side_encryption.as_str().to_string(),
+            );
+            metadata.insert(
+                "x-amz-server-side-encryption-customer-algorithm".to_string(),
+                material.algorithm.as_str().to_string(),
+            );
+            if let Some(customer_key_md5) = &material.customer_key_md5 {
+                metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), customer_key_md5.to_string());
+            }
+        }
+        SSEType::SseS3 | SSEType::SseKms => {
+            metadata.insert(
+                "x-rustfs-encryption-key".to_string(),
+                BASE64_STANDARD.encode(material.encrypted_data_key.as_deref().unwrap_or_default()),
+            );
+            metadata.insert("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(material.base_nonce));
+            metadata.insert("x-rustfs-encryption-algorithm".to_string(), material.algorithm.as_str().to_string());
+            metadata.insert(
+                "x-amz-server-side-encryption".to_string(),
+                material.server_side_encryption.as_str().to_string(),
+            );
+
+            let internal_key_id = material
+                .kms_key_id
+                .clone()
+                .unwrap_or_else(|| SSEKMSKeyId::from("default".to_string()));
+            metadata.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), internal_key_id.clone());
+
+            if matches!(material.sse_type, SSEType::SseKms) {
+                metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), internal_key_id);
+            }
+
+            if let Some(original_size) = material.original_size {
+                metadata.insert("x-rustfs-encryption-original-size".to_string(), original_size.to_string());
+            }
+        }
     }
-}
 
-impl DecryptionMaterial {
-    /// Wrap a reader with decryption
-    /// For multipart objects, use `wrap_multipart_stream` instead
-    pub fn wrap_single_reader<R>(&self, reader: R) -> Box<DecryptReader<R>>
-    where
-        R: rustfs_rio::ReadStream + 'static,
-    {
-        Box::new(DecryptReader::new(reader, self.key_bytes, self.nonce))
-    }
-
-    /// Wrap a stream with multipart decryption
-    /// Returns the decrypted reader and the total plaintext size
-    pub async fn wrap_multipart_stream<R>(&self, encrypted_stream: R) -> Result<(DynReader, i64), StorageError>
-    where
-        R: ReadStream + 'static,
-    {
-        decrypt_multipart_managed_stream(encrypted_stream, &self.parts, self.key_bytes, self.nonce).await
-    }
-
-    /// Unified method to wrap stream with decryption and hard limit
-    /// Handles both single-part and multipart objects, applies decryption and size limiting
-    /// Accepts a readable stream (from object storage) and returns (decrypted_reader, plaintext_size)
-    pub async fn wrap_reader<R>(self, stream: R, actual_size: i64) -> Result<(DynReader, i64), StorageError>
-    where
-        R: ReadStream + 'static,
-    {
-        let (mut final_stream, response_content_length): (DynReader, i64) = if self.is_multipart {
-            // Multipart decryption
-            let (decrypted_reader, plain_size) = self.wrap_multipart_stream(stream).await?;
-            (decrypted_reader, plain_size)
-        } else {
-            // Single-part decryption keeps Reader capabilities via the generic wrapper helper.
-            let decrypt_reader = self.wrap_single_reader(wrap_reader(stream));
-            let plain_size = self.original_size.unwrap_or(actual_size);
-            (decrypt_reader, plain_size)
-        };
-
-        // Add hard limit reader to prevent over-reading
-        // final_stream is already a DynReader, no need to wrap with WarpReader
-        let limit_reader = HardLimitReader::new(final_stream, response_content_length);
-        final_stream = Box::new(limit_reader);
-
-        debug!(
-            "{:?} decryption applied: plaintext_size={}, encrypted_size={}",
-            self.sse_type, response_content_length, actual_size
-        );
-
-        Ok((final_stream, response_content_length))
-    }
+    metadata
 }
 
 // ============================================================================
@@ -728,17 +684,9 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
     if let (Some(algorithm), Some(key), Some(key_md5)) =
         (request.sse_customer_algorithm, request.sse_customer_key, request.sse_customer_key_md5)
     {
-        return apply_ssec_encryption_material(
-            request.bucket,
-            request.key,
-            algorithm,
-            key,
-            key_md5,
-            request.content_size,
-            request.part_number,
-        )
-        .await
-        .map(Some);
+        return apply_ssec_encryption_material(request.bucket, request.key, algorithm, key, key_md5, request.content_size)
+            .await
+            .map(Some);
     }
 
     // Priority 2: Managed SSE (SSE-S3 or SSE-KMS)
@@ -753,9 +701,6 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
             sse_config.effective_sse,
             sse_config.effective_kms_key_id,
             request.content_size,
-            request.part_number,
-            request.part_key,
-            request.part_nonce,
         )
         .await
         .map(Some);
@@ -805,11 +750,9 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
 
     // apply encryption material
     let material = match sse_type {
-        Some(SseTypeV2::SseS3(sse)) => {
-            apply_managed_encryption_material(request.bucket, request.key, sse, None, 0, None, None, None).await?
-        }
+        Some(SseTypeV2::SseS3(sse)) => apply_managed_encryption_material(request.bucket, request.key, sse, None, 0).await?,
         Some(SseTypeV2::SseKms(sse, kms_key_id)) => {
-            apply_managed_encryption_material(request.bucket, request.key, sse, kms_key_id, 0, None, None, None).await?
+            apply_managed_encryption_material(request.bucket, request.key, sse, kms_key_id, 0).await?
         }
         Some(SseTypeV2::SseC(algorithm, _, key_md5)) => apply_ssec_prepare_encryption_material(algorithm, key_md5).await?,
         None => return Ok(None),
@@ -841,18 +784,13 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
 ///     metadata: &metadata,
 ///     sse_customer_key: sse_customer_key.as_deref(),
 ///     sse_customer_key_md5: sse_customer_key_md5.as_deref(),
-///     part_number: None,
 /// };
 ///
 /// if let Some(material) = sse_decryption(request).await? {
-///     let (decrypted_reader, plaintext_size) = material.wrap_reader(reader, actual_size).await?;
-///     reader = decrypted_reader;
-///     content_size = plaintext_size;
+///     content_size = material.original_size.unwrap_or(actual_size);
 /// }
 /// ```
 pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
-    let is_multipart = is_multipart_object(request.etag, request.parts);
-
     // Check for SSE-C encryption
     if request
         .metadata
@@ -872,25 +810,14 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
         let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
         verify_ssec_key_match(key_md5, stored_md5)?;
 
-        let mut material =
-            apply_ssec_decryption_material(request.bucket, request.key, request.metadata, key, key_md5, request.part_number)
-                .await?;
-        material.is_multipart = is_multipart;
-        material.parts = request.parts.to_vec();
+        let mut material = apply_ssec_decryption_material(request.bucket, request.key, request.metadata, key, key_md5).await?;
         material.customer_key_md5 = Some(key_md5.clone());
-
         return Ok(Some(material));
     }
 
     // Check for managed SSE encryption
     if request.metadata.contains_key("x-rustfs-encryption-key") {
-        let mut material_opt =
-            apply_managed_decryption_material(request.bucket, request.key, request.metadata, request.part_number).await?;
-        if let Some(ref mut material) = material_opt {
-            material.is_multipart = is_multipart;
-            material.parts = request.parts.to_vec();
-        }
-        return Ok(material_opt);
+        return apply_managed_decryption_material(request.bucket, request.key, request.metadata).await;
     }
 
     // No encryption detected
@@ -905,21 +832,16 @@ async fn apply_ssec_prepare_encryption_material(
     algorithm: SSECustomerAlgorithm,
     sse_key_md5: SSECustomerKeyMD5,
 ) -> Result<EncryptionMaterial, ApiError> {
-    // Build metadata
-    let mut metadata = HashMap::new();
-
-    metadata.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
-    metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), algorithm.clone());
-    metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), sse_key_md5);
-
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
         server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
         kms_key_id: None,
         algorithm,
         key_bytes: [0; 32],
-        nonce: [0; 12],
-        metadata,
+        base_nonce: [0; 12],
+        encrypted_data_key: None,
+        customer_key_md5: Some(sse_key_md5),
+        original_size: None,
     })
 }
 
@@ -930,7 +852,6 @@ async fn apply_ssec_encryption_material(
     sse_key: SSECustomerKey,
     sse_key_md5: SSECustomerKeyMD5,
     content_size: i64,
-    part_number: Option<usize>,
 ) -> Result<EncryptionMaterial, ApiError> {
     let params = SsecParams {
         algorithm,
@@ -942,31 +863,18 @@ async fn apply_ssec_encryption_material(
 
     // Generate nonce (deterministic for SSE-C)
     let base_nonce = generate_ssec_nonce(bucket, key);
-    let nonce = if let Some(part_num) = part_number {
-        derive_part_nonce(base_nonce, part_num)
-    } else {
-        base_nonce
-    };
 
     // Build metadata
-    let mut metadata = HashMap::new();
-
-    metadata.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
-    metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), validated.algorithm.clone());
-    metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), validated.key_md5.clone());
-    metadata.insert(
-        "x-amz-server-side-encryption-customer-original-size".to_string(),
-        content_size.to_string(),
-    );
-
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
         server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
         kms_key_id: None,
         algorithm: validated.algorithm,
         key_bytes: validated.key_bytes,
-        nonce,
-        metadata,
+        base_nonce,
+        encrypted_data_key: None,
+        customer_key_md5: Some(validated.key_md5),
+        original_size: Some(content_size),
     })
 }
 
@@ -976,7 +884,6 @@ async fn apply_ssec_decryption_material(
     metadata: &HashMap<String, String>,
     sse_key: &str,
     sse_key_md5: &str,
-    part_number: Option<usize>,
 ) -> Result<DecryptionMaterial, ApiError> {
     // Validate provided key
     let algorithm = metadata
@@ -994,11 +901,6 @@ async fn apply_ssec_decryption_material(
 
     // Generate nonce (same as encryption)
     let base_nonce = generate_ssec_nonce(bucket, key);
-    let nonce = if let Some(part_num) = part_number {
-        derive_part_nonce(base_nonce, part_num)
-    } else {
-        base_nonce
-    };
 
     let original_size = metadata
         .get("x-amz-server-side-encryption-customer-original-size")
@@ -1012,11 +914,8 @@ async fn apply_ssec_decryption_material(
 
         customer_key_md5: None,
         key_bytes: validated.key_bytes,
-        nonce,
+        base_nonce,
         original_size,
-
-        is_multipart: false,
-        parts: Vec::new(),
     })
 }
 
@@ -1024,21 +923,13 @@ async fn apply_ssec_decryption_material(
 // Internal Implementation - Managed SSE (SSE-S3 / SSE-KMS)
 // ============================================================================
 
-#[allow(clippy::too_many_arguments)]
 async fn apply_managed_encryption_material(
     bucket: &str,
     key: &str,
     server_side_encryption: ServerSideEncryption,
     kms_key_id: Option<SSEKMSKeyId>,
     content_size: i64,
-    part_number: Option<usize>,
-    part_key: Option<String>,
-    part_nonce: Option<String>,
 ) -> Result<EncryptionMaterial, ApiError> {
-    // For multipart, we only generate keys at CompleteMultipartUpload
-    // During UploadPart, we use the same base nonce with incremented counter
-    // This is handled externally, so here we just generate the base material
-
     if !is_managed_sse(&server_side_encryption) {
         return Err(ApiError::from(StorageError::other(format!(
             "Unsupported server-side encryption: {}",
@@ -1051,11 +942,6 @@ async fn apply_managed_encryption_material(
         "aws:kms" => SSEType::SseKms,
         _ => SSEType::SseS3,
     };
-
-    let mut context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
-    if content_size >= 0 {
-        context = context.with_size(content_size as u64);
-    }
 
     // Determine KMS key ID to use for internal key wrapping.
     let mut kms_key_candidate = kms_key_id.clone();
@@ -1079,95 +965,23 @@ async fn apply_managed_encryption_material(
     };
 
     let provider = get_sse_dek_provider().await?;
-
-    let (data_key, encrypted_data_key) = if let Some(part_number) = part_number
-        && let Some(part_nonce) = part_nonce
-        && let Some(part_key) = part_key
-        && part_number >= 1
-    // upload_part mode, dek generate by create_multipart_upload
-    {
-        let _base_nonce = BASE64_STANDARD
-            .decode(part_nonce.as_bytes())
-            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decode nonce: {e}"))))?;
-        if _base_nonce.len() != 12 {
-            return Err(ApiError::from(StorageError::other("Invalid encryption nonce length; expected 12 bytes")));
-        }
-        let mut base_nonce_array = [0u8; 12];
-        base_nonce_array.copy_from_slice(&_base_nonce[..12]);
-        let encrypted_data_key = BASE64_STANDARD
-            .decode(part_key.as_bytes())
-            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decode data key: {e}"))))?;
-        let _data_key = provider
-            .decrypt_sse_dek(encrypted_data_key.as_slice(), &kms_key_to_use)
-            .await?;
-        let data_key = DataKey {
-            plaintext_key: _data_key,
-            nonce: derive_part_nonce(base_nonce_array, part_number),
-        };
-
-        // load original data key from metadata
-        (data_key, encrypted_data_key)
-    } else {
-        // Use factory pattern to get provider (test or production mode)
-        let (data_key, encrypted_data_key) = provider
-            .generate_sse_dek(bucket, key, &kms_key_to_use)
-            .await
-            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
-        (data_key, encrypted_data_key)
-    };
+    let (data_key, encrypted_data_key) = provider
+        .generate_sse_dek(bucket, key, &kms_key_to_use)
+        .await
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {e}"))))?;
 
     let algorithm = server_side_encryption.as_str().to_string();
-
-    let encryption_metadata = EncryptionMetadata {
-        algorithm: algorithm.clone(),
-        key_id: kms_key_to_use.clone(),
-        key_version: 1,
-        iv: data_key.nonce.to_vec(),
-        tag: None,
-        encryption_context: context.encryption_context.clone(),
-        encrypted_at: jiff::Zoned::now(),
-        original_size: if content_size >= 0 { content_size as u64 } else { 0 },
-        encrypted_data_key,
-    };
-
-    // Build metadata headers
-    let mut metadata = HashMap::new();
-
-    // Try to use service for metadata formatting if available, otherwise build manually
-    if let Some(service) = get_global_encryption_service().await {
-        metadata = service.metadata_to_headers(&encryption_metadata);
-    } else {
-        // Manual metadata building for test mode
-        metadata.insert(
-            "x-rustfs-encryption-key".to_string(),
-            BASE64_STANDARD.encode(&encryption_metadata.encrypted_data_key),
-        );
-        metadata.insert("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(&encryption_metadata.iv));
-        metadata.insert("x-rustfs-encryption-algorithm".to_string(), encryption_metadata.algorithm.clone());
-        metadata.insert("x-amz-server-side-encryption".to_string(), server_side_encryption.as_str().to_string());
-    }
-
-    if matches!(encryption_type, SSEType::SseKms) {
-        metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_to_use.clone());
-    } else {
-        metadata.remove("x-amz-server-side-encryption-aws-kms-key-id");
-    }
-    metadata.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), kms_key_to_use.clone());
-
-    metadata.insert(
-        "x-rustfs-encryption-original-size".to_string(),
-        encryption_metadata.original_size.to_string(),
-    );
 
     Ok(EncryptionMaterial {
         sse_type: encryption_type,
         server_side_encryption,
         kms_key_id: matches!(encryption_type, SSEType::SseKms).then_some(kms_key_to_use),
         algorithm,
-
         key_bytes: data_key.plaintext_key,
-        nonce: data_key.nonce,
-        metadata,
+        base_nonce: data_key.nonce,
+        encrypted_data_key: Some(encrypted_data_key),
+        customer_key_md5: None,
+        original_size: Some(content_size),
     })
 }
 
@@ -1175,7 +989,6 @@ async fn apply_managed_decryption_material(
     _bucket: &str,
     _key: &str,
     metadata: &HashMap<String, String>,
-    part_number: Option<usize>,
 ) -> Result<Option<DecryptionMaterial>, ApiError> {
     if !metadata.contains_key("x-rustfs-encryption-key") || !metadata.contains_key("x-amz-server-side-encryption") {
         return Ok(None);
@@ -1240,11 +1053,6 @@ async fn apply_managed_decryption_material(
 
     let mut base_nonce = [0u8; 12];
     base_nonce.copy_from_slice(&iv[..12]);
-    let nonce = if let Some(part_num) = part_number {
-        derive_part_nonce(base_nonce, part_num)
-    } else {
-        base_nonce
-    };
 
     let original_size = metadata
         .get("x-rustfs-encryption-original-size")
@@ -1264,11 +1072,8 @@ async fn apply_managed_decryption_material(
         customer_key_md5: None,
 
         key_bytes,
-        nonce,
+        base_nonce,
         original_size,
-
-        is_multipart: false,
-        parts: Vec::new(),
     }))
 }
 
@@ -1645,57 +1450,6 @@ pub fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>)
 }
 
 // ============================================================================
-// Multipart Encryption Support
-// ============================================================================
-
-pub fn derive_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
-    derive_nonce_offset(base, 4, part_number)
-}
-
-#[cfg(test)]
-fn derive_legacy_part_nonce(base: [u8; 12], part_number: usize) -> [u8; 12] {
-    derive_nonce_offset(base, 8, part_number)
-}
-
-fn derive_nonce_offset(mut base: [u8; 12], start: usize, offset: usize) -> [u8; 12] {
-    let current = u32::from_be_bytes([base[start], base[start + 1], base[start + 2], base[start + 3]]);
-    let incremented = current.wrapping_add(offset as u32);
-    base[start..start + 4].copy_from_slice(&incremented.to_be_bytes());
-    base
-}
-
-pub(crate) async fn decrypt_multipart_managed_stream<R>(
-    encrypted_stream: R,
-    parts: &[ObjectPartInfo],
-    key_bytes: [u8; 32],
-    base_nonce: [u8; 12],
-) -> Result<(DynReader, i64), StorageError>
-where
-    R: ReadStream + 'static,
-{
-    let total_plain_size = parts
-        .iter()
-        .map(|part| {
-            if part.actual_size > 0 {
-                part.actual_size
-            } else {
-                part.size as i64
-            }
-        })
-        .sum();
-
-    let multipart_parts = parts.iter().map(|part| part.number).collect();
-    let reader = boxed_reader(DecryptReader::new_multipart(
-        wrap_reader(encrypted_stream),
-        key_bytes,
-        base_nonce,
-        multipart_parts,
-    ));
-
-    Ok((reader, total_plain_size))
-}
-
-// ============================================================================
 // SSE-C Functions
 // ============================================================================
 
@@ -1832,6 +1586,7 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 mod tests {
     use super::*;
     use http::HeaderValue;
+    use rustfs_rio::{DecryptReader, EncryptReader};
 
     #[test]
     fn test_extract_ssec_params_from_headers() {
@@ -1952,212 +1707,6 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_part_nonce() {
-        let base = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 10];
-        let part1 = derive_part_nonce(base, 1);
-        let part2 = derive_part_nonce(base, 2);
-
-        assert_eq!(&base[..4], &part1[..4]);
-        assert_eq!(&base[8..], &part1[8..]);
-        assert_ne!(&base[4..8], &part1[4..8]);
-        assert_ne!(&part1[4..8], &part2[4..8]);
-    }
-
-    #[tokio::test]
-    async fn test_decrypt_multipart_managed_stream_accepts_legacy_part_nonce_layout() {
-        use std::io::Cursor;
-        use tokio::io::AsyncReadExt;
-
-        let key_bytes = [7u8; 32];
-        let base_nonce = [3u8; 12];
-
-        let part_one_plaintext = vec![0x11; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 19];
-        let part_two_plaintext = vec![0x22; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 37];
-
-        let part_one_nonce = derive_legacy_part_nonce(base_nonce, 1);
-        let part_two_nonce = derive_legacy_part_nonce(base_nonce, 2);
-
-        let first_part = {
-            let mut buf = Vec::new();
-            EncryptReader::new(Cursor::new(part_one_plaintext.clone()), key_bytes, part_one_nonce)
-                .read_to_end(&mut buf)
-                .await
-                .unwrap();
-            buf
-        };
-        let second_part = {
-            let mut buf = Vec::new();
-            EncryptReader::new(Cursor::new(part_two_plaintext.clone()), key_bytes, part_two_nonce)
-                .read_to_end(&mut buf)
-                .await
-                .unwrap();
-            buf
-        };
-
-        let mut encrypted_stream = Vec::with_capacity(first_part.len() + second_part.len());
-        encrypted_stream.extend_from_slice(&first_part);
-        encrypted_stream.extend_from_slice(&second_part);
-
-        let parts = vec![
-            ObjectPartInfo {
-                number: 1,
-                size: first_part.len(),
-                actual_size: part_one_plaintext.len() as i64,
-                ..Default::default()
-            },
-            ObjectPartInfo {
-                number: 2,
-                size: second_part.len(),
-                actual_size: part_two_plaintext.len() as i64,
-                ..Default::default()
-            },
-        ];
-
-        let (mut decrypted_reader, plaintext_size) =
-            decrypt_multipart_managed_stream(Cursor::new(encrypted_stream), &parts, key_bytes, base_nonce)
-                .await
-                .unwrap();
-
-        let mut decrypted = Vec::new();
-        decrypted_reader.read_to_end(&mut decrypted).await.unwrap();
-
-        let mut expected = part_one_plaintext;
-        expected.extend_from_slice(&part_two_plaintext);
-
-        assert_eq!(plaintext_size, expected.len() as i64);
-        assert_eq!(decrypted, expected);
-    }
-
-    #[tokio::test]
-    async fn test_decrypt_multipart_managed_stream_supports_current_nonce_layout() {
-        use std::io::Cursor;
-        use tokio::io::AsyncReadExt;
-
-        let key_bytes = [9u8; 32];
-        let base_nonce = [5u8; 12];
-
-        let part_one_plaintext = vec![0x33; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 11];
-        let part_two_plaintext = vec![0x44; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE * 2 + 7];
-        let part_one_nonce = derive_part_nonce(base_nonce, 1);
-        let part_two_nonce = derive_part_nonce(base_nonce, 2);
-
-        let first_part = {
-            let mut buf = Vec::new();
-            EncryptReader::new(Cursor::new(part_one_plaintext.clone()), key_bytes, part_one_nonce)
-                .read_to_end(&mut buf)
-                .await
-                .unwrap();
-            buf
-        };
-        let second_part = {
-            let mut buf = Vec::new();
-            EncryptReader::new(Cursor::new(part_two_plaintext.clone()), key_bytes, part_two_nonce)
-                .read_to_end(&mut buf)
-                .await
-                .unwrap();
-            buf
-        };
-
-        let mut encrypted_stream = Vec::with_capacity(first_part.len() + second_part.len());
-        encrypted_stream.extend_from_slice(&first_part);
-        encrypted_stream.extend_from_slice(&second_part);
-
-        let parts = vec![
-            ObjectPartInfo {
-                number: 1,
-                size: first_part.len(),
-                actual_size: part_one_plaintext.len() as i64,
-                ..Default::default()
-            },
-            ObjectPartInfo {
-                number: 2,
-                size: second_part.len(),
-                actual_size: part_two_plaintext.len() as i64,
-                ..Default::default()
-            },
-        ];
-
-        let (mut decrypted_reader, plaintext_size) =
-            decrypt_multipart_managed_stream(Cursor::new(encrypted_stream), &parts, key_bytes, base_nonce)
-                .await
-                .unwrap();
-
-        let mut decrypted = Vec::new();
-        decrypted_reader.read_to_end(&mut decrypted).await.unwrap();
-
-        let mut expected = part_one_plaintext;
-        expected.extend_from_slice(&part_two_plaintext);
-
-        assert_eq!(plaintext_size, expected.len() as i64);
-        assert_eq!(decrypted, expected);
-    }
-
-    #[tokio::test]
-    async fn test_decrypt_multipart_managed_stream_uses_actual_part_numbers_for_nonce_derivation() {
-        use std::io::Cursor;
-        use tokio::io::AsyncReadExt;
-
-        let key_bytes = [0xAu8; 32];
-        let base_nonce = [0xBu8; 12];
-
-        let part_three_plaintext = vec![0x55; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 13];
-        let part_five_plaintext = vec![0x66; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 29];
-
-        let part_three_nonce = derive_part_nonce(base_nonce, 3);
-        let part_five_nonce = derive_part_nonce(base_nonce, 5);
-
-        let encrypted_three = {
-            let mut buf = Vec::new();
-            EncryptReader::new(Cursor::new(part_three_plaintext.clone()), key_bytes, part_three_nonce)
-                .read_to_end(&mut buf)
-                .await
-                .unwrap();
-            buf
-        };
-        let encrypted_five = {
-            let mut buf = Vec::new();
-            EncryptReader::new(Cursor::new(part_five_plaintext.clone()), key_bytes, part_five_nonce)
-                .read_to_end(&mut buf)
-                .await
-                .unwrap();
-            buf
-        };
-
-        let mut encrypted_stream = Vec::with_capacity(encrypted_three.len() + encrypted_five.len());
-        encrypted_stream.extend_from_slice(&encrypted_three);
-        encrypted_stream.extend_from_slice(&encrypted_five);
-
-        let parts = vec![
-            ObjectPartInfo {
-                number: 3,
-                size: encrypted_three.len(),
-                actual_size: part_three_plaintext.len() as i64,
-                ..Default::default()
-            },
-            ObjectPartInfo {
-                number: 5,
-                size: encrypted_five.len(),
-                actual_size: part_five_plaintext.len() as i64,
-                ..Default::default()
-            },
-        ];
-
-        let (mut decrypted_reader, plaintext_size) =
-            decrypt_multipart_managed_stream(Cursor::new(encrypted_stream), &parts, key_bytes, base_nonce)
-                .await
-                .unwrap();
-
-        let mut decrypted = Vec::new();
-        decrypted_reader.read_to_end(&mut decrypted).await.unwrap();
-
-        let mut expected = part_three_plaintext;
-        expected.extend_from_slice(&part_five_plaintext);
-
-        assert_eq!(plaintext_size, expected.len() as i64);
-        assert_eq!(decrypted, expected);
-    }
-
-    #[test]
     fn test_generate_ssec_nonce() {
         let nonce1 = generate_ssec_nonce("bucket1", "key1");
         let nonce2 = generate_ssec_nonce("bucket1", "key1");
@@ -2252,9 +1801,6 @@ mod tests {
             sse_customer_key: Some(sse_key.clone()),
             sse_customer_key_md5: None,
             content_size,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
 
         let err = sse_encryption(request_missing_md5).await.unwrap_err();
@@ -2269,9 +1815,6 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: Some(sse_key_md5.clone()),
             content_size,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
 
         let err = sse_encryption(request_missing_key).await.unwrap_err();
@@ -2286,9 +1829,6 @@ mod tests {
             sse_customer_key: Some(sse_key),
             sse_customer_key_md5: Some(sse_key_md5),
             content_size,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
 
         let err = sse_encryption(request_missing_algorithm).await.unwrap_err();
@@ -2342,7 +1882,7 @@ mod tests {
             .await
             .expect("prepare should accept ssec headers");
         assert!(material.is_some());
-        let metadata = &material.expect("ssec metadata should be generated").metadata;
+        let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"));
         assert_eq!(metadata.get("x-amz-server-side-encryption").unwrap(), "AES256");
         assert_eq!(metadata.get("x-amz-server-side-encryption-customer-algorithm").unwrap(), "AES256");
     }
@@ -2362,9 +1902,6 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
 
         let err = sse_encryption(request).await.unwrap_err();
@@ -2386,9 +1923,6 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
 
         let err = sse_encryption(request).await.unwrap_err();
@@ -2412,9 +1946,6 @@ mod tests {
             sse_customer_key: Some(sse_key),
             sse_customer_key_md5: Some(sse_key_md5),
             content_size,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
 
         let err = sse_encryption(request).await.unwrap_err();
@@ -2441,22 +1972,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_sse_encryption_persists_aws_kms_header_for_kms_objects() {
-        let request = EncryptionRequest {
-            bucket: "test-bucket",
-            key: "test-key",
-            server_side_encryption: Some("aws:kms".to_string().into()),
-            ssekms_key_id: Some("test-key".to_string()),
-            sse_customer_algorithm: None,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
-            content_size: 1024,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
-        };
-
-        let material = sse_encryption(request).await.expect("kms encryption should succeed");
-        let metadata = material.expect("managed kms encryption should return material").metadata;
+        let metadata = encryption_material_to_metadata(&EncryptionMaterial {
+            sse_type: SSEType::SseKms,
+            server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+            kms_key_id: Some("test-key".to_string()),
+            algorithm: SSECustomerAlgorithm::from(ServerSideEncryption::AWS_KMS.to_string()),
+            key_bytes: [7u8; 32],
+            base_nonce: [9u8; 12],
+            encrypted_data_key: Some(vec![1, 2, 3, 4]),
+            customer_key_md5: None,
+            original_size: Some(1024),
+        });
 
         assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"));
         assert_eq!(
@@ -2478,21 +2004,16 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size: 1024,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
 
         let material = sse_encryption(request).await.expect("sse-s3 encryption should succeed");
         let material = material.expect("managed sse-s3 encryption should return material");
+        let metadata = encryption_material_to_metadata(&material);
 
         assert_eq!(material.kms_key_id, None);
-        assert_eq!(material.metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
-        assert!(!material.metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
-        assert_eq!(
-            material.metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str),
-            Some("default")
-        );
+        assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
+        assert!(!metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
+        assert_eq!(metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str), Some("default"));
     }
 
     #[test]
@@ -2507,32 +2028,6 @@ mod tests {
         assert!(!metadata.contains_key("x-amz-server-side-encryption"));
         assert!(!metadata.contains_key("x-rustfs-encryption-key"));
         assert!(metadata.contains_key("content-type"));
-    }
-
-    #[test]
-    fn test_is_multipart_object_treats_single_part_multipart_etag_as_multipart() {
-        let metadata = HashMap::from([("etag".to_string(), "0123456789abcdef0123456789abcdef-1".to_string())]);
-        let parts = vec![ObjectPartInfo {
-            number: 1,
-            size: 128,
-            actual_size: 64,
-            ..Default::default()
-        }];
-
-        assert!(is_multipart_object(metadata.get("etag").map(String::as_str), &parts));
-    }
-
-    #[test]
-    fn test_is_multipart_object_keeps_regular_single_part_object_as_non_multipart() {
-        let metadata = HashMap::from([("etag".to_string(), "0123456789abcdef0123456789abcdef".to_string())]);
-        let parts = vec![ObjectPartInfo {
-            number: 1,
-            size: 128,
-            actual_size: 64,
-            ..Default::default()
-        }];
-
-        assert!(!is_multipart_object(metadata.get("etag").map(String::as_str), &parts));
     }
 
     #[test]
@@ -2572,9 +2067,6 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size: 1,
-            part_number: Some(1),
-            part_key: None,
-            part_nonce: None,
         };
 
         let mismatch = "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789+/==".to_string();
@@ -2597,9 +2089,6 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size: 1,
-            part_number: Some(1),
-            part_key: None,
-            part_nonce: None,
         };
 
         let result = request.check_upload_part_customer_key_md5(&metadata, Some(md5));
@@ -3116,9 +2605,6 @@ mod tests {
             sse_customer_key: None,
             sse_customer_key_md5: None,
             content_size: 1024,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
         let result = sse_encryption(request).await;
         match &result {
@@ -3151,9 +2637,6 @@ mod tests {
             sse_customer_key: Some(sse_key.clone()),
             sse_customer_key_md5: Some(wrong_md5),
             content_size: 1024,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
         let err = sse_encryption(request_wrong_md5).await.unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
@@ -3167,9 +2650,6 @@ mod tests {
             sse_customer_key: Some(sse_key),
             sse_customer_key_md5: Some(BASE64_STANDARD.encode(md5::compute([42u8; 32]).0)),
             content_size: 1024,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
         let err = sse_encryption(request_unsupported_algorithm).await.unwrap_err();
         assert!(err.code == S3ErrorCode::InvalidRequest || err.code == S3ErrorCode::InvalidArgument);

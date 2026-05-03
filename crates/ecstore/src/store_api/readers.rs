@@ -1,4 +1,22 @@
 use super::*;
+use aes_gcm::{
+    Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit},
+};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use md5::{Digest, Md5};
+use rustfs_kms::{service_manager::get_global_encryption_service, types::ObjectEncryptionContext};
+use rustfs_rio::DecryptReader;
+use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
+use std::collections::HashMap;
+use std::env;
+
+const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
+const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
+const INTERNAL_ENCRYPTION_IV_HEADER: &str = "x-rustfs-encryption-iv";
+const INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER: &str = "x-rustfs-encryption-original-size";
+const SSEC_ORIGINAL_SIZE_HEADER: &str = "x-amz-server-side-encryption-customer-original-size";
+const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 
 fn restore_request_active(opts: &ObjectOptions) -> bool {
     let restore = &opts.transition.restore_request;
@@ -95,14 +113,19 @@ pub struct GetObjectReader {
     pub object_info: ObjectInfo,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EncryptionMaterial {
+    key_bytes: [u8; 32],
+    base_nonce: [u8; 12],
+}
+
 impl GetObjectReader {
-    #[tracing::instrument(level = "debug", skip(reader, rs, opts, _h))]
-    pub fn new(
+    pub async fn new(
         reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
         rs: Option<HTTPRangeSpec>,
         oi: &ObjectInfo,
         opts: &ObjectOptions,
-        _h: &HeaderMap<HeaderValue>,
+        h: &HeaderMap<HeaderValue>,
     ) -> Result<(Self, usize, i64)> {
         let mut rs = rs;
 
@@ -120,7 +143,7 @@ impl GetObjectReader {
             is_compressed = false;
         }
 
-        if is_compressed {
+        if is_compressed && !is_encrypted {
             let actual_size = oi.get_actual_size()?;
             let (off, length, dec_off, dec_length) = if let Some(rs) = rs {
                 let (req_off, req_length) = rs.get_offset_length(actual_size)?;
@@ -174,11 +197,62 @@ impl GetObjectReader {
         }
 
         if is_encrypted {
-            let decrypted_size = oi.decrypted_size()?;
-            if let Some(rs) = rs {
-                let _ = rs.get_offset_length(decrypted_size)?;
-            }
-            return Err(Error::other("encrypted object reads are not implemented"));
+            let material = resolve_encryption_material(oi, h).await?;
+            let is_multipart = is_multipart_encrypted_object(&oi.parts, oi.etag.as_deref());
+            let plaintext_size = encrypted_plaintext_size(oi, is_multipart, is_compressed)?;
+            let plaintext_size_usize =
+                usize::try_from(plaintext_size).map_err(|_| Error::other(format!("invalid decrypted size {plaintext_size}")))?;
+            let (plain_offset, plain_length) = if let Some(rs) = rs {
+                rs.get_offset_length(plaintext_size)?
+            } else {
+                (0, plaintext_size)
+            };
+
+            let decrypted_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_multipart {
+                Box::new(DecryptReader::new_multipart(
+                    reader,
+                    material.key_bytes,
+                    material.base_nonce,
+                    multipart_part_numbers(&oi.parts),
+                ))
+            } else {
+                Box::new(DecryptReader::new(reader, material.key_bytes, material.base_nonce))
+            };
+
+            let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_compressed {
+                let decompressed_reader = DecompressReader::new(decrypted_reader, algo);
+                if plain_offset > 0 || plain_length != plaintext_size {
+                    Box::new(RangedDecompressReader::new(
+                        decompressed_reader,
+                        plain_offset,
+                        plain_length,
+                        plaintext_size_usize,
+                    )?)
+                } else {
+                    Box::new(LimitReader::new(decompressed_reader, plaintext_size_usize))
+                }
+            } else if plain_offset > 0 || plain_length != plaintext_size {
+                Box::new(RangedDecompressReader::new(
+                    decrypted_reader,
+                    plain_offset,
+                    plain_length,
+                    plaintext_size_usize,
+                )?)
+            } else {
+                Box::new(LimitReader::new(decrypted_reader, plaintext_size_usize))
+            };
+
+            let mut object_info = oi.clone();
+            object_info.size = plain_length;
+
+            return Ok((
+                GetObjectReader {
+                    stream: final_reader,
+                    object_info,
+                },
+                0,
+                oi.size,
+            ));
         }
 
         if let Some(rs) = rs {
@@ -543,8 +617,32 @@ impl<R: AsyncRead + Unpin + Send + 'static> Drop for StreamConsumer<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use md5::{Digest, Md5};
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
+
+    fn md5_bytes(data: impl AsRef<[u8]>) -> [u8; 16] {
+        let digest = Md5::digest(data.as_ref());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest);
+        bytes
+    }
+
+    fn ssec_headers_from_key(key_bytes: [u8; 32]) -> HeaderMap<HeaderValue> {
+        let mut headers = HeaderMap::new();
+        headers.insert(rustfs_utils::http::SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
+        headers.insert(
+            rustfs_utils::http::SSEC_KEY_HEADER,
+            HeaderValue::from_str(&BASE64_STANDARD.encode(key_bytes)).expect("valid base64 header"),
+        );
+        headers.insert(
+            rustfs_utils::http::SSEC_KEY_MD5_HEADER,
+            HeaderValue::from_str(&BASE64_STANDARD.encode(md5_bytes(key_bytes))).expect("valid md5 header"),
+        );
+        headers
+    }
 
     #[tokio::test]
     async fn test_ranged_decompress_reader() {
@@ -770,8 +868,16 @@ mod tests {
         assert_eq!(&buf2[..1], b"e");
     }
 
-    #[test]
-    fn test_get_object_reader_rejects_encrypted_range_without_decryption_support() {
+    fn encrypt_managed_dek_for_test(dek: [u8; 32], master_key: [u8; 32]) -> String {
+        let key = Key::<Aes256Gcm>::from(master_key);
+        let cipher = Aes256Gcm::new(&key);
+        let nonce = Nonce::from([0u8; 12]);
+        let ciphertext = cipher.encrypt(&nonce, dek.as_slice()).expect("encrypt managed dek");
+        format!("{}:{}", BASE64_STANDARD.encode(nonce), BASE64_STANDARD.encode(ciphertext))
+    }
+
+    #[tokio::test]
+    async fn test_get_object_reader_rejects_ssec_read_without_headers() {
         let object_info = ObjectInfo {
             size: 10,
             user_defined: HashMap::from([
@@ -793,16 +899,14 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &HeaderMap::new(),
-        );
+        )
+        .await;
 
-        match result {
-            Ok(_) => panic!("encrypted range read should not fall back to plain object semantics"),
-            Err(err) => assert!(err.to_string().contains("encrypted object reads are not implemented")),
-        }
+        assert!(result.is_err());
     }
 
-    #[test]
-    fn test_get_object_reader_restore_request_bypasses_encryption_range_rewrite() {
+    #[tokio::test]
+    async fn test_get_object_reader_restore_request_bypasses_encryption_range_rewrite() {
         let object_info = ObjectInfo {
             size: 10,
             user_defined: HashMap::from([
@@ -828,14 +932,58 @@ mod tests {
             &opts,
             &HeaderMap::new(),
         )
+        .await
         .unwrap();
 
         assert_eq!(offset, 6);
         assert_eq!(length, 4);
     }
 
-    #[test]
-    fn test_get_object_reader_compressed_range_returns_physical_offset_from_index() {
+    #[tokio::test]
+    async fn test_get_object_reader_allows_encrypted_full_object_passthrough() {
+        let plaintext = b"managed-full-object".to_vec();
+        let data_key = [0x21; 32];
+        let base_nonce = [0x11; 12];
+        let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+
+        let mut encrypted = Vec::new();
+        rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypt managed object");
+
+        let object_info = ObjectInfo {
+            size: encrypted.len() as i64,
+            user_defined: HashMap::from([
+                ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
+                ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
+                ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
+                ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        let (mut reader, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(encrypted.clone())),
+            None,
+            &object_info,
+            &ObjectOptions::default(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("managed encrypted full-object reads should decrypt inside ecstore");
+
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.expect("read managed plaintext");
+
+        assert_eq!(offset, 0);
+        assert_eq!(length, object_info.size);
+        assert_eq!(reader.object_info.size, plaintext.len() as i64);
+        assert_eq!(actual, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_reader_compressed_range_returns_physical_offset_from_index() {
         let mut index = rustfs_rio::Index::new();
         index.add(0, 0).unwrap();
         index.add(1_048_576, 2_097_152).unwrap();
@@ -870,6 +1018,7 @@ mod tests {
             &ObjectOptions::default(),
             &HeaderMap::new(),
         )
+        .await
         .unwrap();
 
         assert!(offset > 0);
@@ -877,4 +1026,384 @@ mod tests {
         assert_eq!(length, object_info.size - offset as i64);
         assert_eq!(reader.object_info.size, 10);
     }
+
+    #[tokio::test]
+    async fn test_get_object_reader_decrypts_ssec_full_object() {
+        let plaintext = b"ecstore-ssec-full-object".to_vec();
+        let key_bytes = [0x31; 32];
+        let bucket = "bucket";
+        let object = "object";
+        let nonce = md5_bytes(format!("{bucket}-{object}").as_bytes());
+        let mut base_nonce = [0u8; 12];
+        base_nonce.copy_from_slice(&nonce[..12]);
+
+        let mut encrypted = Vec::new();
+        rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypt object");
+
+        let object_info = ObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            size: encrypted.len() as i64,
+            user_defined: HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5".to_string(),
+                    BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-original-size".to_string(),
+                    plaintext.len().to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let (mut reader, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(encrypted.clone())),
+            None,
+            &object_info,
+            &ObjectOptions::default(),
+            &ssec_headers_from_key(key_bytes),
+        )
+        .await
+        .expect("ssec read should be supported");
+
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.expect("read decrypted ssec object");
+
+        assert_eq!(offset, 0);
+        assert_eq!(length, encrypted.len() as i64);
+        assert_eq!(reader.object_info.size, plaintext.len() as i64);
+        assert_eq!(actual, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_reader_decrypts_ssec_range_on_plaintext_semantics() {
+        let plaintext = b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec();
+        let key_bytes = [0x41; 32];
+        let bucket = "bucket";
+        let object = "range-object";
+        let nonce = md5_bytes(format!("{bucket}-{object}").as_bytes());
+        let mut base_nonce = [0u8; 12];
+        base_nonce.copy_from_slice(&nonce[..12]);
+
+        let mut encrypted = Vec::new();
+        rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypt ranged object");
+
+        let object_info = ObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            size: encrypted.len() as i64,
+            user_defined: HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5".to_string(),
+                    BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-original-size".to_string(),
+                    plaintext.len().to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 5,
+            end: 11,
+        };
+
+        let (mut reader, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(encrypted.clone())),
+            Some(range),
+            &object_info,
+            &ObjectOptions::default(),
+            &ssec_headers_from_key(key_bytes),
+        )
+        .await
+        .expect("ssec range read should be supported");
+
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.expect("read ranged decrypted object");
+
+        assert_eq!(offset, 0);
+        assert_eq!(length, encrypted.len() as i64);
+        assert_eq!(reader.object_info.size, 7);
+        assert_eq!(actual, b"56789ab");
+    }
+
+    #[tokio::test]
+    async fn test_get_object_reader_decrypts_then_decompresses_before_applying_range() {
+        let plaintext = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+        let key_bytes = [0x51; 32];
+        let bucket = "bucket";
+        let object = "compressed-object";
+        let nonce = md5_bytes(format!("{bucket}-{object}").as_bytes());
+        let mut base_nonce = [0u8; 12];
+        base_nonce.copy_from_slice(&nonce[..12]);
+
+        let mut compressed = Vec::new();
+        rustfs_rio::CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default())
+            .read_to_end(&mut compressed)
+            .await
+            .expect("compress plaintext");
+
+        let mut encrypted = Vec::new();
+        rustfs_rio::EncryptReader::new(Cursor::new(compressed), key_bytes, base_nonce)
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypt compressed plaintext");
+
+        let object_info = ObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            size: encrypted.len() as i64,
+            user_defined: HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5".to_string(),
+                    BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-original-size".to_string(),
+                    plaintext.len().to_string(),
+                ),
+                ("x-minio-internal-compression".to_string(), CompressionAlgorithm::default().to_string()),
+                ("x-minio-internal-actual-size".to_string(), plaintext.len().to_string()),
+            ]),
+            ..Default::default()
+        };
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 5,
+            end: 11,
+        };
+
+        let (mut reader, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(encrypted.clone())),
+            Some(range),
+            &object_info,
+            &ObjectOptions::default(),
+            &ssec_headers_from_key(key_bytes),
+        )
+        .await
+        .expect("encrypted+compressed range read should be supported");
+
+        let mut actual = Vec::new();
+        reader
+            .read_to_end(&mut actual)
+            .await
+            .expect("read ranged decompressed plaintext");
+
+        assert_eq!(offset, 0);
+        assert_eq!(length, encrypted.len() as i64);
+        assert_eq!(reader.object_info.size, 7);
+        assert_eq!(actual, b"fghijkl");
+    }
+}
+
+fn encrypted_plaintext_size(oi: &ObjectInfo, is_multipart: bool, is_compressed: bool) -> Result<i64> {
+    if is_compressed {
+        return oi.get_actual_size().map_err(Into::into);
+    }
+
+    if is_multipart {
+        return Ok(multipart_plaintext_size(&oi.parts, oi.decrypted_size()?));
+    }
+
+    oi.decrypted_size().map_err(Into::into)
+}
+
+fn is_multipart_encrypted_object(parts: &[rustfs_filemeta::ObjectPartInfo], etag: Option<&str>) -> bool {
+    if parts.len() > 1 {
+        return true;
+    }
+
+    etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)
+}
+
+fn multipart_plaintext_size(parts: &[rustfs_filemeta::ObjectPartInfo], fallback: i64) -> i64 {
+    let total: i64 = parts
+        .iter()
+        .map(|part| {
+            if part.actual_size > 0 {
+                part.actual_size
+            } else {
+                part.size as i64
+            }
+        })
+        .sum();
+
+    if total > 0 { total } else { fallback }
+}
+
+fn multipart_part_numbers(parts: &[rustfs_filemeta::ObjectPartInfo]) -> Vec<usize> {
+    parts.iter().map(|part| part.number).collect()
+}
+
+async fn resolve_encryption_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
+    if oi.user_defined.contains_key(SSEC_ALGORITHM_HEADER) {
+        return resolve_ssec_material(oi, headers);
+    }
+
+    if oi.user_defined.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER) {
+        return resolve_managed_material(&oi.user_defined).await;
+    }
+
+    Err(Error::other("encrypted object metadata is incomplete"))
+}
+
+fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
+    let algorithm = headers
+        .get(SSEC_ALGORITHM_HEADER)
+        .ok_or_else(|| Error::other("missing SSE-C algorithm header"))?
+        .to_str()
+        .map_err(|_| Error::other("invalid SSE-C algorithm header"))?;
+    if algorithm != DEFAULT_SSE_ALGORITHM {
+        return Err(Error::other(format!("unsupported SSE-C algorithm {algorithm}")));
+    }
+
+    let key_b64 = headers
+        .get(SSEC_KEY_HEADER)
+        .ok_or_else(|| Error::other("missing SSE-C key header"))?
+        .to_str()
+        .map_err(|_| Error::other("invalid SSE-C key header"))?;
+    let key_md5 = headers
+        .get(SSEC_KEY_MD5_HEADER)
+        .ok_or_else(|| Error::other("missing SSE-C key md5 header"))?
+        .to_str()
+        .map_err(|_| Error::other("invalid SSE-C key md5 header"))?;
+
+    let key_bytes_vec = BASE64_STANDARD
+        .decode(key_b64)
+        .map_err(|_| Error::other("failed to decode SSE-C key"))?;
+    let key_bytes: [u8; 32] = key_bytes_vec
+        .try_into()
+        .map_err(|_| Error::other("SSE-C key must be 32 bytes"))?;
+
+    let expected_md5 = BASE64_STANDARD.encode(md5_bytes(key_bytes));
+    if expected_md5 != key_md5 {
+        return Err(Error::other("SSE-C key MD5 mismatch"));
+    }
+
+    let stored_md5 = oi
+        .user_defined
+        .get(SSEC_KEY_MD5_HEADER)
+        .ok_or_else(|| Error::other("missing stored SSE-C key md5"))?;
+    if stored_md5 != &expected_md5 {
+        return Err(Error::other("SSE-C key does not match object metadata"));
+    }
+
+    Ok(EncryptionMaterial {
+        key_bytes,
+        base_nonce: generate_ssec_nonce(&oi.bucket, &oi.name),
+    })
+}
+
+async fn resolve_managed_material(metadata: &HashMap<String, String>) -> Result<EncryptionMaterial> {
+    let encrypted_dek = metadata
+        .get(INTERNAL_ENCRYPTION_KEY_HEADER)
+        .ok_or_else(|| Error::other("missing managed encrypted DEK"))?;
+    let encrypted_dek = BASE64_STANDARD
+        .decode(encrypted_dek)
+        .map_err(|e| Error::other(format!("failed to decode managed encrypted DEK: {e}")))?;
+
+    let iv_b64 = metadata
+        .get(INTERNAL_ENCRYPTION_IV_HEADER)
+        .ok_or_else(|| Error::other("missing managed encryption IV"))?;
+    let iv = BASE64_STANDARD
+        .decode(iv_b64)
+        .map_err(|e| Error::other(format!("failed to decode managed encryption IV: {e}")))?;
+    let base_nonce: [u8; 12] = iv
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::other("managed encryption IV must be 12 bytes"))?;
+
+    let kms_key_id = metadata
+        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
+        .map(String::as_str)
+        .unwrap_or("default");
+
+    let key_bytes = if let Some(service) = get_global_encryption_service().await {
+        service
+            .decrypt_data_key(&encrypted_dek, &ObjectEncryptionContext::new(String::new(), String::new()))
+            .await
+            .map_err(|e| Error::other(format!("failed to decrypt managed data key: {e}")))?
+            .plaintext_key
+    } else {
+        decrypt_local_sse_dek(&encrypted_dek, kms_key_id)?
+    };
+
+    Ok(EncryptionMaterial { key_bytes, base_nonce })
+}
+
+fn decrypt_local_sse_dek(encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8; 32]> {
+    let encrypted_dek = std::str::from_utf8(encrypted_dek).map_err(|_| Error::other("managed DEK is not valid UTF-8"))?;
+    let parts: Vec<&str> = encrypted_dek.split(':').collect();
+    if parts.len() != 2 {
+        return Err(Error::other("invalid managed DEK format"));
+    }
+
+    let nonce_vec = BASE64_STANDARD
+        .decode(parts[0])
+        .map_err(|_| Error::other("invalid managed DEK nonce"))?;
+    let ciphertext = BASE64_STANDARD
+        .decode(parts[1])
+        .map_err(|_| Error::other("invalid managed DEK ciphertext"))?;
+
+    let nonce_array: [u8; 12] = nonce_vec
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::other("invalid managed DEK nonce length"))?;
+
+    let key = Key::<Aes256Gcm>::from(local_sse_master_key());
+    let cipher = Aes256Gcm::new(&key);
+    let plaintext = cipher
+        .decrypt(&Nonce::from(nonce_array), ciphertext.as_slice())
+        .map_err(|e| Error::other(format!("failed to decrypt managed DEK: {e}")))?;
+
+    plaintext
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::other("managed DEK has invalid plaintext length"))
+}
+
+fn local_sse_master_key() -> [u8; 32] {
+    if let Ok(value) = env::var("__RUSTFS_SSE_SIMPLE_CMK")
+        && !value.trim().is_empty()
+        && let Ok(decoded) = BASE64_STANDARD.decode(value.trim())
+        && let Ok(arr) = <[u8; 32]>::try_from(decoded.as_slice())
+    {
+        return arr;
+    }
+
+    if let Ok(value) = env::var("RUSTFS_SSE_S3_MASTER_KEY")
+        && !value.trim().is_empty()
+        && let Ok(decoded) = BASE64_STANDARD.decode(value.trim())
+        && let Ok(arr) = <[u8; 32]>::try_from(decoded.as_slice())
+    {
+        return arr;
+    }
+
+    [0u8; 32]
+}
+
+fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
+    let digest = md5_bytes(format!("{bucket}-{key}").as_bytes());
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&digest[..12]);
+    nonce
+}
+
+fn md5_bytes(data: impl AsRef<[u8]>) -> [u8; 16] {
+    let digest = Md5::digest(data.as_ref());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest);
+    out
 }
