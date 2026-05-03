@@ -68,34 +68,23 @@ spec:
           imagePullPolicy: {{ .Values.image.initImage.pullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          env:
-            - name: REPLICA_COUNT
-              value: {{ .Values.replicaCount | quote }}
           command:
             - sh
             - -c
             - |
-              if [ "$REPLICA_COUNT" -eq 4 ]; then
-                for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
-                  mkdir -p /data/rustfs$i
-                done;
-              elif [ "$REPLICA_COUNT" -eq 16 ]; then
-                mkdir -p /data
-              fi
+              set -e
+              mkdir -p /data
+              {{- if $logDir }}
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
+              {{- end }}
           volumeMounts:
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
-            - name: data-rustfs-{{ $i }}
-              mountPath: /data/rustfs{{ $i }}
-            {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
             - name: data
               mountPath: /data
-            {{- end }}
+            {{- if $logDir }}
             - name: logs
               mountPath: /mnt/rustfs
+            {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
@@ -141,18 +130,13 @@ spec:
               mountPath: /opt/tls/ca.crt
               subPath: ca.crt
             {{- end }}
+            {{- if $logDir }}
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
-            - name: data-rustfs-{{ $i }}
-              mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
             - name: data
               mountPath: /data
-            {{- end }}
       {{- if .Values.mtls.enabled }}
       volumes:
         - name: server-cert
@@ -177,6 +161,7 @@ spec:
                 path: client_ca.crt
       {{- end }}
   volumeClaimTemplates:
+    {{- if $logDir }}
     - metadata:
         name: logs
         labels:
@@ -189,22 +174,7 @@ spec:
         resources:
           requests:
             storage: {{ .Values.storageclass.logStorageSize }}
-    {{- if eq (int .Values.replicaCount) 4 }}
-    {{- range $i := until (int .Values.replicaCount) }}
-    - metadata:
-        name: data-rustfs-{{ $i }}
-        labels:
-          {{- toYaml $.Values.commonLabels | nindent 10 }}
-        annotations:
-          {{- toYaml $.Values.storageclass.pvcAnnotations.data | nindent 10 }}
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ $.Values.storageclass.name }}
-        resources:
-          requests:
-            storage: {{ $.Values.storageclass.dataStorageSize }}
     {{- end }}
-    {{- else if eq (int .Values.replicaCount) 16 }}
     - metadata:
         name: data
         labels:
@@ -217,5 +187,4 @@ spec:
         resources:
           requests:
             storage: {{ .Values.storageclass.dataStorageSize }}
-    {{- end }}
 {{- end }}

@@ -63,7 +63,9 @@ config:
     console_address: ":9001"
     log_level: "info"
     region: "us-east-1"
-    obs_log_directory: "/logs"
+    ## If obs_log_directory is set, a separate volume for logs will be created and the logs will NOT be sent to stdout
+    # obs_log_directory: "/logs"
+    ## Can use `production` or `development`.
     obs_environment: "development"
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
@@ -103,7 +105,7 @@ config:
       enabled: false
       type: "vault" # Only Support vault currently.
       vault:
-        vault_backend: "" # Only support vault kv2 and vault transit. 
+        vault_backend: "" # Only support vault kv2 and vault transit.
         vault_address: ""
         vault_token: ""
         vault_mount_path: ""
@@ -214,7 +216,7 @@ ingress:
 gatewayApi:
   enabled: false
   gatewayClass: traefik # Only support for traefik and contour gatewayClass at the moment.
-  listeners: # Specify which listeners to create on the Gateway. 
+  listeners: # Specify which listeners to create on the Gateway.
     http:
       name: web
       port: 8000
