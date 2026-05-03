@@ -110,7 +110,8 @@ pub struct MySqlDsn {
 /// mysql://<user>:<password>@tcp(<host>:<port>)/<database>
 /// ```
 ///
-/// Only `?tls=true` is accepted as a query parameter.
+/// Only `?tls=true`, `?tls=false`, and bare `?tls` are accepted;
+/// other TLS query parameters (`verify_ca`, etc.) are rejected.
 pub fn parse_mysql_dsn(dsn_string: &str) -> Result<MySqlDsn, TargetError> {
     let input = dsn_string.trim();
     if input.is_empty() {
@@ -242,7 +243,7 @@ pub(crate) fn redact_mysql_dsn(dsn_string: &str) -> String {
     match remainder.split_once('@') {
         Some((credentials, host_part)) => match credentials.split_once(':') {
             Some((user, _)) => format!("{}{}:***@{}", prefix, user.trim(), host_part.trim()),
-            None => format!("{prefix}***:{host_part}"),
+            None => format!("{prefix}***@{host_part}"),
         },
         None => format!("{prefix}***"),
     }
@@ -864,6 +865,12 @@ mod tests {
     fn redact_dsn_with_mysql_prefix() {
         let redacted = redact_mysql_dsn("mysql://rustfs:secret123@tcp(127.0.0.1:3306)/mydb");
         assert_eq!(redacted, "mysql://rustfs:***@tcp(127.0.0.1:3306)/mydb");
+    }
+
+    #[test]
+    fn redact_dsn_empty_password() {
+        let redacted = redact_mysql_dsn("root:@tcp(127.0.0.1:4000)/testdb");
+        assert_eq!(redacted, "root:***@tcp(127.0.0.1:4000)/testdb");
     }
 
     #[test]
