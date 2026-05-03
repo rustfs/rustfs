@@ -250,7 +250,12 @@ async fn handle_assume_role(
 
     new_cred.parent_user = cred.access_key.clone();
 
-    debug!("AssumeRole get new_cred {:?}", &new_cred);
+    debug!(
+        access_key = %new_cred.access_key,
+        parent_user = %new_cred.parent_user,
+        expiration = ?new_cred.expiration,
+        "AssumeRole generated temporary credentials"
+    );
 
     let updated_at = iam_store
         .set_temp_user(&new_cred.access_key, &new_cred, None)

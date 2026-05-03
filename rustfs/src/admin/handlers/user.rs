@@ -139,6 +139,36 @@ fn imported_service_account_status(status: &str) -> Option<String> {
     None
 }
 
+const SERVICE_ACCOUNT_PARENT_SCOPE_ERROR: &str = "service account parent is outside requester scope";
+
+fn imported_service_account_parent_allowed(parent: &str, requester: &Credentials, owner: bool) -> bool {
+    if parent.is_empty() {
+        return false;
+    }
+
+    if owner {
+        return true;
+    }
+
+    if requester.is_temp() || requester.is_service_account() {
+        return temp_identity_parent(requester).is_some_and(|requester_parent| requester_parent == parent);
+    }
+
+    requester.parent_user.is_empty() && requester.access_key == parent
+}
+
+fn imported_service_account_parent_scope_failure(
+    access_key: &str,
+    parent: &str,
+    requester: &Credentials,
+    owner: bool,
+) -> Option<IAMErrEntity> {
+    (!imported_service_account_parent_allowed(parent, requester, owner)).then(|| IAMErrEntity {
+        name: access_key.to_string(),
+        error: SERVICE_ACCOUNT_PARENT_SCOPE_ERROR.to_string(),
+    })
+}
+
 pub struct AddUser {}
 #[async_trait::async_trait]
 impl Operation for AddUser {
@@ -984,6 +1014,11 @@ impl Operation for ImportIam {
                         return Err(s3_error!(InvalidArgument, "has space be {ak}"));
                     }
 
+                    if let Some(err) = imported_service_account_parent_scope_failure(&ak, &req.parent, &cred, owner) {
+                        failed.service_accounts.push(err);
+                        continue;
+                    }
+
                     let mut update = true;
 
                     if let Err(e) = iam_store.get_service_account(&req.access_key).await {
@@ -1216,8 +1251,9 @@ impl Operation for ImportIam {
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUP_POLICY_MAPPING_USER_TYPE, imported_service_account_status, should_check_deny_only, should_reject_group_import_name,
-        should_restore_group_as_disabled,
+        GROUP_POLICY_MAPPING_USER_TYPE, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR, imported_service_account_parent_allowed,
+        imported_service_account_parent_scope_failure, imported_service_account_status, should_check_deny_only,
+        should_reject_group_import_name, should_restore_group_as_disabled,
     };
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_iam::error::Error as IamError;
@@ -1335,6 +1371,65 @@ mod tests {
         assert_eq!(imported_service_account_status("disabled").as_deref(), Some("off"));
         assert_eq!(imported_service_account_status("enabled").as_deref(), Some("on"));
         assert!(imported_service_account_status("unknown").is_none());
+    }
+
+    #[test]
+    fn test_import_service_account_parent_rejects_other_parent_for_non_owner() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!imported_service_account_parent_allowed("root-access-key", &requester, false));
+    }
+
+    #[test]
+    fn test_service_account_parent_scope_failure_records_import_error() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+        let err = imported_service_account_parent_scope_failure("svc-access-key", "root-access-key", &requester, false)
+            .expect("non-owner must not import a service account for another parent");
+
+        assert_eq!(err.name, "svc-access-key");
+        assert_eq!(err.error, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR);
+        assert!(
+            imported_service_account_parent_scope_failure("svc-access-key", "delegated-importer", &requester, false).is_none()
+        );
+    }
+
+    #[test]
+    fn test_import_service_account_parent_allows_owner_restore() {
+        let requester = Credentials {
+            access_key: "root-access-key".to_string(),
+            ..Default::default()
+        };
+
+        assert!(imported_service_account_parent_allowed("any-imported-parent", &requester, true));
+    }
+
+    #[test]
+    fn test_import_service_account_parent_allows_requester_self_parent() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+
+        assert!(imported_service_account_parent_allowed("delegated-importer", &requester, false));
+    }
+
+    #[test]
+    fn test_import_service_account_parent_allows_derived_requester_parent() {
+        let requester = Credentials {
+            access_key: "derived-access-key".to_string(),
+            parent_user: "parent-user".to_string(),
+            session_token: "session-token".to_string(),
+            ..Default::default()
+        };
+
+        assert!(imported_service_account_parent_allowed("parent-user", &requester, false));
+        assert!(!imported_service_account_parent_allowed("other-parent", &requester, false));
     }
 
     #[test]
