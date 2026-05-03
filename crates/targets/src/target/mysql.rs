@@ -518,6 +518,8 @@ where
             );
         }
 
+        // When max_open_connections is 0, no explicit upper bound is set —
+        // mysql_async uses its default pool constraints (10–100).
         if self.args.max_open_connections > 0 {
             let constraints = PoolConstraints::new(1, self.args.max_open_connections)
                 .ok_or_else(|| {
