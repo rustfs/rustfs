@@ -8196,6 +8196,7 @@ dependencies = [
 name = "rustfs-filemeta"
 version = "1.0.0-beta.1"
 dependencies = [
+ "arc-swap",
  "byteorder",
  "bytes",
  "crc-fast",
