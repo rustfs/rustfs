@@ -483,6 +483,10 @@ mod tests {
         GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel);
     }
 
+    fn ensure_test_rpc_secret() {
+        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+    }
+
     fn test_lock_request(timeout_duration: Duration) -> LockRequest {
         LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner-a")
             .with_acquire_timeout(timeout_duration)
@@ -491,6 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_client_acquire_lock_respects_request_timeout_and_evicts_connection() {
+        ensure_test_rpc_secret();
         let (addr, accept_task) = spawn_hanging_listener().await;
         cache_lazy_channel(&addr).await;
         assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
@@ -517,6 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_client_acquire_locks_batch_respects_request_timeout_and_evicts_connection() {
+        ensure_test_rpc_secret();
         let (addr, accept_task) = spawn_hanging_listener().await;
         cache_lazy_channel(&addr).await;
         assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
