@@ -87,7 +87,7 @@ impl MySqlArgs {
 /// Produced by [`parse_mysql_dsn`] and consumed by the MySQL
 /// target runtime to build connection options.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MySqlDsn {
+pub struct MySqlDsn {
     /// MySQL user name
     pub user: String,
     /// MySQL password (plaintext, must be redacted before logging)
@@ -111,7 +111,7 @@ pub(crate) struct MySqlDsn {
 /// ```
 ///
 /// Only `?tls=true` is accepted as a query parameter.
-pub(crate) fn parse_mysql_dsn(dsn_string: &str) -> Result<MySqlDsn, TargetError> {
+pub fn parse_mysql_dsn(dsn_string: &str) -> Result<MySqlDsn, TargetError> {
     let input = dsn_string.trim();
     if input.is_empty() {
         return Err(TargetError::Configuration("MySQL dsn_string cannot be empty".to_string()));
