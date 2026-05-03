@@ -140,6 +140,7 @@ fn imported_service_account_status(status: &str) -> Option<String> {
 }
 
 const SERVICE_ACCOUNT_PARENT_SCOPE_ERROR: &str = "service account parent is outside requester scope";
+const SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR: &str = "service account access key does not match import entry";
 
 fn imported_service_account_parent_allowed(parent: &str, requester: &Credentials, owner: bool) -> bool {
     if parent.is_empty() {
@@ -166,6 +167,13 @@ fn imported_service_account_parent_scope_failure(
     (!imported_service_account_parent_allowed(parent, requester, owner)).then(|| IAMErrEntity {
         name: access_key.to_string(),
         error: SERVICE_ACCOUNT_PARENT_SCOPE_ERROR.to_string(),
+    })
+}
+
+fn imported_service_account_access_key_failure(entry_access_key: &str, payload_access_key: &str) -> Option<IAMErrEntity> {
+    (entry_access_key != payload_access_key).then(|| IAMErrEntity {
+        name: entry_access_key.to_string(),
+        error: SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR.to_string(),
     })
 }
 
@@ -1014,6 +1022,11 @@ impl Operation for ImportIam {
                         return Err(s3_error!(InvalidArgument, "has space be {ak}"));
                     }
 
+                    if let Some(err) = imported_service_account_access_key_failure(&ak, &req.access_key) {
+                        failed.service_accounts.push(err);
+                        continue;
+                    }
+
                     if let Some(err) = imported_service_account_parent_scope_failure(&ak, &req.parent, &cred, owner) {
                         failed.service_accounts.push(err);
                         continue;
@@ -1021,7 +1034,7 @@ impl Operation for ImportIam {
 
                     let mut update = true;
 
-                    if let Err(e) = iam_store.get_service_account(&req.access_key).await {
+                    if let Err(e) = iam_store.get_service_account(&ak).await {
                         if !matches!(e, rustfs_iam::error::Error::NoSuchServiceAccount(_)) {
                             return Err(s3_error!(InvalidArgument, "failed to get service account {ak} {e}"));
                         }
@@ -1029,7 +1042,7 @@ impl Operation for ImportIam {
                     }
 
                     if update {
-                        iam_store.delete_service_account(&req.access_key, true).await.map_err(|e| {
+                        iam_store.delete_service_account(&ak, true).await.map_err(|e| {
                             S3Error::with_message(
                                 S3ErrorCode::InternalError,
                                 format!("failed to delete service account {ak} {e}"),
@@ -1251,7 +1264,8 @@ impl Operation for ImportIam {
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUP_POLICY_MAPPING_USER_TYPE, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR, imported_service_account_parent_allowed,
+        GROUP_POLICY_MAPPING_USER_TYPE, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR,
+        imported_service_account_access_key_failure, imported_service_account_parent_allowed,
         imported_service_account_parent_scope_failure, imported_service_account_status, should_check_deny_only,
         should_reject_group_import_name, should_restore_group_as_disabled,
     };
@@ -1397,6 +1411,33 @@ mod tests {
         assert!(
             imported_service_account_parent_scope_failure("svc-access-key", "delegated-importer", &requester, false).is_none()
         );
+    }
+
+    #[test]
+    fn test_service_account_import_rejects_payload_access_key_mismatch() {
+        let payload = r#"{
+            "svcalpha": {
+                "parent": "useralpha",
+                "accessKey": "svcbeta",
+                "secretKey": "svcAlphaSecret123",
+                "groups": [],
+                "claims": {},
+                "sessionPolicy": null,
+                "status": "on",
+                "name": "uploaderKey",
+                "description": "alpha upload key",
+                "expiration": "1970-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_str(payload).unwrap();
+        let req = svc_accts.get("svcalpha").unwrap();
+        let err = imported_service_account_access_key_failure("svcalpha", &req.access_key)
+            .expect("mismatched service account access keys must be rejected");
+
+        assert_eq!(err.name, "svcalpha");
+        assert_eq!(err.error, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR);
+        assert!(imported_service_account_access_key_failure("svcalpha", "svcalpha").is_none());
     }
 
     #[test]
