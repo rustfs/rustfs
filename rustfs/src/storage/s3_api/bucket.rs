@@ -68,7 +68,7 @@ pub(crate) fn build_list_buckets_output(bucket_infos: &[BucketInfo]) -> ListBuck
     let buckets: Vec<Bucket> = bucket_infos
         .iter()
         .map(|bucket_info| Bucket {
-            creation_date: bucket_info.created.map(Timestamp::from),
+            creation_date: Some(Timestamp::from(bucket_info.created.unwrap_or(time::OffsetDateTime::UNIX_EPOCH))),
             name: Some(bucket_info.name.clone()),
             ..Default::default()
         })
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(buckets[0].name.as_deref(), Some("bucket-a"));
         assert_eq!(buckets[0].creation_date, Some(s3s::dto::Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
         assert_eq!(buckets[1].name.as_deref(), Some("bucket-b"));
-        assert_eq!(buckets[1].creation_date, None);
+        assert_eq!(buckets[1].creation_date, Some(s3s::dto::Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
 
         let expected_owner = rustfs_owner();
         assert_eq!(owner.display_name, expected_owner.display_name);
