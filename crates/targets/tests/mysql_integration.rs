@@ -45,6 +45,7 @@ fn make_args(dsn: &str, table: &str, queue_dir: &str) -> MySqlArgs {
         enable: true,
         dsn_string: dsn.to_string(),
         table: table.to_string(),
+        format: "access".to_string(),
         queue_dir: queue_dir.to_string(),
         queue_limit: 100,
         max_open_connections: 2,

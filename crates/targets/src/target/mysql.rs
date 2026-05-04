@@ -45,6 +45,8 @@ pub struct MySqlArgs {
     pub dsn_string: String,
     /// Target table name, accepts `identifier` or `database.identifier`
     pub table: String,
+    /// Write format (currently only `access` is supported)
+    pub format: String,
     /// Directory for persistent queue storage; must be an absolute path if non-empty
     pub queue_dir: String,
     /// Maximum number of events stored in the local queue
@@ -70,6 +72,13 @@ impl MySqlArgs {
         let _ = MySqlDsn::parse(&self.dsn_string)?;
 
         validate_table_name(&self.table)?;
+
+        if self.format != "access" {
+            return Err(TargetError::Configuration(format!(
+                "MySQL format '{}' is not supported; only 'access' is available",
+                self.format
+            )));
+        }
 
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
@@ -963,6 +972,7 @@ mod tests {
                 enable: false,
                 dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
                 table: "events".to_string(),
+                format: "access".to_string(),
                 queue_dir: String::new(),
                 queue_limit: 0,
                 max_open_connections: 2,
@@ -1006,6 +1016,7 @@ mod tests {
                 enable: false,
                 dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
                 table: "events".to_string(),
+                format: "access".to_string(),
                 queue_dir,
                 queue_limit: 10,
                 max_open_connections: 2,
@@ -1059,6 +1070,7 @@ mod tests {
                 enable: false,
                 dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
                 table: "events".to_string(),
+                format: "access".to_string(),
                 queue_dir,
                 queue_limit: 10,
                 max_open_connections: 2,

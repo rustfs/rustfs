@@ -76,6 +76,7 @@ pub const PULSAR_QUEUE_LIMIT: &str = "queue_limit";
 
 pub const MYSQL_DSN_STRING: &str = "dsn_string";
 pub const MYSQL_TABLE: &str = "table";
+pub const MYSQL_FORMAT: &str = "format";
 pub const MYSQL_QUEUE_DIR: &str = "queue_dir";
 pub const MYSQL_QUEUE_LIMIT: &str = "queue_limit";
 pub const MYSQL_MAX_OPEN_CONNECTIONS: &str = "max_open_connections";
