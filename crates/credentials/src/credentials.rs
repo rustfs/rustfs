@@ -559,6 +559,18 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_rpc_secret_trims_and_falls_back_from_blank_env() {
+        assert_eq!(
+            resolve_rpc_secret(Some("  custom-rpc-secret  "), None).as_deref(),
+            Some("custom-rpc-secret")
+        );
+        assert_eq!(
+            resolve_rpc_secret(Some("  "), Some("custom-global-secret")).as_deref(),
+            Some("custom-global-secret")
+        );
+    }
+
+    #[test]
     fn test_masked_debug() {
         // Test None
         assert_eq!(format!("{:?}", Masked(None)), "");
