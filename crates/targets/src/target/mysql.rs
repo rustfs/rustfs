@@ -550,14 +550,9 @@ where
         // short reads/writes to the pool cache. All I/O (connecting,
         // DDL, schema validation) happens outside the lock so that
         // concurrent callers are not blocked by a slow MySQL server.
-        let mut conn = pool
-            .get_conn()
-            .await
-            .map_err(|_| TargetError::NotConnected)?;
+        let mut conn = pool.get_conn().await.map_err(|_| TargetError::NotConnected)?;
 
-        conn.query_drop("SELECT 1")
-            .await
-            .map_err(|_| TargetError::NotConnected)?;
+        conn.query_drop("SELECT 1").await.map_err(|_| TargetError::NotConnected)?;
 
         let ddl = format!(
             "CREATE TABLE IF NOT EXISTS {} (event_time DATETIME(6) NOT NULL, event_data JSON NOT NULL)",
