@@ -51,15 +51,18 @@
 //! tests, and then shut it down.
 
 pub mod admin;
+pub mod allocator_reclaim;
 pub mod app;
 pub mod auth;
 pub mod auth_keystone;
 pub mod capacity;
 pub mod config;
+pub mod delete_tail_activity;
 pub mod embedded;
 pub mod error;
 pub mod init;
 pub mod license;
+pub mod memory_observability;
 pub mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav"))]
 pub mod protocols;

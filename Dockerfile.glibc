@@ -31,14 +31,25 @@ RUN set -eux; \
       arm64)  ARCH_SUBSTR="aarch64-gnu" ;; \
       *) echo "Unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    \
     if [ "$RELEASE" = "latest" ]; then \
       TAG="$(curl -fsSL https://api.github.com/repos/rustfs/rustfs/releases \
               | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4 | head -n 1)"; \
+      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG")"; \
     else \
       TAG="$RELEASE"; \
+      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" 2>/dev/null || true)"; \
+      if [ -z "$RELEASE_JSON" ]; then \
+        if [ "${TAG#v}" = "$TAG" ]; then \
+          ALT_TAG="v$TAG"; \
+        else \
+          ALT_TAG="${TAG#v}"; \
+        fi; \
+        echo "Primary tag lookup failed, retrying with alternate tag: $ALT_TAG"; \
+        RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$ALT_TAG")"; \
+        TAG="$ALT_TAG"; \
+      fi; \
     fi; \
-    \
+    echo "Using tag: $TAG (arch pattern: $ARCH_SUBSTR)"; \
     URL="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" \
            | grep -o "\"browser_download_url\": \"[^\"]*${ARCH_SUBSTR}[^\"]*\\.zip\"" \
            | cut -d'"' -f4 | head -n 1)"; \
@@ -97,7 +108,6 @@ ENV RUSTFS_ADDRESS=":9000" \
     RUSTFS_ACCESS_KEY="rustfsadmin" \
     RUSTFS_SECRET_KEY="rustfsadmin" \
     RUSTFS_CONSOLE_ENABLE="true" \
-    RUSTFS_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_VOLUMES="/data" \
     RUSTFS_OBS_LOGGER_LEVEL=warn \

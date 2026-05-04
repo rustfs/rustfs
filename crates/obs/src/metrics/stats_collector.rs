@@ -21,10 +21,14 @@
 //! and convert them to the Stats structs used by collectors.
 
 use crate::metrics::collectors::{
-    BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats, ClusterHealthStats,
-    ClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats, HostNetworkStats, MemoryStats, ProcessStats,
-    ProcessStatusType, ReplicationStats, ResourceStats,
+    BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats, BucketUsageStats,
+    ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats, CpuStats, DiskStats, DriveCountStats,
+    DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats,
+    ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
+use chrono::Utc;
+use rustfs_common::{internode_metrics::global_internode_metrics, metrics::global_metrics};
+use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState};
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
@@ -32,7 +36,9 @@ use rustfs_ecstore::global::get_global_bucket_monitor;
 use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
+use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
+use std::collections::HashMap;
 use std::time::Duration;
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
@@ -41,6 +47,15 @@ const DRIVE_STATE_OK: &str = "ok";
 const DRIVE_STATE_ONLINE: &str = "online";
 const DRIVE_STATE_UNFORMATTED: &str = "unformatted";
 const DRIVE_RUNTIME_STATE_RETURNING: &str = "returning";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ErasureSetQuorumShape {
+    data_shards: u32,
+    read_quorum: u32,
+    write_quorum: u32,
+    read_tolerance: u32,
+    write_tolerance: u32,
+}
 
 fn disk_is_online_for_metrics(state: &str, runtime_state: Option<&str>) -> bool {
     let state_is_acceptable = state.eq_ignore_ascii_case(DRIVE_STATE_OK)
@@ -54,6 +69,30 @@ fn disk_is_online_for_metrics(state: &str, runtime_state: Option<&str>) -> bool 
     }
 
     state_is_acceptable
+}
+
+fn derive_erasure_set_quorum_shape(set_drive_count: usize, parity: usize) -> ErasureSetQuorumShape {
+    let data_shards = set_drive_count.saturating_sub(parity);
+    let read_quorum = data_shards.max(1);
+    let mut write_quorum = read_quorum;
+    if data_shards == parity {
+        write_quorum += 1;
+    }
+
+    ErasureSetQuorumShape {
+        data_shards: data_shards as u32,
+        read_quorum: read_quorum as u32,
+        write_quorum: write_quorum as u32,
+        read_tolerance: parity as u32,
+        write_tolerance: set_drive_count.saturating_sub(write_quorum) as u32,
+    }
+}
+
+fn apply_erasure_set_health(entry: &mut ErasureSetStats) {
+    let online = entry.online_drives_count;
+    entry.read_health = u8::from(online >= entry.read_quorum);
+    entry.write_health = u8::from(online >= entry.write_quorum);
+    entry.health = u8::from(entry.write_health == 1);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -285,14 +324,12 @@ pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationS
             proxied_get_requests_failures: proxy.get_failed.max(0) as u64,
             proxied_head_requests_total: proxy.head_total.max(0) as u64,
             proxied_head_requests_failures: proxy.head_failed.max(0) as u64,
-            // Proxy cache currently tracks generic PutObject requests, not tagging-specific APIs.
-            // Keep tagging counters zero until PutObjectTagging stats are tracked separately.
-            proxied_put_tagging_requests_total: 0,
-            proxied_put_tagging_requests_failures: 0,
-            proxied_get_tagging_requests_total: 0,
-            proxied_get_tagging_requests_failures: 0,
-            proxied_delete_tagging_requests_total: 0,
-            proxied_delete_tagging_requests_failures: 0,
+            proxied_put_tagging_requests_total: proxy.put_tag_total.max(0) as u64,
+            proxied_put_tagging_requests_failures: proxy.put_tag_failed.max(0) as u64,
+            proxied_get_tagging_requests_total: proxy.get_tag_total.max(0) as u64,
+            proxied_get_tagging_requests_failures: proxy.get_tag_failed.max(0) as u64,
+            proxied_delete_tagging_requests_total: proxy.delete_tag_total.max(0) as u64,
+            proxied_delete_tagging_requests_failures: proxy.delete_tag_failed.max(0) as u64,
             targets,
         });
     }
@@ -585,6 +622,226 @@ pub fn collect_host_network_stats() -> HostNetworkStats {
     }
 }
 
+/// Collect internode network metrics from the global internode metrics snapshot.
+///
+/// The returned values come directly from `global_internode_metrics().snapshot()`
+/// and currently include only the counters and dial timing data tracked by the
+/// internode metrics runtime.
+pub fn collect_internode_network_stats() -> Option<NetworkStats> {
+    let snapshot = global_internode_metrics().snapshot();
+
+    Some(NetworkStats {
+        internode_errors_total: snapshot.errors_total,
+        internode_dial_errors_total: snapshot.dial_errors_total,
+        internode_dial_avg_time_nanos: snapshot.dial_avg_time_nanos,
+        internode_sent_bytes_total: snapshot.sent_bytes_total,
+        internode_recv_bytes_total: snapshot.recv_bytes_total,
+    })
+}
+
+/// Collect cluster config metrics from backend parity configuration.
+pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
+    let store = new_object_layer_fn()?;
+    let backend = store.backend_info().await;
+
+    Some(ClusterConfigStats {
+        rrs_parity: backend.rr_sc_parity.unwrap_or_default() as u32,
+        standard_parity: backend.standard_sc_parity.unwrap_or_default() as u32,
+    })
+}
+
+/// Collect cluster erasure set metrics from storage and backend topology info.
+pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
+    let Some(store) = new_object_layer_fn() else {
+        return Vec::new();
+    };
+
+    let storage_info = store.storage_info().await;
+    let backend = store.backend_info().await;
+    let mut grouped: HashMap<(usize, usize), ErasureSetStats> = HashMap::new();
+
+    for disk in &storage_info.disks {
+        let pool_idx = disk.pool_index.max(0) as usize;
+        let set_idx = disk.set_index.max(0) as usize;
+        let set_drive_count = backend.drives_per_set.get(pool_idx).copied().unwrap_or_default();
+        let parity = backend
+            .standard_sc_parities
+            .get(pool_idx)
+            .copied()
+            .or(backend.standard_sc_parity)
+            .unwrap_or(set_drive_count / 2);
+        let quorum_shape = derive_erasure_set_quorum_shape(set_drive_count, parity);
+
+        let entry = grouped.entry((pool_idx, set_idx)).or_insert_with(|| ErasureSetStats {
+            pool_id: pool_idx as u32,
+            set_id: set_idx as u32,
+            size: set_drive_count as u32,
+            parity: parity as u32,
+            data_shards: quorum_shape.data_shards,
+            read_quorum: quorum_shape.read_quorum,
+            write_quorum: quorum_shape.write_quorum,
+            online_drives_count: 0,
+            healing_drives_count: 0,
+            health: 0,
+            read_tolerance: quorum_shape.read_tolerance,
+            write_tolerance: quorum_shape.write_tolerance,
+            read_health: 0,
+            write_health: 0,
+        });
+
+        if disk_is_online_for_metrics(disk.state.as_str(), disk.runtime_state.as_deref()) {
+            entry.online_drives_count += 1;
+        }
+        if disk.healing {
+            entry.healing_drives_count += 1;
+        }
+    }
+
+    for entry in grouped.values_mut() {
+        apply_erasure_set_health(entry);
+    }
+
+    let mut stats = grouped.into_values().collect::<Vec<_>>();
+    stats.sort_by_key(|stat| (stat.pool_id, stat.set_id));
+    stats
+}
+
+pub async fn collect_iam_stats() -> Option<IamStats> {
+    let iam_sys = get_global_iam_sys()?;
+    let sync = iam_sys.sync_metrics_snapshot();
+    let oidc = oidc_plugin_authn_metrics_snapshot();
+
+    Some(IamStats {
+        last_sync_duration_millis: sync.last_sync_duration_millis,
+        plugin_authn_service_failed_requests_minute: oidc.failed_requests_minute,
+        plugin_authn_service_last_fail_seconds: oidc.last_fail_seconds,
+        plugin_authn_service_last_succ_seconds: oidc.last_succ_seconds,
+        plugin_authn_service_succ_avg_rtt_ms_minute: oidc.succ_avg_rtt_ms_minute,
+        plugin_authn_service_succ_max_rtt_ms_minute: oidc.succ_max_rtt_ms_minute,
+        plugin_authn_service_total_requests_minute: oidc.total_requests_minute,
+        since_last_sync_millis: sync.since_last_sync_millis,
+        sync_failures: sync.sync_failures,
+        sync_successes: sync.sync_successes,
+    })
+}
+
+/// Collect cluster and per-bucket usage metrics from backend usage snapshots.
+///
+/// This reads persisted usage data via `load_data_usage_from_backend()` and
+/// builds cluster totals plus per-bucket distributions from the returned
+/// histograms. It does not trigger an inline object-data rescan.
+pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
+    let store = new_object_layer_fn()?;
+    let data_usage = load_data_usage_from_backend(store.clone()).await.ok()?;
+    let mut buckets = Vec::with_capacity(data_usage.buckets_usage.len());
+
+    for (bucket_name, usage) in &data_usage.buckets_usage {
+        if bucket_name.starts_with('.') {
+            continue;
+        }
+
+        let quota_bytes = match get_quota_config(bucket_name).await {
+            Ok((quota, _)) => quota.get_quota_limit().unwrap_or(0),
+            Err(_) => 0,
+        };
+
+        buckets.push(BucketUsageStats {
+            bucket: bucket_name.clone(),
+            total_bytes: usage.size,
+            objects_count: usage.objects_count,
+            versions_count: usage.versions_count,
+            delete_markers_count: usage.delete_markers_count,
+            quota_bytes,
+            object_size_distribution: usage
+                .object_size_histogram
+                .iter()
+                .map(|(range, count)| (range.clone(), *count))
+                .collect(),
+            version_count_distribution: usage
+                .object_versions_histogram
+                .iter()
+                .map(|(range, count)| (range.clone(), *count))
+                .collect(),
+        });
+    }
+
+    buckets.sort_by(|a, b| a.bucket.cmp(&b.bucket));
+
+    Some((
+        ClusterUsageStats {
+            total_bytes: data_usage.objects_total_size,
+            objects_count: data_usage.objects_total_count,
+            versions_count: data_usage.versions_total_count,
+            delete_markers_count: data_usage.delete_markers_total_count,
+            object_size_distribution: data_usage
+                .buckets_usage
+                .values()
+                .flat_map(|usage| usage.object_size_histogram.iter())
+                .fold(HashMap::<String, u64>::new(), |mut acc, (range, count)| {
+                    *acc.entry(range.clone()).or_default() += *count;
+                    acc
+                })
+                .into_iter()
+                .collect(),
+            versions_distribution: data_usage
+                .buckets_usage
+                .values()
+                .flat_map(|usage| usage.object_versions_histogram.iter())
+                .fold(HashMap::<String, u64>::new(), |mut acc, (range, count)| {
+                    *acc.entry(range.clone()).or_default() += *count;
+                    acc
+                })
+                .into_iter()
+                .collect(),
+        },
+        buckets,
+    ))
+}
+
+/// Collect ILM metrics from the current lifecycle runtime state.
+pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
+    let expiry_pending_tasks = GLOBAL_ExpiryState.read().await.pending_tasks().await as u64;
+    let transition_active_tasks = GLOBAL_TransitionState.active_tasks().max(0) as u64;
+    let transition_pending_tasks = GLOBAL_TransitionState.pending_tasks() as u64;
+    let transition_missed_immediate_tasks = GLOBAL_TransitionState.missed_immediate_tasks().max(0) as u64;
+    let metrics = global_metrics().report().await;
+    let versions_scanned = metrics.life_time_ilm.values().copied().sum();
+
+    Some(IlmStats {
+        expiry_pending_tasks,
+        transition_active_tasks,
+        transition_pending_tasks,
+        transition_missed_immediate_tasks,
+        versions_scanned,
+    })
+}
+
+/// Collect scanner metrics from a runtime source.
+///
+/// Task 5 maps scanner runtime snapshots from `global_metrics()` into the
+/// rustfs-obs scanner collector shape.
+pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
+    let metrics = global_metrics().report().await;
+    let bucket_scans_finished = metrics.life_time_ops.get("scan_bucket_drive").copied().unwrap_or_default();
+    let directories_scanned = metrics.life_time_ops.get("scan_folder").copied().unwrap_or_default();
+    let objects_scanned = metrics.life_time_ops.get("scan_object").copied().unwrap_or_default();
+    let versions_scanned = metrics.life_time_ilm.values().copied().sum();
+    let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
+    let last_activity_seconds = Utc::now().signed_duration_since(reference_time).num_seconds().max(0) as u64;
+
+    Some(ScannerStats {
+        bucket_scans_finished,
+        // `global_metrics()` currently tracks completed bucket-drive scans, not a
+        // separate started counter. Mirror the finished count until Task 5/Task 10
+        // expands the scanner runtime source shape.
+        bucket_scans_started: bucket_scans_finished,
+        directories_scanned,
+        objects_scanned,
+        versions_scanned,
+        last_activity_seconds,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +854,58 @@ mod tests {
     #[test]
     fn disk_is_online_for_metrics_rejects_offline_runtime_state() {
         assert!(!disk_is_online_for_metrics(DRIVE_STATE_OK, Some("offline")));
+    }
+
+    #[test]
+    fn derive_erasure_set_quorum_shape_handles_standard_layout() {
+        let shape = derive_erasure_set_quorum_shape(16, 4);
+
+        assert_eq!(
+            shape,
+            ErasureSetQuorumShape {
+                data_shards: 12,
+                read_quorum: 12,
+                write_quorum: 12,
+                read_tolerance: 4,
+                write_tolerance: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn derive_erasure_set_quorum_shape_handles_equal_data_and_parity() {
+        let shape = derive_erasure_set_quorum_shape(4, 2);
+
+        assert_eq!(
+            shape,
+            ErasureSetQuorumShape {
+                data_shards: 2,
+                read_quorum: 2,
+                write_quorum: 3,
+                read_tolerance: 2,
+                write_tolerance: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_erasure_set_health_marks_read_and_write_health_from_online_count() {
+        let mut stats = ErasureSetStats {
+            read_quorum: 3,
+            write_quorum: 4,
+            online_drives_count: 3,
+            ..Default::default()
+        };
+
+        apply_erasure_set_health(&mut stats);
+        assert_eq!(stats.read_health, 1);
+        assert_eq!(stats.write_health, 0);
+        assert_eq!(stats.health, 0);
+
+        stats.online_drives_count = 4;
+        apply_erasure_set_health(&mut stats);
+        assert_eq!(stats.read_health, 1);
+        assert_eq!(stats.write_health, 1);
+        assert_eq!(stats.health, 1);
     }
 }

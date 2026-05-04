@@ -19,6 +19,9 @@ global:
     cluster: 'rustfs-dev'  # Label to identify the cluster
     replica: '1'  # Replica identifier
 
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
 scrape_configs:
   - job_name: 'otel-collector'
     static_configs:

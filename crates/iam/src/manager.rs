@@ -36,7 +36,7 @@ use rustfs_policy::{
 use rustfs_utils::{get_env_opt_str, path::path_join_buf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -93,6 +93,17 @@ pub struct IamCache<T> {
     pub roles: HashMap<ARN, Vec<String>>,
     pub send_chan: Sender<i64>,
     pub last_timestamp: AtomicI64,
+    pub sync_failures: AtomicU64,
+    pub sync_successes: AtomicU64,
+    pub last_sync_duration_millis: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IamSyncMetricsSnapshot {
+    pub last_sync_duration_millis: u64,
+    pub since_last_sync_millis: u64,
+    pub sync_failures: u64,
+    pub sync_successes: u64,
 }
 
 impl<T> IamCache<T>
@@ -116,6 +127,9 @@ where
             send_chan: sender,
             roles: HashMap::new(),
             last_timestamp: AtomicI64::new(0),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
         });
 
         sys.clone().init(receiver).await.unwrap();
@@ -200,11 +214,38 @@ where
     }
 
     async fn load(self: Arc<Self>) -> Result<()> {
-        // debug!("load iam to cache");
-        self.api.load_all(&self.cache).await?;
-        self.last_timestamp
-            .store(OffsetDateTime::now_utc().unix_timestamp(), Ordering::Relaxed);
-        Ok(())
+        let started_at = std::time::Instant::now();
+        match self.api.load_all(&self.cache).await {
+            Ok(()) => {
+                self.last_timestamp
+                    .store(OffsetDateTime::now_utc().unix_timestamp(), Ordering::Relaxed);
+                self.sync_successes.fetch_add(1, Ordering::Relaxed);
+                self.last_sync_duration_millis
+                    .store(started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(err) => {
+                self.sync_failures.fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn sync_metrics_snapshot(&self) -> IamSyncMetricsSnapshot {
+        let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+        let last_sync_secs = self.last_timestamp.load(Ordering::Relaxed);
+        let since_last_sync_millis = if last_sync_secs > 0 && now_secs >= last_sync_secs {
+            ((now_secs - last_sync_secs) as u64).saturating_mul(1000)
+        } else {
+            0
+        };
+
+        IamSyncMetricsSnapshot {
+            last_sync_duration_millis: self.last_sync_duration_millis.load(Ordering::Relaxed),
+            since_last_sync_millis,
+            sync_failures: self.sync_failures.load(Ordering::Relaxed),
+            sync_successes: self.sync_successes.load(Ordering::Relaxed),
+        }
     }
 
     pub async fn load_user(&self, access_key: &str) -> Result<()> {
@@ -214,18 +255,30 @@ where
         let mut sts_policy_map = HashMap::new();
         let mut policy_docs_map = HashMap::new();
 
-        let _ = self.api.load_user(access_key, UserType::Svc, &mut users_map).await;
+        match self.api.load_user(access_key, UserType::Svc, &mut users_map).await {
+            Ok(()) => {}
+            Err(err) if is_err_no_such_user(&err) => {}
+            Err(err) => return Err(err),
+        }
 
         let parent_user = users_map.get(access_key).map(|svc| svc.credentials.parent_user.clone());
 
         if let Some(parent_user) = parent_user {
-            let _ = self.api.load_user(&parent_user, UserType::Reg, &mut users_map).await;
+            match self.api.load_user(&parent_user, UserType::Reg, &mut users_map).await {
+                Ok(()) => {}
+                Err(err) if is_err_no_such_user(&err) => {}
+                Err(err) => return Err(err),
+            }
             let _ = self
                 .api
                 .load_mapped_policy(&parent_user, UserType::Reg, false, &mut user_policy_map)
                 .await;
         } else {
-            let _ = self.api.load_user(access_key, UserType::Reg, &mut users_map).await;
+            match self.api.load_user(access_key, UserType::Reg, &mut users_map).await {
+                Ok(()) => {}
+                Err(err) if is_err_no_such_user(&err) => {}
+                Err(err) => return Err(err),
+            }
             if users_map.contains_key(access_key) {
                 let _ = self
                     .api
@@ -233,7 +286,11 @@ where
                     .await;
             }
 
-            let _ = self.api.load_user(access_key, UserType::Sts, &mut sts_users_map).await;
+            match self.api.load_user(access_key, UserType::Sts, &mut sts_users_map).await {
+                Ok(()) => {}
+                Err(err) if is_err_no_such_user(&err) => {}
+                Err(err) => return Err(err),
+            }
 
             let has_sts_user = sts_users_map.get(access_key);
 
@@ -588,6 +645,20 @@ where
             }
         }
 
+        let sts_accounts = self.cache.sts_accounts.load();
+        for (_, v) in sts_accounts.iter() {
+            if v.credentials.parent_user == access_key {
+                user_exists = true;
+                if v.credentials.is_temp() && !v.credentials.is_service_account() {
+                    let mut u = v.clone();
+                    u.credentials.secret_key = String::new();
+                    u.credentials.session_token = String::new();
+
+                    ret.push(u);
+                }
+            }
+        }
+
         if !user_exists {
             return Err(Error::NoSuchUser(access_key.to_string()));
         }
@@ -596,8 +667,8 @@ where
     }
 
     pub async fn list_sts_accounts(&self, access_key: &str) -> Result<Vec<Credentials>> {
-        let users = self.cache.users.load();
-        Ok(users
+        let sts_accounts = self.cache.sts_accounts.load();
+        Ok(sts_accounts
             .values()
             .filter_map(|x| {
                 if !access_key.is_empty()
@@ -1364,14 +1435,13 @@ where
     }
 
     pub async fn is_temp_user(&self, access_key: &str) -> Result<(bool, String)> {
-        let users = self.cache.users.load();
-        let u = match users.get(access_key) {
+        let u = match self.get_user(access_key).await {
             Some(u) => u,
             None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
 
         if u.credentials.is_temp() {
-            Ok((true, u.credentials.parent_user.clone()))
+            Ok((true, u.credentials.parent_user))
         } else {
             Ok((false, String::new()))
         }

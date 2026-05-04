@@ -663,7 +663,9 @@ pub fn apply_external_env_compat() -> ExternalEnvCompatReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_str};
+    use super::{
+        apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_bool_with_aliases, get_env_str,
+    };
 
     fn source_key(suffix: &str) -> String {
         let mut key = super::external_env_prefix().to_string();
@@ -746,6 +748,15 @@ mod tests {
         temp_env::with_var("MINIO_ROOT_USER", Some("compat-admin"), || {
             temp_env::with_var_unset("RUSTFS_ROOT_USER", || {
                 assert_eq!(get_env_str("RUSTFS_ROOT_USER", "default-user"), "compat-admin");
+            });
+        });
+    }
+
+    #[test]
+    fn rustfs_bool_env_takes_precedence_over_minio_alias() {
+        temp_env::with_var("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", Some("false"), || {
+            temp_env::with_var("MINIO_CI", Some("1"), || {
+                assert!(!get_env_bool_with_aliases("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", &["MINIO_CI"], true,));
             });
         });
     }

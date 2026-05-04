@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::error::{DiskError, Error as DiskErrorType};
 use crate::rpc::{TONIC_RPC_PREFIX, gen_signature_headers};
 use http::Method;
 use rustfs_common::GLOBAL_CONN_MAP;
 use rustfs_protos::{create_new_channel, proto_gen::node_service::node_service_client::NodeServiceClient};
-use std::error::Error;
+use std::{error::Error, io::ErrorKind};
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
 use tracing::debug;
 
@@ -51,11 +52,52 @@ pub async fn node_service_time_out_client_no_auth(
     node_service_time_out_client(addr, TonicInterceptor::NoOp(NoOpInterceptor)).await
 }
 
+pub(crate) fn is_network_like_disk_error(err: &DiskErrorType) -> bool {
+    match err {
+        DiskError::Timeout => true,
+        DiskError::Io(io_err) => {
+            if matches!(
+                io_err.kind(),
+                ErrorKind::TimedOut
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::NotConnected
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+
+            let message = io_err.to_string().to_ascii_lowercase();
+            [
+                "transport error",
+                "unavailable",
+                "error trying to connect",
+                "connection refused",
+                "connection reset",
+                "broken pipe",
+                "not connected",
+                "unexpected eof",
+                "timed out",
+                "deadline has elapsed",
+                "connection closed",
+                "connection aborted",
+                "tcp connect error",
+            ]
+            .iter()
+            .any(|needle| message.contains(needle))
+        }
+        _ => false,
+    }
+}
+
 pub struct TonicSignatureInterceptor;
 
 impl tonic::service::Interceptor for TonicSignatureInterceptor {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        let headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET);
+        let headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET)
+            .map_err(|_| tonic::Status::unauthenticated("No valid auth token"))?;
         req.metadata_mut().as_mut().extend(headers);
         inject_trace_context_into_metadata(req.metadata_mut());
         inject_request_id_into_metadata(req.metadata_mut());
@@ -94,8 +136,13 @@ mod tests {
     use super::*;
     use tonic::service::Interceptor;
 
+    fn ensure_test_rpc_secret() {
+        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+    }
+
     #[test]
     fn test_signature_interceptor_keeps_auth_headers() {
+        ensure_test_rpc_secret();
         let mut interceptor = TonicSignatureInterceptor;
         let req = tonic::Request::new(());
 
@@ -107,6 +154,7 @@ mod tests {
 
     #[test]
     fn test_signature_interceptor_may_inject_request_id() {
+        ensure_test_rpc_secret();
         let mut interceptor = TonicSignatureInterceptor;
         let req = tonic::Request::new(());
 

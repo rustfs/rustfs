@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::iam_error::iam_error_to_s3_error;
 use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
@@ -79,6 +80,18 @@ fn delete_service_account_success_status(path: &str) -> StatusCode {
     }
 }
 
+fn merge_derived_service_account_claims(
+    target_claims: &mut HashMap<String, serde_json::Value>,
+    source_claims: &HashMap<String, serde_json::Value>,
+) {
+    for (key, value) in source_claims {
+        if key == "exp" {
+            continue;
+        }
+        target_claims.insert(key.clone(), value.clone());
+    }
+}
+
 fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &str) -> bool {
     let caller_parent = if caller.parent_user.is_empty() {
         caller.access_key.as_str()
@@ -92,7 +105,7 @@ fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
     debug!("{action}, e: {:?}", err);
     if is_err_no_such_service_account(&err) {
-        s3_error!(InvalidRequest, "service account not exist")
+        iam_error_to_s3_error(err)
     } else {
         s3_error!(InternalError, "{action}")
     }
@@ -101,7 +114,7 @@ fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str)
 fn map_temp_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
     debug!("{action}, e: {:?}", err);
     if is_err_no_such_temp_account(&err) {
-        s3_error!(InvalidRequest, "access key not exist")
+        iam_error_to_s3_error(err)
     } else {
         s3_error!(InternalError, "{action}")
     }
@@ -303,13 +316,7 @@ impl Operation for AddServiceAccount {
                     opts.claims = Some(HashMap::new());
                 }
 
-                for (k, v) in claims.iter() {
-                    if claims.contains_key("exp") {
-                        continue;
-                    }
-
-                    opts.claims.as_mut().unwrap().insert(k.clone(), v.clone());
-                }
+                merge_derived_service_account_claims(opts.claims.as_mut().unwrap(), &claims);
             }
         }
 
@@ -1505,8 +1512,8 @@ mod tests {
             "get service account failed",
         );
 
-        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("service account not exist"));
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchResource);
+        assert_eq!(err.message(), Some("service account 'missing' does not exist"));
     }
 
     #[test]
@@ -1516,8 +1523,8 @@ mod tests {
             "get temporary account failed",
         );
 
-        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("access key not exist"));
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchResource);
+        assert_eq!(err.message(), Some("temp account 'missing' does not exist"));
     }
 
     #[test]
@@ -1551,5 +1558,21 @@ mod tests {
         assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
         assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
         assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
+    }
+
+    #[test]
+    fn merge_derived_service_account_claims_skips_only_expiration() {
+        let mut merged = HashMap::new();
+        let source = HashMap::from([
+            ("exp".to_string(), json!(123456)),
+            ("parent".to_string(), json!("owner-user")),
+            ("custom".to_string(), json!("value")),
+        ]);
+
+        merge_derived_service_account_claims(&mut merged, &source);
+
+        assert!(!merged.contains_key("exp"));
+        assert_eq!(merged.get("parent"), Some(&json!("owner-user")));
+        assert_eq!(merged.get("custom"), Some(&json!("value")));
     }
 }

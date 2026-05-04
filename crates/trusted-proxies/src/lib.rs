@@ -18,12 +18,19 @@ mod error;
 mod global;
 mod middleware;
 mod proxy;
+mod simple;
 mod utils;
 
 pub use cloud::*;
 pub use config::*;
 pub use error::*;
-pub use global::{config as global_config, init, is_enabled, layer, metrics};
-pub use middleware::{TrustedProxyLayer, TrustedProxyMiddleware};
+pub use global::{
+    config as legacy_global_config, init as legacy_init, is_enabled as legacy_is_enabled, layer as legacy_layer,
+    metrics as legacy_metrics,
+};
+pub use middleware::{TrustedProxyLayer as LegacyTrustedProxyLayer, TrustedProxyMiddleware as LegacyTrustedProxyMiddleware};
 pub use proxy::*;
+pub use simple::{
+    TrustedProxyImplementation, TrustedProxyLayer, TrustedProxyMiddleware, implementation, init, is_enabled, layer,
+};
 pub use utils::*;

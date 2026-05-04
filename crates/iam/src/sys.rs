@@ -16,9 +16,9 @@ use crate::error::Error as IamError;
 use crate::error::is_err_no_such_account;
 use crate::error::is_err_no_such_temp_account;
 use crate::error::{Error, Result};
-use crate::manager::IamCache;
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
+use crate::manager::{IamCache, IamSyncMetricsSnapshot};
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
@@ -184,6 +184,10 @@ impl<T: Store> IamSys<T> {
     /// `true` if a watcher is configured, `false` otherwise
     pub fn has_watcher(&self) -> bool {
         self.store.api.has_watcher()
+    }
+
+    pub fn sync_metrics_snapshot(&self) -> IamSyncMetricsSnapshot {
+        self.store.sync_metrics_snapshot()
     }
 
     pub async fn set_policy_plugin_client(client: rustfs_policy::policy::opa::AuthZPlugin) {
@@ -751,7 +755,7 @@ impl<T: Store> IamSys<T> {
                 Ok((Some(res), ok))
             }
             None => {
-                let _ = self.store.load_user(access_key).await;
+                self.store.load_user(access_key).await?;
 
                 if let Some(res) = self.store.get_user(access_key).await {
                     let ok = res.credentials.is_valid();
@@ -863,16 +867,6 @@ impl<T: Store> IamSys<T> {
             };
         }
 
-        let Ok((is_temp, parent_user)) = self.is_temp_user(args.account).await else {
-            return PreparedIamAuth {
-                needs_existing_object_tag: false,
-                mode: PreparedIamMode::Deny,
-            };
-        };
-        if is_temp {
-            return self.prepare_sts_auth(args, &parent_user).await;
-        }
-
         let Ok((is_svc, parent_user)) = self.is_service_account(args.account).await else {
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
@@ -881,6 +875,16 @@ impl<T: Store> IamSys<T> {
         };
         if is_svc {
             return self.prepare_service_account_auth(args, &parent_user).await;
+        }
+
+        let Ok((is_temp, parent_user)) = self.is_temp_user(args.account).await else {
+            return PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            };
+        };
+        if is_temp {
+            return self.prepare_sts_auth(args, &parent_user).await;
         }
 
         self.prepare_regular_auth(args).await
@@ -1291,7 +1295,7 @@ mod tests {
     use crate::manager::get_default_policyes;
     use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
     use rustfs_credentials::{Credentials, get_global_action_cred, init_global_action_credentials};
-    use rustfs_policy::auth::UserIdentity;
+    use rustfs_policy::auth::{UserIdentity, get_new_credentials_with_metadata};
     use rustfs_policy::policy::Args;
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
     use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
@@ -1368,6 +1372,10 @@ mod tests {
         }
 
         async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            if user_type == UserType::Reg && name == "load-failure-user" {
+                return Err(Error::Io(std::io::Error::other("load user failed")));
+            }
+
             if user_type == UserType::Reg && name == "notify-user" {
                 let user = UserIdentity::from(Credentials {
                     access_key: name.to_string(),
@@ -1669,6 +1677,189 @@ mod tests {
         assert_eq!(claims.get("exp").and_then(|v| v.as_i64()), Some(updated_expiration.unix_timestamp()));
     }
 
+    #[tokio::test]
+    async fn test_created_access_token_authorizes_with_parent_policy() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-fallback-test-parent";
+        let groups = Some(vec!["testgroup".to_string()]);
+        let (cred, _) = iam_sys
+            .new_service_account(
+                parent_user,
+                groups.clone(),
+                NewServiceAccountOpts {
+                    access_key: "ACCESSTOKENTESTUSER".to_string(),
+                    secret_key: "accessTokenTestSecret".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("access token should be created");
+
+        let stored = iam_sys
+            .get_user(&cred.access_key)
+            .await
+            .expect("created access token should be cached");
+        assert!(stored.credentials.is_service_account());
+        assert_eq!(stored.credentials.parent_user, parent_user);
+
+        let claims = stored
+            .credentials
+            .claims
+            .as_ref()
+            .expect("created access token should have decoded JWT claims");
+        assert_eq!(claims.get("parent").and_then(Value::as_str), Some(parent_user));
+        assert_eq!(
+            claims.get(&iam_policy_claim_name_sa()).and_then(Value::as_str),
+            Some(INHERITED_POLICY_TYPE)
+        );
+
+        let (is_service_account, resolved_parent) = iam_sys
+            .is_service_account(&cred.access_key)
+            .await
+            .expect("created access token should be recognized as a service account");
+        assert!(is_service_account);
+        assert_eq!(resolved_parent, parent_user);
+
+        let (redacted, policy) = iam_sys
+            .get_service_account(&cred.access_key)
+            .await
+            .expect("created access token should be readable");
+        assert_eq!(redacted.access_key, cred.access_key);
+        assert_eq!(redacted.parent_user, parent_user);
+        assert!(redacted.secret_key.is_empty());
+        assert!(redacted.session_token.is_empty());
+        assert!(policy.is_none());
+
+        let args = Args {
+            account: &cred.access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::ListBucketAction),
+            bucket: "mybucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_auth(&args).await;
+        assert!(
+            matches!(prepared.mode, PreparedIamMode::ServiceAccount { .. }),
+            "created access token must use service-account authorization path"
+        );
+        assert!(
+            iam_sys.eval_prepared(&prepared, &args).await,
+            "created access token should be allowed through the parent's group policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_created_sts_credentials_authorize_with_session_token_claims() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-fallback-test-parent";
+        let token_secret = get_global_action_cred()
+            .expect("global action credentials should be initialized")
+            .secret_key;
+        let mut claims = HashMap::new();
+        claims.insert("parent".to_string(), Value::String(parent_user.to_string()));
+        claims.insert(
+            "exp".to_string(),
+            Value::Number(serde_json::Number::from(
+                (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp(),
+            )),
+        );
+
+        let mut cred = get_new_credentials_with_metadata(&claims, &token_secret).expect("STS credentials should be created");
+        cred.parent_user = parent_user.to_string();
+
+        iam_sys
+            .set_temp_user(&cred.access_key, &cred, None)
+            .await
+            .expect("STS credentials should be persisted in the temp-user cache");
+
+        let stored = iam_sys
+            .get_user(&cred.access_key)
+            .await
+            .expect("created STS credentials should be cached");
+        assert!(stored.credentials.is_temp());
+        assert!(!stored.credentials.is_service_account());
+        assert_eq!(stored.credentials.parent_user, parent_user);
+
+        let (is_temp, resolved_parent) = iam_sys
+            .is_temp_user(&cred.access_key)
+            .await
+            .expect("created STS credentials should be recognized as temp");
+        assert!(is_temp);
+        assert_eq!(resolved_parent, parent_user);
+
+        let listed = iam_sys
+            .list_sts_accounts(parent_user)
+            .await
+            .expect("created STS credentials should be listable by parent");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].access_key, cred.access_key);
+        assert_eq!(listed[0].parent_user, parent_user);
+        assert!(listed[0].secret_key.is_empty());
+        assert!(listed[0].session_token.is_empty());
+
+        let temp_accounts = iam_sys
+            .list_temp_accounts(parent_user)
+            .await
+            .expect("created STS credentials should be listable as temp accounts");
+        assert_eq!(temp_accounts.len(), 1);
+        assert_eq!(temp_accounts[0].credentials.access_key, cred.access_key);
+        assert_eq!(temp_accounts[0].credentials.parent_user, parent_user);
+        assert!(temp_accounts[0].credentials.secret_key.is_empty());
+        assert!(temp_accounts[0].credentials.session_token.is_empty());
+
+        let (redacted, policy) = iam_sys
+            .get_temporary_account(&cred.access_key)
+            .await
+            .expect("created STS credentials should be readable");
+        assert_eq!(redacted.access_key, cred.access_key);
+        assert_eq!(redacted.parent_user, parent_user);
+        assert!(redacted.secret_key.is_empty());
+        assert!(redacted.session_token.is_empty());
+        assert!(policy.is_none());
+
+        let decoded_claims = get_claims_from_token_with_secret(&cred.session_token, &token_secret)
+            .expect("created STS session token should decode with the active signing key");
+        assert_eq!(decoded_claims.get("parent").and_then(Value::as_str), Some(parent_user));
+
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: &cred.access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::ListBucketAction),
+            bucket: "mybucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &decoded_claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_auth(&args).await;
+        assert!(
+            matches!(prepared.mode, PreparedIamMode::Sts { .. }),
+            "created STS credentials must use STS authorization path"
+        );
+        assert!(
+            iam_sys.eval_prepared(&prepared, &args).await,
+            "created STS credentials should inherit the parent user's group policy"
+        );
+    }
+
     /// Regression test: temp credentials without groups in args still receive group-attached
     /// policies via the parent user (groups fallback). Without the fallback, policy_db_get
     /// would get None for groups and the user would have no group policies, so the action
@@ -1807,6 +1998,17 @@ mod tests {
             bucket_users.contains_key("notify-user"),
             "regular user mapped policy must be written to user_policies for bucket user listing"
         );
+    }
+
+    #[tokio::test]
+    async fn test_check_key_propagates_cache_miss_load_failure() {
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let result = iam_sys.check_key("load-failure-user").await;
+
+        assert!(matches!(result, Err(Error::Io(_))));
     }
 
     #[tokio::test]

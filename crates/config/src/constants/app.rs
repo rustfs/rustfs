@@ -131,6 +131,18 @@ pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
 /// Environment variable for server volumes.
 pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
 
+/// Environment variable to explicitly bypass local physical disk independence checks.
+pub const ENV_UNSAFE_BYPASS_DISK_CHECK: &str = "RUSTFS_UNSAFE_BYPASS_DISK_CHECK";
+
+/// Compatibility alias used by legacy MinIO CI pipelines.
+///
+/// RustFS keeps this alias for backward compatibility only. Prefer
+/// `ENV_UNSAFE_BYPASS_DISK_CHECK` for explicit bypass control.
+pub const ENV_MINIO_CI: &str = "MINIO_CI";
+
+/// Default flag value for bypassing local physical disk independence checks.
+pub const DEFAULT_UNSAFE_BYPASS_DISK_CHECK: bool = false;
+
 /// Environment variable for server access key.
 pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
 
@@ -223,6 +235,9 @@ pub const ENV_RUSTFS_REGION: &str = "RUSTFS_REGION";
 /// Environment variable for server license.
 pub const ENV_RUSTFS_LICENSE: &str = "RUSTFS_LICENSE";
 
+/// Environment variable for the RSA public key used to verify server licenses.
+pub const ENV_RUSTFS_LICENSE_PUBLIC_KEY: &str = "RUSTFS_LICENSE_PUBLIC_KEY";
+
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.
 /// It is used to store the logs of the application.
@@ -284,9 +299,9 @@ pub const DEFAULT_OBS_LOGS_EXPORT_ENABLED: bool = true;
 
 /// Default profiling export enabled
 /// It is used to enable or disable exporting profiles
-/// Default value: true
+/// Default value: false
 /// Environment variable: RUSTFS_OBS_PROFILING_EXPORT_ENABLED
-pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = true;
+pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = false;
 
 /// Default log local logging enabled for rustfs
 /// This is the default log local logging enabled for rustfs.
@@ -336,6 +351,7 @@ mod tests {
     fn test_environment_constants() {
         // Test environment related constants
         assert_eq!(ENVIRONMENT, "production");
+        assert_eq!(ENV_RUSTFS_LICENSE_PUBLIC_KEY, "RUSTFS_LICENSE_PUBLIC_KEY");
         assert!(
             ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
             "Environment should be a standard environment name"

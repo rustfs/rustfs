@@ -80,7 +80,9 @@ The library selects a backend automatically based on configuration:
 
 ```
 1. Any OTLP endpoint set?
-   └─ YES → Full OTLP/HTTP pipeline (traces + metrics + logs + profiling)
+   └─ YES → Full OTLP/HTTP pipeline (traces + metrics + logs)
+            + Profiling (Pyroscope) only if:
+              - RUSTFS_OBS_PROFILING_EXPORT_ENABLED=true (explicit opt-in, default: false)
 
 2. RUSTFS_OBS_LOG_DIRECTORY set to a non-empty path?
    └─ YES → Rolling-file JSON logging
@@ -117,7 +119,7 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_TRACES_EXPORT_ENABLED`    | `true`    | Toggle trace export                                        |
 | `RUSTFS_OBS_METRICS_EXPORT_ENABLED`   | `true`    | Toggle metrics export                                      |
 | `RUSTFS_OBS_LOGS_EXPORT_ENABLED`      | `true`    | Toggle OTLP log export                                     |
-| `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `true`    | Toggle profiling export                                    |
+| `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `false`   | Toggle profiling export                                    |
 | `RUSTFS_OBS_USE_STDOUT`               | `false`   | Mirror all signals to stdout alongside OTLP                |
 | `RUSTFS_OBS_SAMPLE_RATIO`             | `0.1`     | Trace sampling ratio `0.0`–`1.0`                           |
 | `RUSTFS_OBS_METER_INTERVAL`           | `15`      | Metrics export interval (seconds)                          |
@@ -171,16 +173,16 @@ The log rotation and cleanup pipeline emits these metrics (via the `metrics` fac
 
 | Metric | Type | Description |
 |---|---|---|
-| `rustfs.log_cleaner.deleted_files_total` | counter | Number of files deleted per cleanup pass |
-| `rustfs.log_cleaner.freed_bytes_total` | counter | Bytes reclaimed by deletion |
-| `rustfs.log_cleaner.compress_duration_seconds` | histogram | Compression stage duration |
-| `rustfs.log_cleaner.steal_success_rate` | gauge | Work-stealing success ratio in parallel mode |
-| `rustfs.log_cleaner.runs_total` | counter | Successful cleanup loop runs |
-| `rustfs.log_cleaner.run_failures_total` | counter | Failed or panicked cleanup loop runs |
-| `rustfs.log_cleaner.rotation_total` | counter | Successful file rotations |
-| `rustfs.log_cleaner.rotation_failures_total` | counter | Failed file rotations |
-| `rustfs.log_cleaner.rotation_duration_seconds` | histogram | Rotation latency |
-| `rustfs.log_cleaner.active_file_size_bytes` | gauge | Current active log file size |
+| `rustfs_log_cleaner_deleted_files_total` | counter | Number of files deleted per cleanup pass |
+| `rustfs_log_cleaner_freed_bytes_total` | counter | Bytes reclaimed by deletion |
+| `rustfs_log_cleaner_compress_duration_seconds` | histogram | Compression stage duration |
+| `rustfs_log_cleaner_steal_success_rate` | gauge | Work-stealing success ratio in parallel mode |
+| `rustfs_log_cleaner_runs_total` | counter | Successful cleanup loop runs |
+| `rustfs_log_cleaner_run_failures_total` | counter | Failed or panicked cleanup loop runs |
+| `rustfs_log_cleaner_rotation_total` | counter | Successful file rotations |
+| `rustfs_log_cleaner_rotation_failures_total` | counter | Failed file rotations |
+| `rustfs_log_cleaner_rotation_duration_seconds` | histogram | Rotation latency |
+| `rustfs_log_cleaner_active_file_size_bytes` | gauge | Current active log file size |
 
 These metrics cover compression, cleanup, and file rotation end-to-end.
 
@@ -195,8 +197,8 @@ These metrics cover compression, cleanup, and file rotation end-to-end.
 ### Grafana Dashboard JSON Draft (Ready to Import)
 
 > Save this as `rustfs-log-cleaner-dashboard.json`, then import from Grafana UI.
-> For Prometheus datasources, metric names are usually normalized to underscores,
-> so `rustfs.log_cleaner.deleted_files_total` becomes `rustfs_log_cleaner_deleted_files_total`.
+> The canonical metric names use underscore notation, for example
+> `rustfs_log_cleaner_deleted_files_total`.
 >
 > The same panels are now checked in at:
 > `.docker/observability/grafana/dashboards/rustfs.json`

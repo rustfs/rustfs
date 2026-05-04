@@ -87,25 +87,70 @@ impl AsyncBatchProcessor {
         T: Send + 'static,
         F: Future<Output = Result<T>> + Send + 'static,
     {
-        let results = self.execute_batch(tasks).await;
-        let mut successes = Vec::new();
+        if required_successes == 0 {
+            return Ok(Vec::new());
+        }
 
-        for value in results.into_iter().flatten() {
-            successes.push(value);
-            if successes.len() >= required_successes {
-                return Ok(successes);
+        if tasks.is_empty() {
+            return Err(Error::other(format!(
+                "Insufficient successful results: got 0, needed {required_successes}"
+            )));
+        }
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
+        let mut join_set = JoinSet::new();
+        let mut successes = Vec::new();
+        let mut pending_tasks = tasks.len();
+        let mut first_error = None;
+
+        for task in tasks {
+            let sem = semaphore.clone();
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.map_err(|_| Error::other("Semaphore error"))?;
+                task.await
+            });
+        }
+
+        while let Some(join_result) = join_set.join_next().await {
+            pending_tasks = pending_tasks.saturating_sub(1);
+
+            match join_result {
+                Ok(Ok(value)) => {
+                    successes.push(value);
+                    if successes.len() >= required_successes {
+                        return Ok(successes);
+                    }
+                }
+                Ok(Err(err)) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+                Err(join_error) => {
+                    if first_error.is_none() {
+                        first_error = Some(Error::other(format!("Task panicked in quorum batch processor: {join_error}")));
+                    }
+                }
+            }
+
+            if successes.len() + pending_tasks < required_successes {
+                return Err(first_error.unwrap_or_else(|| {
+                    Error::other(format!(
+                        "Insufficient successful results: got {}, needed {}",
+                        successes.len(),
+                        required_successes
+                    ))
+                }));
             }
         }
 
-        if successes.len() >= required_successes {
-            Ok(successes)
-        } else {
-            Err(Error::other(format!(
+        Err(first_error.unwrap_or_else(|| {
+            Error::other(format!(
                 "Insufficient successful results: got {}, needed {}",
                 successes.len(),
                 required_successes
-            )))
-        }
+            ))
+        }))
     }
 }
 
@@ -227,5 +272,53 @@ mod tests {
         assert!(results.is_ok());
         let successes = results.unwrap();
         assert!(successes.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_quorum_returns_before_slow_tail() {
+        let processor = AsyncBatchProcessor::new(4);
+        let started = std::time::Instant::now();
+
+        let tasks: Vec<_> = [(10_u64, Ok(1_i32)), (15, Ok(2)), (250, Ok(3))]
+            .into_iter()
+            .map(|(delay_ms, outcome)| async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                outcome
+            })
+            .collect();
+
+        let results = processor
+            .execute_batch_with_quorum(tasks, 2)
+            .await
+            .expect("quorum should succeed");
+        assert_eq!(results.len(), 2);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_quorum_fails_once_quorum_becomes_impossible() {
+        let processor = AsyncBatchProcessor::new(4);
+        let started = std::time::Instant::now();
+
+        let tasks: Vec<_> = vec![
+            (10_u64, Ok(1_i32)),
+            (15, Err(Error::other("first failure"))),
+            (20, Err(Error::other("second failure"))),
+            (250, Ok(4)),
+        ]
+        .into_iter()
+        .map(|(delay_ms, outcome)| async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            outcome
+        })
+        .collect();
+
+        let err = processor
+            .execute_batch_with_quorum(tasks, 3)
+            .await
+            .expect_err("quorum should fail once it becomes impossible");
+
+        assert!(err.to_string().contains("first failure"));
+        assert!(started.elapsed() < Duration::from_millis(120));
     }
 }

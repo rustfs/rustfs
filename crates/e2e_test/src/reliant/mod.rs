@@ -17,6 +17,7 @@ mod get_deleted_object_test;
 mod grpc_lock_client;
 mod grpc_lock_server;
 mod head_deleted_object_versioning_test;
+mod head_tls_bodyless_test;
 mod lifecycle;
 mod lock;
 mod node_interact_test;

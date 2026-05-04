@@ -157,7 +157,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(increase(rustfs_api_requests_total{job=~\"$job\"}[$__range]))",
+          "expr": "sum(increase(rustfs_http_server_requests_total{job=~\"$job\"}[$__range]))",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -518,7 +518,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(rustfs_api_requests_total{job=~\"$job\"}[5m]))",
+          "expr": "sum(rate(rustfs_http_server_requests_total{job=~\"$job\"}[5m]))",
           "hide": false,
           "instant": false,
           "legendFormat": "__auto",
@@ -605,7 +605,7 @@
       },
       "id": 11,
       "panels": [],
-      "title": "Requests",
+      "title": "API RED",
       "type": "row"
     },
     {
@@ -699,8 +699,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (request_method) (rate(rustfs_api_requests_total{job=~\"$job\", request_method=~\"$method\"}[$__rate_interval]))",
-          "legendFormat": "{{request_method}}",
+          "expr": "sum by (method) (rate(rustfs_http_server_requests_total{job=~\"$job\", method=~\"$method\"}[$__rate_interval]))",
+          "legendFormat": "{{method}}",
           "range": true,
           "refId": "A"
         }
@@ -851,7 +851,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\"}[5m])))",
+          "expr": "1000 * histogram_quantile(0.50, sum by (le, job) (rate(rustfs_http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P50",
           "range": true,
           "refId": "A"
@@ -862,7 +862,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\"}[5m])))",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, job) (rate(rustfs_http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P95",
           "range": true,
           "refId": "B"
@@ -873,7 +873,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_latency_ms_bucket{job=~\"$job\"}[5m])))",
+          "expr": "1000 * histogram_quantile(0.99, sum by (le, job) (rate(rustfs_http_server_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P99",
           "range": true,
           "refId": "C"
@@ -1025,7 +1025,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, job) (rate(rustfs_http_server_response_body_size_bytes_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P50",
           "range": true,
           "refId": "A"
@@ -1036,7 +1036,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(rustfs_http_server_response_body_size_bytes_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P95",
           "range": true,
           "refId": "B"
@@ -1047,13 +1047,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_request_body_len_bucket{job=~\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, job) (rate(rustfs_http_server_response_body_size_bytes_bucket{job=~\"$job\"}[5m])))",
           "legendFormat": "P99",
           "range": true,
           "refId": "C"
         }
       ],
-      "title": "Request Body Percentiles",
+      "title": "Response Body Percentiles",
       "type": "timeseries"
     },
     {
@@ -1566,7 +1566,7 @@
       },
       "id": 34,
       "panels": [],
-      "title": "Buckets",
+      "title": "Storage and Capacity",
       "type": "row"
     },
     {
@@ -2314,7 +2314,7 @@
       },
       "id": 12,
       "panels": [],
-      "title": "Resource Usage",
+      "title": "Host and Process USE",
       "type": "row"
     },
     {
@@ -2534,7 +2534,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (rustfs_system_process_resident_memory_bytes{job=~\"$job\"})",
+          "expr": "sum by (job) (rustfs_system_process_resident_memory_bytes{job=~\"$job\"}) or sum by (job) (rustfs_memory_process_resident_bytes{job=~\"$job\"})",
           "legendFormat": "process rss - {{job}}",
           "range": true,
           "refId": "A"
@@ -2545,8 +2545,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rustfs_system_memory_used_bytes{job=~\"$job\"}",
-          "legendFormat": "system used - {{job}}",
+          "expr": "sum by (job) (rustfs_memory_process_virtual_bytes{job=~\"$job\"})",
+          "legendFormat": "process virtual - {{job}}",
           "range": true,
           "refId": "B"
         },
@@ -2556,13 +2556,755 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rustfs_system_memory_used_perc{job=~\"$job\"}",
-          "legendFormat": "system used percent - {{job}}",
+          "expr": "sum by (job) (rustfs_memory_cgroup_anon_bytes{job=~\"$job\"})",
+          "legendFormat": "anon split - {{job}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_cgroup_file_bytes{job=~\"$job\"})",
+          "legendFormat": "file split - {{job}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Memory Split",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 80
+      },
+      "id": 501,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_delete_tail_activity_total_inflight_current{job=~\"$job\"})",
+          "legendFormat": "delete tail inflight - {{job}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_allocator_reclaim_scanner_activity_current{job=~\"$job\"})",
+          "legendFormat": "scanner activity - {{job}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_allocator_reclaim_heal_activity_current{job=~\"$job\"})",
+          "legendFormat": "heal activity - {{job}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_allocator_reclaim_reclaimable_work_current{job=~\"$job\"})",
+          "legendFormat": "reclaimable work - {{job}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Tail / Reclaim Activity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 80
+      },
+      "id": 502,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_allocator_reclaim_idle_streak{job=~\"$job\"})",
+          "legendFormat": "idle streak - {{job}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rate(rustfs_memory_allocator_reclaim_total{job=~\"$job\",result=\"ok\"}[5m]))",
+          "legendFormat": "reclaim ok rate - {{job}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job,reason) (rate(rustfs_memory_allocator_reclaim_skipped_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "reclaim skipped {{reason}} - {{job}}",
           "range": true,
           "refId": "C"
         }
       ],
-      "title": "Memory Usage",
+      "title": "Allocator Reclaim Health",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 87
+      },
+      "id": 503,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_cgroup_current_bytes{job=~\"$job\"})",
+          "legendFormat": "cgroup current - {{job}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_cgroup_limit_bytes{job=~\"$job\"})",
+          "legendFormat": "cgroup limit - {{job}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_cgroup_active_file_bytes{job=~\"$job\"})",
+          "legendFormat": "active file - {{job}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_cgroup_inactive_file_bytes{job=~\"$job\"})",
+          "legendFormat": "inactive file - {{job}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Memory Cgroup Detail",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 87
+      },
+      "id": 504,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_ec_encode_inflight_bytes_current{job=~\"$job\"})",
+          "legendFormat": "ec inflight bytes - {{job}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_get_object_buffered_bytes_current{job=~\"$job\"})",
+          "legendFormat": "get buffered bytes - {{job}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_allocator_reclaim_active_requests{job=~\"$job\"})",
+          "legendFormat": "allocator active requests - {{job}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job) (rustfs_memory_allocator_reclaim_delete_tail_activity_current{job=~\"$job\"})",
+          "legendFormat": "allocator tail activity - {{job}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Heap Amplification Signals",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 94
+      },
+      "id": 505,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job,stage) (rustfs_delete_tail_activity_inflight_current{job=~\"$job\"})",
+          "legendFormat": "{{stage}} inflight - {{job}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job,stage) (rate(rustfs_delete_tail_activity_started_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "{{stage}} started rate - {{job}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Delete Tail by Stage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 94
+      },
+      "id": 506,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job,kind,result) (rate(rustfs_page_cache_reclaim_requests_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "{{kind}} reclaim {{result}} rate - {{job}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (job,kind) (rate(rustfs_page_cache_reclaim_bytes_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "{{kind}} reclaim bytes/s - {{job}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Page Cache Reclaim",
       "type": "timeseries"
     },
     {
@@ -4964,7 +5706,7 @@
       },
       "id": 114,
       "panels": [],
-      "title": "Delivery Targets",
+      "title": "Security and Delivery",
       "type": "row"
     },
     {
@@ -5463,7 +6205,7 @@
       },
       "id": 121,
       "panels": [],
-      "title": "Scanner Activity",
+      "title": "Background Services",
       "type": "row"
     },
     {
@@ -6566,7 +7308,7 @@
           },
           "editorMode": "code",
           "expr": "rustfs_bucket_replication_proxied_put_tagging_requests_total{job=~\"$job\",bucket=~\"$bucket\"}",
-          "legendFormat": "put - {{bucket}}",
+          "legendFormat": "put via tagging - {{bucket}}",
           "range": true,
           "refId": "E"
         },
@@ -6577,12 +7319,12 @@
           },
           "editorMode": "code",
           "expr": "rustfs_bucket_replication_proxied_put_tagging_requests_failures_total{job=~\"$job\",bucket=~\"$bucket\"}",
-          "legendFormat": "put failures - {{bucket}}",
+          "legendFormat": "put via tagging failures - {{bucket}}",
           "range": true,
           "refId": "F"
         }
       ],
-      "title": "Bucket Replication Proxy Requests (Get/Head/Put)",
+      "title": "Bucket Replication Proxy Requests (Get/Head/Put+Tagging)",
       "type": "timeseries"
     },
     {
@@ -6954,7 +7696,7 @@
       },
       "id": 137,
       "panels": [],
-      "title": "System / Cluster Coverage Gap (By Subsystem)",
+      "title": "Debug / Raw Explorer",
       "type": "row"
     },
     {
@@ -8155,7 +8897,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(rustfs_api_requests_total, job)",
+        "definition": "label_values(rustfs_http_server_requests_total, job)",
         "includeAll": true,
         "label": "Job",
         "multi": true,
@@ -8163,7 +8905,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_api_requests_total, job)",
+          "query": "label_values(rustfs_http_server_requests_total, job)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
@@ -8181,7 +8923,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(rustfs_api_requests_total,request_method)",
+        "definition": "label_values(rustfs_http_server_requests_total,method)",
         "includeAll": true,
         "label": "Method",
         "multi": true,
@@ -8189,7 +8931,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_api_requests_total,request_method)",
+          "query": "label_values(rustfs_http_server_requests_total,method)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,

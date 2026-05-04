@@ -4,6 +4,13 @@ The `rustfs-trusted-proxies` module provides secure and efficient management of 
 ecosystem. It is designed to handle multi-layer proxy architectures, ensuring accurate client IP identification while
 maintaining a zero-trust security model.
 
+## Modes
+
+- **Simple default**: only trusts forwarding headers when the direct peer IP is
+  internal.
+- **Legacy full mode**: keeps the original proxy-chain validation, available
+  via `legacy_*` helpers.
+
 ## Features
 
 - **Multi-Layer Proxy Validation**: Supports `Strict`, `Lenient`, and `HopByHop` validation modes to accurately identify
@@ -23,6 +30,7 @@ The module is configured primarily through environment variables:
 | Variable                                      | Default             | Description                                             |
 |-----------------------------------------------|---------------------|---------------------------------------------------------|
 | `RUSTFS_TRUSTED_PROXY_ENABLED`                | `true`              | Enable the trusted proxy middleware                     |
+| `RUSTFS_TRUSTED_PROXY_IMPLEMENTATION`         | `simple`            | Select `simple` or `legacy` implementation              |
 | `RUSTFS_TRUSTED_PROXY_VALIDATION_MODE`        | `hop_by_hop`        | Validation strategy (`strict`, `lenient`, `hop_by_hop`) |
 | `RUSTFS_TRUSTED_PROXY_NETWORKS`               | `127.0.0.1,::1,...` | Comma-separated list of trusted CIDR ranges             |
 | `RUSTFS_TRUSTED_PROXY_MAX_HOPS`               | `10`                | Maximum allowed proxy hops                              |
@@ -56,6 +64,29 @@ let app = Router::new()
     } else {
         None
     });
+```
+
+### Simple default mode
+
+The default mode only trusts forwarding headers from internal IPs.
+
+```bash
+RUSTFS_TRUSTED_PROXY_IMPLEMENTATION=simple
+```
+
+### Legacy mode
+
+The original implementation is still available:
+
+```rust
+rustfs_trusted_proxies::legacy_init();
+let layer = rustfs_trusted_proxies::LegacyTrustedProxyLayer::enabled(config, None);
+```
+
+Or switch the global default path:
+
+```bash
+RUSTFS_TRUSTED_PROXY_IMPLEMENTATION=legacy
 ```
 
 ### Accessing Client Info

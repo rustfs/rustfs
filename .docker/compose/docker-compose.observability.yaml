@@ -26,7 +26,7 @@ services:
     restart: "no"
 
   tempo:
-    image: grafana/tempo:latest
+    image: grafana/tempo:2.10.5
     user: "10001"
     command: [ "-config.file=/etc/tempo.yaml" ]
     volumes:
@@ -36,9 +36,19 @@ services:
       - "3200:3200" # tempo
       - "4317"      # otlp grpc
       - "4318"      # otlp http
+      - "7946"      # memberlist
     restart: unless-stopped
     networks:
       - rustfs-network
+    depends_on:
+      tempo-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD", "/tempo", "-version" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
@@ -61,6 +71,12 @@ services:
       - jaeger
       - prometheus
       - loki
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "/otelcol-contrib", "--version" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   jaeger:
     image: jaegertracing/jaeger:latest
@@ -72,12 +88,23 @@ services:
       - BADGER_DIRECTORY_KEY=/badger/key
       - COLLECTOR_OTLP_ENABLED=true
     volumes:
+      - ../../.docker/observability/jaeger.yaml:/etc/jaeger/config.yml:ro
       - jaeger-data:/badger
     ports:
       - "16686:16686" # Web UI
       - "14269:14269" # Admin/Metrics
+      - "4317"        # otlp grpc
+      - "4318"        # otlp http
+    command: [ "--config", "/etc/jaeger/config.yml" ]
     networks:
       - rustfs-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:14269" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   prometheus:
     image: prom/prometheus:latest
@@ -85,6 +112,7 @@ services:
       - TZ=Asia/Shanghai
     volumes:
       - ../../.docker/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../.docker/observability/prometheus-rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     ports:
       - "9090:9090"
@@ -94,23 +122,45 @@ services:
       - '--web.enable-remote-write-receiver'
       - '--enable-feature=promql-experimental-functions'
       - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
     networks:
       - rustfs-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   loki:
     image: grafana/loki:latest
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ../../.docker/observability/loki.yaml:/etc/loki/local-config.yaml:ro
+      - ../../.docker/observability/loki.yaml:/etc/loki/loki.yaml:ro
       - loki-data:/loki
     ports:
       - "3100:3100"
-    command: -config.file=/etc/loki/local-config.yaml
+    command: -config.file=/etc/loki/loki.yaml
     networks:
       - rustfs-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3100/ready" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  pyroscope:
+    image: grafana/pyroscope:latest
+    ports:
+      - "4040:4040"
+    command:
+      - -self-profiling.disable-push=true
+    networks:
+      - rustfs-network
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:latest
@@ -127,10 +177,17 @@ services:
     volumes:
       - ../../.docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../../.docker/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus
       - tempo
       - loki
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # --- RustFS Cluster ---
 
@@ -215,6 +272,7 @@ volumes:
   tempo-data:
   loki-data:
   jaeger-data:
+  grafana-data:
 
 networks:
   rustfs-network:

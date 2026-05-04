@@ -19,13 +19,23 @@ use strum::{EnumString, IntoStaticStr};
 use super::Validator;
 
 #[derive(Serialize, Clone, Deserialize, EnumString, IntoStaticStr, Default, Debug, PartialEq)]
-#[serde(try_from = "&str", into = "&str")]
+#[serde(try_from = "String", into = "&str")]
 pub enum Effect {
     #[default]
     #[strum(serialize = "Allow")]
     Allow,
     #[strum(serialize = "Deny")]
     Deny,
+}
+
+impl TryFrom<String> for Effect {
+    type Error = Error;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value
+            .parse::<Self>()
+            .map_err(|e: strum::ParseError| Error::StringError(e.to_string()))
+    }
 }
 
 impl Effect {

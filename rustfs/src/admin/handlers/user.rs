@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::iam_error::iam_error_to_s3_error;
 use super::{account_info, group, service_account, user_iam, user_lifecycle, user_policy_binding};
 use crate::{
     admin::{
@@ -136,6 +137,44 @@ fn imported_service_account_status(status: &str) -> Option<String> {
     }
 
     None
+}
+
+const SERVICE_ACCOUNT_PARENT_SCOPE_ERROR: &str = "service account parent is outside requester scope";
+const SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR: &str = "service account access key does not match import entry";
+
+fn imported_service_account_parent_allowed(parent: &str, requester: &Credentials, owner: bool) -> bool {
+    if parent.is_empty() {
+        return false;
+    }
+
+    if owner {
+        return true;
+    }
+
+    if requester.is_temp() || requester.is_service_account() {
+        return temp_identity_parent(requester).is_some_and(|requester_parent| requester_parent == parent);
+    }
+
+    requester.parent_user.is_empty() && requester.access_key == parent
+}
+
+fn imported_service_account_parent_scope_failure(
+    access_key: &str,
+    parent: &str,
+    requester: &Credentials,
+    owner: bool,
+) -> Option<IAMErrEntity> {
+    (!imported_service_account_parent_allowed(parent, requester, owner)).then(|| IAMErrEntity {
+        name: access_key.to_string(),
+        error: SERVICE_ACCOUNT_PARENT_SCOPE_ERROR.to_string(),
+    })
+}
+
+fn imported_service_account_access_key_failure(entry_access_key: &str, payload_access_key: &str) -> Option<IAMErrEntity> {
+    (entry_access_key != payload_access_key).then(|| IAMErrEntity {
+        name: entry_access_key.to_string(),
+        error: SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR.to_string(),
+    })
 }
 
 pub struct AddUser {}
@@ -534,10 +573,7 @@ impl Operation for GetUserInfo {
         )
         .await?;
 
-        let info = iam_store
-            .get_user_info(ak)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+        let info = iam_store.get_user_info(ak).await.map_err(iam_error_to_s3_error)?;
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal user err {e}")))?;
@@ -986,9 +1022,19 @@ impl Operation for ImportIam {
                         return Err(s3_error!(InvalidArgument, "has space be {ak}"));
                     }
 
+                    if let Some(err) = imported_service_account_access_key_failure(&ak, &req.access_key) {
+                        failed.service_accounts.push(err);
+                        continue;
+                    }
+
+                    if let Some(err) = imported_service_account_parent_scope_failure(&ak, &req.parent, &cred, owner) {
+                        failed.service_accounts.push(err);
+                        continue;
+                    }
+
                     let mut update = true;
 
-                    if let Err(e) = iam_store.get_service_account(&req.access_key).await {
+                    if let Err(e) = iam_store.get_service_account(&ak).await {
                         if !matches!(e, rustfs_iam::error::Error::NoSuchServiceAccount(_)) {
                             return Err(s3_error!(InvalidArgument, "failed to get service account {ak} {e}"));
                         }
@@ -996,7 +1042,7 @@ impl Operation for ImportIam {
                     }
 
                     if update {
-                        iam_store.delete_service_account(&req.access_key, true).await.map_err(|e| {
+                        iam_store.delete_service_account(&ak, true).await.map_err(|e| {
                             S3Error::with_message(
                                 S3ErrorCode::InternalError,
                                 format!("failed to delete service account {ak} {e}"),
@@ -1218,8 +1264,10 @@ impl Operation for ImportIam {
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUP_POLICY_MAPPING_USER_TYPE, imported_service_account_status, should_check_deny_only, should_reject_group_import_name,
-        should_restore_group_as_disabled,
+        GROUP_POLICY_MAPPING_USER_TYPE, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR,
+        imported_service_account_access_key_failure, imported_service_account_parent_allowed,
+        imported_service_account_parent_scope_failure, imported_service_account_status, should_check_deny_only,
+        should_reject_group_import_name, should_restore_group_as_disabled,
     };
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_iam::error::Error as IamError;
@@ -1337,6 +1385,92 @@ mod tests {
         assert_eq!(imported_service_account_status("disabled").as_deref(), Some("off"));
         assert_eq!(imported_service_account_status("enabled").as_deref(), Some("on"));
         assert!(imported_service_account_status("unknown").is_none());
+    }
+
+    #[test]
+    fn test_import_service_account_parent_rejects_other_parent_for_non_owner() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!imported_service_account_parent_allowed("root-access-key", &requester, false));
+    }
+
+    #[test]
+    fn test_service_account_parent_scope_failure_records_import_error() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+        let err = imported_service_account_parent_scope_failure("svc-access-key", "root-access-key", &requester, false)
+            .expect("non-owner must not import a service account for another parent");
+
+        assert_eq!(err.name, "svc-access-key");
+        assert_eq!(err.error, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR);
+        assert!(
+            imported_service_account_parent_scope_failure("svc-access-key", "delegated-importer", &requester, false).is_none()
+        );
+    }
+
+    #[test]
+    fn test_service_account_import_rejects_payload_access_key_mismatch() {
+        let payload = r#"{
+            "svcalpha": {
+                "parent": "useralpha",
+                "accessKey": "svcbeta",
+                "secretKey": "svcAlphaSecret123",
+                "groups": [],
+                "claims": {},
+                "sessionPolicy": null,
+                "status": "on",
+                "name": "uploaderKey",
+                "description": "alpha upload key",
+                "expiration": "1970-01-01T00:00:00Z"
+            }
+        }"#;
+
+        let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_str(payload).unwrap();
+        let req = svc_accts.get("svcalpha").unwrap();
+        let err = imported_service_account_access_key_failure("svcalpha", &req.access_key)
+            .expect("mismatched service account access keys must be rejected");
+
+        assert_eq!(err.name, "svcalpha");
+        assert_eq!(err.error, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR);
+        assert!(imported_service_account_access_key_failure("svcalpha", "svcalpha").is_none());
+    }
+
+    #[test]
+    fn test_import_service_account_parent_allows_owner_restore() {
+        let requester = Credentials {
+            access_key: "root-access-key".to_string(),
+            ..Default::default()
+        };
+
+        assert!(imported_service_account_parent_allowed("any-imported-parent", &requester, true));
+    }
+
+    #[test]
+    fn test_import_service_account_parent_allows_requester_self_parent() {
+        let requester = Credentials {
+            access_key: "delegated-importer".to_string(),
+            ..Default::default()
+        };
+
+        assert!(imported_service_account_parent_allowed("delegated-importer", &requester, false));
+    }
+
+    #[test]
+    fn test_import_service_account_parent_allows_derived_requester_parent() {
+        let requester = Credentials {
+            access_key: "derived-access-key".to_string(),
+            parent_user: "parent-user".to_string(),
+            session_token: "session-token".to_string(),
+            ..Default::default()
+        };
+
+        assert!(imported_service_account_parent_allowed("parent-user", &requester, false));
+        assert!(!imported_service_account_parent_allowed("other-parent", &requester, false));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::time::Duration;
 #[inline(always)]
 pub fn record_lock_optimization_enabled(enabled: bool) {
     use metrics::gauge;
-    gauge!("rustfs.lock.optimization.enabled").set(if enabled { 1.0 } else { 0.0 });
+    gauge!("rustfs_lock_optimization_enabled").set(if enabled { 1.0 } else { 0.0 });
 }
 
 /// Record spin attempt.
@@ -28,9 +28,9 @@ pub fn record_lock_optimization_enabled(enabled: bool) {
 pub fn record_spin_attempt(success: bool) {
     use metrics::counter;
     if success {
-        counter!("rustfs.lock.spin.successes").increment(1);
+        counter!("rustfs_lock_spin_successes").increment(1);
     } else {
-        counter!("rustfs.lock.spin.failures").increment(1);
+        counter!("rustfs_lock_spin_failures").increment(1);
     }
 }
 
@@ -38,28 +38,28 @@ pub fn record_spin_attempt(success: bool) {
 #[inline(always)]
 pub fn record_spin_count_change(new_count: usize) {
     use metrics::gauge;
-    gauge!("rustfs.lock.spin.count").set(new_count as f64);
+    gauge!("rustfs_lock_spin_count").set(new_count as f64);
 }
 
 /// Record lock hold time.
 #[inline(always)]
 pub fn record_lock_hold_time(hold_time: Duration) {
     use metrics::histogram;
-    histogram!("rustfs.lock.hold_time.secs").record(hold_time.as_secs_f64());
+    histogram!("rustfs_lock_hold_time_secs").record(hold_time.as_secs_f64());
 }
 
 /// Record early release.
 #[inline(always)]
 pub fn record_early_release() {
     use metrics::counter;
-    counter!("rustfs.lock.early_releases").increment(1);
+    counter!("rustfs_lock_early_releases").increment(1);
 }
 
 /// Record contention event.
 #[inline(always)]
 pub fn record_contention_event() {
     use metrics::counter;
-    counter!("rustfs.lock.contentions").increment(1);
+    counter!("rustfs_lock_contentions").increment(1);
 }
 
 /// Lock statistics summary.

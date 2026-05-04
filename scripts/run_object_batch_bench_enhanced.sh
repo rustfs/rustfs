@@ -95,6 +95,16 @@ require_cmd() {
   fi
 }
 
+normalize_warp_host() {
+  local raw="$1"
+  raw="${raw#http://}"
+  raw="${raw#https://}"
+  raw="${raw%%/*}"
+  raw="${raw%%\?*}"
+  raw="${raw%%\#*}"
+  echo "$raw"
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -161,6 +171,14 @@ validate_args() {
   if [[ -n "$BASELINE_CSV" && ! -f "$BASELINE_CSV" ]]; then
     echo "ERROR: --baseline-csv does not exist: $BASELINE_CSV" >&2
     exit 1
+  fi
+  if [[ "$TOOL" == "warp" ]]; then
+    local warp_host
+    warp_host="$(normalize_warp_host "$ENDPOINT")"
+    if [[ -z "$warp_host" ]]; then
+      echo "ERROR: invalid --endpoint for warp: $ENDPOINT" >&2
+      exit 1
+    fi
   fi
 }
 
@@ -286,9 +304,11 @@ run_one_attempt() {
   local status="ok"
 
   if [[ "$TOOL" == "warp" ]]; then
+    local warp_host
+    warp_host="$(normalize_warp_host "$ENDPOINT")"
     local cmd=(
       "$WARP_BIN" "$WARP_MODE"
-      "--host" "$ENDPOINT"
+      "--host" "$warp_host"
       "--access-key" "$ACCESS_KEY"
       "--secret-key" "$SECRET_KEY"
       "--bucket" "$BUCKET"
@@ -300,7 +320,9 @@ run_one_attempt() {
     if [[ "$INSECURE" == "true" ]]; then
       cmd+=("--insecure")
     fi
-    cmd+=("${EXTRA_ARGS[@]}")
+    if [[ ${EXTRA_ARGS[@]+_} ]]; then
+      cmd+=("${EXTRA_ARGS[@]}")
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
       printf '[DRY-RUN] %q ' "${cmd[@]}"
@@ -326,7 +348,9 @@ run_one_attempt() {
     if [[ "$INSECURE" == "true" ]]; then
       cmd+=("-insecure")
     fi
-    cmd+=("${EXTRA_ARGS[@]}")
+    if [[ ${EXTRA_ARGS[@]+_} ]]; then
+      cmd+=("${EXTRA_ARGS[@]}")
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
       printf '[DRY-RUN] %q ' "${cmd[@]}"
@@ -484,4 +508,3 @@ main() {
 }
 
 main "$@"
-

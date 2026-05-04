@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::policy::function::condition::Condition;
+use crate::policy::function::{condition::Condition, key_name::KeyName};
 use crate::policy::variables::PolicyVariableResolver;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer, de};
@@ -70,6 +70,14 @@ impl Functions {
 
     pub fn is_empty(&self) -> bool {
         self.for_all_values.is_empty() && self.for_any_value.is_empty() && self.for_normal.is_empty()
+    }
+
+    pub fn references_key_name(&self, key_name: &KeyName) -> bool {
+        self.for_any_value
+            .iter()
+            .chain(self.for_all_values.iter())
+            .chain(self.for_normal.iter())
+            .any(|condition| condition.references_key_name(key_name))
     }
 }
 

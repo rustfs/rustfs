@@ -171,6 +171,7 @@ libsystemd.workspace = true
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
+libmimalloc-sys = { version = "0.1.47", features = ["extended"] }
 
 
 
