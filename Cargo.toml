@@ -170,7 +170,7 @@ jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0"
 rsa = { version = "0.10.0-rc.18" }
-rustls = { version = "0.23.39", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
+rustls = { version = "0.23.40", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = "1.14.1"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
@@ -254,7 +254,7 @@ rustc-hash = { version = "2.1.2" }
 s3s = { git = "https://github.com/rustfs/s3s", rev = "a3b16608df35aaeed8fff08b4988d03f4ca9445b", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "2.0.0", default-features = false }
-siphasher = "1.0.2"
+siphasher = "1.0.3"
 smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.9.0"
@@ -284,7 +284,7 @@ zip = "8.6.0"
 zstd = "0.13.3"
 
 # Observability and Metrics
-metrics = "0.24.3"
+metrics = "0.24.5"
 dial9-tokio-telemetry = "0.3"
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
