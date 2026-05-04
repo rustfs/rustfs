@@ -298,10 +298,7 @@ mod tests {
         let dsn = "rustfs:secret123@tcp(mysql.example.com:3306)/rustfs_events";
         let redacted = redact_target_field_value(rustfs_config::MYSQL_DSN_STRING, dsn);
         assert_eq!(redacted, "rustfs:***@tcp(mysql.example.com:3306)/rustfs_events");
-    }
-
-    #[test]
-    fn redact_dsn_string_empty_value() {
+        // empty dsn_string value
         assert_eq!(redact_target_field_value(rustfs_config::MYSQL_DSN_STRING, ""), "");
     }
 

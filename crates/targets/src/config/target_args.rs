@@ -445,7 +445,7 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
 mod tests {
     use super::{build_kafka_args, build_mysql_args, validate_kafka_config, validate_mysql_config};
     use crate::target::TargetType;
-    use rustfs_config::{KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_QUEUE_DIR, MYSQL_TABLE};
+    use rustfs_config::{KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE};
     use rustfs_ecstore::config::KVS;
 
     fn kafka_base_config() -> KVS {
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn validate_mysql_config_rejects_invalid_max_open_connections() {
         let mut config = mysql_base_config();
-        config.insert("max_open_connections".to_string(), "not-a-number".to_string());
+        config.insert(MYSQL_MAX_OPEN_CONNECTIONS.to_string(), "not-a-number".to_string());
 
         let err = validate_mysql_config(&config, "").expect_err("invalid max_open_connections should be rejected");
         assert!(err.to_string().contains("max_open_connections"));

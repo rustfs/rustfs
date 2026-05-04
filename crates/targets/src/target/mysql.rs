@@ -149,7 +149,7 @@ impl MySqlDsn {
                 match key.trim().to_ascii_lowercase().as_str() {
                     "tls" => {
                         let val = value.trim().to_ascii_lowercase();
-                        if val == "true" || val == "tls" || val.is_empty() {
+                        if val == "true" || val.is_empty() {
                             tls = true;
                         } else if val == "false" {
                             tls = false;
