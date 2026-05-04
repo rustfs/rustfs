@@ -78,3 +78,50 @@ impl Operation for TriggerProfileMemory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{TriggerProfileCPU, TriggerProfileMemory};
+    use crate::admin::router::Operation;
+    use crate::server::{PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
+    use http::{Extensions, HeaderMap, Uri};
+    use hyper::Method;
+    use matchit::Params;
+    use s3s::{Body, S3ErrorCode, S3Request};
+
+    fn build_profile_request(uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn trigger_profile_cpu_rejects_missing_credentials() {
+        let result = TriggerProfileCPU {}
+            .call(build_profile_request(PROFILE_CPU_PATH), Params::new())
+            .await;
+        let err = result.expect_err("legacy CPU profile handler must reject anonymous requests");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Signature is required"));
+    }
+
+    #[tokio::test]
+    async fn trigger_profile_memory_rejects_missing_credentials() {
+        let result = TriggerProfileMemory {}
+            .call(build_profile_request(PROFILE_MEMORY_PATH), Params::new())
+            .await;
+        let err = result.expect_err("legacy memory profile handler must reject anonymous requests");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Signature is required"));
+    }
+}
