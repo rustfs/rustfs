@@ -445,7 +445,9 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
 mod tests {
     use super::{build_kafka_args, build_mysql_args, validate_kafka_config, validate_mysql_config};
     use crate::target::TargetType;
-    use rustfs_config::{KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE};
+    use rustfs_config::{
+        KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
+    };
     use rustfs_ecstore::config::KVS;
 
     fn kafka_base_config() -> KVS {
