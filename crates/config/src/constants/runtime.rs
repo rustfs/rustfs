@@ -77,10 +77,13 @@ pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: bool = false;
 pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: bool = false;
 pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: usize = 4 * 1024 * 1024;
 
-/// Threshold for small object seek support in megabytes.
+/// Threshold for small object seek support in bytes.
 ///
-/// When an object is smaller than this size, rustfs will provide seek support.
+/// When an object response is smaller than this size, rustfs may provide
+/// in-memory seek support. Runtime GET logic also enforces a hard safety cap
+/// (`64 MiB`) to prevent large-download memory spikes even if this threshold
+/// is configured higher.
 ///
-/// Default is set to 10MB.
+/// Default is set to 10 MiB.
 pub const ENV_OBJECT_SEEK_SUPPORT_THRESHOLD: &str = "RUSTFS_OBJECT_SEEK_SUPPORT_THRESHOLD";
 pub const DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD: usize = 10 * 1024 * 1024;

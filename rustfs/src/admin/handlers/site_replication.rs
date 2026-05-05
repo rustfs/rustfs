@@ -14,6 +14,10 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::site_replication_identity::{
+    canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
+    site_identity_key,
+};
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -25,7 +29,10 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_config::{DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::{
+    DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_RUSTFS_TLS_PATH, ENV_TRUST_LEAF_CERT_AS_CA,
+    MAX_ADMIN_REQUEST_BODY_SIZE, RUSTFS_CA_CERT, RUSTFS_TLS_CERT,
+};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -60,6 +67,7 @@ use rustfs_policy::policy::{
 };
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
+use rustfs_utils::http::get_source_scheme;
 use s3s::dto::{
     BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus,
     Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule,
@@ -71,11 +79,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+use tracing::warn;
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -88,13 +96,14 @@ const SITE_REPL_RESYNC_CANCEL: &str = "cancel";
 const SITE_REPL_MIN_NETPERF_DURATION: Duration = Duration::from_secs(1);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
 const IDENTITY_LDAP_SUB_SYS: &str = "identity_ldap";
 const LEGACY_LDAP_SUB_SYS: &str = "ldapserverconfig";
 const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
 const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
-static SITE_REPLICATION_PEER_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static SITE_REPLICATION_PEER_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SiteReplicationState {
@@ -378,9 +387,22 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    match read_config(store, SITE_REPLICATION_STATE_PATH).await {
-        Ok(data) => serde_json::from_slice(&data)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}"))),
+    match read_config(store.clone(), SITE_REPLICATION_STATE_PATH).await {
+        Ok(data) => {
+            let mut state: SiteReplicationState = serde_json::from_slice(&data)
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
+            let original_state = serde_json::to_vec(&state).ok();
+            state.peers = normalize_peer_map_by_identity(state.peers);
+            let normalized_state = serde_json::to_vec(&state).ok();
+            if original_state != normalized_state
+                && let Some(data) = normalized_state
+            {
+                save_config(store, SITE_REPLICATION_STATE_PATH, data).await.map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("normalize site replication state failed: {e}"))
+                })?;
+            }
+            Ok(state)
+        }
         Err(StorageError::ConfigNotFound) => Ok(SiteReplicationState::default()),
         Err(err) => Err(S3Error::with_message(
             S3ErrorCode::InternalError,
@@ -394,7 +416,10 @@ async fn save_site_replication_state(state: &SiteReplicationState) -> S3Result<(
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    let data = serde_json::to_vec(state)
+    let mut normalized = state.clone();
+    normalized.peers = normalize_peer_map_by_identity(normalized.peers);
+
+    let data = serde_json::to_vec(&normalized)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize state failed: {e}")))?;
     save_config(store, SITE_REPLICATION_STATE_PATH, data)
         .await
@@ -414,22 +439,96 @@ async fn clear_site_replication_state() -> S3Result<()> {
 }
 
 async fn persist_site_replication_state(state: &SiteReplicationState) -> S3Result<()> {
-    if state.peers.len() <= 1 {
+    let mut normalized = state.clone();
+    normalized.peers = normalize_peer_map_by_identity(normalized.peers);
+    if normalized.peers.len() <= 1 {
         clear_site_replication_state().await
     } else {
-        save_site_replication_state(state).await
+        save_site_replication_state(&normalized).await
     }
 }
 
-fn site_replication_peer_client() -> &'static reqwest::Client {
-    SITE_REPLICATION_PEER_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
-            .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
-            .pool_idle_timeout(Some(Duration::from_secs(60)))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+fn add_root_certificates_from_file(
+    mut builder: reqwest::ClientBuilder,
+    cert_path: &std::path::Path,
+    description: &str,
+) -> S3Result<reqwest::ClientBuilder> {
+    if !cert_path.exists() {
+        return Ok(builder);
+    }
+
+    std::fs::read(cert_path).map_err(|e| {
+        S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("failed to read {description} {}: {e}", cert_path.display()),
+        )
+    })?;
+
+    let certs_der = rustfs_utils::load_cert_bundle_der_bytes(cert_path.to_string_lossy().as_ref()).map_err(|e| {
+        S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("failed to parse {description} {}: {e}", cert_path.display()),
+        )
+    })?;
+
+    for cert_der in certs_der {
+        let cert = reqwest::Certificate::from_der(&cert_der).map_err(|e| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("failed to load {description} {}: {e}", cert_path.display()),
+            )
+        })?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    Ok(builder)
+}
+
+fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
+        .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
+        .pool_idle_timeout(Some(Duration::from_secs(60)));
+
+    let tls_path = rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH);
+    if !tls_path.is_empty() {
+        let tls_dir = std::path::Path::new(&tls_path);
+        builder = add_root_certificates_from_file(builder, &tls_dir.join(RUSTFS_CA_CERT), "site-replication CA cert")?;
+
+        if rustfs_utils::get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA) {
+            builder =
+                add_root_certificates_from_file(builder, &tls_dir.join(RUSTFS_TLS_CERT), "site-replication leaf cert as CA")?;
+        }
+    }
+
+    builder
+        .build()
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build site replication peer client failed: {e}")))
+}
+
+fn site_replication_peer_client() -> S3Result<&'static reqwest::Client> {
+    let result = SITE_REPLICATION_PEER_CLIENT.get_or_init(|| build_site_replication_peer_client().map_err(|e| e.to_string()));
+    result.as_ref().map_err(|err| {
+        S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("initialize site replication peer client failed: {err}"),
+        )
     })
+}
+
+fn runtime_tls_enabled() -> bool {
+    if let Some(tls_enabled) = get_global_endpoints_opt().and_then(|endpoints| {
+        endpoints
+            .as_ref()
+            .iter()
+            .flat_map(|pool| pool.endpoints.as_ref().iter())
+            .find(|endpoint| endpoint.is_local)
+            .map(|endpoint| endpoint.url.scheme().eq_ignore_ascii_case("https"))
+    }) {
+        return tls_enabled;
+    }
+
+    !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty()
 }
 
 fn query_pairs(uri: &Uri) -> HashMap<String, String> {
@@ -554,17 +653,30 @@ fn load_ldap_idp_settings() -> (LDAPSettings, LDAPConfigSettings) {
 }
 
 fn request_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("http");
+    let scheme = get_source_scheme(headers)
+        .and_then(|value| {
+            value
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_lowercase)
+        })
+        .or_else(|| uri.scheme_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| {
+            if runtime_tls_enabled() {
+                "https".to_string()
+            } else {
+                "http".to_string()
+            }
+        });
 
     let host = headers
         .get(http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+        .or_else(|| uri.authority().map(|value| value.as_str().to_string()))
         .or_else(|| {
             get_global_endpoints_opt().and_then(|endpoints| {
                 endpoints
@@ -576,10 +688,6 @@ fn request_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
             })
         })
         .unwrap_or_else(|| format!("127.0.0.1:{}", global_rustfs_port()));
-
-    if uri.scheme_str().is_some() {
-        return format!("{scheme}://{host}");
-    }
 
     format!("{scheme}://{host}")
 }
@@ -599,12 +707,6 @@ fn infer_site_name(endpoint: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
-}
-
-fn deployment_id_for_endpoint(endpoint: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    endpoint.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }
 
 fn qstat(count: i64, bytes: i64) -> QStat {
@@ -666,37 +768,15 @@ fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
     }
 }
 
-fn canonical_endpoint(endpoint: &str) -> String {
-    let trimmed = endpoint.trim().trim_end_matches('/');
-    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{trimmed}")
-    };
-
-    Url::parse(&candidate)
-        .ok()
-        .map(|url| {
-            let scheme = url.scheme().to_ascii_lowercase();
-            let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-            let port = url.port_or_known_default();
-            match port {
-                Some(port) => format!("{scheme}://{host}:{port}"),
-                None => format!("{scheme}://{host}"),
-            }
-        })
-        .unwrap_or_else(|| trimmed.to_ascii_lowercase())
-}
-
-fn same_endpoint(left: &str, right: &str) -> bool {
-    canonical_endpoint(left) == canonical_endpoint(right)
+fn normalize_peer_map_by_identity(peers: BTreeMap<String, PeerInfo>) -> BTreeMap<String, PeerInfo> {
+    normalize_peer_map_by_identity_with(peers, normalize_peer_info)
 }
 
 fn existing_peer_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> Option<PeerInfo> {
     state
         .peers
         .values()
-        .find(|peer| same_endpoint(&peer.endpoint, endpoint))
+        .find(|peer| same_identity_endpoint(&peer.endpoint, endpoint))
         .cloned()
 }
 
@@ -744,11 +824,11 @@ fn build_join_peers(
     let mut normalized_local = local_peer.clone();
     normalized_local.replicate_ilm_expiry = replicate_ilm_expiry;
     normalized_local = normalize_peer_info(normalized_local);
-    seen_endpoints.insert(canonical_endpoint(&normalized_local.endpoint));
+    seen_endpoints.insert(site_identity_key(&normalized_local.endpoint));
     peers.insert(normalized_local.deployment_id.clone(), normalized_local);
 
     for site in sites {
-        let endpoint_key = canonical_endpoint(&site.endpoint);
+        let endpoint_key = site_identity_key(&site.endpoint);
         if !seen_endpoints.insert(endpoint_key) {
             continue;
         }
@@ -764,7 +844,7 @@ fn build_join_peers(
         peers.insert(peer.deployment_id.clone(), peer);
     }
 
-    peers
+    normalize_peer_map_by_identity(peers)
 }
 
 fn normalize_join_peers_for_local(local_peer: &PeerInfo, peers: BTreeMap<String, PeerInfo>) -> BTreeMap<String, PeerInfo> {
@@ -772,7 +852,7 @@ fn normalize_join_peers_for_local(local_peer: &PeerInfo, peers: BTreeMap<String,
 
     for (_, incoming_peer) in peers {
         let mut peer = normalize_peer_info(incoming_peer);
-        if same_endpoint(&peer.endpoint, &local_peer.endpoint) {
+        if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             peer.deployment_id = local_peer.deployment_id.clone();
             if peer.name.is_empty() {
                 peer.name = local_peer.name.clone();
@@ -785,15 +865,16 @@ fn normalize_join_peers_for_local(local_peer: &PeerInfo, peers: BTreeMap<String,
         normalized.insert(local_peer.deployment_id.clone(), local_peer.clone());
     }
 
-    normalized
+    normalize_peer_map_by_identity(normalized)
 }
 
 fn reconcile_peer_with_actual_identity(mut state: SiteReplicationState, actual_peer: PeerInfo) -> SiteReplicationState {
     let actual_peer = normalize_peer_info(actual_peer);
     state
         .peers
-        .retain(|_, peer| !same_endpoint(&peer.endpoint, &actual_peer.endpoint));
+        .retain(|_, peer| !same_identity_endpoint(&peer.endpoint, &actual_peer.endpoint));
     state.peers.insert(actual_peer.deployment_id.clone(), actual_peer);
+    state.peers = normalize_peer_map_by_identity(state.peers);
     state
 }
 
@@ -888,16 +969,26 @@ async fn send_peer_admin_request<T: Serialize>(
             .unwrap_or("us-east-1"),
     );
 
-    let mut req = site_replication_peer_client().request(reqwest::Method::PUT, &url);
+    let mut req = site_replication_peer_client()?.request(reqwest::Method::PUT, &url);
     for (name, value) in signed.headers() {
         req = req.header(name, value);
     }
 
-    let response = req
-        .body(payload)
-        .send()
-        .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("peer request failed: {e}")))?;
+    let response = req.body(payload).send().await.map_err(|e| {
+        let classify = if e.is_timeout() {
+            "timeout"
+        } else if e.is_connect() && e.to_string().to_ascii_lowercase().contains("dns") {
+            "dns resolution"
+        } else if e.to_string().to_ascii_lowercase().contains("certificate") || e.to_string().to_ascii_lowercase().contains("tls")
+        {
+            "tls handshake"
+        } else if e.is_connect() {
+            "connect"
+        } else {
+            "request"
+        };
+        S3Error::with_message(S3ErrorCode::InternalError, format!("peer request to {url} failed ({classify}): {e}"))
+    })?;
 
     let status = response.status();
     let body = response
@@ -931,7 +1022,7 @@ async fn broadcast_site_replication_json<T: Serialize>(path: &str, body: &T) -> 
     };
 
     for peer in state.peers.values() {
-        if peer.deployment_id == local_peer.deployment_id || same_endpoint(&peer.endpoint, &local_peer.endpoint) {
+        if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             continue;
         }
 
@@ -1473,7 +1564,7 @@ fn sync_state_name_for_local_peer(
     local_peer: &PeerInfo,
     incoming: &PeerInfo,
 ) -> SiteReplicationState {
-    if same_endpoint(&incoming.endpoint, &local_peer.endpoint) && !incoming.name.is_empty() {
+    if same_identity_endpoint(&incoming.endpoint, &local_peer.endpoint) && !incoming.name.is_empty() {
         state.name = incoming.name.clone();
     }
     state
@@ -1503,10 +1594,56 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         return state;
     }
 
-    let names: Vec<String> = req.site_names.into_iter().collect();
-    state.peers.retain(|_, peer| !names.iter().any(|name| name == &peer.name));
+    let names: HashSet<String> = req.site_names.into_iter().collect();
+    if names.contains(&state.name) {
+        state.peers.clear();
+        state.resync_status.clear();
+        state.updated_at = Some(OffsetDateTime::now_utc());
+        return state;
+    }
+
+    let removed_deployment_ids: Vec<String> = state
+        .peers
+        .iter()
+        .filter(|(_, peer)| names.contains(&peer.name))
+        .map(|(deployment_id, _)| deployment_id.clone())
+        .collect();
+    for deployment_id in removed_deployment_ids {
+        state.peers.remove(&deployment_id);
+        state.resync_status.remove(&deployment_id);
+    }
+    state
+        .resync_status
+        .retain(|deployment_id, _| state.peers.contains_key(deployment_id));
     state.updated_at = Some(OffsetDateTime::now_utc());
     state
+}
+
+fn summarize_peer_error_detail(detail: &str) -> String {
+    let detail = detail.trim();
+    let detail_chars = detail.chars().count();
+    if detail_chars <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT {
+        return detail.to_string();
+    }
+
+    let suffix = "... (truncated)";
+    let take_chars = SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT.saturating_sub(suffix.chars().count());
+    let mut summary: String = detail.chars().take(take_chars).collect();
+    summary.push_str(suffix);
+    summary
+}
+
+fn site_replication_remove_status(peer_errors: &[String]) -> ReplicateRemoveStatus {
+    ReplicateRemoveStatus {
+        status: SITE_REPL_REMOVE_SUCCESS.to_string(),
+        err_detail: if peer_errors.is_empty() {
+            String::new()
+        } else {
+            let summaries: Vec<String> = peer_errors.iter().map(|error| summarize_peer_error_detail(error)).collect();
+            summarize_peer_error_detail(&format!("failed to notify {} peer(s): {}", summaries.len(), summaries.join("; ")))
+        },
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+    }
 }
 
 fn resync_status_for_state(
@@ -1634,7 +1771,7 @@ fn reconcile_site_replication_bucket_targets(
     let mut targets = existing.targets;
 
     for peer in state.peers.values() {
-        if peer.deployment_id == local_peer.deployment_id || same_endpoint(&peer.endpoint, &local_peer.endpoint) {
+        if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             continue;
         }
 
@@ -1705,7 +1842,7 @@ fn build_site_replication_config(
 ) -> Option<ReplicationConfiguration> {
     let mut rules = Vec::new();
     for peer in state.peers.values() {
-        if peer.deployment_id == local_peer.deployment_id || same_endpoint(&peer.endpoint, &local_peer.endpoint) {
+        if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             continue;
         }
 
@@ -2283,8 +2420,9 @@ impl Operation for SiteReplicationAddHandler {
 
         let mut joined_endpoints = HashSet::new();
         for site in &sites {
-            let endpoint_key = canonical_endpoint(&site.endpoint);
-            if same_endpoint(&site.endpoint, &local_peer.endpoint) || !joined_endpoints.insert(endpoint_key) {
+            if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
+                || !joined_endpoints.insert(site_identity_key(&site.endpoint))
+            {
                 continue;
             }
 
@@ -2327,13 +2465,17 @@ impl Operation for SiteReplicationRemoveHandler {
         let current_state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &current_state);
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
+        let state = remove_sites(current_state.clone(), remove_req.clone());
+        persist_site_replication_state(&state).await?;
+        let mut status = site_replication_remove_status(&[]);
 
+        let mut peer_errors = Vec::new();
         if !current_state.service_account_access_key.is_empty() && !current_state.service_account_secret_key.is_empty() {
             for peer in current_state.peers.values() {
-                if same_endpoint(&peer.endpoint, &local_peer.endpoint) {
+                if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
                     continue;
                 }
-                send_peer_admin_request(
+                if let Err(err) = send_peer_admin_request(
                     &peer.endpoint,
                     SITE_REPLICATION_PEER_REMOVE_PATH,
                     &current_state.service_account_access_key,
@@ -2344,17 +2486,20 @@ impl Operation for SiteReplicationRemoveHandler {
                         remove_all: remove_req.remove_all,
                     },
                 )
-                .await?;
+                .await
+                {
+                    let err_detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
+                    warn!(peer = %peer.endpoint, error = %err_detail, "site replication peer remove notification failed");
+                    peer_errors.push(err_detail);
+                }
             }
         }
 
-        let state = remove_sites(current_state, remove_req);
-        persist_site_replication_state(&state).await?;
-        json_response(&ReplicateRemoveStatus {
-            status: SITE_REPL_REMOVE_SUCCESS.to_string(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
+        if !peer_errors.is_empty() {
+            status = site_replication_remove_status(&peer_errors);
+        }
+
+        json_response(&status)
     }
 }
 
@@ -2745,7 +2890,7 @@ impl Operation for SRPeerEditHandler {
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
         let mut incoming: PeerInfo = read_site_replication_json(req, "", false).await?;
-        if same_endpoint(&incoming.endpoint, &local_peer.endpoint) {
+        if same_identity_endpoint(&incoming.endpoint, &local_peer.endpoint) {
             incoming.deployment_id = local_peer.deployment_id.clone();
             if incoming.name.is_empty() {
                 incoming.name = local_peer.name.clone();
@@ -2863,7 +3008,8 @@ impl Operation for SRStateEditHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::Uri;
+    use http::{HeaderMap, HeaderValue, Uri};
+    use temp_env::with_var;
 
     fn peer(name: &str, endpoint: &str) -> PeerInfo {
         PeerInfo {
@@ -2992,6 +3138,76 @@ mod tests {
     }
 
     #[test]
+    fn test_site_identity_key_deduplicates_scheme_drift_on_same_host_port() {
+        assert_eq!(
+            site_identity_key("https://node-a.example.com:9000"),
+            site_identity_key("http://NODE-A.example.com:9000/"),
+        );
+    }
+
+    #[test]
+    fn test_normalize_peer_map_by_identity_prefers_https_endpoint() {
+        let peers = BTreeMap::from([
+            (
+                "peer-http".to_string(),
+                PeerInfo {
+                    deployment_id: "peer-http".to_string(),
+                    ..peer("peer", "http://node-a.example.com:9000")
+                },
+            ),
+            (
+                "peer-https".to_string(),
+                PeerInfo {
+                    deployment_id: "peer-https".to_string(),
+                    ..peer("peer", "https://node-a.example.com:9000")
+                },
+            ),
+        ]);
+
+        let normalized = normalize_peer_map_by_identity(peers);
+        assert_eq!(normalized.len(), 1);
+        let normalized_peer = normalized.values().next().expect("normalized peer");
+        assert!(normalized_peer.endpoint.starts_with("https://"));
+    }
+
+    #[test]
+    fn test_request_endpoint_prefers_forwarded_proto() {
+        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-scheme", HeaderValue::from_static("http"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("host", HeaderValue::from_static("node-a.example.com:9000"));
+
+        let endpoint = request_endpoint(&uri, &headers);
+
+        assert_eq!(endpoint, "https://node-a.example.com:9000");
+    }
+
+    #[test]
+    fn test_request_endpoint_uses_absolute_uri_without_host_header() {
+        let uri: Uri = "https://node-a.example.com:9443/rustfs/admin/v3/site-replication/status"
+            .parse()
+            .unwrap();
+        let headers = HeaderMap::new();
+
+        let endpoint = request_endpoint(&uri, &headers);
+
+        assert_eq!(endpoint, "https://node-a.example.com:9443");
+    }
+
+    #[test]
+    fn test_request_endpoint_falls_back_to_https_when_tls_path_is_configured() {
+        with_var(ENV_RUSTFS_TLS_PATH, Some("/tmp/tls"), || {
+            let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
+            let headers = HeaderMap::new();
+
+            let endpoint = request_endpoint(&uri, &headers);
+
+            assert!(endpoint.starts_with("https://"));
+        });
+    }
+
+    #[test]
     fn test_reconcile_peer_with_actual_identity_replaces_endpoint_hash_key() {
         let mut state = SiteReplicationState::default();
         state.peers.insert(
@@ -3062,6 +3278,179 @@ mod tests {
 
         assert!(req.remove_all);
         assert!(req.site_names.is_empty());
+    }
+
+    #[test]
+    fn test_remove_sites_keeps_local_success_with_peer_errors() {
+        let mut state = SiteReplicationState::default();
+        state.peers.insert(
+            "local".to_string(),
+            PeerInfo {
+                deployment_id: "local".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote".to_string(),
+            PeerInfo {
+                deployment_id: "remote".to_string(),
+                ..peer("remote", "https://remote.example.com")
+            },
+        );
+
+        let state = remove_sites(
+            state,
+            SRRemoveReq {
+                remove_all: true,
+                ..Default::default()
+            },
+        );
+        let status =
+            site_replication_remove_status(&["peer request to https://remote.example.com failed with 403 Forbidden".to_string()]);
+
+        assert!(state.peers.is_empty());
+        assert_eq!(status.status, SITE_REPL_REMOVE_SUCCESS);
+        assert!(status.err_detail.contains("failed to notify 1 peer"));
+        assert!(status.err_detail.contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn test_remove_sites_drops_resync_status_for_removed_peer() {
+        let mut state = SiteReplicationState {
+            name: "local".to_string(),
+            ..Default::default()
+        };
+        state.peers.insert(
+            "local-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "local-deployment".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-a-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-a-deployment".to_string(),
+                ..peer("remote-a", "https://remote-a.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-b-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-b-deployment".to_string(),
+                ..peer("remote-b", "https://remote-b.example.com")
+            },
+        );
+        state.resync_status.insert(
+            "remote-a-deployment".to_string(),
+            SRResyncOpStatus {
+                resync_id: "stale-a".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+        state.resync_status.insert(
+            "remote-a-legacy-key".to_string(),
+            SRResyncOpStatus {
+                resync_id: "stale-a-legacy".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+        state.resync_status.insert(
+            "remote-b-deployment".to_string(),
+            SRResyncOpStatus {
+                resync_id: "active-b".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let state = remove_sites(
+            state,
+            SRRemoveReq {
+                site_names: vec!["remote-a".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(state.peers.contains_key("local-deployment"));
+        assert!(!state.peers.contains_key("remote-a-deployment"));
+        assert!(state.peers.contains_key("remote-b-deployment"));
+        assert!(!state.resync_status.contains_key("remote-a-deployment"));
+        assert!(!state.resync_status.contains_key("remote-a-legacy-key"));
+        assert!(state.resync_status.contains_key("remote-b-deployment"));
+    }
+
+    #[test]
+    fn test_remove_sites_clears_state_when_local_site_is_removed() {
+        let mut state = SiteReplicationState {
+            name: "local".to_string(),
+            ..Default::default()
+        };
+        state.peers.insert(
+            "local-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "local-deployment".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-a-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-a-deployment".to_string(),
+                ..peer("remote-a", "https://remote-a.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-b-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-b-deployment".to_string(),
+                ..peer("remote-b", "https://remote-b.example.com")
+            },
+        );
+        state.resync_status.insert(
+            "remote-a-deployment".to_string(),
+            SRResyncOpStatus {
+                resync_id: "active-a".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let state = remove_sites(
+            state,
+            SRRemoveReq {
+                site_names: vec!["local".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(state.peers.is_empty());
+        assert!(state.resync_status.is_empty());
+    }
+
+    #[test]
+    fn test_site_replication_remove_status_truncates_peer_error_detail() {
+        let long_peer_body = "peer response body ".repeat(40);
+        let status = site_replication_remove_status(&[format!(
+            "https://remote.example.com: peer request failed with 403 Forbidden: {long_peer_body}"
+        )]);
+
+        assert!(status.err_detail.contains("403 Forbidden"));
+        assert!(status.err_detail.contains("truncated"));
+        assert!(!status.err_detail.contains(&long_peer_body));
+    }
+
+    #[test]
+    fn test_site_replication_remove_status_caps_final_error_detail() {
+        let peer_errors: Vec<String> = (0..8)
+            .map(|idx| format!("https://remote-{idx}.example.com: {}", "peer response body ".repeat(40)))
+            .collect();
+        let status = site_replication_remove_status(&peer_errors);
+
+        assert!(status.err_detail.chars().count() <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT);
+        assert!(status.err_detail.contains("truncated"));
     }
 
     #[test]

@@ -163,11 +163,10 @@ jobs:
                 if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
-                  # TODO: Temporary change - currently allows alpha versions to also create latest tags
-                  # After the version is stable, you need to remove the following line and restore the original logic (latest is created only for stable versions)
-                  if [[ "$version" == *"alpha"* ]]; then
+                  # Current policy: create latest tags for stable releases and selected prereleases (alpha/beta).
+                  if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]]; then
                     create_latest=true
-                     echo "🧪 Building Docker image for prerelease: $version (temporarily allowing creation of latest tag)"
+                    echo "🧪 Building Docker image for prerelease: $version (creating latest tag)"
                   else
                     echo "🧪 Building Docker image for prerelease: $version"
                   fi
@@ -216,11 +215,10 @@ jobs:
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
-                # TODO: Temporary change - currently allows alpha versions to also create latest tags
-                # After the version is stable, you need to remove the if block below and restore the original logic.
-                if [[ "$input_version" == *"alpha"* ]]; then
+                # Current policy: create latest tags for stable releases and selected prereleases (alpha/beta).
+                if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]]; then
                   create_latest=true
-                   echo "🧪 Building with prerelease version: $input_version (temporarily allowing creation of latest tag)"
+                  echo "🧪 Building with prerelease version: $input_version (creating latest tag)"
                 else
                   echo "🧪 Building with prerelease version: $input_version"
                 fi
@@ -351,9 +349,7 @@ jobs:
 
           # Add channel tags for prereleases and latest for stable
           if [[ "$CREATE_LATEST" == "true" ]]; then
-            # TODO: Temporary change - the current alpha version will also create the latest tag
-            # After the version is stabilized, the logic here remains unchanged, but the upstream CREATE_LATEST setting needs to be restored.
-            # Stable release (and temporary alpha versions)
+            # Create latest tags for stable releases and selected prereleases when CREATE_LATEST=true.
             TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_GHCR }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_QUAY }}:latest${VARIANT_SUFFIX}"
           elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Prerelease channel tags (alpha, beta, rc)
@@ -450,10 +446,9 @@ jobs:
             "prerelease")
               echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
               echo "⚠️  This is a prerelease image - use with caution"
-              # TODO: Temporary change - alpha versions currently create the latest tag
-              # After the version is stable, you need to restore the following prompt information
-              if [[ "$VERSION" == *"alpha"* ]] && [[ "$CREATE_LATEST" == "true" ]]; then
-                echo "🏷️  Latest tag has been created for alpha version (temporary measures)"
+              # Create latest tags for stable releases and selected prereleases when CREATE_LATEST=true.
+              if [[ "$CREATE_LATEST" == "true" ]]; then
+                echo "🏷️  Latest tag has been created for prerelease: $VERSION"
               else
                 echo "🚫 Latest tag NOT created for prerelease"
               fi

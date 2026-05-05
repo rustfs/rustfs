@@ -2331,11 +2331,6 @@ where
         // Allow unauthenticated access to health check
         let path = req.uri.path();
 
-        // Profiling endpoints
-        if req.method == Method::GET && (path == PROFILE_CPU_PATH || path == PROFILE_MEMORY_PATH) {
-            return Ok(());
-        }
-
         // Health check
         if (req.method == Method::HEAD || req.method == Method::GET) && is_public_health_path(path) {
             return Ok(());
@@ -3744,6 +3739,28 @@ mod tests {
             .check_access(&mut req)
             .await
             .expect_err("anonymous extension request must be denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn check_access_rejects_anonymous_profile_request() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: PROFILE_CPU_PATH.parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = router
+            .check_access(&mut req)
+            .await
+            .expect_err("anonymous profile request must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
