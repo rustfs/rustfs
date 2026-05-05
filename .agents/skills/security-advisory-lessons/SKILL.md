@@ -5,7 +5,7 @@ description: Apply RustFS security lessons distilled from repository GitHub Secu
 
 # RustFS Security Advisory Lessons
 
-Use this skill as a RustFS-specific security lens before changing or approving code. It is based on the repository advisory snapshot fetched on 2026-05-05: 23 total advisories across triage, published, and closed states.
+Use this skill as a RustFS-specific security lens before changing or approving code. For the current advisory snapshot and full pattern map, read [advisory-patterns.md](references/advisory-patterns.md).
 
 When currentness matters, refresh the advisory inventory first:
 
