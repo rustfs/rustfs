@@ -138,9 +138,8 @@ fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
     rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key) && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
 }
 
-fn default_credentials_warning_message() -> &'static str {
-    "Detected default root credentials; change them with the RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY environment variables"
-}
+const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str =
+    "Detected default root credentials; change them with the RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY environment variables";
 
 async fn async_main() -> Result<()> {
     // Parse command line arguments
@@ -359,7 +358,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     };
 
     if is_using_default_credentials(&config) {
-        warn!("{}", default_credentials_warning_message());
+        warn!("{}", DEFAULT_CREDENTIALS_WARNING_MESSAGE);
     }
 
     let ctx = CancellationToken::new();
@@ -783,10 +782,10 @@ mod tests {
 
     #[test]
     fn default_credentials_warning_message_does_not_expose_values() {
-        let message = default_credentials_warning_message();
+        let message = DEFAULT_CREDENTIALS_WARNING_MESSAGE;
 
-        assert!(message.contains("RUSTFS_ACCESS_KEY"));
-        assert!(message.contains("RUSTFS_SECRET_KEY"));
+        assert!(message.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
+        assert!(message.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
         assert!(!message.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
         assert!(!message.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
     }
