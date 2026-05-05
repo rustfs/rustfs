@@ -415,13 +415,13 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
 
     crate::target::mysql::validate_table_name(&table)?;
 
-    if let Some(format) = config.lookup(MYSQL_FORMAT) {
-        if format != "access" {
-            return Err(TargetError::Configuration(format!(
-                "MySQL format '{}' is not supported; only 'access' is available",
-                format
-            )));
-        }
+    if let Some(format) = config.lookup(MYSQL_FORMAT)
+        && format != "access"
+    {
+        return Err(TargetError::Configuration(format!(
+            "MySQL format '{}' is not supported; only 'access' is available",
+            format
+        )));
     }
 
     let queue_dir = config

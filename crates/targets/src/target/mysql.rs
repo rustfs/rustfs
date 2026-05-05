@@ -734,10 +734,10 @@ where
                     "Corrupted queued MySQL payload: missing or invalid Records[0].eventTime; dropping entry"
                 );
 
-                if let Some(store) = &self.store {
-                    if let Err(e) = delete_stored_payload(store.as_ref(), &key) {
-                        error!(target_id = %self.id, key=%key, error = %e, "Failed to delete corrupted queue entry");
-                    }
+                if let Some(store) = &self.store
+                    && let Err(e) = delete_stored_payload(store.as_ref(), &key)
+                {
+                    error!(target_id = %self.id, key=%key, error = %e, "Failed to delete corrupted queue entry");
                 }
 
                 self.delivery_counters.record_final_failure();
