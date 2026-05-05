@@ -1411,12 +1411,11 @@ impl DefaultObjectUsecase {
                 let server_side_encryption = Some(material.server_side_encryption.clone());
                 let sse_customer_algorithm = matches!(material.sse_type, SSEType::SseC).then_some(material.algorithm.clone());
                 let sse_customer_key_md5 = material.customer_key_md5.clone();
-                let ssekms_key_id = material.kms_key_id.clone();
                 (
                     server_side_encryption,
                     sse_customer_algorithm,
                     sse_customer_key_md5,
-                    ssekms_key_id,
+                    material.kms_key_id,
                     true,
                     wrap_reader(reader.stream),
                 )

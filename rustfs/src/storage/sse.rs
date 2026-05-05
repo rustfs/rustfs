@@ -569,8 +569,6 @@ pub struct DecryptionMaterial {
     pub key_bytes: [u8; 32],
     /// Base nonce/IV used by rio to derive block/part nonces.
     pub base_nonce: [u8; 12],
-    /// Original unencrypted size (if available)
-    pub original_size: Option<i64>,
 }
 
 /// Type of encryption used
@@ -902,10 +900,6 @@ async fn apply_ssec_decryption_material(
     // Generate nonce (same as encryption)
     let base_nonce = generate_ssec_nonce(bucket, key);
 
-    let original_size = metadata
-        .get("x-amz-server-side-encryption-customer-original-size")
-        .and_then(|s| s.parse::<i64>().ok());
-
     Ok(DecryptionMaterial {
         sse_type: SSEType::SseC,
         server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256), // const
@@ -915,7 +909,6 @@ async fn apply_ssec_decryption_material(
         customer_key_md5: None,
         key_bytes: validated.key_bytes,
         base_nonce,
-        original_size,
     })
 }
 
@@ -1054,10 +1047,6 @@ async fn apply_managed_decryption_material(
     let mut base_nonce = [0u8; 12];
     base_nonce.copy_from_slice(&iv[..12]);
 
-    let original_size = metadata
-        .get("x-rustfs-encryption-original-size")
-        .and_then(|s| s.parse::<i64>().ok());
-
     let encryption_type = match server_side_encryption.as_str() {
         ServerSideEncryption::AES256 => SSEType::SseS3,
         ServerSideEncryption::AWS_KMS => SSEType::SseKms,
@@ -1073,7 +1062,6 @@ async fn apply_managed_decryption_material(
 
         key_bytes,
         base_nonce,
-        original_size,
     }))
 }
 
