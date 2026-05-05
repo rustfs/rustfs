@@ -1069,13 +1069,6 @@ impl S3Access for FS {
         req_info.object = None;
         req_info.version_id = None;
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteObjectAction)).await?;
-
-        // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
-        if has_bypass_governance_header(&req.headers) {
-            authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
-        }
-
         Ok(())
     }
 
@@ -2398,6 +2391,38 @@ mod tests {
         let req_info = req.extensions.get::<ReqInfo>().expect("req info should remain available");
         assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
         assert_eq!(req_info.object.as_deref(), Some("test-key"));
+        assert_eq!(req_info.version_id, None);
+    }
+
+    #[tokio::test]
+    async fn delete_objects_defers_object_authorization_to_usecase() {
+        let input = DeleteObjectsInput::builder()
+            .bucket("test-bucket".to_string())
+            .delete(Delete {
+                objects: vec![ObjectIdentifier {
+                    key: "prefix/test-key".to_string(),
+                    version_id: None,
+                    ..Default::default()
+                }],
+                quiet: None,
+            })
+            .build()
+            .expect("delete objects input should build");
+
+        let mut req = build_request(input, Method::POST);
+        req.extensions.insert(ReqInfo {
+            cred: Some(rustfs_credentials::Credentials::default()),
+            ..ReqInfo::default()
+        });
+
+        FS::new()
+            .delete_objects(&mut req)
+            .await
+            .expect("DeleteObjects access hook should not require bucket-level DeleteObject");
+
+        let req_info = req.extensions.get::<ReqInfo>().expect("req info should remain available");
+        assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
+        assert_eq!(req_info.object, None);
         assert_eq!(req_info.version_id, None);
     }
 
