@@ -215,7 +215,7 @@
                 "RUSTFS_KMS_ENABLE": "true",
                 "RUSTFS_KMS_BACKEND": "vault-transit",
                 "RUSTFS_KMS_VAULT_ADDRESS": "http://127.0.0.1:8200",
-                "RUSTFS_KMS_VAULT_TOKEN": "hvs.yroERirqez6W1M30oY8kDGIQ",
+                "RUSTFS_KMS_VAULT_TOKEN": "Dev Token",
                 "RUSTFS_KMS_VAULT_MOUNT_PATH": "transit",
                 "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
 
