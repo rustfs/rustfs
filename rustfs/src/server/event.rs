@@ -107,7 +107,7 @@ pub async fn init_event_notifier() {
     if !enabled {
         info!(
             target: "rustfs::main::init_event_notifier",
-            "Notify module is disabled, event notifier initialization is skipped. Enable the notify module first."
+            "Notify module is disabled, event notifier initialization is skipped. Set RUSTFS_NOTIFY_ENABLE=true to enable notify initialization."
         );
         return;
     }

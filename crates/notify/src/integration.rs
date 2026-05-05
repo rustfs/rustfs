@@ -41,6 +41,7 @@ use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 const MAX_RECENT_LIVE_EVENTS: usize = 1024;
+const NOTIFY_CONFIGURATION_HINT: &str = "No notify targets configured. Check RUSTFS_NOTIFY_ENABLE=true and instance-scoped target env vars (for example RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY + RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY for arn:rustfs:sqs::primary:webhook). If using default queue_dir, ensure /opt/rustfs/events is writable.";
 
 fn subsystem_target_type(target_type: &str) -> &str {
     match target_type {
@@ -325,6 +326,9 @@ impl NotificationSystem {
         let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
+        if targets.is_empty() {
+            warn!("{NOTIFY_CONFIGURATION_HINT}");
+        }
 
         // Initialize targets and start event streams
         let cancellers = self.init_targets_and_start_streams(&targets).await;
@@ -607,7 +611,7 @@ impl NotificationSystem {
     ) -> Result<(), NotificationError> {
         let arn_list = self.notifier.get_arn_list(&cfg.region).await;
         if arn_list.is_empty() {
-            return Err(NotificationError::Configuration("No targets configured".to_string()));
+            return Err(NotificationError::Configuration(NOTIFY_CONFIGURATION_HINT.to_string()));
         }
         info!("Available ARNs: {:?}", arn_list);
         // Validate the configuration against the available ARNs
