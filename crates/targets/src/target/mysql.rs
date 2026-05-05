@@ -624,10 +624,13 @@ where
         );
 
         let pool = self.get_or_init_pool().await?;
+        // At this point the pool has already been initialized (get_or_init_pool
+        // succeeded above), so get_conn() failures are always transient: the
+        // connection was lost or the pool is temporarily exhausted.
         let mut conn = pool
             .get_conn()
             .await
-            .map_err(|e| TargetError::Network(format!("Failed to get MySQL connection: {e}")))?;
+            .map_err(|_| TargetError::NotConnected)?;
 
         let event_time = extract_event_time(body)?;
         let event_data =
@@ -638,10 +641,9 @@ where
             quote_table_name(&self.args.table)?
         );
 
-        conn.exec_drop(sql, (event_time.as_str(), event_data)).await.map_err(|e| {
-            error!(target_id = %self.id, error = %e, "Failed to insert MySQL event");
-            TargetError::Request(format!("Failed to insert event: {e}"))
-        })?;
+        conn.exec_drop(sql, (event_time.as_str(), event_data))
+            .await
+            .map_err(map_mysql_error)?;
 
         self.delivery_counters.record_success();
         debug!(target_id = %self.id, "MySQL event inserted");
@@ -657,6 +659,25 @@ where
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })
+    }
+}
+
+/// Maps a mysql_async error to `TargetError`:
+/// - `Io`/`Driver` → `NotConnected` (connection lost, fixed-delay retry)
+/// - `Server(1213|1205|1040)` → `Timeout` (deadlock/lock timeout/too
+///   many connections, exponential-backoff retry)
+/// - everything else → `Request` (permanent failure)
+fn map_mysql_error(err: mysql_async::Error) -> TargetError {
+    match &err {
+        mysql_async::Error::Io(_) | mysql_async::Error::Driver(_) => TargetError::NotConnected,
+        mysql_async::Error::Server(server_err) => match server_err.code {
+            1213 | 1205 | 1040 => TargetError::Timeout(format!(
+                "MySQL transient server error {}: {}",
+                server_err.code, server_err.message
+            )),
+            _ => TargetError::Request(format!("Failed to insert event: {err}")),
+        },
+        _ => TargetError::Request(format!("Failed to insert event: {err}")),
     }
 }
 
