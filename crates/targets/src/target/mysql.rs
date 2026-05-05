@@ -374,9 +374,9 @@ async fn validate_existing_schema(conn: &mut Conn, table: &str) -> Result<(), Ta
 
         if field == "event_time" {
             has_event_time = true;
-            if !col_type.to_lowercase().starts_with("datetime") {
+            if col_type.to_lowercase() != "datetime(6)" {
                 return Err(TargetError::Initialization(
-                    "MySQL table column 'event_time' must be DATETIME type".to_string(),
+                    "MySQL table column 'event_time' must be DATETIME(6) to match insert precision".to_string(),
                 ));
             }
             if nullable.to_lowercase() != "no" {
@@ -761,16 +761,16 @@ where
         match extract_event_time(&body) {
             Ok(_) => {}
             Err(_) => {
-                // If the payload is missing the required eventTime field or it cannot be parsed, we consider it corrupted and drop it to avoid blocking the queue with undeliverable entries.
-                // - log a warning with the target ID and key, but do not include the body in the log to avoid exposing potentially sensitive information
-                // - attempt to delete the corrupted entry from the store if possible
-                // - record a final failure in the delivery counters.
+                // If the payload is missing the required eventTime field or it
+                // cannot be parsed, we consider it corrupted and drop it to
+                // avoid blocking the queue with undeliverable entries.
                 error!(
                     target_id = %self.id,
                     key = %key,
                     "Corrupted queued MySQL payload: missing or invalid Records[0].eventTime; dropping entry"
                 );
 
+                // attempt to delete the corrupted entry from the store if possible
                 if let Some(store) = &self.store
                     && let Err(e) = delete_stored_payload(store.as_ref(), &key)
                 {
