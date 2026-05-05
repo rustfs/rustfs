@@ -565,9 +565,14 @@ mod tests {
             Some("custom-rpc-secret")
         );
         assert_eq!(
+            resolve_rpc_secret(Some("  "), Some("  custom-global-secret  ")).as_deref(),
+            Some("custom-global-secret")
+        );
+        assert_eq!(
             resolve_rpc_secret(Some("  "), Some("custom-global-secret")).as_deref(),
             Some("custom-global-secret")
         );
+        assert!(resolve_rpc_secret(Some("  rustfsadmin  "), Some("custom-global-secret")).is_none());
     }
 
     #[test]
