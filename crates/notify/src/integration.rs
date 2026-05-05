@@ -24,8 +24,9 @@ use crate::{
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{
-    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS,
-    NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_WEBHOOK_ENABLE,
+    ENV_NOTIFY_WEBHOOK_ENDPOINT, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS,
+    NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{ENV_NOTIFY_ENABLE, EVENT_DEFAULT_DIR};
 use rustfs_ecstore::config::{Config, KVS};
@@ -44,8 +45,10 @@ use tracing::{debug, info, warn};
 const MAX_RECENT_LIVE_EVENTS: usize = 1024;
 
 fn notify_configuration_hint() -> String {
+    let webhook_enable_primary = format!("{ENV_NOTIFY_WEBHOOK_ENABLE}_PRIMARY");
+    let webhook_endpoint_primary = format!("{ENV_NOTIFY_WEBHOOK_ENDPOINT}_PRIMARY");
     format!(
-        "No notify targets configured. Check {ENV_NOTIFY_ENABLE}=true and instance-scoped target env vars (for example RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY + RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY for arn:rustfs:sqs::primary:webhook). If using default queue_dir, ensure {EVENT_DEFAULT_DIR} is writable."
+        "No notify targets configured. Check {ENV_NOTIFY_ENABLE}=true and instance-scoped target env vars (for example {webhook_enable_primary} + {webhook_endpoint_primary} for arn:rustfs:sqs::primary:webhook). If using default queue_dir, ensure {EVENT_DEFAULT_DIR} is writable."
     )
 }
 
