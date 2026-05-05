@@ -695,12 +695,28 @@ where
             return Ok(false);
         }
 
-        // TODO: should we add a timeout here to avoid hanging if the database is unreachable?
         let pool = self.get_or_init_pool().await?;
-        let mut conn = pool.get_conn().await.map_err(|_| TargetError::NotConnected)?;
-        conn.query_drop("SELECT 1").await.map_err(|_| TargetError::NotConnected)?;
-        debug!("MySQL target '{}' is reachable", self.id);
-        Ok(true)
+
+        let health_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            async {
+                let mut conn = pool.get_conn().await?;
+                conn.query_drop("SELECT 1").await
+            },
+        )
+        .await;
+
+        match health_result {
+            Ok(Ok(())) => {
+                debug!("MySQL target '{}' is reachable", self.id);
+                Ok(true)
+            }
+            // get_or_init_pool has already verified connectivity, DDL, and
+            // schema, so a SELECT 1 failure here is always transient
+            // (connection lost). No need to classify error codes.
+            Ok(Err(_)) => Err(TargetError::NotConnected),
+            Err(_elapsed) => Err(TargetError::Timeout("MySQL is_active health check timed out after 10s".to_string())),
+        }
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
