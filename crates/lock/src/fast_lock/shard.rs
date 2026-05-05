@@ -48,20 +48,28 @@ pub struct LockShard {
 struct WaiterCounterGuard {
     state: Arc<ObjectLockState>,
     mode: LockMode,
+    incremented: bool,
 }
 
 impl WaiterCounterGuard {
     fn new(state: Arc<ObjectLockState>, mode: LockMode) -> Self {
-        match mode {
+        let incremented = match mode {
             LockMode::Shared => state.atomic_state.inc_readers_waiting(),
             LockMode::Exclusive => state.atomic_state.inc_writers_waiting(),
+        };
+        Self {
+            state,
+            mode,
+            incremented,
         }
-        Self { state, mode }
     }
 }
 
 impl Drop for WaiterCounterGuard {
     fn drop(&mut self) {
+        if !self.incremented {
+            return;
+        }
         match self.mode {
             LockMode::Shared => self.state.atomic_state.dec_readers_waiting(),
             LockMode::Exclusive => self.state.atomic_state.dec_writers_waiting(),
@@ -841,8 +849,19 @@ mod tests {
         let shard_for_waiter = shard.clone();
         let waiter_handle = tokio::spawn(async move { shard_for_waiter.acquire_lock(&contended_writer).await });
 
-        // Allow the contended writer task to enter slow-path waiting.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Ensure we actually enter slow-path wait registration before aborting.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(state) = shard.objects.read().get(&key).cloned()
+                    && state.atomic_state.writers_waiting_count() > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for contended writer to register as waiting");
         waiter_handle.abort();
         let _ = waiter_handle.await;
 
