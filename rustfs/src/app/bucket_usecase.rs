@@ -102,6 +102,13 @@ fn invalid_filter_value_message(cfg_scope: &str, value: &str) -> String {
     format!("invalid notification filter value (len={}) ({cfg_scope})", value.len())
 }
 
+fn invalid_filter_name_message(cfg_scope: &str, name: &str) -> String {
+    format!(
+        "invalid notification filter name (len={}) (only 'prefix'/'suffix' are supported) ({cfg_scope})",
+        name.len()
+    )
+}
+
 fn validate_notification_filter_rules(
     filter: Option<&NotificationConfigurationFilter>,
     cfg_kind: &str,
@@ -150,10 +157,7 @@ fn validate_notification_filter_rules(
                 has_suffix = true;
             }
             other => {
-                return Err(s3_error!(
-                    InvalidArgument,
-                    "invalid notification filter name '{other}' (only 'prefix'/'suffix' are supported) ({cfg_scope})"
-                ));
+                return Err(s3_error!(InvalidArgument, "{}", invalid_filter_name_message(&cfg_scope, other)));
             }
         }
     }
@@ -2972,6 +2976,7 @@ mod tests {
 
     #[test]
     fn validate_notification_configuration_filters_rejects_invalid_filter_name() {
+        let raw_name = "Prefix".repeat(100);
         let cfg = NotificationConfiguration {
             queue_configurations: Some(vec![QueueConfiguration {
                 id: Some("q1".to_string()),
@@ -2980,7 +2985,7 @@ mod tests {
                 filter: Some(NotificationConfigurationFilter {
                     key: Some(S3KeyFilter {
                         filter_rules: Some(vec![FilterRule {
-                            name: Some(FilterRuleName::from("Prefix".to_string())),
+                            name: Some(FilterRuleName::from(raw_name.clone())),
                             value: Some("uploads/".to_string()),
                         }]),
                     }),
@@ -2991,6 +2996,9 @@ mod tests {
 
         let err = validate_notification_configuration_filters(&cfg).unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        let msg = err.message().unwrap_or_default();
+        assert!(msg.contains("len="), "error message should include summarized length");
+        assert!(!msg.contains(&raw_name), "error message should not echo full raw filter name");
     }
 
     #[test]
