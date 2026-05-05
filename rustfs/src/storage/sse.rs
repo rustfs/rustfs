@@ -75,7 +75,7 @@ use aes_gcm::{
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
 use rand::Rng;
 use rustfs_ecstore::error::StorageError;
 use rustfs_kms::{DataKey, service_manager::get_global_encryption_service, types::ObjectEncryptionContext};
@@ -87,10 +87,15 @@ use std::sync::{Arc, OnceLock};
 use tracing::{debug, error};
 
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
+const SSEC_ORIGINAL_SIZE_HEADER: &str = "x-amz-server-side-encryption-customer-original-size";
 
 use crate::error::ApiError;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::error::Error;
+use rustfs_utils::http::headers::{
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+};
 use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
 
 // ============================================================================
@@ -582,6 +587,34 @@ pub enum SSEType {
     SseC,
 }
 
+pub(crate) fn build_ssec_read_headers(
+    algorithm: Option<&SSECustomerAlgorithm>,
+    key: Option<&SSECustomerKey>,
+    key_md5: Option<&SSECustomerKeyMD5>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+
+    if let Some(algorithm) = algorithm
+        && let Ok(value) = HeaderValue::from_str(algorithm.as_str())
+    {
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, value);
+    }
+
+    if let Some(key) = key
+        && let Ok(value) = HeaderValue::from_str(key.as_str())
+    {
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY, value);
+    }
+
+    if let Some(key_md5) = key_md5
+        && let Ok(value) = HeaderValue::from_str(key_md5.as_str())
+    {
+        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, value);
+    }
+
+    headers
+}
+
 pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap<String, String> {
     let mut metadata = HashMap::new();
 
@@ -598,12 +631,16 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap
             if let Some(customer_key_md5) = &material.customer_key_md5 {
                 metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), customer_key_md5.to_string());
             }
+            if let Some(original_size) = material.original_size {
+                metadata.insert(SSEC_ORIGINAL_SIZE_HEADER.to_string(), original_size.to_string());
+            }
         }
         SSEType::SseS3 | SSEType::SseKms => {
-            metadata.insert(
-                "x-rustfs-encryption-key".to_string(),
-                BASE64_STANDARD.encode(material.encrypted_data_key.as_deref().unwrap_or_default()),
-            );
+            let encrypted_data_key = material
+                .encrypted_data_key
+                .as_deref()
+                .expect("managed SSE materials must carry an encrypted data key");
+            metadata.insert("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_data_key));
             metadata.insert("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(material.base_nonce));
             metadata.insert("x-rustfs-encryption-algorithm".to_string(), material.algorithm.as_str().to_string());
             metadata.insert(
@@ -1873,6 +1910,23 @@ mod tests {
         let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"));
         assert_eq!(metadata.get("x-amz-server-side-encryption").unwrap(), "AES256");
         assert_eq!(metadata.get("x-amz-server-side-encryption-customer-algorithm").unwrap(), "AES256");
+    }
+
+    #[test]
+    fn test_encryption_material_to_metadata_persists_ssec_original_size() {
+        let metadata = encryption_material_to_metadata(&EncryptionMaterial {
+            sse_type: SSEType::SseC,
+            server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+            kms_key_id: None,
+            algorithm: SSECustomerAlgorithm::from("AES256".to_string()),
+            key_bytes: [0u8; 32],
+            base_nonce: [0u8; 12],
+            encrypted_data_key: None,
+            customer_key_md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            original_size: Some(1024),
+        });
+
+        assert_eq!(metadata.get(SSEC_ORIGINAL_SIZE_HEADER).map(String::as_str), Some("1024"));
     }
 
     #[tokio::test]

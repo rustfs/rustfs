@@ -31,7 +31,7 @@ use crate::storage::options::{
 };
 use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
-use crate::storage::sse::{SSEType, encryption_material_to_metadata};
+use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_to_metadata};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::*;
 use bytes::Bytes;
@@ -101,9 +101,9 @@ use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS,
         AMZ_RESTORE_REQUEST_DATE, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX,
-        AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
-        AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT,
-        AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
+        AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
+        AMZ_SNOWBALL_EXTRACT, AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS,
+        AMZ_TAG_COUNT,
     },
     insert_str, remove_str,
 };
@@ -119,34 +119,6 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
-
-fn build_ssec_read_headers(
-    algorithm: Option<&SSECustomerAlgorithm>,
-    key: Option<&SSECustomerKey>,
-    key_md5: Option<&SSECustomerKeyMD5>,
-) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-
-    if let Some(algorithm) = algorithm
-        && let Ok(value) = HeaderValue::from_str(algorithm.as_str())
-    {
-        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, value);
-    }
-
-    if let Some(key) = key
-        && let Ok(value) = HeaderValue::from_str(key.as_str())
-    {
-        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY, value);
-    }
-
-    if let Some(key_md5) = key_md5
-        && let Ok(value) = HeaderValue::from_str(key_md5.as_str())
-    {
-        headers.insert(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, value);
-    }
-
-    headers
-}
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};

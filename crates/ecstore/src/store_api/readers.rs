@@ -18,6 +18,14 @@ const INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER: &str = "x-rustfs-encryption-orig
 const SSEC_ORIGINAL_SIZE_HEADER: &str = "x-amz-server-side-encryption-customer-original-size";
 const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 
+fn part_plaintext_size(part: &ObjectPartInfo) -> i64 {
+    if part.actual_size > 0 {
+        part.actual_size
+    } else {
+        part.size as i64
+    }
+}
+
 fn restore_request_active(opts: &ObjectOptions) -> bool {
     let restore = &opts.transition.restore_request;
     restore.type_.is_some() || restore.days.is_some() || restore.output_location.is_some() || restore.select_parameters.is_some()
@@ -40,12 +48,12 @@ fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64
     let mut compressed_offset = 0_i64;
 
     for (i, part) in oi.parts.iter().enumerate() {
-        cumulative_actual_size += part.actual_size;
+        cumulative_actual_size += part_plaintext_size(part);
         if cumulative_actual_size <= offset {
             compressed_offset += part.size as i64;
         } else {
             first_part_idx = i;
-            skip_length = cumulative_actual_size - part.actual_size;
+            skip_length = cumulative_actual_size - part_plaintext_size(part);
             break;
         }
     }
@@ -321,7 +329,7 @@ impl HTTPRangeSpec {
         for i in 0..part_number {
             let part = &oi.parts[i];
             start = end + 1;
-            end = start + part.actual_size - 1;
+            end = start + part_plaintext_size(part) - 1;
         }
 
         Some(HTTPRangeSpec {
@@ -818,6 +826,41 @@ mod tests {
         assert_eq!(spec.end, 69);
     }
 
+    #[test]
+    fn test_http_range_spec_from_object_info_falls_back_to_part_size_when_actual_size_missing() {
+        let object_info = ObjectInfo {
+            size: 90,
+            parts: vec![
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 1,
+                    size: 20,
+                    actual_size: 0,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 2,
+                    size: 30,
+                    actual_size: 40,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    etag: String::new(),
+                    number: 3,
+                    size: 40,
+                    actual_size: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let spec = HTTPRangeSpec::from_object_info(&object_info, 3).unwrap();
+        assert_eq!(spec.start, 60);
+        assert_eq!(spec.end, 99);
+    }
+
     #[tokio::test]
     async fn test_ranged_decompress_reader_zero_length() {
         let original_data = b"Hello, World!";
@@ -1229,16 +1272,7 @@ fn is_multipart_encrypted_object(parts: &[rustfs_filemeta::ObjectPartInfo], etag
 }
 
 fn multipart_plaintext_size(parts: &[rustfs_filemeta::ObjectPartInfo], fallback: i64) -> i64 {
-    let total: i64 = parts
-        .iter()
-        .map(|part| {
-            if part.actual_size > 0 {
-                part.actual_size
-            } else {
-                part.size as i64
-            }
-        })
-        .sum();
+    let total: i64 = parts.iter().map(part_plaintext_size).sum();
 
     if total > 0 { total } else { fallback }
 }
@@ -1362,7 +1396,7 @@ fn decrypt_local_sse_dek(encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8;
         .try_into()
         .map_err(|_| Error::other("invalid managed DEK nonce length"))?;
 
-    let key = Key::<Aes256Gcm>::from(local_sse_master_key());
+    let key = Key::<Aes256Gcm>::from(local_sse_master_key()?);
     let cipher = Aes256Gcm::new(&key);
     let plaintext = cipher
         .decrypt(&Nonce::from(nonce_array), ciphertext.as_slice())
@@ -1374,24 +1408,37 @@ fn decrypt_local_sse_dek(encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8;
         .map_err(|_| Error::other("managed DEK has invalid plaintext length"))
 }
 
-fn local_sse_master_key() -> [u8; 32] {
-    if let Ok(value) = env::var("__RUSTFS_SSE_SIMPLE_CMK")
-        && !value.trim().is_empty()
-        && let Ok(decoded) = BASE64_STANDARD.decode(value.trim())
-        && let Ok(arr) = <[u8; 32]>::try_from(decoded.as_slice())
-    {
-        return arr;
+fn local_sse_master_key() -> Result<[u8; 32]> {
+    if let Some(key) = decode_master_key_env("__RUSTFS_SSE_SIMPLE_CMK")? {
+        return Ok(key);
     }
 
-    if let Ok(value) = env::var("RUSTFS_SSE_S3_MASTER_KEY")
-        && !value.trim().is_empty()
-        && let Ok(decoded) = BASE64_STANDARD.decode(value.trim())
-        && let Ok(arr) = <[u8; 32]>::try_from(decoded.as_slice())
-    {
-        return arr;
+    if let Some(key) = decode_master_key_env("RUSTFS_SSE_S3_MASTER_KEY")? {
+        return Ok(key);
     }
 
-    [0u8; 32]
+    Err(Error::other(
+        "managed SSE master key is not configured; set __RUSTFS_SSE_SIMPLE_CMK or RUSTFS_SSE_S3_MASTER_KEY",
+    ))
+}
+
+fn decode_master_key_env(name: &str) -> Result<Option<[u8; 32]>> {
+    let Ok(value) = env::var(name) else {
+        return Ok(None);
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let decoded = BASE64_STANDARD
+        .decode(value)
+        .map_err(|e| Error::other(format!("{name} is not valid base64: {e}")))?;
+    let key =
+        <[u8; 32]>::try_from(decoded.as_slice()).map_err(|_| Error::other(format!("{name} must decode to exactly 32 bytes")))?;
+
+    Ok(Some(key))
 }
 
 fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {

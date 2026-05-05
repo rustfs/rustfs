@@ -28,7 +28,7 @@ use crate::storage::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
     parse_list_multipart_uploads_params, parse_list_parts_params,
 };
-use crate::storage::sse::encryption_material_to_metadata;
+use crate::storage::sse::{build_ssec_read_headers, encryption_material_to_metadata};
 use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -100,34 +100,6 @@ fn multipart_plaintext_size(parts: &[rustfs_filemeta::ObjectPartInfo], fallback:
 #[cfg(test)]
 fn multipart_part_numbers(parts: &[rustfs_filemeta::ObjectPartInfo]) -> Vec<usize> {
     parts.iter().map(|part| part.number).collect()
-}
-
-fn build_ssec_read_headers(
-    algorithm: Option<&SSECustomerAlgorithm>,
-    key: Option<&SSECustomerKey>,
-    key_md5: Option<&SSECustomerKeyMD5>,
-) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-
-    if let Some(algorithm) = algorithm
-        && let Ok(value) = http::HeaderValue::from_str(algorithm.as_str())
-    {
-        headers.insert("x-amz-server-side-encryption-customer-algorithm", value);
-    }
-
-    if let Some(key) = key
-        && let Ok(value) = http::HeaderValue::from_str(key.as_str())
-    {
-        headers.insert("x-amz-server-side-encryption-customer-key", value);
-    }
-
-    if let Some(key_md5) = key_md5
-        && let Ok(value) = http::HeaderValue::from_str(key_md5.as_str())
-    {
-        headers.insert("x-amz-server-side-encryption-customer-key-md5", value);
-    }
-
-    headers
 }
 
 /// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
