@@ -119,6 +119,7 @@ use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -132,6 +133,8 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
+const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
 
 struct DeadlockRequestGuard {
     deadlock_detector: Arc<deadlock_detector::DeadlockDetector>,
@@ -392,6 +395,41 @@ fn object_seek_support_threshold() -> usize {
             rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD,
         )
     })
+}
+
+fn should_buffer_get_object_in_memory(
+    info: &ObjectInfo,
+    response_content_length: i64,
+    part_number: Option<usize>,
+    has_range: bool,
+) -> bool {
+    if part_number.is_some() || has_range || response_content_length <= 0 {
+        return false;
+    }
+
+    let configured_threshold = object_seek_support_threshold() as i64;
+    let effective_threshold = configured_threshold.min(MAX_GET_OBJECT_MEMORY_BUFFER_BYTES);
+    if configured_threshold > MAX_GET_OBJECT_MEMORY_BUFFER_BYTES
+        && GET_OBJECT_BUFFER_THRESHOLD_WARNED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!(
+            configured_threshold_bytes = configured_threshold,
+            hard_limit_bytes = MAX_GET_OBJECT_MEMORY_BUFFER_BYTES,
+            "RUSTFS_OBJECT_SEEK_SUPPORT_THRESHOLD exceeds safety cap; using capped in-memory buffer threshold"
+        );
+    }
+
+    if response_content_length > effective_threshold {
+        return false;
+    }
+
+    if info.size > 0 && info.size > effective_threshold {
+        return false;
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -1518,7 +1556,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_body<R>(
         mut final_stream: R,
-        _info: &ObjectInfo,
+        info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
         part_number: Option<usize>,
@@ -1529,11 +1567,8 @@ impl DefaultObjectUsecase {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         if encryption_applied {
-            let seekable_object_size_threshold = object_seek_support_threshold();
-            let should_buffer_encrypted_object = response_content_length > 0
-                && response_content_length <= seekable_object_size_threshold as i64
-                && part_number.is_none()
-                && !has_range;
+            let should_buffer_encrypted_object =
+                should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range);
 
             if should_buffer_encrypted_object {
                 let mut buf = Vec::with_capacity(response_content_length as usize);
@@ -1560,11 +1595,8 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size));
         }
 
-        let seekable_object_size_threshold = object_seek_support_threshold();
-        let should_provide_seek_support = response_content_length > 0
-            && response_content_length <= seekable_object_size_threshold as i64
-            && part_number.is_none()
-            && !has_range;
+        let should_provide_seek_support =
+            should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range);
 
         if should_provide_seek_support {
             let mut buf = Vec::with_capacity(response_content_length as usize);
@@ -4439,6 +4471,12 @@ mod tests {
         DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
         ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
     };
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use temp_env::with_vars;
+    use tokio::io::{AsyncRead, ReadBuf};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -4522,6 +4560,102 @@ mod tests {
         headers.insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("AES256"));
 
         assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_respects_hard_safety_cap() {
+        with_vars(
+            [(
+                rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD,
+                Some((20_i64 * 1024 * 1024 * 1024).to_string()),
+            )],
+            || {
+                let info = ObjectInfo {
+                    size: 18_i64 * 1024 * 1024 * 1024,
+                    ..Default::default()
+                };
+                let should_buffer = should_buffer_get_object_in_memory(
+                    &info,
+                    18_i64 * 1024 * 1024 * 1024,
+                    None,
+                    false,
+                );
+
+                assert!(!should_buffer, "large objects must stay on streaming path");
+            },
+        );
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_allows_small_non_range_requests() {
+        with_vars(
+            [(rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD, Some("10485760".to_string()))],
+            || {
+                let info = ObjectInfo {
+                    size: 1024 * 1024,
+                    ..Default::default()
+                };
+
+                assert!(should_buffer_get_object_in_memory(&info, 1024 * 1024, None, false));
+                assert!(!should_buffer_get_object_in_memory(&info, 1024 * 1024, Some(1), false));
+                assert!(!should_buffer_get_object_in_memory(&info, 1024 * 1024, None, true));
+            },
+        );
+    }
+
+    struct ReadProbeReader {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for ReadProbeReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_keeps_large_objects_on_streaming_path_without_preread() {
+        with_vars(
+            [(
+                rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD,
+                Some((20_i64 * 1024 * 1024 * 1024).to_string()),
+            )],
+            || async {
+                let reads = Arc::new(AtomicUsize::new(0));
+                let reader = ReadProbeReader {
+                    reads: Arc::clone(&reads),
+                };
+                let info = ObjectInfo {
+                    size: 18_i64 * 1024 * 1024 * 1024,
+                    ..Default::default()
+                };
+
+                let body = DefaultObjectUsecase::build_get_object_body(
+                    reader,
+                    &info,
+                    18_i64 * 1024 * 1024 * 1024,
+                    128 * 1024,
+                    None,
+                    false,
+                    false,
+                )
+                .await
+                .expect("build_get_object_body should succeed for streaming path");
+
+                assert!(body.is_some());
+                assert_eq!(
+                    reads.load(AtomicOrdering::Relaxed),
+                    0,
+                    "large-object response construction should not pre-read object data"
+                );
+            },
+        )
+        .await;
     }
 
     #[test]
