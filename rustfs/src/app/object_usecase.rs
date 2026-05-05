@@ -131,6 +131,8 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
+const ACCEPT_RANGES_BYTES: &str = "bytes";
+
 struct DeadlockRequestGuard {
     deadlock_detector: Arc<deadlock_detector::DeadlockDetector>,
     request_id: String,
@@ -2117,7 +2119,7 @@ impl DefaultObjectUsecase {
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
-            accept_ranges: Some("bytes".to_string()),
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&info.user_defined),
@@ -3625,6 +3627,7 @@ impl DefaultObjectUsecase {
             cache_control,
             content_disposition,
             content_language,
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             website_redirect_location,
             expires,
             last_modified,
