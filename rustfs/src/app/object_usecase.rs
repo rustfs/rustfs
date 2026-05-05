@@ -404,13 +404,7 @@ fn should_buffer_get_object_in_memory(
     has_range: bool,
 ) -> bool {
     let configured_threshold = object_seek_support_threshold() as i64;
-    should_buffer_get_object_in_memory_with_threshold(
-        info,
-        response_content_length,
-        part_number,
-        has_range,
-        configured_threshold,
-    )
+    should_buffer_get_object_in_memory_with_threshold(info, response_content_length, part_number, has_range, configured_threshold)
 }
 
 fn should_buffer_get_object_in_memory_with_threshold(
@@ -4654,6 +4648,37 @@ mod tests {
             reads.load(AtomicOrdering::Relaxed),
             0,
             "large-object response construction should not pre-read object data"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_keeps_large_encrypted_objects_on_streaming_path_without_preread() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 18_i64 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            18_i64 * 1024 * 1024 * 1024,
+            128 * 1024,
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("build_get_object_body should succeed for encrypted streaming path");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "large encrypted object response construction should not pre-read object data"
         );
     }
 
