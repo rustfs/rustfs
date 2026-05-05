@@ -41,6 +41,42 @@ pub struct LockShard {
     active_guards: parking_lot::Mutex<HashSet<u64>>,
 }
 
+/// Cancellation-safe waiter counter ticket.
+///
+/// Ensures waiting counters are decremented even if the waiting future
+/// is cancelled/dropped before the normal post-await path runs.
+struct WaiterCounterGuard {
+    state: Arc<ObjectLockState>,
+    mode: LockMode,
+    incremented: bool,
+}
+
+impl WaiterCounterGuard {
+    fn new(state: Arc<ObjectLockState>, mode: LockMode) -> Self {
+        let incremented = match mode {
+            LockMode::Shared => state.atomic_state.inc_readers_waiting(),
+            LockMode::Exclusive => state.atomic_state.inc_writers_waiting(),
+        };
+        Self {
+            state,
+            mode,
+            incremented,
+        }
+    }
+}
+
+impl Drop for WaiterCounterGuard {
+    fn drop(&mut self) {
+        if !self.incremented {
+            return;
+        }
+        match self.mode {
+            LockMode::Shared => self.state.atomic_state.dec_readers_waiting(),
+            LockMode::Exclusive => self.state.atomic_state.dec_writers_waiting(),
+        }
+    }
+}
+
 impl LockShard {
     pub fn new(shard_id: usize) -> Self {
         Self {
@@ -184,16 +220,12 @@ impl LockShard {
             // If we've exhausted quick retries or have little time left, use notification wait
             let wait_result = match request.mode {
                 LockMode::Shared => {
-                    state.atomic_state.inc_readers_waiting();
-                    let result = timeout(remaining, state.optimized_notify.wait_for_read()).await;
-                    state.atomic_state.dec_readers_waiting();
-                    result
+                    let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Shared);
+                    timeout(remaining, state.optimized_notify.wait_for_read()).await
                 }
                 LockMode::Exclusive => {
-                    state.atomic_state.inc_writers_waiting();
-                    let result = timeout(remaining, state.optimized_notify.wait_for_write()).await;
-                    state.atomic_state.dec_writers_waiting();
-                    result
+                    let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Exclusive);
+                    timeout(remaining, state.optimized_notify.wait_for_write()).await
                 }
             };
 
@@ -783,5 +815,71 @@ mod tests {
         let obj1_key = ObjectKey::new("bucket", "obj1");
         let lock_info = shard.get_lock_info(&obj1_key);
         assert!(lock_info.is_some(), "obj1 should still be locked by blocking_owner");
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_waiter_abort_does_not_block_following_shared_lock() {
+        let shard = Arc::new(LockShard::new(0));
+        let key = ObjectKey::new("bucket", "abort-waiter-key");
+
+        let owner1: Arc<str> = Arc::from("writer-owner-1");
+        let owner2: Arc<str> = Arc::from("writer-owner-2");
+        let reader_owner: Arc<str> = Arc::from("reader-owner");
+
+        let hold_writer = ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Exclusive,
+            owner: owner1.clone(),
+            acquire_timeout: Duration::from_secs(1),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+        };
+
+        assert!(shard.acquire_lock(&hold_writer).await.is_ok());
+
+        let contended_writer = ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Exclusive,
+            owner: owner2.clone(),
+            acquire_timeout: Duration::from_secs(5),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+        };
+
+        let shard_for_waiter = shard.clone();
+        let waiter_handle = tokio::spawn(async move { shard_for_waiter.acquire_lock(&contended_writer).await });
+
+        // Ensure we actually enter slow-path wait registration before aborting.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(state) = shard.objects.read().get(&key).cloned()
+                    && state.atomic_state.writers_waiting_count() > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for contended writer to register as waiting");
+        waiter_handle.abort();
+        let _ = waiter_handle.await;
+
+        assert!(shard.release_lock(&key, &owner1, LockMode::Exclusive));
+
+        let followup_reader = ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Shared,
+            owner: reader_owner.clone(),
+            acquire_timeout: Duration::from_millis(200),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+        };
+
+        assert!(
+            shard.acquire_lock(&followup_reader).await.is_ok(),
+            "shared lock should succeed after writer waiter task is aborted"
+        );
+        assert!(shard.release_lock(&key, &reader_owner, LockMode::Shared));
     }
 }
