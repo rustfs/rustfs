@@ -627,10 +627,7 @@ where
         // At this point the pool has already been initialized (get_or_init_pool
         // succeeded above), so get_conn() failures are always transient: the
         // connection was lost or the pool is temporarily exhausted.
-        let mut conn = pool
-            .get_conn()
-            .await
-            .map_err(|_| TargetError::NotConnected)?;
+        let mut conn = pool.get_conn().await.map_err(|_| TargetError::NotConnected)?;
 
         let event_time = extract_event_time(body)?;
         let event_data =
@@ -671,10 +668,9 @@ fn map_mysql_error(err: mysql_async::Error) -> TargetError {
     match &err {
         mysql_async::Error::Io(_) | mysql_async::Error::Driver(_) => TargetError::NotConnected,
         mysql_async::Error::Server(server_err) => match server_err.code {
-            1213 | 1205 | 1040 => TargetError::Timeout(format!(
-                "MySQL transient server error {}: {}",
-                server_err.code, server_err.message
-            )),
+            1213 | 1205 | 1040 => {
+                TargetError::Timeout(format!("MySQL transient server error {}: {}", server_err.code, server_err.message))
+            }
             _ => TargetError::Request(format!("Failed to insert event: {err}")),
         },
         _ => TargetError::Request(format!("Failed to insert event: {err}")),
@@ -697,13 +693,10 @@ where
 
         let pool = self.get_or_init_pool().await?;
 
-        let health_result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            async {
-                let mut conn = pool.get_conn().await?;
-                conn.query_drop("SELECT 1").await
-            },
-        )
+        let health_result = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            let mut conn = pool.get_conn().await?;
+            conn.query_drop("SELECT 1").await
+        })
         .await;
 
         match health_result {
