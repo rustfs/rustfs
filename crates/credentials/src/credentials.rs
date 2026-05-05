@@ -572,7 +572,8 @@ mod tests {
             resolve_rpc_secret(Some("  "), Some("custom-global-secret")).as_deref(),
             Some("custom-global-secret")
         );
-        assert!(resolve_rpc_secret(Some("  rustfsadmin  "), Some("custom-global-secret")).is_none());
+        let padded_default_secret = format!("  {}  ", DEFAULT_SECRET_KEY);
+        assert!(resolve_rpc_secret(Some(padded_default_secret.as_str()), Some("custom-global-secret")).is_none());
     }
 
     #[test]
