@@ -403,11 +403,27 @@ fn should_buffer_get_object_in_memory(
     part_number: Option<usize>,
     has_range: bool,
 ) -> bool {
-    if part_number.is_some() || has_range || response_content_length <= 0 {
+    let configured_threshold = object_seek_support_threshold() as i64;
+    should_buffer_get_object_in_memory_with_threshold(
+        info,
+        response_content_length,
+        part_number,
+        has_range,
+        configured_threshold,
+    )
+}
+
+fn should_buffer_get_object_in_memory_with_threshold(
+    _info: &ObjectInfo,
+    response_content_length: i64,
+    part_number: Option<usize>,
+    has_range: bool,
+    configured_threshold: i64,
+) -> bool {
+    if part_number.is_some() || has_range || response_content_length <= 0 || configured_threshold <= 0 {
         return false;
     }
 
-    let configured_threshold = object_seek_support_threshold() as i64;
     let effective_threshold = configured_threshold.min(MAX_GET_OBJECT_MEMORY_BUFFER_BYTES);
     if configured_threshold > MAX_GET_OBJECT_MEMORY_BUFFER_BYTES
         && GET_OBJECT_BUFFER_THRESHOLD_WARNED
@@ -422,10 +438,6 @@ fn should_buffer_get_object_in_memory(
     }
 
     if response_content_length > effective_threshold {
-        return false;
-    }
-
-    if info.size > 0 && info.size > effective_threshold {
         return false;
     }
 
@@ -4475,7 +4487,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
-    use temp_env::with_vars;
     use tokio::io::{AsyncRead, ReadBuf};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
@@ -4564,35 +4575,44 @@ mod tests {
 
     #[test]
     fn should_buffer_get_object_in_memory_respects_hard_safety_cap() {
-        with_vars(
-            [(
-                rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD,
-                Some((20_i64 * 1024 * 1024 * 1024).to_string()),
-            )],
-            || {
-                let info = ObjectInfo {
-                    size: 18_i64 * 1024 * 1024 * 1024,
-                    ..Default::default()
-                };
-                let should_buffer = should_buffer_get_object_in_memory(&info, 18_i64 * 1024 * 1024 * 1024, None, false);
+        let info = ObjectInfo::default();
+        let configured_threshold = 20_i64 * 1024 * 1024 * 1024;
+        let response_len = 80_i64 * 1024 * 1024;
+        let should_buffer =
+            should_buffer_get_object_in_memory_with_threshold(&info, response_len, None, false, configured_threshold);
 
-                assert!(!should_buffer, "large objects must stay on streaming path");
-            },
+        assert!(
+            !should_buffer,
+            "64MiB hard cap must force streaming when response exceeds cap even if configured threshold is much higher"
         );
     }
 
     #[test]
     fn should_buffer_get_object_in_memory_allows_small_non_range_requests() {
-        with_vars([(rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD, Some("10485760".to_string()))], || {
-            let info = ObjectInfo {
-                size: 1024 * 1024,
-                ..Default::default()
-            };
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
 
-            assert!(should_buffer_get_object_in_memory(&info, 1024 * 1024, None, false));
-            assert!(!should_buffer_get_object_in_memory(&info, 1024 * 1024, Some(1), false));
-            assert!(!should_buffer_get_object_in_memory(&info, 1024 * 1024, None, true));
-        });
+        assert!(should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024 * 1024,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024 * 1024,
+            Some(1),
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024 * 1024,
+            None,
+            true,
+            configured_threshold
+        ));
     }
 
     struct ReadProbeReader {
@@ -4608,42 +4628,33 @@ mod tests {
 
     #[tokio::test]
     async fn build_get_object_body_keeps_large_objects_on_streaming_path_without_preread() {
-        with_vars(
-            [(
-                rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD,
-                Some((20_i64 * 1024 * 1024 * 1024).to_string()),
-            )],
-            || async {
-                let reads = Arc::new(AtomicUsize::new(0));
-                let reader = ReadProbeReader {
-                    reads: Arc::clone(&reads),
-                };
-                let info = ObjectInfo {
-                    size: 18_i64 * 1024 * 1024 * 1024,
-                    ..Default::default()
-                };
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 18_i64 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
 
-                let body = DefaultObjectUsecase::build_get_object_body(
-                    reader,
-                    &info,
-                    18_i64 * 1024 * 1024 * 1024,
-                    128 * 1024,
-                    None,
-                    false,
-                    false,
-                )
-                .await
-                .expect("build_get_object_body should succeed for streaming path");
-
-                assert!(body.is_some());
-                assert_eq!(
-                    reads.load(AtomicOrdering::Relaxed),
-                    0,
-                    "large-object response construction should not pre-read object data"
-                );
-            },
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            18_i64 * 1024 * 1024 * 1024,
+            128 * 1024,
+            None,
+            false,
+            false,
         )
-        .await;
+        .await
+        .expect("build_get_object_body should succeed for streaming path");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "large-object response construction should not pre-read object data"
+        );
     }
 
     #[test]
