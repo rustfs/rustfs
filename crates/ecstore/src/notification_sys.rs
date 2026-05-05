@@ -22,7 +22,7 @@ use crate::rpc::PeerRestClient;
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
 use futures::future::join_all;
 use lazy_static::lazy_static;
-use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysService};
+use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties};
@@ -622,14 +622,14 @@ impl NotificationSys {
         join_all(futures).await
     }
 
-    pub async fn get_sys_services(&self) -> Vec<SysService> {
+    pub async fn get_sys_services(&self) -> Vec<SysServices> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().cloned() {
             futures.push(async move {
                 if let Some(client) = client {
                     client.get_se_linux_info().await.unwrap_or_default()
                 } else {
-                    SysService::default()
+                    SysServices::default()
                 }
             });
         }
