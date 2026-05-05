@@ -4472,8 +4472,8 @@ mod tests {
         ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
     };
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
     use temp_env::with_vars;
     use tokio::io::{AsyncRead, ReadBuf};
@@ -4574,12 +4574,7 @@ mod tests {
                     size: 18_i64 * 1024 * 1024 * 1024,
                     ..Default::default()
                 };
-                let should_buffer = should_buffer_get_object_in_memory(
-                    &info,
-                    18_i64 * 1024 * 1024 * 1024,
-                    None,
-                    false,
-                );
+                let should_buffer = should_buffer_get_object_in_memory(&info, 18_i64 * 1024 * 1024 * 1024, None, false);
 
                 assert!(!should_buffer, "large objects must stay on streaming path");
             },
@@ -4588,19 +4583,16 @@ mod tests {
 
     #[test]
     fn should_buffer_get_object_in_memory_allows_small_non_range_requests() {
-        with_vars(
-            [(rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD, Some("10485760".to_string()))],
-            || {
-                let info = ObjectInfo {
-                    size: 1024 * 1024,
-                    ..Default::default()
-                };
+        with_vars([(rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD, Some("10485760".to_string()))], || {
+            let info = ObjectInfo {
+                size: 1024 * 1024,
+                ..Default::default()
+            };
 
-                assert!(should_buffer_get_object_in_memory(&info, 1024 * 1024, None, false));
-                assert!(!should_buffer_get_object_in_memory(&info, 1024 * 1024, Some(1), false));
-                assert!(!should_buffer_get_object_in_memory(&info, 1024 * 1024, None, true));
-            },
-        );
+            assert!(should_buffer_get_object_in_memory(&info, 1024 * 1024, None, false));
+            assert!(!should_buffer_get_object_in_memory(&info, 1024 * 1024, Some(1), false));
+            assert!(!should_buffer_get_object_in_memory(&info, 1024 * 1024, None, true));
+        });
     }
 
     struct ReadProbeReader {
@@ -4608,11 +4600,7 @@ mod tests {
     }
 
     impl AsyncRead for ReadProbeReader {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
             self.reads.fetch_add(1, AtomicOrdering::Relaxed);
             Poll::Ready(Ok(()))
         }
