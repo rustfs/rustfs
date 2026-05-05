@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::storage::rpc::encode_msgpack_map;
 
 impl NodeService {
     pub(super) async fn handle_get_proc_info(
@@ -21,19 +22,18 @@ impl NodeService {
     ) -> Result<Response<GetProcInfoResponse>, Status> {
         let addr = get_global_local_node_name().await;
         let info = get_proc_info(&addr);
-        let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetProcInfoResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(GetProcInfoResponse {
+                success: true,
+                proc_info: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetProcInfoResponse {
                 success: false,
                 proc_info: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetProcInfoResponse {
-            success: true,
-            proc_info: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_get_mem_info(
@@ -42,19 +42,18 @@ impl NodeService {
     ) -> Result<Response<GetMemInfoResponse>, Status> {
         let addr = get_global_local_node_name().await;
         let info = get_mem_info(&addr);
-        let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetMemInfoResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(GetMemInfoResponse {
+                success: true,
+                mem_info: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetMemInfoResponse {
                 success: false,
                 mem_info: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetMemInfoResponse {
-            success: true,
-            mem_info: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_get_sys_errors(
@@ -63,19 +62,18 @@ impl NodeService {
     ) -> Result<Response<GetSysErrorsResponse>, Status> {
         let addr = get_global_local_node_name().await;
         let info = get_sys_errors(&addr);
-        let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetSysErrorsResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(GetSysErrorsResponse {
+                success: true,
+                sys_errors: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetSysErrorsResponse {
                 success: false,
                 sys_errors: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetSysErrorsResponse {
-            success: true,
-            sys_errors: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_get_sys_config(
@@ -84,19 +82,18 @@ impl NodeService {
     ) -> Result<Response<GetSysConfigResponse>, Status> {
         let addr = get_global_local_node_name().await;
         let info = get_sys_config(&addr);
-        let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetSysConfigResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(GetSysConfigResponse {
+                success: true,
+                sys_config: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetSysConfigResponse {
                 success: false,
                 sys_config: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetSysConfigResponse {
-            success: true,
-            sys_config: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_get_se_linux_info(
@@ -105,19 +102,18 @@ impl NodeService {
     ) -> Result<Response<GetSeLinuxInfoResponse>, Status> {
         let addr = get_global_local_node_name().await;
         let info = get_sys_services(&addr);
-        let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetSeLinuxInfoResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(GetSeLinuxInfoResponse {
+                success: true,
+                sys_services: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetSeLinuxInfoResponse {
                 success: false,
                 sys_services: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetSeLinuxInfoResponse {
-            success: true,
-            sys_services: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_get_os_info(
@@ -125,19 +121,18 @@ impl NodeService {
         _request: Request<GetOsInfoRequest>,
     ) -> Result<Response<GetOsInfoResponse>, Status> {
         let os_info = get_os_info();
-        let mut buf = Vec::new();
-        if let Err(err) = os_info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetOsInfoResponse {
+        match encode_msgpack_map(&os_info) {
+            Ok(buf) => Ok(Response::new(GetOsInfoResponse {
+                success: true,
+                os_info: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetOsInfoResponse {
                 success: false,
                 os_info: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetOsInfoResponse {
-            success: true,
-            os_info: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_get_partitions(
@@ -145,19 +140,18 @@ impl NodeService {
         _request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
         let partitions = get_partitions();
-        let mut buf = Vec::new();
-        if let Err(err) = partitions.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetPartitionsResponse {
+        match encode_msgpack_map(&partitions) {
+            Ok(buf) => Ok(Response::new(GetPartitionsResponse {
+                success: true,
+                partitions: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetPartitionsResponse {
                 success: false,
                 partitions: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetPartitionsResponse {
-            success: true,
-            partitions: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_get_net_info(
@@ -166,36 +160,34 @@ impl NodeService {
     ) -> Result<Response<GetNetInfoResponse>, Status> {
         let addr = get_global_local_node_name().await;
         let info = get_net_info(&addr, "");
-        let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetNetInfoResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(GetNetInfoResponse {
+                success: true,
+                net_info: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetNetInfoResponse {
                 success: false,
                 net_info: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetNetInfoResponse {
-            success: true,
-            net_info: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_get_cpus(&self, _request: Request<GetCpusRequest>) -> Result<Response<GetCpusResponse>, Status> {
         let info = get_cpus();
-        let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetCpusResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(GetCpusResponse {
+                success: true,
+                cpus: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetCpusResponse {
                 success: false,
                 cpus: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetCpusResponse {
-            success: true,
-            cpus: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_server_info(
@@ -203,29 +195,24 @@ impl NodeService {
         _request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
         let info = get_local_server_property().await;
-        let mut buf = Vec::new();
-        // Use map encoding for forward/backward compatibility across mixed versions:
-        // unknown fields can be ignored by older nodes during deserialization.
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf).with_struct_map()) {
-            return Ok(Response::new(ServerInfoResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(ServerInfoResponse {
+                success: true,
+                server_properties: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(ServerInfoResponse {
                 success: false,
                 server_properties: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(ServerInfoResponse {
-            success: true,
-            server_properties: buf.into(),
-            error_info: None,
-        }))
     }
 
     pub(super) async fn handle_local_storage_info(
         &self,
         _request: Request<LocalStorageInfoRequest>,
     ) -> Result<Response<LocalStorageInfoResponse>, Status> {
-        // let request = request.into_inner();
-
         let Some(store) = new_object_layer_fn() else {
             return Ok(Response::new(LocalStorageInfoResponse {
                 success: false,
@@ -235,19 +222,17 @@ impl NodeService {
         };
 
         let info = store.local_storage_info().await;
-        let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(LocalStorageInfoResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(LocalStorageInfoResponse {
+                success: true,
+                storage_info: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(LocalStorageInfoResponse {
                 success: false,
                 storage_info: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-
-        Ok(Response::new(LocalStorageInfoResponse {
-            success: true,
-            storage_info: buf.into(),
-            error_info: None,
-        }))
     }
 }
