@@ -98,6 +98,10 @@ fn is_valid_notification_filter_value(value: &str) -> bool {
     !value.split('/').any(|segment| segment == "." || segment == "..")
 }
 
+fn invalid_filter_value_message(cfg_scope: &str, value: &str) -> String {
+    format!("invalid notification filter value (len={}) ({cfg_scope})", value.len())
+}
+
 fn validate_notification_filter_rules(
     filter: Option<&NotificationConfigurationFilter>,
     cfg_kind: &str,
@@ -129,7 +133,7 @@ fn validate_notification_filter_rules(
         };
 
         if !is_valid_notification_filter_value(value) {
-            return Err(s3_error!(InvalidArgument, "invalid notification filter value '{value}' ({cfg_scope})"));
+            return Err(s3_error!(InvalidArgument, "{}", invalid_filter_value_message(&cfg_scope, value)));
         }
 
         match name.as_str() {
@@ -3031,6 +3035,84 @@ mod tests {
                             name: Some(FilterRuleName::from_static(FilterRuleName::SUFFIX)),
                             value: Some("../secret".to_string()),
                         }]),
+                    }),
+                }),
+            }]),
+            ..Default::default()
+        };
+
+        let err = validate_notification_configuration_filters(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        let msg = err.message().unwrap_or_default();
+        assert!(msg.contains("len="), "error message should include summarized length");
+        assert!(!msg.contains("../secret"), "error message should not echo full raw filter value");
+    }
+
+    #[test]
+    fn validate_notification_configuration_filters_rejects_missing_filter_name() {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(vec![QueueConfiguration {
+                id: Some("q1".to_string()),
+                queue_arn: "arn:rustfs:sqs:us-east-1:1:webhook".to_string(),
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                filter: Some(NotificationConfigurationFilter {
+                    key: Some(S3KeyFilter {
+                        filter_rules: Some(vec![FilterRule {
+                            name: None,
+                            value: Some("uploads/".to_string()),
+                        }]),
+                    }),
+                }),
+            }]),
+            ..Default::default()
+        };
+
+        let err = validate_notification_configuration_filters(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_notification_configuration_filters_rejects_missing_filter_value() {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(vec![QueueConfiguration {
+                id: Some("q1".to_string()),
+                queue_arn: "arn:rustfs:sqs:us-east-1:1:webhook".to_string(),
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                filter: Some(NotificationConfigurationFilter {
+                    key: Some(S3KeyFilter {
+                        filter_rules: Some(vec![FilterRule {
+                            name: Some(FilterRuleName::from_static(FilterRuleName::PREFIX)),
+                            value: None,
+                        }]),
+                    }),
+                }),
+            }]),
+            ..Default::default()
+        };
+
+        let err = validate_notification_configuration_filters(&cfg).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_notification_configuration_filters_rejects_duplicate_suffix_rules() {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(vec![QueueConfiguration {
+                id: Some("q1".to_string()),
+                queue_arn: "arn:rustfs:sqs:us-east-1:1:webhook".to_string(),
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                filter: Some(NotificationConfigurationFilter {
+                    key: Some(S3KeyFilter {
+                        filter_rules: Some(vec![
+                            FilterRule {
+                                name: Some(FilterRuleName::from_static(FilterRuleName::SUFFIX)),
+                                value: Some(".csv".to_string()),
+                            },
+                            FilterRule {
+                                name: Some(FilterRuleName::from_static(FilterRuleName::SUFFIX)),
+                                value: Some(".log".to_string()),
+                            },
+                        ]),
                     }),
                 }),
             }]),
