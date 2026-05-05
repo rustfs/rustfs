@@ -7975,6 +7975,7 @@ dependencies = [
  "rand 0.10.1",
  "reqwest 0.13.3",
  "rmp-serde",
+ "rsa 0.10.0-rc.18",
  "rust-embed",
  "rustfs-appauth",
  "rustfs-audit",
