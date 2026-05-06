@@ -938,7 +938,8 @@ mod test {
 }"#,
         )?;
 
-        let conditions = HashMap::new();
+        let mut conditions = HashMap::new();
+        conditions.insert("prefix".to_string(), vec!["home/alice/projects/".to_string()]);
         let claims = HashMap::new();
         let args = Args {
             account: "polaris-session",
@@ -955,6 +956,42 @@ mod test {
         assert!(
             policy.is_allowed(&args).await,
             "Gateway ListBucket auth without an s3:prefix condition should continue matching prefix-scoped resources via args.object"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_gateway_prefix_uses_object_resource_when_condition_missing() -> Result<()> {
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": "*"},
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::polaris-test-bucket/home/alice/*"]
+    }
+  ]
+}"#,
+        )?;
+
+        let mut conditions = HashMap::new();
+        conditions.insert("prefix".to_string(), vec!["home/alice/projects/".to_string()]);
+        let args = BucketPolicyArgs {
+            account: "polaris-session",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "polaris-test-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "home/alice/projects/",
+        };
+
+        assert!(
+            bucket_policy.is_allowed(&args).await,
+            "Bucket policy ListBucket without an s3:prefix condition should continue matching prefix-scoped resources via args.object"
         );
 
         Ok(())

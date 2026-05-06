@@ -29,7 +29,6 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_ACCESS_KEY=rustfsadmin # CHANGEME
       - RUSTFS_SECRET_KEY=rustfsadmin # CHANGEME
@@ -49,6 +48,9 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
+      # Production strict TLS example (SAN/FQDN aligned, no `-k`):
+      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9000:127.0.0.1 https://rustfs-a.example.com:9000/health
+      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9001:127.0.0.1 https://rustfs-a.example.com:9001/rustfs/console/health
       test:
         [
           "CMD",
@@ -75,6 +77,9 @@ services:
         echo 'Volume Permissions fixed' &&
         exit 0
       "
+    # Permission baseline:
+    # - default RustFS runtime user is 10001:10001
+    # - alternatively, run rustfs service with host-matched `user: \"<uid>:<gid>\"`
     restart: "no"
 
 networks:

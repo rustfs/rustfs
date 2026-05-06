@@ -21,7 +21,7 @@ use crate::common::{
 };
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{Tag, Tagging};
+use aws_sdk_s3::types::{Delete, ObjectIdentifier, Tag, Tagging};
 use aws_sdk_s3::{Client, Config};
 use serial_test::serial;
 use tracing::info;
@@ -318,11 +318,18 @@ async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result
 
     let rw = serde_json::to_string(&serde_json::json!({
         "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": ["s3:*"],
-            "Resource": ["arn:aws:s3:::*"]
-        }]
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:*"],
+                "Resource": ["arn:aws:s3:::*"]
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["sts:AssumeRole"],
+                "Resource": ["arn:aws:s3:::*"]
+            }
+        ]
     }))?;
     admin_add_canned_policy(&env, &policy_readwrite, &rw).await?;
     admin_attach_policy_to_user(&env, &policy_readwrite, &parent).await?;
@@ -360,5 +367,116 @@ async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result
     admin_remove_policy(&env, &policy_readwrite).await;
 
     info!("test_e2e_sts_assume_role_session_policy_existing_object_tag passed");
+    Ok(())
+}
+
+/// STS inline session policy: DeleteObjects must evaluate `s3:DeleteObject` per requested object key.
+#[tokio::test]
+#[serial]
+async fn test_e2e_sts_session_policy_delete_objects_object_prefix_only() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    if !awscurl_available() {
+        info!("Skipping test_e2e_sts_session_policy_delete_objects_object_prefix_only: awscurl not available");
+        return Ok(());
+    }
+
+    let suffix = Uuid::new_v4();
+    let parent = format!("e2e-sts-del-par-{suffix}");
+    let parent_secret = "longSecretKeyForParentDelete99!";
+    let policy_readwrite = format!("e2e-sts-del-rw-{suffix}");
+    let bucket = format!("e2e-sts-del-bkt-{suffix}");
+    let allowed_key = "allowed/table/data.parquet";
+    let denied_key = "denied/table/data.parquet";
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let admin = env.create_s3_client();
+    admin_create_user(&env, &parent, parent_secret).await?;
+
+    let rw = serde_json::to_string(&serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:*"],
+                "Resource": ["arn:aws:s3:::*"]
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["sts:AssumeRole"],
+                "Resource": ["arn:aws:s3:::*"]
+            }
+        ]
+    }))?;
+    admin_add_canned_policy(&env, &policy_readwrite, &rw).await?;
+    admin_attach_policy_to_user(&env, &policy_readwrite, &parent).await?;
+
+    let parent_client = user_client(&env, &parent, parent_secret);
+    parent_client.create_bucket().bucket(&bucket).send().await?;
+    parent_client
+        .put_object()
+        .bucket(&bucket)
+        .key(allowed_key)
+        .body(ByteStream::from_static(b"allowed-delete-data"))
+        .send()
+        .await?;
+    parent_client
+        .put_object()
+        .bucket(&bucket)
+        .key(denied_key)
+        .body(ByteStream::from_static(b"denied-delete-data"))
+        .send()
+        .await?;
+
+    let session_policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["s3:DeleteObject"],
+            "Resource": [format!("arn:aws:s3:::{}/allowed/*", bucket)]
+        }]
+    })
+    .to_string();
+
+    let (ak, sk, token) = assume_role_with_session_policy(&env, &parent, parent_secret, &session_policy).await?;
+    let session_client = sts_session_client(&env, &ak, &sk, &token);
+
+    let delete = Delete::builder()
+        .objects(ObjectIdentifier::builder().key(allowed_key).build()?)
+        .objects(ObjectIdentifier::builder().key(denied_key).build()?)
+        .build()?;
+
+    let result = session_client.delete_objects().bucket(&bucket).delete(delete).send().await?;
+
+    assert_eq!(result.deleted().len(), 1, "only the allowed-prefix object should be deleted");
+    assert!(
+        result.deleted().iter().any(|deleted| deleted.key() == Some(allowed_key)),
+        "DeleteObjects response should report the allowed-prefix object as deleted"
+    );
+
+    assert_eq!(result.errors().len(), 1, "the out-of-prefix object should return one per-key error");
+    let error = &result.errors()[0];
+    assert_eq!(error.key(), Some(denied_key));
+    assert_eq!(error.code(), Some("AccessDenied"));
+
+    let allowed_head = parent_client.head_object().bucket(&bucket).key(allowed_key).send().await;
+    assert!(allowed_head.is_err(), "allowed-prefix object should have been deleted");
+
+    parent_client
+        .head_object()
+        .bucket(&bucket)
+        .key(denied_key)
+        .send()
+        .await
+        .expect("out-of-prefix object should remain after per-key AccessDenied");
+
+    let _ = admin.delete_object().bucket(&bucket).key(allowed_key).send().await;
+    let _ = admin.delete_object().bucket(&bucket).key(denied_key).send().await;
+    let _ = admin.delete_bucket().bucket(&bucket).send().await;
+    admin_remove_user(&env, &parent).await;
+    admin_remove_policy(&env, &policy_readwrite).await;
+
+    info!("test_e2e_sts_session_policy_delete_objects_object_prefix_only passed");
     Ok(())
 }

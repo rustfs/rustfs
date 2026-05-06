@@ -19,6 +19,7 @@ use serde::ser::SerializeMap;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
+use super::key_name::KeyName;
 use super::{addr::AddrFunc, binary::BinaryFunc, bool_null::BoolFunc, date::DateFunc, number::NumberFunc, string::StringFunc};
 
 #[derive(Clone, Deserialize, Debug)]
@@ -168,6 +169,39 @@ impl Condition {
             | DateGreaterThan(s)
             | DateGreaterThanEquals(s) => s.key_names().any(|k| values.contains_key(k.as_str())),
             IfExists(inner) => inner.has_any_key_in(values),
+        }
+    }
+
+    pub fn references_key_name(&self, key_name: &KeyName) -> bool {
+        use Condition::*;
+        match self {
+            StringEquals(s)
+            | StringNotEquals(s)
+            | StringEqualsIgnoreCase(s)
+            | StringNotEqualsIgnoreCase(s)
+            | StringLike(s)
+            | StringNotLike(s)
+            | ArnLike(s)
+            | ArnNotLike(s)
+            | ArnEquals(s)
+            | ArnNotEquals(s) => s.contains_key_name(key_name),
+            BinaryEquals(s) => s.contains_key_name(key_name),
+            IpAddress(s) | NotIpAddress(s) => s.contains_key_name(key_name),
+            Null(s) | Bool(s) => s.contains_key_name(key_name),
+            NumericEquals(s)
+            | NumericNotEquals(s)
+            | NumericLessThan(s)
+            | NumericLessThanEquals(s)
+            | NumericGreaterThan(s)
+            | NumericGreaterThanIfExists(s)
+            | NumericGreaterThanEquals(s) => s.contains_key_name(key_name),
+            DateEquals(s)
+            | DateNotEquals(s)
+            | DateLessThan(s)
+            | DateLessThanEquals(s)
+            | DateGreaterThan(s)
+            | DateGreaterThanEquals(s) => s.contains_key_name(key_name),
+            IfExists(inner) => inner.references_key_name(key_name),
         }
     }
 

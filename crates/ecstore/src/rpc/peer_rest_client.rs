@@ -23,7 +23,7 @@ use crate::{
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_madmin::{
     ServerProperties,
-    health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysService},
+    health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices},
     metrics::RealtimeMetrics,
     net::NetInfo,
 };
@@ -361,7 +361,7 @@ impl PeerRestClient {
         Ok(os_info)
     }
 
-    pub async fn get_se_linux_info(&self) -> Result<SysService> {
+    pub async fn get_se_linux_info(&self) -> Result<SysServices> {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
@@ -377,7 +377,7 @@ impl PeerRestClient {
                 let data = response.sys_services;
 
                 let mut buf = Deserializer::new(Cursor::new(data));
-                let sys_services: SysService = Deserialize::deserialize(&mut buf)?;
+                let sys_services: SysServices = Deserialize::deserialize(&mut buf)?;
 
                 Ok(sys_services)
             }

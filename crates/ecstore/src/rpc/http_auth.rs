@@ -17,8 +17,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose;
 use hmac::{Hmac, KeyInit, Mac};
 use http::{HeaderMap, HeaderValue, Method, Uri};
-use rustfs_credentials::{DEFAULT_SECRET_KEY, ENV_RPC_SECRET, get_global_secret_key_opt};
+#[cfg(test)]
+use rustfs_credentials::{DEFAULT_SECRET_KEY, RPC_SECRET_REQUIRED_MESSAGE};
+use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use sha2::Sha256;
+use std::sync::Once;
 use time::OffsetDateTime;
 use tracing::error;
 
@@ -28,47 +31,76 @@ const SIGNATURE_HEADER: &str = "x-rustfs-signature";
 const TIMESTAMP_HEADER: &str = "x-rustfs-timestamp";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
+static RPC_SECRET_RESOLUTION_LOG_ONCE: Once = Once::new();
 
 /// Get the shared secret for HMAC signing
-fn get_shared_secret() -> String {
-    rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET
-        .get_or_init(|| {
-            rustfs_utils::get_env_str(
-                ENV_RPC_SECRET,
-                get_global_secret_key_opt()
-                    .unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string())
-                    .as_str(),
-            )
-        })
-        .clone()
+#[cfg(test)]
+fn resolve_shared_secret(env_secret: Option<&str>, global_secret: Option<&str>) -> std::io::Result<String> {
+    if let Some(secret) = env_secret.map(str::trim).filter(|secret| !secret.is_empty()) {
+        return (secret != DEFAULT_SECRET_KEY)
+            .then(|| secret.to_string())
+            .ok_or_else(|| std::io::Error::other(RPC_SECRET_REQUIRED_MESSAGE));
+    }
+
+    global_secret
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty() && *secret != DEFAULT_SECRET_KEY)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| std::io::Error::other(RPC_SECRET_REQUIRED_MESSAGE))
 }
 
-/// Generate HMAC-SHA256 signature for the given data
-fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) -> String {
+fn get_shared_secret() -> std::io::Result<String> {
+    try_get_rpc_token().map_err(|err| {
+        RPC_SECRET_RESOLUTION_LOG_ONCE.call_once(|| {
+            error!("RPC auth secret resolution failed: {}; {}", err, RPC_SECRET_REQUIRED_OPERATOR_MESSAGE);
+        });
+        err
+    })
+}
+
+/// Build the canonical payload covered by the RPC HMAC.
+fn signature_payload(url: &str, method: &Method, timestamp: i64) -> String {
     let uri: Uri = url.parse().expect("Invalid URL");
 
     let path_and_query = uri.path_and_query().unwrap();
 
     let url = path_and_query.to_string();
 
-    let data = format!("{url}|{method}|{timestamp}");
+    format!("{url}|{method}|{timestamp}")
+}
+
+/// Generate HMAC-SHA256 signature for the given data
+fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) -> String {
+    let data = signature_payload(url, method, timestamp);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
     general_purpose::STANDARD.encode(result.into_bytes())
 }
 
+fn verify_signature(secret: &str, url: &str, method: &Method, timestamp: i64, signature: &str) -> bool {
+    let Ok(signature) = general_purpose::STANDARD.decode(signature) else {
+        return false;
+    };
+
+    let data = signature_payload(url, method, timestamp);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+    mac.update(data.as_bytes());
+    mac.verify_slice(&signature).is_ok()
+}
+
 /// Build headers with authentication signature
-pub fn build_auth_headers(url: &str, method: &Method, headers: &mut HeaderMap) {
-    let auth_headers = gen_signature_headers(url, method);
+pub fn build_auth_headers(url: &str, method: &Method, headers: &mut HeaderMap) -> std::io::Result<()> {
+    let auth_headers = gen_signature_headers(url, method)?;
 
     headers.extend(auth_headers);
     inject_trace_context_into_http_headers(headers);
     inject_request_id_into_http_headers(headers);
+    Ok(())
 }
 
-pub fn gen_signature_headers(url: &str, method: &Method) -> HeaderMap {
-    let secret = get_shared_secret();
+pub fn gen_signature_headers(url: &str, method: &Method) -> std::io::Result<HeaderMap> {
+    let secret = get_shared_secret()?;
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
 
     let signature = generate_signature(&secret, url, method, timestamp);
@@ -80,13 +112,11 @@ pub fn gen_signature_headers(url: &str, method: &Method) -> HeaderMap {
         HeaderValue::from_str(&timestamp.to_string()).expect("Invalid header value"),
     );
 
-    headers
+    Ok(headers)
 }
 
 /// Verify the request signature for RPC requests
 pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> std::io::Result<()> {
-    let secret = get_shared_secret();
-
     // Get signature from header
     let signature = headers
         .get(SIGNATURE_HEADER)
@@ -106,24 +136,22 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
     // Check timestamp validity (prevent replay attacks)
     let current_time = OffsetDateTime::now_utc().unix_timestamp();
 
-    if current_time.saturating_sub(timestamp) > SIGNATURE_VALID_DURATION {
+    if current_time.saturating_sub(timestamp) > SIGNATURE_VALID_DURATION
+        || timestamp.saturating_sub(current_time) > SIGNATURE_VALID_DURATION
+    {
         return Err(std::io::Error::other("Request timestamp expired"));
     }
 
-    // Generate expected signature
-    let expected_signature = generate_signature(&secret, url, method, timestamp);
+    // Verify signature with constant-time HMAC comparison.
+    let secret = get_shared_secret()?;
 
-    // Compare signatures
-    if signature != expected_signature {
+    if !verify_signature(&secret, url, method, timestamp, signature) {
         error!(
-            "verify_rpc_signature: Invalid signature: url {}, method {}, timestamp {}, signature {}, expected_signature: {}***{}|{}",
+            "verify_rpc_signature: Invalid signature: url {}, method {}, timestamp {}, signature_len {}",
             url,
             method,
             timestamp,
-            signature,
-            expected_signature.chars().next().unwrap_or('*'),
-            expected_signature.chars().last().unwrap_or('*'),
-            expected_signature.len()
+            signature.len()
         );
 
         return Err(std::io::Error::other("Invalid signature"));
@@ -137,18 +165,79 @@ mod tests {
     use super::*;
     use crate::rpc::context_propagation::REQUEST_ID_HEADER;
     use http::{HeaderMap, Method};
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let buffer = self
+                .buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clone();
+            String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    fn ensure_test_rpc_secret() {
+        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+    }
+
+    #[test]
+    fn test_resolve_shared_secret_rejects_default_fallback() {
+        let err = resolve_shared_secret(None, None).expect_err("default fallback must be rejected");
+        assert_eq!(err.to_string(), RPC_SECRET_REQUIRED_MESSAGE);
+
+        let err = resolve_shared_secret(None, Some(DEFAULT_SECRET_KEY)).expect_err("default global secret must be rejected");
+        assert_eq!(err.to_string(), RPC_SECRET_REQUIRED_MESSAGE);
+    }
 
     #[test]
     fn test_get_shared_secret() {
-        let secret = get_shared_secret();
+        ensure_test_rpc_secret();
+        let secret = get_shared_secret().expect("test RPC secret should resolve");
         assert!(!secret.is_empty(), "Secret should not be empty");
 
         let url = "http://node1:7000/rustfs/rpc/read_file_stream?disk=http%3A%2F%2Fnode1%3A7000%2Fdata%2Frustfs3&volume=.rustfs.sys&path=pool.bin%2Fdd0fd773-a962-4265-b543-783ce83953e9%2Fpart.1&offset=0&length=44";
         let method = Method::GET;
         let mut headers = HeaderMap::new();
 
-        build_auth_headers(url, &method, &mut headers);
+        build_auth_headers(url, &method, &mut headers).expect("auth headers should build");
 
         let url = "/rustfs/rpc/read_file_stream?disk=http%3A%2F%2Fnode1%3A7000%2Fdata%2Frustfs3&volume=.rustfs.sys&path=pool.bin%2Fdd0fd773-a962-4265-b543-783ce83953e9%2Fpart.1&offset=0&length=44";
 
@@ -189,11 +278,12 @@ mod tests {
 
     #[test]
     fn test_build_auth_headers() {
+        ensure_test_rpc_secret();
         let url = "http://example.com/api/test";
         let method = Method::POST;
         let mut headers = HeaderMap::new();
 
-        build_auth_headers(url, &method, &mut headers);
+        build_auth_headers(url, &method, &mut headers).expect("auth headers should build");
 
         // Verify headers are present
         assert!(headers.contains_key(SIGNATURE_HEADER), "Should contain signature header");
@@ -216,25 +306,27 @@ mod tests {
 
     #[test]
     fn test_build_auth_headers_preserves_existing_request_id() {
+        ensure_test_rpc_secret();
         let url = "http://example.com/api/test";
         let method = Method::GET;
         let mut headers = HeaderMap::new();
         headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("req-upstream-123"));
 
-        build_auth_headers(url, &method, &mut headers);
+        build_auth_headers(url, &method, &mut headers).expect("auth headers should build");
 
         assert_eq!(headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()), Some("req-upstream-123"));
     }
 
     #[test]
     fn test_build_auth_headers_may_set_request_id_from_trace_id() {
+        ensure_test_rpc_secret();
         let url = "http://example.com/api/test";
         let method = Method::GET;
         let mut headers = HeaderMap::new();
 
         let span = tracing::info_span!("rpc-test-span");
         let _guard = span.enter();
-        build_auth_headers(url, &method, &mut headers);
+        build_auth_headers(url, &method, &mut headers).expect("auth headers should build");
 
         if let Some(value) = headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()) {
             assert!(!value.is_empty(), "request id should not be empty");
@@ -243,12 +335,13 @@ mod tests {
 
     #[test]
     fn test_verify_rpc_signature_success() {
+        ensure_test_rpc_secret();
         let url = "http://example.com/api/test";
         let method = Method::GET;
         let mut headers = HeaderMap::new();
 
         // Build headers with valid signature
-        build_auth_headers(url, &method, &mut headers);
+        build_auth_headers(url, &method, &mut headers).expect("auth headers should build");
 
         // Verify should succeed
         let result = verify_rpc_signature(url, &method, &headers);
@@ -257,12 +350,13 @@ mod tests {
 
     #[test]
     fn test_verify_rpc_signature_invalid_signature() {
+        ensure_test_rpc_secret();
         let url = "http://example.com/api/test";
         let method = Method::GET;
         let mut headers = HeaderMap::new();
 
         // Build headers with valid signature first
-        build_auth_headers(url, &method, &mut headers);
+        build_auth_headers(url, &method, &mut headers).expect("auth headers should build");
 
         // Tamper with the signature
         headers.insert(SIGNATURE_HEADER, HeaderValue::from_str("invalid-signature").unwrap());
@@ -276,14 +370,64 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_signature_uses_hmac_verification() {
+        let secret = "test-secret";
+        let url = "http://example.com/api/test";
+        let method = Method::GET;
+        let timestamp = 1640995200;
+        let signature = generate_signature(secret, url, &method, timestamp);
+        let mut tampered = general_purpose::STANDARD.decode(&signature).unwrap();
+        tampered[0] ^= 1;
+        let tampered_signature = general_purpose::STANDARD.encode(tampered);
+
+        assert!(verify_signature(secret, url, &method, timestamp, &signature));
+        assert!(!verify_signature(secret, url, &method, timestamp, &tampered_signature));
+        assert!(!verify_signature(secret, url, &method, timestamp, "invalid-signature"));
+    }
+
+    #[test]
+    fn test_invalid_signature_log_contract_excludes_secrets() {
+        ensure_test_rpc_secret();
+        let url = "http://example.com/api/test";
+        let method = Method::GET;
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+        let secret = get_shared_secret().expect("test RPC secret should resolve");
+        let expected_signature = generate_signature(&secret, url, &method, timestamp);
+        let invalid_signature = "invalid-signature";
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(invalid_signature).unwrap());
+        headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&timestamp.to_string()).unwrap());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let result = verify_rpc_signature(url, &method, &headers);
+            assert!(result.is_err(), "Invalid signature should fail verification");
+        });
+
+        let captured = logs.contents();
+        assert!(captured.contains("Invalid signature"));
+        assert!(!captured.contains(&secret));
+        assert!(!captured.contains(&expected_signature));
+        assert!(!captured.contains(invalid_signature));
+    }
+
+    #[test]
     fn test_verify_rpc_signature_expired_timestamp() {
+        ensure_test_rpc_secret();
         let url = "http://example.com/api/test";
         let method = Method::GET;
         let mut headers = HeaderMap::new();
 
         // Set expired timestamp (older than SIGNATURE_VALID_DURATION)
         let expired_timestamp = OffsetDateTime::now_utc().unix_timestamp() - SIGNATURE_VALID_DURATION - 10;
-        let secret = get_shared_secret();
+        let secret = get_shared_secret().expect("test RPC secret should resolve");
         let signature = generate_signature(&secret, url, &method, expired_timestamp);
 
         headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).unwrap());
@@ -292,6 +436,27 @@ mod tests {
         // Verify should fail due to expired timestamp
         let result = verify_rpc_signature(url, &method, &headers);
         assert!(result.is_err(), "Expired timestamp should fail verification");
+
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "Request timestamp expired");
+    }
+
+    #[test]
+    fn test_verify_rpc_signature_future_timestamp_outside_window() {
+        ensure_test_rpc_secret();
+        let url = "http://example.com/api/test";
+        let method = Method::GET;
+        let mut headers = HeaderMap::new();
+
+        let future_timestamp = OffsetDateTime::now_utc().unix_timestamp() + SIGNATURE_VALID_DURATION + 10;
+        let secret = get_shared_secret().expect("test RPC secret should resolve");
+        let signature = generate_signature(&secret, url, &method, future_timestamp);
+
+        headers.insert(SIGNATURE_HEADER, HeaderValue::from_str(&signature).unwrap());
+        headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&future_timestamp.to_string()).unwrap());
+
+        let result = verify_rpc_signature(url, &method, &headers);
+        assert!(result.is_err(), "Future timestamp outside valid window should fail verification");
 
         let error = result.unwrap_err();
         assert_eq!(error.to_string(), "Request timestamp expired");
@@ -351,13 +516,14 @@ mod tests {
 
     #[test]
     fn test_verify_rpc_signature_url_mismatch() {
+        ensure_test_rpc_secret();
         let original_url = "http://example.com/api/test";
         let different_url = "http://example.com/api/different";
         let method = Method::GET;
         let mut headers = HeaderMap::new();
 
         // Build headers for one URL
-        build_auth_headers(original_url, &method, &mut headers);
+        build_auth_headers(original_url, &method, &mut headers).expect("auth headers should build");
 
         // Try to verify with a different URL
         let result = verify_rpc_signature(different_url, &method, &headers);
@@ -369,13 +535,14 @@ mod tests {
 
     #[test]
     fn test_verify_rpc_signature_method_mismatch() {
+        ensure_test_rpc_secret();
         let url = "http://example.com/api/test";
         let original_method = Method::GET;
         let different_method = Method::POST;
         let mut headers = HeaderMap::new();
 
         // Build headers for one method
-        build_auth_headers(url, &original_method, &mut headers);
+        build_auth_headers(url, &original_method, &mut headers).expect("auth headers should build");
 
         // Try to verify with a different method
         let result = verify_rpc_signature(url, &different_method, &headers);
@@ -387,9 +554,10 @@ mod tests {
 
     #[test]
     fn test_signature_valid_duration_boundary() {
+        ensure_test_rpc_secret();
         let url = "http://example.com/api/test";
         let method = Method::GET;
-        let secret = get_shared_secret();
+        let secret = get_shared_secret().expect("test RPC secret should resolve");
 
         let mut headers = HeaderMap::new();
         let current_time = OffsetDateTime::now_utc().unix_timestamp();
@@ -418,6 +586,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_authentication() {
+        ensure_test_rpc_secret();
         let test_cases = vec![
             ("http://example.com/api/test", Method::GET),
             ("https://api.rustfs.com/v1/bucket", Method::POST),
@@ -429,7 +598,7 @@ mod tests {
             let mut headers = HeaderMap::new();
 
             // Build authentication headers
-            build_auth_headers(url, &method, &mut headers);
+            build_auth_headers(url, &method, &mut headers).expect("auth headers should build");
 
             // Verify the signature should succeed
             let result = verify_rpc_signature(url, &method, &headers);

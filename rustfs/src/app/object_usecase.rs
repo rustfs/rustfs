@@ -119,6 +119,7 @@ use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -130,6 +131,10 @@ use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+const ACCEPT_RANGES_BYTES: &str = "bytes";
+const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
 
 struct DeadlockRequestGuard {
     deadlock_detector: Arc<deadlock_detector::DeadlockDetector>,
@@ -390,6 +395,47 @@ fn object_seek_support_threshold() -> usize {
             rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD,
         )
     })
+}
+
+fn should_buffer_get_object_in_memory(
+    info: &ObjectInfo,
+    response_content_length: i64,
+    part_number: Option<usize>,
+    has_range: bool,
+) -> bool {
+    let configured_threshold = object_seek_support_threshold() as i64;
+    should_buffer_get_object_in_memory_with_threshold(info, response_content_length, part_number, has_range, configured_threshold)
+}
+
+fn should_buffer_get_object_in_memory_with_threshold(
+    _info: &ObjectInfo,
+    response_content_length: i64,
+    part_number: Option<usize>,
+    has_range: bool,
+    configured_threshold: i64,
+) -> bool {
+    if part_number.is_some() || has_range || response_content_length <= 0 || configured_threshold <= 0 {
+        return false;
+    }
+
+    let effective_threshold = configured_threshold.min(MAX_GET_OBJECT_MEMORY_BUFFER_BYTES);
+    if configured_threshold > MAX_GET_OBJECT_MEMORY_BUFFER_BYTES
+        && GET_OBJECT_BUFFER_THRESHOLD_WARNED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!(
+            configured_threshold_bytes = configured_threshold,
+            hard_limit_bytes = MAX_GET_OBJECT_MEMORY_BUFFER_BYTES,
+            "RUSTFS_OBJECT_SEEK_SUPPORT_THRESHOLD exceeds safety cap; using capped in-memory buffer threshold"
+        );
+    }
+
+    if response_content_length > effective_threshold {
+        return false;
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -874,6 +920,11 @@ async fn apply_put_request_object_lock_opts(
     Ok(())
 }
 
+// Shared across Object Lock validation paths to keep the client-facing
+// InvalidRequest message consistent.
+pub(crate) const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
+    "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
+
 pub(crate) async fn build_put_like_object_lock_metadata(
     bucket: &str,
     object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
@@ -884,19 +935,21 @@ pub(crate) async fn build_put_like_object_lock_metadata(
         return Ok(None);
     }
 
-    validate_bucket_object_lock_enabled(bucket).await?;
-
     let retention = match (object_lock_mode, object_lock_retain_until_date) {
-        (Some(mode), retain_until_date) => Some(ObjectLockRetention {
+        (Some(mode), Some(retain_until_date)) => Some(ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from(mode.as_str().to_string())),
-            retain_until_date,
-        }),
-        (None, Some(retain_until_date)) => Some(ObjectLockRetention {
-            mode: None,
             retain_until_date: Some(retain_until_date),
         }),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED.to_string(),
+            ));
+        }
         (None, None) => None,
     };
+
+    validate_bucket_object_lock_enabled(bucket).await?;
 
     let mut eval_metadata = parse_object_lock_retention(retention)?;
     eval_metadata.extend(parse_object_lock_legal_hold(
@@ -1516,7 +1569,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_body<R>(
         mut final_stream: R,
-        _info: &ObjectInfo,
+        info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
         part_number: Option<usize>,
@@ -1527,11 +1580,8 @@ impl DefaultObjectUsecase {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         if encryption_applied {
-            let seekable_object_size_threshold = object_seek_support_threshold();
-            let should_buffer_encrypted_object = response_content_length > 0
-                && response_content_length <= seekable_object_size_threshold as i64
-                && part_number.is_none()
-                && !has_range;
+            let should_buffer_encrypted_object =
+                should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range);
 
             if should_buffer_encrypted_object {
                 let mut buf = Vec::with_capacity(response_content_length as usize);
@@ -1558,11 +1608,8 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size));
         }
 
-        let seekable_object_size_threshold = object_seek_support_threshold();
-        let should_provide_seek_support = response_content_length > 0
-            && response_content_length <= seekable_object_size_threshold as i64
-            && part_number.is_none()
-            && !has_range;
+        let should_provide_seek_support =
+            should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range);
 
         if should_provide_seek_support {
             let mut buf = Vec::with_capacity(response_content_length as usize);
@@ -1752,6 +1799,7 @@ impl DefaultObjectUsecase {
         )?;
 
         let mut metadata = metadata.unwrap_or_default();
+        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
         apply_put_request_metadata(
             &mut metadata,
             &req.headers,
@@ -1766,6 +1814,7 @@ impl DefaultObjectUsecase {
             tagging,
             storage_class.clone(),
         )?;
+        apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
 
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
             .await
@@ -2117,7 +2166,7 @@ impl DefaultObjectUsecase {
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
-            accept_ranges: Some("bytes".to_string()),
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&info.user_defined),
@@ -2719,6 +2768,8 @@ impl DefaultObjectUsecase {
             }
         }
 
+        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        remove_object_lock_metadata_for_copy(&mut src_info.user_defined);
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
             object_lock_legal_hold_status,
@@ -2729,6 +2780,7 @@ impl DefaultObjectUsecase {
         {
             src_info.user_defined.extend(object_lock_metadata);
         }
+        apply_bucket_default_lock_retention(&bucket, &mut src_info.user_defined, has_explicit_object_lock_retention).await?;
 
         let mut reader = match decryption_material {
             Some(material) => {
@@ -2961,6 +3013,19 @@ impl DefaultObjectUsecase {
                     version_id: version_id.clone(),
                 });
                 continue;
+            }
+
+            if bypass_governance {
+                let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
+                if let Err(e) = auth_res {
+                    delete_results[idx].error = Some(Error {
+                        code: Some("AccessDenied".to_string()),
+                        key: Some(obj_id.key.clone()),
+                        message: Some(e.to_string()),
+                        version_id: version_id.clone(),
+                    });
+                    continue;
+                }
             }
 
             let mut object = ObjectToDelete {
@@ -3625,6 +3690,7 @@ impl DefaultObjectUsecase {
             cache_control,
             content_disposition,
             content_language,
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             website_redirect_location,
             expires,
             last_modified,
@@ -4238,6 +4304,7 @@ impl DefaultObjectUsecase {
                 .ok()
                 .and_then(|modified_at_secs| OffsetDateTime::from_unix_timestamp(modified_at_secs as i64).ok());
             let mut metadata = HashMap::new();
+            let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
             apply_put_request_metadata(
                 &mut metadata,
                 &req.headers,
@@ -4252,6 +4319,7 @@ impl DefaultObjectUsecase {
                 tagging.clone(),
                 storage_class.clone(),
             )?;
+            apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
             let mut opts = put_opts(&bucket, &fpath, None, &req.headers, metadata.clone())
                 .await
                 .map_err(ApiError::from)?;
@@ -4436,6 +4504,11 @@ mod tests {
         DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
         ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
     };
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -4449,6 +4522,32 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[tokio::test]
+    async fn build_put_like_object_lock_metadata_rejects_mode_without_retain_until_date() {
+        let err = build_put_like_object_lock_metadata(
+            "test-bucket",
+            None,
+            Some(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
+    }
+
+    #[tokio::test]
+    async fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
+        let retain_until = Timestamp::from(OffsetDateTime::now_utc().add(time::Duration::days(1)));
+        let err = build_put_like_object_lock_metadata("test-bucket", None, None, Some(retain_until))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
     }
 
     #[test]
@@ -4519,6 +4618,164 @@ mod tests {
         headers.insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("AES256"));
 
         assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_respects_hard_safety_cap() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 20_i64 * 1024 * 1024 * 1024;
+        let response_len = 80_i64 * 1024 * 1024;
+        let should_buffer =
+            should_buffer_get_object_in_memory_with_threshold(&info, response_len, None, false, configured_threshold);
+
+        assert!(
+            !should_buffer,
+            "64MiB hard cap must force streaming when response exceeds cap even if configured threshold is much higher"
+        );
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_allows_small_non_range_requests() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024 * 1024,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024 * 1024,
+            Some(1),
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024 * 1024,
+            None,
+            true,
+            configured_threshold
+        ));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_respects_configured_threshold_below_cap() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold + 1,
+            None,
+            false,
+            configured_threshold
+        ));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_rejects_unknown_lengths_and_disabled_thresholds() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            0,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            -1,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0));
+    }
+
+    struct ReadProbeReader {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for ReadProbeReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_keeps_large_objects_on_streaming_path_without_preread() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 18_i64 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            18_i64 * 1024 * 1024 * 1024,
+            128 * 1024,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("build_get_object_body should succeed for streaming path");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "large-object response construction should not pre-read object data"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_keeps_large_encrypted_objects_on_streaming_path_without_preread() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 18_i64 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            18_i64 * 1024 * 1024 * 1024,
+            128 * 1024,
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("build_get_object_body should succeed for encrypted streaming path");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "large encrypted object response construction should not pre-read object data"
+        );
     }
 
     #[test]
@@ -4785,6 +5042,23 @@ mod tests {
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
             .part_number(Some(0))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_get_object(req)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn execute_get_object_rejects_range_with_part_number() {
+        let input = GetObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .part_number(Some(1))
+            .range(Some(Range::Int { first: 0, last: Some(1) }))
             .build()
             .unwrap();
 

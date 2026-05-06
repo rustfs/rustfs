@@ -32,8 +32,9 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      # SECURITY: these defaults are public and well-known. Override before
+      # exposing the listener beyond localhost.
       - RUSTFS_ACCESS_KEY=rustfsadmin
       - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_OBS_LOGGER_LEVEL=info
@@ -42,11 +43,22 @@ services:
     volumes:
       - ./deploy/data/pro:/data
       - ./deploy/logs:/app/logs
-      - ./deploy/data/certs/:/opt/tls # TLS configuration, you should create tls directory and put your tls files in it and then specify the path here
+      # TLS configuration directory.
+      # Place at least:
+      # - /opt/tls/ca.crt
+      # - /opt/tls/rustfs_cert.pem
+      # - /opt/tls/rustfs_key.pem
+      - ./deploy/data/certs/:/opt/tls
+      # Permission baseline:
+      # - default RustFS runtime user is 10001:10001
+      # - ensure host mounts are writable by that user, or run with host-matched user
     networks:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
+      # Production strict TLS example (SAN/FQDN aligned, no `-k`):
+      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9000:127.0.0.1 https://rustfs-a.example.com:9000/health
+      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9001:127.0.0.1 https://rustfs-a.example.com:9001/rustfs/console/health
       test:
         [
           "CMD",
@@ -79,7 +91,6 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_ACCESS_KEY=devadmin
       - RUSTFS_SECRET_KEY=devadmin

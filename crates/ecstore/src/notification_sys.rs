@@ -22,7 +22,7 @@ use crate::rpc::PeerRestClient;
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
 use futures::future::join_all;
 use lazy_static::lazy_static;
-use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysService};
+use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties};
@@ -485,31 +485,29 @@ impl NotificationSys {
         Ok(())
     }
 
-    pub async fn load_bucket_metadata(&self, bucket: &str) -> Vec<NotificationPeerErr> {
+    pub async fn load_bucket_metadata(&self, bucket: &str) -> Result<()> {
+        let operation = format!("load_bucket_metadata({bucket})");
+        let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for client in self.peer_clients.iter() {
-            let b = bucket.to_string();
-            futures.push(async move {
-                if let Some(client) = client {
-                    match client.load_bucket_metadata(&b).await {
-                        Ok(_) => NotificationPeerErr {
-                            host: client.host.to_string(),
-                            err: None,
-                        },
-                        Err(e) => NotificationPeerErr {
-                            host: client.host.to_string(),
-                            err: Some(e),
-                        },
-                    }
-                } else {
-                    NotificationPeerErr {
-                        host: "".to_string(),
-                        err: Some(Error::other("peer is not reachable")),
-                    }
-                }
-            });
+        for (idx, client) in self.peer_clients.iter().enumerate() {
+            if let Some(client) = client {
+                let host = client.host.to_string();
+                let b = bucket.to_string();
+                futures.push(async move { client.load_bucket_metadata(&b).await.map_err(|err| (host, err)) });
+            } else {
+                failures.push(format!("peer[{idx}] {operation} failed: peer is not reachable"));
+            }
         }
-        join_all(futures).await
+
+        for result in join_all(futures).await {
+            if let Err((host, err)) = result {
+                let failure = format!("peer {host} {operation} failed: {err}");
+                error!("notification {operation} err {failure}");
+                failures.push(failure);
+            }
+        }
+
+        aggregate_notification_failures(&operation, failures)
     }
 
     pub async fn delete_bucket_metadata(&self, bucket: &str) -> Vec<NotificationPeerErr> {
@@ -622,14 +620,14 @@ impl NotificationSys {
         join_all(futures).await
     }
 
-    pub async fn get_sys_services(&self) -> Vec<SysService> {
+    pub async fn get_sys_services(&self) -> Vec<SysServices> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().cloned() {
             futures.push(async move {
                 if let Some(client) = client {
                     client.get_se_linux_info().await.unwrap_or_default()
                 } else {
-                    SysService::default()
+                    SysServices::default()
                 }
             });
         }
@@ -903,5 +901,23 @@ mod tests {
         assert!(msg.contains("2 failure(s)"));
         assert!(msg.contains("peer-1 failed"));
         assert!(msg.contains("local save failed"));
+    }
+
+    #[tokio::test]
+    async fn load_bucket_metadata_reports_unreachable_peers() {
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+        };
+
+        let err = sys
+            .load_bucket_metadata("bucket-a")
+            .await
+            .expect_err("unreachable peers should fail bucket metadata reload");
+
+        let msg = err.to_string();
+        assert!(msg.contains("load_bucket_metadata(bucket-a)"));
+        assert!(msg.contains("1 failure(s)"));
+        assert!(msg.contains("peer[0]"));
     }
 }
