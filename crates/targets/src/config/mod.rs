@@ -21,7 +21,7 @@ pub use loader::{
     collect_target_configs_from_env,
 };
 pub use target_args::{
-    build_kafka_args, build_mqtt_args, build_nats_args, build_pulsar_args, build_redis_args, build_webhook_args,
-    validate_kafka_config, validate_mqtt_config, validate_nats_config, validate_pulsar_config, validate_redis_config,
+    build_kafka_args, build_mqtt_args, build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, build_webhook_args,
+    validate_kafka_config, validate_mqtt_config, validate_nats_config, validate_postgres_config, validate_pulsar_config,, validate_redis_config,
     validate_webhook_config,
 };

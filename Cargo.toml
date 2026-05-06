@@ -171,6 +171,8 @@ openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0"
 rsa = { version = "0.10.0-rc.18" }
 rustls = { version = "0.23.40", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 rustls-pki-types = "1.14.1"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
@@ -182,6 +184,11 @@ chrono = { version = "0.4.44", features = ["serde"] }
 humantime = "2.3.0"
 jiff = { version = "0.2.24", features = ["serde"] }
 time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
+
+# Database
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime", "with-serde_json-1"] }
+tokio-postgres-rustls = "0.13"
 
 # Utilities and Tools
 anyhow = "1.0.102"

@@ -74,6 +74,7 @@ pub const PULSAR_TLS_HOSTNAME_VERIFICATION: &str = "tls_hostname_verification";
 pub const PULSAR_QUEUE_DIR: &str = "queue_dir";
 pub const PULSAR_QUEUE_LIMIT: &str = "queue_limit";
 
+
 pub const REDIS_URL: &str = "url";
 pub const REDIS_CHANNEL: &str = "channel";
 pub const REDIS_USERNAME: &str = "username";
@@ -93,6 +94,21 @@ pub const REDIS_TLS_CA: &str = "tls_ca";
 pub const REDIS_TLS_CLIENT_CERT: &str = "tls_client_cert";
 pub const REDIS_TLS_CLIENT_KEY: &str = "tls_client_key";
 pub const REDIS_TLS_ALLOW_INSECURE: &str = "tls_allow_insecure";
+
+pub const POSTGRES_HOST: &str = "host";
+pub const POSTGRES_PORT: &str = "port";
+pub const POSTGRES_USER: &str = "user";
+pub const POSTGRES_PASSWORD: &str = "password";
+pub const POSTGRES_DATABASE: &str = "database";
+pub const POSTGRES_SCHEMA: &str = "schema";
+pub const POSTGRES_TABLE: &str = "table";
+pub const POSTGRES_FORMAT: &str = "format";
+pub const POSTGRES_TLS_REQUIRED: &str = "tls_required";
+pub const POSTGRES_TLS_CA: &str = "tls_ca";
+pub const POSTGRES_TLS_CLIENT_CERT: &str = "tls_client_cert";
+pub const POSTGRES_TLS_CLIENT_KEY: &str = "tls_client_key";
+pub const POSTGRES_QUEUE_DIR: &str = "queue_dir";
+pub const POSTGRES_QUEUE_LIMIT: &str = "queue_limit";
 
 /// Environment variable controlling whether target queue files are Snappy-compressed.
 /// Applies to both notify and audit target queue stores.
