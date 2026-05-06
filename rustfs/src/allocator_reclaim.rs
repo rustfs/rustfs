@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unsafe_code)]
-
 use metrics::{counter, gauge, histogram};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -91,6 +89,7 @@ fn reclaimable_work_snapshot() -> ReclaimableWorkSnapshot {
     not(target_os = "windows"),
     not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
 ))]
+#[allow(unsafe_code)]
 fn collect_allocator_memory(force: bool) -> Result<(), String> {
     // SAFETY: `mi_collect` is provided by the active global allocator backend
     // on this target family. It is explicitly intended to reclaim retained

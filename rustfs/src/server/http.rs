@@ -1021,6 +1021,9 @@ fn get_listen_backlog() -> i32 {
 // For macOS and BSD variants use the syscall way of getting the connection queue length.
 // NetBSD has no somaxconn-like kernel state.
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+// SAFETY: The only unsafe operation in this function is `libc::sysctl`, called
+// with kernel MIB arrays selected by target OS, a valid output buffer, and no
+// input buffer.
 #[allow(unsafe_code)]
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
@@ -1032,6 +1035,8 @@ fn get_listen_backlog() -> i32 {
     let mut buf = [0; 1];
     let mut buf_len = size_of_val(&buf);
 
+    // SAFETY: `name` points to the target OS MIB, `buf` is a valid writable
+    // output buffer, `buf_len` points to its size, and no input buffer is used.
     if unsafe {
         libc::sysctl(
             name.as_mut_ptr(),
