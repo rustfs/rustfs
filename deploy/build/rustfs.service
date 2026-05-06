@@ -26,7 +26,7 @@ ExecStart=/usr/local/bin/rustfs \
 # environment variable configuration (Option 2: Use environment variables)
 # rustfs example file see: `../config/rustfs.env`
 EnvironmentFile=-/etc/default/rustfs
-ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES $RUSTFS_OPTS
+ExecStart=/usr/local/bin/rustfs  $RUSTFS_VOLUMES
 
 # service log configuration
 LogsDirectory=rustfs

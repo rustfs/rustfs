@@ -20,7 +20,7 @@
 use super::Opt;
 use crate::apply_external_env_compat;
 use rustfs_config::{
-    DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, ENV_RUSTFS_ROOT_PASSWORD, ENV_RUSTFS_ROOT_USER, RUSTFS_REGION,
+    DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, ENV_RUSTFS_ACCESS_KEY, ENV_RUSTFS_SECRET_KEY, RUSTFS_REGION,
 };
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 
@@ -169,8 +169,8 @@ impl Config {
             buffer_profile,
         } = opt;
 
-        let access_key = resolve_credential(access_key, access_key_file.as_ref(), ENV_RUSTFS_ROOT_USER, DEFAULT_ACCESS_KEY)?;
-        let secret_key = resolve_credential(secret_key, secret_key_file.as_ref(), ENV_RUSTFS_ROOT_PASSWORD, DEFAULT_SECRET_KEY)?;
+        let access_key = resolve_credential(access_key, access_key_file.as_ref(), ENV_RUSTFS_ACCESS_KEY, DEFAULT_ACCESS_KEY)?;
+        let secret_key = resolve_credential(secret_key, secret_key_file.as_ref(), ENV_RUSTFS_SECRET_KEY, DEFAULT_SECRET_KEY)?;
 
         // Region is optional, but if not set, we should default to "us-east-1" for signing compatibility with AWS S3 clients
         let region = region.or_else(|| Some(RUSTFS_REGION.to_string()));
