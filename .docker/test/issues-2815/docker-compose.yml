@@ -1,0 +1,120 @@
+services:
+  rustfs1:
+    image: rustfs-issue-2815-local
+    platform: ${RUSTFS_DOCKER_PLATFORM:-linux/arm64}
+    hostname: rustfs1
+    container_name: rustfs-issue-2815-rustfs1
+    environment:
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_ACCESS_KEY: "rustfsadmin"
+      RUSTFS_SECRET_KEY: "issue-2815-secret"
+      RUSTFS_RPC_SECRET: "issue-2815-rpc-secret"
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUST_LOG: "info"
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+      RUSTFS_VOLUMES: "http://rustfs{1...4}:9000/data/rustfs{0...3}"
+    volumes:
+      - ./data/rustfs1-disk0:/data/rustfs0
+      - ./data/rustfs1-disk1:/data/rustfs1
+      - ./data/rustfs1-disk2:/data/rustfs2
+      - ./data/rustfs1-disk3:/data/rustfs3
+    networks: [rustfs-issue-2815-net]
+    ports:
+      - "9101:9000"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+
+  rustfs2:
+    image: rustfs-issue-2815-local
+    platform: ${RUSTFS_DOCKER_PLATFORM:-linux/arm64}
+    hostname: rustfs2
+    container_name: rustfs-issue-2815-rustfs2
+    environment:
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_ACCESS_KEY: "rustfsadmin"
+      RUSTFS_SECRET_KEY: "issue-2815-secret"
+      RUSTFS_RPC_SECRET: "issue-2815-rpc-secret"
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUST_LOG: "info"
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+      RUSTFS_VOLUMES: "http://rustfs{1...4}:9000/data/rustfs{0...3}"
+    volumes:
+      - ./data/rustfs2-disk0:/data/rustfs0
+      - ./data/rustfs2-disk1:/data/rustfs1
+      - ./data/rustfs2-disk2:/data/rustfs2
+      - ./data/rustfs2-disk3:/data/rustfs3
+    networks: [rustfs-issue-2815-net]
+    ports:
+      - "9102:9000"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+
+  rustfs3:
+    image: rustfs-issue-2815-local
+    platform: ${RUSTFS_DOCKER_PLATFORM:-linux/arm64}
+    hostname: rustfs3
+    container_name: rustfs-issue-2815-rustfs3
+    environment:
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_ACCESS_KEY: "rustfsadmin"
+      RUSTFS_SECRET_KEY: "issue-2815-secret"
+      RUSTFS_RPC_SECRET: "issue-2815-rpc-secret"
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUST_LOG: "info"
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+      RUSTFS_VOLUMES: "http://rustfs{1...4}:9000/data/rustfs{0...3}"
+    volumes:
+      - ./data/rustfs3-disk0:/data/rustfs0
+      - ./data/rustfs3-disk1:/data/rustfs1
+      - ./data/rustfs3-disk2:/data/rustfs2
+      - ./data/rustfs3-disk3:/data/rustfs3
+    networks: [rustfs-issue-2815-net]
+    ports:
+      - "9103:9000"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+
+  rustfs4:
+    image: rustfs-issue-2815-local
+    platform: ${RUSTFS_DOCKER_PLATFORM:-linux/arm64}
+    hostname: rustfs4
+    container_name: rustfs-issue-2815-rustfs4
+    environment:
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_ACCESS_KEY: "rustfsadmin"
+      RUSTFS_SECRET_KEY: "issue-2815-secret"
+      RUSTFS_RPC_SECRET: "issue-2815-rpc-secret"
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUST_LOG: "info"
+      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+      RUSTFS_VOLUMES: "http://rustfs{1...4}:9000/data/rustfs{0...3}"
+    volumes:
+      - ./data/rustfs4-disk0:/data/rustfs0
+      - ./data/rustfs4-disk1:/data/rustfs1
+      - ./data/rustfs4-disk2:/data/rustfs2
+      - ./data/rustfs4-disk3:/data/rustfs3
+    networks: [rustfs-issue-2815-net]
+    ports:
+      - "9104:9000"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+
+networks:
+  rustfs-issue-2815-net:
+    name: rustfs-issue-2815-net
