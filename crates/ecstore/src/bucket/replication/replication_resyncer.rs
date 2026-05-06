@@ -185,6 +185,14 @@ async fn head_object_fallback(
     }
 }
 
+// Version IDs differ by design on this path (RustFS UUID vs AWS alphanumeric), so
+// compare only ETags. Equal ETags mean identical content; version ID is irrelevant.
+fn content_matches(src: &ObjectInfo, tgt: &HeadObjectOutput) -> bool {
+    let src_etag = src.etag.as_deref().map(rustfs_utils::path::trim_etag);
+    let tgt_etag = tgt.e_tag.as_deref().map(rustfs_utils::path::trim_etag);
+    src_etag.is_some() && src_etag == tgt_etag
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ResyncOpts {
     pub bucket: String,
@@ -2576,17 +2584,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 } else if is_version_id_format_mismatch(&e) {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
                     match head_object_fallback(&bucket, &tgt_client, &object).await {
-                        Ok(Some(oi)) => {
-                            replication_action = get_replication_action(&object_info, &oi, self.op_type);
-                            if replication_action == ReplicationAction::None {
-                                rinfo.replication_status = ReplicationStatusType::Completed;
-                                rinfo.replication_resynced = true;
-                                rinfo.replication_action = ReplicationAction::None;
-                                rinfo.size = size;
-                                return rinfo;
-                            }
+                        Ok(Some(oi)) if content_matches(&object_info, &oi) => {
+                            rinfo.replication_status = ReplicationStatusType::Completed;
+                            rinfo.replication_resynced = true;
+                            rinfo.replication_action = ReplicationAction::None;
+                            rinfo.size = size;
+                            return rinfo;
                         }
-                        Ok(None) => {}
+                        Ok(_) => {}
                         Err(e2) => {
                             rinfo.error = Some(e2.to_string());
                             warn!(
@@ -2861,9 +2866,15 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
                     match head_object_fallback(&bucket, &tgt_client, &object).await {
                         Ok(Some(oi)) => {
-                            replication_action = get_replication_action(&object_info, &oi, self.op_type);
+                            replication_action = if content_matches(&object_info, &oi) {
+                                ReplicationAction::None
+                            } else {
+                                ReplicationAction::All
+                            };
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            replication_action = ReplicationAction::All;
+                        }
                         Err(e2) => {
                             rinfo.error = Some(e2.to_string());
                             warn!(
@@ -3965,6 +3976,36 @@ mod tests {
             !is_version_id_mismatch(Some("EntityTooLarge"), Some(400)),
             "EntityTooLarge/400 is a real request error and must not trigger version-ID fallback"
         );
+    }
+
+    #[test]
+    fn test_content_matches_compares_etag_only() {
+        let src = ObjectInfo {
+            etag: Some("\"abc123\"".to_string()),
+            ..Default::default()
+        };
+
+        let tgt_match = HeadObjectOutput::builder().e_tag("\"abc123\"").build();
+        assert!(content_matches(&src, &tgt_match), "identical ETags must match");
+
+        // version_id on the target is intentionally ignored
+        let tgt_different_version = HeadObjectOutput::builder()
+            .e_tag("\"abc123\"")
+            .version_id("aws-alphanumeric-id")
+            .build();
+        assert!(
+            content_matches(&src, &tgt_different_version),
+            "matching ETags with different version IDs must still match"
+        );
+
+        let tgt_different_content = HeadObjectOutput::builder().e_tag("\"def456\"").build();
+        assert!(!content_matches(&src, &tgt_different_content), "different ETags must not match");
+
+        let src_no_etag = ObjectInfo {
+            etag: None,
+            ..Default::default()
+        };
+        assert!(!content_matches(&src_no_etag, &tgt_match), "missing source ETag must not match");
     }
 
     #[test]
