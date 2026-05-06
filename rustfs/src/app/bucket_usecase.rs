@@ -54,6 +54,7 @@ use rustfs_ecstore::bucket::{
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::store_api::{
     BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
     MakeBucketOptions, ObjectInfo,
@@ -191,6 +192,14 @@ fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
         updated_at: Some(time::OffsetDateTime::now_utc()),
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
         ..Default::default()
+    }
+}
+
+async fn notify_bucket_metadata_reload(bucket: &str, operation: &str) {
+    if let Some(notification_sys) = get_global_notification_sys()
+        && let Err(err) = notification_sys.load_bucket_metadata(bucket).await
+    {
+        warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
     }
 }
 
@@ -992,6 +1001,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(&bucket, "delete bucket lifecycle").await;
+
         let item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle delete hook failed");
@@ -1542,6 +1553,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(&bucket, "put bucket lifecycle").await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         item.expiry_lc_config =
