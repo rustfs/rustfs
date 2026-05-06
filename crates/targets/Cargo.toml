@@ -40,9 +40,12 @@ urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 rustfs-kafka-async = { workspace = true }
+mysql_async = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "queue_store_benchmark"

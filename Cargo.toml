@@ -115,6 +115,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.1" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
+mysql_async = { version = "0.36.2", default-features = false, features = ["default-rustls"] }
 async-compression = { version = "0.4.42" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"

@@ -14,6 +14,7 @@
 
 use crate::Event;
 use crate::factory::{
+    KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory,
     KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory, RedisTargetFactory, TargetFactory,
     WebhookTargetFactory,
 };
@@ -50,6 +51,7 @@ impl TargetRegistry {
         registry.register(ChannelTargetType::Postgres.as_str(), Box::new(PostgresTargetFactory));
         registry.register(ChannelTargetType::Pulsar.as_str(), Box::new(PulsarTargetFactory));
         registry.register(ChannelTargetType::Kafka.as_str(), Box::new(KafkaTargetFactory));
+        registry.register(ChannelTargetType::MySql.as_str(), Box::new(MySqlTargetFactory));
         registry.register(ChannelTargetType::Redis.as_str(), Box::new(RedisTargetFactory));
 
         registry

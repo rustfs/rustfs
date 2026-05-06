@@ -33,6 +33,9 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::{
+    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
+    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS,
+    NOTIFY_WEBHOOK_SUB_SYS,
     NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
     NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_ROUTE_PREFIX,
     NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
@@ -119,6 +122,12 @@ fn notification_target_specs() -> [AdminTargetSpec; 6] {
             service: "mqtt",
             valid_keys: NOTIFY_MQTT_KEYS,
             validator: AdminTargetValidator::Mqtt,
+        },
+        AdminTargetSpec {
+            subsystem: NOTIFY_MYSQL_SUB_SYS,
+            service: "mysql",
+            valid_keys: NOTIFY_MYSQL_KEYS,
+            validator: AdminTargetValidator::MySql,
         },
         AdminTargetSpec {
             subsystem: NOTIFY_NATS_SUB_SYS,

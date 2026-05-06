@@ -23,6 +23,8 @@ use rustfs_config::audit::{
     AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::notify::{
+    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
+    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS,
     NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
     NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS,
     NOTIFY_WEBHOOK_SUB_SYS,
@@ -78,6 +80,12 @@ fn notify_target_descriptors() -> [TargetConfigDescriptor; 6] {
             subsystem_key: NOTIFY_MQTT_SUB_SYS,
             default_kvs: &notify::DEFAULT_NOTIFY_MQTT_KVS,
             valid_keys: NOTIFY_MQTT_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "mysql",
+            subsystem_key: NOTIFY_MYSQL_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_MYSQL_KVS,
+            valid_keys: NOTIFY_MYSQL_KEYS,
         },
         TargetConfigDescriptor {
             external_key: "nats",
@@ -1139,9 +1147,11 @@ mod tests {
     };
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
-    use rustfs_config::notify::{NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+    use rustfs_config::notify::{NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
-    use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
+    use rustfs_config::{
+        DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
+    };
     use rustfs_filemeta::FileInfo;
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
@@ -1782,6 +1792,15 @@ mod tests {
                 "acks":"all",
                 "tls_enable":true
               }
+            },
+            "mysql":{
+              "primary":{
+                "enable":true,
+                "dsn_string":"rustfs:password@tcp(127.0.0.1:3306)/rustfs_events",
+                "table":"rustfs_events",
+                "queue_dir":"/tmp/mysql-queue",
+                "max_open_connections":"2"
+              }
             }
           }
         }"#;
@@ -1818,6 +1837,15 @@ mod tests {
         assert_eq!(kafka.get(rustfs_config::KAFKA_TOPIC), "events-kafka");
         assert_eq!(kafka.get(rustfs_config::KAFKA_ACKS), "all");
         assert_eq!(kafka.get(rustfs_config::KAFKA_TLS_ENABLE), "true");
+
+        let mysql = cfg
+            .get_value(NOTIFY_MYSQL_SUB_SYS, "primary")
+            .expect("mysql target should be decoded");
+        assert_eq!(mysql.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(mysql.get(MYSQL_DSN_STRING), "rustfs:password@tcp(127.0.0.1:3306)/rustfs_events");
+        assert_eq!(mysql.get(MYSQL_TABLE), "rustfs_events");
+        assert_eq!(mysql.get(MYSQL_QUEUE_DIR), "/tmp/mysql-queue");
+        assert_eq!(mysql.get(MYSQL_MAX_OPEN_CONNECTIONS), "2");
     }
 
     #[test]

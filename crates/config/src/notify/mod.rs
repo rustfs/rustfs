@@ -15,6 +15,7 @@
 mod arn;
 mod kafka;
 mod mqtt;
+mod mysql;
 mod nats;
 mod postgres;
 mod pulsar;
@@ -25,6 +26,7 @@ mod webhook;
 pub use arn::*;
 pub use kafka::*;
 pub use mqtt::*;
+pub use mysql::*;
 pub use nats::*;
 pub use postgres::*;
 pub use pulsar::*;
@@ -73,10 +75,10 @@ pub const ENV_NOTIFY_SEND_CONCURRENCY: &str = "RUSTFS_NOTIFY_SEND_CONCURRENCY";
 /// Adjust this value based on your system's capabilities and expected load.
 pub const DEFAULT_NOTIFY_SEND_CONCURRENCY: usize = 64;
 
-#[allow(dead_code)]
 pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[
     NOTIFY_KAFKA_SUB_SYS,
     NOTIFY_MQTT_SUB_SYS,
+    NOTIFY_MYSQL_SUB_SYS,
     NOTIFY_NATS_SUB_SYS,
     NOTIFY_POSTGRES_SUB_SYS,
     NOTIFY_PULSAR_SUB_SYS,
@@ -86,8 +88,7 @@ pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[
 
 pub const NOTIFY_KAFKA_SUB_SYS: &str = "notify_kafka";
 pub const NOTIFY_MQTT_SUB_SYS: &str = "notify_mqtt";
-#[allow(dead_code)]
-pub const NOTIFY_MY_SQL_SUB_SYS: &str = "notify_mysql";
+pub const NOTIFY_MYSQL_SUB_SYS: &str = "notify_mysql";
 #[allow(dead_code)]
 pub const NOTIFY_NATS_SUB_SYS: &str = "notify_nats";
 #[allow(dead_code)]
