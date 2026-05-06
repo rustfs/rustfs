@@ -17,8 +17,10 @@ use http::{HeaderMap, HeaderValue};
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
-use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
-use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
+use rustfs_utils::http::{
+    AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+    AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+};
 use rustfs_utils::http::{
     SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_DELETEMARKER,
     SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header, insert_header_map,
@@ -586,9 +588,9 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "expires",
         "x-amz-replication-status",
         // Object Lock headers - required for S3 Object Lock functionality
-        "x-amz-object-lock-mode",
-        "x-amz-object-lock-retain-until-date",
-        "x-amz-object-lock-legal-hold",
+        AMZ_OBJECT_LOCK_MODE_LOWER,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
     ]
 });
 
@@ -1325,9 +1327,9 @@ mod tests {
             "x-amz-tagging",
             "expires",
             "x-amz-replication-status",
-            "x-amz-object-lock-mode",
-            "x-amz-object-lock-retain-until-date",
-            "x-amz-object-lock-legal-hold",
+            AMZ_OBJECT_LOCK_MODE_LOWER,
+            AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+            AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
         ];
 
         assert_eq!(*SUPPORTED_HEADERS, expected_headers);

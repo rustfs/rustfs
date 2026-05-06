@@ -841,9 +841,9 @@ mod tests {
             retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let compliance_metadata = parse_object_lock_retention(Some(valid_compliance_retention)).unwrap();
-        assert_eq!(compliance_metadata.get("x-amz-object-lock-mode").unwrap(), "COMPLIANCE");
+        assert_eq!(compliance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "COMPLIANCE");
         assert_eq!(
-            compliance_metadata.get("x-amz-object-lock-retain-until-date").unwrap(),
+            compliance_metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).unwrap(),
             "2030-01-01T00:00:00Z"
         );
         assert!(contains_key_str(&compliance_metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
@@ -858,7 +858,7 @@ mod tests {
             retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
-        assert_eq!(governance_metadata.get("x-amz-object-lock-mode").unwrap(), "GOVERNANCE");
+        assert_eq!(governance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "GOVERNANCE");
 
         // [4] Normal case: Retention with None mode (empty string for mode, date not validated)
         let none_mode_retention = ObjectLockRetention {
@@ -866,7 +866,7 @@ mod tests {
             retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
         };
         let none_mode_metadata = parse_object_lock_retention(Some(none_mode_retention)).unwrap();
-        assert_eq!(none_mode_metadata.get("x-amz-object-lock-mode").unwrap(), "");
+        assert_eq!(none_mode_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "");
 
         // [5] Normal case: Retention with None retain_until_date (empty string for date)
         let none_date_retention = ObjectLockRetention {
@@ -874,7 +874,7 @@ mod tests {
             retain_until_date: None,
         };
         let none_date_metadata = parse_object_lock_retention(Some(none_date_retention)).unwrap();
-        assert_eq!(none_date_metadata.get("x-amz-object-lock-retain-until-date").unwrap(), "");
+        assert_eq!(none_date_metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).unwrap(), "");
 
         // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
         let invalid_mode_retention = ObjectLockRetention {
