@@ -920,7 +920,9 @@ async fn apply_put_request_object_lock_opts(
     Ok(())
 }
 
-const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
+// Shared across Object Lock validation paths to keep the client-facing
+// InvalidRequest message consistent.
+pub(crate) const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
     "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
 
 pub(crate) async fn build_put_like_object_lock_metadata(
