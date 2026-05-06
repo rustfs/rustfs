@@ -1,0 +1,103 @@
+# cargo-deny configuration
+#
+# Run with `cargo deny check` (advisories, sources, bans, licenses).
+# Schema: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+#
+# This file codifies what was previously implicit policy:
+#   - which RustSec advisories we knowingly accept and why,
+#   - which non-crates.io sources we trust,
+#   - which duplicate crate versions we tolerate vs. flag.
+#
+# When adding an exception, include an `# owner: <github-handle> review: <yyyy-mm>`
+# comment so future audits know who signed off and when to revisit.
+
+[graph]
+all-features = true
+no-default-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # `instant 0.1.13` — unmaintained. No direct dependency; pulled in
+    # transitively. Tracked for upgrade as part of broader dep refresh.
+    # owner: rustfs-maintainers  review: 2026-07
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; transitive only; tracked for upgrade" },
+
+    # `paste 1.0.15` — unmaintained. No direct dependency.
+    # owner: rustfs-maintainers  review: 2026-07
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive only; tracked for upgrade" },
+
+    # `rsa` Marvin timing sidechannel (RUSTSEC-2023-0071). Pulled in via
+    # `openidconnect` (transitive) and historically used directly. No upstream
+    # fix is available yet. Tracked separately for follow-up; remove this
+    # entry once a patched `rsa` lands in the dependency graph and any
+    # in-process RSA decryption oracles are removed.
+    # owner: rustfs-maintainers  review: 2026-07
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing sidechannel; no fixed upstream version; tracked separately" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    # Custom S3 server library with minio compatibility patches not yet upstreamed.
+    # Pinned to a specific commit in workspace Cargo.toml.
+    "https://github.com/rustfs/s3s",
+]
+
+[bans]
+# Multiple-versions of the same crate are permitted with a warning so the
+# graph remains buildable while we work the chains down. Crypto- and
+# transport-sensitive crates are tracked separately below.
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+# Any future crate we want to forbid outright belongs here.
+deny = []
+
+# Crates whose duplicate versions are most worth eliminating, because they
+# touch crypto, parsing, or networking trust boundaries. Not currently a
+# build error — the graph still has duplicates — but tracking the list keeps
+# them visible.
+[[bans.skip-tree]]
+# `windows-sys` notoriously has many old versions in dependency closures;
+# don't flood the report with it.
+name = "windows-sys"
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",            # boost; tracing-related crates
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",# webpki / linux-raw-sys metadata
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+exceptions = [
+    # `ring` ships a custom license combining ISC, MIT, and an OpenSSL-style
+    # notice that does not parse cleanly as SPDX OpenSSL.
+    { allow = ["ISC", "MIT"], crate = "ring" },
+
+    # `inferno` is CDDL-1.0 (copyleft). Used only by profiling tooling
+    # (pyroscope / jemalloc_pprof) which is opt-in and never linked into the
+    # default S3 path. Tracked as an exception rather than a blanket allow.
+    # owner: rustfs-maintainers  review: 2026-07
+    { allow = ["CDDL-1.0"], crate = "inferno" },
+
+    # `libbz2-rs-sys` carries the upstream bzip2-1.0.6 license. It's used
+    # transitively via `bzip2`. Not on a hot path.
+    # owner: rustfs-maintainers  review: 2026-07
+    { allow = ["bzip2-1.0.6"], crate = "libbz2-rs-sys" },
+]

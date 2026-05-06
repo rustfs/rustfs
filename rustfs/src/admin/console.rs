@@ -602,12 +602,18 @@ async fn health_route_disabled() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
-/// Parse CORS allowed origins from configuration
+/// Parse CORS allowed origins from configuration.
 ///
-/// # Arguments:
+/// When no origins are configured (None or an empty string), the layer is
+/// left without `Access-Control-Allow-Origin` so browsers treat responses
+/// as same-origin only. Operators that need cross-origin access set
+/// `RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS` to a comma-separated allow-list,
+/// or to `*` to allow any origin.
+///
+/// # Arguments
 /// - `origins`: An optional reference to a string containing allowed origins.
 ///
-/// # Returns:
+/// # Returns
 /// - A `CorsLayer` configured with the specified origins.
 pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     let cors_layer = CorsLayer::new()
@@ -615,38 +621,28 @@ pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
         .allow_headers(Any);
 
     match origins {
-        Some(origins_str) if origins_str == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
-        Some(origins_str) => {
-            let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).collect();
-            if origins.is_empty() {
-                warn!("Empty CORS origins provided, using permissive CORS");
-                cors_layer.allow_origin(Any).expose_headers(Any)
-            } else {
-                // Parse origins with proper error handling
-                let mut valid_origins = Vec::new();
-                for origin in origins {
-                    match origin.parse::<HeaderValue>() {
-                        Ok(header_value) => {
-                            valid_origins.push(header_value);
-                        }
-                        Err(e) => {
-                            warn!("Invalid CORS origin '{}': {}", origin, e);
-                        }
-                    }
-                }
-
-                if valid_origins.is_empty() {
-                    warn!("No valid CORS origins found, using permissive CORS");
-                    cors_layer.allow_origin(Any).expose_headers(Any)
-                } else {
-                    info!("Console CORS origins configured: {:?}", valid_origins);
-                    cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
+        Some(origins_str) if origins_str.trim() == "*" => cors_layer.allow_origin(Any).expose_headers(Any),
+        Some(origins_str) if !origins_str.trim().is_empty() => {
+            let origins: Vec<&str> = origins_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let mut valid_origins = Vec::new();
+            for origin in origins {
+                match origin.parse::<HeaderValue>() {
+                    Ok(header_value) => valid_origins.push(header_value),
+                    Err(e) => warn!("Invalid CORS origin '{}': {}", origin, e),
                 }
             }
+
+            if valid_origins.is_empty() {
+                warn!("No valid CORS origins parsed from configuration; defaulting to same-origin only");
+                cors_layer
+            } else {
+                info!("Console CORS origins configured: {:?}", valid_origins);
+                cors_layer.allow_origin(AllowOrigin::list(valid_origins)).expose_headers(Any)
+            }
         }
-        None => {
-            debug!("No CORS origins configured for console, using permissive CORS");
-            cors_layer.allow_origin(Any)
+        _ => {
+            debug!("No CORS origins configured for console; same-origin only");
+            cors_layer
         }
     }
 }
@@ -676,6 +672,7 @@ mod tests {
     use axum::body::Body;
     use http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use serial_test::serial;
     use std::net::{IpAddr, Ipv4Addr};
     use temp_env::async_with_vars;
     use tower::ServiceExt;
@@ -709,7 +706,10 @@ mod tests {
         assert!(!is_console_path("/rustfs/admin/v3/info"));
     }
 
+    // setup_console_middleware_stack reads ENV_HEALTH_ENDPOINT_ENABLE; serialise
+    // with other tests that override that env var to avoid cross-task leakage.
     #[tokio::test]
+    #[serial]
     async fn console_middleware_stack_propagates_request_id_header() {
         let app = setup_console_middleware_stack(parse_cors_origins(None), false, 0, 30);
         let request = Request::builder()
@@ -725,7 +725,95 @@ mod tests {
         );
     }
 
+    /// Regression: when no console CORS origins are configured (the new
+    /// default), the layer must NOT emit `Access-Control-Allow-Origin`, so
+    /// browsers treat responses as same-origin only.
     #[tokio::test]
+    #[serial]
+    async fn default_console_cors_is_same_origin_only() {
+        let app = setup_console_middleware_stack(parse_cors_origins(None), false, 0, 30);
+
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri(format!("{CONSOLE_PREFIX}/license"))
+            .header("origin", "https://example.com")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .expect("build preflight");
+
+        let response = app.oneshot(request).await.expect("preflight should complete");
+
+        assert!(
+            response.headers().get("access-control-allow-origin").is_none(),
+            "default console CORS must not emit Access-Control-Allow-Origin"
+        );
+        assert!(
+            response.headers().get("access-control-allow-credentials").is_none(),
+            "default console CORS must not emit Access-Control-Allow-Credentials"
+        );
+    }
+
+    /// Operators that opt in to wildcard origins (via `*`) keep the previous
+    /// permissive behavior.
+    #[tokio::test]
+    #[serial]
+    async fn explicit_wildcard_console_cors_allows_any_origin() {
+        let star = "*".to_string();
+        let app = setup_console_middleware_stack(parse_cors_origins(Some(&star)), false, 0, 30);
+
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri(format!("{CONSOLE_PREFIX}/license"))
+            .header("origin", "https://example.com")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .expect("build preflight");
+
+        let response = app.oneshot(request).await.expect("preflight should complete");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "explicit `*` origin must produce wildcard Allow-Origin"
+        );
+    }
+
+    /// Whitespace-padded wildcard ("` * `") must still be treated as wildcard
+    /// rather than falling into the comma-separated parser. Common when the
+    /// origin string is templated through env vars.
+    #[tokio::test]
+    #[serial]
+    async fn whitespace_padded_wildcard_console_cors_allows_any_origin() {
+        let star = " * ".to_string();
+        let app = setup_console_middleware_stack(parse_cors_origins(Some(&star)), false, 0, 30);
+
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri(format!("{CONSOLE_PREFIX}/license"))
+            .header("origin", "https://example.com")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .expect("build preflight");
+
+        let response = app.oneshot(request).await.expect("preflight should complete");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*"),
+            "whitespace-padded `*` origin must produce wildcard Allow-Origin"
+        );
+    }
+
+    // Mutates the global ENV_HEALTH_ENDPOINT_ENABLE env var; serialise to
+    // avoid leaking the override into other async tests in the same module.
+    #[tokio::test]
+    #[serial]
     async fn console_middleware_stack_hides_health_routes_when_disabled() {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let app = setup_console_middleware_stack(parse_cors_origins(None), false, 0, 30);

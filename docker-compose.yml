@@ -33,6 +33,8 @@ services:
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
       - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      # SECURITY: these defaults are public and well-known. Override before
+      # exposing the listener beyond localhost.
       - RUSTFS_ACCESS_KEY=rustfsadmin
       - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_OBS_LOGGER_LEVEL=info
