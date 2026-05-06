@@ -32,15 +32,6 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
-      # NOTE: `*` here permits any browser origin to make credentialed S3
-      # requests against this instance. Safe only for local dev. For any
-      # exposed deployment, set an explicit allow-list (e.g.
-      # https://app.example.com). Note: at present the S3 listener reflects
-      # any Origin even when this var is unset, so an explicit allow-list
-      # is the only way to constrain browser callers.
-      - RUSTFS_CORS_ALLOWED_ORIGINS=*
-      # Console CORS: omit this var to keep the same-origin default; only
-      # set it (or `*`) when serving the console under a different origin.
       - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       # SECURITY: these defaults are public and well-known. Override before
       # exposing the listener beyond localhost.
@@ -100,7 +91,6 @@ services:
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_ACCESS_KEY=devadmin
       - RUSTFS_SECRET_KEY=devadmin

@@ -1143,7 +1143,7 @@ impl DiskAPI for RemoteDisk {
 
                 let mut headers = HeaderMap::new();
                 headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                build_auth_headers(&url, &Method::GET, &mut headers);
+                build_auth_headers(&url, &Method::GET, &mut headers)?;
 
                 let mut reader = HttpReader::new_with_stall_timeout(
                     url,
@@ -1196,7 +1196,7 @@ impl DiskAPI for RemoteDisk {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::GET, &mut headers);
+        build_auth_headers(&url, &Method::GET, &mut headers)?;
         Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
     }
 
@@ -1239,7 +1239,7 @@ impl DiskAPI for RemoteDisk {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::PUT, &mut headers);
+        build_auth_headers(&url, &Method::PUT, &mut headers)?;
         Ok(Box::new(HttpWriter::new(url, Method::PUT, headers).await?))
     }
 
@@ -1270,7 +1270,7 @@ impl DiskAPI for RemoteDisk {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::PUT, &mut headers);
+        build_auth_headers(&url, &Method::PUT, &mut headers)?;
         Ok(Box::new(HttpWriter::new(url, Method::PUT, headers).await?))
     }
 

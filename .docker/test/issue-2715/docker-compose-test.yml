@@ -1,0 +1,52 @@
+services:
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.99-glibc
+    container_name: rustfs-issue-2715-test
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs{0...8}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_ACCESS_KEY=admin
+      - RUSTFS_SECRET_KEY=admin
+      - RUSTFS_OBS_LOGGER_LEVEL=info
+      - RUSTFS_OBS_ENDPOINT=http://otel-collector:4318
+      - RUSTFS_OBS_PROFILING_ENDPOINT=http://pyroscope:4040
+      - RUSTFS_STORAGE_CLASS_STANDARD=EC:2
+      - RUSTFS_STORAGE_CLASS_RRS=EC:1
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
+      - RUSTFS_OBS_LOG_DIRECTORY=/opt/rustfs/logs
+    extra_hosts:
+      - "otel-collector:host-gateway"
+      - "pyroscope:host-gateway"
+    volumes:
+      - ./deploy/data/issue-2715/rustfs0:/data/rustfs0
+      - ./deploy/data/issue-2715/rustfs1:/data/rustfs1
+      - ./deploy/data/issue-2715/rustfs2:/data/rustfs2
+      - ./deploy/data/issue-2715/rustfs3:/data/rustfs3
+      - ./deploy/data/issue-2715/rustfs4:/data/rustfs4
+      - ./deploy/data/issue-2715/rustfs5:/data/rustfs5
+      - ./deploy/data/issue-2715/rustfs6:/data/rustfs6
+      - ./deploy/data/issue-2715/rustfs7:/data/rustfs7
+      - ./deploy/data/issue-2715/rustfs8:/data/rustfs8
+      - ./deploy/logs/issue-2715:/opt/rustfs/logs
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "sh",
+          "-c",
+          "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

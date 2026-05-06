@@ -104,6 +104,9 @@ mod checksum_upload_test;
 #[cfg(test)]
 mod group_delete_test;
 
+#[cfg(test)]
+mod head_object_range_test;
+
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;

@@ -41,6 +41,7 @@ Examples:
 - `RUSTFS_ADDRESS`
 - `RUSTFS_VOLUMES`
 - `RUSTFS_LICENSE`
+- `RUSTFS_LICENSE_PUBLIC_KEY`
 
 Current guidance:
 - Prefer module-specific names only when they are not top-level product configuration.
@@ -50,6 +51,16 @@ Current guidance:
   - `RUSTFS_ENABLE_SCANNER` -> `RUSTFS_SCANNER_ENABLED`
   - `RUSTFS_ENABLE_HEAL` -> `RUSTFS_HEAL_ENABLED`
   - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` -> `RUSTFS_SCANNER_START_DELAY_SECS`
+
+## License environment variables
+
+- `RUSTFS_LICENSE` contains the signed license token.
+- `RUSTFS_LICENSE_PUBLIC_KEY` contains the RSA public key used to verify signed license tokens.
+
+## CORS environment variables
+
+- `RUSTFS_CORS_ALLOWED_ORIGINS` defaults to empty, so the S3 endpoint emits no generic CORS headers unless configured. Set `*` for wildcard origins without credentials, or a comma-separated allow-list for credentialed explicit origins.
+- `RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS` defaults to `*` for the console service.
 
 ## Scanner environment aliases
 

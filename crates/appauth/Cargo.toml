@@ -26,7 +26,7 @@ categories = ["web-programming", "development-tools", "authentication"]
 
 [dependencies]
 base64-simd = { workspace = true }
-rsa = { workspace = true }
+rsa = { workspace = true, features = ["sha2"] }
 serde.workspace = true
 serde_json.workspace = true
 rand.workspace = true

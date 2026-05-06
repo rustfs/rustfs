@@ -149,17 +149,11 @@ pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
 /// Environment variable for server access key file.
 pub const ENV_RUSTFS_ACCESS_KEY_FILE: &str = "RUSTFS_ACCESS_KEY_FILE";
 
-/// Environment variable for server root user.
-pub const ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
-
 /// Environment variable for server secret key.
 pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
 
 /// Environment variable for server secret key file.
 pub const ENV_RUSTFS_SECRET_KEY_FILE: &str = "RUSTFS_SECRET_KEY_FILE";
-
-/// Environment variable for server root password.
-pub const ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
 
 /// Environment variable for server OBS endpoint.
 pub const ENV_RUSTFS_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
@@ -234,6 +228,9 @@ pub const ENV_RUSTFS_REGION: &str = "RUSTFS_REGION";
 
 /// Environment variable for server license.
 pub const ENV_RUSTFS_LICENSE: &str = "RUSTFS_LICENSE";
+
+/// Environment variable for the RSA public key used to verify server licenses.
+pub const ENV_RUSTFS_LICENSE_PUBLIC_KEY: &str = "RUSTFS_LICENSE_PUBLIC_KEY";
 
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.
@@ -348,6 +345,7 @@ mod tests {
     fn test_environment_constants() {
         // Test environment related constants
         assert_eq!(ENVIRONMENT, "production");
+        assert_eq!(ENV_RUSTFS_LICENSE_PUBLIC_KEY, "RUSTFS_LICENSE_PUBLIC_KEY");
         assert!(
             ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
             "Environment should be a standard environment name"
