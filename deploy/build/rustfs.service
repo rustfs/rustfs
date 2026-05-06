@@ -17,8 +17,7 @@ Group=rustfs
 WorkingDirectory=/opt/rustfs
 
 # environment variable configuration and main program (Option 1: Directly specify arguments)
-Environment=RUSTFS_ACCESS_KEY=rustfsadmin
-Environment=RUSTFS_SECRET_KEY=rustfsadmin
+# Credentials are loaded from /etc/default/rustfs below. Replace the sample values before deployment.
 ExecStart=/usr/local/bin/rustfs \
     --address 0.0.0.0:9000 \
     --volumes /data/rustfs/vol1,/data/rustfs/vol2 \
