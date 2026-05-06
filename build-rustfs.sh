@@ -577,6 +577,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -f|--features)
+            if [ -z "${2:-}" ]; then
+                print_message $RED "❌ Missing value for $1"
+                usage
+                exit 1
+            fi
             FEATURES="$2"
             shift 2
             ;;
