@@ -290,6 +290,12 @@ impl AtomicLockState {
     }
 
     #[cfg(test)]
+    pub fn readers_waiting_count(&self) -> u16 {
+        let state = self.state.load(Ordering::Acquire);
+        self.readers_waiting(state)
+    }
+
+    #[cfg(test)]
     pub fn writers_waiting_count(&self) -> u16 {
         let state = self.state.load(Ordering::Acquire);
         self.writers_waiting(state)

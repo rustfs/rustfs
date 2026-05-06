@@ -885,8 +885,8 @@ mod tests {
         network.insert("ip".to_string(), "192.168.1.100".to_string());
 
         let mut env_vars = HashMap::new();
-        env_vars.insert("RUSTFS_ROOT_USER".to_string(), "admin".to_string());
-        env_vars.insert("RUSTFS_ROOT_PASSWORD".to_string(), "password".to_string());
+        env_vars.insert("RUSTFS_ACCESS_KEY".to_string(), "admin".to_string());
+        env_vars.insert("RUSTFS_SECRET_KEY".to_string(), "password".to_string());
 
         let server_props = ServerProperties {
             state: "online".to_string(),

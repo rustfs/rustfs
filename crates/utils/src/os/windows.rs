@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unsafe_code)] // TODO: audit unsafe code
-
 use crate::os::{DiskInfo, IOStats};
 use std::io::Error;
 use std::path::Path;
@@ -21,6 +19,9 @@ use windows::Win32::Foundation::MAX_PATH;
 use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDiskFreeSpaceW, GetVolumeInformationW, GetVolumePathNameW};
 
 /// Returns total and free bytes available in a directory, e.g. `C:\`.
+// SAFETY: Windows API calls receive null-terminated UTF-16 paths and valid
+// pointers to initialized stack output variables.
+#[allow(unsafe_code)]
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let path_wide = to_wide_path(p.as_ref());
 
@@ -81,6 +82,9 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     })
 }
 
+// SAFETY: Windows volume APIs receive null-terminated UTF-16 paths and fixed
+// stack buffers sized for the documented MAX_PATH outputs used here.
+#[allow(unsafe_code)]
 fn get_windows_fs_type(p: &[u16]) -> std::io::Result<String> {
     let path = get_volume_name(p)?;
 
@@ -109,6 +113,9 @@ fn get_windows_fs_type(p: &[u16]) -> std::io::Result<String> {
     Ok(utf16_to_string(&file_system_name_buffer))
 }
 
+// SAFETY: `v` is a null-terminated UTF-16 path and `volume_name_buffer` is a
+// writable MAX_PATH-sized stack buffer for the returned volume path.
+#[allow(unsafe_code)]
 fn get_volume_name(v: &[u16]) -> std::io::Result<Vec<u16>> {
     let mut volume_name_buffer = [0u16; MAX_PATH as usize];
 

@@ -1594,8 +1594,27 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         return state;
     }
 
-    let names: Vec<String> = req.site_names.into_iter().collect();
-    state.peers.retain(|_, peer| !names.iter().any(|name| name == &peer.name));
+    let names: HashSet<String> = req.site_names.into_iter().collect();
+    if names.contains(&state.name) {
+        state.peers.clear();
+        state.resync_status.clear();
+        state.updated_at = Some(OffsetDateTime::now_utc());
+        return state;
+    }
+
+    let removed_deployment_ids: Vec<String> = state
+        .peers
+        .iter()
+        .filter(|(_, peer)| names.contains(&peer.name))
+        .map(|(deployment_id, _)| deployment_id.clone())
+        .collect();
+    for deployment_id in removed_deployment_ids {
+        state.peers.remove(&deployment_id);
+        state.resync_status.remove(&deployment_id);
+    }
+    state
+        .resync_status
+        .retain(|deployment_id, _| state.peers.contains_key(deployment_id));
     state.updated_at = Some(OffsetDateTime::now_utc());
     state
 }
@@ -3293,6 +3312,173 @@ mod tests {
         assert_eq!(status.status, SITE_REPL_REMOVE_SUCCESS);
         assert!(status.err_detail.contains("failed to notify 1 peer"));
         assert!(status.err_detail.contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn test_remove_sites_drops_resync_status_for_removed_peer() {
+        let mut state = SiteReplicationState {
+            name: "local".to_string(),
+            ..Default::default()
+        };
+        state.peers.insert(
+            "local-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "local-deployment".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-a-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-a-deployment".to_string(),
+                ..peer("remote-a", "https://remote-a.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-b-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-b-deployment".to_string(),
+                ..peer("remote-b", "https://remote-b.example.com")
+            },
+        );
+        state.resync_status.insert(
+            "remote-a-deployment".to_string(),
+            SRResyncOpStatus {
+                resync_id: "stale-a".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+        state.resync_status.insert(
+            "remote-a-legacy-key".to_string(),
+            SRResyncOpStatus {
+                resync_id: "stale-a-legacy".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+        state.resync_status.insert(
+            "remote-b-deployment".to_string(),
+            SRResyncOpStatus {
+                resync_id: "active-b".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let state = remove_sites(
+            state,
+            SRRemoveReq {
+                site_names: vec!["remote-a".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(state.peers.contains_key("local-deployment"));
+        assert!(!state.peers.contains_key("remote-a-deployment"));
+        assert!(state.peers.contains_key("remote-b-deployment"));
+        assert!(!state.resync_status.contains_key("remote-a-deployment"));
+        assert!(!state.resync_status.contains_key("remote-a-legacy-key"));
+        assert!(state.resync_status.contains_key("remote-b-deployment"));
+    }
+
+    #[test]
+    fn test_remove_sites_prunes_orphan_resync_status_without_matching_site() {
+        let mut state = SiteReplicationState {
+            name: "local".to_string(),
+            ..Default::default()
+        };
+        state.peers.insert(
+            "remote-a-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-a-deployment".to_string(),
+                ..peer("remote-a", "https://remote-a.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-b-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-b-deployment".to_string(),
+                ..peer("remote-b", "https://remote-b.example.com")
+            },
+        );
+        state.resync_status.insert(
+            "remote-a-deployment".to_string(),
+            SRResyncOpStatus {
+                resync_id: "active-a".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+        state.resync_status.insert(
+            "removed-deployment".to_string(),
+            SRResyncOpStatus {
+                resync_id: "orphaned".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let state = remove_sites(
+            state,
+            SRRemoveReq {
+                site_names: vec!["missing-site".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(state.peers.contains_key("remote-a-deployment"));
+        assert!(state.peers.contains_key("remote-b-deployment"));
+        assert!(state.resync_status.contains_key("remote-a-deployment"));
+        assert!(!state.resync_status.contains_key("removed-deployment"));
+    }
+
+    #[test]
+    fn test_remove_sites_clears_state_when_local_site_is_removed() {
+        let mut state = SiteReplicationState {
+            name: "local".to_string(),
+            ..Default::default()
+        };
+        state.peers.insert(
+            "local-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "local-deployment".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-a-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-a-deployment".to_string(),
+                ..peer("remote-a", "https://remote-a.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote-b-deployment".to_string(),
+            PeerInfo {
+                deployment_id: "remote-b-deployment".to_string(),
+                ..peer("remote-b", "https://remote-b.example.com")
+            },
+        );
+        state.resync_status.insert(
+            "remote-a-deployment".to_string(),
+            SRResyncOpStatus {
+                resync_id: "active-a".to_string(),
+                status: "success".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let state = remove_sites(
+            state,
+            SRRemoveReq {
+                site_names: vec!["local".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(state.peers.is_empty());
+        assert!(state.resync_status.is_empty());
     }
 
     #[test]

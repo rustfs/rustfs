@@ -30,7 +30,7 @@ use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, insert_str,
+    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, insert_str, remove_str,
 };
 use s3s::dto::{
     Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
@@ -50,21 +50,41 @@ use tracing::{debug, warn};
 pub const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
+fn format_object_lock_timestamp(timestamp: OffsetDateTime) -> String {
+    timestamp.format(&Rfc3339).unwrap_or_default()
+}
+
+fn has_object_lock_retention_metadata(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER) || metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+}
+
+pub(crate) fn remove_object_lock_retention_metadata(metadata: &mut HashMap<String, String>) -> bool {
+    let removed_mode = metadata.remove(AMZ_OBJECT_LOCK_MODE_LOWER).is_some();
+    let removed_retain_until_date = metadata.remove(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).is_some();
+    let removed_timestamp = contains_key_str(metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP);
+    remove_str(metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP);
+
+    removed_mode || removed_retain_until_date || removed_timestamp
+}
+
+fn remove_object_lock_legal_hold_metadata(metadata: &mut HashMap<String, String>) -> bool {
+    let removed_legal_hold = metadata.remove(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).is_some();
+    let removed_timestamp = contains_key_str(metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP);
+    remove_str(metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP);
+
+    removed_legal_hold || removed_timestamp
+}
+
+pub(crate) fn remove_object_lock_metadata_for_copy(metadata: &mut HashMap<String, String>) -> bool {
+    let removed_retention = remove_object_lock_retention_metadata(metadata);
+    let removed_legal_hold = remove_object_lock_legal_hold_metadata(metadata);
+
+    removed_retention || removed_legal_hold
+}
+
 /// Apply bucket default Object Lock retention to object metadata if no explicit retention is set.
-///
-/// This function implements S3-compatible behavior where objects uploaded to a bucket with
-/// default retention configuration automatically inherit the bucket's default retention policy.
-/// The retention is only applied if:
-/// 1. The bucket has Object Lock enabled
-/// 2. The bucket has a default retention rule configured
-/// 3. The object metadata does not already contain explicit retention headers
-///
-/// # Arguments
-/// * `object_lock_config` - Optional bucket Object Lock configuration. If None, no retention is applied.
-/// * `metadata` - Mutable reference to object metadata HashMap. Retention headers are inserted here.
-#[allow(dead_code)]
 pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
-    if metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER) || metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER) {
+    if has_object_lock_retention_metadata(metadata) {
         return;
     }
 
@@ -87,7 +107,58 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
     if let Ok(date_str) = retain_until.format(&Rfc3339) {
         metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode.as_str().to_string());
         metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), date_str);
+        insert_str(metadata, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, format_object_lock_timestamp(now));
     }
+}
+
+pub(crate) fn apply_default_lock_retention_metadata(
+    object_lock_configuration: Option<ObjectLockConfiguration>,
+    metadata: &mut HashMap<String, String>,
+) -> bool {
+    if has_object_lock_retention_metadata(metadata) {
+        return false;
+    }
+
+    let mut default_retention_metadata = HashMap::new();
+    apply_lock_retention(object_lock_configuration, &mut default_retention_metadata);
+    if default_retention_metadata.is_empty() {
+        return false;
+    }
+
+    metadata.extend(default_retention_metadata);
+    true
+}
+
+pub(crate) async fn apply_bucket_default_lock_retention(
+    bucket: &str,
+    metadata: &mut HashMap<String, String>,
+    has_explicit_retention: bool,
+) -> S3Result<()> {
+    if has_explicit_retention {
+        return Ok(());
+    }
+
+    if has_object_lock_retention_metadata(metadata) {
+        return Ok(());
+    }
+
+    let object_lock_configuration = match metadata_sys::get_object_lock_config(bucket).await {
+        Ok((cfg, _created)) => Some(cfg),
+        Err(err) => {
+            if err == StorageError::ConfigNotFound {
+                None
+            } else {
+                warn!("get_object_lock_config err {:?}", err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    "Failed to load Object Lock configuration".to_string(),
+                ));
+            }
+        }
+    };
+
+    apply_default_lock_retention_metadata(object_lock_configuration, metadata);
+    Ok(())
 }
 
 /// Calculate adaptive buffer size with workload profile support.
@@ -301,7 +372,7 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
         insert_str(
             &mut eval_metadata,
             SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
-            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+            format_object_lock_timestamp(now),
         );
     }
     Ok(eval_metadata)
@@ -328,7 +399,7 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
         insert_str(
             &mut eval_metadata,
             SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
-            format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
+            format_object_lock_timestamp(now),
         );
     }
     Ok(eval_metadata)

@@ -24,9 +24,11 @@ use crate::{
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{
-    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS,
-    NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_WEBHOOK_ENABLE,
+    ENV_NOTIFY_WEBHOOK_ENDPOINT, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS,
+    NOTIFY_WEBHOOK_SUB_SYS,
 };
+use rustfs_config::{ENV_NOTIFY_ENABLE, EVENT_DEFAULT_DIR};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
@@ -41,6 +43,14 @@ use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 const MAX_RECENT_LIVE_EVENTS: usize = 1024;
+
+fn notify_configuration_hint() -> String {
+    let webhook_enable_primary = format!("{ENV_NOTIFY_WEBHOOK_ENABLE}_PRIMARY");
+    let webhook_endpoint_primary = format!("{ENV_NOTIFY_WEBHOOK_ENDPOINT}_PRIMARY");
+    format!(
+        "No notify targets configured. Check {ENV_NOTIFY_ENABLE}=true and instance-scoped target env vars (for example {webhook_enable_primary} + {webhook_endpoint_primary} for arn:rustfs:sqs::primary:webhook). If using default queue_dir, ensure {EVENT_DEFAULT_DIR} is writable."
+    )
+}
 
 fn subsystem_target_type(target_type: &str) -> &str {
     match target_type {
@@ -325,6 +335,9 @@ impl NotificationSystem {
         let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
+        if targets.is_empty() {
+            warn!("{}", notify_configuration_hint());
+        }
 
         // Initialize targets and start event streams
         let cancellers = self.init_targets_and_start_streams(&targets).await;
@@ -586,6 +599,9 @@ impl NotificationSystem {
             .map_err(NotificationError::Target)?;
 
         info!("{} notification targets were created from the new configuration", targets.len());
+        if targets.is_empty() {
+            warn!("{}", notify_configuration_hint());
+        }
 
         // Initialize targets and start event streams using shared helper
         let new_cancellers = self.init_targets_and_start_streams(&targets).await;
@@ -607,7 +623,7 @@ impl NotificationSystem {
     ) -> Result<(), NotificationError> {
         let arn_list = self.notifier.get_arn_list(&cfg.region).await;
         if arn_list.is_empty() {
-            return Err(NotificationError::Configuration("No targets configured".to_string()));
+            return Err(NotificationError::Configuration(notify_configuration_hint()));
         }
         info!("Available ARNs: {:?}", arn_list);
         // Validate the configuration against the available ARNs

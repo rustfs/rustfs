@@ -365,6 +365,23 @@ pub fn get_env_opt_u16(key: &str) -> Option<u16> {
 pub fn get_env_i32(key: &str, default: i32) -> i32 {
     parse_env_value(key).unwrap_or(default)
 }
+
+/// Retrieve an i32 environment variable with deprecated aliases and a default fallback.
+///
+/// Canonical `key` takes precedence over deprecated aliases when both are present.
+pub fn get_env_i32_with_aliases(key: &str, deprecated: &[&str], default: i32) -> i32 {
+    let Some((used_key, value)) = resolve_env_with_aliases(key, deprecated) else {
+        return default;
+    };
+
+    value.parse::<i32>().unwrap_or_else(|_| {
+        log_once(&format!("env_invalid_i32:{used_key}"), || {
+            format!("Invalid i32 value for {used_key}: {value}. Using default behavior.")
+        });
+        default
+    })
+}
+
 /// Retrieve an environment variable as a specific type, returning None if not set or parsing fails.
 /// 32-bit type: signed i32
 ///
@@ -651,7 +668,7 @@ pub fn apply_external_env_compat() -> ExternalEnvCompatReport {
     let report = build_external_env_compat_report();
     for (source_key, rustfs_key) in &report.mapped_pairs {
         if let Ok(value) = env::var(source_key) {
-            // Safety: this helper is intended for early startup bootstrap
+            // SAFETY: this helper is intended for early startup bootstrap
             // before any background threads are created.
             unsafe {
                 env::set_var(rustfs_key, value);
@@ -664,7 +681,8 @@ pub fn apply_external_env_compat() -> ExternalEnvCompatReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_bool_with_aliases, get_env_str,
+        apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_bool_with_aliases,
+        get_env_i32_with_aliases, get_env_str,
     };
 
     fn source_key(suffix: &str) -> String {
@@ -757,6 +775,33 @@ mod tests {
         temp_env::with_var("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", Some("false"), || {
             temp_env::with_var("MINIO_CI", Some("1"), || {
                 assert!(!get_env_bool_with_aliases("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", &["MINIO_CI"], true,));
+            });
+        });
+    }
+
+    #[test]
+    fn i32_alias_value_is_used_when_canonical_missing() {
+        temp_env::with_var_unset("RUSTFS_TEST_I32", || {
+            temp_env::with_var("RUSTFS_TEST_I32_LEGACY", Some("12"), || {
+                assert_eq!(get_env_i32_with_aliases("RUSTFS_TEST_I32", &["RUSTFS_TEST_I32_LEGACY"], 8), 12);
+            });
+        });
+    }
+
+    #[test]
+    fn i32_canonical_value_takes_precedence_over_alias() {
+        temp_env::with_var("RUSTFS_TEST_I32", Some("9"), || {
+            temp_env::with_var("RUSTFS_TEST_I32_LEGACY", Some("12"), || {
+                assert_eq!(get_env_i32_with_aliases("RUSTFS_TEST_I32", &["RUSTFS_TEST_I32_LEGACY"], 8), 9);
+            });
+        });
+    }
+
+    #[test]
+    fn i32_invalid_alias_value_falls_back_to_default() {
+        temp_env::with_var_unset("RUSTFS_TEST_I32", || {
+            temp_env::with_var("RUSTFS_TEST_I32_LEGACY", Some("not-an-i32"), || {
+                assert_eq!(get_env_i32_with_aliases("RUSTFS_TEST_I32", &["RUSTFS_TEST_I32_LEGACY"], 8), 8);
             });
         });
     }

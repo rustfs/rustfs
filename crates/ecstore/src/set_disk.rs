@@ -1446,7 +1446,6 @@ impl ObjectOperations for SetDisks {
             }
         };
 
-        let inline_data = fi.inline_data();
         fi.metadata = src_info.user_defined.clone();
 
         if let Some(etag) = &src_info.etag {
@@ -1454,27 +1453,50 @@ impl ObjectOperations for SetDisks {
         }
 
         let mod_time = OffsetDateTime::now_utc();
+        fi.mod_time = Some(mod_time);
+        fi.version_id = version_id;
+        fi.versioned = src_opts.versioned || src_opts.version_suspended;
 
-        for fi in metas.iter_mut() {
-            if fi.is_valid() {
-                fi.metadata = src_info.user_defined.clone();
-                fi.mod_time = Some(mod_time);
-                fi.version_id = version_id;
-                fi.versioned = src_opts.versioned || src_opts.version_suspended;
+        if src_info.version_only {
+            let inline_data = fi.inline_data();
 
-                if !fi.inline_data() {
-                    fi.data = None;
-                }
+            for fi in metas.iter_mut() {
+                if fi.is_valid() {
+                    fi.metadata = src_info.user_defined.clone();
+                    if let Some(etag) = &src_info.etag {
+                        fi.metadata.insert("etag".to_owned(), etag.clone());
+                    }
+                    fi.mod_time = Some(mod_time);
+                    fi.version_id = version_id;
+                    fi.versioned = src_opts.versioned || src_opts.version_suspended;
 
-                if inline_data {
-                    fi.set_inline_data();
+                    if !fi.inline_data() {
+                        fi.data = None;
+                    }
+
+                    if inline_data {
+                        fi.set_inline_data();
+                    }
                 }
             }
-        }
 
-        Self::write_unique_file_info(&online_disks, "", src_bucket, src_object, &metas, write_quorum)
+            Self::write_unique_file_info(&online_disks, "", src_bucket, src_object, &metas, write_quorum)
+                .await
+                .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
+        } else {
+            self.update_object_meta_with_opts(
+                src_bucket,
+                src_object,
+                fi.clone(),
+                &online_disks,
+                &UpdateMetadataOpts {
+                    replace_user_metadata: true,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
+        }
 
         Ok(ObjectInfo::from_file_info(
             &fi,
