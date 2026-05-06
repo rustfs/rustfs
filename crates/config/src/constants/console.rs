@@ -24,8 +24,14 @@ pub const DEFAULT_CORS_ALLOWED_ORIGINS: &str = "";
 /// Comma-separated list of origins or "*" for all origins
 pub const ENV_CONSOLE_CORS_ALLOWED_ORIGINS: &str = "RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS";
 
-/// Default CORS allowed origins for the console service
-pub const DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS: &str = "*";
+/// Default CORS allowed origins for the console service.
+///
+/// Empty string means same-origin only — no `Access-Control-Allow-Origin`
+/// header is emitted, so browsers will not allow cross-origin reads of
+/// console responses by default. Operators that need cross-origin access set
+/// `RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS` to a comma-separated allow-list, or
+/// to `*` to keep the previous permissive behavior.
+pub const DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS: &str = "";
 
 /// Enable or disable the console service
 pub const ENV_CONSOLE_ENABLE: &str = "RUSTFS_CONSOLE_ENABLE";
@@ -100,8 +106,8 @@ mod tests {
     }
 
     #[test]
-    fn console_cors_default_remains_wildcard() {
+    fn console_cors_default_is_same_origin_only() {
         assert_eq!(ENV_CONSOLE_CORS_ALLOWED_ORIGINS, "RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS");
-        assert_eq!(DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS, "*");
+        assert_eq!(DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS, "");
     }
 }

@@ -505,6 +505,7 @@ impl DefaultMultipartUsecase {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
         }
 
+        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
             object_lock_legal_hold_status,
@@ -515,6 +516,7 @@ impl DefaultMultipartUsecase {
         {
             metadata.extend(object_lock_metadata);
         }
+        apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
 
         let encryption_request = PrepareEncryptionRequest {
             bucket: &bucket,
