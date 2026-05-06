@@ -119,6 +119,9 @@ impl ZeroCopyObjectReader {
     /// let reader = ZeroCopyObjectReader::from_file_mmap_path("large_file.bin", 0, 1024).await?;
     /// ```
     #[cfg(unix)]
+    // SAFETY: The mmap is created from a read-only file handle for the
+    // caller-provided range, then copied into owned `Bytes` before the file and
+    // mapping are dropped.
     #[allow(unsafe_code)]
     pub async fn from_file_mmap_path(path: &std::path::Path, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
         use memmap2::MmapOptions;
@@ -130,7 +133,8 @@ impl ZeroCopyObjectReader {
             // Open the file in sync context
             let std_file = std::fs::File::open(&path).map_err(|e| ZeroCopyReadError::Io(e.to_string()))?;
 
-            // Create memory map
+            // SAFETY: `std_file` remains open while the mapping is created and
+            // copied, and the mapped bytes are not exposed beyond this closure.
             let mmap = unsafe { MmapOptions::new().offset(offset).len(size).map(&std_file) }
                 .map_err(|e| ZeroCopyReadError::Mmap(e.to_string()))?;
 

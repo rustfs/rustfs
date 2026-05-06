@@ -668,7 +668,7 @@ pub fn apply_external_env_compat() -> ExternalEnvCompatReport {
     let report = build_external_env_compat_report();
     for (source_key, rustfs_key) in &report.mapped_pairs {
         if let Ok(value) = env::var(source_key) {
-            // Safety: this helper is intended for early startup bootstrap
+            // SAFETY: this helper is intended for early startup bootstrap
             // before any background threads are created.
             unsafe {
                 env::set_var(rustfs_key, value);

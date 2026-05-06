@@ -28,6 +28,8 @@ mod tests {
     /// # Safety
     /// This function uses unsafe env::set_var and env::remove_var.
     /// Tests using this helper must be marked with #[serial] to avoid race conditions.
+    // SAFETY: This helper mutates process environment only inside serial tests
+    // and restores the variable before returning or resuming a panic.
     #[allow(unsafe_code)]
     fn with_env_var<F>(key: &str, value: &str, test_fn: F)
     where
@@ -366,7 +368,6 @@ mod tests {
     /// Uses #[serial] to avoid concurrent env var modifications.
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_rustfs_volumes_env_variable() {
         // Test case 1: Single volume via environment variable
         with_env_var("RUSTFS_VOLUMES", "/data/vol1", || {
@@ -511,7 +512,6 @@ mod tests {
     /// which means paths with spaces are NOT supported.
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_volumes_boundary_cases() {
         // Test case 1: Paths with spaces are not properly supported (known limitation)
         // This test documents the current behavior - space-separated paths will be split
@@ -670,7 +670,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_access_key_arguments_mutually_exclusive_env_var() {
         // Test that env var args configuration fails on conflict
         with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
@@ -710,7 +709,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[allow(unsafe_code)]
     fn test_secret_key_arguments_mutually_exclusive_env_var() {
         // Test that env var args configuration fails on conflict
         with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {

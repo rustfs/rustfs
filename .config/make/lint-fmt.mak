@@ -16,6 +16,11 @@ clippy-check: core-deps ## Run clippy checks
 	cargo clippy --fix --allow-dirty
 	cargo clippy --all-targets --all-features -- -D warnings
 
+.PHONY: unsafe-code-check
+unsafe-code-check: ## Check unsafe_code allowances have SAFETY comments
+	@echo "🔒 Checking unsafe_code allowances..."
+	./scripts/check_unsafe_code_allowances.sh
+
 .PHONY: compilation-check
 compilation-check: core-deps ## Run compilation check
 	@echo "🔨 Running compilation check..."
