@@ -2,8 +2,13 @@
 
 TEST_THREADS ?= 1
 
+.PHONY: script-tests
+script-tests: ## Run shell script tests
+	@echo "Running script tests..."
+	./scripts/test_build_rustfs_options.sh
+
 .PHONY: test
-test: core-deps test-deps ## Run all tests
+test: core-deps test-deps script-tests ## Run all tests
 	@echo "🧪 Running tests..."
 	@if command -v cargo-nextest >/dev/null 2>&1; then \
 		cargo nextest run --all --exclude e2e_test; \
