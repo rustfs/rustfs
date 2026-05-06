@@ -958,6 +958,12 @@ mod tests {
     use std::sync::Arc;
     use time::macros::datetime;
 
+    fn with_default_ilm_process_time(test: impl FnOnce()) {
+        temp_env::with_var_unset(ENV_ILM_PROCESS_TIME, || {
+            temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, test);
+        });
+    }
+
     #[tokio::test]
     #[serial]
     async fn validate_accepts_zero_expiration_days() {
@@ -2151,37 +2157,75 @@ mod tests {
     // --- TASK-003 tests: Round up to next UTC processing boundary ---
 
     #[test]
+    #[serial]
     fn expected_expiry_time_rounds_up_to_next_midnight_utc() {
-        // Object created at 2025-01-15T10:30:45Z, expire in 30 days
-        let mod_time = datetime!(2025-01-15 10:30:45 UTC);
-        let result = expected_expiry_time(mod_time, 30);
+        with_default_ilm_process_time(|| {
+            // Object created at 2025-01-15T10:30:45Z, expire in 30 days
+            let mod_time = datetime!(2025-01-15 10:30:45 UTC);
+            let result = expected_expiry_time(mod_time, 30);
 
-        // Should round up to the next midnight: 2025-02-15T00:00:00Z
-        assert_eq!(result.hour(), 0);
-        assert_eq!(result.minute(), 0);
-        assert_eq!(result.second(), 0);
-        assert_eq!(result, datetime!(2025-02-15 00:00:00 UTC));
+            // Should round up to the next midnight: 2025-02-15T00:00:00Z
+            assert_eq!(result.hour(), 0);
+            assert_eq!(result.minute(), 0);
+            assert_eq!(result.second(), 0);
+            assert_eq!(result, datetime!(2025-02-15 00:00:00 UTC));
+        });
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_immediate_expiry_returns_epoch() {
-        let mod_time = datetime!(2025-06-01 12:00:00 UTC);
-        let result = expected_expiry_time(mod_time, 0);
-        assert_eq!(result, OffsetDateTime::UNIX_EPOCH);
+        with_default_ilm_process_time(|| {
+            let mod_time = datetime!(2025-06-01 12:00:00 UTC);
+            let result = expected_expiry_time(mod_time, 0);
+            assert_eq!(result, OffsetDateTime::UNIX_EPOCH);
+        });
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_preserves_exact_midnight_boundary() {
-        let mod_time = datetime!(2025-03-01 00:00:00 UTC);
-        let result = expected_expiry_time(mod_time, 1);
-        assert_eq!(result, datetime!(2025-03-02 00:00:00 UTC));
+        with_default_ilm_process_time(|| {
+            let mod_time = datetime!(2025-03-01 00:00:00 UTC);
+            let result = expected_expiry_time(mod_time, 1);
+            assert_eq!(result, datetime!(2025-03-02 00:00:00 UTC));
+        });
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_rounds_end_of_day_to_following_midnight() {
-        let mod_time = datetime!(2025-06-15 23:59:59 UTC);
-        let result = expected_expiry_time(mod_time, 1);
-        assert_eq!(result, datetime!(2025-06-17 00:00:00 UTC));
+        with_default_ilm_process_time(|| {
+            let mod_time = datetime!(2025-06-15 23:59:59 UTC);
+            let result = expected_expiry_time(mod_time, 1);
+            assert_eq!(result, datetime!(2025-06-17 00:00:00 UTC));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn expected_expiry_time_uses_canonical_process_time_boundary() {
+        let mod_time = datetime!(2025-01-15 10:30:45 UTC);
+
+        temp_env::with_var(ENV_ILM_PROCESS_TIME, Some("3600"), || {
+            temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, || {
+                let result = expected_expiry_time(mod_time, 1);
+                assert_eq!(result, datetime!(2025-01-16 11:00:00 UTC));
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn expected_expiry_time_uses_deprecated_process_time_alias() {
+        let mod_time = datetime!(2025-01-15 10:30:45 UTC);
+
+        temp_env::with_var_unset(ENV_ILM_PROCESS_TIME, || {
+            temp_env::with_var(ENV_ILM_PROCESS_TIME_DEPRECATED, Some("3600"), || {
+                let result = expected_expiry_time(mod_time, 1);
+                assert_eq!(result, datetime!(2025-01-16 11:00:00 UTC));
+            });
+        });
     }
 
     #[test]
