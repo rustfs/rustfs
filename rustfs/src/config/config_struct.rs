@@ -26,8 +26,8 @@ use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-const LEGACY_ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
-const LEGACY_ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
+pub(crate) const LEGACY_ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
+pub(crate) const LEGACY_ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
 static LEGACY_CREDENTIAL_WARNED_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn warn_legacy_credential_env_once(legacy_key: &str, canonical_key: &str) {

@@ -18,7 +18,7 @@
 //! that can be accessed globally without needing the full Config struct.
 
 use super::Config;
-use crate::config::config_struct::resolve_credential;
+use crate::config::config_struct::{LEGACY_ENV_RUSTFS_ROOT_USER, resolve_credential};
 use rustfs_config::{
     DEFAULT_ADDRESS, DEFAULT_BUFFER_PROFILE, DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_KMS_BACKEND,
     DEFAULT_KMS_ENABLE, DEFAULT_OBS_ENDPOINT, ENV_RUSTFS_ACCESS_KEY, ENV_RUSTFS_ACCESS_KEY_FILE, ENV_RUSTFS_ADDRESS,
@@ -84,7 +84,7 @@ impl ConfigSnapshot {
             get_env_opt_str(ENV_RUSTFS_ACCESS_KEY),
             get_env_opt_str(ENV_RUSTFS_ACCESS_KEY_FILE),
             ENV_RUSTFS_ACCESS_KEY,
-            &["RUSTFS_ROOT_USER"],
+            &[LEGACY_ENV_RUSTFS_ROOT_USER],
             DEFAULT_ACCESS_KEY,
         )
         .unwrap_or_else(|_| DEFAULT_ACCESS_KEY.to_string());
