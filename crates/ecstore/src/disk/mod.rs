@@ -559,6 +559,7 @@ pub struct CheckPartsResp {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct UpdateMetadataOpts {
     pub no_persistence: bool,
+    pub replace_user_metadata: bool,
 }
 
 pub struct DiskLocation {
@@ -914,9 +915,13 @@ mod tests {
     /// Test UpdateMetadataOpts structure
     #[test]
     fn test_update_metadata_opts() {
-        let opts = UpdateMetadataOpts { no_persistence: true };
+        let opts = UpdateMetadataOpts {
+            no_persistence: true,
+            ..Default::default()
+        };
 
         assert!(opts.no_persistence);
+        assert!(!opts.replace_user_metadata);
     }
 
     /// Test DiskOption structure
