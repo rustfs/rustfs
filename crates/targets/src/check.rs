@@ -223,3 +223,15 @@ pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs
         Err(_) => Err(crate::TargetError::Timeout("Kafka connection timed out".to_string())),
     }
 }
+
+pub async fn check_redis_server_available(args: &crate::target::redis::RedisArgs) -> Result<(), crate::TargetError> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let client = crate::target::redis::build_redis_client(args)?;
+        crate::target::redis::ping_redis_server(&client, args).await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::TargetError::Timeout("Redis connection timed out".to_string())),
+    }
+}

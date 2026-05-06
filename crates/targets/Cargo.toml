@@ -23,6 +23,7 @@ hyper-rustls = { workspace = true }
 pulsar = { workspace = true }
 reqwest = { workspace = true }
 rumqttc = { workspace = true }
+redis = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }

@@ -21,6 +21,7 @@ use crate::target::{
     nats::{NATSArgs, validate_nats_address},
     postgres::{PostgresArgs, parse_postgres_format, validate_pg_identifier},
     pulsar::{PulsarArgs, validate_pulsar_broker},
+    redis::{RedisArgs, RedisTlsConfig, validate_redis_url},
     webhook::WebhookArgs,
 };
 use rumqttc::QoS;
@@ -30,6 +31,14 @@ use rustfs_config::{
     MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY,
     MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, NATS_ADDRESS,
     NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
+    NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD,
+    PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION,
+    PULSAR_TOPIC, PULSAR_USERNAME, REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_KEEP_ALIVE_INTERVAL, REDIS_MAX_RETRY_ATTEMPTS,
+    REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PASSWORD, REDIS_PIPELINE_BUFFER_SIZE, REDIS_QUEUE_DIR, REDIS_QUEUE_LIMIT,
+    REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT,
+    REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY, REDIS_URL, REDIS_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT,
+    WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR,
+    WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
     NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, POSTGRES_DATABASE, POSTGRES_FORMAT, POSTGRES_HOST,
     POSTGRES_PASSWORD, POSTGRES_PORT, POSTGRES_QUEUE_DIR, POSTGRES_QUEUE_LIMIT, POSTGRES_SCHEMA, POSTGRES_TABLE, POSTGRES_TLS_CA,
     POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_TLS_REQUIRED, POSTGRES_USER, PULSAR_AUTH_TOKEN, PULSAR_BROKER,
@@ -290,6 +299,75 @@ pub fn validate_pulsar_config(config: &KVS, default_queue_dir: &str) -> Result<(
     validate_pulsar_broker_config(&broker, config, default_queue_dir)
 }
 
+
+pub fn build_redis_args(
+    config: &KVS,
+    default_queue_dir: &str,
+    default_channel: &str,
+    target_type: TargetType,
+) -> Result<RedisArgs, TargetError> {
+    let url = config
+        .lookup(REDIS_URL)
+        .ok_or_else(|| TargetError::Configuration("Missing Redis URL".to_string()))?;
+    let url = parse_url(&url, "Redis URL")?;
+
+    let channel = config.lookup(REDIS_CHANNEL).unwrap_or_else(|| default_channel.to_string());
+
+    Ok(RedisArgs {
+        enable: true,
+        url,
+        channel,
+        username: config.lookup(REDIS_USERNAME).filter(|value| !value.trim().is_empty()),
+        password: config.lookup(REDIS_PASSWORD).filter(|value| !value.trim().is_empty()),
+        tls: RedisTlsConfig::from_values(
+            config.lookup(REDIS_TLS_POLICY).as_deref(),
+            config.lookup(REDIS_TLS_CA).as_deref(),
+            config.lookup(REDIS_TLS_CLIENT_CERT).as_deref(),
+            config.lookup(REDIS_TLS_CLIENT_KEY).as_deref(),
+            config.lookup(REDIS_TLS_ALLOW_INSECURE).as_deref(),
+        )?,
+        keep_alive: config
+            .lookup(REDIS_KEEP_ALIVE_INTERVAL)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(15)),
+        queue_dir: config
+            .lookup(REDIS_QUEUE_DIR)
+            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_limit: config
+            .lookup(REDIS_QUEUE_LIMIT)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LIMIT),
+        max_retry_attempts: config
+            .lookup(REDIS_MAX_RETRY_ATTEMPTS)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3),
+        reconnect_retry_attempts: config
+            .lookup(REDIS_RECONNECT_RETRY_ATTEMPTS)
+            .and_then(|v| v.parse::<usize>().ok()),
+        min_retry_delay: config
+            .lookup(REDIS_MIN_RETRY_DELAY)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis),
+        max_retry_delay: config
+            .lookup(REDIS_MAX_RETRY_DELAY)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis),
+        connection_timeout: config
+            .lookup(REDIS_CONNECTION_TIMEOUT)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs),
+        response_timeout: config
+            .lookup(REDIS_RESPONSE_TIMEOUT)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs),
+        pipeline_buffer_size: config
+            .lookup(REDIS_PIPELINE_BUFFER_SIZE)
+            .and_then(|v| v.parse::<usize>().ok()),
+target_type,
+    })
+}
+
 pub fn build_postgres_args(config: &KVS, default_queue_dir: &str, target_type: TargetType) -> Result<PostgresArgs, TargetError> {
     let host = config
         .lookup(POSTGRES_HOST)
@@ -336,6 +414,17 @@ pub fn build_postgres_args(config: &KVS, default_queue_dir: &str, target_type: T
     })
 }
 
+
+pub fn validate_redis_config(config: &KVS, default_queue_dir: &str, default_channel: &str) -> Result<(), TargetError> {
+    let url = config
+        .lookup(REDIS_URL)
+        .ok_or_else(|| TargetError::Configuration("Missing Redis URL".to_string()))?;
+    let url = parse_url(&url, "Redis URL")?;
+    validate_redis_url(&url)?;
+
+    let args = build_redis_args(config, default_queue_dir, default_channel, TargetType::NotifyEvent)?;
+    args.validate()
+}
 pub fn validate_postgres_config(config: &KVS, default_queue_dir: &str) -> Result<(), TargetError> {
     if config.lookup(POSTGRES_HOST).is_none() {
         return Err(TargetError::Configuration("Missing PostgreSQL host".to_string()));
@@ -468,10 +557,12 @@ pub fn validate_kafka_config(config: &KVS, default_queue_dir: &str) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{build_kafka_args, build_postgres_args, validate_kafka_config, validate_postgres_config};
+    use super::{build_kafka_args, build_redis_args, validate_kafka_config, validate_redis_config,build_postgres_args, validate_postgres_config};
     use crate::target::{TargetType, postgres::PostgresFormat};
     use rustfs_config::{
-        KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, POSTGRES_DATABASE, POSTGRES_FORMAT, POSTGRES_HOST, POSTGRES_PORT,
+        KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY,
+        REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE, REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT,
+        REDIS_TLS_ALLOW_INSECURE, REDIS_URL,POSTGRES_DATABASE, POSTGRES_FORMAT, POSTGRES_HOST, POSTGRES_PORT,
         POSTGRES_QUEUE_DIR, POSTGRES_SCHEMA, POSTGRES_TABLE, POSTGRES_TLS_CLIENT_CERT, POSTGRES_USER,
     };
     use rustfs_ecstore::config::KVS;
@@ -510,6 +601,13 @@ mod tests {
         assert!(err.to_string().contains("Kafka acks must be one of"));
     }
 
+
+    fn redis_base_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/0".to_string());
+        config.insert(REDIS_CHANNEL.to_string(), "events".to_string());
+        config
+    }
     fn postgres_base_config() -> KVS {
         let mut config = KVS::new();
         config.insert(POSTGRES_HOST.to_string(), "localhost".to_string());
@@ -519,6 +617,70 @@ mod tests {
         config
     }
 
+    #[test]
+    fn build_redis_args_keeps_manager_tuning_fields_none_when_unset() {
+        let config = redis_base_config();
+
+        let args = build_redis_args(&config, "/tmp/queue", "default-channel", TargetType::NotifyEvent).expect("valid redis args");
+
+        assert_eq!(args.channel, "events");
+        assert_eq!(args.reconnect_retry_attempts, None);
+        assert_eq!(args.min_retry_delay, None);
+        assert_eq!(args.max_retry_delay, None);
+        assert_eq!(args.connection_timeout, None);
+        assert_eq!(args.response_timeout, None);
+        assert_eq!(args.pipeline_buffer_size, None);
+    }
+
+    #[test]
+    fn build_redis_args_uses_default_channel_when_missing() {
+        let mut config = KVS::new();
+        config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/0".to_string());
+
+        let args =
+            build_redis_args(&config, "/tmp/queue", "fallback-channel", TargetType::NotifyEvent).expect("valid redis args");
+
+        assert_eq!(args.channel, "fallback-channel");
+    }
+
+    #[test]
+    fn build_redis_args_parses_optional_tuning_values_when_present() {
+        let mut config = redis_base_config();
+        config.insert(REDIS_RECONNECT_RETRY_ATTEMPTS.to_string(), "9".to_string());
+        config.insert(REDIS_MIN_RETRY_DELAY.to_string(), "250".to_string());
+        config.insert(REDIS_MAX_RETRY_DELAY.to_string(), "5000".to_string());
+        config.insert(REDIS_CONNECTION_TIMEOUT.to_string(), "7".to_string());
+        config.insert(REDIS_RESPONSE_TIMEOUT.to_string(), "11".to_string());
+        config.insert(REDIS_PIPELINE_BUFFER_SIZE.to_string(), "64".to_string());
+
+        let args = build_redis_args(&config, "/tmp/queue", "default-channel", TargetType::NotifyEvent).expect("valid redis args");
+
+        assert_eq!(args.reconnect_retry_attempts, Some(9));
+        assert_eq!(args.min_retry_delay, Some(std::time::Duration::from_millis(250)));
+        assert_eq!(args.max_retry_delay, Some(std::time::Duration::from_millis(5000)));
+        assert_eq!(args.connection_timeout, Some(std::time::Duration::from_secs(7)));
+        assert_eq!(args.response_timeout, Some(std::time::Duration::from_secs(11)));
+        assert_eq!(args.pipeline_buffer_size, Some(64));
+    }
+
+    #[test]
+    fn build_redis_args_parses_tls_allow_insecure_when_present() {
+        let mut config = redis_base_config();
+        config.insert(REDIS_URL.to_string(), "rediss://127.0.0.1:6379/0".to_string());
+        config.insert(REDIS_TLS_ALLOW_INSECURE.to_string(), "on".to_string());
+
+        let args = build_redis_args(&config, "/tmp/queue", "default-channel", TargetType::NotifyEvent).expect("valid redis args");
+
+        assert!(args.tls.allow_insecure);
+    }
+
+    #[test]
+    fn validate_redis_config_rejects_missing_url() {
+        let config = KVS::new();
+
+        let err = validate_redis_config(&config, "/tmp/queue", "default-channel").expect_err("missing redis url should fail");
+        assert!(err.to_string().contains("Missing Redis URL"));
+    }
     #[test]
     fn build_postgres_args_uses_default_port_5432() {
         let config = postgres_base_config();

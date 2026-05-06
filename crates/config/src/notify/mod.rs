@@ -18,6 +18,7 @@ mod mqtt;
 mod nats;
 mod postgres;
 mod pulsar;
+mod redis;
 mod store;
 mod webhook;
 
@@ -27,6 +28,7 @@ pub use mqtt::*;
 pub use nats::*;
 pub use postgres::*;
 pub use pulsar::*;
+pub use redis::*;
 pub use store::*;
 pub use webhook::*;
 
@@ -78,6 +80,7 @@ pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[
     NOTIFY_NATS_SUB_SYS,
     NOTIFY_POSTGRES_SUB_SYS,
     NOTIFY_PULSAR_SUB_SYS,
+    NOTIFY_REDIS_SUB_SYS,
     NOTIFY_WEBHOOK_SUB_SYS,
 ];
 
@@ -96,5 +99,6 @@ pub const NOTIFY_AMQP_SUB_SYS: &str = "notify_amqp";
 pub const NOTIFY_POSTGRES_SUB_SYS: &str = "notify_postgres";
 #[allow(dead_code)]
 pub const NOTIFY_REDIS_SUB_SYS: &str = "notify_redis";
+pub const NOTIFY_REDIS_DEFAULT_CHANNEL: &str = "rustfs_notify_channel";
 pub const NOTIFY_PULSAR_SUB_SYS: &str = "notify_pulsar";
 pub const NOTIFY_WEBHOOK_SUB_SYS: &str = "notify_webhook";
