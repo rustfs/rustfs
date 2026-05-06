@@ -533,3 +533,4 @@ test_object_put_acl_mtime
 test_object_raw_authenticated_bucket_acl
 test_object_raw_authenticated_object_acl
 test_object_raw_get_object_acl
+test_object_copy_to_itself_with_metadata
