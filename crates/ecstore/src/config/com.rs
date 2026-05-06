@@ -20,14 +20,12 @@ use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::audit::{
     AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS,
-    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::notify::{
     NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
-    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS,
-    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
-    NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS,
-    NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS,
+    NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_KEYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
@@ -61,7 +59,7 @@ struct TargetConfigDescriptor {
     valid_keys: &'static [&'static str],
 }
 
-fn notify_target_descriptors() -> [TargetConfigDescriptor; 6] {
+fn notify_target_descriptors() -> [TargetConfigDescriptor; 8] {
     [
         TargetConfigDescriptor {
             external_key: "webhook",
@@ -100,6 +98,12 @@ fn notify_target_descriptors() -> [TargetConfigDescriptor; 6] {
             valid_keys: NOTIFY_POSTGRES_KEYS,
         },
         TargetConfigDescriptor {
+            external_key: "redis",
+            subsystem_key: NOTIFY_REDIS_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_REDIS_KVS,
+            valid_keys: NOTIFY_REDIS_KEYS,
+        },
+        TargetConfigDescriptor {
             external_key: "pulsar",
             subsystem_key: NOTIFY_PULSAR_SUB_SYS,
             default_kvs: &notify::DEFAULT_NOTIFY_PULSAR_KVS,
@@ -108,7 +112,7 @@ fn notify_target_descriptors() -> [TargetConfigDescriptor; 6] {
     ]
 }
 
-fn audit_target_descriptors() -> [TargetConfigDescriptor; 5] {
+fn audit_target_descriptors() -> [TargetConfigDescriptor; 6] {
     [
         TargetConfigDescriptor {
             external_key: "webhook",
@@ -139,6 +143,12 @@ fn audit_target_descriptors() -> [TargetConfigDescriptor; 5] {
             subsystem_key: AUDIT_PULSAR_SUB_SYS,
             default_kvs: &audit::DEFAULT_AUDIT_PULSAR_KVS,
             valid_keys: AUDIT_PULSAR_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "redis",
+            subsystem_key: AUDIT_REDIS_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_REDIS_KVS,
+            valid_keys: AUDIT_REDIS_KEYS,
         },
     ]
 }

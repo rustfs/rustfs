@@ -78,7 +78,7 @@ pub async fn check_mqtt_broker_available_with_tls(
         std::time::Duration::from_secs(5),
         None,
     )?;
-    let (client, mut eventloop) = AsyncClient::new(mqtt_options, 1);
+    let (client, mut eventloop) = AsyncClient::builder(mqtt_options).capacity(1).build();
 
     // Try to connect and subscribe
     client

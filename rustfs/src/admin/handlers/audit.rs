@@ -34,7 +34,8 @@ use matchit::Params;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::audit::{
     AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS,
-    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS,
+    AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
@@ -93,7 +94,7 @@ struct AuditEndpointsResponse {
     audit_endpoints: Vec<AuditEndpoint>,
 }
 
-fn audit_target_specs() -> [AdminTargetSpec; 5] {
+fn audit_target_specs() -> [AdminTargetSpec; 6] {
     [
         AdminTargetSpec {
             subsystem: AUDIT_WEBHOOK_SUB_SYS,
@@ -124,6 +125,12 @@ fn audit_target_specs() -> [AdminTargetSpec; 5] {
             service: "pulsar",
             valid_keys: AUDIT_PULSAR_KEYS,
             validator: AdminTargetValidator::Pulsar(TargetDomain::Audit),
+        },
+        AdminTargetSpec {
+            subsystem: AUDIT_REDIS_SUB_SYS,
+            service: "redis",
+            valid_keys: AUDIT_REDIS_KEYS,
+            validator: AdminTargetValidator::Redis(TargetDomain::Audit, AUDIT_REDIS_DEFAULT_CHANNEL),
         },
     ]
 }

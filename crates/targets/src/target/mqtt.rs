@@ -582,7 +582,7 @@ where
                     Some(MAX_MQTT_PACKET_SIZE_BYTES),
                 )?;
 
-                let (new_client, eventloop) = AsyncClient::new(mqtt_options, 10);
+                let (new_client, eventloop) = AsyncClient::builder(mqtt_options).capacity(10).build();
 
                 if let Err(e) = new_client.subscribe(&args_clone.topic, args_clone.qos).await {
                     error!(target_id = %target_id_clone, error = %e, "Failed to subscribe to MQTT topic during init");

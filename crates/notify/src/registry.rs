@@ -14,9 +14,8 @@
 
 use crate::Event;
 use crate::factory::{
-    KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory,
-    KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory, RedisTargetFactory, TargetFactory,
-    WebhookTargetFactory,
+    KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory,
+    RedisTargetFactory, TargetFactory, WebhookTargetFactory,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::HashMap;

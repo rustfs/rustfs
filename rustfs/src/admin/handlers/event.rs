@@ -34,10 +34,8 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::{
     NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
-    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS,
-    NOTIFY_WEBHOOK_SUB_SYS,
-    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
-    NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_ROUTE_PREFIX,
+    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS,
+    NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_REDIS_KEYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_ROUTE_PREFIX,
     NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
@@ -103,7 +101,7 @@ struct NotificationEndpointsResponse {
     notification_endpoints: Vec<NotificationEndpoint>,
 }
 
-fn notification_target_specs() -> [AdminTargetSpec; 6] {
+fn notification_target_specs() -> [AdminTargetSpec; 8] {
     [
         AdminTargetSpec {
             subsystem: NOTIFY_WEBHOOK_SUB_SYS,
@@ -140,6 +138,12 @@ fn notification_target_specs() -> [AdminTargetSpec; 6] {
             service: "postgres",
             valid_keys: NOTIFY_POSTGRES_KEYS,
             validator: AdminTargetValidator::Postgres(TargetDomain::Notify),
+        },
+        AdminTargetSpec {
+            subsystem: NOTIFY_REDIS_SUB_SYS,
+            service: "redis",
+            valid_keys: NOTIFY_REDIS_KEYS,
+            validator: AdminTargetValidator::Redis(TargetDomain::Notify, NOTIFY_REDIS_DEFAULT_CHANNEL),
         },
         AdminTargetSpec {
             subsystem: NOTIFY_PULSAR_SUB_SYS,
