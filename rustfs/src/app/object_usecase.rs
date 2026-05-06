@@ -31,7 +31,7 @@ use crate::storage::options::{
 };
 use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
-use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_to_metadata};
+use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_to_metadata, map_get_object_reader_error};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::*;
 use bytes::Bytes;
@@ -1301,7 +1301,7 @@ impl DefaultObjectUsecase {
         let reader = store
             .get_object_reader(bucket, key, rs.clone(), h, opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(map_get_object_reader_error)?;
 
         let info = reader.object_info;
 
@@ -2666,7 +2666,7 @@ impl DefaultObjectUsecase {
         let gr = store
             .get_object_reader(&src_bucket, &src_key, None, h, &src_get_opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(map_get_object_reader_error)?;
 
         let mut src_info = gr.object_info.clone();
 

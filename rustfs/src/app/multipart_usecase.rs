@@ -28,7 +28,7 @@ use crate::storage::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
     parse_list_multipart_uploads_params, parse_list_parts_params,
 };
-use crate::storage::sse::{build_ssec_read_headers, encryption_material_to_metadata};
+use crate::storage::sse::{build_ssec_read_headers, encryption_material_to_metadata, map_get_object_reader_error};
 use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -1006,7 +1006,7 @@ impl DefaultMultipartUsecase {
         let src_reader = store
             .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(map_get_object_reader_error)?;
 
         let src_info = src_reader.object_info;
 
@@ -1062,7 +1062,7 @@ impl DefaultMultipartUsecase {
         let src_reader = store
             .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(map_get_object_reader_error)?;
         let src_stream = src_reader.stream;
 
         let is_compressible = rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);

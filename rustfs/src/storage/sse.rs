@@ -522,6 +522,52 @@ pub(crate) fn validate_sse_headers_for_read(metadata: &HashMap<String, String>, 
     Ok(())
 }
 
+pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
+    if let Some(message) = map_ssec_get_object_reader_error_message(&err) {
+        return ApiError {
+            code: S3ErrorCode::InvalidRequest,
+            message,
+            source: Some(Box::new(err)),
+        };
+    }
+
+    ApiError::from(err)
+}
+
+fn map_ssec_get_object_reader_error_message(err: &StorageError) -> Option<String> {
+    let StorageError::Io(io_err) = err else {
+        return None;
+    };
+
+    let detail = io_err.to_string();
+    match detail.as_str() {
+        "missing SSE-C algorithm header"
+        | "invalid SSE-C algorithm header"
+        | "missing SSE-C key header"
+        | "invalid SSE-C key header"
+        | "missing SSE-C key md5 header"
+        | "invalid SSE-C key md5 header" => Some(
+            "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object."
+                .to_string(),
+        ),
+        "failed to decode SSE-C key" => Some("Invalid SSE-C key: not valid Base64.".to_string()),
+        "SSE-C key must be 32 bytes" => Some("SSE-C key must be exactly 32 bytes.".to_string()),
+        "SSE-C key MD5 mismatch" => {
+            Some("The calculated MD5 hash of the key did not match the hash that was provided.".to_string())
+        }
+        "missing stored SSE-C key md5" => Some("Object has no stored SSE-C key metadata.".to_string()),
+        "SSE-C key does not match object metadata" => Some(
+            "The provided encryption parameters did not match the ones used originally to encrypt the object.".to_string(),
+        ),
+        _ => detail.strip_prefix("unsupported SSE-C algorithm ").map(|algorithm| {
+            format!(
+                "Unsupported SSE-C algorithm: {}. Only {} is supported.",
+                algorithm, DEFAULT_SSE_ALGORITHM
+            )
+        }),
+    }
+}
+
 /// Request parameters for unified decryption
 #[derive(Debug)]
 pub struct DecryptionRequest<'a> {
@@ -2602,6 +2648,33 @@ mod tests {
         let metadata = HashMap::from([("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string())]);
         let err = validate_sse_headers_for_read(&metadata, &headers).unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn test_map_get_object_reader_error_converts_missing_ssec_headers_to_invalid_request() {
+        let err = map_get_object_reader_error(StorageError::other("missing SSE-C algorithm header"));
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.message,
+            "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object."
+        );
+    }
+
+    #[test]
+    fn test_map_get_object_reader_error_converts_ssec_md5_mismatch_to_invalid_request() {
+        let err = map_get_object_reader_error(StorageError::other("SSE-C key MD5 mismatch"));
+        assert_eq!(err.code, S3ErrorCode::InvalidRequest);
+        assert_eq!(
+            err.message,
+            "The calculated MD5 hash of the key did not match the hash that was provided."
+        );
+    }
+
+    #[test]
+    fn test_map_get_object_reader_error_leaves_non_ssec_errors_unchanged() {
+        let err = map_get_object_reader_error(StorageError::other("plain io failure"));
+        assert_eq!(err.code, S3ErrorCode::InternalError);
+        assert_eq!(err.message, "Io error: plain io failure");
     }
 
     #[test]

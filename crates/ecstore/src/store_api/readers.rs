@@ -629,6 +629,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use md5::{Digest, Md5};
     use std::io::Cursor;
+    use temp_env::async_with_vars;
     use tokio::io::AsyncReadExt;
 
     fn md5_bytes(data: impl AsRef<[u8]>) -> [u8; 16] {
@@ -984,45 +985,48 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_object_reader_allows_encrypted_full_object_passthrough() {
-        let plaintext = b"managed-full-object".to_vec();
-        let data_key = [0x21; 32];
-        let base_nonce = [0x11; 12];
-        let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
+            let plaintext = b"managed-full-object".to_vec();
+            let data_key = [0x21; 32];
+            let base_nonce = [0x11; 12];
+            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
 
-        let mut encrypted = Vec::new();
-        rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
-            .read_to_end(&mut encrypted)
+            let mut encrypted = Vec::new();
+            rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("encrypt managed object");
+
+            let object_info = ObjectInfo {
+                size: encrypted.len() as i64,
+                user_defined: HashMap::from([
+                    ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
+                    ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
+                    ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
+                    ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
+                ]),
+                ..Default::default()
+            };
+
+            let (mut reader, offset, length) = GetObjectReader::new(
+                Box::new(Cursor::new(encrypted.clone())),
+                None,
+                &object_info,
+                &ObjectOptions::default(),
+                &HeaderMap::new(),
+            )
             .await
-            .expect("encrypt managed object");
+            .expect("managed encrypted full-object reads should decrypt inside ecstore");
 
-        let object_info = ObjectInfo {
-            size: encrypted.len() as i64,
-            user_defined: HashMap::from([
-                ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
-                ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
-                ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
-                ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-            ]),
-            ..Default::default()
-        };
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("read managed plaintext");
 
-        let (mut reader, offset, length) = GetObjectReader::new(
-            Box::new(Cursor::new(encrypted.clone())),
-            None,
-            &object_info,
-            &ObjectOptions::default(),
-            &HeaderMap::new(),
-        )
-        .await
-        .expect("managed encrypted full-object reads should decrypt inside ecstore");
-
-        let mut actual = Vec::new();
-        reader.read_to_end(&mut actual).await.expect("read managed plaintext");
-
-        assert_eq!(offset, 0);
-        assert_eq!(length, object_info.size);
-        assert_eq!(reader.object_info.size, plaintext.len() as i64);
-        assert_eq!(actual, plaintext);
+            assert_eq!(offset, 0);
+            assert_eq!(length, object_info.size);
+            assert_eq!(reader.object_info.size, plaintext.len() as i64);
+            assert_eq!(actual, plaintext);
+        })
+        .await;
     }
 
     #[tokio::test]
