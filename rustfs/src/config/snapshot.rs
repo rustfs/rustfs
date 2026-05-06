@@ -84,6 +84,7 @@ impl ConfigSnapshot {
             get_env_opt_str(ENV_RUSTFS_ACCESS_KEY),
             get_env_opt_str(ENV_RUSTFS_ACCESS_KEY_FILE),
             ENV_RUSTFS_ACCESS_KEY,
+            &["RUSTFS_ROOT_USER"],
             DEFAULT_ACCESS_KEY,
         )
         .unwrap_or_else(|_| DEFAULT_ACCESS_KEY.to_string());

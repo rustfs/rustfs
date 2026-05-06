@@ -24,21 +24,32 @@ use rustfs_config::{
 };
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 
+const LEGACY_ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
+const LEGACY_ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
+
 /// Helper function to resolve credentials from multiple sources with precedence:
 /// 1. Inline value (if provided)
 /// 2. File value (if provided, read the content of the file)
-/// 3. Environment variable (if set)
-/// 4. Default value (if none of the above are provided)
+/// 3. Canonical environment variable (if set)
+/// 4. Legacy environment aliases (if set)
+/// 5. Default value (if none of the above are provided)
 pub(crate) fn resolve_credential<T: AsRef<std::path::Path>>(
     inline_value: Option<String>,
     file_value: Option<T>,
     env_key: &str,
+    legacy_env_keys: &[&str],
     default_value: &str,
 ) -> std::io::Result<String> {
     let value = inline_value
         .map(Ok)
         .or_else(|| file_value.map(std::fs::read_to_string))
         .or_else(|| rustfs_utils::get_env_opt_str(env_key).map(Ok))
+        .or_else(|| {
+            legacy_env_keys
+                .iter()
+                .find_map(|key| rustfs_utils::get_env_opt_str(key))
+                .map(Ok)
+        })
         .transpose()?
         .unwrap_or_else(|| default_value.to_string());
 
@@ -169,8 +180,20 @@ impl Config {
             buffer_profile,
         } = opt;
 
-        let access_key = resolve_credential(access_key, access_key_file.as_ref(), ENV_RUSTFS_ACCESS_KEY, DEFAULT_ACCESS_KEY)?;
-        let secret_key = resolve_credential(secret_key, secret_key_file.as_ref(), ENV_RUSTFS_SECRET_KEY, DEFAULT_SECRET_KEY)?;
+        let access_key = resolve_credential(
+            access_key,
+            access_key_file.as_ref(),
+            ENV_RUSTFS_ACCESS_KEY,
+            &[LEGACY_ENV_RUSTFS_ROOT_USER],
+            DEFAULT_ACCESS_KEY,
+        )?;
+        let secret_key = resolve_credential(
+            secret_key,
+            secret_key_file.as_ref(),
+            ENV_RUSTFS_SECRET_KEY,
+            &[LEGACY_ENV_RUSTFS_ROOT_PASSWORD],
+            DEFAULT_SECRET_KEY,
+        )?;
 
         // Region is optional, but if not set, we should default to "us-east-1" for signing compatibility with AWS S3 clients
         let region = region.or_else(|| Some(RUSTFS_REGION.to_string()));

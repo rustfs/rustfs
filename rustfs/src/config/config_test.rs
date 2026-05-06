@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_root_envs_are_used_for_bootstrap_credentials() {
+    fn test_access_key_envs_are_used_for_bootstrap_credentials() {
         temp_env::with_vars(
             [
                 ("RUSTFS_VOLUMES", Some("/compat/vol1")),
@@ -191,12 +191,33 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_access_key_env_is_used_for_bootstrap_credentials() {
+    fn test_root_envs_fallback_for_bootstrap_credentials() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_VOLUMES", Some("/compat/vol1")),
+                ("RUSTFS_ROOT_USER", Some("root-user")),
+                ("RUSTFS_ROOT_PASSWORD", Some("root-password")),
+                ("RUSTFS_ACCESS_KEY", None),
+                ("RUSTFS_SECRET_KEY", None),
+            ],
+            || {
+                let config = Config::from_opt(Opt::parse_from(["rustfs"])).expect("config should parse");
+                assert_eq!(config.access_key, "root-user");
+                assert_eq!(config.secret_key, "root-password");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_access_key_env_takes_precedence_over_root_aliases() {
         temp_env::with_vars(
             [
                 ("RUSTFS_VOLUMES", Some("/compat/vol1")),
                 ("RUSTFS_ACCESS_KEY", Some("canonical-access")),
                 ("RUSTFS_SECRET_KEY", Some("canonical-secret")),
+                ("RUSTFS_ROOT_USER", Some("root-user")),
+                ("RUSTFS_ROOT_PASSWORD", Some("root-password")),
             ],
             || {
                 let config = Config::from_opt(Opt::parse_from(["rustfs"])).expect("config should parse");
