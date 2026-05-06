@@ -3003,6 +3003,19 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
+            if bypass_governance {
+                let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
+                if let Err(e) = auth_res {
+                    delete_results[idx].error = Some(Error {
+                        code: Some("AccessDenied".to_string()),
+                        key: Some(obj_id.key.clone()),
+                        message: Some(e.to_string()),
+                        version_id: version_id.clone(),
+                    });
+                    continue;
+                }
+            }
+
             let mut object = ObjectToDelete {
                 object_name: obj_id.key.clone(),
                 version_id: version_uuid,
@@ -4607,6 +4620,49 @@ mod tests {
             true,
             configured_threshold
         ));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_respects_configured_threshold_below_cap() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold + 1,
+            None,
+            false,
+            configured_threshold
+        ));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_rejects_unknown_lengths_and_disabled_thresholds() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            0,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            -1,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0));
     }
 
     struct ReadProbeReader {
