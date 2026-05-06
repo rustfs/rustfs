@@ -91,8 +91,9 @@ With those values in place, the current 4-node local Docker cluster reaches heal
 
 In other words:
 
+- `RUSTFS_ACCESS_KEY` may still be `rustfsadmin` for local service credentials if desired
 - `RUSTFS_SECRET_KEY` can still be used for service credentials
-- but RPC authentication must not resolve to the default secret `rustfsadmin`
+- but RPC authentication must not resolve to the default secret value `rustfsadmin`
 - if `RUSTFS_RPC_SECRET` is unset, the code falls back to `RUSTFS_SECRET_KEY`
 - so at least one of them must provide a non-default shared secret for internode RPC signing
 

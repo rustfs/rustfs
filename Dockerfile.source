@@ -137,7 +137,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     case "${TARGETARCH:-$(uname -m)}" in \
     amd64|x86_64) target_platform="linux/amd64" ;; \
     arm64|aarch64) target_platform="linux/arm64" ;; \
-    *) target_platform="linux/amd64" ;; \
+    *) echo "Unsupported target architecture: ${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
     esac; \
     fi; \
     case "${target_platform}" in \

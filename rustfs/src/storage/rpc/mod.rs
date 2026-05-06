@@ -119,6 +119,11 @@ mod tests {
         };
 
         let buf = encode_msgpack_map(&value).unwrap();
+        let marker = buf[0];
+        assert!(
+            (0x80..=0x8f).contains(&marker) || marker == 0xde || marker == 0xdf,
+            "StorageInfo map-encoded payload must start with a map marker, got 0x{marker:02x}"
+        );
         let decoded: StorageInfo = Deserialize::deserialize(&mut Deserializer::new(Cursor::new(&buf))).unwrap();
 
         assert_eq!(decoded.disks.len(), 1);
