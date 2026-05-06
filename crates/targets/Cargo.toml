@@ -20,6 +20,7 @@ async-trait = { workspace = true }
 async-nats = { workspace = true }
 deadpool-postgres = { workspace = true }
 hyper-rustls = { workspace = true }
+lapin = { workspace = true }
 pulsar = { workspace = true }
 reqwest = { workspace = true }
 rumqttc = { workspace = true }
