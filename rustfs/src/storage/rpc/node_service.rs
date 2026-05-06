@@ -16,7 +16,7 @@ use crate::admin::service::site_replication::reload_site_replication_runtime_sta
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
-use rmp_serde::{Deserializer, Serializer};
+use rmp_serde::Deserializer;
 use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
 use rustfs_ecstore::{
     admin_server_info::get_local_server_property,
@@ -43,7 +43,7 @@ use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{io::Cursor, pin::Pin, sync::Arc};
 use tokio::spawn;
 use tokio::sync::mpsc;
@@ -1980,6 +1980,156 @@ mod tests {
         let proc_response = response.unwrap().into_inner();
         assert!(proc_response.success);
         assert!(!proc_response.proc_info.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_proc_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_proc_info(Request::new(GetProcInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.proc_info));
+        let _: rustfs_madmin::health::ProcInfo = serde::Deserialize::deserialize(&mut de).expect("ProcInfo round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_mem_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_mem_info(Request::new(GetMemInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.mem_info));
+        let _: rustfs_madmin::health::MemInfo = serde::Deserialize::deserialize(&mut de).expect("MemInfo round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_sys_errors_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_sys_errors(Request::new(GetSysErrorsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.sys_errors));
+        let _: rustfs_madmin::health::SysErrors = serde::Deserialize::deserialize(&mut de).expect("SysErrors round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_sys_config_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_sys_config(Request::new(GetSysConfigRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.sys_config));
+        let _: rustfs_madmin::health::SysConfig = serde::Deserialize::deserialize(&mut de).expect("SysConfig round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_se_linux_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_se_linux_info(Request::new(GetSeLinuxInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.sys_services));
+        let _: rustfs_madmin::health::SysServices =
+            serde::Deserialize::deserialize(&mut de).expect("SysServices round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_os_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_os_info(Request::new(GetOsInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.os_info));
+        let _: rustfs_madmin::health::OsInfo = serde::Deserialize::deserialize(&mut de).expect("OsInfo round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_partitions_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_partitions(Request::new(GetPartitionsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.partitions));
+        let _: rustfs_madmin::health::Partitions =
+            serde::Deserialize::deserialize(&mut de).expect("Partitions round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_net_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_net_info(Request::new(GetNetInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.net_info));
+        let _: rustfs_madmin::net::NetInfo = serde::Deserialize::deserialize(&mut de).expect("NetInfo round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_cpus_round_trip() {
+        let service = create_test_node_service();
+        let response = service.get_cpus(Request::new(GetCpusRequest {})).await.unwrap().into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.cpus));
+        let _: rustfs_madmin::health::Cpus = serde::Deserialize::deserialize(&mut de).expect("Cpus round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_server_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .server_info(Request::new(ServerInfoRequest { metrics: false }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.server_properties));
+        let _: rustfs_madmin::ServerProperties =
+            serde::Deserialize::deserialize(&mut de).expect("ServerProperties round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_round_trip() {
+        let service = create_test_node_service();
+        let metric_type = MetricType::DISK;
+        let opts = CollectMetricsOpts::default();
+        let metric_type_bytes = rmp_serde::to_vec(&metric_type).unwrap();
+        let opts_bytes = rmp_serde::to_vec(&opts).unwrap();
+        let response = service
+            .get_metrics(Request::new(GetMetricsRequest {
+                metric_type: Bytes::from(metric_type_bytes),
+                opts: Bytes::from(opts_bytes),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.realtime_metrics));
+        let _: rustfs_madmin::metrics::RealtimeMetrics =
+            serde::Deserialize::deserialize(&mut de).expect("RealtimeMetrics round-trip failed");
     }
 
     #[tokio::test]
