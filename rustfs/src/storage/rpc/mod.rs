@@ -36,7 +36,7 @@ pub(crate) fn encode_msgpack_map<T: Serialize>(value: &T) -> Result<Vec<u8>, rmp
 mod tests {
     use super::*;
     use rmp_serde::Deserializer;
-    use rustfs_madmin::{BackendDisks, BackendInfo, Disk, StorageInfo, ITEM_ONLINE};
+    use rustfs_madmin::{BackendDisks, BackendInfo, Disk, ITEM_ONLINE, StorageInfo};
     use serde::Deserialize;
     use std::collections::HashMap;
     use std::io::Cursor;
