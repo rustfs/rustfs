@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use time::OffsetDateTime;
-use tracing::warn;
+use tracing::debug;
 
 const ACCESS_KEY_MIN_LEN: usize = 3;
 const ACCESS_KEY_MAX_LEN: usize = 128;
@@ -144,7 +144,7 @@ pub fn create_new_credentials_with_metadata(
         }
     };
 
-    warn!("create_new_credentials_with_metadata expiration {expiration:?}, access_key: {ak}");
+    debug!("create_new_credentials_with_metadata expiration {expiration:?}");
 
     let token = utils::generate_jwt(&claims, token_secret)?;
 
