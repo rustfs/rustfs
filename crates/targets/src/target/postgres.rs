@@ -26,13 +26,13 @@
 //! is `Clone`, so no `Mutex` is required around it.
 
 use crate::{
-    StoreError, Target, TargetLog,
+    StoreError, Target,
     arn::TargetID,
     error::TargetError,
     store::{Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType,
+        TargetType, build_queued_payload,
     },
 };
 use async_trait::async_trait;
@@ -498,25 +498,6 @@ where
         }
     }
 
-    fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
-        let object_name = crate::target::decode_object_name(&event.object_name)?;
-        let key = format!("{}/{}", event.bucket_name, object_name);
-        let log = TargetLog {
-            event_name: event.event_name,
-            key,
-            records: vec![event.data.clone()],
-        };
-        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
-        let meta = QueuedPayloadMeta::new(
-            event.event_name,
-            event.bucket_name.clone(),
-            event.object_name.clone(),
-            "application/json",
-            body.len(),
-        );
-        Ok(QueuedPayload::new(meta, body))
-    }
-
     /// Probes the table from `init()`. Failure is non-fatal when a queue is
     /// configured: events buffer in the store until the schema is fixed.
     async fn probe_table(&self) -> Result<(), TargetError> {
@@ -544,20 +525,32 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed"))?;
-        client
-            .execute("SELECT 1", &[])
-            .await
-            .map_err(|e| map_pg_error(&e, "PostgreSQL liveness probe failed"))?;
-        Ok(true)
+        if !self.is_enabled() {
+            return Ok(false);
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let client = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed"))?;
+            client
+                .execute("SELECT 1", &[])
+                .await
+                .map_err(|e| map_pg_error(&e, "PostgreSQL liveness probe failed"))?;
+            Ok::<(), TargetError>(())
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(TargetError::Timeout("PostgreSQL liveness probe timed out after 10s".to_string())),
+        }
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-        let queued = match self.build_queued_payload(&event) {
+        let queued = match build_queued_payload(event.as_ref()) {
             Ok(queued) => queued,
             Err(err) => {
                 self.delivery_counters.record_final_failure();
@@ -681,6 +674,20 @@ mod tests {
     #[test]
     fn validate_accepts_base_args() {
         assert!(base_args().validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn is_active_returns_false_when_disabled() {
+        let target = PostgresTarget::<String>::new(
+            "postgres:test".to_string(),
+            PostgresArgs {
+                enable: false,
+                ..base_args()
+            },
+        )
+        .expect("disabled target should still construct");
+
+        assert!(!target.is_active().await.expect("disabled target should not probe"));
     }
 
     #[test]

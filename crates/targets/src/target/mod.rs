@@ -14,7 +14,7 @@
 
 use crate::arn::TargetID;
 use crate::store::{Key, Store};
-use crate::{StoreError, TargetError};
+use crate::{StoreError, TargetError, TargetLog};
 use async_trait::async_trait;
 use rustfs_s3_common::EventName;
 use serde::de::DeserializeOwned;
@@ -389,6 +389,31 @@ pub fn decode_object_name(encoded: &str) -> Result<String, TargetError> {
         .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))
 }
 
+pub(crate) fn build_queued_payload<E>(event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    let object_name = decode_object_name(&event.object_name)?;
+    let key = format!("{}/{}", event.bucket_name, object_name);
+
+    let log = TargetLog {
+        event_name: event.event_name,
+        key,
+        records: vec![event.data.clone()],
+    };
+
+    let body = serde_json::to_vec(&log).map_err(|err| TargetError::Serialization(format!("Failed to serialize event: {err}")))?;
+    let meta = QueuedPayloadMeta::new(
+        event.event_name,
+        event.bucket_name.clone(),
+        event.object_name.clone(),
+        "application/json",
+        body.len(),
+    );
+
+    Ok(QueuedPayload::new(meta, body))
+}
+
 pub(crate) fn delete_stored_payload(
     store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync),
     key: &Key,
@@ -422,6 +447,22 @@ mod tests {
         assert_eq!(decoded.meta.object_name, meta.object_name);
         assert_eq!(decoded.meta.content_type, meta.content_type);
         assert_eq!(decoded.body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn build_queued_payload_uses_event_data_shape() {
+        let event = EntityTarget {
+            object_name: "greeting+file+%282%29.csv".to_string(),
+            bucket_name: "bucket-a".to_string(),
+            event_name: EventName::ObjectCreatedPut,
+            data: "payload-data".to_string(),
+        };
+
+        let payload = build_queued_payload(&event).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&payload.body).unwrap();
+
+        assert_eq!(value["Key"], "bucket-a/greeting file (2).csv");
+        assert_eq!(value["Records"][0], "payload-data");
     }
 
     #[test]

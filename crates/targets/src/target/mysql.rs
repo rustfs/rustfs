@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crate::{
-    StoreError, Target, TargetLog,
+    StoreError, Target,
     arn::TargetID,
     error::TargetError,
     store::{Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, delete_stored_payload,
+        TargetType, build_queued_payload, delete_stored_payload,
     },
 };
 use async_trait::async_trait;
@@ -587,31 +587,6 @@ where
         Ok(pool)
     }
 
-    /// Serializes an event into a `QueuedPayload` using `TargetLog` for
-    /// the JSON body with `EventName`, `Key`, and `Records`.
-    fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
-        let object_name = crate::target::decode_object_name(&event.object_name)?;
-        let key = format!("{}/{}", event.bucket_name, object_name);
-
-        let log = TargetLog {
-            event_name: event.event_name,
-            key,
-            records: vec![event.data.clone()],
-        };
-
-        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
-
-        let meta = QueuedPayloadMeta::new(
-            event.event_name,
-            event.bucket_name.clone(),
-            event.object_name.clone(),
-            "application/json",
-            body.len(),
-        );
-
-        Ok(QueuedPayload::new(meta, body))
-    }
-
     /// Inserts an event directly into the MySQL table.
     async fn insert_event(&self, body: &[u8], meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
         debug!(
@@ -713,7 +688,7 @@ where
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-        let queued = match self.build_queued_payload(&event) {
+        let queued = match build_queued_payload(event.as_ref()) {
             Ok(queued) => queued,
             Err(err) => {
                 self.delivery_counters.record_final_failure();
@@ -795,8 +770,17 @@ where
     }
 
     async fn close(&self) -> Result<(), TargetError> {
-        let mut guard = self.pool.lock().await;
-        *guard = None;
+        let pool = {
+            let mut guard = self.pool.lock().await;
+            guard.take()
+        };
+
+        if let Some(pool) = pool {
+            pool.disconnect()
+                .await
+                .map_err(|err| TargetError::Network(format!("Failed to disconnect MySQL pool: {err}")))?;
+        }
+
         info!("MySQL target closed: {}", self.id);
         Ok(())
     }
@@ -996,21 +980,6 @@ mod tests {
 
     #[test]
     fn queued_payload_round_trip_preserves_event_data() {
-        let target: MySqlTarget<serde_json::Value> = MySqlTarget::new(
-            "test".to_string(),
-            MySqlArgs {
-                enable: false,
-                dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
-                table: "events".to_string(),
-                format: "access".to_string(),
-                queue_dir: String::new(),
-                queue_limit: 0,
-                max_open_connections: 2,
-                target_type: TargetType::NotifyEvent,
-            },
-        )
-        .expect("valid args");
-
         let entity = EntityTarget {
             object_name: "bucket%2Fobj.txt".to_string(),
             bucket_name: "testbucket".to_string(),
@@ -1018,7 +987,7 @@ mod tests {
             data: serde_json::json!({"eventTime": "2026-05-03T10:00:00Z"}),
         };
 
-        let payload = target.build_queued_payload(&entity).expect("build payload");
+        let payload = build_queued_payload(&entity).expect("build payload");
         let encoded = payload.encode().expect("encode");
         let decoded = QueuedPayload::decode(&encoded).expect("decode");
 

@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crate::{
-    StoreError, Target, TargetLog,
+    StoreError, Target,
     arn::TargetID,
     error::TargetError,
     store::{Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType,
+        TargetType, build_queued_payload,
     },
 };
 use async_trait::async_trait;
@@ -357,25 +357,6 @@ where
         })
     }
 
-    fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
-        let object_name = crate::target::decode_object_name(&event.object_name)?;
-        let key = format!("{}/{}", event.bucket_name, object_name);
-        let log = TargetLog {
-            event_name: event.event_name,
-            key,
-            records: vec![event.clone()],
-        };
-        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
-        let meta = QueuedPayloadMeta::new(
-            event.event_name,
-            event.bucket_name.clone(),
-            event.object_name.clone(),
-            "application/json",
-            body.len(),
-        );
-        Ok(QueuedPayload::new(meta, body))
-    }
-
     async fn get_or_create_publisher(&self) -> Result<ConnectionManager, TargetError> {
         let mut guard = self.publisher.lock().await;
         if let Some(manager) = guard.clone() {
@@ -514,7 +495,7 @@ where
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-        let queued = match self.build_queued_payload(&event) {
+        let queued = match build_queued_payload(event.as_ref()) {
             Ok(queued) => queued,
             Err(err) => {
                 self.delivery_counters.record_final_failure();
@@ -700,10 +681,7 @@ pub(crate) async fn ping_redis_server(client: &Client, args: &RedisArgs) -> Resu
         .await
         .map_err(map_redis_error)?;
 
-    cmd("PING")
-        .query_async::<String>(&mut conn)
-        .await
-        .map_err(map_redis_error)?;
+    cmd("PING").query_async::<String>(&mut conn).await.map_err(map_redis_error)?;
 
     Ok(())
 }
@@ -963,6 +941,21 @@ mod tests {
         assert_eq!(compute_retry_delay(1, min, max), min);
         assert!(compute_retry_delay(5, min, max) <= max);
         assert_eq!(compute_retry_delay(50, min, max), max);
+    }
+
+    #[test]
+    fn queued_payload_uses_event_data_in_records() {
+        let payload = build_queued_payload(&EntityTarget {
+            object_name: "greeting+file+%282%29.csv".to_string(),
+            bucket_name: "bucket".to_string(),
+            event_name: rustfs_s3_common::EventName::ObjectCreatedPut,
+            data: "payload-data".to_string(),
+        })
+        .expect("payload should build");
+
+        let value: serde_json::Value = serde_json::from_slice(&payload.body).expect("payload JSON");
+        assert_eq!(value["Key"], "bucket/greeting file (2).csv");
+        assert_eq!(value["Records"][0], "payload-data");
     }
 
     fn parse_resp_array(input: &[u8]) -> Option<(Vec<String>, usize)> {
