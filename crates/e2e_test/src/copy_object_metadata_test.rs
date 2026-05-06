@@ -49,6 +49,7 @@ mod tests {
             .key(key)
             .content_type("text/javascript; charset=utf-8")
             .metadata("mtime", "1777992333")
+            .metadata("stale", "must-be-removed")
             .body(ByteStream::from_static(content))
             .send()
             .await
@@ -79,6 +80,11 @@ mod tests {
             Some(&"1777992348".to_string()),
             "HEAD should return replaced metadata"
         );
+        assert_eq!(
+            head_resp.metadata().and_then(|metadata| metadata.get("stale")),
+            None,
+            "HEAD should not return metadata omitted by REPLACE"
+        );
 
         let get_resp = client
             .get_object()
@@ -94,6 +100,44 @@ mod tests {
             .expect("Failed to collect GET body")
             .into_bytes();
         assert_eq!(body.as_ref(), content, "self-copy metadata replacement must not drop object data");
+
+        client
+            .copy_object()
+            .bucket(bucket)
+            .key(key)
+            .copy_source(format!("{bucket}/{key}"))
+            .metadata_directive(MetadataDirective::Replace)
+            .send()
+            .await
+            .expect("self CopyObject with empty metadata replacement failed");
+
+        let empty_head_resp = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("HEAD failed after empty metadata replacement");
+        assert_eq!(
+            empty_head_resp.metadata().and_then(|metadata| metadata.get("mtime")),
+            None,
+            "HEAD should not return metadata omitted by empty REPLACE"
+        );
+
+        let empty_get_resp = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("GET failed after empty metadata replacement");
+        let empty_body = empty_get_resp
+            .body
+            .collect()
+            .await
+            .expect("Failed to collect GET body after empty metadata replacement")
+            .into_bytes();
+        assert_eq!(empty_body.as_ref(), content, "empty metadata replacement must not drop object data");
 
         env.stop_server();
     }

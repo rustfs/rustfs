@@ -1484,9 +1484,18 @@ impl ObjectOperations for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
         } else {
-            self.update_object_meta(src_bucket, src_object, fi.clone(), &online_disks)
-                .await
-                .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
+            self.update_object_meta_with_opts(
+                src_bucket,
+                src_object,
+                fi.clone(),
+                &online_disks,
+                &UpdateMetadataOpts {
+                    replace_user_metadata: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
         }
 
         Ok(ObjectInfo::from_file_info(
