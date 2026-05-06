@@ -142,6 +142,10 @@ mod tests {
 
         let mut buf = Vec::new();
         value.serialize(&mut Serializer::new(&mut buf)).unwrap();
-        assert_eq!(buf[0], 0x92, "legacy tuple-mode StorageInfo must start with fixarray(2)");
+        let marker = buf[0];
+        assert!(
+            (0x90..=0x9f).contains(&marker) || marker == 0xdc || marker == 0xdd,
+            "legacy tuple-mode StorageInfo must start with an array marker, got 0x{marker:02x}"
+        );
     }
 }

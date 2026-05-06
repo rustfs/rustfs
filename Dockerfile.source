@@ -137,8 +137,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     case "${TARGETARCH:-$(uname -m)}" in \
     amd64|x86_64) target_platform="linux/amd64" ;; \
     arm64|aarch64) target_platform="linux/arm64" ;; \
-    x86_64) target_platform="linux/amd64" ;; \
-    aarch64|arm64) target_platform="linux/arm64" ;; \
     *) target_platform="linux/amd64" ;; \
     esac; \
     fi; \
