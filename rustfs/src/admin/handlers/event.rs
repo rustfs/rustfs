@@ -36,6 +36,9 @@ use rustfs_config::notify::{
     NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
     NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS,
     NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
+    NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_ROUTE_PREFIX,
+    NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
@@ -131,6 +134,12 @@ fn notification_target_specs() -> [AdminTargetSpec; 6] {
             service: "nats",
             valid_keys: NOTIFY_NATS_KEYS,
             validator: AdminTargetValidator::Nats(TargetDomain::Notify),
+        },
+        AdminTargetSpec {
+            subsystem: NOTIFY_POSTGRES_SUB_SYS,
+            service: "postgres",
+            valid_keys: NOTIFY_POSTGRES_KEYS,
+            validator: AdminTargetValidator::Postgres(TargetDomain::Notify),
         },
         AdminTargetSpec {
             subsystem: NOTIFY_PULSAR_SUB_SYS,

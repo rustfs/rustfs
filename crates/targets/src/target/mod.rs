@@ -29,7 +29,9 @@ pub mod kafka;
 pub mod mqtt;
 pub mod mysql;
 pub mod nats;
+pub mod postgres;
 pub mod pulsar;
+pub mod redis;
 pub mod webhook;
 
 /// A read-only snapshot of delivery counters for a target.
@@ -292,7 +294,9 @@ pub enum ChannelTargetType {
     Mqtt,
     MySql,
     Nats,
+    Postgres,
     Pulsar,
+    Redis,
 }
 
 impl ChannelTargetType {
@@ -303,7 +307,9 @@ impl ChannelTargetType {
             ChannelTargetType::Mqtt => "mqtt",
             ChannelTargetType::MySql => "mysql",
             ChannelTargetType::Nats => "nats",
+            ChannelTargetType::Postgres => "postgres",
             ChannelTargetType::Pulsar => "pulsar",
+            ChannelTargetType::Redis => "redis",
         }
     }
 }
@@ -316,7 +322,9 @@ impl std::fmt::Display for ChannelTargetType {
             ChannelTargetType::Mqtt => write!(f, "mqtt"),
             ChannelTargetType::MySql => write!(f, "mysql"),
             ChannelTargetType::Nats => write!(f, "nats"),
+            ChannelTargetType::Postgres => write!(f, "postgres"),
             ChannelTargetType::Pulsar => write!(f, "pulsar"),
+            ChannelTargetType::Redis => write!(f, "redis"),
         }
     }
 }

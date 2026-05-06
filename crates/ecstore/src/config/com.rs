@@ -25,6 +25,8 @@ use rustfs_config::audit::{
 use rustfs_config::notify::{
     NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
     NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS,
+    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
+    NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS,
     NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
@@ -90,6 +92,12 @@ fn notify_target_descriptors() -> [TargetConfigDescriptor; 6] {
             subsystem_key: NOTIFY_NATS_SUB_SYS,
             default_kvs: &notify::DEFAULT_NOTIFY_NATS_KVS,
             valid_keys: NOTIFY_NATS_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "postgres",
+            subsystem_key: NOTIFY_POSTGRES_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_POSTGRES_KVS,
+            valid_keys: NOTIFY_POSTGRES_KEYS,
         },
         TargetConfigDescriptor {
             external_key: "pulsar",

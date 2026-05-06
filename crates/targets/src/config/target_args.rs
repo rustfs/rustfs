@@ -20,7 +20,9 @@ use crate::target::{
     mqtt::{MQTTArgs, MQTTTlsConfig, validate_mqtt_broker_url},
     mysql::MySqlArgs,
     nats::{NATSArgs, validate_nats_address},
+    postgres::{PostgresArgs, parse_postgres_format, validate_pg_identifier},
     pulsar::{PulsarArgs, validate_pulsar_broker},
+    redis::{RedisArgs, RedisTlsConfig, validate_redis_url},
     webhook::WebhookArgs,
 };
 use rumqttc::QoS;
@@ -33,8 +35,19 @@ use rustfs_config::{
     NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
     NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD,
     PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION,
-    PULSAR_TOPIC, PULSAR_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA,
-    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
+    PULSAR_TOPIC, PULSAR_USERNAME, REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_KEEP_ALIVE_INTERVAL, REDIS_MAX_RETRY_ATTEMPTS,
+    REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PASSWORD, REDIS_PIPELINE_BUFFER_SIZE, REDIS_QUEUE_DIR, REDIS_QUEUE_LIMIT,
+    REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT,
+    REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY, REDIS_URL, REDIS_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT,
+    WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR,
+    WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
+    NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, POSTGRES_DATABASE, POSTGRES_FORMAT, POSTGRES_HOST,
+    POSTGRES_PASSWORD, POSTGRES_PORT, POSTGRES_QUEUE_DIR, POSTGRES_QUEUE_LIMIT, POSTGRES_SCHEMA, POSTGRES_TABLE, POSTGRES_TLS_CA,
+    POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_TLS_REQUIRED, POSTGRES_USER, PULSAR_AUTH_TOKEN, PULSAR_BROKER,
+    PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA,
+    PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN,
+    WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
+    WEBHOOK_SKIP_TLS_VERIFY,
 };
 use rustfs_ecstore::config::KVS;
 use std::path::Path;
@@ -288,6 +301,193 @@ pub fn validate_pulsar_config(config: &KVS, default_queue_dir: &str) -> Result<(
     validate_pulsar_broker_config(&broker, config, default_queue_dir)
 }
 
+
+pub fn build_redis_args(
+    config: &KVS,
+    default_queue_dir: &str,
+    default_channel: &str,
+    target_type: TargetType,
+) -> Result<RedisArgs, TargetError> {
+    let url = config
+        .lookup(REDIS_URL)
+        .ok_or_else(|| TargetError::Configuration("Missing Redis URL".to_string()))?;
+    let url = parse_url(&url, "Redis URL")?;
+
+    let channel = config.lookup(REDIS_CHANNEL).unwrap_or_else(|| default_channel.to_string());
+
+    Ok(RedisArgs {
+        enable: true,
+        url,
+        channel,
+        username: config.lookup(REDIS_USERNAME).filter(|value| !value.trim().is_empty()),
+        password: config.lookup(REDIS_PASSWORD).filter(|value| !value.trim().is_empty()),
+        tls: RedisTlsConfig::from_values(
+            config.lookup(REDIS_TLS_POLICY).as_deref(),
+            config.lookup(REDIS_TLS_CA).as_deref(),
+            config.lookup(REDIS_TLS_CLIENT_CERT).as_deref(),
+            config.lookup(REDIS_TLS_CLIENT_KEY).as_deref(),
+            config.lookup(REDIS_TLS_ALLOW_INSECURE).as_deref(),
+        )?,
+        keep_alive: config
+            .lookup(REDIS_KEEP_ALIVE_INTERVAL)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(15)),
+        queue_dir: config
+            .lookup(REDIS_QUEUE_DIR)
+            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_limit: config
+            .lookup(REDIS_QUEUE_LIMIT)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LIMIT),
+        max_retry_attempts: config
+            .lookup(REDIS_MAX_RETRY_ATTEMPTS)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3),
+        reconnect_retry_attempts: config
+            .lookup(REDIS_RECONNECT_RETRY_ATTEMPTS)
+            .and_then(|v| v.parse::<usize>().ok()),
+        min_retry_delay: config
+            .lookup(REDIS_MIN_RETRY_DELAY)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis),
+        max_retry_delay: config
+            .lookup(REDIS_MAX_RETRY_DELAY)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis),
+        connection_timeout: config
+            .lookup(REDIS_CONNECTION_TIMEOUT)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs),
+        response_timeout: config
+            .lookup(REDIS_RESPONSE_TIMEOUT)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs),
+        pipeline_buffer_size: config
+            .lookup(REDIS_PIPELINE_BUFFER_SIZE)
+            .and_then(|v| v.parse::<usize>().ok()),
+target_type,
+    })
+}
+
+pub fn build_postgres_args(config: &KVS, default_queue_dir: &str, target_type: TargetType) -> Result<PostgresArgs, TargetError> {
+    let host = config
+        .lookup(POSTGRES_HOST)
+        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL host".to_string()))?;
+    let user = config
+        .lookup(POSTGRES_USER)
+        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL user".to_string()))?;
+    let database = config
+        .lookup(POSTGRES_DATABASE)
+        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL database".to_string()))?;
+    let table = config
+        .lookup(POSTGRES_TABLE)
+        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL table".to_string()))?;
+
+    let port = parse_postgres_port(config.lookup(POSTGRES_PORT).as_deref())?;
+    let format = parse_postgres_format(config.lookup(POSTGRES_FORMAT).as_deref())?;
+    let schema = config
+        .lookup(POSTGRES_SCHEMA)
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "public".to_string());
+
+    Ok(PostgresArgs {
+        enable: true,
+        host,
+        port,
+        user,
+        password: config.lookup(POSTGRES_PASSWORD).unwrap_or_default(),
+        database,
+        schema,
+        table,
+        format,
+        tls_required: parse_target_bool(config.lookup(POSTGRES_TLS_REQUIRED).as_deref()).unwrap_or(false),
+        tls_ca: config.lookup(POSTGRES_TLS_CA).unwrap_or_default(),
+        tls_client_cert: config.lookup(POSTGRES_TLS_CLIENT_CERT).unwrap_or_default(),
+        tls_client_key: config.lookup(POSTGRES_TLS_CLIENT_KEY).unwrap_or_default(),
+        queue_dir: config
+            .lookup(POSTGRES_QUEUE_DIR)
+            .unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_limit: config
+            .lookup(POSTGRES_QUEUE_LIMIT)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LIMIT),
+        target_type,
+    })
+}
+
+
+pub fn validate_redis_config(config: &KVS, default_queue_dir: &str, default_channel: &str) -> Result<(), TargetError> {
+    let url = config
+        .lookup(REDIS_URL)
+        .ok_or_else(|| TargetError::Configuration("Missing Redis URL".to_string()))?;
+    let url = parse_url(&url, "Redis URL")?;
+    validate_redis_url(&url)?;
+
+    let args = build_redis_args(config, default_queue_dir, default_channel, TargetType::NotifyEvent)?;
+    args.validate()
+}
+pub fn validate_postgres_config(config: &KVS, default_queue_dir: &str) -> Result<(), TargetError> {
+    if config.lookup(POSTGRES_HOST).is_none() {
+        return Err(TargetError::Configuration("Missing PostgreSQL host".to_string()));
+    }
+    if config.lookup(POSTGRES_USER).is_none() {
+        return Err(TargetError::Configuration("Missing PostgreSQL user".to_string()));
+    }
+    if config.lookup(POSTGRES_DATABASE).is_none() {
+        return Err(TargetError::Configuration("Missing PostgreSQL database".to_string()));
+    }
+    let table = config
+        .lookup(POSTGRES_TABLE)
+        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL table".to_string()))?;
+    let schema = config
+        .lookup(POSTGRES_SCHEMA)
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "public".to_string());
+    validate_pg_identifier(&schema, "schema")?;
+    validate_pg_identifier(&table, "table")?;
+
+    parse_postgres_port(config.lookup(POSTGRES_PORT).as_deref())?;
+    parse_postgres_format(config.lookup(POSTGRES_FORMAT).as_deref())?;
+
+    let tls_client_cert = config.lookup(POSTGRES_TLS_CLIENT_CERT).unwrap_or_default();
+    let tls_client_key = config.lookup(POSTGRES_TLS_CLIENT_KEY).unwrap_or_default();
+    if tls_client_cert.is_empty() != tls_client_key.is_empty() {
+        return Err(TargetError::Configuration(format!(
+            "PostgreSQL {POSTGRES_TLS_CLIENT_CERT} and {POSTGRES_TLS_CLIENT_KEY} must be specified together"
+        )));
+    }
+
+    let queue_dir = config
+        .lookup(POSTGRES_QUEUE_DIR)
+        .unwrap_or_else(|| default_queue_dir.to_string());
+    if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
+        return Err(TargetError::Configuration(
+            "PostgreSQL queue directory must be an absolute path".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_postgres_port(value: Option<&str>) -> Result<u16, TargetError> {
+    let Some(raw) = value else { return Ok(5432) };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(5432);
+    }
+    trimmed
+        .parse::<u16>()
+        .map_err(|_| TargetError::Configuration(format!("PostgreSQL port must be a u16 (1-65535), got: {raw}")))
+        .and_then(|p| {
+            if p == 0 {
+                Err(TargetError::Configuration("PostgreSQL port must not be zero".to_string()))
+            } else {
+                Ok(p)
+            }
+        })
+}
+
 pub fn build_kafka_args(config: &KVS, default_queue_dir: &str, target_type: TargetType) -> Result<KafkaArgs, TargetError> {
     let brokers_raw = config
         .lookup(KAFKA_BROKERS)
@@ -443,10 +643,14 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{build_kafka_args, build_mysql_args, validate_kafka_config, validate_mysql_config};
-    use crate::target::TargetType;
+    use super::{build_kafka_args, build_redis_args, validate_kafka_config, validate_redis_config,build_postgres_args, validate_postgres_config,build_mysql_args,validate_mysql_config};
+    use crate::target::{TargetType, postgres::PostgresFormat};
     use rustfs_config::{
-        KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
+       KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
+        KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY,
+        REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE, REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT,
+        REDIS_TLS_ALLOW_INSECURE, REDIS_URL,POSTGRES_DATABASE, POSTGRES_FORMAT, POSTGRES_HOST, POSTGRES_PORT,
+        POSTGRES_QUEUE_DIR, POSTGRES_SCHEMA, POSTGRES_TABLE, POSTGRES_TLS_CLIENT_CERT, POSTGRES_USER,
     };
     use rustfs_ecstore::config::KVS;
 
@@ -547,5 +751,173 @@ mod tests {
 
         let err = validate_mysql_config(&config, "").expect_err("empty dsn should fail");
         assert!(err.to_string().contains("empty"));
+    }
+
+    fn redis_base_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/0".to_string());
+        config.insert(REDIS_CHANNEL.to_string(), "events".to_string());
+        config
+    }
+    fn postgres_base_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(POSTGRES_HOST.to_string(), "localhost".to_string());
+        config.insert(POSTGRES_USER.to_string(), "postgres".to_string());
+        config.insert(POSTGRES_DATABASE.to_string(), "rustfs_events".to_string());
+        config.insert(POSTGRES_TABLE.to_string(), "rustfs_events_namespace".to_string());
+        config
+    }
+
+    #[test]
+    fn build_redis_args_keeps_manager_tuning_fields_none_when_unset() {
+        let config = redis_base_config();
+
+        let args = build_redis_args(&config, "/tmp/queue", "default-channel", TargetType::NotifyEvent).expect("valid redis args");
+
+        assert_eq!(args.channel, "events");
+        assert_eq!(args.reconnect_retry_attempts, None);
+        assert_eq!(args.min_retry_delay, None);
+        assert_eq!(args.max_retry_delay, None);
+        assert_eq!(args.connection_timeout, None);
+        assert_eq!(args.response_timeout, None);
+        assert_eq!(args.pipeline_buffer_size, None);
+    }
+
+    #[test]
+    fn build_redis_args_uses_default_channel_when_missing() {
+        let mut config = KVS::new();
+        config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/0".to_string());
+
+        let args =
+            build_redis_args(&config, "/tmp/queue", "fallback-channel", TargetType::NotifyEvent).expect("valid redis args");
+
+        assert_eq!(args.channel, "fallback-channel");
+    }
+
+    #[test]
+    fn build_redis_args_parses_optional_tuning_values_when_present() {
+        let mut config = redis_base_config();
+        config.insert(REDIS_RECONNECT_RETRY_ATTEMPTS.to_string(), "9".to_string());
+        config.insert(REDIS_MIN_RETRY_DELAY.to_string(), "250".to_string());
+        config.insert(REDIS_MAX_RETRY_DELAY.to_string(), "5000".to_string());
+        config.insert(REDIS_CONNECTION_TIMEOUT.to_string(), "7".to_string());
+        config.insert(REDIS_RESPONSE_TIMEOUT.to_string(), "11".to_string());
+        config.insert(REDIS_PIPELINE_BUFFER_SIZE.to_string(), "64".to_string());
+
+        let args = build_redis_args(&config, "/tmp/queue", "default-channel", TargetType::NotifyEvent).expect("valid redis args");
+
+        assert_eq!(args.reconnect_retry_attempts, Some(9));
+        assert_eq!(args.min_retry_delay, Some(std::time::Duration::from_millis(250)));
+        assert_eq!(args.max_retry_delay, Some(std::time::Duration::from_millis(5000)));
+        assert_eq!(args.connection_timeout, Some(std::time::Duration::from_secs(7)));
+        assert_eq!(args.response_timeout, Some(std::time::Duration::from_secs(11)));
+        assert_eq!(args.pipeline_buffer_size, Some(64));
+    }
+
+    #[test]
+    fn build_redis_args_parses_tls_allow_insecure_when_present() {
+        let mut config = redis_base_config();
+        config.insert(REDIS_URL.to_string(), "rediss://127.0.0.1:6379/0".to_string());
+        config.insert(REDIS_TLS_ALLOW_INSECURE.to_string(), "on".to_string());
+
+        let args = build_redis_args(&config, "/tmp/queue", "default-channel", TargetType::NotifyEvent).expect("valid redis args");
+
+        assert!(args.tls.allow_insecure);
+    }
+
+    #[test]
+    fn validate_redis_config_rejects_missing_url() {
+        let config = KVS::new();
+
+        let err = validate_redis_config(&config, "/tmp/queue", "default-channel").expect_err("missing redis url should fail");
+        assert!(err.to_string().contains("Missing Redis URL"));
+    }
+    #[test]
+    fn build_postgres_args_uses_default_port_5432() {
+        let config = postgres_base_config();
+        let args = build_postgres_args(&config, "", TargetType::NotifyEvent).expect("valid postgres args");
+        assert_eq!(args.port, 5432);
+        assert_eq!(args.schema, "public");
+        assert_eq!(args.format, PostgresFormat::Namespace);
+    }
+
+    #[test]
+    fn build_postgres_args_parses_explicit_port() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_PORT.to_string(), "6543".to_string());
+        let args = build_postgres_args(&config, "", TargetType::NotifyEvent).expect("valid postgres args");
+        assert_eq!(args.port, 6543);
+    }
+
+    #[test]
+    fn build_postgres_args_rejects_zero_port() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_PORT.to_string(), "0".to_string());
+        let err = build_postgres_args(&config, "", TargetType::NotifyEvent).expect_err("zero port should fail");
+        assert!(err.to_string().contains("port must not be zero"));
+    }
+
+    #[test]
+    fn build_postgres_args_rejects_invalid_port() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_PORT.to_string(), "abc".to_string());
+        let err = build_postgres_args(&config, "", TargetType::NotifyEvent).expect_err("non-numeric port should fail");
+        assert!(err.to_string().contains("port must be a u16"));
+    }
+
+    #[test]
+    fn build_postgres_args_parses_access_format() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_FORMAT.to_string(), "access".to_string());
+        let args = build_postgres_args(&config, "", TargetType::NotifyEvent).expect("valid postgres args");
+        assert_eq!(args.format, PostgresFormat::Access);
+    }
+
+    #[test]
+    fn validate_postgres_config_rejects_missing_host() {
+        let mut config = postgres_base_config();
+        config.0.retain(|kv| kv.key != POSTGRES_HOST);
+        let err = validate_postgres_config(&config, "").expect_err("missing host should fail");
+        assert!(err.to_string().contains("Missing PostgreSQL host"));
+    }
+
+    #[test]
+    fn validate_postgres_config_rejects_missing_database() {
+        let mut config = postgres_base_config();
+        config.0.retain(|kv| kv.key != POSTGRES_DATABASE);
+        let err = validate_postgres_config(&config, "").expect_err("missing database should fail");
+        assert!(err.to_string().contains("Missing PostgreSQL database"));
+    }
+
+    #[test]
+    fn validate_postgres_config_rejects_missing_table() {
+        let mut config = postgres_base_config();
+        config.0.retain(|kv| kv.key != POSTGRES_TABLE);
+        let err = validate_postgres_config(&config, "").expect_err("missing table should fail");
+        assert!(err.to_string().contains("Missing PostgreSQL table"));
+    }
+
+    #[test]
+    fn validate_postgres_config_rejects_invalid_schema_identifier() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_SCHEMA.to_string(), "public; DROP TABLE".to_string());
+        let err = validate_postgres_config(&config, "").expect_err("malicious schema should fail");
+        assert!(err.to_string().contains("schema"));
+    }
+
+    #[test]
+    fn validate_postgres_config_rejects_relative_queue_dir() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_QUEUE_DIR.to_string(), "relative/path".to_string());
+        let err = validate_postgres_config(&config, "").expect_err("relative queue_dir should fail");
+        assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn validate_postgres_config_rejects_mtls_without_key() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_TLS_CLIENT_CERT.to_string(), "/etc/ssl/cert.pem".to_string());
+        let err = validate_postgres_config(&config, "").expect_err("missing key should fail");
+        assert!(err.to_string().contains("must be specified together"));
     }
 }

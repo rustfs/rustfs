@@ -129,6 +129,54 @@ pub async fn check_pulsar_broker_available(args: &crate::target::pulsar::PulsarA
     }
 }
 
+/// Probes a PostgreSQL server for connectivity and verifies the configured
+/// table is readable.
+///
+/// Used by both the admin validation flow (pre-flight before persisting a
+/// target) and `PostgresTarget::init()` (runtime startup check). The probe is
+/// strictly read-only:
+///
+/// 1. Build a deadpool pool from `args` (cheap, no actual connection yet).
+/// 2. Check out a single connection.
+/// 3. Run `SELECT 1` to confirm the credentials work.
+/// 4. Run `SELECT 1 FROM <schema>.<table> LIMIT 0` to confirm the relation
+///    exists and the user has read permission. `LIMIT 0` ensures no rows are
+///    actually returned and no DML side effects occur.
+///
+/// The whole flow is wrapped in an 8s `tokio::time::timeout` so a stuck DNS
+/// resolver or TLS handshake cannot exhaust the admin layer's outer 10s
+/// timeout.
+pub async fn check_postgres_server_available(args: &crate::target::postgres::PostgresArgs) -> Result<(), crate::TargetError> {
+    use crate::target::postgres::{build_pool, map_pg_error, map_pool_error, table_probe_sql};
+
+    args.validate()?;
+
+    let timeout = std::time::Duration::from_secs(8);
+    match tokio::time::timeout(timeout, async {
+        let pool = build_pool(args)?;
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| map_pool_error(e, "PostgreSQL connectivity probe failed to acquire connection"))?;
+        client
+            .execute("SELECT 1", &[])
+            .await
+            .map_err(|e| map_pg_error(&e, "PostgreSQL liveness probe failed"))?;
+        let probe_sql = table_probe_sql(&args.schema, &args.table);
+        client
+            .execute(probe_sql.as_str(), &[])
+            .await
+            .map_err(|e| map_pg_error(&e, "PostgreSQL table probe failed"))?;
+        pool.close();
+        Ok::<(), crate::TargetError>(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::TargetError::Timeout("PostgreSQL connectivity probe timed out".to_string())),
+    }
+}
+
 pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs) -> Result<(), crate::TargetError> {
     use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
     use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, RequiredAcks, SecurityConfig};
@@ -173,5 +221,17 @@ pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs
     {
         Ok(result) => result,
         Err(_) => Err(crate::TargetError::Timeout("Kafka connection timed out".to_string())),
+    }
+}
+
+pub async fn check_redis_server_available(args: &crate::target::redis::RedisArgs) -> Result<(), crate::TargetError> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let client = crate::target::redis::build_redis_client(args)?;
+        crate::target::redis::ping_redis_server(&client, args).await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::TargetError::Timeout("Redis connection timed out".to_string())),
     }
 }
