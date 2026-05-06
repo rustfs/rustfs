@@ -33,6 +33,10 @@ fi
 rolling_output=$(render_standalone_deployment)
 grep -q "type: RollingUpdate" <<<"$rolling_output"
 grep -q "rollingUpdate:" <<<"$rolling_output"
+grep -Eq '^[[:space:]]*replicas:[[:space:]]*1[[:space:]]*$' <<<"$rolling_output"
+
+scaled_to_zero_output=$(render_standalone_deployment --set replicaCount=0)
+grep -Eq '^[[:space:]]*replicas:[[:space:]]*0[[:space:]]*$' <<<"$scaled_to_zero_output"
 
 # Fail-closed credential checks. Rendering must fail when no credentials,
 # existingSecret, or allowInsecureDefaults override is supplied.
