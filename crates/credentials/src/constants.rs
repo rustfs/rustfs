@@ -66,7 +66,7 @@ mod tests {
 
         // In production environment, access key and secret key should be different
         // These are default values, so being the same is acceptable, but should be warned in documentation
-        println!("Warning: Default access key and secret key are the same. Change them in production!");
+        assert_eq!(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY);
     }
 
     #[test]
@@ -74,10 +74,8 @@ mod tests {
         // Test security best practices
 
         // These are default values, should be changed in production environments
-        println!("Security Warning: Default credentials detected!");
-        println!("Access Key: {DEFAULT_ACCESS_KEY}");
-        println!("Secret Key: {DEFAULT_SECRET_KEY}");
-        println!("These should be changed in production environments!");
+        assert_eq!(DEFAULT_ACCESS_KEY, "rustfsadmin");
+        assert_eq!(DEFAULT_SECRET_KEY, "rustfsadmin");
 
         // Verify that key lengths meet minimum security requirements
         assert!(DEFAULT_ACCESS_KEY.len() >= 8, "Access key should be at least 8 characters");
