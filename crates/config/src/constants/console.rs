@@ -106,8 +106,8 @@ mod tests {
     }
 
     #[test]
-    fn console_cors_default_remains_wildcard() {
+    fn console_cors_default_is_same_origin_only() {
         assert_eq!(ENV_CONSOLE_CORS_ALLOWED_ORIGINS, "RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS");
-        assert_eq!(DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS, "*");
+        assert_eq!(DEFAULT_CONSOLE_CORS_ALLOWED_ORIGINS, "");
     }
 }

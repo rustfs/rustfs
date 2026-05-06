@@ -671,8 +671,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http::{Request, StatusCode};
-    use serial_test::serial;
     use http_body_util::BodyExt;
+    use serial_test::serial;
     use std::net::{IpAddr, Ipv4Addr};
     use temp_env::async_with_vars;
     use tower::ServiceExt;
