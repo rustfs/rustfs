@@ -402,7 +402,7 @@ impl SetDisks {
         disks: &[Option<DiskStore>],
         opts: &UpdateMetadataOpts,
     ) -> disk::error::Result<()> {
-        if fi.metadata.is_empty() {
+        if fi.metadata.is_empty() && !opts.replace_user_metadata {
             return Ok(());
         }
 

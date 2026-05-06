@@ -201,6 +201,10 @@ impl FileMeta {
     }
 
     pub fn update_object_version(&mut self, fi: FileInfo) -> Result<()> {
+        self.update_object_version_with_opts(fi, false)
+    }
+
+    pub fn update_object_version_with_opts(&mut self, fi: FileInfo, replace_user_metadata: bool) -> Result<()> {
         for version in self.versions.iter_mut() {
             match version.header.version_type {
                 VersionType::Invalid | VersionType::Legacy => (),
@@ -213,6 +217,10 @@ impl FileMeta {
                         let mut ver = FileMetaVersion::try_from(version.meta.as_slice())?;
 
                         if let Some(ref mut obj) = ver.object {
+                            if replace_user_metadata {
+                                obj.meta_user.clear();
+                            }
+
                             for (k, v) in fi.metadata.iter() {
                                 // Split metadata into meta_user and meta_sys based on prefix
                                 // This logic must match From<FileInfo> for MetaObject

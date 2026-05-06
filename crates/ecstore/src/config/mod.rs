@@ -43,10 +43,6 @@ pub static DEFAULT_KVS: LazyLock<OnceLock<HashMap<String, KVS>>> = LazyLock::new
 pub static GLOBAL_SERVER_CONFIG: LazyLock<OnceLock<Config>> = LazyLock::new(OnceLock::new);
 pub static GLOBAL_CONFIG_SYS: LazyLock<ConfigSys> = LazyLock::new(ConfigSys::new);
 
-pub const ENV_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
-pub const ENV_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
-pub const ENV_ROOT_USER: &str = "RUSTFS_ROOT_USER";
-pub const ENV_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
 pub static RUSTFS_CONFIG_PREFIX: &str = "config";
 
 pub struct ConfigSys {}

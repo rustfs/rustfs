@@ -1,0 +1,4 @@
+interface:
+  display_name: "Security Advisory Lessons"
+  short_description: "Apply advisory lessons in reviews."
+  default_prompt: "Review code changes against past RustFS security advisory lessons and report concrete risks, missing tests, and recommended fixes."

@@ -26,6 +26,7 @@
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
+ARG TARGETARCH
 
 # -----------------------------
 # Build stage
@@ -35,6 +36,7 @@ FROM rust:1.93-trixie AS builder
 # Re-declare args after FROM
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
+ARG TARGETARCH
 
 # Debug: print platforms
 RUN echo "Build info -> BUILDPLATFORM=${BUILDPLATFORM}, TARGETPLATFORM=${TARGETPLATFORM}"
@@ -87,6 +89,7 @@ ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
 ENV CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc
 ENV CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++
+ENV CARGO_TARGET_DIR=/usr/src/rustfs/target/docker-build
 
 WORKDIR /usr/src/rustfs
 
@@ -120,33 +123,33 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
 # Generate protobuf/flatbuffers code (uses protoc/flatc from distro)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/rustfs/target \
+    --mount=type=cache,target=/usr/src/rustfs/target/docker-build \
     cargo run --bin gproto
 
 # Build RustFS (target depends on TARGETPLATFORM)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/rustfs/target \
+    --mount=type=cache,target=/usr/src/rustfs/target/docker-build \
     set -eux; \
     rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; \
     target_platform="${TARGETPLATFORM:-}"; \
     if [ -z "${target_platform}" ]; then \
-    case "$(uname -m)" in \
-    x86_64) target_platform="linux/amd64" ;; \
-    aarch64|arm64) target_platform="linux/arm64" ;; \
-    *) target_platform="linux/amd64" ;; \
+    case "${TARGETARCH:-$(uname -m)}" in \
+    amd64|x86_64) target_platform="linux/amd64" ;; \
+    arm64|aarch64) target_platform="linux/arm64" ;; \
+    *) echo "Unsupported target architecture: ${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
     esac; \
     fi; \
     case "${target_platform}" in \
     linux/amd64) \
     echo "Building for x86_64-unknown-linux-gnu"; \
     cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
-    install -m 0755 target/x86_64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
+    install -m 0755 "${CARGO_TARGET_DIR}/x86_64-unknown-linux-gnu/release/rustfs" /usr/local/bin/rustfs \
     ;; \
     linux/arm64) \
     echo "Building for aarch64-unknown-linux-gnu"; \
     cargo build --release --locked --target aarch64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
-    install -m 0755 target/aarch64-unknown-linux-gnu/release/rustfs /usr/local/bin/rustfs \
+    install -m 0755 "${CARGO_TARGET_DIR}/aarch64-unknown-linux-gnu/release/rustfs" /usr/local/bin/rustfs \
     ;; \
     *) \
     echo "Unsupported target platform=${target_platform}" >&2; exit 1 \
@@ -212,6 +215,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     tzdata \
     coreutils; \
     rm -rf /var/lib/apt/lists/*

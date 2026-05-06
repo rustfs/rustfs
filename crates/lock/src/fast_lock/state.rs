@@ -165,13 +165,13 @@ impl AtomicLockState {
     }
 
     /// Increment waiting readers count
-    pub fn inc_readers_waiting(&self) {
+    pub fn inc_readers_waiting(&self) -> bool {
         loop {
             let current = self.state.load(Ordering::Acquire);
             let waiting = self.readers_waiting(current);
 
             if waiting == 0xFFFF {
-                break; // Max waiting readers
+                return false; // Max waiting readers
             }
 
             let new_state = current + (1 << READERS_WAITING_SHIFT);
@@ -181,7 +181,7 @@ impl AtomicLockState {
                 .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                break;
+                return true;
             }
         }
     }
@@ -209,13 +209,13 @@ impl AtomicLockState {
     }
 
     /// Increment waiting writers count
-    pub fn inc_writers_waiting(&self) {
+    pub fn inc_writers_waiting(&self) -> bool {
         loop {
             let current = self.state.load(Ordering::Acquire);
             let waiting = self.writers_waiting(current);
 
             if waiting == 0xFFFF {
-                break; // Max waiting writers
+                return false; // Max waiting writers
             }
 
             let new_state = current + (1 << WRITERS_WAITING_SHIFT);
@@ -225,7 +225,7 @@ impl AtomicLockState {
                 .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                break;
+                return true;
             }
         }
     }
@@ -287,6 +287,18 @@ impl AtomicLockState {
 
     fn writers_waiting(&self, state: u64) -> u16 {
         ((state & WRITERS_WAITING_MASK) >> WRITERS_WAITING_SHIFT) as u16
+    }
+
+    #[cfg(test)]
+    pub fn readers_waiting_count(&self) -> u16 {
+        let state = self.state.load(Ordering::Acquire);
+        self.readers_waiting(state)
+    }
+
+    #[cfg(test)]
+    pub fn writers_waiting_count(&self) -> u16 {
+        let state = self.state.load(Ordering::Acquire);
+        self.writers_waiting(state)
     }
 }
 

@@ -324,6 +324,12 @@ pub fn license_check() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::{
+        RsaPrivateKey, RsaPublicKey,
+        pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
+    };
+    use rustfs_appauth::token::sign_license_token;
+    use serial_test::serial;
 
     #[test]
     fn license_token_current_requires_future_expiration() {
@@ -335,5 +341,57 @@ mod tests {
         assert!(is_license_token_current(&token, 99));
         assert!(!is_license_token_current(&token, 100));
         assert!(!is_license_token_current(&token, 101));
+    }
+
+    #[test]
+    #[serial]
+    fn appauth_verifier_rejects_missing_public_key() {
+        temp_env::with_var(rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY, None::<&str>, || {
+            assert_license_public_key_error(AppAuthLicenseVerifier.validate("signed-license", 0));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn appauth_verifier_rejects_blank_public_key() {
+        temp_env::with_var(rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY, Some("  \t\n  "), || {
+            assert_license_public_key_error(AppAuthLicenseVerifier.validate("signed-license", 0));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn appauth_verifier_accepts_signed_license_with_trimmed_public_key() {
+        let mut rng = rand::rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("private key should be generated");
+        let public_key = RsaPublicKey::from(&private_key);
+        let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF).expect("private key should encode");
+        let public_key_pem = public_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("public key should encode");
+        let expected = Token {
+            name: "test_app".to_string(),
+            expired: 100,
+        };
+        let signed_license = sign_license_token(&expected, &private_key_pem).expect("license should sign");
+        let public_key_env = format!(" \n{public_key_pem}\t ");
+
+        let actual = temp_env::with_var(rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY, Some(public_key_env), || {
+            AppAuthLicenseVerifier.validate(&signed_license, 0)
+        })
+        .expect("signed license should validate with env public key");
+
+        assert_eq!(expected.name, actual.name);
+        assert_eq!(expected.expired, actual.expired);
+    }
+
+    fn assert_license_public_key_error(result: LicenseResult<Token>) {
+        let err = result.expect_err("license verification should fail without a public key");
+        let LicenseError::Invalid(message) = err else {
+            panic!("expected invalid license error, got {err:?}");
+        };
+
+        assert!(message.contains(rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY));
+        assert!(message.contains("RSA public key"));
     }
 }

@@ -174,7 +174,24 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_root_envs_are_used_for_bootstrap_credentials() {
+    fn test_access_key_envs_are_used_for_bootstrap_credentials() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_VOLUMES", Some("/compat/vol1")),
+                ("RUSTFS_ACCESS_KEY", Some("canonical-access")),
+                ("RUSTFS_SECRET_KEY", Some("canonical-secret")),
+            ],
+            || {
+                let config = Config::from_opt(Opt::parse_from(["rustfs"])).expect("config should parse");
+                assert_eq!(config.access_key, "canonical-access");
+                assert_eq!(config.secret_key, "canonical-secret");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_root_envs_fallback_for_bootstrap_credentials() {
         temp_env::with_vars(
             [
                 ("RUSTFS_VOLUMES", Some("/compat/vol1")),

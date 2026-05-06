@@ -149,17 +149,11 @@ pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
 /// Environment variable for server access key file.
 pub const ENV_RUSTFS_ACCESS_KEY_FILE: &str = "RUSTFS_ACCESS_KEY_FILE";
 
-/// Environment variable for server root user.
-pub const ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
-
 /// Environment variable for server secret key.
 pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
 
 /// Environment variable for server secret key file.
 pub const ENV_RUSTFS_SECRET_KEY_FILE: &str = "RUSTFS_SECRET_KEY_FILE";
-
-/// Environment variable for server root password.
-pub const ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
 
 /// Environment variable for server OBS endpoint.
 pub const ENV_RUSTFS_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
