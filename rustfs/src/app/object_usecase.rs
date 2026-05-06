@@ -4609,6 +4609,49 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn should_buffer_get_object_in_memory_respects_configured_threshold_below_cap() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold + 1,
+            None,
+            false,
+            configured_threshold
+        ));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_rejects_unknown_lengths_and_disabled_thresholds() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            0,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            -1,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0));
+    }
+
     struct ReadProbeReader {
         reads: Arc<AtomicUsize>,
     }
