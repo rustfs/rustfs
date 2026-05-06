@@ -136,6 +136,22 @@ Similarly, you can run the command with podman
 podman compose --profile observability up -d
 ```
 
+Webhook notification quick start (Docker):
+
+```bash
+docker run -d --name rustfs -p 9000:9000 \
+  -e RUSTFS_NOTIFY_ENABLE=true \
+  -e RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY=on \
+  -e RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=http://<host-ip>:3020/webhook \
+  -e RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY=/tmp/rustfs-events \
+  rustfs/rustfs:latest
+```
+
+Notes:
+- `RUSTFS_NOTIFY_ENABLE=true` enables the global notify module switch.
+- For ARN `arn:rustfs:sqs::primary:webhook`, use instance-scoped env vars with `_PRIMARY`.
+- If queue dir is omitted, default is `/opt/rustfs/events`; ensure it is writable by the container runtime user.
+
 **NOTE**: We recommend reviewing the `docker-compose.yml` file before running. It defines several services including Grafana, Prometheus, and Jaeger, which are helpful for RustFS observability. If you wish to start Redis or Nginx containers, you can specify the corresponding profiles.
 
 ### 3\. Build from Source (Option 3) - Advanced Users
