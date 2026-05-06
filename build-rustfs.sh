@@ -109,6 +109,7 @@ FORCE_CONSOLE_UPDATE=false
 CONSOLE_VERSION="latest"
 SKIP_VERIFICATION=false
 CUSTOM_PLATFORM=""
+FEATURES=""
 
 # Print usage
 usage() {
@@ -141,6 +142,7 @@ usage() {
     echo "  --no-console               Skip console static assets"
     echo "  --force-console-update     Force update console assets even if they exist"
     echo "  --console-version VERSION  Console version to download (default: latest)"
+    echo "  -f, --features FEATURES    Cargo features to enable (e.g. 'webdav', 'full')"
     echo "  --skip-verification        Skip binary verification after build"
     echo "  -h, --help                 Show this help message"
     echo ""
@@ -148,6 +150,8 @@ usage() {
     echo "  $0                         # Build for current platform (includes console assets)"
     echo "  $0 --dev                   # Development build"
     echo "  $0 --sign                  # Build and sign binary (release CI)"
+    echo "  $0 --features webdav       # Build with WebDAV support"
+    echo "  $0 --features full         # Build with all protocol features"
     echo "  $0 --no-console            # Build without console static assets"
     echo "  $0 --force-console-update  # Force update console assets"
     echo "  $0 --platform x86_64-unknown-linux-musl  # Build for specific platform"
@@ -440,6 +444,10 @@ build_binary() {
     build_cmd+=" --target $PLATFORM"
     build_cmd+=" -p rustfs --bins"
 
+    if [ -n "$FEATURES" ]; then
+        build_cmd+=" --features $FEATURES"
+    fi
+
     print_message $BLUE "📦 Executing: $build_cmd"
 
     # Execute build (this matches exactly what the working version does)
@@ -497,6 +505,9 @@ build_rustfs() {
         print_message $YELLOW "   Force Console Update: $FORCE_CONSOLE_UPDATE"
     fi
     print_message $YELLOW "   Skip Verification: $SKIP_VERIFICATION"
+    if [ -n "$FEATURES" ]; then
+        print_message $YELLOW "   Features: $FEATURES"
+    fi
     echo ""
 
     # Setup environment
@@ -564,6 +575,15 @@ while [[ $# -gt 0 ]]; do
         --skip-verification)
             SKIP_VERIFICATION=true
             shift
+            ;;
+        -f|--features)
+            if [ -z "${2:-}" ]; then
+                print_message $RED "❌ Missing value for $1"
+                usage
+                exit 1
+            fi
+            FEATURES="$2"
+            shift 2
             ;;
         -h|--help)
             usage
