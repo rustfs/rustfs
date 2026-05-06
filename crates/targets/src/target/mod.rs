@@ -28,6 +28,7 @@ use tracing::warn;
 pub mod kafka;
 pub mod mqtt;
 pub mod nats;
+pub mod postgres;
 pub mod pulsar;
 pub mod webhook;
 
@@ -290,6 +291,7 @@ pub enum ChannelTargetType {
     Kafka,
     Mqtt,
     Nats,
+    Postgres,
     Pulsar,
 }
 
@@ -300,6 +302,7 @@ impl ChannelTargetType {
             ChannelTargetType::Kafka => "kafka",
             ChannelTargetType::Mqtt => "mqtt",
             ChannelTargetType::Nats => "nats",
+            ChannelTargetType::Postgres => "postgres",
             ChannelTargetType::Pulsar => "pulsar",
         }
     }
@@ -312,6 +315,7 @@ impl std::fmt::Display for ChannelTargetType {
             ChannelTargetType::Kafka => write!(f, "kafka"),
             ChannelTargetType::Mqtt => write!(f, "mqtt"),
             ChannelTargetType::Nats => write!(f, "nats"),
+            ChannelTargetType::Postgres => write!(f, "postgres"),
             ChannelTargetType::Pulsar => write!(f, "pulsar"),
         }
     }

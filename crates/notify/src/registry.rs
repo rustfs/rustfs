@@ -14,7 +14,8 @@
 
 use crate::Event;
 use crate::factory::{
-    KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory, WebhookTargetFactory,
+    KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory, TargetFactory,
+    WebhookTargetFactory,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::HashMap;
@@ -46,6 +47,7 @@ impl TargetRegistry {
         registry.register(ChannelTargetType::Webhook.as_str(), Box::new(WebhookTargetFactory));
         registry.register(ChannelTargetType::Mqtt.as_str(), Box::new(MQTTTargetFactory));
         registry.register(ChannelTargetType::Nats.as_str(), Box::new(NATSTargetFactory));
+        registry.register(ChannelTargetType::Postgres.as_str(), Box::new(PostgresTargetFactory));
         registry.register(ChannelTargetType::Pulsar.as_str(), Box::new(PulsarTargetFactory));
         registry.register(ChannelTargetType::Kafka.as_str(), Box::new(KafkaTargetFactory));
 
