@@ -107,6 +107,9 @@ mod group_delete_test;
 #[cfg(test)]
 mod head_object_range_test;
 
+#[cfg(test)]
+mod copy_object_metadata_test;
+
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;

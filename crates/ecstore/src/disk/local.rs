@@ -2665,7 +2665,7 @@ impl DiskAPI for LocalDisk {
 
             let mut xl_meta = FileMeta::load(buf.as_ref())?;
 
-            xl_meta.update_object_version(fi)?;
+            xl_meta.update_object_version_with_opts(fi, opts.replace_user_metadata)?;
 
             let wbuf = xl_meta.marshal_msg()?;
 
