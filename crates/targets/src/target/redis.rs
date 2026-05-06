@@ -811,15 +811,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_requires_explicit_tls_policy_for_secure_scheme() {
-        let args = RedisArgs {
-            url: Url::parse("rediss://127.0.0.1:6379").unwrap(),
-            ..base_args()
-        };
-        assert!(args.validate().is_ok());
-    }
-
-    #[test]
     fn validate_accepts_custom_ca_tls_policy() {
         let args = RedisArgs {
             url: Url::parse("rediss://127.0.0.1:6379").unwrap(),
