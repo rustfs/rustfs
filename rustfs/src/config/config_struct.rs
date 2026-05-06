@@ -23,9 +23,27 @@ use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, ENV_RUSTFS_ACCESS_KEY, ENV_RUSTFS_SECRET_KEY, RUSTFS_REGION,
 };
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 const LEGACY_ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
 const LEGACY_ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
+static LEGACY_CREDENTIAL_WARNED_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn warn_legacy_credential_env_once(legacy_key: &str, canonical_key: &str) {
+    let warned = LEGACY_CREDENTIAL_WARNED_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut warned = match warned.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if warned.insert(legacy_key.to_string()) {
+        tracing::warn!(
+            "Environment variable {} is deprecated and will be removed at GA; use {} instead",
+            legacy_key,
+            canonical_key
+        );
+    }
+}
 
 /// Helper function to resolve credentials from multiple sources with precedence:
 /// 1. Inline value (if provided)
@@ -40,18 +58,21 @@ pub(crate) fn resolve_credential<T: AsRef<std::path::Path>>(
     legacy_env_keys: &[&str],
     default_value: &str,
 ) -> std::io::Result<String> {
-    let value = inline_value
-        .map(Ok)
-        .or_else(|| file_value.map(std::fs::read_to_string))
-        .or_else(|| rustfs_utils::get_env_opt_str(env_key).map(Ok))
-        .or_else(|| {
-            legacy_env_keys
-                .iter()
-                .find_map(|key| rustfs_utils::get_env_opt_str(key))
-                .map(Ok)
-        })
-        .transpose()?
-        .unwrap_or_else(|| default_value.to_string());
+    let value = if let Some(value) = inline_value {
+        value
+    } else if let Some(path) = file_value {
+        std::fs::read_to_string(path)?
+    } else if let Some(value) = rustfs_utils::get_env_opt_str(env_key) {
+        value
+    } else if let Some((legacy_key, value)) = legacy_env_keys
+        .iter()
+        .find_map(|legacy_key| rustfs_utils::get_env_opt_str(legacy_key).map(|value| (*legacy_key, value)))
+    {
+        warn_legacy_credential_env_once(legacy_key, env_key);
+        value
+    } else {
+        default_value.to_string()
+    };
 
     Ok(value.trim().to_string())
 }
