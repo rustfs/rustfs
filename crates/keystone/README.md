@@ -82,6 +82,10 @@ export RUSTFS_KEYSTONE_CACHE_SIZE=10000
 export RUSTFS_KEYSTONE_CACHE_TTL=300
 ```
 
+TLS certificate verification is enabled by default. Set
+`RUSTFS_KEYSTONE_VERIFY_SSL=false` only for an explicitly trusted hop; it allows
+MITM attacks against the Keystone connection and emits a startup warning.
+
 ## API Documentation
 
 ### KeystoneClient
@@ -628,8 +632,8 @@ time curl -X GET http://localhost:9000/ \
 - Verify token format is correct (no newlines, extra spaces)
 
 **Issue: "SSL verification failed"**
-- If using self-signed certificates, set `RUSTFS_KEYSTONE_VERIFY_SSL=false`
-- Or install Keystone's CA certificate in system trust store
+- Prefer installing Keystone's CA certificate in the system trust store
+- If using a trusted non-production hop, set `RUSTFS_KEYSTONE_VERIFY_SSL=false`; this allows MITM attacks and emits a startup warning
 
 **Issue: Slow performance**
 - Increase cache size: `RUSTFS_KEYSTONE_CACHE_SIZE=50000`

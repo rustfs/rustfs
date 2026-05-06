@@ -130,6 +130,9 @@ jobs:
       - name: Check code formatting
         run: cargo fmt --all --check
 
+      - name: Check unsafe code allowances
+        run: ./scripts/check_unsafe_code_allowances.sh
+
       - name: Run clippy lints
         run: cargo clippy --all-targets --all-features -- -D warnings
 
