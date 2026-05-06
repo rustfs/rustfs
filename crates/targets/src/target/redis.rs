@@ -698,12 +698,12 @@ pub(crate) async fn ping_redis_server(client: &Client, args: &RedisArgs) -> Resu
     let mut conn = client
         .get_connection_manager_with_config(config)
         .await
-        .map_err(|e| TargetError::Network(format!("Redis connection manager init failed: {e}")))?;
+        .map_err(map_redis_error)?;
 
     cmd("PING")
         .query_async::<String>(&mut conn)
         .await
-        .map_err(|e| TargetError::Network(format!("Redis ping failed: {e}")))?;
+        .map_err(map_redis_error)?;
 
     Ok(())
 }
