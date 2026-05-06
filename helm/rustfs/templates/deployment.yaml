@@ -12,7 +12,7 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  replicas: 1
+  replicas: {{ min 1 .Values.replicaCount }}
   {{- with .Values.mode.standalone.strategy }}
   {{- $type := default "RollingUpdate" .type }}
   strategy:
