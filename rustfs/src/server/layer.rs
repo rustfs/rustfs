@@ -232,11 +232,12 @@ pub struct AdminChunkedContentLengthCompatService<S> {
     inner: S,
 }
 
-impl<S, ResBody> Service<HttpRequest<Incoming>> for AdminChunkedContentLengthCompatService<S>
+impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for AdminChunkedContentLengthCompatService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ReqBody: Send + 'static,
     ResBody: Send + 'static,
 {
     type Response = Response<ResBody>;
@@ -247,7 +248,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, mut req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, mut req: HttpRequest<ReqBody>) -> Self::Future {
         if should_force_zero_content_length_for_admin_empty_body(&req) {
             req.headers_mut()
                 .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
@@ -933,6 +934,7 @@ mod tests {
     use http_body_util::BodyExt;
     use http_body_util::Full;
     use std::convert::Infallible;
+    use std::sync::Mutex;
     use temp_env::with_var;
 
     #[derive(Clone, Debug)]
@@ -949,6 +951,32 @@ mod tests {
 
         fn call(&mut self, req: Request<B>) -> Self::Future {
             ready(Ok(req))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct HeaderCaptureService {
+        headers: Arc<Mutex<Option<HeaderMap>>>,
+    }
+
+    impl HeaderCaptureService {
+        fn headers(&self) -> Arc<Mutex<Option<HeaderMap>>> {
+            Arc::clone(&self.headers)
+        }
+    }
+
+    impl<B: Send + 'static> Service<Request<B>> for HeaderCaptureService {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<B>) -> Self::Future {
+            *self.headers.lock().expect("capture headers") = Some(req.headers().clone());
+            ready(Ok(Response::new(Full::from(Bytes::new()))))
         }
     }
 
@@ -984,6 +1012,23 @@ mod tests {
                 "{path} should force Content-Length: 0"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn admin_empty_body_post_layer_inserts_zero_content_length() {
+        let capture = HeaderCaptureService::default();
+        let headers = capture.headers();
+        let mut service = AdminChunkedContentLengthCompatLayer.layer(capture);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/rustfs/admin/v3/rebalance/start")
+            .body(())
+            .expect("request");
+
+        let _ = service.call(request).await.expect("service call");
+
+        let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+        assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
     }
 
     #[test]
