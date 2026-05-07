@@ -920,6 +920,11 @@ async fn apply_put_request_object_lock_opts(
     Ok(())
 }
 
+// Shared across Object Lock validation paths to keep the client-facing
+// InvalidRequest message consistent.
+pub(crate) const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
+    "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
+
 pub(crate) async fn build_put_like_object_lock_metadata(
     bucket: &str,
     object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
@@ -930,19 +935,21 @@ pub(crate) async fn build_put_like_object_lock_metadata(
         return Ok(None);
     }
 
-    validate_bucket_object_lock_enabled(bucket).await?;
-
     let retention = match (object_lock_mode, object_lock_retain_until_date) {
-        (Some(mode), retain_until_date) => Some(ObjectLockRetention {
+        (Some(mode), Some(retain_until_date)) => Some(ObjectLockRetention {
             mode: Some(ObjectLockRetentionMode::from(mode.as_str().to_string())),
-            retain_until_date,
-        }),
-        (None, Some(retain_until_date)) => Some(ObjectLockRetention {
-            mode: None,
             retain_until_date: Some(retain_until_date),
         }),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED.to_string(),
+            ));
+        }
         (None, None) => None,
     };
+
+    validate_bucket_object_lock_enabled(bucket).await?;
 
     let mut eval_metadata = parse_object_lock_retention(retention)?;
     eval_metadata.extend(parse_object_lock_legal_hold(
@@ -1792,6 +1799,7 @@ impl DefaultObjectUsecase {
         )?;
 
         let mut metadata = metadata.unwrap_or_default();
+        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
         apply_put_request_metadata(
             &mut metadata,
             &req.headers,
@@ -1806,6 +1814,7 @@ impl DefaultObjectUsecase {
             tagging,
             storage_class.clone(),
         )?;
+        apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
 
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
             .await
@@ -2759,6 +2768,8 @@ impl DefaultObjectUsecase {
             }
         }
 
+        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        remove_object_lock_metadata_for_copy(&mut src_info.user_defined);
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
             object_lock_legal_hold_status,
@@ -2769,6 +2780,7 @@ impl DefaultObjectUsecase {
         {
             src_info.user_defined.extend(object_lock_metadata);
         }
+        apply_bucket_default_lock_retention(&bucket, &mut src_info.user_defined, has_explicit_object_lock_retention).await?;
 
         let mut reader = match decryption_material {
             Some(material) => {
@@ -4292,6 +4304,7 @@ impl DefaultObjectUsecase {
                 .ok()
                 .and_then(|modified_at_secs| OffsetDateTime::from_unix_timestamp(modified_at_secs as i64).ok());
             let mut metadata = HashMap::new();
+            let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
             apply_put_request_metadata(
                 &mut metadata,
                 &req.headers,
@@ -4306,6 +4319,7 @@ impl DefaultObjectUsecase {
                 tagging.clone(),
                 storage_class.clone(),
             )?;
+            apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
             let mut opts = put_opts(&bucket, &fpath, None, &req.headers, metadata.clone())
                 .await
                 .map_err(ApiError::from)?;
@@ -4508,6 +4522,32 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[tokio::test]
+    async fn build_put_like_object_lock_metadata_rejects_mode_without_retain_until_date() {
+        let err = build_put_like_object_lock_metadata(
+            "test-bucket",
+            None,
+            Some(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
+    }
+
+    #[tokio::test]
+    async fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
+        let retain_until = Timestamp::from(OffsetDateTime::now_utc().add(time::Duration::days(1)));
+        let err = build_put_like_object_lock_metadata("test-bucket", None, None, Some(retain_until))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
     }
 
     #[test]

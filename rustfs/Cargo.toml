@@ -43,7 +43,7 @@ bench = false
 required-features = ["manual-test-runners"]
 
 [features]
-default = []
+default = ["ftps", "webdav"]
 metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
@@ -105,7 +105,7 @@ http-body.workspace = true
 http-body-util.workspace = true
 reqwest = { workspace = true }
 socket2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util","io-uring"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "io-uring"] }
 tokio-rustls = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 tokio-stream.workspace = true

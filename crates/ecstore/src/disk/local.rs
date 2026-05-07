@@ -2160,6 +2160,8 @@ impl DiskAPI for LocalDisk {
 
     /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
     /// Returns Bytes that can be shared without copying.
+    // SAFETY: Unix unsafe calls in this function only query page size and mmap
+    // a read-only file region after bounds and alignment are validated.
     #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
@@ -2212,6 +2214,8 @@ impl DiskAPI for LocalDisk {
                 // mmap offsets on Unix must be page-size aligned. Align the
                 // mapping down to the nearest page boundary, then slice out the
                 // originally requested logical range.
+                // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and
+                // only queries process-global OS configuration.
                 let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
                 if page_size <= 0 {
                     return Err(DiskError::other("failed to determine system page size"));
