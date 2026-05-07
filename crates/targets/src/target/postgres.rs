@@ -38,6 +38,8 @@ use crate::{
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rustfs_config::{POSTGRES_DSN_STRING, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
@@ -416,7 +418,7 @@ pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, Tar
         let pem = std::fs::read(&args.tls_ca)
             .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CA}: {e}")))?;
         let mut reader = BufReader::new(pem.as_slice());
-        for cert in rustls_pemfile::certs(&mut reader) {
+        for cert in CertificateDer::pem_reader_iter(&mut reader) {
             let cert = cert.map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CA}: {e}")))?;
             root_store
                 .add(cert)
@@ -432,13 +434,12 @@ pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, Tar
         let key_pem = std::fs::read(&args.tls_client_key)
             .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CLIENT_KEY}: {e}")))?;
 
-        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_slice()))
+        let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut BufReader::new(cert_pem.as_slice()))
             .collect::<Result<_, _>>()
             .map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CLIENT_CERT}: {e}")))?;
 
-        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
-            .map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CLIENT_KEY}: {e}")))?
-            .ok_or_else(|| TargetError::Configuration(format!("no private key found in {POSTGRES_TLS_CLIENT_KEY}")))?;
+        let key = PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_pem.as_slice()))
+            .map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CLIENT_KEY}: {e}")))?;
 
         builder
             .with_client_auth_cert(certs, key)
