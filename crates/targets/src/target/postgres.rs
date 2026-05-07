@@ -32,7 +32,7 @@ use crate::{
     store::{Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload,
+        TargetType, build_queued_payload, queue_store_subdir_name,
     },
 };
 use async_trait::async_trait;
@@ -595,7 +595,8 @@ where
 
         let queue_store = if !args.queue_dir.is_empty() {
             let base_path = PathBuf::from(&args.queue_dir);
-            let specific_queue_path = base_path.join(format!("rustfs-{}-{}", ChannelTargetType::Postgres.as_str(), target_id.id));
+            let specific_queue_path =
+                base_path.join(queue_store_subdir_name(ChannelTargetType::Postgres.as_str(), &target_id.id));
             let extension = match args.target_type {
                 TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
                 TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,

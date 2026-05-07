@@ -354,6 +354,23 @@ impl std::fmt::Display for TargetType {
     }
 }
 
+pub(crate) fn sanitize_queue_dir_component(component: &str) -> String {
+    let mut sanitized = String::with_capacity(component.len());
+    for ch in component.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.is_empty() { "_".to_string() } else { sanitized }
+}
+
+pub(crate) fn queue_store_subdir_name(target_type: &str, target_id: &str) -> String {
+    format!("rustfs-{target_type}-{}", sanitize_queue_dir_component(target_id))
+}
+
 /// Decodes a form-urlencoded object name to its original form.
 ///
 /// This function properly handles form-urlencoded strings where spaces are
@@ -461,5 +478,17 @@ mod tests {
     fn queued_payload_decode_rejects_invalid_magic() {
         let err = QueuedPayload::decode(b"bad-payload").unwrap_err();
         assert!(err.to_string().contains("magic") || err.to_string().contains("short"));
+    }
+
+    #[test]
+    fn sanitize_queue_dir_component_replaces_non_path_safe_characters() {
+        let sanitized = sanitize_queue_dir_component("tenant:alpha/beta\\gamma?*");
+        assert_eq!(sanitized, "tenant_alpha_beta_gamma__");
+    }
+
+    #[test]
+    fn queue_store_subdir_name_sanitizes_target_id() {
+        let dir = queue_store_subdir_name("redis", "tenant:alpha");
+        assert_eq!(dir, "rustfs-redis-tenant_alpha");
     }
 }

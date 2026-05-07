@@ -19,7 +19,7 @@ use crate::{
     store::{Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, delete_stored_payload,
+        TargetType, build_queued_payload, delete_stored_payload, queue_store_subdir_name,
     },
 };
 use async_trait::async_trait;
@@ -512,7 +512,7 @@ where
         // If `queue_dir` is non-empty, a `QueueStore` is created for persistent at-least-once delivery.
         let queue_store = if !args.queue_dir.is_empty() {
             let queue_dir =
-                PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::MySql.as_str(), target_id.id));
+                PathBuf::from(&args.queue_dir).join(queue_store_subdir_name(ChannelTargetType::MySql.as_str(), &target_id.id));
 
             let extension = match args.target_type {
                 TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
