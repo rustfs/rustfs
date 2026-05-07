@@ -1129,7 +1129,7 @@ mod tests {
 
         let err = target
             .send_raw_from_store(
-                crate::store::Key {
+                Key {
                     name: "key".to_string(),
                     extension: String::new(),
                     item_count: 1,

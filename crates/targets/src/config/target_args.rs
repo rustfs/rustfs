@@ -476,7 +476,7 @@ pub fn validate_kafka_config(config: &KVS, default_queue_dir: &str) -> Result<()
     let queue_dir = config
         .lookup(KAFKA_QUEUE_DIR)
         .unwrap_or_else(|| default_queue_dir.to_string());
-    if !queue_dir.is_empty() && !std::path::Path::new(&queue_dir).is_absolute() {
+    if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
         return Err(TargetError::Configuration("Kafka queue directory must be an absolute path".to_string()));
     }
 

@@ -103,7 +103,7 @@ impl MySqlArgs {
         }
 
         if !self.queue_dir.is_empty() {
-            let path = std::path::Path::new(&self.queue_dir);
+            let path = Path::new(&self.queue_dir);
             if !path.is_absolute() {
                 return Err(TargetError::Configuration("MySQL queue_dir must be an absolute path".to_string()));
             }
@@ -836,7 +836,7 @@ where
         Ok(())
     }
 
-    fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = crate::StoreError, Key = Key> + Send + Sync)> {
+    fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
         self.store.as_deref()
     }
 

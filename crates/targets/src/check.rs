@@ -94,7 +94,7 @@ pub async fn check_mqtt_broker_available_with_tls(
 }
 
 pub async fn check_nats_server_available(args: &crate::target::nats::NATSArgs) -> Result<(), crate::TargetError> {
-    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let client = crate::target::nats::connect_nats(args).await?;
         client
             .flush()
@@ -107,14 +107,11 @@ pub async fn check_nats_server_available(args: &crate::target::nats::NATSArgs) -
         Ok(())
     })
     .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(crate::TargetError::Timeout("NATS connection timed out".to_string())),
-    }
+    .unwrap_or_else(|_| Err(crate::TargetError::Timeout("NATS connection timed out".to_string())))
 }
 
 pub async fn check_pulsar_broker_available(args: &crate::target::pulsar::PulsarArgs) -> Result<(), crate::TargetError> {
-    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let client = crate::target::pulsar::connect_pulsar(args).await?;
         client
             .lookup_partitioned_topic(args.topic.clone())
@@ -123,10 +120,7 @@ pub async fn check_pulsar_broker_available(args: &crate::target::pulsar::PulsarA
         Ok(())
     })
     .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(crate::TargetError::Timeout("Pulsar connection timed out".to_string())),
-    }
+    .unwrap_or_else(|_| Err(crate::TargetError::Timeout("Pulsar connection timed out".to_string())))
 }
 
 /// Probes a PostgreSQL server for connectivity and verifies the configured
@@ -152,7 +146,7 @@ pub async fn check_postgres_server_available(args: &crate::target::postgres::Pos
     args.validate()?;
 
     let timeout = std::time::Duration::from_secs(8);
-    match tokio::time::timeout(timeout, async {
+    tokio::time::timeout(timeout, async {
         let pool = build_pool(args)?;
         let client = pool
             .get()
@@ -171,10 +165,7 @@ pub async fn check_postgres_server_available(args: &crate::target::postgres::Pos
         Ok::<(), crate::TargetError>(())
     })
     .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(crate::TargetError::Timeout("PostgreSQL connectivity probe timed out".to_string())),
-    }
+    .unwrap_or_else(|_| Err(crate::TargetError::Timeout("PostgreSQL connectivity probe timed out".to_string())))
 }
 
 pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs) -> Result<(), crate::TargetError> {
@@ -211,27 +202,21 @@ pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs
         config = config.with_security(security);
     }
 
-    match tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         let _ = AsyncProducer::from_hosts_with_config(args.brokers.clone(), config)
             .await
             .map_err(|err| map_kafka_error(err, "Kafka broker check failed to create producer"))?;
         Ok(())
     })
     .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(crate::TargetError::Timeout("Kafka connection timed out".to_string())),
-    }
+    .unwrap_or_else(|_| Err(crate::TargetError::Timeout("Kafka connection timed out".to_string())))
 }
 
 pub async fn check_redis_server_available(args: &crate::target::redis::RedisArgs) -> Result<(), crate::TargetError> {
-    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let client = crate::target::redis::build_redis_client(args)?;
         crate::target::redis::ping_redis_server(&client, args).await
     })
     .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(crate::TargetError::Timeout("Redis connection timed out".to_string())),
-    }
+    .unwrap_or_else(|_| Err(crate::TargetError::Timeout("Redis connection timed out".to_string())))
 }

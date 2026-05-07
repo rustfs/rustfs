@@ -465,7 +465,7 @@ impl MQTTArgs {
         }
 
         if !self.queue_dir.is_empty() {
-            let path = std::path::Path::new(&self.queue_dir);
+            let path = Path::new(&self.queue_dir);
             if !path.is_absolute() {
                 return Err(TargetError::Configuration("mqtt queue_dir path should be absolute".to_string()));
             }
@@ -828,7 +828,7 @@ fn is_fatal_mqtt_error(err: &ConnectionError) -> bool {
             match state_err {
                 // If StateError is caused by deserialization issues, check the underlying MqttBytesError
                 rumqttc::StateError::Deserialization(mqtt_bytes_err) => { // The type of mqtt_bytes_err is &rumqttc::mqttbytes::Error
-                        matches!(
+                    matches!(
                         mqtt_bytes_err,
                         MqttBytesError::InvalidProtocol // Invalid agreement
                         | MqttBytesError::InvalidProtocolLevel(_) // Invalid protocol level
@@ -922,7 +922,7 @@ where
                 Err(e) => {
                     error!(target_id = %self.id, error = %e, "Failed to save event to store");
                     self.delivery_counters.record_final_failure();
-                    return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+                    Err(TargetError::Storage(format!("Failed to save event to store: {e}")))
                 }
             }
         } else {
