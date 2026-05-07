@@ -1105,7 +1105,7 @@ where
                 Ok(get_output) => {
                     // Read all content from source
                     let body_bytes = if let Some(body) = get_output.body {
-                        let chunks: Vec<Result<Bytes, std::io::Error>> = body.collect().await;
+                        let chunks: Vec<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> = body.collect().await;
                         let mut all_data = Vec::new();
                         for chunk in chunks {
                             match chunk {
