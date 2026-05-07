@@ -8093,7 +8093,6 @@ version = "1.0.0-beta.2"
 dependencies = [
  "aes-gcm",
  "argon2",
- "cfg-if",
  "chacha20poly1305",
  "jsonwebtoken",
  "pbkdf2",
