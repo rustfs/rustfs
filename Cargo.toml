@@ -115,11 +115,11 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.1" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
-mysql_async = { version = "0.36.2", default-features = false, features = ["default-rustls"] }
+mysql_async = { version = "0.36.1", default-features = false, features = ["default-rustls", "tracing"], git = "https://github.com/blackbeam/mysql_async", rev = "98d3d8067efdf97d3e93cdca7b9231753c904aca" }
 async-compression = { version = "0.4.42" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
-async-nats = "0.47.0"
+async-nats = "0.48.0"
 axum = "0.8.9"
 futures = "0.3.32"
 futures-core = "0.3.32"
@@ -216,7 +216,7 @@ crossbeam-deque = "0.8.6"
 crossbeam-utils = "0.8.21"
 datafusion = "53.1.0"
 derive_builder = "0.20.2"
-enumset = "1.1.10"
+enumset = "1.1.12"
 faster-hex = "0.10.0"
 flate2 = "1.1.9"
 glob = "0.3.3"
