@@ -73,7 +73,8 @@ config:
     region: "us-east-1"
     ## If obs_log_directory is set, a separate volume for logs will be created and the logs will NOT be sent to stdout
     # obs_log_directory: "/logs"
-    ## Can use `production` or `development`.
+    ## Supported values include `production`, `development`, `test`, and `staging`;
+    ## refer to the RustFS configuration documentation/source for the authoritative list.
     obs_environment: "development"
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
