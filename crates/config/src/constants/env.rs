@@ -34,6 +34,12 @@ pub const ENV_NOTIFY_ENABLE: &str = "RUSTFS_NOTIFY_ENABLE";
 pub const DEFAULT_AUDIT_ENABLE: bool = false;
 /// Default global notify switch (disabled by default).
 pub const DEFAULT_NOTIFY_ENABLE: bool = false;
+/// Canonical ILM process boundary env key (seconds).
+pub const ENV_ILM_PROCESS_TIME: &str = "RUSTFS_ILM_PROCESS_TIME";
+/// Deprecated ILM process boundary env key kept for compatibility.
+pub const ENV_ILM_PROCESS_TIME_DEPRECATED: &str = "_RUSTFS_ILM_PROCESS_TIME";
+/// Default ILM process boundary in seconds (24h).
+pub const DEFAULT_ILM_PROCESS_TIME_SECS: i32 = 86400;
 
 /// Medium-drawn lines separator
 /// This is used to separate words in environment variable names.

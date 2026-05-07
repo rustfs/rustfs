@@ -443,11 +443,13 @@ impl PoolTier {
 }
 
 impl Drop for PooledBuffer {
+    // SAFETY: Drop has exclusive access to `self`; taking the `ManuallyDrop`
+    // buffer moves it exactly once into the pool when a tier still owns it.
     #[allow(unsafe_code)]
     fn drop(&mut self) {
         // Return buffer to pool if tier reference exists
         if let Some(ref tier) = self.tier {
-            // Safety: We're in drop(), so this is the last use of the buffer
+            // SAFETY: We're in drop(), so this is the last use of the buffer
             // ManuallyDrop allows us to take the value without running BytesMut's drop
             let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
             tier.return_buffer(buffer);

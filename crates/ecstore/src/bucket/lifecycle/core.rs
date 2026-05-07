@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_config::{DEFAULT_ILM_PROCESS_TIME_SECS, ENV_ILM_PROCESS_TIME, ENV_ILM_PROCESS_TIME_DEPRECATED};
 use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
@@ -19,7 +20,6 @@ use s3s::dto::{
 };
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::env;
 use std::sync::Arc;
 use time::macros::offset;
 use time::{self, Duration, OffsetDateTime};
@@ -805,16 +805,29 @@ pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTi
         .to_offset(offset!(-0:00:00))
         .saturating_add(Duration::days(days as i64));
 
-    // Truncate to midnight UTC per S3 standard, unless overridden by env var.
-    // _RUSTFS_ILM_PROCESS_TIME controls the truncation granularity in seconds.
-    let truncation_secs = env::var("_RUSTFS_ILM_PROCESS_TIME")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(86400); // default: truncate to midnight (24h)
+    // Round up to the next processing boundary per S3-compatible Days semantics.
+    // Canonical key: RUSTFS_ILM_PROCESS_TIME; deprecated alias: _RUSTFS_ILM_PROCESS_TIME.
+    // TODO(GA): Remove ENV_ILM_PROCESS_TIME_DEPRECATED compatibility during GA release.
+    let process_interval_secs = rustfs_utils::get_env_i32_with_aliases(
+        ENV_ILM_PROCESS_TIME,
+        &[ENV_ILM_PROCESS_TIME_DEPRECATED],
+        DEFAULT_ILM_PROCESS_TIME_SECS,
+    );
+    let process_interval_secs = if process_interval_secs > 0 {
+        process_interval_secs as u32
+    } else {
+        DEFAULT_ILM_PROCESS_TIME_SECS as u32
+    };
 
-    let unix_secs = t.unix_timestamp();
-    let truncated_secs = (unix_secs / truncation_secs as i64) * truncation_secs as i64;
-    OffsetDateTime::from_unix_timestamp(truncated_secs).unwrap_or(t)
+    let boundary_nanos = i128::from(process_interval_secs) * 1_000_000_000;
+    let timestamp_nanos = t.unix_timestamp_nanos();
+    let remainder = timestamp_nanos.rem_euclid(boundary_nanos);
+    let rounded_nanos = if remainder == 0 {
+        timestamp_nanos
+    } else {
+        timestamp_nanos + (boundary_nanos - remainder)
+    };
+    OffsetDateTime::from_unix_timestamp_nanos(rounded_nanos).unwrap_or(t)
 }
 
 pub async fn abort_incomplete_multipart_upload_due(
@@ -944,6 +957,12 @@ mod tests {
     use serial_test::serial;
     use std::sync::Arc;
     use time::macros::datetime;
+
+    fn with_default_ilm_process_time(test: impl FnOnce()) {
+        temp_env::with_var_unset(ENV_ILM_PROCESS_TIME, || {
+            temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, test);
+        });
+    }
 
     #[tokio::test]
     #[serial]
@@ -1336,7 +1355,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn eval_inner_expires_latest_object_after_days_due() {
-        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let base_time = datetime!(2025-01-15 10:30:45 UTC);
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
@@ -1362,11 +1381,11 @@ mod tests {
             is_latest: true,
             ..Default::default()
         };
-        let event = lc.eval_inner(&opts, base_time + Duration::days(2), 0).await;
+        let event = lc.eval_inner(&opts, datetime!(2025-01-17 00:00:00 UTC), 0).await;
 
         assert_eq!(event.action, IlmAction::DeleteAction);
         assert_eq!(event.rule_id, "expire-days");
-        assert_eq!(event.due, Some(expected_expiry_time(base_time, 1)));
+        assert_eq!(event.due, Some(datetime!(2025-01-17 00:00:00 UTC)));
     }
 
     #[tokio::test]
@@ -2135,40 +2154,98 @@ mod tests {
             .expect("expected days-based expiration to pass on locked bucket");
     }
 
-    // --- TASK-003 tests: Midnight UTC truncation ---
+    // --- TASK-003 tests: Round up to next UTC processing boundary ---
 
     #[test]
-    fn expected_expiry_time_truncates_to_midnight_utc() {
-        // Object created at 2025-01-15T10:30:45Z, expire in 30 days
-        let mod_time = datetime!(2025-01-15 10:30:45 UTC);
-        let result = expected_expiry_time(mod_time, 30);
+    #[serial]
+    fn expected_expiry_time_rounds_up_to_next_midnight_utc() {
+        with_default_ilm_process_time(|| {
+            // Object created at 2025-01-15T10:30:45Z, expire in 30 days
+            let mod_time = datetime!(2025-01-15 10:30:45 UTC);
+            let result = expected_expiry_time(mod_time, 30);
 
-        // Should be truncated to midnight: 2025-02-14T00:00:00Z
-        assert_eq!(result.hour(), 0);
-        assert_eq!(result.minute(), 0);
-        assert_eq!(result.second(), 0);
-        assert_eq!(result, datetime!(2025-02-14 00:00:00 UTC));
+            // Should round up to the next midnight: 2025-02-15T00:00:00Z
+            assert_eq!(result.hour(), 0);
+            assert_eq!(result.minute(), 0);
+            assert_eq!(result.second(), 0);
+            assert_eq!(result, datetime!(2025-02-15 00:00:00 UTC));
+        });
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_immediate_expiry_returns_epoch() {
-        let mod_time = datetime!(2025-06-01 12:00:00 UTC);
-        let result = expected_expiry_time(mod_time, 0);
-        assert_eq!(result, OffsetDateTime::UNIX_EPOCH);
+        with_default_ilm_process_time(|| {
+            let mod_time = datetime!(2025-06-01 12:00:00 UTC);
+            let result = expected_expiry_time(mod_time, 0);
+            assert_eq!(result, OffsetDateTime::UNIX_EPOCH);
+        });
     }
 
     #[test]
-    fn expected_expiry_time_truncates_already_midnight() {
-        let mod_time = datetime!(2025-03-01 00:00:00 UTC);
-        let result = expected_expiry_time(mod_time, 1);
-        assert_eq!(result, datetime!(2025-03-02 00:00:00 UTC));
+    #[serial]
+    fn expected_expiry_time_preserves_exact_midnight_boundary() {
+        with_default_ilm_process_time(|| {
+            let mod_time = datetime!(2025-03-01 00:00:00 UTC);
+            let result = expected_expiry_time(mod_time, 1);
+            assert_eq!(result, datetime!(2025-03-02 00:00:00 UTC));
+        });
     }
 
     #[test]
-    fn expected_expiry_time_truncates_end_of_day() {
-        let mod_time = datetime!(2025-06-15 23:59:59 UTC);
-        let result = expected_expiry_time(mod_time, 1);
-        assert_eq!(result, datetime!(2025-06-16 00:00:00 UTC));
+    #[serial]
+    fn expected_expiry_time_rounds_end_of_day_to_following_midnight() {
+        with_default_ilm_process_time(|| {
+            let mod_time = datetime!(2025-06-15 23:59:59 UTC);
+            let result = expected_expiry_time(mod_time, 1);
+            assert_eq!(result, datetime!(2025-06-17 00:00:00 UTC));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn expected_expiry_time_uses_canonical_process_time_boundary() {
+        let mod_time = datetime!(2025-01-15 10:30:45 UTC);
+
+        temp_env::with_var(ENV_ILM_PROCESS_TIME, Some("3600"), || {
+            temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, || {
+                let result = expected_expiry_time(mod_time, 1);
+                assert_eq!(result, datetime!(2025-01-16 11:00:00 UTC));
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn expected_expiry_time_uses_deprecated_process_time_alias() {
+        let mod_time = datetime!(2025-01-15 10:30:45 UTC);
+
+        temp_env::with_var_unset(ENV_ILM_PROCESS_TIME, || {
+            temp_env::with_var(ENV_ILM_PROCESS_TIME_DEPRECATED, Some("3600"), || {
+                let result = expected_expiry_time(mod_time, 1);
+                assert_eq!(result, datetime!(2025-01-16 11:00:00 UTC));
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn expected_expiry_time_uses_default_boundary_when_process_time_is_zero_or_invalid() {
+        let mod_time = datetime!(2025-01-15 10:30:45 UTC);
+
+        temp_env::with_var(ENV_ILM_PROCESS_TIME, Some("0"), || {
+            temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, || {
+                let result = expected_expiry_time(mod_time, 30);
+                assert_eq!(result, datetime!(2025-02-15 00:00:00 UTC));
+            });
+        });
+
+        temp_env::with_var(ENV_ILM_PROCESS_TIME, Some("not-a-number"), || {
+            temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, || {
+                let result = expected_expiry_time(mod_time, 30);
+                assert_eq!(result, datetime!(2025-02-15 00:00:00 UTC));
+            });
+        });
     }
 
     // --- TASK-007 tests: Legacy Prefix/Filter conflict ---

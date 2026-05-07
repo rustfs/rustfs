@@ -4,9 +4,6 @@
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml">
     <img src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" alt="CI Status" />
   </a>
-  <a href="https://docs.rs/rustfs-io-metrics">
-    <img src="https://docs.rs/rustfs-io-metrics/badge.svg" alt="Documentation" />
-  </a>
   <a href="https://crates.io/crates/rustfs-io-metrics">
     <img src="https://img.shields.io/crates/v/rustfs-io-metrics.svg" alt="Crates.io" />
   </a>
@@ -14,7 +11,7 @@
 
 <p align="center">
   · <a href="https://github.com/rustfs/rustfs">Home</a>
-  · <a href="https://docs.rs/rustfs-io-metrics">Docs</a>
+  · <a href="#documentation">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Issues</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
 </p>
@@ -205,10 +202,23 @@ cargo bench --package rustfs-io-metrics --bench metrics_pipeline
 
 ## Documentation
 
-- [API Documentation](https://docs.rs/rustfs-io-metrics)
-- [Adaptive TTL Design](./docs/adaptive-ttl-design.md)
-- [Metrics Guide](./docs/metrics-guide.md)
-- [Configuration Reference](./docs/config-reference.md)
+This crate records metrics through the Rust `metrics` crate and leaves
+exporting to `rustfs-obs` or the application-level observability pipeline. It
+does not expose Prometheus-compatible HTTP endpoints such as
+`/rustfs/v2/metrics/cluster` or `/rustfs/v2/metrics/node`.
+
+API documentation can be generated locally:
+
+```bash
+cargo doc --package rustfs-io-metrics --no-deps --open
+```
+
+Useful source references:
+
+- [Crate API overview](./src/lib.rs)
+- [Metrics example](./examples/metrics_example.rs)
+- [Configuration module](./src/config.rs)
+- [Adaptive TTL module](./src/adaptive_ttl.rs)
 
 ## Related Modules
 

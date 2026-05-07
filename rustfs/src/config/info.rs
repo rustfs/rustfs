@@ -604,7 +604,7 @@ fn feature_specs() -> [FeatureSpec; 8] {
             enabled: cfg!(feature = "ftps"),
             description: "FTPS protocol support",
             dependencies: "rustfs-protocols/ftps",
-            default_enabled: false,
+            default_enabled: true,
         },
         FeatureSpec {
             name: "swift",
@@ -618,7 +618,7 @@ fn feature_specs() -> [FeatureSpec; 8] {
             enabled: cfg!(feature = "webdav"),
             description: "WebDAV protocol support",
             dependencies: "rustfs-protocols/webdav",
-            default_enabled: false,
+            default_enabled: true,
         },
         FeatureSpec {
             name: "license",
@@ -748,6 +748,7 @@ fn format_config_info() -> String {
     } else {
         &snapshot.obs_endpoint
     };
+    let protocol_info = format_protocol_config_info();
 
     format!(
         "## Configuration Information\n\n\
@@ -764,6 +765,7 @@ fn format_config_info() -> String {
          | KMS Enabled | {} |\n\
          | KMS Backend | {} |\n\
          | Buffer Profile | {} |\n\
+         {}\n\
          {}",
         snapshot.address,
         snapshot.console_enable,
@@ -775,7 +777,87 @@ fn format_config_info() -> String {
         snapshot.kms_enable,
         snapshot.kms_backend,
         snapshot.buffer_profile,
-        workload_info
+        workload_info,
+        protocol_info
+    )
+}
+
+fn format_protocol_config_info() -> String {
+    const DEFAULT_FTPS_PASSIVE_PORTS: &str = "40000-50000";
+    const DEFAULT_WEBDAV_MAX_BODY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+    const DEFAULT_WEBDAV_REQUEST_TIMEOUT_SECS: u64 = 300;
+
+    let ftps_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_FTPS_ENABLE, false);
+    let ftps_address = rustfs_utils::get_env_str(rustfs_config::ENV_FTPS_ADDRESS, rustfs_config::DEFAULT_FTPS_ADDRESS);
+    let ftps_tls_enabled = rustfs_utils::get_env_bool(rustfs_config::ENV_FTPS_TLS_ENABLED, true);
+    let ftps_certs_dir =
+        rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_CERTS_DIR).unwrap_or_else(|| "(not set)".to_string());
+    let ftps_ca_file = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_CA_FILE).unwrap_or_else(|| "(not set)".to_string());
+    let ftps_passive_ports = rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_PASSIVE_PORTS)
+        .unwrap_or_else(|| DEFAULT_FTPS_PASSIVE_PORTS.to_string());
+    let ftps_external_ip =
+        rustfs_utils::get_env_opt_str(rustfs_config::ENV_FTPS_EXTERNAL_IP).unwrap_or_else(|| "(not set)".to_string());
+
+    let webdav_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_WEBDAV_ENABLE, false);
+    let webdav_address = rustfs_utils::get_env_str(rustfs_config::ENV_WEBDAV_ADDRESS, rustfs_config::DEFAULT_WEBDAV_ADDRESS);
+    let webdav_tls_enabled = rustfs_utils::get_env_bool(rustfs_config::ENV_WEBDAV_TLS_ENABLED, true);
+    let webdav_certs_dir =
+        rustfs_utils::get_env_opt_str(rustfs_config::ENV_WEBDAV_CERTS_DIR).unwrap_or_else(|| "(not set)".to_string());
+    let webdav_ca_file =
+        rustfs_utils::get_env_opt_str(rustfs_config::ENV_WEBDAV_CA_FILE).unwrap_or_else(|| "(not set)".to_string());
+    let webdav_max_body_size = rustfs_utils::get_env_u64(rustfs_config::ENV_WEBDAV_MAX_BODY_SIZE, DEFAULT_WEBDAV_MAX_BODY_SIZE);
+    let webdav_request_timeout =
+        rustfs_utils::get_env_u64(rustfs_config::ENV_WEBDAV_REQUEST_TIMEOUT, DEFAULT_WEBDAV_REQUEST_TIMEOUT_SECS);
+
+    format!(
+        "| FTPS | --- |\n\
+         | FTPS > Build Feature | {} |\n\
+         | FTPS > Enabled (`{}`) | {} |\n\
+         | FTPS > Address (`{}`) | {} |\n\
+         | FTPS > TLS Enabled (`{}`) | {} |\n\
+         | FTPS > Certs Dir (`{}`) | {} |\n\
+         | FTPS > CA File (`{}`) | {} |\n\
+         | FTPS > Passive Ports (`{}`) | {} |\n\
+         | FTPS > External IP (`{}`) | {} |\n\
+         | WebDAV | --- |\n\
+         | WebDAV > Build Feature | {} |\n\
+         | WebDAV > Enabled (`{}`) | {} |\n\
+         | WebDAV > Address (`{}`) | {} |\n\
+         | WebDAV > TLS Enabled (`{}`) | {} |\n\
+         | WebDAV > Certs Dir (`{}`) | {} |\n\
+         | WebDAV > CA File (`{}`) | {} |\n\
+         | WebDAV > Max Body Size (`{}`) | {} bytes |\n\
+         | WebDAV > Request Timeout (`{}`) | {} seconds |",
+        if cfg!(feature = "ftps") { "enabled" } else { "disabled" },
+        rustfs_config::ENV_FTPS_ENABLE,
+        ftps_enable,
+        rustfs_config::ENV_FTPS_ADDRESS,
+        ftps_address,
+        rustfs_config::ENV_FTPS_TLS_ENABLED,
+        ftps_tls_enabled,
+        rustfs_config::ENV_FTPS_CERTS_DIR,
+        ftps_certs_dir,
+        rustfs_config::ENV_FTPS_CA_FILE,
+        ftps_ca_file,
+        rustfs_config::ENV_FTPS_PASSIVE_PORTS,
+        ftps_passive_ports,
+        rustfs_config::ENV_FTPS_EXTERNAL_IP,
+        ftps_external_ip,
+        if cfg!(feature = "webdav") { "enabled" } else { "disabled" },
+        rustfs_config::ENV_WEBDAV_ENABLE,
+        webdav_enable,
+        rustfs_config::ENV_WEBDAV_ADDRESS,
+        webdav_address,
+        rustfs_config::ENV_WEBDAV_TLS_ENABLED,
+        webdav_tls_enabled,
+        rustfs_config::ENV_WEBDAV_CERTS_DIR,
+        webdav_certs_dir,
+        rustfs_config::ENV_WEBDAV_CA_FILE,
+        webdav_ca_file,
+        rustfs_config::ENV_WEBDAV_MAX_BODY_SIZE,
+        webdav_max_body_size,
+        rustfs_config::ENV_WEBDAV_REQUEST_TIMEOUT,
+        webdav_request_timeout
     )
 }
 
@@ -935,7 +1017,23 @@ mod tests {
         assert!(output.contains("| metrics-gpu |"));
         assert!(output.contains("| io-scheduler-debug |"));
         assert!(output.contains("| manual-test-runners |"));
+        assert!(output.contains("| ftps | enabled by default |"));
+        assert!(output.contains("| webdav | enabled by default |"));
         assert!(output.contains("| full | metrics-gpu + ftps + swift + webdav |"));
         assert!(!output.contains("| direct-io |"));
+    }
+
+    #[test]
+    fn test_format_config_info_includes_ftps_and_webdav_subitems() {
+        let output = format_config_info();
+
+        assert!(output.contains("| FTPS | --- |"));
+        assert!(output.contains("| FTPS > Enabled (`RUSTFS_FTPS_ENABLE`) |"));
+        assert!(output.contains("| FTPS > Address (`RUSTFS_FTPS_ADDRESS`) |"));
+        assert!(output.contains("| FTPS > Passive Ports (`RUSTFS_FTPS_PASSIVE_PORTS`) |"));
+        assert!(output.contains("| WebDAV | --- |"));
+        assert!(output.contains("| WebDAV > Enabled (`RUSTFS_WEBDAV_ENABLE`) |"));
+        assert!(output.contains("| WebDAV > Address (`RUSTFS_WEBDAV_ADDRESS`) |"));
+        assert!(output.contains("| WebDAV > Max Body Size (`RUSTFS_WEBDAV_MAX_BODY_SIZE`) |"));
     }
 }

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unsafe_code)]
-
 use backtrace::Backtrace;
 use pprof::protos::Message;
 use rand::RngExt;
@@ -343,6 +341,11 @@ fn handle_dealloc_sampling(ptr: *mut u8) {
     }
 }
 
+// SAFETY: This allocator wrapper preserves the `GlobalAlloc` contract by
+// delegating all allocation operations to `inner` with the exact caller-provided
+// layouts and pointers. Sampling records metadata only and does not take
+// ownership of allocation memory.
+#[allow(unsafe_code)]
 unsafe impl<A: GlobalAlloc> GlobalAlloc for TracingAllocator<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: Delegating to inner allocator.
@@ -376,6 +379,10 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for TracingAllocator<A> {
 }
 
 #[cfg(test)]
+// SAFETY: Tests call the unsafe `GlobalAlloc` methods with layouts created by
+// `Layout::from_size_align` and deallocate each returned pointer with the same
+// layout.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use serial_test::serial;

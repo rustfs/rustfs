@@ -16,7 +16,7 @@ use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
         AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, TargetEndpointSource, allowed_target_keys,
-        collect_validated_key_values as shared_collect_validated_key_values,
+        build_json_response, collect_validated_key_values as shared_collect_validated_key_values,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
         validate_target_request,
@@ -28,18 +28,20 @@ use crate::server::{
     ADMIN_PREFIX, RemoteAddr, is_audit_module_enabled, refresh_audit_module_enabled, refresh_persisted_module_switches_from_store,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
-use http::{HeaderMap, StatusCode};
+use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::audit::{
-    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS,
-    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS,
+    AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
+    AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS, AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS,
+    AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -93,7 +95,7 @@ struct AuditEndpointsResponse {
     audit_endpoints: Vec<AuditEndpoint>,
 }
 
-fn audit_target_specs() -> [AdminTargetSpec; 5] {
+fn audit_target_specs() -> [AdminTargetSpec; 8] {
     [
         AdminTargetSpec {
             subsystem: AUDIT_WEBHOOK_SUB_SYS,
@@ -114,16 +116,34 @@ fn audit_target_specs() -> [AdminTargetSpec; 5] {
             validator: AdminTargetValidator::Mqtt,
         },
         AdminTargetSpec {
+            subsystem: AUDIT_MYSQL_SUB_SYS,
+            service: "mysql",
+            valid_keys: AUDIT_MYSQL_KEYS,
+            validator: AdminTargetValidator::MySql,
+        },
+        AdminTargetSpec {
             subsystem: AUDIT_NATS_SUB_SYS,
             service: "nats",
             valid_keys: AUDIT_NATS_KEYS,
             validator: AdminTargetValidator::Nats(TargetDomain::Audit),
         },
         AdminTargetSpec {
+            subsystem: AUDIT_POSTGRES_SUB_SYS,
+            service: "postgres",
+            valid_keys: AUDIT_POSTGRES_KEYS,
+            validator: AdminTargetValidator::Postgres(TargetDomain::Audit),
+        },
+        AdminTargetSpec {
             subsystem: AUDIT_PULSAR_SUB_SYS,
             service: "pulsar",
             valid_keys: AUDIT_PULSAR_KEYS,
             validator: AdminTargetValidator::Pulsar(TargetDomain::Audit),
+        },
+        AdminTargetSpec {
+            subsystem: AUDIT_REDIS_SUB_SYS,
+            service: "redis",
+            valid_keys: AUDIT_REDIS_KEYS,
+            validator: AdminTargetValidator::Redis(TargetDomain::Audit, AUDIT_REDIS_DEFAULT_CHANNEL),
         },
     ]
 }
@@ -136,15 +156,6 @@ async fn authorize_audit_admin_request(req: &S3Request<Body>, action: AdminActio
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
-}
-
-fn build_response(status: StatusCode, body: Body, request_id: Option<&http::HeaderValue>) -> S3Response<(StatusCode, Body)> {
-    let mut header = HeaderMap::new();
-    header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-    if let Some(v) = request_id {
-        header.insert("x-request-id", v.clone());
-    }
-    S3Response::with_headers((status, body), header)
 }
 
 fn has_any_audit_targets(config: &Config) -> bool {
@@ -334,7 +345,7 @@ impl Operation for AuditTargetConfig {
         })
         .await?;
 
-        Ok(build_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
 }
 
@@ -375,7 +386,7 @@ impl Operation for ListAuditTargets {
         let data = serde_json::to_vec(&AuditEndpointsResponse { audit_endpoints })
             .map_err(|e| s3_error!(InternalError, "failed to serialize audit targets: {}", e))?;
 
-        Ok(build_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
 }
 
@@ -411,7 +422,7 @@ impl Operation for RemoveAuditTarget {
         })
         .await?;
 
-        Ok(build_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
 }
 

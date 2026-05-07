@@ -351,6 +351,7 @@ impl RustFSTestEnvironment {
     async fn start_rustfs_server_inner(
         &mut self,
         extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
         cleanup_existing: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if cleanup_existing {
@@ -362,10 +363,12 @@ impl RustFSTestEnvironment {
         info!("Starting RustFS server with args: {:?}", args);
 
         let binary_path = rustfs_binary_path();
-        let process = Command::new(&binary_path)
-            .env("RUST_LOG", "rustfs=info,rustfs_notify=debug")
-            .args(&args)
-            .spawn()?;
+        let mut command = Command::new(&binary_path);
+        command.env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let process = command.args(&args).spawn()?;
 
         self.process = Some(process);
 
@@ -377,7 +380,16 @@ impl RustFSTestEnvironment {
 
     /// Start RustFS server with basic configuration
     pub async fn start_rustfs_server(&mut self, extra_args: Vec<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.start_rustfs_server_inner(extra_args, true).await
+        self.start_rustfs_server_inner(extra_args, &[], true).await
+    }
+
+    /// Start RustFS server with extra child-process environment variables.
+    pub async fn start_rustfs_server_with_env(
+        &mut self,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_inner(extra_args, extra_env, true).await
     }
 
     /// Start RustFS server without cleaning up other running RustFS processes.
@@ -388,7 +400,7 @@ impl RustFSTestEnvironment {
         &mut self,
         extra_args: Vec<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.start_rustfs_server_inner(extra_args, false).await
+        self.start_rustfs_server_inner(extra_args, &[], false).await
     }
 
     /// Wait for RustFS server to be ready.

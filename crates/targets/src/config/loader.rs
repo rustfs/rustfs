@@ -38,10 +38,24 @@ fn is_sensitive_target_field(field_name: &str) -> bool {
         || field_name.contains("client_key")
         || field_name.contains("access_key")
         || field_name.contains("auth")
+        || field_name.contains(rustfs_config::BASE_DSN_STRING)
 }
 
 fn redact_target_field_value(field_name: &str, value: &str) -> String {
-    if is_sensitive_target_field(field_name) && !value.is_empty() {
+    if value.is_empty() {
+        return value.to_string();
+    }
+    // MySQL DSN fields need partial redaction instead of full masking so the
+    // remaining connection details (host, port, database) remain visible in
+    // debug logs while the password is hidden.
+    if field_name == rustfs_config::BASE_DSN_STRING {
+        let trimmed = value.trim_start();
+        if trimmed.starts_with("postgres://") || trimmed.starts_with("postgresql://") {
+            return crate::target::postgres::redact_postgres_dsn(value);
+        }
+        return crate::target::mysql::redact_mysql_dsn(value);
+    }
+    if is_sensitive_target_field(field_name) {
         return "***redacted***".to_string();
     }
     value.to_string()
@@ -281,6 +295,23 @@ mod tests {
     fn redact_target_field_value_keeps_non_sensitive_fields() {
         assert_eq!(redact_target_field_value("endpoint", "https://example.com"), "https://example.com");
         assert_eq!(redact_target_field_value("queue_limit", "1000"), "1000");
+    }
+
+    #[test]
+    fn redact_dsn_string_partial_redaction() {
+        let dsn = "rustfs:secret123@tcp(mysql.example.com:3306)/rustfs_events";
+        let redacted = redact_target_field_value(rustfs_config::MYSQL_DSN_STRING, dsn);
+        assert_eq!(redacted, "rustfs:***@tcp(mysql.example.com:3306)/rustfs_events");
+        // empty dsn_string value
+        assert_eq!(redact_target_field_value(rustfs_config::MYSQL_DSN_STRING, ""), "");
+    }
+
+    #[test]
+    fn redact_postgres_dsn_string_partial_redaction() {
+        let dsn = "postgres://rustfs:secret123@pg.example.com:5432/rustfs_events?search_path=public";
+        let redacted = redact_target_field_value(rustfs_config::POSTGRES_DSN_STRING, dsn);
+        assert_eq!(redacted, "postgres://rustfs:***@pg.example.com:5432/rustfs_events?search_path=public");
+        assert_eq!(redact_target_field_value(rustfs_config::POSTGRES_DSN_STRING, ""), "");
     }
 
     #[test]

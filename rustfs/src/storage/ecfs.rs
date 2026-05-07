@@ -43,7 +43,9 @@ use rustfs_ecstore::{
 };
 use rustfs_s3_common::{S3Operation, record_s3_op};
 use rustfs_targets::EventName;
-use rustfs_utils::http::headers::AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER;
+use rustfs_utils::http::headers::{
+    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::fmt::Debug;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -780,12 +782,12 @@ impl S3 for FS {
 
         let mode = object_info
             .user_defined
-            .get("x-amz-object-lock-mode")
+            .get(AMZ_OBJECT_LOCK_MODE_LOWER)
             .map(|v| ObjectLockRetentionMode::from(v.as_str().to_string()));
 
         let retain_until_date = object_info
             .user_defined
-            .get("x-amz-object-lock-retain-until-date")
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
             .and_then(|v| OffsetDateTime::parse(v.as_str(), &Rfc3339).ok())
             .map(Timestamp::from);
 

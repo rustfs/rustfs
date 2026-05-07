@@ -1203,6 +1203,9 @@ mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri, header::HeaderValue};
     use rustfs_filemeta::ObjectPartInfo;
+    use rustfs_utils::http::{
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+    };
     use std::{collections::HashMap, io::Cursor};
     use tokio::io::AsyncReadExt;
 
@@ -1548,9 +1551,9 @@ mod tests {
         };
 
         for (header_name, header_value) in [
-            ("x-amz-object-lock-mode", "GOVERNANCE"),
-            ("x-amz-object-lock-retain-until-date", "2030-01-01T00:00:00Z"),
-            ("x-amz-object-lock-legal-hold", "ON"),
+            (AMZ_OBJECT_LOCK_MODE_LOWER, "GOVERNANCE"),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, "2030-01-01T00:00:00Z"),
+            (AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "ON"),
             ("x-amz-bypass-governance-retention", "true"),
         ] {
             let input = CompleteMultipartUploadInput::builder()

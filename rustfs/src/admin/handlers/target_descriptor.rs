@@ -13,19 +13,23 @@
 // limitations under the License.
 
 use hashbrown::HashSet as HbHashSet;
+use http::{HeaderMap, HeaderValue, StatusCode};
 use rustfs_config::{
     ENABLE_KEY, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_TLS_CA,
     MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
-    MQTT_WS_PATH_ALLOWLIST,
+    MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     TargetError, check_kafka_broker_available, check_mqtt_broker_available_with_tls, check_nats_server_available,
-    check_pulsar_broker_available,
-    config::{build_kafka_args, build_nats_args, build_pulsar_args, collect_env_target_instance_ids},
+    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
+    config::{
+        build_kafka_args, build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args,
+        collect_env_target_instance_ids, validate_mysql_config, validate_redis_config,
+    },
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
-use s3s::{S3Result, s3_error};
+use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
@@ -71,8 +75,11 @@ pub(crate) enum AdminTargetValidator {
     Webhook,
     Mqtt,
     Kafka(TargetDomain),
+    MySql,
     Nats(TargetDomain),
+    Postgres(TargetDomain),
     Pulsar(TargetDomain),
+    Redis(TargetDomain, &'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +206,19 @@ pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, en
             "{module_name} module is disabled; enable the {module_name} module first in the console or set {env_key}=true before {action}"
         )
     })
+}
+
+pub(crate) fn build_json_response(
+    status: StatusCode,
+    body: Body,
+    request_id: Option<&HeaderValue>,
+) -> S3Response<(StatusCode, Body)> {
+    let mut header = HeaderMap::new();
+    header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(v) = request_id {
+        header.insert("x-request-id", v.clone());
+    }
+    S3Response::with_headers((status, body), header)
 }
 
 pub(crate) fn merge_target_endpoints(
@@ -336,8 +356,13 @@ pub(crate) async fn validate_target_request(
         AdminTargetValidator::Webhook => validate_webhook_request(kv_map).await,
         AdminTargetValidator::Mqtt => validate_mqtt_request(kv_map).await,
         AdminTargetValidator::Kafka(domain) => validate_kafka_request(kv_map, default_queue_dir, domain).await,
+        AdminTargetValidator::MySql => validate_mysql_request(kv_map, default_queue_dir).await,
         AdminTargetValidator::Nats(domain) => validate_nats_request(kv_map, default_queue_dir, domain).await,
         AdminTargetValidator::Pulsar(domain) => validate_pulsar_request(kv_map, default_queue_dir, domain).await,
+        AdminTargetValidator::Postgres(domain) => validate_postgres_request(kv_map, default_queue_dir, domain).await,
+        AdminTargetValidator::Redis(domain, default_channel) => {
+            validate_redis_request(kv_map, default_queue_dir, domain, default_channel).await
+        }
     }
 }
 
@@ -484,6 +509,53 @@ async fn validate_pulsar_request(
     check_pulsar_broker_available(&args).await.map_err(|e| match e {
         TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
         _ => s3_error!(InvalidArgument, "Pulsar broker check failed: {}", e),
+    })
+}
+
+async fn validate_mysql_request(kv_map: &HashMap<String, String>, default_queue_dir: &str) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get(MYSQL_QUEUE_DIR) {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+
+    validate_mysql_config(&to_kvs(kv_map), default_queue_dir).map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+
+    Ok(())
+}
+
+async fn validate_postgres_request(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get(POSTGRES_QUEUE_DIR) {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+    let args = build_postgres_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
+        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    check_postgres_server_available(&args).await.map_err(|e| match e {
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+        _ => s3_error!(InvalidArgument, "PostgreSQL server check failed: {}", e),
+    })
+}
+
+async fn validate_redis_request(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+    default_channel: &str,
+) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get(REDIS_QUEUE_DIR) {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+
+    validate_redis_config(&to_kvs(kv_map), default_queue_dir, default_channel)
+        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+
+    let args = build_redis_args(&to_kvs(kv_map), default_queue_dir, default_channel, domain.runtime_target_type())
+        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    check_redis_server_available(&args).await.map_err(|e| match e {
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+        _ => s3_error!(InvalidArgument, "Redis server check failed: {}", e),
     })
 }
 

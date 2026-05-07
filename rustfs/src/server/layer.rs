@@ -232,11 +232,12 @@ pub struct AdminChunkedContentLengthCompatService<S> {
     inner: S,
 }
 
-impl<S, ResBody> Service<HttpRequest<Incoming>> for AdminChunkedContentLengthCompatService<S>
+impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for AdminChunkedContentLengthCompatService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ReqBody: Send + 'static,
     ResBody: Send + 'static,
 {
     type Response = Response<ResBody>;
@@ -247,7 +248,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, mut req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, mut req: HttpRequest<ReqBody>) -> Self::Future {
         if should_force_zero_content_length_for_admin_empty_body(&req) {
             req.headers_mut()
                 .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
@@ -259,19 +260,31 @@ where
 }
 
 fn should_force_zero_content_length_for_admin_empty_body<B>(req: &HttpRequest<B>) -> bool {
-    req.method() == Method::PUT
-        && is_empty_body_admin_put_path(req.uri().path())
-        && !req.headers().contains_key(http::header::CONTENT_LENGTH)
+    is_empty_body_admin_path(req.method(), req.uri().path()) && !req.headers().contains_key(http::header::CONTENT_LENGTH)
 }
 
-fn is_empty_body_admin_put_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/minio/admin/v3/set-user-status"
-            | "/minio/admin/v3/set-group-status"
-            | "/rustfs/admin/v3/set-user-status"
-            | "/rustfs/admin/v3/set-group-status"
-    )
+fn is_empty_body_admin_path(method: &Method, path: &str) -> bool {
+    match *method {
+        Method::PUT => matches!(
+            path,
+            "/minio/admin/v3/set-user-status"
+                | "/minio/admin/v3/set-group-status"
+                | "/rustfs/admin/v3/set-user-status"
+                | "/rustfs/admin/v3/set-group-status"
+        ),
+        Method::POST => matches!(
+            path,
+            "/minio/admin/v3/rebalance/start"
+                | "/minio/admin/v3/rebalance/stop"
+                | "/minio/admin/v3/pools/decommission"
+                | "/minio/admin/v3/pools/cancel"
+                | "/rustfs/admin/v3/rebalance/start"
+                | "/rustfs/admin/v3/rebalance/stop"
+                | "/rustfs/admin/v3/pools/decommission"
+                | "/rustfs/admin/v3/pools/cancel"
+        ),
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -921,6 +934,7 @@ mod tests {
     use http_body_util::BodyExt;
     use http_body_util::Full;
     use std::convert::Infallible;
+    use std::sync::Mutex;
     use temp_env::with_var;
 
     #[derive(Clone, Debug)]
@@ -940,6 +954,32 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct HeaderCaptureService {
+        headers: Arc<Mutex<Option<HeaderMap>>>,
+    }
+
+    impl HeaderCaptureService {
+        fn headers(&self) -> Arc<Mutex<Option<HeaderMap>>> {
+            Arc::clone(&self.headers)
+        }
+    }
+
+    impl<B: Send + 'static> Service<Request<B>> for HeaderCaptureService {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<B>) -> Self::Future {
+            *self.headers.lock().expect("capture headers") = Some(req.headers().clone());
+            ready(Ok(Response::new(Full::from(Bytes::new()))))
+        }
+    }
+
     #[test]
     fn admin_chunked_put_without_content_length_is_normalized() {
         let request = Request::builder()
@@ -949,6 +989,46 @@ mod tests {
             .expect("request");
 
         assert!(should_force_zero_content_length_for_admin_empty_body(&request));
+    }
+
+    #[test]
+    fn admin_empty_body_post_without_content_length_is_normalized() {
+        let paths = [
+            "/minio/admin/v3/rebalance/start",
+            "/minio/admin/v3/rebalance/stop",
+            "/minio/admin/v3/pools/decommission?pool=http%3A%2F%2Fminio-%7B1...4%7D%3A9000%2Fdata%7B1...2%7D",
+            "/minio/admin/v3/pools/cancel?pool=http%3A%2F%2Fminio-%7B1...4%7D%3A9000%2Fdata%7B1...2%7D",
+            "/rustfs/admin/v3/rebalance/start",
+            "/rustfs/admin/v3/rebalance/stop",
+            "/rustfs/admin/v3/pools/decommission?pool=http%3A%2F%2Fminio-%7B1...4%7D%3A9000%2Fdata%7B1...2%7D",
+            "/rustfs/admin/v3/pools/cancel?pool=http%3A%2F%2Fminio-%7B1...4%7D%3A9000%2Fdata%7B1...2%7D",
+        ];
+
+        for path in paths {
+            let request = Request::builder().method(Method::POST).uri(path).body(()).expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_admin_empty_body(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_empty_body_post_layer_inserts_zero_content_length() {
+        let capture = HeaderCaptureService::default();
+        let headers = capture.headers();
+        let mut service = AdminChunkedContentLengthCompatLayer.layer(capture);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/rustfs/admin/v3/rebalance/start")
+            .body(())
+            .expect("request");
+
+        let _ = service.call(request).await.expect("service call");
+
+        let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+        assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
     }
 
     #[test]
@@ -968,6 +1048,17 @@ mod tests {
         let request = Request::builder()
             .method(Method::PUT)
             .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+    }
+
+    #[test]
+    fn non_empty_body_admin_post_path_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/minio/admin/v3/update-service-account")
             .body(())
             .expect("request");
 

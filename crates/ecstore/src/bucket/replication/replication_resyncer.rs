@@ -119,7 +119,14 @@ fn should_count_head_proxy_failure(is_not_found: bool, code: Option<&str>, raw_s
     if is_not_found || matches!(code, Some("MethodNotAllowed" | "405")) {
         return false;
     }
-    !matches!(raw_status, Some(404 | 405))
+    if matches!(raw_status, Some(404 | 405)) {
+        return false;
+    }
+    !is_version_id_mismatch(code, raw_status)
+}
+
+fn has_raw_status(err: &SdkError<HeadObjectError>, status: u16) -> bool {
+    err.raw_response().is_some_and(|r| r.status().as_u16() == status)
 }
 
 fn is_head_proxy_failure(err: &SdkError<HeadObjectError>) -> bool {
@@ -148,6 +155,42 @@ async fn head_object_with_proxy_stats(
     let is_err = result.as_ref().err().is_some_and(is_head_proxy_failure);
     record_proxy_request(source_bucket, "HeadObject", is_err).await;
     result
+}
+
+// AWS returns 400 for root callers and 403 for IAM users when a UUID version ID
+// is rejected. The 403 case is safe: a real auth failure also returns 403 on the
+// versionId-less fallback, propagating as a hard error instead of silently skipping.
+fn is_version_id_mismatch(code: Option<&str>, raw_status: Option<u16>) -> bool {
+    match code {
+        Some(c) if !c.is_empty() => c == "InvalidArgument",
+        _ => matches!(raw_status, Some(400) | Some(403)),
+    }
+}
+
+fn is_version_id_format_mismatch(err: &SdkError<HeadObjectError>) -> bool {
+    let code = err.as_service_error().and_then(|se| se.code());
+    let raw_status = err.raw_response().map(|r| r.status().as_u16());
+    is_version_id_mismatch(code, raw_status)
+}
+
+async fn head_object_fallback(
+    source_bucket: &str,
+    tgt_client: &TargetClient,
+    object: &str,
+) -> std::result::Result<Option<HeadObjectOutput>, SdkError<HeadObjectError>> {
+    match head_object_with_proxy_stats(source_bucket, tgt_client, &tgt_client.bucket, object, None).await {
+        Ok(oi) => Ok(Some(oi)),
+        Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+// Version IDs differ by design on this path (RustFS UUID vs AWS alphanumeric), so
+// compare only ETags. Equal ETags mean identical content; version ID is irrelevant.
+fn content_matches(src: &ObjectInfo, tgt: &HeadObjectOutput) -> bool {
+    let src_etag = src.etag.as_deref().map(rustfs_utils::path::trim_etag);
+    let tgt_etag = tgt.e_tag.as_deref().map(rustfs_utils::path::trim_etag);
+    src_etag.is_some() && src_etag == tgt_etag
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2536,16 +2579,28 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             }
             Err(e) => {
-                if let Some(se) = e.as_service_error() {
-                    if !se.is_not_found() {
-                        rinfo.error = Some(e.to_string());
-                        warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
-                        return rinfo;
+                if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) {
+                    // Object not on target yet → fall through to PUT.
+                } else if is_version_id_format_mismatch(&e) {
+                    // Version-ID format mismatch: retry without versionId and compare ETags.
+                    match head_object_fallback(&bucket, &tgt_client, &object).await {
+                        Ok(Some(oi)) if content_matches(&object_info, &oi) => {
+                            rinfo.replication_status = ReplicationStatusType::Completed;
+                            rinfo.replication_resynced = true;
+                            rinfo.replication_action = ReplicationAction::None;
+                            rinfo.size = size;
+                            return rinfo;
+                        }
+                        Ok(_) => {}
+                        Err(e2) => {
+                            rinfo.error = Some(e2.to_string());
+                            warn!(
+                                "replication head_object fallback failed bucket:{} arn:{} error:{}",
+                                bucket, tgt_client.arn, e2
+                            );
+                            return rinfo;
+                        }
                     }
-                } else if e.raw_response().is_some_and(|resp| resp.status().as_u16() == 404) {
-                    // Some HEAD Object 404 responses are surfaced by the AWS SDK as `response error`
-                    // instead of `service error (NotFound)`. Treat raw HTTP 404 as object-not-found
-                    // so replication can proceed with PUT.
                 } else {
                     rinfo.error = Some(e.to_string());
                     warn!("replication head_object failed bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
@@ -2807,25 +2862,39 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             }
             Err(e) => {
-                if let Some(se) = e.as_service_error() {
-                    if se.is_not_found() {
-                        replication_action = ReplicationAction::All;
-                    } else {
-                        rinfo.error = Some(e.to_string());
-                        warn!("failed to head object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
-
-                        send_event(EventArgs {
-                            event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                            bucket_name: bucket.clone(),
-                            object: object_info,
-                            host: GLOBAL_LocalNodeName.to_string(),
-                            user_agent: "Internal: [Replication]".to_string(),
-                            ..Default::default()
-                        });
-
-                        rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
-                        return rinfo;
+                if is_version_id_format_mismatch(&e) {
+                    // Version-ID format mismatch: retry without versionId and compare ETags.
+                    match head_object_fallback(&bucket, &tgt_client, &object).await {
+                        Ok(Some(oi)) => {
+                            replication_action = if content_matches(&object_info, &oi) {
+                                ReplicationAction::None
+                            } else {
+                                ReplicationAction::All
+                            };
+                        }
+                        Ok(None) => {
+                            replication_action = ReplicationAction::All;
+                        }
+                        Err(e2) => {
+                            rinfo.error = Some(e2.to_string());
+                            warn!(
+                                "replication head_object fallback failed bucket:{} arn:{} error:{}",
+                                bucket, tgt_client.arn, e2
+                            );
+                            send_event(EventArgs {
+                                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                                bucket_name: bucket.clone(),
+                                object: object_info,
+                                host: GLOBAL_LocalNodeName.to_string(),
+                                user_agent: "Internal: [Replication]".to_string(),
+                                ..Default::default()
+                            });
+                            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                            return rinfo;
+                        }
                     }
+                } else if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+                    replication_action = ReplicationAction::All;
                 } else {
                     rinfo.error = Some(e.to_string());
                     warn!("failed to head object for bucket:{} arn:{} error:{}", bucket, tgt_client.arn, e);
@@ -3835,6 +3904,117 @@ mod tests {
             !should_count_head_proxy_failure(false, Some("405"), Some(405)),
             "numeric 405 codes must align with MethodNotAllowed semantics"
         );
+    }
+
+    #[test]
+    fn test_should_count_head_proxy_failure_ignores_version_id_format_rejections() {
+        assert!(
+            !should_count_head_proxy_failure(false, Some("InvalidArgument"), Some(400)),
+            "InvalidArgument/400 is a version-ID format rejection and must not be counted as a proxy failure"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, None, Some(400)),
+            "raw HTTP 400 without error code must not be counted as a proxy failure"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, None, Some(403)),
+            "raw HTTP 403 without error code must not be counted as a proxy failure (IAM user + invalid versionId)"
+        );
+    }
+
+    #[test]
+    fn test_is_version_id_mismatch_detects_invalid_argument() {
+        assert!(
+            is_version_id_mismatch(Some("InvalidArgument"), Some(400)),
+            "AWS S3 returns InvalidArgument/400 when a UUID versionId is passed to HeadObject"
+        );
+        assert!(
+            !is_version_id_mismatch(Some("AccessDenied"), Some(403)),
+            "AccessDenied must not trigger the version-ID fallback path"
+        );
+        assert!(
+            !is_version_id_mismatch(Some("NoSuchKey"), Some(404)),
+            "NoSuchKey is an object-not-found response, not a version-ID mismatch"
+        );
+    }
+
+    #[test]
+    fn test_is_version_id_mismatch_raw_status_without_service_code() {
+        assert!(
+            is_version_id_mismatch(None, Some(400)),
+            "no error code + HTTP 400 is treated as version-ID mismatch (HEAD response)"
+        );
+        assert!(
+            is_version_id_mismatch(Some(""), Some(400)),
+            "empty error code + HTTP 400 is treated as version-ID mismatch"
+        );
+        assert!(
+            is_version_id_mismatch(None, Some(403)),
+            "no error code + HTTP 403 is treated as version-ID mismatch (IAM user + invalid versionId)"
+        );
+        assert!(
+            is_version_id_mismatch(Some(""), Some(403)),
+            "empty error code + HTTP 403 is treated as version-ID mismatch"
+        );
+        assert!(
+            !is_version_id_mismatch(None, Some(500)),
+            "raw 5xx must not trigger the version-ID fallback path"
+        );
+        assert!(
+            !is_version_id_mismatch(None, Some(404)),
+            "raw 404 must not trigger the version-ID fallback path"
+        );
+    }
+
+    #[test]
+    fn test_is_version_id_mismatch_400_with_other_service_code() {
+        assert!(
+            !is_version_id_mismatch(Some("MalformedXML"), Some(400)),
+            "MalformedXML/400 is a real request error and must not trigger version-ID fallback"
+        );
+        assert!(
+            !is_version_id_mismatch(Some("EntityTooLarge"), Some(400)),
+            "EntityTooLarge/400 is a real request error and must not trigger version-ID fallback"
+        );
+    }
+
+    #[test]
+    fn test_content_matches_compares_etag_only() {
+        let src = ObjectInfo {
+            etag: Some("\"abc123\"".to_string()),
+            ..Default::default()
+        };
+
+        let tgt_match = HeadObjectOutput::builder().e_tag("\"abc123\"").build();
+        assert!(content_matches(&src, &tgt_match), "identical ETags must match");
+
+        let tgt_unquoted_match = HeadObjectOutput::builder().e_tag("abc123").build();
+        assert!(
+            content_matches(&src, &tgt_unquoted_match),
+            "quoted and unquoted ETags with identical values must match"
+        );
+
+        // version_id on the target is intentionally ignored
+        let tgt_different_version = HeadObjectOutput::builder()
+            .e_tag("\"abc123\"")
+            .version_id("aws-alphanumeric-id")
+            .build();
+        assert!(
+            content_matches(&src, &tgt_different_version),
+            "matching ETags with different version IDs must still match"
+        );
+
+        let tgt_different_content = HeadObjectOutput::builder().e_tag("\"def456\"").build();
+        assert!(!content_matches(&src, &tgt_different_content), "different ETags must not match");
+
+        let src_no_etag = ObjectInfo {
+            etag: None,
+            ..Default::default()
+        };
+        assert!(!content_matches(&src_no_etag, &tgt_match), "missing source ETag must not match");
+
+        let tgt_no_etag = HeadObjectOutput::builder().build();
+        assert!(!content_matches(&src, &tgt_no_etag), "missing target ETag must not match");
     }
 
     #[test]
