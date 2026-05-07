@@ -25,7 +25,7 @@ use std::error::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 
 #[derive(Debug)]
@@ -170,6 +170,28 @@ async fn spawn_object_lambda_webhook_server_with_response(
     });
 
     Ok((webhook_url, request_rx, handle))
+}
+
+async fn read_request_path(stream: &mut tokio::net::TcpStream) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+
+    let header_end = loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err("request ended before headers were fully received".into());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(pos) = find_header_terminator(&buffer) {
+            break pos;
+        }
+    };
+
+    let header_text = std::str::from_utf8(&buffer[..header_end])?;
+    let request_line = header_text.lines().next().ok_or("missing request line")?;
+    let path = request_line.split_whitespace().nth(1).ok_or("missing request path")?;
+
+    Ok(path.to_string())
 }
 
 async fn presigned_get_request(
@@ -395,20 +417,32 @@ async fn restart_rustfs_server(env: &mut RustFSTestEnvironment) -> Result<(), Bo
     env.start_rustfs_server_without_cleanup(vec![]).await
 }
 
-async fn spawn_tcp_only_webhook_probe_server()
--> Result<(String, tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>), Box<dyn Error + Send + Sync>> {
+async fn spawn_http_origin_probe_server() -> Result<
+    (
+        String,
+        mpsc::Receiver<String>,
+        tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
+    ),
+    Box<dyn Error + Send + Sync>,
+> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let webhook_url = format!("http://{address}/hook");
+    let (path_tx, path_rx) = mpsc::channel(1);
 
     let handle = tokio::spawn(async move {
         loop {
-            let (stream, _) = listener.accept().await?;
-            drop(stream);
+            let (mut stream, _) = listener.accept().await?;
+            let path = timeout(Duration::from_secs(2), read_request_path(&mut stream)).await??;
+            let _ = path_tx.try_send(path.clone());
+            if path == "/" {
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                stream.write_all(response).await?;
+            }
         }
     });
 
-    Ok((webhook_url, handle))
+    Ok((webhook_url, path_rx, handle))
 }
 
 async fn read_persisted_server_config(env: &RustFSTestEnvironment) -> String {
@@ -544,7 +578,7 @@ async fn test_notification_target_persists_across_restart_and_delete() -> Result
 async fn test_notification_target_with_path_is_online_via_transport_probe() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
-    let (webhook_url, probe_handle) = spawn_tcp_only_webhook_probe_server().await?;
+    let (webhook_url, mut probe_rx, probe_handle) = spawn_http_origin_probe_server().await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "true")])
@@ -555,6 +589,11 @@ async fn test_notification_target_with_path_is_online_via_transport_probe() -> R
 
     let (visible_targets, visible_arns) = wait_for_target_visibility(&env, target_name).await?;
     assert_eq!(notification_target_status(&visible_targets, target_name), Some("online"));
+    let observed_path = timeout(Duration::from_secs(10), probe_rx.recv())
+        .await
+        .map_err(|_| "probe server timed out waiting for a request")?
+        .ok_or("probe server did not observe a request")?;
+    assert_eq!(observed_path, "/");
     assert!(
         visible_arns
             .iter()
