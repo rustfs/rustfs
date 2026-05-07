@@ -140,11 +140,11 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 tokio-stream = { version = "0.1.18" }
 tokio-test = "0.4.5"
 tokio-util = { version = "0.7.18", features = ["io", "compat"] }
-tonic = { version = "0.14.5", features = ["gzip"] }
-tonic-prost = { version = "0.14.5" }
-tonic-prost-build = { version = "0.14.5" }
+tonic = { version = "0.14.6", features = ["gzip"] }
+tonic-prost = { version = "0.14.6" }
+tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3", features = ["timeout"] }
-tower-http = { version = "0.6.9", features = ["cors"] }
+tower-http = { version = "0.6.10", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.1", features = ["serde"] }
@@ -199,7 +199,7 @@ atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.16" }
 aws-credential-types = { version = "1.2.14" }
-aws-sdk-s3 = { version = "1.131.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.132.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-http-client = { version = "1.1.12", default-features = false, features = ["default-client", "rustls-aws-lc"] }
 aws-smithy-types = { version = "1.4.7" }
 backtrace = "0.3.76"
