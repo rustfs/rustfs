@@ -375,20 +375,14 @@ pub fn map_pg_error(err: &tokio_postgres::Error, context: &str) -> TargetError {
             _ => TargetError::Request(format!("{context}: {db_err}")),
         };
     }
-    TargetError::Network(format!("{context}: {err}"))
+    TargetError::NotConnected
 }
 
 /// Maps a `deadpool_postgres::PoolError` to the proper `TargetError` variant.
 pub fn map_pool_error(err: deadpool_postgres::PoolError, context: &str) -> TargetError {
     match err {
         deadpool_postgres::PoolError::Timeout(_) => TargetError::Timeout(format!("{context}: pool timeout")),
-        deadpool_postgres::PoolError::Backend(pg_err) => {
-            if pg_err.is_closed() {
-                TargetError::NotConnected
-            } else {
-                TargetError::Network(format!("{context}: {pg_err}"))
-            }
-        }
+        deadpool_postgres::PoolError::Backend(pg_err) => map_pg_error(&pg_err, context),
         deadpool_postgres::PoolError::Closed => TargetError::NotConnected,
         other => TargetError::Request(format!("{context}: {other}")),
     }
@@ -474,7 +468,15 @@ where
         let payload: serde_json::Value =
             serde_json::from_slice(body).map_err(|e| TargetError::Serialization(format!("Failed to parse JSON payload: {e}")))?;
 
-        let key = format!("{}/{}", meta.bucket_name, meta.object_name);
+        let key = payload
+            .get("Key")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                let decoded_object =
+                    crate::target::decode_object_name(&meta.object_name).unwrap_or_else(|_| meta.object_name.clone());
+                format!("{}/{}", meta.bucket_name, decoded_object)
+            });
 
         let result = match self.args.format {
             PostgresFormat::Namespace => {
@@ -483,7 +485,7 @@ where
             }
             PostgresFormat::Access => {
                 let sql = access_insert_sql(&self.args.schema, &self.args.table);
-                let event_name_str = format!("{:?}", meta.event_name);
+                let event_name_str = meta.event_name.to_string();
                 let queued_at_ms = meta.queued_at_unix_ms as i64;
                 client
                     .execute(&sql, &[&event_id, &event_name_str, &key, &payload, &queued_at_ms])

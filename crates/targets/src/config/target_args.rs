@@ -20,7 +20,7 @@ use crate::target::{
     mqtt::{MQTTArgs, MQTTTlsConfig, validate_mqtt_broker_url},
     mysql::MySqlArgs,
     nats::{NATSArgs, validate_nats_address},
-    postgres::{PostgresArgs, parse_postgres_format, validate_pg_identifier},
+    postgres::{PostgresArgs, parse_postgres_format},
     pulsar::{PulsarArgs, validate_pulsar_broker},
     redis::{RedisArgs, RedisTlsConfig, validate_redis_url},
     webhook::WebhookArgs,
@@ -421,46 +421,8 @@ pub fn validate_redis_config(config: &KVS, default_queue_dir: &str, default_chan
     args.validate()
 }
 pub fn validate_postgres_config(config: &KVS, default_queue_dir: &str) -> Result<(), TargetError> {
-    if config.lookup(POSTGRES_HOST).is_none() {
-        return Err(TargetError::Configuration("Missing PostgreSQL host".to_string()));
-    }
-    if config.lookup(POSTGRES_USER).is_none() {
-        return Err(TargetError::Configuration("Missing PostgreSQL user".to_string()));
-    }
-    if config.lookup(POSTGRES_DATABASE).is_none() {
-        return Err(TargetError::Configuration("Missing PostgreSQL database".to_string()));
-    }
-    let table = config
-        .lookup(POSTGRES_TABLE)
-        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL table".to_string()))?;
-    let schema = config
-        .lookup(POSTGRES_SCHEMA)
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "public".to_string());
-    validate_pg_identifier(&schema, "schema")?;
-    validate_pg_identifier(&table, "table")?;
-
-    parse_postgres_port(config.lookup(POSTGRES_PORT).as_deref())?;
-    parse_postgres_format(config.lookup(POSTGRES_FORMAT).as_deref())?;
-
-    let tls_client_cert = config.lookup(POSTGRES_TLS_CLIENT_CERT).unwrap_or_default();
-    let tls_client_key = config.lookup(POSTGRES_TLS_CLIENT_KEY).unwrap_or_default();
-    if tls_client_cert.is_empty() != tls_client_key.is_empty() {
-        return Err(TargetError::Configuration(format!(
-            "PostgreSQL {POSTGRES_TLS_CLIENT_CERT} and {POSTGRES_TLS_CLIENT_KEY} must be specified together"
-        )));
-    }
-
-    let queue_dir = config
-        .lookup(POSTGRES_QUEUE_DIR)
-        .unwrap_or_else(|| default_queue_dir.to_string());
-    if !queue_dir.is_empty() && !Path::new(&queue_dir).is_absolute() {
-        return Err(TargetError::Configuration(
-            "PostgreSQL queue directory must be an absolute path".to_string(),
-        ));
-    }
-
-    Ok(())
+    let args = build_postgres_args(config, default_queue_dir, TargetType::NotifyEvent)?;
+    args.validate()
 }
 
 fn parse_postgres_port(value: Option<&str>) -> Result<u16, TargetError> {
@@ -644,9 +606,9 @@ mod tests {
     use rustfs_config::{
         KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
         POSTGRES_DATABASE, POSTGRES_FORMAT, POSTGRES_HOST, POSTGRES_PORT, POSTGRES_QUEUE_DIR, POSTGRES_SCHEMA, POSTGRES_TABLE,
-        POSTGRES_TLS_CLIENT_CERT, POSTGRES_USER, REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY,
-        REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE, REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT,
-        REDIS_TLS_ALLOW_INSECURE, REDIS_URL,
+        POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_USER, REDIS_CHANNEL,
+        REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE,
+        REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_URL,
     };
     use rustfs_ecstore::config::KVS;
 
@@ -878,6 +840,14 @@ mod tests {
     }
 
     #[test]
+    fn validate_postgres_config_rejects_empty_host() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_HOST.to_string(), "".to_string());
+        let err = validate_postgres_config(&config, "").expect_err("empty host should fail");
+        assert!(err.to_string().contains("host cannot be empty"));
+    }
+
+    #[test]
     fn validate_postgres_config_rejects_missing_database() {
         let mut config = postgres_base_config();
         config.0.retain(|kv| kv.key != POSTGRES_DATABASE);
@@ -915,5 +885,22 @@ mod tests {
         config.insert(POSTGRES_TLS_CLIENT_CERT.to_string(), "/etc/ssl/cert.pem".to_string());
         let err = validate_postgres_config(&config, "").expect_err("missing key should fail");
         assert!(err.to_string().contains("must be specified together"));
+    }
+
+    #[test]
+    fn validate_postgres_config_rejects_relative_tls_ca() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_TLS_CA.to_string(), "relative/ca.pem".to_string());
+        let err = validate_postgres_config(&config, "").expect_err("relative tls_ca should fail");
+        assert!(err.to_string().contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn validate_postgres_config_rejects_relative_tls_client_cert() {
+        let mut config = postgres_base_config();
+        config.insert(POSTGRES_TLS_CLIENT_CERT.to_string(), "relative/client.pem".to_string());
+        config.insert(POSTGRES_TLS_CLIENT_KEY.to_string(), "/etc/ssl/client.key".to_string());
+        let err = validate_postgres_config(&config, "").expect_err("relative tls_client_cert should fail");
+        assert!(err.to_string().contains("must be an absolute path"));
     }
 }

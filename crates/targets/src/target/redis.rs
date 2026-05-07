@@ -40,8 +40,6 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
-const DEFAULT_REDIS_CHANNEL: &str = "redis_target";
-const DEFAULT_PUBLISH_RETRIES: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedisTlsPolicy {
     SystemCa,
@@ -188,30 +186,6 @@ impl RedisArgs {
         }
 
         Ok(())
-    }
-}
-
-impl Default for RedisArgs {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            url: Url::parse("redis://127.0.0.1:6379").expect("static redis URL should parse"),
-            channel: String::from(DEFAULT_REDIS_CHANNEL),
-            username: None,
-            password: None,
-            tls: RedisTlsConfig::default(),
-            keep_alive: Duration::from_secs(15),
-            queue_dir: String::new(),
-            queue_limit: 0,
-            max_retry_attempts: DEFAULT_PUBLISH_RETRIES,
-            reconnect_retry_attempts: None,
-            min_retry_delay: None,
-            max_retry_delay: None,
-            connection_timeout: None,
-            response_timeout: None,
-            pipeline_buffer_size: None,
-            target_type: TargetType::NotifyEvent,
-        }
     }
 }
 
@@ -476,6 +450,10 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
+        if !self.is_enabled() {
+            return Ok(false);
+        }
+
         match tokio::time::timeout(Duration::from_secs(5), ping_redis_server(&self.publisher_client, &self.args)).await {
             Ok(Ok(())) => {
                 self.connected.store(true, Ordering::SeqCst);
@@ -931,6 +909,20 @@ mod tests {
         ));
         assert!(!target.connected.load(Ordering::SeqCst));
         assert!(target.publisher.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn is_active_returns_false_when_disabled() {
+        let target = RedisTarget::<String>::new(
+            "redis:test".to_string(),
+            RedisArgs {
+                enable: false,
+                ..base_args()
+            },
+        )
+        .expect("target should build");
+
+        assert!(!target.is_active().await.expect("disabled target should not probe"));
     }
 
     #[test]
