@@ -19,7 +19,7 @@ use crate::{
     store::{Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType,
+        TargetType, queue_store_subdir_name,
     },
 };
 use async_trait::async_trait;
@@ -465,7 +465,7 @@ impl MQTTArgs {
         }
 
         if !self.queue_dir.is_empty() {
-            let path = std::path::Path::new(&self.queue_dir);
+            let path = Path::new(&self.queue_dir);
             if !path.is_absolute() {
                 return Err(TargetError::Configuration("mqtt queue_dir path should be absolute".to_string()));
             }
@@ -512,7 +512,7 @@ where
         let target_id = TargetID::new(id, ChannelTargetType::Mqtt.as_str().to_string());
         let queue_store = if !args.queue_dir.is_empty() {
             let base_path = PathBuf::from(&args.queue_dir);
-            let unique_dir_name = format!("rustfs-{}-{}", ChannelTargetType::Mqtt.as_str(), target_id.id).replace(":", "_");
+            let unique_dir_name = queue_store_subdir_name(ChannelTargetType::Mqtt.as_str(), &target_id.id);
             // Ensure the directory name is valid for filesystem
             let specific_queue_path = base_path.join(unique_dir_name);
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");
@@ -582,7 +582,7 @@ where
                     Some(MAX_MQTT_PACKET_SIZE_BYTES),
                 )?;
 
-                let (new_client, eventloop) = AsyncClient::new(mqtt_options, 10);
+                let (new_client, eventloop) = AsyncClient::builder(mqtt_options).capacity(10).build();
 
                 if let Err(e) = new_client.subscribe(&args_clone.topic, args_clone.qos).await {
                     error!(target_id = %target_id_clone, error = %e, "Failed to subscribe to MQTT topic during init");
@@ -828,7 +828,7 @@ fn is_fatal_mqtt_error(err: &ConnectionError) -> bool {
             match state_err {
                 // If StateError is caused by deserialization issues, check the underlying MqttBytesError
                 rumqttc::StateError::Deserialization(mqtt_bytes_err) => { // The type of mqtt_bytes_err is &rumqttc::mqttbytes::Error
-                        matches!(
+                    matches!(
                         mqtt_bytes_err,
                         MqttBytesError::InvalidProtocol // Invalid agreement
                         | MqttBytesError::InvalidProtocolLevel(_) // Invalid protocol level
@@ -922,7 +922,7 @@ where
                 Err(e) => {
                     error!(target_id = %self.id, error = %e, "Failed to save event to store");
                     self.delivery_counters.record_final_failure();
-                    return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+                    Err(TargetError::Storage(format!("Failed to save event to store: {e}")))
                 }
             }
         } else {
