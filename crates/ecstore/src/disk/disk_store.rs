@@ -1280,4 +1280,21 @@ mod tests {
         assert!(!health.is_faulty());
         assert!(health.offline_duration().is_none());
     }
+
+    #[test]
+    fn reset_for_store_init_retry_clears_faulty_and_back_online() {
+        let endpoint = Endpoint::try_from("/tmp/reset-store-init-retry").expect("endpoint should parse");
+        let health = DiskHealthTracker::new();
+
+        assert!(health.mark_offline(&endpoint, "simulated_fault"));
+        assert!(health.is_faulty());
+        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+
+        health.reset_for_store_init_retry(&endpoint);
+        assert!(!health.is_faulty());
+        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+
+        assert!(health.mark_offline(&endpoint, "again"));
+        assert!(health.is_faulty());
+    }
 }
