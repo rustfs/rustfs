@@ -14,8 +14,13 @@
 
 use crate::Event;
 use crate::factory::{
+<<<<<<< HEAD
     KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory,
     RedisTargetFactory, TargetFactory, WebhookTargetFactory,
+=======
+    AMQPTargetFactory, KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory,
+    WebhookTargetFactory,
+>>>>>>> 56f1dc85 (feat(targets): implement AMQP notification target)
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::HashMap;
@@ -44,6 +49,7 @@ impl TargetRegistry {
         };
 
         // Register built-in factories
+        registry.register(ChannelTargetType::Amqp.as_str(), Box::new(AMQPTargetFactory));
         registry.register(ChannelTargetType::Webhook.as_str(), Box::new(WebhookTargetFactory));
         registry.register(ChannelTargetType::Mqtt.as_str(), Box::new(MQTTTargetFactory));
         registry.register(ChannelTargetType::Nats.as_str(), Box::new(NATSTargetFactory));
@@ -124,5 +130,18 @@ impl TargetRegistry {
 
         info!(count = successful_targets.len(), "All target processing completed");
         Ok(successful_targets)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TargetRegistry;
+    use rustfs_targets::target::ChannelTargetType;
+
+    #[test]
+    fn registry_registers_amqp_factory() {
+        let registry = TargetRegistry::new();
+
+        assert!(registry.factories.contains_key(ChannelTargetType::Amqp.as_str()));
     }
 }

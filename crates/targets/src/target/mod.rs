@@ -290,6 +290,7 @@ impl QueuedPayload {
 /// example output:
 /// Target type: webhook
 pub enum ChannelTargetType {
+    Amqp,
     Webhook,
     Kafka,
     Mqtt,
@@ -303,6 +304,7 @@ pub enum ChannelTargetType {
 impl ChannelTargetType {
     pub fn as_str(&self) -> &'static str {
         match self {
+            ChannelTargetType::Amqp => "amqp",
             ChannelTargetType::Webhook => "webhook",
             ChannelTargetType::Kafka => "kafka",
             ChannelTargetType::Mqtt => "mqtt",
@@ -318,6 +320,7 @@ impl ChannelTargetType {
 impl std::fmt::Display for ChannelTargetType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            ChannelTargetType::Amqp => write!(f, "amqp"),
             ChannelTargetType::Webhook => write!(f, "webhook"),
             ChannelTargetType::Kafka => write!(f, "kafka"),
             ChannelTargetType::Mqtt => write!(f, "mqtt"),
@@ -437,6 +440,12 @@ pub(crate) fn delete_stored_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_target_type_amqp_uses_runtime_name() {
+        assert_eq!(ChannelTargetType::Amqp.as_str(), "amqp");
+        assert_eq!(ChannelTargetType::Amqp.to_string(), "amqp");
+    }
 
     #[test]
     fn queued_payload_round_trips_meta_and_body() {

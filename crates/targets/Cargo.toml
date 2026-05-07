@@ -32,9 +32,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
+<<<<<<< HEAD
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tokio-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
+=======
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
+>>>>>>> 56f1dc85 (feat(targets): implement AMQP notification target)
 tracing = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
