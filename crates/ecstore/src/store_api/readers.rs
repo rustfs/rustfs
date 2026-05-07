@@ -622,6 +622,208 @@ impl<R: AsyncRead + Unpin + Send + 'static> Drop for StreamConsumer<R> {
     }
 }
 
+fn encrypted_plaintext_size(oi: &ObjectInfo, is_multipart: bool, is_compressed: bool) -> Result<i64> {
+    if is_compressed {
+        return oi.get_actual_size().map_err(Into::into);
+    }
+
+    if is_multipart {
+        return Ok(multipart_plaintext_size(&oi.parts, oi.decrypted_size()?));
+    }
+
+    oi.decrypted_size().map_err(Into::into)
+}
+
+fn is_multipart_encrypted_object(parts: &[rustfs_filemeta::ObjectPartInfo], etag: Option<&str>) -> bool {
+    if parts.len() > 1 {
+        return true;
+    }
+
+    etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)
+}
+
+fn multipart_plaintext_size(parts: &[rustfs_filemeta::ObjectPartInfo], fallback: i64) -> i64 {
+    let total: i64 = parts.iter().map(part_plaintext_size).sum();
+
+    if total > 0 { total } else { fallback }
+}
+
+fn multipart_part_numbers(parts: &[rustfs_filemeta::ObjectPartInfo]) -> Vec<usize> {
+    parts.iter().map(|part| part.number).collect()
+}
+
+async fn resolve_encryption_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
+    if oi.user_defined.contains_key(SSEC_ALGORITHM_HEADER) {
+        return resolve_ssec_material(oi, headers);
+    }
+
+    if oi.user_defined.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER) {
+        return resolve_managed_material(&oi.user_defined).await;
+    }
+
+    Err(Error::other("encrypted object metadata is incomplete"))
+}
+
+fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
+    let algorithm = headers
+        .get(SSEC_ALGORITHM_HEADER)
+        .ok_or_else(|| Error::other("missing SSE-C algorithm header"))?
+        .to_str()
+        .map_err(|_| Error::other("invalid SSE-C algorithm header"))?;
+    if algorithm != DEFAULT_SSE_ALGORITHM {
+        return Err(Error::other(format!("unsupported SSE-C algorithm {algorithm}")));
+    }
+
+    let key_b64 = headers
+        .get(SSEC_KEY_HEADER)
+        .ok_or_else(|| Error::other("missing SSE-C key header"))?
+        .to_str()
+        .map_err(|_| Error::other("invalid SSE-C key header"))?;
+    let key_md5 = headers
+        .get(SSEC_KEY_MD5_HEADER)
+        .ok_or_else(|| Error::other("missing SSE-C key md5 header"))?
+        .to_str()
+        .map_err(|_| Error::other("invalid SSE-C key md5 header"))?;
+
+    let key_bytes_vec = BASE64_STANDARD
+        .decode(key_b64)
+        .map_err(|_| Error::other("failed to decode SSE-C key"))?;
+    let key_bytes: [u8; 32] = key_bytes_vec
+        .try_into()
+        .map_err(|_| Error::other("SSE-C key must be 32 bytes"))?;
+
+    let expected_md5 = BASE64_STANDARD.encode(md5_bytes(key_bytes));
+    if expected_md5 != key_md5 {
+        return Err(Error::other("SSE-C key MD5 mismatch"));
+    }
+
+    let stored_md5 = oi
+        .user_defined
+        .get(SSEC_KEY_MD5_HEADER)
+        .ok_or_else(|| Error::other("missing stored SSE-C key md5"))?;
+    if stored_md5 != &expected_md5 {
+        return Err(Error::other("SSE-C key does not match object metadata"));
+    }
+
+    Ok(EncryptionMaterial {
+        key_bytes,
+        base_nonce: generate_ssec_nonce(&oi.bucket, &oi.name),
+    })
+}
+
+async fn resolve_managed_material(metadata: &HashMap<String, String>) -> Result<EncryptionMaterial> {
+    let encrypted_dek = metadata
+        .get(INTERNAL_ENCRYPTION_KEY_HEADER)
+        .ok_or_else(|| Error::other("missing managed encrypted DEK"))?;
+    let encrypted_dek = BASE64_STANDARD
+        .decode(encrypted_dek)
+        .map_err(|e| Error::other(format!("failed to decode managed encrypted DEK: {e}")))?;
+
+    let iv_b64 = metadata
+        .get(INTERNAL_ENCRYPTION_IV_HEADER)
+        .ok_or_else(|| Error::other("missing managed encryption IV"))?;
+    let iv = BASE64_STANDARD
+        .decode(iv_b64)
+        .map_err(|e| Error::other(format!("failed to decode managed encryption IV: {e}")))?;
+    let base_nonce: [u8; 12] = iv
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::other("managed encryption IV must be 12 bytes"))?;
+
+    let kms_key_id = metadata
+        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
+        .map(String::as_str)
+        .unwrap_or("default");
+
+    let key_bytes = if let Some(service) = get_global_encryption_service().await {
+        service
+            .decrypt_data_key(&encrypted_dek, &ObjectEncryptionContext::new(String::new(), String::new()))
+            .await
+            .map_err(|e| Error::other(format!("failed to decrypt managed data key: {e}")))?
+            .plaintext_key
+    } else {
+        decrypt_local_sse_dek(&encrypted_dek, kms_key_id)?
+    };
+
+    Ok(EncryptionMaterial { key_bytes, base_nonce })
+}
+
+fn decrypt_local_sse_dek(encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8; 32]> {
+    let encrypted_dek = std::str::from_utf8(encrypted_dek).map_err(|_| Error::other("managed DEK is not valid UTF-8"))?;
+    let parts: Vec<&str> = encrypted_dek.split(':').collect();
+    if parts.len() != 2 {
+        return Err(Error::other("invalid managed DEK format"));
+    }
+
+    let nonce_vec = BASE64_STANDARD
+        .decode(parts[0])
+        .map_err(|_| Error::other("invalid managed DEK nonce"))?;
+    let ciphertext = BASE64_STANDARD
+        .decode(parts[1])
+        .map_err(|_| Error::other("invalid managed DEK ciphertext"))?;
+
+    let nonce_array: [u8; 12] = nonce_vec
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::other("invalid managed DEK nonce length"))?;
+
+    let key = Key::<Aes256Gcm>::from(local_sse_master_key()?);
+    let cipher = Aes256Gcm::new(&key);
+    let plaintext = cipher
+        .decrypt(&Nonce::from(nonce_array), ciphertext.as_slice())
+        .map_err(|e| Error::other(format!("failed to decrypt managed DEK: {e}")))?;
+
+    plaintext
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::other("managed DEK has invalid plaintext length"))
+}
+
+fn local_sse_master_key() -> Result<[u8; 32]> {
+    if let Some(key) = decode_master_key_env("__RUSTFS_SSE_SIMPLE_CMK")? {
+        return Ok(key);
+    }
+
+    if let Some(key) = decode_master_key_env("RUSTFS_SSE_S3_MASTER_KEY")? {
+        return Ok(key);
+    }
+
+    Ok([0u8; 32])
+}
+
+fn decode_master_key_env(name: &str) -> Result<Option<[u8; 32]>> {
+    let Ok(value) = env::var(name) else {
+        return Ok(None);
+    };
+
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let decoded = BASE64_STANDARD
+        .decode(value)
+        .map_err(|e| Error::other(format!("{name} is not valid base64: {e}")))?;
+    let key =
+        <[u8; 32]>::try_from(decoded.as_slice()).map_err(|_| Error::other(format!("{name} must decode to exactly 32 bytes")))?;
+
+    Ok(Some(key))
+}
+
+fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
+    let digest = md5_bytes(format!("{bucket}-{key}").as_bytes());
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&digest[..12]);
+    nonce
+}
+
+fn md5_bytes(data: impl AsRef<[u8]>) -> [u8; 16] {
+    let digest = Md5::digest(data.as_ref());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,6 +1232,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_object_reader_uses_local_managed_fallback_without_env() {
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
+                ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
+            ],
+            async {
+                let plaintext = b"managed-local-fallback".to_vec();
+                let data_key = [0x22; 32];
+                let base_nonce = [0x12; 12];
+                let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+
+                let mut encrypted = Vec::new();
+                rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+                    .read_to_end(&mut encrypted)
+                    .await
+                    .expect("encrypt managed object with local fallback key");
+
+                let object_info = ObjectInfo {
+                    size: encrypted.len() as i64,
+                    user_defined: HashMap::from([
+                        ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
+                        ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
+                        ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
+                        ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
+                    ]),
+                    ..Default::default()
+                };
+
+                let (mut reader, _, _) = GetObjectReader::new(
+                    Box::new(Cursor::new(encrypted)),
+                    None,
+                    &object_info,
+                    &ObjectOptions::default(),
+                    &HeaderMap::new(),
+                )
+                .await
+                .expect("managed encrypted reads should fall back to the local SSE-S3 key");
+
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).await.expect("read managed plaintext");
+
+                assert_eq!(reader.object_info.size, plaintext.len() as i64);
+                assert_eq!(actual, plaintext);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_get_object_reader_compressed_range_returns_physical_offset_from_index() {
         let mut index = rustfs_rio::Index::new();
         index.add(0, 0).unwrap();
@@ -1253,208 +1505,4 @@ mod tests {
         assert_eq!(reader.object_info.size, 7);
         assert_eq!(actual, b"fghijkl");
     }
-}
-
-fn encrypted_plaintext_size(oi: &ObjectInfo, is_multipart: bool, is_compressed: bool) -> Result<i64> {
-    if is_compressed {
-        return oi.get_actual_size().map_err(Into::into);
-    }
-
-    if is_multipart {
-        return Ok(multipart_plaintext_size(&oi.parts, oi.decrypted_size()?));
-    }
-
-    oi.decrypted_size().map_err(Into::into)
-}
-
-fn is_multipart_encrypted_object(parts: &[rustfs_filemeta::ObjectPartInfo], etag: Option<&str>) -> bool {
-    if parts.len() > 1 {
-        return true;
-    }
-
-    etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)
-}
-
-fn multipart_plaintext_size(parts: &[rustfs_filemeta::ObjectPartInfo], fallback: i64) -> i64 {
-    let total: i64 = parts.iter().map(part_plaintext_size).sum();
-
-    if total > 0 { total } else { fallback }
-}
-
-fn multipart_part_numbers(parts: &[rustfs_filemeta::ObjectPartInfo]) -> Vec<usize> {
-    parts.iter().map(|part| part.number).collect()
-}
-
-async fn resolve_encryption_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
-    if oi.user_defined.contains_key(SSEC_ALGORITHM_HEADER) {
-        return resolve_ssec_material(oi, headers);
-    }
-
-    if oi.user_defined.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER) {
-        return resolve_managed_material(&oi.user_defined).await;
-    }
-
-    Err(Error::other("encrypted object metadata is incomplete"))
-}
-
-fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
-    let algorithm = headers
-        .get(SSEC_ALGORITHM_HEADER)
-        .ok_or_else(|| Error::other("missing SSE-C algorithm header"))?
-        .to_str()
-        .map_err(|_| Error::other("invalid SSE-C algorithm header"))?;
-    if algorithm != DEFAULT_SSE_ALGORITHM {
-        return Err(Error::other(format!("unsupported SSE-C algorithm {algorithm}")));
-    }
-
-    let key_b64 = headers
-        .get(SSEC_KEY_HEADER)
-        .ok_or_else(|| Error::other("missing SSE-C key header"))?
-        .to_str()
-        .map_err(|_| Error::other("invalid SSE-C key header"))?;
-    let key_md5 = headers
-        .get(SSEC_KEY_MD5_HEADER)
-        .ok_or_else(|| Error::other("missing SSE-C key md5 header"))?
-        .to_str()
-        .map_err(|_| Error::other("invalid SSE-C key md5 header"))?;
-
-    let key_bytes_vec = BASE64_STANDARD
-        .decode(key_b64)
-        .map_err(|_| Error::other("failed to decode SSE-C key"))?;
-    let key_bytes: [u8; 32] = key_bytes_vec
-        .try_into()
-        .map_err(|_| Error::other("SSE-C key must be 32 bytes"))?;
-
-    let expected_md5 = BASE64_STANDARD.encode(md5_bytes(key_bytes));
-    if expected_md5 != key_md5 {
-        return Err(Error::other("SSE-C key MD5 mismatch"));
-    }
-
-    let stored_md5 = oi
-        .user_defined
-        .get(SSEC_KEY_MD5_HEADER)
-        .ok_or_else(|| Error::other("missing stored SSE-C key md5"))?;
-    if stored_md5 != &expected_md5 {
-        return Err(Error::other("SSE-C key does not match object metadata"));
-    }
-
-    Ok(EncryptionMaterial {
-        key_bytes,
-        base_nonce: generate_ssec_nonce(&oi.bucket, &oi.name),
-    })
-}
-
-async fn resolve_managed_material(metadata: &HashMap<String, String>) -> Result<EncryptionMaterial> {
-    let encrypted_dek = metadata
-        .get(INTERNAL_ENCRYPTION_KEY_HEADER)
-        .ok_or_else(|| Error::other("missing managed encrypted DEK"))?;
-    let encrypted_dek = BASE64_STANDARD
-        .decode(encrypted_dek)
-        .map_err(|e| Error::other(format!("failed to decode managed encrypted DEK: {e}")))?;
-
-    let iv_b64 = metadata
-        .get(INTERNAL_ENCRYPTION_IV_HEADER)
-        .ok_or_else(|| Error::other("missing managed encryption IV"))?;
-    let iv = BASE64_STANDARD
-        .decode(iv_b64)
-        .map_err(|e| Error::other(format!("failed to decode managed encryption IV: {e}")))?;
-    let base_nonce: [u8; 12] = iv
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::other("managed encryption IV must be 12 bytes"))?;
-
-    let kms_key_id = metadata
-        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-        .map(String::as_str)
-        .unwrap_or("default");
-
-    let key_bytes = if let Some(service) = get_global_encryption_service().await {
-        service
-            .decrypt_data_key(&encrypted_dek, &ObjectEncryptionContext::new(String::new(), String::new()))
-            .await
-            .map_err(|e| Error::other(format!("failed to decrypt managed data key: {e}")))?
-            .plaintext_key
-    } else {
-        decrypt_local_sse_dek(&encrypted_dek, kms_key_id)?
-    };
-
-    Ok(EncryptionMaterial { key_bytes, base_nonce })
-}
-
-fn decrypt_local_sse_dek(encrypted_dek: &[u8], _kms_key_id: &str) -> Result<[u8; 32]> {
-    let encrypted_dek = std::str::from_utf8(encrypted_dek).map_err(|_| Error::other("managed DEK is not valid UTF-8"))?;
-    let parts: Vec<&str> = encrypted_dek.split(':').collect();
-    if parts.len() != 2 {
-        return Err(Error::other("invalid managed DEK format"));
-    }
-
-    let nonce_vec = BASE64_STANDARD
-        .decode(parts[0])
-        .map_err(|_| Error::other("invalid managed DEK nonce"))?;
-    let ciphertext = BASE64_STANDARD
-        .decode(parts[1])
-        .map_err(|_| Error::other("invalid managed DEK ciphertext"))?;
-
-    let nonce_array: [u8; 12] = nonce_vec
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::other("invalid managed DEK nonce length"))?;
-
-    let key = Key::<Aes256Gcm>::from(local_sse_master_key()?);
-    let cipher = Aes256Gcm::new(&key);
-    let plaintext = cipher
-        .decrypt(&Nonce::from(nonce_array), ciphertext.as_slice())
-        .map_err(|e| Error::other(format!("failed to decrypt managed DEK: {e}")))?;
-
-    plaintext
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::other("managed DEK has invalid plaintext length"))
-}
-
-fn local_sse_master_key() -> Result<[u8; 32]> {
-    if let Some(key) = decode_master_key_env("__RUSTFS_SSE_SIMPLE_CMK")? {
-        return Ok(key);
-    }
-
-    if let Some(key) = decode_master_key_env("RUSTFS_SSE_S3_MASTER_KEY")? {
-        return Ok(key);
-    }
-
-    Err(Error::other(
-        "managed SSE master key is not configured; set __RUSTFS_SSE_SIMPLE_CMK or RUSTFS_SSE_S3_MASTER_KEY",
-    ))
-}
-
-fn decode_master_key_env(name: &str) -> Result<Option<[u8; 32]>> {
-    let Ok(value) = env::var(name) else {
-        return Ok(None);
-    };
-
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-
-    let decoded = BASE64_STANDARD
-        .decode(value)
-        .map_err(|e| Error::other(format!("{name} is not valid base64: {e}")))?;
-    let key =
-        <[u8; 32]>::try_from(decoded.as_slice()).map_err(|_| Error::other(format!("{name} must decode to exactly 32 bytes")))?;
-
-    Ok(Some(key))
-}
-
-fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
-    let digest = md5_bytes(format!("{bucket}-{key}").as_bytes());
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&digest[..12]);
-    nonce
-}
-
-fn md5_bytes(data: impl AsRef<[u8]>) -> [u8; 16] {
-    let digest = Md5::digest(data.as_ref());
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest);
-    out
 }
