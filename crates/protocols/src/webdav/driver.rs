@@ -846,19 +846,17 @@ where
                                     &self.session_context.principal.user_identity.credentials.secret_key,
                                 )
                                 .await
+                                && (list_output.contents.map(|c| !c.is_empty()).unwrap_or(false)
+                                    || list_output.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false))
                             {
-                                if list_output.contents.map(|c| !c.is_empty()).unwrap_or(false)
-                                    || list_output.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false)
-                                {
-                                    return Ok(Box::new(WebDavMetaData {
-                                        size: 0,
-                                        modified,
-                                        created: modified,
-                                        is_dir: true,
-                                        etag: output.e_tag.as_ref().map(etag_to_string),
-                                        content_type,
-                                    }) as Box<dyn DavMetaData>);
-                                }
+                                return Ok(Box::new(WebDavMetaData {
+                                    size: 0,
+                                    modified,
+                                    created: modified,
+                                    is_dir: true,
+                                    etag: output.e_tag.as_ref().map(etag_to_string),
+                                    content_type,
+                                }) as Box<dyn DavMetaData>);
                             }
                         }
 
@@ -1273,10 +1271,8 @@ where
                                                 let chunks: Vec<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> =
                                                     body.collect().await;
                                                 let mut all_data = Vec::new();
-                                                for chunk in chunks {
-                                                    if let Ok(data) = chunk {
-                                                        all_data.extend_from_slice(&data);
-                                                    }
+                                                for data in chunks.into_iter().flatten() {
+                                                    all_data.extend_from_slice(&data);
                                                 }
                                                 Bytes::from(all_data)
                                             } else {
