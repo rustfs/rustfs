@@ -511,7 +511,12 @@ pub fn build_mysql_args(config: &KVS, default_queue_dir: &str, target_type: Targ
             .unwrap_or(DEFAULT_LIMIT),
         max_open_connections: config
             .lookup(MYSQL_MAX_OPEN_CONNECTIONS)
-            .and_then(|v| v.parse::<usize>().ok())
+            .map(|value| {
+                value.trim().parse::<usize>().map_err(|_| {
+                    TargetError::Configuration(format!("MySQL max_open_connections value '{}' is not a valid number", value))
+                })
+            })
+            .transpose()?
             .unwrap_or(2),
         target_type,
     };
@@ -525,64 +530,7 @@ pub fn build_mysql_args(config: &KVS, default_queue_dir: &str, target_type: Targ
 /// Performs the same checks as `build_mysql_args` but discards the result,
 /// used for pre-validation before target creation.
 pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<(), TargetError> {
-    let dsn_string = config
-        .lookup(MYSQL_DSN_STRING)
-        .ok_or_else(|| TargetError::Configuration("Missing MySQL dsn_string".to_string()))?;
-
-    if dsn_string.trim().is_empty() {
-        return Err(TargetError::Configuration("MySQL dsn_string cannot be empty".to_string()));
-    }
-
-    let _ = crate::target::mysql::MySqlDsn::parse(&dsn_string)?;
-
-    let table = config
-        .lookup(MYSQL_TABLE)
-        .ok_or_else(|| TargetError::Configuration("Missing MySQL table".to_string()))?;
-
-    crate::target::mysql::validate_table_name(&table)?;
-
-    if let Some(format) = config.lookup(MYSQL_FORMAT)
-        && format != "access"
-    {
-        return Err(TargetError::Configuration(format!(
-            "MySQL format '{}' is not supported; only 'access' is available",
-            format
-        )));
-    }
-
-    let tls_ca = config.lookup(MYSQL_TLS_CA).unwrap_or_default();
-    if !tls_ca.is_empty() && !std::path::Path::new(&tls_ca).is_absolute() {
-        return Err(TargetError::Configuration("MySQL tls_ca must be an absolute path".to_string()));
-    }
-
-    let tls_client_cert = config.lookup(MYSQL_TLS_CLIENT_CERT).unwrap_or_default();
-    let tls_client_key = config.lookup(MYSQL_TLS_CLIENT_KEY).unwrap_or_default();
-    if tls_client_cert.is_empty() != tls_client_key.is_empty() {
-        return Err(TargetError::Configuration(
-            "MySQL tls_client_cert and tls_client_key must be specified together".to_string(),
-        ));
-    }
-    if !tls_client_cert.is_empty() && !std::path::Path::new(&tls_client_cert).is_absolute() {
-        return Err(TargetError::Configuration("MySQL tls_client_cert must be an absolute path".to_string()));
-    }
-    if !tls_client_key.is_empty() && !std::path::Path::new(&tls_client_key).is_absolute() {
-        return Err(TargetError::Configuration("MySQL tls_client_key must be an absolute path".to_string()));
-    }
-
-    let queue_dir = config
-        .lookup(MYSQL_QUEUE_DIR)
-        .unwrap_or_else(|| default_queue_dir.to_string());
-
-    if !queue_dir.is_empty() && !std::path::Path::new(&queue_dir).is_absolute() {
-        return Err(TargetError::Configuration("MySQL queue_dir must be an absolute path".to_string()));
-    }
-
-    if let Some(max_conn_str) = config.lookup(MYSQL_MAX_OPEN_CONNECTIONS) {
-        let _: usize = max_conn_str.trim().parse().map_err(|_| {
-            TargetError::Configuration(format!("MySQL max_open_connections value '{}' is not a valid number", max_conn_str))
-        })?;
-    }
-
+    let _ = build_mysql_args(config, default_queue_dir, TargetType::NotifyEvent)?;
     Ok(())
 }
 
