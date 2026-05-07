@@ -445,7 +445,9 @@ build_binary() {
     build_cmd+=" -p rustfs --bins"
 
     if [ -n "$FEATURES" ]; then
-        build_cmd+=" --features $FEATURES"
+        local quoted_features
+        printf -v quoted_features '%q' "$FEATURES"
+        build_cmd+=" --features $quoted_features"
     fi
 
     print_message $BLUE "📦 Executing: $build_cmd"

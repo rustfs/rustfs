@@ -38,6 +38,13 @@ cat >"$BIN_DIR/cargo" <<'STUB'
 set -euo pipefail
 
 printf '%s\n' "$*" >>"${CARGO_LOG:?}"
+if [[ -n "${CARGO_ARG_LOG:-}" ]]; then
+  i=0
+  for arg in "$@"; do
+    printf 'ARG[%d]=<%s>\n' "$i" "$arg" >>"$CARGO_ARG_LOG"
+    i=$((i + 1))
+  done
+fi
 
 target=""
 profile="debug"
@@ -90,6 +97,37 @@ short_cargo_log="$TMP_DIR/cargo-short.log"
 
 grep -q -- "Features: full" "$short_run_log"
 grep -q -- "--features full" "$short_cargo_log"
+
+multi_run_log="$TMP_DIR/run-multi.log"
+multi_cargo_log="$TMP_DIR/cargo-multi.log"
+multi_arg_log="$TMP_DIR/cargo-multi-args.log"
+(
+  cd "$PROJECT_DIR"
+  PATH="$BIN_DIR:$PATH" CARGO_LOG="$multi_cargo_log" CARGO_ARG_LOG="$multi_arg_log" ./build-rustfs.sh \
+    --dev \
+    --no-console \
+    --skip-verification \
+    --output-dir "$TMP_DIR/out-multi" \
+    --features "webdav full" >"$multi_run_log"
+)
+
+grep -q -- "Features: webdav full" "$multi_run_log"
+features_arg_line=$(awk '/^ARG\[[0-9]+\]=<--features>$/ { print NR; exit }' "$multi_arg_log")
+if [[ -z "$features_arg_line" ]]; then
+  echo "Expected cargo argv to include --features" >&2
+  exit 1
+fi
+
+features_value_line=$(sed -n "$((features_arg_line + 1))p" "$multi_arg_log")
+if ! grep -q -E '^ARG\[[0-9]+\]=<webdav full>$' <<<"$features_value_line"; then
+  echo "Expected --features value to remain one cargo argument" >&2
+  exit 1
+fi
+
+if tail -n +"$((features_arg_line + 2))" "$multi_arg_log" | grep -q -E '^ARG\[[0-9]+\]=<full>$'; then
+  echo "Expected space-separated feature list to remain one cargo argument" >&2
+  exit 1
+fi
 
 missing_log="$TMP_DIR/missing.log"
 if (
