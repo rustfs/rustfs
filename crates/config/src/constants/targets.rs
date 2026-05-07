@@ -74,6 +74,48 @@ pub const PULSAR_TLS_HOSTNAME_VERIFICATION: &str = "tls_hostname_verification";
 pub const PULSAR_QUEUE_DIR: &str = "queue_dir";
 pub const PULSAR_QUEUE_LIMIT: &str = "queue_limit";
 
+pub const BASE_DSN_STRING: &str = "dsn_string";
+
+pub const MYSQL_DSN_STRING: &str = BASE_DSN_STRING;
+pub const MYSQL_TABLE: &str = "table";
+pub const MYSQL_FORMAT: &str = "format";
+pub const MYSQL_TLS_CA: &str = "tls_ca";
+pub const MYSQL_TLS_CLIENT_CERT: &str = "tls_client_cert";
+pub const MYSQL_TLS_CLIENT_KEY: &str = "tls_client_key";
+pub const MYSQL_QUEUE_DIR: &str = "queue_dir";
+pub const MYSQL_QUEUE_LIMIT: &str = "queue_limit";
+pub const MYSQL_MAX_OPEN_CONNECTIONS: &str = "max_open_connections";
+
+pub const REDIS_URL: &str = "url";
+pub const REDIS_CHANNEL: &str = "channel";
+pub const REDIS_USERNAME: &str = "username";
+pub const REDIS_PASSWORD: &str = "password";
+pub const REDIS_KEEP_ALIVE_INTERVAL: &str = "keep_alive_interval";
+pub const REDIS_QUEUE_DIR: &str = "queue_dir";
+pub const REDIS_QUEUE_LIMIT: &str = "queue_limit";
+pub const REDIS_MAX_RETRY_ATTEMPTS: &str = "max_retry_attempts";
+pub const REDIS_RECONNECT_RETRY_ATTEMPTS: &str = "reconnect_retry_attempts";
+pub const REDIS_MIN_RETRY_DELAY: &str = "min_retry_delay";
+pub const REDIS_MAX_RETRY_DELAY: &str = "max_retry_delay";
+pub const REDIS_CONNECTION_TIMEOUT: &str = "connection_timeout";
+pub const REDIS_RESPONSE_TIMEOUT: &str = "response_timeout";
+pub const REDIS_PIPELINE_BUFFER_SIZE: &str = "pipeline_buffer_size";
+pub const REDIS_TLS_POLICY: &str = "tls_policy";
+pub const REDIS_TLS_CA: &str = "tls_ca";
+pub const REDIS_TLS_CLIENT_CERT: &str = "tls_client_cert";
+pub const REDIS_TLS_CLIENT_KEY: &str = "tls_client_key";
+pub const REDIS_TLS_ALLOW_INSECURE: &str = "tls_allow_insecure";
+
+pub const POSTGRES_DSN_STRING: &str = BASE_DSN_STRING;
+pub const POSTGRES_TABLE: &str = "table";
+pub const POSTGRES_FORMAT: &str = "format";
+pub const POSTGRES_TLS_REQUIRED: &str = "tls_required";
+pub const POSTGRES_TLS_CA: &str = "tls_ca";
+pub const POSTGRES_TLS_CLIENT_CERT: &str = "tls_client_cert";
+pub const POSTGRES_TLS_CLIENT_KEY: &str = "tls_client_key";
+pub const POSTGRES_QUEUE_DIR: &str = "queue_dir";
+pub const POSTGRES_QUEUE_LIMIT: &str = "queue_limit";
+
 /// Environment variable controlling whether target queue files are Snappy-compressed.
 /// Applies to both notify and audit target queue stores.
 pub const ENV_TARGET_STORE_COMPRESS: &str = "RUSTFS_TARGET_STORE_COMPRESS";
