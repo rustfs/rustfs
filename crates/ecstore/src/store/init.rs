@@ -181,6 +181,8 @@ impl ECStore {
                         _ = sleep(Duration::from_secs(interval)) => {
                         }
                     }
+                    // After waiting for peers, clear transient faulty marks so the next attempt can open RPCs again
+                    // (these `DiskStore` handles are reused; `is_faulty()` would otherwise short-circuit).
                     if times <= 10 {
                         for disk in disks.iter().flatten() {
                             disk.reset_health_for_store_init_retry();
