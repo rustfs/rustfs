@@ -49,6 +49,32 @@ use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
 
+fn pool_participant_errors(clients: &[Client], errors: &[Option<Error>], pool_idx: usize) -> Vec<Option<Error>> {
+    clients
+        .iter()
+        .zip(errors.iter())
+        .filter_map(|(client, err)| {
+            if client.get_pools().unwrap_or_default().contains(&pool_idx) {
+                Some(err.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn pool_write_quorum(participant_count: usize) -> usize {
+    (participant_count / 2) + 1
+}
+
+fn reduce_pool_write_quorum_errs(per_pool_errs: &[Option<Error>]) -> Option<Error> {
+    if per_pool_errs.is_empty() {
+        return Some(Error::ErasureWriteQuorum);
+    }
+
+    reduce_write_quorum_errs(per_pool_errs, BUCKET_OP_IGNORED_ERRS, pool_write_quorum(per_pool_errs.len()))
+}
+
 #[async_trait]
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
@@ -190,18 +216,8 @@ impl S3PeerSys {
         }
 
         for i in 0..self.pools_count {
-            let mut per_pool_errs = vec![None; self.clients.len()];
-            for (j, cli) in self.clients.iter().enumerate() {
-                let pools = cli.get_pools();
-                let idx = i;
-                if pools.unwrap_or_default().contains(&idx) {
-                    per_pool_errs[j] = errors[j].clone();
-                }
-            }
-
-            if let Some(pool_err) =
-                reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, (per_pool_errs.len() / 2) + 1)
-            {
+            let per_pool_errs = pool_participant_errors(&self.clients, &errors, i);
+            if let Some(pool_err) = reduce_pool_write_quorum_errs(&per_pool_errs) {
                 tracing::error!("make_bucket per_pool_errs: {per_pool_errs:?}");
                 tracing::error!("make_bucket reduce_write_quorum_errs: {pool_err}");
                 return Err(pool_err);
@@ -1031,6 +1047,50 @@ async fn clone_drives() -> Vec<Option<DiskStore>> {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct TestPeerS3Client {
+        pools: Option<Vec<usize>>,
+        make_bucket_result: Result<()>,
+    }
+
+    #[async_trait]
+    impl PeerS3Client for TestPeerS3Client {
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
+            unreachable!("not used by quorum tests")
+        }
+
+        async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
+            self.make_bucket_result.clone()
+        }
+
+        async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+            unreachable!("not used by quorum tests")
+        }
+
+        async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+            unreachable!("not used by quorum tests")
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+            unreachable!("not used by quorum tests")
+        }
+
+        fn get_pools(&self) -> Option<Vec<usize>> {
+            self.pools.clone()
+        }
+    }
+
+    fn test_peer(pools: &[usize]) -> Client {
+        test_peer_with_make_bucket(pools, Ok(()))
+    }
+
+    fn test_peer_with_make_bucket(pools: &[usize], make_bucket_result: Result<()>) -> Client {
+        Arc::new(Box::new(TestPeerS3Client {
+            pools: Some(pools.to_vec()),
+            make_bucket_result,
+        }))
+    }
+
     fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
         let node = Node {
             url: url::Url::parse(addr).expect("test peer URL should parse"),
@@ -1090,5 +1150,58 @@ mod tests {
         assert!(!client.health.is_faulty(), "business errors should not mark remote peer faulty");
 
         client.cancel_token.cancel();
+    }
+
+    #[test]
+    fn test_reduce_pool_write_quorum_uses_only_pool_participants() {
+        let clients = vec![
+            test_peer(&[0]),
+            test_peer(&[0]),
+            test_peer(&[0]),
+            test_peer(&[0]),
+            test_peer(&[1]),
+            test_peer(&[1]),
+            test_peer(&[1]),
+            test_peer(&[1]),
+        ];
+        let errors = vec![
+            Some(Error::VolumeExists),
+            Some(Error::VolumeExists),
+            Some(Error::VolumeExists),
+            Some(Error::VolumeExists),
+            None,
+            None,
+            None,
+            None,
+        ];
+
+        let per_pool_errs = pool_participant_errors(&clients, &errors, 0);
+        let err = reduce_pool_write_quorum_errs(&per_pool_errs).expect("all pool participants returned VolumeExists");
+
+        assert_eq!(err, Error::VolumeExists);
+    }
+
+    #[tokio::test]
+    async fn test_make_bucket_reduces_quorum_by_pool_participants() {
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer_with_make_bucket(&[0], Err(Error::VolumeExists)),
+                test_peer(&[1]),
+                test_peer(&[1]),
+                test_peer(&[1]),
+                test_peer(&[1]),
+            ],
+            pools_count: 2,
+        };
+
+        let err = peer_sys
+            .make_bucket("existing-bucket", &MakeBucketOptions::default())
+            .await
+            .expect_err("existing bucket should surface as VolumeExists, not quorum failure");
+
+        assert_eq!(err, Error::VolumeExists);
     }
 }

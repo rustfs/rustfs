@@ -19,12 +19,14 @@ use crate::global::is_first_cluster_node_local;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::audit::{
-    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS,
-    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS,
+    AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
+    AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::notify::{
-    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
-    NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
+    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS,
+    NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_KEYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
@@ -58,7 +60,7 @@ struct TargetConfigDescriptor {
     valid_keys: &'static [&'static str],
 }
 
-fn notify_target_descriptors() -> [TargetConfigDescriptor; 5] {
+fn notify_target_descriptors() -> [TargetConfigDescriptor; 8] {
     [
         TargetConfigDescriptor {
             external_key: "webhook",
@@ -79,10 +81,28 @@ fn notify_target_descriptors() -> [TargetConfigDescriptor; 5] {
             valid_keys: NOTIFY_MQTT_KEYS,
         },
         TargetConfigDescriptor {
+            external_key: "mysql",
+            subsystem_key: NOTIFY_MYSQL_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_MYSQL_KVS,
+            valid_keys: NOTIFY_MYSQL_KEYS,
+        },
+        TargetConfigDescriptor {
             external_key: "nats",
             subsystem_key: NOTIFY_NATS_SUB_SYS,
             default_kvs: &notify::DEFAULT_NOTIFY_NATS_KVS,
             valid_keys: NOTIFY_NATS_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "postgres",
+            subsystem_key: NOTIFY_POSTGRES_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_POSTGRES_KVS,
+            valid_keys: NOTIFY_POSTGRES_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "redis",
+            subsystem_key: NOTIFY_REDIS_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_REDIS_KVS,
+            valid_keys: NOTIFY_REDIS_KEYS,
         },
         TargetConfigDescriptor {
             external_key: "pulsar",
@@ -93,7 +113,7 @@ fn notify_target_descriptors() -> [TargetConfigDescriptor; 5] {
     ]
 }
 
-fn audit_target_descriptors() -> [TargetConfigDescriptor; 5] {
+fn audit_target_descriptors() -> [TargetConfigDescriptor; 8] {
     [
         TargetConfigDescriptor {
             external_key: "webhook",
@@ -114,16 +134,34 @@ fn audit_target_descriptors() -> [TargetConfigDescriptor; 5] {
             valid_keys: AUDIT_MQTT_KEYS,
         },
         TargetConfigDescriptor {
+            external_key: "mysql",
+            subsystem_key: AUDIT_MYSQL_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_MYSQL_KVS,
+            valid_keys: AUDIT_MYSQL_KEYS,
+        },
+        TargetConfigDescriptor {
             external_key: "nats",
             subsystem_key: AUDIT_NATS_SUB_SYS,
             default_kvs: &audit::DEFAULT_AUDIT_NATS_KVS,
             valid_keys: AUDIT_NATS_KEYS,
         },
         TargetConfigDescriptor {
+            external_key: "postgres",
+            subsystem_key: AUDIT_POSTGRES_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_POSTGRES_KVS,
+            valid_keys: AUDIT_POSTGRES_KEYS,
+        },
+        TargetConfigDescriptor {
             external_key: "pulsar",
             subsystem_key: AUDIT_PULSAR_SUB_SYS,
             default_kvs: &audit::DEFAULT_AUDIT_PULSAR_KVS,
             valid_keys: AUDIT_PULSAR_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "redis",
+            subsystem_key: AUDIT_REDIS_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_REDIS_KVS,
+            valid_keys: AUDIT_REDIS_KEYS,
         },
     ]
 }
@@ -1132,9 +1170,11 @@ mod tests {
     };
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
-    use rustfs_config::notify::{NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+    use rustfs_config::notify::{NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
-    use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
+    use rustfs_config::{
+        DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
+    };
     use rustfs_filemeta::FileInfo;
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
@@ -1775,6 +1815,15 @@ mod tests {
                 "acks":"all",
                 "tls_enable":true
               }
+            },
+            "mysql":{
+              "primary":{
+                "enable":true,
+                "dsn_string":"rustfs:password@tcp(127.0.0.1:3306)/rustfs_events",
+                "table":"rustfs_events",
+                "queue_dir":"/tmp/mysql-queue",
+                "max_open_connections":"2"
+              }
             }
           }
         }"#;
@@ -1811,6 +1860,15 @@ mod tests {
         assert_eq!(kafka.get(rustfs_config::KAFKA_TOPIC), "events-kafka");
         assert_eq!(kafka.get(rustfs_config::KAFKA_ACKS), "all");
         assert_eq!(kafka.get(rustfs_config::KAFKA_TLS_ENABLE), "true");
+
+        let mysql = cfg
+            .get_value(NOTIFY_MYSQL_SUB_SYS, "primary")
+            .expect("mysql target should be decoded");
+        assert_eq!(mysql.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(mysql.get(MYSQL_DSN_STRING), "rustfs:password@tcp(127.0.0.1:3306)/rustfs_events");
+        assert_eq!(mysql.get(MYSQL_TABLE), "rustfs_events");
+        assert_eq!(mysql.get(MYSQL_QUEUE_DIR), "/tmp/mysql-queue");
+        assert_eq!(mysql.get(MYSQL_MAX_OPEN_CONNECTIONS), "2");
     }
 
     #[test]
