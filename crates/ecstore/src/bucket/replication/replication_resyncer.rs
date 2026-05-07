@@ -3988,6 +3988,12 @@ mod tests {
         let tgt_match = HeadObjectOutput::builder().e_tag("\"abc123\"").build();
         assert!(content_matches(&src, &tgt_match), "identical ETags must match");
 
+        let tgt_unquoted_match = HeadObjectOutput::builder().e_tag("abc123").build();
+        assert!(
+            content_matches(&src, &tgt_unquoted_match),
+            "quoted and unquoted ETags with identical values must match"
+        );
+
         // version_id on the target is intentionally ignored
         let tgt_different_version = HeadObjectOutput::builder()
             .e_tag("\"abc123\"")
@@ -4006,6 +4012,9 @@ mod tests {
             ..Default::default()
         };
         assert!(!content_matches(&src_no_etag, &tgt_match), "missing source ETag must not match");
+
+        let tgt_no_etag = HeadObjectOutput::builder().build();
+        assert!(!content_matches(&src, &tgt_no_etag), "missing target ETag must not match");
     }
 
     #[test]
