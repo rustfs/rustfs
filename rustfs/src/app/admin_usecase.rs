@@ -80,7 +80,7 @@ pub struct AdminPoolListItem {
     #[serde(rename = "status")]
     pub status: String,
     #[serde(rename = "decommissionInfo")]
-    pub decommission: Option<rustfs_ecstore::pools::PoolDecommissionInfo>,
+    pub decommission: Option<PoolDecommissionInfo>,
 }
 
 #[derive(Clone, Default)]
@@ -98,6 +98,11 @@ impl DefaultAdminUsecase {
     const DISK_STATE_OK: &'static str = "ok";
     const DISK_STATE_UNFORMATTED: &'static str = "unformatted";
     const RUNTIME_STATE_RETURNING: &'static str = "returning";
+    const POOL_STATUS_ACTIVE: &'static str = "active";
+    const POOL_STATUS_CANCELED: &'static str = "canceled";
+    const POOL_STATUS_COMPLETE: &'static str = "complete";
+    const POOL_STATUS_FAILED: &'static str = "failed";
+    const POOL_STATUS_RUNNING: &'static str = "running";
 
     #[cfg(test)]
     pub fn without_context() -> Self {
@@ -292,18 +297,18 @@ impl DefaultAdminUsecase {
             current_size,
             used_size,
             used: Self::used_ratio(total_size, used_size),
-            status: Self::pool_list_status(decommission.as_ref()),
+            status: Self::pool_list_status(decommission.as_ref()).to_string(),
             decommission,
         }
     }
 
-    fn pool_list_status(decommission: Option<&PoolDecommissionInfo>) -> String {
+    fn pool_list_status(decommission: Option<&PoolDecommissionInfo>) -> &'static str {
         match decommission {
-            Some(info) if info.complete => "complete".to_string(),
-            Some(info) if info.failed => "failed".to_string(),
-            Some(info) if info.canceled => "canceled".to_string(),
-            Some(info) if info.start_time.is_some() => "running".to_string(),
-            _ => "active".to_string(),
+            Some(info) if info.complete => Self::POOL_STATUS_COMPLETE,
+            Some(info) if info.failed => Self::POOL_STATUS_FAILED,
+            Some(info) if info.canceled => Self::POOL_STATUS_CANCELED,
+            Some(info) if info.start_time.is_some() => Self::POOL_STATUS_RUNNING,
+            _ => Self::POOL_STATUS_ACTIVE,
         }
     }
 
@@ -619,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_pool_list_item_maps_capacity_and_idle_status() {
+    fn admin_pool_list_item_maps_capacity_and_active_status() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let pool = PoolStatus {
             id: 2,
