@@ -789,12 +789,12 @@ impl ECStore {
             let Some(meta) = rebalance_meta.as_mut() else {
                 return Err(Error::ConfigNotFound);
             };
-            if complete_rebalance_pools_at_goal(meta, OffsetDateTime::now_utc()) {
-                meta_to_save = Some(meta.clone());
-            }
             if should_skip_start_rebalance(meta.cancel.is_some(), is_rebalance_in_progress(meta)) {
                 info!("start_rebalance: already in progress, skip duplicate start");
                 return Ok(());
+            }
+            if complete_rebalance_pools_at_goal(meta, OffsetDateTime::now_utc()) {
+                meta_to_save = Some(meta.clone());
             }
             meta.cancel = Some(cancel_tx);
 

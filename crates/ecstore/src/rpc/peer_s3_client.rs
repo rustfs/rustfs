@@ -67,13 +67,12 @@ fn pool_write_quorum(participant_count: usize) -> usize {
     (participant_count / 2) + 1
 }
 
-fn reduce_pool_write_quorum_errs(clients: &[Client], errors: &[Option<Error>], pool_idx: usize) -> Option<Error> {
-    let per_pool_errs = pool_participant_errors(clients, errors, pool_idx);
+fn reduce_pool_write_quorum_errs(per_pool_errs: &[Option<Error>]) -> Option<Error> {
     if per_pool_errs.is_empty() {
         return Some(Error::ErasureWriteQuorum);
     }
 
-    reduce_write_quorum_errs(&per_pool_errs, BUCKET_OP_IGNORED_ERRS, pool_write_quorum(per_pool_errs.len()))
+    reduce_write_quorum_errs(per_pool_errs, BUCKET_OP_IGNORED_ERRS, pool_write_quorum(per_pool_errs.len()))
 }
 
 #[async_trait]
@@ -217,8 +216,8 @@ impl S3PeerSys {
         }
 
         for i in 0..self.pools_count {
-            if let Some(pool_err) = reduce_pool_write_quorum_errs(&self.clients, &errors, i) {
-                let per_pool_errs = pool_participant_errors(&self.clients, &errors, i);
+            let per_pool_errs = pool_participant_errors(&self.clients, &errors, i);
+            if let Some(pool_err) = reduce_pool_write_quorum_errs(&per_pool_errs) {
                 tracing::error!("make_bucket per_pool_errs: {per_pool_errs:?}");
                 tracing::error!("make_bucket reduce_write_quorum_errs: {pool_err}");
                 return Err(pool_err);
@@ -1047,7 +1046,6 @@ async fn clone_drives() -> Vec<Option<DiskStore>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_api::BucketOptions;
 
     #[derive(Debug)]
     struct TestPeerS3Client {
@@ -1177,7 +1175,8 @@ mod tests {
             None,
         ];
 
-        let err = reduce_pool_write_quorum_errs(&clients, &errors, 0).expect("all pool participants returned VolumeExists");
+        let per_pool_errs = pool_participant_errors(&clients, &errors, 0);
+        let err = reduce_pool_write_quorum_errs(&per_pool_errs).expect("all pool participants returned VolumeExists");
 
         assert_eq!(err, Error::VolumeExists);
     }
