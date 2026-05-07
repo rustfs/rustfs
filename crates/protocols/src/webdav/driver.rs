@@ -1577,7 +1577,7 @@ mod tests {
         let (bucket, key) = driver.parse_path(&path).expect("path should decode");
 
         assert_eq!(bucket, "bucket");
-        assert_eq!(key.as_deref(), Some("folder/"));
+        assert_eq!(key.as_deref(), Some("folder"));
     }
 
     #[test]
