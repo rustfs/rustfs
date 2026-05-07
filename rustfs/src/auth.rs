@@ -20,7 +20,9 @@ use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
-use rustfs_utils::http::ip::get_source_ip_raw;
+use rustfs_utils::http::{
+    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, ip::get_source_ip_raw,
+};
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
@@ -571,9 +573,9 @@ pub fn get_condition_values_with_query(
     }
 
     for obj_lock in &[
-        "x-amz-object-lock-mode",
-        "x-amz-object-lock-legal-hold",
-        "x-amz-object-lock-retain-until-date",
+        AMZ_OBJECT_LOCK_MODE_LOWER,
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     ] {
         let values = clone_header
             .get_all(*obj_lock)
@@ -1173,8 +1175,8 @@ mod tests {
     fn test_get_condition_values_with_object_lock_headers() {
         let cred = create_test_credentials();
         let mut headers = HeaderMap::new();
-        headers.insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
-        headers.insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2024-12-31T23:59:59Z"));
+        headers.insert(AMZ_OBJECT_LOCK_MODE_LOWER, HeaderValue::from_static("GOVERNANCE"));
+        headers.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, HeaderValue::from_static("2024-12-31T23:59:59Z"));
 
         let conditions = get_condition_values(&headers, &cred, None, None, None);
 

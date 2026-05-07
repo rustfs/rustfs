@@ -1538,6 +1538,91 @@ async fn test_default_retention_applied_to_new_objects() {
 
 #[tokio::test]
 #[serial]
+async fn test_delete_object_creates_delete_marker_for_default_retained_current_version() {
+    init_logging();
+    info!("🧪 Test: DeleteObject creates delete marker for default-retained current version");
+
+    let mut env = ObjectLockTestEnvironment::new().await.unwrap();
+    env.start_rustfs().await.unwrap();
+
+    let bucket = "test-default-retention-delete-marker";
+    let key = "default-retained-object";
+    let data = b"test data for default-retained current version";
+
+    env.create_object_lock_bucket(bucket).await.unwrap();
+
+    let client = env.s3_client();
+    put_object_lock_configuration(&client, bucket, ObjectLockRetentionMode::Governance, Some(30), None)
+        .await
+        .unwrap();
+
+    let put_output = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(data.to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let retained_version_id = put_output
+        .version_id()
+        .expect("default-retained object should have a version id")
+        .to_string();
+
+    let retention = client
+        .get_object_retention()
+        .bucket(bucket)
+        .key(key)
+        .version_id(&retained_version_id)
+        .send()
+        .await
+        .unwrap();
+    let retention = retention.retention().expect("default retention should be readable");
+    assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
+    assert!(
+        retention.retain_until_date().is_some(),
+        "default retention should write a retain-until date"
+    );
+
+    let delete_marker_output = client.delete_object().bucket(bucket).key(key).send().await.unwrap();
+    assert_eq!(delete_marker_output.delete_marker(), Some(true));
+    let delete_marker_version_id = delete_marker_output
+        .version_id()
+        .expect("delete marker should have a version id")
+        .to_string();
+
+    let protected_delete = delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), false).await;
+    assert!(protected_delete.is_err(), "Default-retained version should still reject direct deletion");
+
+    let retention_after_delete_marker = client
+        .get_object_retention()
+        .bucket(bucket)
+        .key(key)
+        .version_id(&retained_version_id)
+        .send()
+        .await
+        .unwrap();
+    let retention_after_delete_marker = retention_after_delete_marker
+        .retention()
+        .expect("default retention should remain readable by version id after delete marker creation");
+    assert_eq!(retention_after_delete_marker.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
+    assert!(
+        retention_after_delete_marker.retain_until_date().is_some(),
+        "retained version should keep its retain-until date after delete marker creation"
+    );
+
+    delete_object_with_bypass(&client, bucket, key, Some(&delete_marker_version_id), false)
+        .await
+        .unwrap();
+    delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), true)
+        .await
+        .unwrap();
+
+    info!("✅ Test passed: Delete marker is allowed while default-retained version stays protected");
+}
+
+#[tokio::test]
+#[serial]
 async fn test_put_copy_and_multipart_reject_incomplete_retention_headers() {
     init_logging();
     info!("🧪 Test: write paths reject incomplete Object Lock retention headers");
