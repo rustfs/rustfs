@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::config::{KV, KVS};
+use rustfs_config::notify::NOTIFY_REDIS_DEFAULT_CHANNEL;
 use rustfs_config::{
     COMMENT_KEY, DEFAULT_LIMIT, ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_QUEUE_DIR,
     KAFKA_QUEUE_LIMIT, KAFKA_TLS_CA, KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY, KAFKA_TLS_ENABLE, KAFKA_TOPIC, MQTT_BROKER,
@@ -337,7 +338,7 @@ pub static DEFAULT_NOTIFY_REDIS_KVS: LazyLock<KVS> = LazyLock::new(|| {
         },
         KV {
             key: REDIS_CHANNEL.to_owned(),
-            value: "".to_owned(),
+            value: NOTIFY_REDIS_DEFAULT_CHANNEL.to_owned(),
             hidden_if_empty: false,
         },
         KV {

@@ -307,7 +307,10 @@ pub fn build_redis_args(
         .ok_or_else(|| TargetError::Configuration("Missing Redis URL".to_string()))?;
     let url = parse_url(&url, "Redis URL")?;
 
-    let channel = config.lookup(REDIS_CHANNEL).unwrap_or_else(|| default_channel.to_string());
+    let channel = config
+        .lookup(REDIS_CHANNEL)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default_channel.to_string());
 
     Ok(RedisArgs {
         enable: true,
@@ -722,6 +725,18 @@ mod tests {
     fn build_redis_args_uses_default_channel_when_missing() {
         let mut config = KVS::new();
         config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/0".to_string());
+
+        let args =
+            build_redis_args(&config, "/tmp/queue", "fallback-channel", TargetType::NotifyEvent).expect("valid redis args");
+
+        assert_eq!(args.channel, "fallback-channel");
+    }
+
+    #[test]
+    fn build_redis_args_uses_default_channel_when_empty() {
+        let mut config = KVS::new();
+        config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/0".to_string());
+        config.insert(REDIS_CHANNEL.to_string(), "   ".to_string());
 
         let args =
             build_redis_args(&config, "/tmp/queue", "fallback-channel", TargetType::NotifyEvent).expect("valid redis args");
