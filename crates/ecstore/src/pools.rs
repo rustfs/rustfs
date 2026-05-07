@@ -142,6 +142,13 @@ fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     Ok(())
 }
 
+fn decommission_meta_bucket_options() -> MakeBucketOptions {
+    MakeBucketOptions {
+        force_create: true,
+        ..Default::default()
+    }
+}
+
 fn is_decommission_active(complete: bool, failed: bool, canceled: bool) -> bool {
     !complete && !failed && !canceled
 }
@@ -2036,9 +2043,10 @@ impl ECStore {
             path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)]),
         ];
 
+        let meta_bucket_opts = decommission_meta_bucket_options();
         for bk in meta_buckets.iter() {
             if let Err(err) = self
-                .make_bucket(bk.to_string_lossy().to_string().as_str(), &MakeBucketOptions::default())
+                .make_bucket(bk.to_string_lossy().to_string().as_str(), &meta_bucket_opts)
                 .await
                 && !is_err_bucket_exists(&err)
             {
@@ -2737,12 +2745,13 @@ mod pools_tests {
     use super::{
         DecomBucketInfo, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolStatus, bind_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
-        decommission_cancel_signal_result, decommission_item_size, decommission_start_guard_state, dedup_indices,
-        ensure_decommission_cancel_allowed, ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing,
-        ensure_decommission_start_allowed, ensure_decommission_terminal_operation_supported,
-        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
-        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
+        decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed,
+        ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
+        ensure_decommission_terminal_operation_supported, ensure_valid_decommission_pool_index, get_by_index,
+        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
+        load_decommission_entry_versions, mark_decommission_bucket_done, require_decommission_store,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
         resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
@@ -3374,6 +3383,13 @@ mod pools_tests {
     #[test]
     fn test_ensure_decommission_not_rebalancing_allows_idle() {
         assert!(ensure_decommission_not_rebalancing(false).is_ok());
+    }
+
+    #[test]
+    fn test_decommission_meta_bucket_options_are_idempotent() {
+        let opts = decommission_meta_bucket_options();
+
+        assert!(opts.force_create);
     }
 
     #[test]
