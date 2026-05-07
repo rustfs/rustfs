@@ -181,6 +181,11 @@ impl ECStore {
                         _ = sleep(Duration::from_secs(interval)) => {
                         }
                     }
+                    if times <= 10 {
+                        for disk in disks.iter().flatten() {
+                            disk.reset_health_for_store_init_retry();
+                        }
+                    }
                 }
             }?;
 

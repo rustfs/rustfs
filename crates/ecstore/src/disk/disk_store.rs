@@ -265,6 +265,29 @@ impl DiskHealthTracker {
         true
     }
 
+    /// Clear faulty/offline state so a store-init format load retry can issue RPC again.
+    ///
+    /// Remote disks are marked faulty on timeout/network errors; the init loop retries with the
+    /// same [`DiskStore`] handles, which would otherwise fail immediately at `is_faulty()`.
+    pub fn reset_for_store_init_retry(&self, endpoint: &Endpoint) {
+        self.status.store(DISK_HEALTH_OK, Ordering::Release);
+        self.runtime_state
+            .store(RuntimeDriveHealthState::Online as u32, Ordering::Release);
+        self.consecutive_failures.store(0, Ordering::Release);
+        self.consecutive_successes.store(0, Ordering::Release);
+        self.offline_since_unix_secs.store(0, Ordering::Release);
+        self.waiting.store(0, Ordering::Release);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let now_nanos = now.as_nanos() as i64;
+        self.last_success.store(now_nanos, Ordering::Relaxed);
+        self.last_started.store(now_nanos, Ordering::Relaxed);
+        self.last_transition_unix_secs
+            .store(now.as_secs() as i64, Ordering::Release);
+        record_drive_runtime_state(endpoint, RuntimeDriveHealthState::Online);
+    }
+
     pub fn mark_recovery_success(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
         let current = self.runtime_state();
         let next = match current {
@@ -446,6 +469,11 @@ impl LocalDiskWrapper {
     #[cfg(test)]
     pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
         self.health.force_runtime_state_for_test(state);
+    }
+
+    pub fn reset_health_for_store_init_retry(&self) {
+        self.health
+            .reset_for_store_init_retry(&self.disk.endpoint());
     }
 
     /// Enable health monitoring after disk creation.

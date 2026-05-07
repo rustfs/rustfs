@@ -140,6 +140,10 @@ impl RemoteDisk {
         self.health.force_runtime_state_for_test(state);
     }
 
+    pub fn reset_health_for_store_init_retry(&self) {
+        self.health.reset_for_store_init_retry(&self.endpoint);
+    }
+
     fn spawn_recovery_monitor_if_needed(&self) {
         if !self.health_check {
             return;
