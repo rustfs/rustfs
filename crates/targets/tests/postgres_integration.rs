@@ -32,10 +32,11 @@ use rustfs_targets::Target;
 use rustfs_targets::check_postgres_server_available;
 use rustfs_targets::target::EntityTarget;
 use rustfs_targets::target::TargetType;
-use rustfs_targets::target::postgres::{PostgresArgs, PostgresFormat, PostgresTarget};
+use rustfs_targets::target::postgres::{PostgresArgs, PostgresDsn, PostgresFormat, PostgresTarget};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
+use url::Url;
 use uuid::Uuid;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -47,10 +48,13 @@ fn test_args(table: &str, format: PostgresFormat) -> PostgresArgs {
         "RUSTFS_TEST_PG_DSN",
         "postgres://postgres:rustfs@localhost:5432/rustfs_events?search_path=public",
     );
+    let schema = PostgresDsn::parse(&dsn)
+        .expect("RUSTFS_TEST_PG_DSN must be a valid PostgreSQL DSN")
+        .schema;
     PostgresArgs {
         enable: true,
         dsn_string: dsn,
-        schema: "public".to_string(),
+        schema,
         table: table.to_string(),
         format,
         tls_required: false,
@@ -61,6 +65,12 @@ fn test_args(table: &str, format: PostgresFormat) -> PostgresArgs {
         queue_limit: 100_000,
         target_type: TargetType::NotifyEvent,
     }
+}
+
+fn with_search_path(dsn: &str, schema: &str) -> String {
+    let mut url = Url::parse(dsn).expect("RUSTFS_TEST_PG_DSN must be a valid PostgreSQL DSN URL");
+    url.query_pairs_mut().clear().append_pair("search_path", schema);
+    url.to_string()
 }
 
 async fn raw_client(args: &PostgresArgs) -> tokio_postgres::Client {
@@ -90,9 +100,10 @@ fn entity_for(bucket: &str, object: &str) -> Arc<EntityTarget<serde_json::Value>
 #[tokio::test]
 #[ignore = "requires running PostgreSQL server"]
 async fn test_check_postgres_server_available_with_existing_table() {
-    let args = test_args("public.pg_catalog_does_not_apply", PostgresFormat::Namespace);
+    let args = test_args("pg_class", PostgresFormat::Namespace);
     // Use a real existing table: pg_class always exists.
     let mut args = args;
+    args.dsn_string = with_search_path(&args.dsn_string, "pg_catalog");
     args.schema = "pg_catalog".to_string();
     args.table = "pg_class".to_string();
 
