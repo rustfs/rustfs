@@ -266,7 +266,9 @@ fn is_valid_identifier_segment(segment: &str) -> bool {
     }
 
     let mut chars = segment.chars();
-    let first = chars.next().unwrap();
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }

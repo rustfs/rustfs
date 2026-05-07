@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use hashbrown::HashSet as HbHashSet;
+use http::{HeaderMap, HeaderValue, StatusCode};
 use rustfs_config::{
     ENABLE_KEY, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_TLS_CA,
     MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
@@ -28,7 +29,7 @@ use rustfs_targets::{
     },
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
-use s3s::{S3Result, s3_error};
+use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
@@ -205,6 +206,19 @@ pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, en
             "{module_name} module is disabled; enable the {module_name} module first in the console or set {env_key}=true before {action}"
         )
     })
+}
+
+pub(crate) fn build_json_response(
+    status: StatusCode,
+    body: Body,
+    request_id: Option<&HeaderValue>,
+) -> S3Response<(StatusCode, Body)> {
+    let mut header = HeaderMap::new();
+    header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(v) = request_id {
+        header.insert("x-request-id", v.clone());
+    }
+    S3Response::with_headers((status, body), header)
 }
 
 pub(crate) fn merge_target_endpoints(

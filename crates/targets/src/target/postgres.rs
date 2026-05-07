@@ -96,7 +96,9 @@ pub fn validate_pg_identifier(name: &str, kind: &str) -> Result<(), TargetError>
         return Err(TargetError::Configuration(format!("PostgreSQL {kind} cannot be empty")));
     }
     let mut chars = name.chars();
-    let first = chars.next().expect("non-empty checked above");
+    let Some(first) = chars.next() else {
+        return Err(TargetError::Configuration(format!("PostgreSQL {kind} cannot be empty")));
+    };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return Err(TargetError::Configuration(format!(
             "PostgreSQL {kind} must start with a letter or underscore"
