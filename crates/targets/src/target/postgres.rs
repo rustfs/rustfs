@@ -49,6 +49,8 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
+const TARGET_LOG_KEY_FIELD: &str = "Key";
+
 /// Output format selection for the PostgreSQL target.
 ///
 /// - `Namespace`: single-row UPSERT per object key (MinIO `namespace` style).
@@ -388,6 +390,18 @@ pub fn map_pool_error(err: deadpool_postgres::PoolError, context: &str) -> Targe
     }
 }
 
+fn resolve_payload_key(payload: &serde_json::Value, meta: &QueuedPayloadMeta) -> String {
+    payload
+        .get(TARGET_LOG_KEY_FIELD)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            let decoded_object =
+                crate::target::decode_object_name(&meta.object_name).unwrap_or_else(|_| meta.object_name.clone());
+            format!("{}/{}", meta.bucket_name, decoded_object)
+        })
+}
+
 /// PostgreSQL notification target.
 ///
 /// Holds a cloneable `deadpool_postgres::Pool` rather than a `Mutex<Option<Pool>>`
@@ -468,15 +482,7 @@ where
         let payload: serde_json::Value =
             serde_json::from_slice(body).map_err(|e| TargetError::Serialization(format!("Failed to parse JSON payload: {e}")))?;
 
-        let key = payload
-            .get("Key")
-            .and_then(serde_json::Value::as_str)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| {
-                let decoded_object =
-                    crate::target::decode_object_name(&meta.object_name).unwrap_or_else(|_| meta.object_name.clone());
-                format!("{}/{}", meta.bucket_name, decoded_object)
-            });
+        let key = resolve_payload_key(&payload, meta);
 
         let result = match self.args.format {
             PostgresFormat::Namespace => {
@@ -855,5 +861,40 @@ mod tests {
         assert!(validate_pg_identifier("public.events", "table").is_err());
         assert!(validate_pg_identifier("events\"DROP", "table").is_err());
         assert!(validate_pg_identifier("a b", "table").is_err());
+    }
+
+    #[test]
+    fn resolve_payload_key_prefers_serialized_key_field() {
+        let payload = serde_json::json!({
+            "EventName": "s3:ObjectCreated:Put",
+            "Key": "bucket-a/folder/object.txt",
+            "Records": []
+        });
+        let meta = QueuedPayloadMeta::new(
+            rustfs_s3_common::EventName::ObjectCreatedPut,
+            "bucket-a".to_string(),
+            "fallback%2Fvalue.txt".to_string(),
+            "application/json",
+            0,
+        );
+
+        assert_eq!(resolve_payload_key(&payload, &meta), "bucket-a/folder/object.txt");
+    }
+
+    #[test]
+    fn resolve_payload_key_falls_back_to_decoded_meta_key() {
+        let payload = serde_json::json!({
+            "EventName": "s3:ObjectCreated:Put",
+            "Records": []
+        });
+        let meta = QueuedPayloadMeta::new(
+            rustfs_s3_common::EventName::ObjectCreatedPut,
+            "bucket-a".to_string(),
+            "hello+world%2Ftest.txt".to_string(),
+            "application/json",
+            0,
+        );
+
+        assert_eq!(resolve_payload_key(&payload, &meta), "bucket-a/hello world/test.txt");
     }
 }
