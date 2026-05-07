@@ -196,8 +196,13 @@ mod tests {
         collect_env_target_instance_ids_from_env, collect_target_configs_from_env, redact_target_field_value,
         redacted_target_config,
     };
-    use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
-    use rustfs_config::{ENABLE_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_LIMIT};
+    use rustfs_config::notify::{
+        ENV_NOTIFY_REDIS_ENABLE, ENV_NOTIFY_REDIS_RECONNECT_RETRY_ATTEMPTS, ENV_NOTIFY_REDIS_TLS_ALLOW_INSECURE,
+        ENV_NOTIFY_REDIS_URL, NOTIFY_REDIS_KEYS, NOTIFY_ROUTE_PREFIX,
+    };
+    use rustfs_config::{
+        ENABLE_KEY, REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_TLS_ALLOW_INSECURE, REDIS_URL, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_LIMIT,
+    };
     use rustfs_ecstore::config::{Config, KVS};
     use std::collections::{HashMap, HashSet};
 
@@ -282,6 +287,33 @@ mod tests {
         );
 
         assert_eq!(ids, HashSet::from(["primary".to_string()]));
+    }
+
+    #[test]
+    fn collect_target_configs_accepts_redis_env_fields_with_internal_underscores() {
+        let cfg = Config(HashMap::new());
+        let valid_fields = NOTIFY_REDIS_KEYS.iter().map(|key| (*key).to_string()).collect();
+
+        let configs = collect_target_configs_from_env(
+            &cfg,
+            NOTIFY_ROUTE_PREFIX,
+            "redis",
+            &valid_fields,
+            vec![
+                (format!("{ENV_NOTIFY_REDIS_ENABLE}_PRIMARY"), "on".to_string()),
+                (format!("{ENV_NOTIFY_REDIS_URL}_PRIMARY"), "redis://127.0.0.1:6379/0".to_string()),
+                (format!("{ENV_NOTIFY_REDIS_RECONNECT_RETRY_ATTEMPTS}_PRIMARY"), "9".to_string()),
+                (format!("{ENV_NOTIFY_REDIS_TLS_ALLOW_INSECURE}_PRIMARY"), "off".to_string()),
+            ],
+        );
+
+        let configs: HashMap<String, KVS> = configs.into_iter().collect();
+        let redis_config = configs.get("primary").expect("redis env target should be discovered");
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(redis_config.lookup(REDIS_URL).as_deref(), Some("redis://127.0.0.1:6379/0"));
+        assert_eq!(redis_config.lookup(REDIS_RECONNECT_RETRY_ATTEMPTS).as_deref(), Some("9"));
+        assert_eq!(redis_config.lookup(REDIS_TLS_ALLOW_INSECURE).as_deref(), Some("off"));
     }
 
     #[test]
