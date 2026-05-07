@@ -338,6 +338,20 @@ fn notification_target_is_listed(targets: &serde_json::Value, target_name: &str)
         })
 }
 
+fn notification_target_status<'a>(targets: &'a serde_json::Value, target_name: &str) -> Option<&'a str> {
+    targets["notification_endpoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry["account_id"].as_str() == Some(target_name)
+                && entry["service"]
+                    .as_str()
+                    .is_some_and(|service| service == "webhook" || service.starts_with("webhook-"))
+        })
+        .and_then(|entry| entry["status"].as_str())
+}
+
 async fn wait_for_target_visibility(
     env: &RustFSTestEnvironment,
     target_name: &str,
@@ -385,6 +399,22 @@ async fn wait_for_target_absence(
 async fn restart_rustfs_server(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn Error + Send + Sync>> {
     env.stop_server();
     env.start_rustfs_server_without_cleanup(vec![]).await
+}
+
+async fn spawn_tcp_only_webhook_probe_server()
+-> Result<(String, tokio::task::JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>), Box<dyn Error + Send + Sync>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let webhook_url = format!("http://{address}/hook");
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            drop(stream);
+        }
+    });
+
+    Ok((webhook_url, handle))
 }
 
 async fn read_persisted_server_config(env: &RustFSTestEnvironment) -> String {
@@ -511,6 +541,35 @@ async fn test_notification_target_persists_across_restart_and_delete() -> Result
 
     webhook_handle.abort();
     let _ = webhook_handle.await;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_notification_target_with_path_is_online_via_transport_probe() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let (webhook_url, probe_handle) = spawn_tcp_only_webhook_probe_server().await?;
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "true")])
+        .await?;
+
+    let target_name = "path-probe";
+    configure_webhook_target(&env, target_name, &webhook_url, "secret-token").await?;
+
+    let (visible_targets, visible_arns) = wait_for_target_visibility(&env, target_name).await?;
+    assert_eq!(notification_target_status(&visible_targets, target_name), Some("online"));
+    assert!(
+        visible_arns
+            .iter()
+            .any(|arn| arn.ends_with(&format!(":{target_name}:webhook"))),
+        "target ARN missing for reachable path endpoint: {visible_arns:?}"
+    );
+
+    probe_handle.abort();
+    let _ = probe_handle.await;
 
     Ok(())
 }

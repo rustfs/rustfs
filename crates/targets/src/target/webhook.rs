@@ -29,6 +29,7 @@ use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{
+    io::ErrorKind,
     marker::PhantomData,
     path::PathBuf,
     sync::{
@@ -37,8 +38,10 @@ use std::{
     },
     time::Duration,
 };
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, warn};
+use url::Host;
 
 /// Arguments for configuring a Webhook target
 #[derive(Debug, Clone)]
@@ -106,6 +109,7 @@ where
 {
     id: TargetID,
     args: WebhookArgs,
+    health_check_addr: String,
     http_client: Arc<Client>,
     // Add Send + Sync constraints to ensure thread safety
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
@@ -124,6 +128,7 @@ where
         Box::new(WebhookTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
+            health_check_addr: self.health_check_addr.clone(),
             http_client: Arc::clone(&self.http_client),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             initialized: AtomicBool::new(self.initialized.load(Ordering::SeqCst)),
@@ -140,6 +145,7 @@ where
         args.validate()?;
         // Create a TargetID
         let target_id = TargetID::new(id, ChannelTargetType::Webhook.as_str().to_string());
+        let health_check_addr = Self::health_check_addr(&args.endpoint)?;
 
         // Build HTTP client using the helper function
         let http_client = Arc::new(Self::build_http_client(&args)?);
@@ -173,6 +179,7 @@ where
         Ok(WebhookTarget::<E> {
             id: target_id,
             args,
+            health_check_addr,
             http_client,
             store: queue_store,
             initialized: AtomicBool::new(false),
@@ -222,38 +229,66 @@ where
             .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {e}")))
     }
 
+    fn health_check_addr(endpoint: &Url) -> Result<String, TargetError> {
+        let host = endpoint
+            .host()
+            .ok_or_else(|| TargetError::Configuration(format!("Webhook endpoint '{}' is missing a host", endpoint)))?;
+        let port = endpoint.port_or_known_default().ok_or_else(|| {
+            TargetError::Configuration(format!(
+                "Webhook endpoint '{}' is missing a known port for scheme '{}'",
+                endpoint,
+                endpoint.scheme()
+            ))
+        })?;
+
+        Ok(match host {
+            Host::Domain(domain) => format!("{domain}:{port}"),
+            Host::Ipv4(addr) => format!("{addr}:{port}"),
+            Host::Ipv6(addr) => format!("[{addr}]:{port}"),
+        })
+    }
+
+    async fn probe_reachability(&self) -> Result<bool, TargetError> {
+        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(self.health_check_addr.as_str())).await {
+            Ok(Ok(_stream)) => Ok(true),
+            Ok(Err(err)) => match err.kind() {
+                ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionReset
+                | ErrorKind::NotConnected
+                | ErrorKind::AddrNotAvailable => Ok(false),
+                ErrorKind::TimedOut => Err(TargetError::Timeout(format!(
+                    "Webhook connectivity probe to {} timed out",
+                    self.health_check_addr
+                ))),
+                _ => Err(TargetError::Network(format!(
+                    "Webhook connectivity probe to {} failed: {}",
+                    self.health_check_addr, err
+                ))),
+            },
+            Err(_) => Err(TargetError::Timeout(format!(
+                "Webhook connectivity probe to {} timed out",
+                self.health_check_addr
+            ))),
+        }
+    }
+
     async fn init_inner(&self) -> Result<(), TargetError> {
         if self.initialized.load(Ordering::SeqCst) {
             return Ok(());
         }
 
-        // HTTP HEAD probe: verifies the full request path (proxy, TLS, firewall)
-        // unlike TCP connect which can't detect proxy issues.
-        let probe_timeout = Duration::from_secs(5);
-        match tokio::time::timeout(probe_timeout, self.http_client.head(self.args.endpoint.as_str()).send()).await {
-            Ok(Ok(resp)) => {
-                let status = resp.status();
-                if status.is_success() || status == StatusCode::NOT_FOUND {
-                    // NOT_FOUND is acceptable for HEAD probes — the endpoint may not
-                    // exist as a HEAD route, but the server is reachable.
-                    debug!("Webhook target {} HEAD probe returned {}", self.id, status);
-                } else if status == StatusCode::METHOD_NOT_ALLOWED {
-                    // Server is reachable but doesn't support HEAD — still valid.
-                    debug!("Webhook target {} HEAD probe: METHOD_NOT_ALLOWED (reachable)", self.id);
-                } else {
-                    warn!("Webhook target {} HEAD probe returned {}", self.id, status);
-                }
+        // Use host:port reachability for health checks so path-specific webhook
+        // routing or HTTP method handling does not incorrectly hide a reachable target.
+        match self.probe_reachability().await {
+            Ok(true) => {
+                debug!("Webhook target {} reachability probe succeeded via {}", self.id, self.health_check_addr);
             }
-            Ok(Err(e)) => {
-                // Connection-level error (DNS, TLS, refused, timeout)
-                return Err(if e.is_timeout() || e.is_connect() {
-                    TargetError::NotConnected
-                } else {
-                    TargetError::Network(format!("Webhook HEAD probe failed: {e}"))
-                });
+            Ok(false) => {
+                return Err(TargetError::NotConnected);
             }
-            Err(_) => {
-                return Err(TargetError::Timeout("Webhook HEAD probe timed out".to_string()));
+            Err(err) => {
+                return Err(err);
             }
         }
 
@@ -352,27 +387,7 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
-        match tokio::time::timeout(Duration::from_secs(5), self.http_client.head(self.args.endpoint.as_str()).send()).await {
-            Ok(Ok(resp)) => {
-                let status = resp.status();
-                if status.is_server_error() {
-                    debug!("Webhook {} server error: {}", self.id, status);
-                    Ok(false)
-                } else {
-                    debug!("Webhook {} is reachable (status: {})", self.id, status);
-                    Ok(true)
-                }
-            }
-            Ok(Err(e)) => {
-                debug!("Webhook {} request failed: {}", self.id, e);
-                if e.is_timeout() || e.is_connect() {
-                    Err(TargetError::NotConnected)
-                } else {
-                    Err(TargetError::Network(format!("Webhook health check failed: {e}")))
-                }
-            }
-            Err(_) => Err(TargetError::Timeout("Webhook health check timed out".to_string())),
-        }
+        self.probe_reachability().await
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
@@ -478,8 +493,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::WebhookArgs;
-    use crate::target::{TargetType, decode_object_name};
+    use super::{WebhookArgs, WebhookTarget};
+    use crate::target::{Target, TargetType, decode_object_name};
+    use tokio::net::TcpListener;
     use url::Url;
     use url::form_urlencoded;
 
@@ -572,5 +588,31 @@ mod tests {
 
         let decoded = decode_object_name(&form_encoded).unwrap();
         assert_eq!(decoded, object_name);
+    }
+
+    #[test]
+    fn test_health_check_addr_ignores_endpoint_path() {
+        let endpoint = Url::parse("https://example.com:9443/hook/path").unwrap();
+        let health_check_addr = WebhookTarget::<serde_json::Value>::health_check_addr(&endpoint).unwrap();
+
+        assert_eq!(health_check_addr, "example.com:9443");
+    }
+
+    #[tokio::test]
+    async fn test_is_active_uses_host_port_reachability_for_path_endpoints() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let args = WebhookArgs {
+            endpoint: Url::parse(&format!("http://{address}/hook")).unwrap(),
+            ..base_args()
+        };
+        let target = WebhookTarget::<serde_json::Value>::new("path-probe".to_string(), args).unwrap();
+
+        assert!(target.is_active().await.unwrap());
+        accept_task.await.unwrap();
     }
 }
