@@ -16,6 +16,10 @@ use super::*;
 use crate::error::is_err_decommission_running;
 use crate::global::is_first_cluster_node_local;
 
+fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
+    pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
+}
+
 fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize) -> Result<bool> {
     let pool = endpoints.as_ref().get(idx).ok_or_else(|| {
         Error::other(format!(
@@ -104,8 +108,6 @@ impl ECStore {
         let mut pools = Vec::with_capacity(endpoint_pools.as_ref().len());
         let mut disk_map = HashMap::with_capacity(endpoint_pools.as_ref().len());
 
-        let first_is_local = endpoint_pools.first_local();
-
         let mut local_disks = Vec::new();
 
         info!("ECStore new address: {}", address.to_string());
@@ -125,6 +127,7 @@ impl ECStore {
         let mut common_parity_drives = 0;
 
         for (i, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
+            let pool_first_is_local = pool_first_endpoint_is_local(pool_eps);
             if common_parity_drives == 0 {
                 let parity_drives = ec_drives_no_config(pool_eps.drives_per_set)?;
                 storageclass::validate_parity(parity_drives, pool_eps.drives_per_set)?;
@@ -133,14 +136,15 @@ impl ECStore {
 
             // validate_parity(parity_count, pool_eps.drives_per_set)?;
 
-            // Initialize disks without health monitoring so that remote peers
-            // are not immediately marked as faulty before they have a chance to
-            // start up. Health monitoring is enabled after format loading succeeds.
+            // Build disks with health monitoring available, but do not start
+            // periodic monitoring until format loading succeeds. Startup RPC
+            // failures can still spawn recovery probes for peers that come up
+            // after this node.
             let (disks, errs) = store_init::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
-                    health_check: false,
+                    health_check: true,
                 },
             )
             .await;
@@ -152,7 +156,7 @@ impl ECStore {
                 let mut interval = 1;
                 loop {
                     match store_init::connect_load_init_formats(
-                        first_is_local,
+                        pool_first_is_local,
                         &disks,
                         pool_eps.set_count,
                         pool_eps.drives_per_set,
@@ -366,8 +370,8 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, resolve_store_init_stage_result, should_resume_local_decommission,
-        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, pool_first_endpoint_is_local, resolve_store_init_stage_result,
+        should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     use crate::{
         disk::endpoint::Endpoint,
@@ -463,5 +467,39 @@ mod tests {
         let rx = CancellationToken::new();
         rx.cancel();
         assert!(!wait_for_local_decommission_resume_delay(&rx, Duration::from_secs(1)).await);
+    }
+
+    #[test]
+    fn test_pool_first_endpoint_is_local_uses_pool_scope_for_expansion() {
+        let mut remote_endpoint = Endpoint::try_from("http://127.0.0.2:9000/data1").expect("remote endpoint should parse");
+        remote_endpoint.is_local = false;
+
+        let mut local_endpoint = Endpoint::try_from("http://127.0.0.1:9000/data1").expect("local endpoint should parse");
+        local_endpoint.is_local = true;
+
+        let endpoints = EndpointServerPools::from(vec![
+            PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 1,
+                endpoints: Endpoints::from(vec![remote_endpoint]),
+                cmd_line: "pool-0".to_string(),
+                platform: String::new(),
+            },
+            PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 1,
+                endpoints: Endpoints::from(vec![local_endpoint]),
+                cmd_line: "pool-1".to_string(),
+                platform: String::new(),
+            },
+        ]);
+
+        assert!(!endpoints.first_local(), "cluster first endpoint is intentionally remote");
+        assert!(
+            pool_first_endpoint_is_local(endpoints.as_ref().get(1).expect("second pool should exist")),
+            "the expanded pool should be initialized by its own first local endpoint"
+        );
     }
 }
