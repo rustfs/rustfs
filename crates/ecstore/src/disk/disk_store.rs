@@ -277,14 +277,11 @@ impl DiskHealthTracker {
         self.consecutive_successes.store(0, Ordering::Release);
         self.offline_since_unix_secs.store(0, Ordering::Release);
         self.waiting.store(0, Ordering::Release);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
         let now_nanos = now.as_nanos() as i64;
         self.last_success.store(now_nanos, Ordering::Relaxed);
         self.last_started.store(now_nanos, Ordering::Relaxed);
-        self.last_transition_unix_secs
-            .store(now.as_secs() as i64, Ordering::Release);
+        self.last_transition_unix_secs.store(now.as_secs() as i64, Ordering::Release);
         record_drive_runtime_state(endpoint, RuntimeDriveHealthState::Online);
     }
 
@@ -473,8 +470,7 @@ impl LocalDiskWrapper {
 
     /// Same as [`DiskHealthTracker::reset_for_store_init_retry`]: undo a transient faulty mark before another format load attempt.
     pub fn reset_health_for_store_init_retry(&self) {
-        self.health
-            .reset_for_store_init_retry(&self.disk.endpoint());
+        self.health.reset_for_store_init_retry(&self.disk.endpoint());
     }
 
     /// Enable health monitoring after disk creation.
