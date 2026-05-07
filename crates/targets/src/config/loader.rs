@@ -38,8 +38,7 @@ fn is_sensitive_target_field(field_name: &str) -> bool {
         || field_name.contains("client_key")
         || field_name.contains("access_key")
         || field_name.contains("auth")
-        || field_name.contains(rustfs_config::MYSQL_DSN_STRING)
-        || field_name.contains(rustfs_config::POSTGRES_DSN_STRING)
+        || field_name.contains(rustfs_config::BASE_DSN_STRING)
 }
 
 fn redact_target_field_value(field_name: &str, value: &str) -> String {

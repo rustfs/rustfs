@@ -27,17 +27,15 @@ use rustfs_targets::{Target, TargetError, target::mysql::*, target::*};
 use std::env;
 use std::sync::Arc;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 fn test_dsn() -> String {
     env::var("RUSTFS_MYSQL_TEST_DSN").expect("RUSTFS_MYSQL_TEST_DSN must be set")
 }
 
 fn table_name(prefix: &str) -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    format!("{prefix}_{ts}")
+    let suffix = Uuid::new_v4().simple().to_string();
+    format!("{prefix}_{}", &suffix[..16])
 }
 
 fn make_args(dsn: &str, table: &str, queue_dir: &str) -> MySqlArgs {

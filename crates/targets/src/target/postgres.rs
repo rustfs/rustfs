@@ -195,21 +195,39 @@ pub(crate) fn redact_postgres_dsn(dsn_string: &str) -> String {
         return String::new();
     }
 
-    let (prefix, rest) = if let Some(rest) = input.strip_prefix("postgres://") {
-        ("postgres://", rest)
-    } else if let Some(rest) = input.strip_prefix("postgresql://") {
-        ("postgresql://", rest)
-    } else {
-        return "***".to_string();
+    let mut url = match Url::parse(input) {
+        Ok(url) => url,
+        Err(_) => return "***".to_string(),
     };
 
-    let Some((credentials, host_part)) = rest.split_once('@') else {
-        return input.to_string();
-    };
-    let Some((user, _password)) = credentials.split_once(':') else {
-        return input.to_string();
-    };
-    format!("{prefix}{user}:***@{host_part}")
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "postgres" && scheme != "postgresql" {
+        return "***".to_string();
+    }
+
+    if url.password().is_some() {
+        let _ = url.set_password(Some("***"));
+    }
+
+    let mut query_pairs: Vec<(String, String)> = Vec::new();
+    let mut has_password_param = false;
+    for (key, value) in url.query_pairs() {
+        if key.eq_ignore_ascii_case("password") {
+            has_password_param = true;
+            query_pairs.push((key.into_owned(), "***".to_string()));
+        } else {
+            query_pairs.push((key.into_owned(), value.into_owned()));
+        }
+    }
+    if has_password_param {
+        url.set_query(None);
+        let mut serializer = url.query_pairs_mut();
+        for (key, value) in query_pairs {
+            serializer.append_pair(&key, &value);
+        }
+    }
+
+    url.to_string()
 }
 
 /// Validates a PostgreSQL identifier (schema or table name).
@@ -545,6 +563,8 @@ where
     id: TargetID,
     args: PostgresArgs,
     pool: Pool,
+    namespace_sql: String,
+    access_sql: String,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: std::marker::PhantomData<E>,
@@ -559,6 +579,8 @@ where
             id: self.id.clone(),
             args: self.args.clone(),
             pool: self.pool.clone(),
+            namespace_sql: self.namespace_sql.clone(),
+            access_sql: self.access_sql.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: std::marker::PhantomData,
@@ -590,6 +612,8 @@ where
 
         Ok(Self {
             id: target_id,
+            namespace_sql: namespace_upsert_sql(&args.schema, &args.table),
+            access_sql: access_insert_sql(&args.schema, &args.table),
             args,
             pool,
             store: queue_store,
@@ -615,16 +639,12 @@ where
         let key = resolve_payload_key(&payload, meta);
 
         let result = match self.args.format {
-            PostgresFormat::Namespace => {
-                let sql = namespace_upsert_sql(&self.args.schema, &self.args.table);
-                client.execute(&sql, &[&key, &payload]).await
-            }
+            PostgresFormat::Namespace => client.execute(&self.namespace_sql, &[&key, &payload]).await,
             PostgresFormat::Access => {
-                let sql = access_insert_sql(&self.args.schema, &self.args.table);
                 let event_name_str = meta.event_name.to_string();
                 let queued_at_ms = meta.queued_at_unix_ms as i64;
                 client
-                    .execute(&sql, &[&event_id, &event_name_str, &key, &payload, &queued_at_ms])
+                    .execute(&self.access_sql, &[&event_id, &event_name_str, &key, &payload, &queued_at_ms])
                     .await
             }
         };
@@ -984,6 +1004,13 @@ mod tests {
         };
         let rendered = format!("{args:?}");
         assert!(!rendered.contains(":***@"));
+    }
+
+    #[test]
+    fn redact_postgres_dsn_masks_password_query_parameter() {
+        let redacted = redact_postgres_dsn("postgres://postgres@localhost:5432/db?search_path=public&password=secret");
+        assert!(!redacted.contains("secret"));
+        assert!(redacted.contains("password=%2A%2A%2A") || redacted.contains("password=***"));
     }
 
     #[test]

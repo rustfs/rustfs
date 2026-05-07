@@ -347,7 +347,6 @@ pub static DEFAULT_AUDIT_PULSAR_KVS: LazyLock<KVS> = LazyLock::new(|| {
     ])
 });
 
-#[allow(dead_code)]
 pub static DEFAULT_AUDIT_REDIS_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {

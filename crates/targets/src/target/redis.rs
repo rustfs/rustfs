@@ -32,6 +32,7 @@ use redis::{
 use rustfs_config::{REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,7 +103,7 @@ impl RedisTlsConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RedisArgs {
     /// Whether the target is enabled
     pub enable: bool,
@@ -138,6 +139,45 @@ pub struct RedisArgs {
     pub pipeline_buffer_size: Option<usize>,
     /// the target type
     pub target_type: TargetType,
+}
+
+fn redact_redis_url(url: &Url) -> String {
+    let mut redacted = url.clone();
+    if redacted.password().is_some() {
+        let _ = redacted.set_password(Some("***"));
+    }
+    redacted.to_string()
+}
+
+impl fmt::Debug for RedisArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedisArgs")
+            .field("enable", &self.enable)
+            .field("url", &redact_redis_url(&self.url))
+            .field("channel", &self.channel)
+            .field("username", &self.username)
+            .field(
+                "password",
+                if self.password.as_deref().unwrap_or_default().is_empty() {
+                    &""
+                } else {
+                    &"***REDACTED***"
+                },
+            )
+            .field("tls", &self.tls)
+            .field("keep_alive", &self.keep_alive)
+            .field("queue_dir", &self.queue_dir)
+            .field("queue_limit", &self.queue_limit)
+            .field("max_retry_attempts", &self.max_retry_attempts)
+            .field("reconnect_retry_attempts", &self.reconnect_retry_attempts)
+            .field("min_retry_delay", &self.min_retry_delay)
+            .field("max_retry_delay", &self.max_retry_delay)
+            .field("connection_timeout", &self.connection_timeout)
+            .field("response_timeout", &self.response_timeout)
+            .field("pipeline_buffer_size", &self.pipeline_buffer_size)
+            .field("target_type", &self.target_type)
+            .finish()
+    }
 }
 
 impl RedisArgs {
@@ -182,7 +222,7 @@ impl RedisArgs {
         }
 
         if !self.queue_dir.is_empty() && !Path::new(&self.queue_dir).is_absolute() {
-            return Err(TargetError::Configuration("redis queue_dir path should be absolute".to_string()));
+            return Err(TargetError::Configuration("Redis queue_dir path should be absolute".to_string()));
         }
 
         Ok(())
@@ -778,6 +818,21 @@ mod tests {
             ..base_args()
         };
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn debug_redacts_passwords_from_url_and_args() {
+        let args = RedisArgs {
+            url: Url::parse("redis://user:secret@127.0.0.1:6379/0").unwrap(),
+            password: Some("override-secret".to_string()),
+            ..base_args()
+        };
+
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains("secret"), "url password leaked: {rendered}");
+        assert!(!rendered.contains("override-secret"), "args password leaked: {rendered}");
+        assert!(rendered.contains("redis://user:***@127.0.0.1:6379/0"));
+        assert!(rendered.contains("\"***REDACTED***\""));
     }
 
     #[test]
