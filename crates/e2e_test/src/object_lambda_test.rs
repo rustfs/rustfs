@@ -326,19 +326,10 @@ async fn delete_webhook_target(env: &RustFSTestEnvironment, target_name: &str) -
 }
 
 fn notification_target_is_listed(targets: &serde_json::Value, target_name: &str) -> bool {
-    targets["notification_endpoints"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|entry| {
-            entry["account_id"].as_str() == Some(target_name)
-                && entry["service"]
-                    .as_str()
-                    .is_some_and(|service| service == "webhook" || service.starts_with("webhook-"))
-        })
+    notification_target_entry(targets, target_name).is_some()
 }
 
-fn notification_target_status<'a>(targets: &'a serde_json::Value, target_name: &str) -> Option<&'a str> {
+fn notification_target_entry<'a>(targets: &'a serde_json::Value, target_name: &str) -> Option<&'a serde_json::Value> {
     targets["notification_endpoints"]
         .as_array()
         .into_iter()
@@ -349,7 +340,10 @@ fn notification_target_status<'a>(targets: &'a serde_json::Value, target_name: &
                     .as_str()
                     .is_some_and(|service| service == "webhook" || service.starts_with("webhook-"))
         })
-        .and_then(|entry| entry["status"].as_str())
+}
+
+fn notification_target_status<'a>(targets: &'a serde_json::Value, target_name: &str) -> Option<&'a str> {
+    notification_target_entry(targets, target_name).and_then(|entry| entry["status"].as_str())
 }
 
 async fn wait_for_target_visibility(
