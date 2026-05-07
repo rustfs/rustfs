@@ -26,10 +26,12 @@
 
 use super::common::*;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, DateTimeFormat};
 use aws_sdk_s3::types::{
-    CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
+    CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier, ObjectLockLegalHoldStatus,
+    ObjectLockMode, ObjectLockRetentionMode,
 };
+use chrono::{DateTime, Duration, Utc};
 use serial_test::serial;
 use tracing::info;
 
@@ -77,6 +79,26 @@ fn assert_access_denied<T, E: std::fmt::Debug>(result: Result<T, E>, context: &s
         err.contains("AccessDenied") || err.to_lowercase().contains("access denied"),
         "{context}: expected AccessDenied, got: {err}"
     );
+}
+
+fn assert_invalid_object_lock_retention_pair<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) {
+    let err = match result {
+        Ok(_) => panic!("{context}"),
+        Err(err) => format!("{err:?}"),
+    };
+    assert!(
+        err.contains("InvalidRequest") || err.contains("must both be supplied"),
+        "{context}: expected invalid paired retention headers, got: {err}"
+    );
+}
+
+fn parse_s3_datetime(value: &aws_sdk_s3::primitives::DateTime) -> DateTime<Utc> {
+    let formatted = value
+        .fmt(DateTimeFormat::DateTime)
+        .expect("S3 timestamp should format as RFC3339");
+    DateTime::parse_from_rfc3339(&formatted)
+        .expect("S3 timestamp should parse as RFC3339")
+        .with_timezone(&Utc)
 }
 
 // ============================================================================
@@ -534,6 +556,100 @@ async fn test_copy_object_applies_requested_legal_hold() {
             .and_then(|value| value.status())
             .map(|value| value.as_str()),
         Some("ON")
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_copy_object_does_not_inherit_source_legal_hold() {
+    init_logging();
+    info!("🧪 Test: CopyObject does not inherit source Legal Hold");
+
+    let mut env = ObjectLockTestEnvironment::new().await.unwrap();
+    env.start_rustfs().await.unwrap();
+
+    let bucket = "test-copy-object-legal-hold-inherit";
+    let src_key = "held-source";
+
+    env.create_object_lock_bucket(bucket).await.unwrap();
+
+    let client = env.s3_client();
+    put_object_with_legal_hold(&client, bucket, src_key, b"copy-source", ObjectLockLegalHoldStatus::On)
+        .await
+        .unwrap();
+
+    client
+        .copy_object()
+        .copy_source(format!("{bucket}/{src_key}"))
+        .bucket(bucket)
+        .key("implicit-copy")
+        .send()
+        .await
+        .unwrap();
+
+    let implicit_legal_hold = client
+        .get_object_legal_hold()
+        .bucket(bucket)
+        .key("implicit-copy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        implicit_legal_hold
+            .legal_hold()
+            .and_then(|value| value.status())
+            .map(|value| value.as_str()),
+        Some("OFF")
+    );
+
+    client
+        .copy_object()
+        .copy_source(format!("{bucket}/{src_key}"))
+        .bucket(bucket)
+        .key("explicit-on-copy")
+        .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+        .send()
+        .await
+        .unwrap();
+
+    let explicit_on_legal_hold = client
+        .get_object_legal_hold()
+        .bucket(bucket)
+        .key("explicit-on-copy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit_on_legal_hold
+            .legal_hold()
+            .and_then(|value| value.status())
+            .map(|value| value.as_str()),
+        Some("ON")
+    );
+
+    client
+        .copy_object()
+        .copy_source(format!("{bucket}/{src_key}"))
+        .bucket(bucket)
+        .key("explicit-off-copy")
+        .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::Off)
+        .send()
+        .await
+        .unwrap();
+
+    let explicit_off_legal_hold = client
+        .get_object_legal_hold()
+        .bucket(bucket)
+        .key("explicit-off-copy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit_off_legal_hold
+            .legal_hold()
+            .and_then(|value| value.status())
+            .map(|value| value.as_str()),
+        Some("OFF")
     );
 }
 
@@ -1388,7 +1504,455 @@ async fn test_default_retention_applied_to_new_objects() {
     let delete_result = delete_object_with_bypass(&client, bucket, key, Some(version_id), false).await;
     assert!(delete_result.is_err(), "Delete should fail for object with default retention applied");
 
+    let retention = client
+        .get_object_retention()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .send()
+        .await
+        .unwrap();
+    let retention = retention.retention().expect("default retention should be readable");
+    assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
+    assert!(
+        retention.retain_until_date().is_some(),
+        "default retention should write a retain-until date"
+    );
+
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.object_lock_mode().map(|value| value.as_str()), Some("GOVERNANCE"));
+    assert!(
+        head.object_lock_retain_until_date().is_some(),
+        "HeadObject should expose the default retention retain-until date"
+    );
+
     info!("✅ Test passed: Default retention is applied to new objects");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_delete_object_creates_delete_marker_for_default_retained_current_version() {
+    init_logging();
+    info!("🧪 Test: DeleteObject creates delete marker for default-retained current version");
+
+    let mut env = ObjectLockTestEnvironment::new().await.unwrap();
+    env.start_rustfs().await.unwrap();
+
+    let bucket = "test-default-retention-delete-marker";
+    let key = "default-retained-object";
+    let data = b"test data for default-retained current version";
+
+    env.create_object_lock_bucket(bucket).await.unwrap();
+
+    let client = env.s3_client();
+    put_object_lock_configuration(&client, bucket, ObjectLockRetentionMode::Governance, Some(30), None)
+        .await
+        .unwrap();
+
+    let put_output = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(data.to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let retained_version_id = put_output
+        .version_id()
+        .expect("default-retained object should have a version id")
+        .to_string();
+
+    let retention = client
+        .get_object_retention()
+        .bucket(bucket)
+        .key(key)
+        .version_id(&retained_version_id)
+        .send()
+        .await
+        .unwrap();
+    let retention = retention.retention().expect("default retention should be readable");
+    assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
+    assert!(
+        retention.retain_until_date().is_some(),
+        "default retention should write a retain-until date"
+    );
+
+    let delete_marker_output = client.delete_object().bucket(bucket).key(key).send().await.unwrap();
+    assert_eq!(delete_marker_output.delete_marker(), Some(true));
+    let delete_marker_version_id = delete_marker_output
+        .version_id()
+        .expect("delete marker should have a version id")
+        .to_string();
+
+    let protected_delete = delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), false).await;
+    assert!(protected_delete.is_err(), "Default-retained version should still reject direct deletion");
+
+    let retention_after_delete_marker = client
+        .get_object_retention()
+        .bucket(bucket)
+        .key(key)
+        .version_id(&retained_version_id)
+        .send()
+        .await
+        .unwrap();
+    let retention_after_delete_marker = retention_after_delete_marker
+        .retention()
+        .expect("default retention should remain readable by version id after delete marker creation");
+    assert_eq!(retention_after_delete_marker.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
+    assert!(
+        retention_after_delete_marker.retain_until_date().is_some(),
+        "retained version should keep its retain-until date after delete marker creation"
+    );
+
+    delete_object_with_bypass(&client, bucket, key, Some(&delete_marker_version_id), false)
+        .await
+        .unwrap();
+    delete_object_with_bypass(&client, bucket, key, Some(&retained_version_id), true)
+        .await
+        .unwrap();
+
+    info!("✅ Test passed: Delete marker is allowed while default-retained version stays protected");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_put_copy_and_multipart_reject_incomplete_retention_headers() {
+    init_logging();
+    info!("🧪 Test: write paths reject incomplete Object Lock retention headers");
+
+    let mut env = ObjectLockTestEnvironment::new().await.unwrap();
+    env.start_rustfs().await.unwrap();
+
+    let bucket = "test-incomplete-retention";
+    let src_key = "copy-source";
+
+    env.create_object_lock_bucket(bucket).await.unwrap();
+
+    let client = env.s3_client();
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(src_key)
+        .body(ByteStream::from(b"copy-source".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    put_object_lock_configuration(&client, bucket, ObjectLockRetentionMode::Governance, Some(30), None)
+        .await
+        .unwrap();
+
+    assert_invalid_object_lock_retention_pair(
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("put-mode-only")
+            .body(ByteStream::from(b"put-body".to_vec()))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .send()
+            .await,
+        "PutObject with mode only should fail",
+    );
+
+    assert_invalid_object_lock_retention_pair(
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("put-date-only")
+            .body(ByteStream::from(b"put-body".to_vec()))
+            .object_lock_retain_until_date(retention_timestamp(30))
+            .send()
+            .await,
+        "PutObject with retain-until-date only should fail",
+    );
+
+    assert_invalid_object_lock_retention_pair(
+        client
+            .copy_object()
+            .copy_source(format!("{bucket}/{src_key}"))
+            .bucket(bucket)
+            .key("copy-mode-only")
+            .object_lock_mode(ObjectLockMode::Governance)
+            .send()
+            .await,
+        "CopyObject with mode only should fail",
+    );
+
+    assert_invalid_object_lock_retention_pair(
+        client
+            .copy_object()
+            .copy_source(format!("{bucket}/{src_key}"))
+            .bucket(bucket)
+            .key("copy-date-only")
+            .object_lock_retain_until_date(retention_timestamp(30))
+            .send()
+            .await,
+        "CopyObject with retain-until-date only should fail",
+    );
+
+    assert_invalid_object_lock_retention_pair(
+        client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key("multipart-mode-only")
+            .object_lock_mode(ObjectLockMode::Governance)
+            .send()
+            .await,
+        "CreateMultipartUpload with mode only should fail",
+    );
+
+    assert_invalid_object_lock_retention_pair(
+        client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key("multipart-date-only")
+            .object_lock_retain_until_date(retention_timestamp(30))
+            .send()
+            .await,
+        "CreateMultipartUpload with retain-until-date only should fail",
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_copy_object_retention_uses_destination_policy() {
+    init_logging();
+    info!("🧪 Test: CopyObject retention follows destination policy");
+
+    let mut env = ObjectLockTestEnvironment::new().await.unwrap();
+    env.start_rustfs().await.unwrap();
+
+    let src_bucket = "test-copy-retention-src";
+    let dst_bucket = "test-copy-retention-dst";
+    let no_default_bucket = "test-copy-retention-nodef";
+    let src_key = "retained-source";
+
+    env.create_object_lock_bucket(src_bucket).await.unwrap();
+    env.create_object_lock_bucket(dst_bucket).await.unwrap();
+    env.create_object_lock_bucket(no_default_bucket).await.unwrap();
+
+    let client = env.s3_client();
+    put_object_lock_configuration(&client, dst_bucket, ObjectLockRetentionMode::Governance, Some(1), None)
+        .await
+        .unwrap();
+
+    put_object_with_retention(
+        &client,
+        src_bucket,
+        src_key,
+        b"copy-source",
+        ObjectLockRetentionMode::Compliance,
+        future_retain_until(30),
+    )
+    .await
+    .unwrap();
+
+    let copy_started = Utc::now();
+    client
+        .copy_object()
+        .copy_source(format!("{src_bucket}/{src_key}"))
+        .bucket(dst_bucket)
+        .key("default-copy")
+        .send()
+        .await
+        .unwrap();
+
+    let retention = client
+        .get_object_retention()
+        .bucket(dst_bucket)
+        .key("default-copy")
+        .send()
+        .await
+        .unwrap();
+    let retention = retention
+        .retention()
+        .expect("destination default retention should be present");
+    assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
+    let retain_until = parse_s3_datetime(retention.retain_until_date().expect("retain-until date should be present"));
+    assert!(
+        retain_until < copy_started + Duration::days(3),
+        "destination default retention should not inherit the source's longer retention"
+    );
+
+    client
+        .copy_object()
+        .copy_source(format!("{src_bucket}/{src_key}"))
+        .bucket(dst_bucket)
+        .key("replace-copy")
+        .metadata_directive(MetadataDirective::Replace)
+        .send()
+        .await
+        .unwrap();
+
+    let replace_retention = client
+        .get_object_retention()
+        .bucket(dst_bucket)
+        .key("replace-copy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        replace_retention
+            .retention()
+            .and_then(|value| value.mode())
+            .map(|value| value.as_str()),
+        Some("GOVERNANCE")
+    );
+
+    client
+        .copy_object()
+        .copy_source(format!("{src_bucket}/{src_key}"))
+        .bucket(dst_bucket)
+        .key("explicit-copy")
+        .object_lock_mode(ObjectLockMode::Compliance)
+        .object_lock_retain_until_date(retention_timestamp(30))
+        .send()
+        .await
+        .unwrap();
+
+    let explicit_retention = client
+        .get_object_retention()
+        .bucket(dst_bucket)
+        .key("explicit-copy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit_retention
+            .retention()
+            .and_then(|value| value.mode())
+            .map(|value| value.as_str()),
+        Some("COMPLIANCE")
+    );
+    let explicit_retain_until = parse_s3_datetime(
+        explicit_retention
+            .retention()
+            .and_then(|value| value.retain_until_date())
+            .expect("explicit retain-until date should be present"),
+    );
+    assert!(
+        explicit_retain_until > Utc::now() + Duration::days(20),
+        "explicit retention should override the shorter bucket default"
+    );
+
+    client
+        .copy_object()
+        .copy_source(format!("{src_bucket}/{src_key}"))
+        .bucket(no_default_bucket)
+        .key("no-default-copy")
+        .send()
+        .await
+        .unwrap();
+
+    let no_default_retention = client
+        .get_object_retention()
+        .bucket(no_default_bucket)
+        .key("no-default-copy")
+        .send()
+        .await
+        .unwrap();
+    let no_default_retention = no_default_retention
+        .retention()
+        .expect("retention response should be present");
+    assert!(no_default_retention.mode().is_none());
+    assert!(no_default_retention.retain_until_date().is_none());
+
+    put_object_with_retention(
+        &client,
+        dst_bucket,
+        "locked-destination",
+        b"locked-target",
+        ObjectLockRetentionMode::Compliance,
+        future_retain_until(30),
+    )
+    .await
+    .unwrap();
+
+    let overwrite_result = client
+        .copy_object()
+        .copy_source(format!("{src_bucket}/{src_key}"))
+        .bucket(dst_bucket)
+        .key("locked-destination")
+        .send()
+        .await;
+    assert!(
+        overwrite_result.is_err(),
+        "CopyObject overwrite should not bypass active destination retention"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_multipart_default_retention_fixed_at_create() {
+    init_logging();
+    info!("🧪 Test: multipart default retention is fixed at CreateMultipartUpload");
+
+    let mut env = ObjectLockTestEnvironment::new().await.unwrap();
+    env.start_rustfs().await.unwrap();
+
+    let bucket = "test-multipart-default-drift";
+    let key = "multipart-object";
+
+    env.create_object_lock_bucket(bucket).await.unwrap();
+
+    let client = env.s3_client();
+    put_object_lock_configuration(&client, bucket, ObjectLockRetentionMode::Governance, Some(1), None)
+        .await
+        .unwrap();
+
+    let create_started = Utc::now();
+    let create_output = client.create_multipart_upload().bucket(bucket).key(key).send().await.unwrap();
+    let upload_id = create_output.upload_id().unwrap();
+
+    let upload_part_output = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from(b"multipart-body".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    put_object_lock_configuration(&client, bucket, ObjectLockRetentionMode::Governance, Some(10), None)
+        .await
+        .unwrap();
+
+    let completed_upload = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(upload_part_output.e_tag().unwrap_or_default())
+                .build(),
+        )
+        .build();
+
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(completed_upload)
+        .send()
+        .await
+        .unwrap();
+
+    let retention = client.get_object_retention().bucket(bucket).key(key).send().await.unwrap();
+    let retention = retention.retention().expect("multipart default retention should be present");
+    assert_eq!(retention.mode().map(|value| value.as_str()), Some("GOVERNANCE"));
+    let retain_until = parse_s3_datetime(retention.retain_until_date().expect("retain-until date should be present"));
+    assert!(
+        retain_until < create_started + Duration::days(3),
+        "CompleteMultipartUpload should keep the default retention calculated at create time"
+    );
 }
 
 // ============================================================================

@@ -16,7 +16,7 @@ use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
         AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, TargetEndpointSource, allowed_target_keys,
-        collect_validated_key_values as shared_collect_validated_key_values,
+        build_json_response, collect_validated_key_values as shared_collect_validated_key_values,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
         validate_target_request,
@@ -29,17 +29,19 @@ use crate::server::{
     refresh_persisted_module_switches_from_store,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
-use http::{HeaderMap, StatusCode};
+use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::{
-    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS,
-    NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
+    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS,
+    NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_REDIS_KEYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_ROUTE_PREFIX,
+    NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -99,7 +101,7 @@ struct NotificationEndpointsResponse {
     notification_endpoints: Vec<NotificationEndpoint>,
 }
 
-fn notification_target_specs() -> [AdminTargetSpec; 5] {
+fn notification_target_specs() -> [AdminTargetSpec; 8] {
     [
         AdminTargetSpec {
             subsystem: NOTIFY_WEBHOOK_SUB_SYS,
@@ -120,10 +122,28 @@ fn notification_target_specs() -> [AdminTargetSpec; 5] {
             validator: AdminTargetValidator::Mqtt,
         },
         AdminTargetSpec {
+            subsystem: NOTIFY_MYSQL_SUB_SYS,
+            service: "mysql",
+            valid_keys: NOTIFY_MYSQL_KEYS,
+            validator: AdminTargetValidator::MySql,
+        },
+        AdminTargetSpec {
             subsystem: NOTIFY_NATS_SUB_SYS,
             service: "nats",
             valid_keys: NOTIFY_NATS_KEYS,
             validator: AdminTargetValidator::Nats(TargetDomain::Notify),
+        },
+        AdminTargetSpec {
+            subsystem: NOTIFY_POSTGRES_SUB_SYS,
+            service: "postgres",
+            valid_keys: NOTIFY_POSTGRES_KEYS,
+            validator: AdminTargetValidator::Postgres(TargetDomain::Notify),
+        },
+        AdminTargetSpec {
+            subsystem: NOTIFY_REDIS_SUB_SYS,
+            service: "redis",
+            valid_keys: NOTIFY_REDIS_KEYS,
+            validator: AdminTargetValidator::Redis(TargetDomain::Notify, NOTIFY_REDIS_DEFAULT_CHANNEL),
         },
         AdminTargetSpec {
             subsystem: NOTIFY_PULSAR_SUB_SYS,
@@ -148,15 +168,6 @@ async fn authorize_notification_admin_request(req: &S3Request<Body>, action: Adm
 
 fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {
     rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))
-}
-
-fn build_response(status: StatusCode, body: Body, request_id: Option<&http::HeaderValue>) -> S3Response<(StatusCode, Body)> {
-    let mut header = HeaderMap::new();
-    header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-    if let Some(v) = request_id {
-        header.insert("x-request-id", v.clone());
-    }
-    S3Response::with_headers((status, body), header)
 }
 
 fn target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
@@ -258,7 +269,7 @@ impl Operation for NotificationTarget {
             .await
             .map_err(|e| s3_error!(InternalError, "failed to set target config: {}", e))?;
 
-        Ok(build_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
 }
 
@@ -297,7 +308,7 @@ impl Operation for ListNotificationTargets {
         let data = serde_json::to_vec(&NotificationEndpointsResponse { notification_endpoints })
             .map_err(|e| s3_error!(InternalError, "failed to serialize targets: {}", e))?;
 
-        Ok(build_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
 }
 
@@ -347,7 +358,7 @@ impl Operation for ListTargetsArns {
         let data = serde_json::to_vec(&data_target_arn_list)
             .map_err(|e| s3_error!(InternalError, "failed to serialize targets: {}", e))?;
 
-        Ok(build_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
 }
 
@@ -374,7 +385,7 @@ impl Operation for RemoveNotificationTarget {
             .await
             .map_err(|e| s3_error!(InternalError, "failed to remove target config: {}", e))?;
 
-        Ok(build_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
 }
 

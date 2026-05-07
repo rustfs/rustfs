@@ -48,9 +48,17 @@ mode:
 
 secret:
   existingSecret: ""
+  # SECURITY: rendering fails by default unless one of the following is true:
+  #   1. `secret.existingSecret` names a Kubernetes Secret you control, or
+  #   2. `secret.rustfs.access_key` and `secret.rustfs.secret_key` are both
+  #      set to non-empty, non-default values, or
+  #   3. `secret.allowInsecureDefaults: true` is set (only for local dev).
+  # This prevents accidental deployment with the well-known default
+  # `rustfsadmin/rustfsadmin` credentials.
+  allowInsecureDefaults: false
   rustfs:
-    access_key: rustfsadmin
-    secret_key: rustfsadmin
+    access_key: ""
+    secret_key: ""
 
 config:
   rustfs:

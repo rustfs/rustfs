@@ -651,6 +651,10 @@ fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Resu
     }
 
     if config.skip_tls_verify {
+        warn!(
+            "Object Lambda webhook target '{}' is configured to skip TLS certificate verification. This permits MITM attacks and should not be used in production.",
+            config.endpoint
+        );
         builder = builder.danger_accept_invalid_certs(true);
     } else if !config.client_ca.is_empty() {
         let ca_pem = std::fs::read(&config.client_ca)

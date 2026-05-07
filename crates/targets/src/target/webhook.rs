@@ -19,7 +19,7 @@ use crate::{
     store::{Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType,
+        TargetType, queue_store_subdir_name,
     },
 };
 use async_trait::async_trait;
@@ -147,7 +147,7 @@ where
         // Build storage
         let queue_store = if !args.queue_dir.is_empty() {
             let queue_dir =
-                PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::Webhook.as_str(), target_id.id));
+                PathBuf::from(&args.queue_dir).join(queue_store_subdir_name(ChannelTargetType::Webhook.as_str(), &target_id.id));
 
             let extension = match args.target_type {
                 TargetType::AuditLog => AUDIT_STORE_EXTENSION,

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SAFETY: `generated` is prost/tonic-generated protocol code. The allowance is
+// scoped to that module so generated internals do not relax lints elsewhere.
 #[allow(unsafe_code)]
 mod generated;
 

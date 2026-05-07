@@ -58,6 +58,13 @@ impl KeystoneClient {
         admin_domain: String,
         verify_ssl: bool,
     ) -> Self {
+        if !verify_ssl {
+            warn!(
+                "Keystone client for '{}' is configured to skip TLS certificate verification. This permits MITM attacks and should not be used in production.",
+                auth_url
+            );
+        }
+
         let client = Client::builder()
             .danger_accept_invalid_certs(!verify_ssl)
             .timeout(std::time::Duration::from_secs(30))

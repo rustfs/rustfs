@@ -54,6 +54,7 @@ use rustfs_ecstore::bucket::{
 use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::store_api::{
     BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
     MakeBucketOptions, ObjectInfo,
@@ -192,6 +193,20 @@ fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
         ..Default::default()
     }
+}
+
+fn notify_bucket_metadata_reload(
+    bucket: String,
+    operation: &'static str,
+    request_context: Option<request_context::RequestContext>,
+) {
+    spawn_background_with_context(request_context, async move {
+        if let Some(notification_sys) = get_global_notification_sys()
+            && let Err(err) = notification_sys.load_bucket_metadata(&bucket).await
+        {
+            warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
+        }
+    });
 }
 
 fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
@@ -977,6 +992,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketLifecycleInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -991,6 +1007,8 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_LIFECYCLE_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket lifecycle", request_context);
 
         let item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1508,6 +1526,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketLifecycleConfigurationInput {
             bucket,
             lifecycle_configuration,
@@ -1542,6 +1561,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket lifecycle", request_context);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         item.expiry_lc_config =
