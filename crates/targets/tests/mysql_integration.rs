@@ -46,6 +46,9 @@ fn make_args(dsn: &str, table: &str, queue_dir: &str) -> MySqlArgs {
         dsn_string: dsn.to_string(),
         table: table.to_string(),
         format: "access".to_string(),
+        tls_ca: String::new(),
+        tls_client_cert: String::new(),
+        tls_client_key: String::new(),
         queue_dir: queue_dir.to_string(),
         queue_limit: 100,
         max_open_connections: 2,
@@ -73,7 +76,9 @@ fn build_test_pool(dsn_string: &str) -> Pool {
         .db_name(Some(parsed.database));
 
     if parsed.tls {
-        rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
+        }
         builder = builder.ssl_opts(Some(SslOpts::default()));
     }
 

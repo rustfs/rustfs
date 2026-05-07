@@ -74,9 +74,14 @@ pub const PULSAR_TLS_HOSTNAME_VERIFICATION: &str = "tls_hostname_verification";
 pub const PULSAR_QUEUE_DIR: &str = "queue_dir";
 pub const PULSAR_QUEUE_LIMIT: &str = "queue_limit";
 
-pub const MYSQL_DSN_STRING: &str = "dsn_string";
+pub const BASE_DSN_STRING: &str = "dsn_string";
+
+pub const MYSQL_DSN_STRING: &str = BASE_DSN_STRING;
 pub const MYSQL_TABLE: &str = "table";
 pub const MYSQL_FORMAT: &str = "format";
+pub const MYSQL_TLS_CA: &str = "tls_ca";
+pub const MYSQL_TLS_CLIENT_CERT: &str = "tls_client_cert";
+pub const MYSQL_TLS_CLIENT_KEY: &str = "tls_client_key";
 pub const MYSQL_QUEUE_DIR: &str = "queue_dir";
 pub const MYSQL_QUEUE_LIMIT: &str = "queue_limit";
 pub const MYSQL_MAX_OPEN_CONNECTIONS: &str = "max_open_connections";
@@ -101,12 +106,7 @@ pub const REDIS_TLS_CLIENT_CERT: &str = "tls_client_cert";
 pub const REDIS_TLS_CLIENT_KEY: &str = "tls_client_key";
 pub const REDIS_TLS_ALLOW_INSECURE: &str = "tls_allow_insecure";
 
-pub const POSTGRES_HOST: &str = "host";
-pub const POSTGRES_PORT: &str = "port";
-pub const POSTGRES_USER: &str = "user";
-pub const POSTGRES_PASSWORD: &str = "password";
-pub const POSTGRES_DATABASE: &str = "database";
-pub const POSTGRES_SCHEMA: &str = "schema";
+pub const POSTGRES_DSN_STRING: &str = BASE_DSN_STRING;
 pub const POSTGRES_TABLE: &str = "table";
 pub const POSTGRES_FORMAT: &str = "format";
 pub const POSTGRES_TLS_REQUIRED: &str = "tls_required";

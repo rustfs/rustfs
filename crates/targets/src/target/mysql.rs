@@ -25,10 +25,11 @@ use crate::{
 use async_trait::async_trait;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, prelude::Queryable};
 use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
+use rustfs_config::{MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -47,6 +48,12 @@ pub struct MySqlArgs {
     pub table: String,
     /// Write format (currently only `access` is supported)
     pub format: String,
+    /// Optional custom CA certificate file for TLS server verification
+    pub tls_ca: String,
+    /// Optional client certificate chain file for mutual TLS
+    pub tls_client_cert: String,
+    /// Optional client private key file for mutual TLS
+    pub tls_client_key: String,
     /// Directory for persistent queue storage; must be an absolute path if non-empty
     pub queue_dir: String,
     /// Maximum number of events stored in the local queue
@@ -78,6 +85,21 @@ impl MySqlArgs {
                 "MySQL format '{}' is not supported; only 'access' is available",
                 self.format
             )));
+        }
+
+        if self.tls_client_cert.is_empty() != self.tls_client_key.is_empty() {
+            return Err(TargetError::Configuration(format!(
+                "MySQL {MYSQL_TLS_CLIENT_CERT} and {MYSQL_TLS_CLIENT_KEY} must be specified together"
+            )));
+        }
+        if !self.tls_ca.is_empty() && !Path::new(&self.tls_ca).is_absolute() {
+            return Err(TargetError::Configuration(format!("{MYSQL_TLS_CA} must be an absolute path")));
+        }
+        if !self.tls_client_cert.is_empty() && !Path::new(&self.tls_client_cert).is_absolute() {
+            return Err(TargetError::Configuration(format!("{MYSQL_TLS_CLIENT_CERT} must be an absolute path")));
+        }
+        if !self.tls_client_key.is_empty() && !Path::new(&self.tls_client_key).is_absolute() {
+            return Err(TargetError::Configuration(format!("{MYSQL_TLS_CLIENT_KEY} must be an absolute path")));
         }
 
         if !self.queue_dir.is_empty() {
@@ -282,6 +304,16 @@ fn is_valid_identifier_segment(segment: &str) -> bool {
     true
 }
 
+fn ensure_rustls_provider_installed() {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return;
+    }
+
+    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        debug!("rustls provider already installed or unavailable for mysql target: {err:?}");
+    }
+}
+
 pub(crate) fn validate_table_name(table: &str) -> Result<(), TargetError> {
     let table = table.trim();
 
@@ -428,6 +460,9 @@ async fn validate_existing_schema(conn: &mut Conn, table: &str) -> Result<(), Ta
 ///   enable=on \
 ///   dsn_string="rustfs:password@tcp(mysql.example.com:3306)/rustfs_events?tls=true" \
 ///   table="rustfs_events" \
+///   tls_ca="/etc/ssl/mysql/ca.pem" \
+///   tls_client_cert="/etc/ssl/mysql/client.pem" \
+///   tls_client_key="/etc/ssl/mysql/client.key" \
 ///   queue_dir="/var/lib/rustfs/events" \
 ///   queue_limit="100000" \
 ///   max_open_connections="2"
@@ -439,6 +474,9 @@ async fn validate_existing_schema(conn: &mut Conn, table: &str) -> Result<(), Ta
 /// RUSTFS_NOTIFY_MYSQL_ENABLE=on
 /// RUSTFS_NOTIFY_MYSQL_DSN_STRING=rustfs:password@tcp(127.0.0.1:3306)/rustfs_events
 /// RUSTFS_NOTIFY_MYSQL_TABLE=rustfs_events
+/// RUSTFS_NOTIFY_MYSQL_TLS_CA=/etc/ssl/mysql/ca.pem
+/// RUSTFS_NOTIFY_MYSQL_TLS_CLIENT_CERT=/etc/ssl/mysql/client.pem
+/// RUSTFS_NOTIFY_MYSQL_TLS_CLIENT_KEY=/etc/ssl/mysql/client.key
 /// RUSTFS_NOTIFY_MYSQL_QUEUE_DIR=/opt/rustfs/events
 /// RUSTFS_NOTIFY_MYSQL_QUEUE_LIMIT=100000
 /// RUSTFS_NOTIFY_MYSQL_MAX_OPEN_CONNECTIONS=2
@@ -533,8 +571,19 @@ where
             .db_name(Some(dsn.database.clone()));
 
         if dsn.tls {
-            rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
-            builder = builder.ssl_opts(Some(SslOpts::default()));
+            ensure_rustls_provider_installed();
+            let mut ssl_opts = SslOpts::default();
+            if !self.args.tls_ca.is_empty() {
+                ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(self.args.tls_ca.clone()).into()]);
+            }
+            if !self.args.tls_client_cert.is_empty() && !self.args.tls_client_key.is_empty() {
+                let identity = mysql_async::ClientIdentity::new(
+                    PathBuf::from(self.args.tls_client_cert.clone()).into(),
+                    PathBuf::from(self.args.tls_client_key.clone()).into(),
+                );
+                ssl_opts = ssl_opts.with_client_identity(Some(identity));
+            }
+            builder = builder.ssl_opts(Some(ssl_opts));
         } else {
             warn!(
                 "MySQL target '{}' is configured without TLS. This is insecure and should not be used in production.",
@@ -1018,6 +1067,9 @@ mod tests {
                 dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
                 table: "events".to_string(),
                 format: "access".to_string(),
+                tls_ca: String::new(),
+                tls_client_cert: String::new(),
+                tls_client_key: String::new(),
                 queue_dir,
                 queue_limit: 10,
                 max_open_connections: 2,
@@ -1072,6 +1124,9 @@ mod tests {
                 dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
                 table: "events".to_string(),
                 format: "access".to_string(),
+                tls_ca: String::new(),
+                tls_client_cert: String::new(),
+                tls_client_key: String::new(),
                 queue_dir,
                 queue_limit: 10,
                 max_open_connections: 2,
@@ -1108,5 +1163,64 @@ mod tests {
 
         // Verify entry is NOT deleted on non-Dropped errors
         assert!(target.store().unwrap().get_raw(&stored_key).is_ok(), "valid entry should remain in store");
+    }
+
+    #[test]
+    fn validate_rejects_unpaired_tls_client_fields() {
+        let args = MySqlArgs {
+            enable: true,
+            dsn_string: "rustfs:password@tcp(127.0.0.1:3306)/db".to_string(),
+            table: "events".to_string(),
+            format: "access".to_string(),
+            tls_ca: String::new(),
+            tls_client_cert: "/etc/ssl/mysql/client.pem".to_string(),
+            tls_client_key: String::new(),
+            queue_dir: "/tmp".to_string(),
+            queue_limit: 100,
+            max_open_connections: 2,
+            target_type: TargetType::NotifyEvent,
+        };
+
+        let err = args.validate().expect_err("unpaired tls client fields should fail");
+        assert!(err.to_string().contains("must be specified together"));
+    }
+
+    #[test]
+    fn validate_rejects_relative_tls_paths() {
+        let args = MySqlArgs {
+            enable: true,
+            dsn_string: "rustfs:password@tcp(127.0.0.1:3306)/db".to_string(),
+            table: "events".to_string(),
+            format: "access".to_string(),
+            tls_ca: "ca.pem".to_string(),
+            tls_client_cert: String::new(),
+            tls_client_key: String::new(),
+            queue_dir: "/tmp".to_string(),
+            queue_limit: 100,
+            max_open_connections: 2,
+            target_type: TargetType::NotifyEvent,
+        };
+
+        let err = args.validate().expect_err("relative tls_ca should fail");
+        assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn validate_accepts_absolute_tls_paths() {
+        let args = MySqlArgs {
+            enable: true,
+            dsn_string: "rustfs:password@tcp(127.0.0.1:3306)/db".to_string(),
+            table: "events".to_string(),
+            format: "access".to_string(),
+            tls_ca: "/etc/ssl/mysql/ca.pem".to_string(),
+            tls_client_cert: "/etc/ssl/mysql/client.pem".to_string(),
+            tls_client_key: "/etc/ssl/mysql/client.key".to_string(),
+            queue_dir: "/tmp".to_string(),
+            queue_limit: 100,
+            max_open_connections: 2,
+            target_type: TargetType::NotifyEvent,
+        };
+
+        args.validate().expect("absolute tls paths should pass");
     }
 }

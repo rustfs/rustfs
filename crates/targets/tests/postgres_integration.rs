@@ -20,12 +20,12 @@
 //! ```bash
 //! docker run -d --name rustfs-pg -p 5432:5432 \
 //!     -e POSTGRES_PASSWORD=rustfs -e POSTGRES_DB=rustfs_events postgres:16
+//! export RUSTFS_TEST_PG_DSN="postgres://postgres:rustfs@localhost:5432/rustfs_events?search_path=public"
 //! cargo test -p rustfs-targets --test postgres_integration -- --ignored
 //! ```
 //!
-//! Connection parameters can be overridden via environment variables:
-//! `RUSTFS_TEST_PG_HOST`, `RUSTFS_TEST_PG_PORT`, `RUSTFS_TEST_PG_USER`,
-//! `RUSTFS_TEST_PG_PASSWORD`, `RUSTFS_TEST_PG_DATABASE`.
+//! Connection parameters can be overridden via environment variable:
+//! `RUSTFS_TEST_PG_DSN`.
 
 use rustfs_s3_common::EventName;
 use rustfs_targets::Target;
@@ -43,13 +43,13 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn test_args(table: &str, format: PostgresFormat) -> PostgresArgs {
+    let dsn = env_or(
+        "RUSTFS_TEST_PG_DSN",
+        "postgres://postgres:rustfs@localhost:5432/rustfs_events?search_path=public",
+    );
     PostgresArgs {
         enable: true,
-        host: env_or("RUSTFS_TEST_PG_HOST", "localhost"),
-        port: env_or("RUSTFS_TEST_PG_PORT", "5432").parse().unwrap_or(5432),
-        user: env_or("RUSTFS_TEST_PG_USER", "postgres"),
-        password: env_or("RUSTFS_TEST_PG_PASSWORD", "rustfs"),
-        database: env_or("RUSTFS_TEST_PG_DATABASE", "rustfs_events"),
+        dsn_string: dsn,
         schema: "public".to_string(),
         table: table.to_string(),
         format,
@@ -64,11 +64,7 @@ fn test_args(table: &str, format: PostgresFormat) -> PostgresArgs {
 }
 
 async fn raw_client(args: &PostgresArgs) -> tokio_postgres::Client {
-    let conn_str = format!(
-        "host={} port={} user={} password={} dbname={}",
-        args.host, args.port, args.user, args.password, args.database
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+    let (client, connection) = tokio_postgres::connect(&args.dsn_string, NoTls)
         .await
         .expect("connect to postgres test server");
     tokio::spawn(async move {
@@ -290,8 +286,7 @@ async fn test_init_succeeds_against_existing_table() {
 #[tokio::test]
 async fn test_invalid_identifier_rejected_at_construction() {
     // No #[ignore] — pure validation, no DB needed.
-    let mut args = test_args("malicious; DROP TABLE users", PostgresFormat::Namespace);
-    args.host = "localhost".to_string();
+    let args = test_args("malicious; DROP TABLE users", PostgresFormat::Namespace);
     match PostgresTarget::<serde_json::Value>::new("bad_id".to_string(), args) {
         Ok(_) => panic!("malicious table identifier must fail at construction"),
         Err(e) => assert!(e.to_string().contains("table"), "unexpected error: {e}"),

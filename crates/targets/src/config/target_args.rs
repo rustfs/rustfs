@@ -20,7 +20,7 @@ use crate::target::{
     mqtt::{MQTTArgs, MQTTTlsConfig, validate_mqtt_broker_url},
     mysql::MySqlArgs,
     nats::{NATSArgs, validate_nats_address},
-    postgres::{PostgresArgs, parse_postgres_format},
+    postgres::{PostgresArgs, PostgresDsn, parse_postgres_format},
     pulsar::{PulsarArgs, validate_pulsar_broker},
     redis::{RedisArgs, RedisTlsConfig, validate_redis_url},
     webhook::WebhookArgs,
@@ -31,11 +31,11 @@ use rustfs_config::{
     KAFKA_TLS_CLIENT_KEY, KAFKA_TLS_ENABLE, KAFKA_TOPIC, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS,
     MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY,
     MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_DSN_STRING,
-    MYSQL_FORMAT, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT, MYSQL_TABLE, NATS_ADDRESS,
-    NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
-    NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, POSTGRES_DATABASE, POSTGRES_FORMAT, POSTGRES_HOST,
-    POSTGRES_PASSWORD, POSTGRES_PORT, POSTGRES_QUEUE_DIR, POSTGRES_QUEUE_LIMIT, POSTGRES_SCHEMA, POSTGRES_TABLE, POSTGRES_TLS_CA,
-    POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_TLS_REQUIRED, POSTGRES_USER, PULSAR_AUTH_TOKEN, PULSAR_BROKER,
+    MYSQL_FORMAT, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT, MYSQL_TABLE, MYSQL_TLS_CA,
+    MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, NATS_ADDRESS, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR,
+    NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN,
+    NATS_USERNAME, POSTGRES_DSN_STRING, POSTGRES_FORMAT, POSTGRES_QUEUE_DIR, POSTGRES_QUEUE_LIMIT, POSTGRES_TABLE,
+    POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_TLS_REQUIRED, PULSAR_AUTH_TOKEN, PULSAR_BROKER,
     PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA,
     PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT,
     REDIS_KEEP_ALIVE_INTERVAL, REDIS_MAX_RETRY_ATTEMPTS, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PASSWORD,
@@ -365,33 +365,19 @@ pub fn build_redis_args(
 }
 
 pub fn build_postgres_args(config: &KVS, default_queue_dir: &str, target_type: TargetType) -> Result<PostgresArgs, TargetError> {
-    let host = config
-        .lookup(POSTGRES_HOST)
-        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL host".to_string()))?;
-    let user = config
-        .lookup(POSTGRES_USER)
-        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL user".to_string()))?;
-    let database = config
-        .lookup(POSTGRES_DATABASE)
-        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL database".to_string()))?;
+    let dsn_string = config
+        .lookup(POSTGRES_DSN_STRING)
+        .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL dsn_string".to_string()))?;
     let table = config
         .lookup(POSTGRES_TABLE)
         .ok_or_else(|| TargetError::Configuration("Missing PostgreSQL table".to_string()))?;
 
-    let port = parse_postgres_port(config.lookup(POSTGRES_PORT).as_deref())?;
+    let schema = PostgresDsn::parse(&dsn_string)?.schema;
     let format = parse_postgres_format(config.lookup(POSTGRES_FORMAT).as_deref())?;
-    let schema = config
-        .lookup(POSTGRES_SCHEMA)
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "public".to_string());
 
     Ok(PostgresArgs {
         enable: true,
-        host,
-        port,
-        user,
-        password: config.lookup(POSTGRES_PASSWORD).unwrap_or_default(),
-        database,
+        dsn_string,
         schema,
         table,
         format,
@@ -423,24 +409,6 @@ pub fn validate_redis_config(config: &KVS, default_queue_dir: &str, default_chan
 pub fn validate_postgres_config(config: &KVS, default_queue_dir: &str) -> Result<(), TargetError> {
     let args = build_postgres_args(config, default_queue_dir, TargetType::NotifyEvent)?;
     args.validate()
-}
-
-fn parse_postgres_port(value: Option<&str>) -> Result<u16, TargetError> {
-    let Some(raw) = value else { return Ok(5432) };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(5432);
-    }
-    trimmed
-        .parse::<u16>()
-        .map_err(|_| TargetError::Configuration(format!("PostgreSQL port must be a u16 (1-65535), got: {raw}")))
-        .and_then(|p| {
-            if p == 0 {
-                Err(TargetError::Configuration("PostgreSQL port must not be zero".to_string()))
-            } else {
-                Ok(p)
-            }
-        })
 }
 
 pub fn build_kafka_args(config: &KVS, default_queue_dir: &str, target_type: TargetType) -> Result<KafkaArgs, TargetError> {
@@ -531,6 +499,9 @@ pub fn build_mysql_args(config: &KVS, default_queue_dir: &str, target_type: Targ
         dsn_string,
         table,
         format: config.lookup(MYSQL_FORMAT).unwrap_or_else(|| "access".to_string()),
+        tls_ca: config.lookup(MYSQL_TLS_CA).unwrap_or_default(),
+        tls_client_cert: config.lookup(MYSQL_TLS_CLIENT_CERT).unwrap_or_default(),
+        tls_client_key: config.lookup(MYSQL_TLS_CLIENT_KEY).unwrap_or_default(),
         queue_dir: config
             .lookup(MYSQL_QUEUE_DIR)
             .unwrap_or_else(|| default_queue_dir.to_string()),
@@ -579,6 +550,25 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
         )));
     }
 
+    let tls_ca = config.lookup(MYSQL_TLS_CA).unwrap_or_default();
+    if !tls_ca.is_empty() && !std::path::Path::new(&tls_ca).is_absolute() {
+        return Err(TargetError::Configuration("MySQL tls_ca must be an absolute path".to_string()));
+    }
+
+    let tls_client_cert = config.lookup(MYSQL_TLS_CLIENT_CERT).unwrap_or_default();
+    let tls_client_key = config.lookup(MYSQL_TLS_CLIENT_KEY).unwrap_or_default();
+    if tls_client_cert.is_empty() != tls_client_key.is_empty() {
+        return Err(TargetError::Configuration(
+            "MySQL tls_client_cert and tls_client_key must be specified together".to_string(),
+        ));
+    }
+    if !tls_client_cert.is_empty() && !std::path::Path::new(&tls_client_cert).is_absolute() {
+        return Err(TargetError::Configuration("MySQL tls_client_cert must be an absolute path".to_string()));
+    }
+    if !tls_client_key.is_empty() && !std::path::Path::new(&tls_client_key).is_absolute() {
+        return Err(TargetError::Configuration("MySQL tls_client_key must be an absolute path".to_string()));
+    }
+
     let queue_dir = config
         .lookup(MYSQL_QUEUE_DIR)
         .unwrap_or_else(|| default_queue_dir.to_string());
@@ -605,8 +595,8 @@ mod tests {
     use crate::target::{TargetType, postgres::PostgresFormat};
     use rustfs_config::{
         KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
-        POSTGRES_DATABASE, POSTGRES_FORMAT, POSTGRES_HOST, POSTGRES_PORT, POSTGRES_QUEUE_DIR, POSTGRES_SCHEMA, POSTGRES_TABLE,
-        POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_USER, REDIS_CHANNEL,
+        MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, POSTGRES_DSN_STRING, POSTGRES_FORMAT, POSTGRES_QUEUE_DIR,
+        POSTGRES_TABLE, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, REDIS_CHANNEL,
         REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE,
         REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_URL,
     };
@@ -711,6 +701,44 @@ mod tests {
         assert!(err.to_string().contains("empty"));
     }
 
+    #[test]
+    fn validate_mysql_config_rejects_unpaired_tls_client_fields() {
+        let mut config = mysql_base_config();
+        config.insert(MYSQL_TLS_CLIENT_CERT.to_string(), "/etc/ssl/mysql/client.pem".to_string());
+
+        let err = validate_mysql_config(&config, "").expect_err("unpaired mysql TLS client cert should fail");
+        assert!(err.to_string().contains("must be specified together"));
+    }
+
+    #[test]
+    fn validate_mysql_config_rejects_relative_tls_paths() {
+        let mut config = mysql_base_config();
+        config.insert(MYSQL_TLS_CA.to_string(), "ca.pem".to_string());
+
+        let err = validate_mysql_config(&config, "").expect_err("relative tls_ca should fail");
+        assert!(err.to_string().contains("tls_ca must be an absolute path"));
+
+        config.insert(MYSQL_TLS_CA.to_string(), "/etc/ssl/mysql/ca.pem".to_string());
+        config.insert(MYSQL_TLS_CLIENT_CERT.to_string(), "client.pem".to_string());
+        config.insert(MYSQL_TLS_CLIENT_KEY.to_string(), "client.key".to_string());
+
+        let err = validate_mysql_config(&config, "").expect_err("relative tls client paths should fail");
+        assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn build_mysql_args_accepts_absolute_tls_paths() {
+        let mut config = mysql_base_config();
+        config.insert(MYSQL_TLS_CA.to_string(), "/etc/ssl/mysql/ca.pem".to_string());
+        config.insert(MYSQL_TLS_CLIENT_CERT.to_string(), "/etc/ssl/mysql/client.pem".to_string());
+        config.insert(MYSQL_TLS_CLIENT_KEY.to_string(), "/etc/ssl/mysql/client.key".to_string());
+
+        let args = build_mysql_args(&config, "", TargetType::NotifyEvent).expect("absolute mysql TLS paths should pass");
+        assert_eq!(args.tls_ca, "/etc/ssl/mysql/ca.pem");
+        assert_eq!(args.tls_client_cert, "/etc/ssl/mysql/client.pem");
+        assert_eq!(args.tls_client_key, "/etc/ssl/mysql/client.key");
+    }
+
     fn redis_base_config() -> KVS {
         let mut config = KVS::new();
         config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/0".to_string());
@@ -719,9 +747,10 @@ mod tests {
     }
     fn postgres_base_config() -> KVS {
         let mut config = KVS::new();
-        config.insert(POSTGRES_HOST.to_string(), "localhost".to_string());
-        config.insert(POSTGRES_USER.to_string(), "postgres".to_string());
-        config.insert(POSTGRES_DATABASE.to_string(), "rustfs_events".to_string());
+        config.insert(
+            POSTGRES_DSN_STRING.to_string(),
+            "postgres://postgres:rustfs@localhost:5432/rustfs_events?search_path=public".to_string(),
+        );
         config.insert(POSTGRES_TABLE.to_string(), "rustfs_events_namespace".to_string());
         config
     }
@@ -791,36 +820,14 @@ mod tests {
         assert!(err.to_string().contains("Missing Redis URL"));
     }
     #[test]
-    fn build_postgres_args_uses_default_port_5432() {
+    fn build_postgres_args_accepts_minimal_config() {
         let config = postgres_base_config();
         let args = build_postgres_args(&config, "", TargetType::NotifyEvent).expect("valid postgres args");
-        assert_eq!(args.port, 5432);
-        assert_eq!(args.schema, "public");
+        assert_eq!(
+            args.dsn_string,
+            "postgres://postgres:rustfs@localhost:5432/rustfs_events?search_path=public"
+        );
         assert_eq!(args.format, PostgresFormat::Namespace);
-    }
-
-    #[test]
-    fn build_postgres_args_parses_explicit_port() {
-        let mut config = postgres_base_config();
-        config.insert(POSTGRES_PORT.to_string(), "6543".to_string());
-        let args = build_postgres_args(&config, "", TargetType::NotifyEvent).expect("valid postgres args");
-        assert_eq!(args.port, 6543);
-    }
-
-    #[test]
-    fn build_postgres_args_rejects_zero_port() {
-        let mut config = postgres_base_config();
-        config.insert(POSTGRES_PORT.to_string(), "0".to_string());
-        let err = build_postgres_args(&config, "", TargetType::NotifyEvent).expect_err("zero port should fail");
-        assert!(err.to_string().contains("port must not be zero"));
-    }
-
-    #[test]
-    fn build_postgres_args_rejects_invalid_port() {
-        let mut config = postgres_base_config();
-        config.insert(POSTGRES_PORT.to_string(), "abc".to_string());
-        let err = build_postgres_args(&config, "", TargetType::NotifyEvent).expect_err("non-numeric port should fail");
-        assert!(err.to_string().contains("port must be a u16"));
     }
 
     #[test]
@@ -832,27 +839,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_postgres_config_rejects_missing_host() {
+    fn validate_postgres_config_rejects_missing_dsn_string() {
         let mut config = postgres_base_config();
-        config.0.retain(|kv| kv.key != POSTGRES_HOST);
-        let err = validate_postgres_config(&config, "").expect_err("missing host should fail");
-        assert!(err.to_string().contains("Missing PostgreSQL host"));
+        config.0.retain(|kv| kv.key != POSTGRES_DSN_STRING);
+        let err = validate_postgres_config(&config, "").expect_err("missing dsn_string should fail");
+        assert!(err.to_string().contains("Missing PostgreSQL dsn_string"));
     }
 
     #[test]
-    fn validate_postgres_config_rejects_empty_host() {
+    fn validate_postgres_config_rejects_empty_dsn_string() {
         let mut config = postgres_base_config();
-        config.insert(POSTGRES_HOST.to_string(), "".to_string());
-        let err = validate_postgres_config(&config, "").expect_err("empty host should fail");
-        assert!(err.to_string().contains("host cannot be empty"));
-    }
-
-    #[test]
-    fn validate_postgres_config_rejects_missing_database() {
-        let mut config = postgres_base_config();
-        config.0.retain(|kv| kv.key != POSTGRES_DATABASE);
-        let err = validate_postgres_config(&config, "").expect_err("missing database should fail");
-        assert!(err.to_string().contains("Missing PostgreSQL database"));
+        config.insert(POSTGRES_DSN_STRING.to_string(), "".to_string());
+        let err = validate_postgres_config(&config, "").expect_err("empty dsn_string should fail");
+        assert!(err.to_string().contains("dsn_string cannot be empty"));
     }
 
     #[test]
@@ -864,11 +863,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_postgres_config_rejects_invalid_schema_identifier() {
+    fn validate_postgres_config_rejects_invalid_dsn() {
         let mut config = postgres_base_config();
-        config.insert(POSTGRES_SCHEMA.to_string(), "public; DROP TABLE".to_string());
-        let err = validate_postgres_config(&config, "").expect_err("malicious schema should fail");
-        assert!(err.to_string().contains("schema"));
+        config.insert(POSTGRES_DSN_STRING.to_string(), "postgres://".to_string());
+        let err = validate_postgres_config(&config, "").expect_err("invalid dsn should fail");
+        assert!(err.to_string().contains("invalid PostgreSQL dsn_string"));
     }
 
     #[test]

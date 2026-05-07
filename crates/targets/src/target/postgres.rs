@@ -37,7 +37,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
-use rustfs_config::{POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY};
+use rustfs_config::{POSTGRES_DSN_STRING, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
@@ -46,7 +46,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_postgres::Config;
 use tokio_postgres_rustls::MakeRustlsConnect;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
+use url::Url;
 use uuid::Uuid;
 
 const TARGET_LOG_KEY_FIELD: &str = "Key";
@@ -88,6 +89,127 @@ pub fn parse_postgres_format(value: Option<&str>) -> Result<PostgresFormat, Targ
     }
 }
 
+/// Parsed representation of a PostgreSQL DSN string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresDsn {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: Option<String>,
+    pub database: String,
+    pub schema: String,
+}
+
+impl PostgresDsn {
+    /// Parses and validates PostgreSQL DSN string.
+    ///
+    /// Supports canonical URL format like:
+    /// `postgres://user:password@host:5432/database?search_path=public`
+    pub fn parse(dsn_string: &str) -> Result<Self, TargetError> {
+        let input = dsn_string.trim();
+        if input.is_empty() {
+            return Err(TargetError::Configuration(format!("PostgreSQL {POSTGRES_DSN_STRING} cannot be empty")));
+        }
+
+        let url = Url::parse(input).map_err(|e| TargetError::Configuration(format!("invalid PostgreSQL dsn_string: {e}")))?;
+        let scheme = url.scheme().to_ascii_lowercase();
+        if scheme != "postgres" && scheme != "postgresql" {
+            return Err(TargetError::Configuration(
+                "invalid PostgreSQL dsn_string: URL scheme must be postgres or postgresql".to_string(),
+            ));
+        }
+
+        if url.host_str().is_none() {
+            return Err(TargetError::Configuration(
+                "invalid PostgreSQL dsn_string: host cannot be empty".to_string(),
+            ));
+        }
+
+        let user = url.username().trim();
+        if user.is_empty() {
+            return Err(TargetError::Configuration(
+                "invalid PostgreSQL dsn_string: user cannot be empty".to_string(),
+            ));
+        }
+
+        let host = url.host_str().unwrap_or_default().trim();
+        if host.is_empty() {
+            return Err(TargetError::Configuration(
+                "invalid PostgreSQL dsn_string: host cannot be empty".to_string(),
+            ));
+        }
+        let port = url.port().unwrap_or(5432);
+
+        let database = url.path().trim_start_matches('/').trim();
+        if database.is_empty() {
+            return Err(TargetError::Configuration(
+                "invalid PostgreSQL dsn_string: database cannot be empty".to_string(),
+            ));
+        }
+
+        let mut schema = "public".to_string();
+        for (key, value) in url.query_pairs() {
+            if !key.eq_ignore_ascii_case("search_path") {
+                return Err(TargetError::Configuration(format!(
+                    "invalid PostgreSQL dsn_string: unsupported query parameter '{key}'"
+                )));
+            }
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(TargetError::Configuration(
+                    "invalid PostgreSQL dsn_string: search_path cannot be empty".to_string(),
+                ));
+            }
+            let first_schema = value
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| {
+                    TargetError::Configuration(
+                        "invalid PostgreSQL dsn_string: search_path must contain at least one schema".to_string(),
+                    )
+                })?;
+            validate_pg_identifier(first_schema, "schema")?;
+            schema = first_schema.to_string();
+        }
+
+        Ok(PostgresDsn {
+            host: host.to_string(),
+            port,
+            user: user.to_string(),
+            password: url.password().map(ToOwned::to_owned),
+            database: database.to_string(),
+            schema,
+        })
+    }
+}
+
+/// Returns a redacted version of the DSN string with the password replaced by
+/// `***` while preserving non-secret connection details for diagnostics.
+pub(crate) fn redact_postgres_dsn(dsn_string: &str) -> String {
+    let input = dsn_string.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let (prefix, rest) = if let Some(rest) = input.strip_prefix("postgres://") {
+        ("postgres://", rest)
+    } else if let Some(rest) = input.strip_prefix("postgresql://") {
+        ("postgresql://", rest)
+    } else {
+        return "***".to_string();
+    };
+
+    let Some((credentials, host_part)) = rest.split_once('@') else {
+        return input.to_string();
+    };
+    let Some((user, _password)) = credentials.split_once(':') else {
+        return input.to_string();
+    };
+    format!("{prefix}{user}:***@{host_part}")
+}
+
 /// Validates a PostgreSQL identifier (schema or table name).
 ///
 /// Accepts only `^[A-Za-z_][A-Za-z0-9_]*$`. Quoted identifiers, dots, and
@@ -118,18 +240,14 @@ pub fn validate_pg_identifier(name: &str, kind: &str) -> Result<(), TargetError>
 
 /// PostgreSQL target configuration.
 ///
-/// Implements a manual `Debug` that masks the password to prevent secret
+/// Implements a manual `Debug` that redacts the DSN password to prevent secret
 /// leakage through logging or `tracing::instrument` capture.
 #[derive(Clone)]
 pub struct PostgresArgs {
     pub enable: bool,
 
     // Connection
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub password: String,
-    pub database: String,
+    pub dsn_string: String,
 
     // Schema/Table/Format
     pub schema: String,
@@ -153,11 +271,7 @@ impl fmt::Debug for PostgresArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PostgresArgs")
             .field("enable", &self.enable)
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("user", &self.user)
-            .field("password", if self.password.is_empty() { &"" } else { &"***REDACTED***" })
-            .field("database", &self.database)
+            .field("dsn_string", &redact_postgres_dsn(&self.dsn_string))
             .field("schema", &self.schema)
             .field("table", &self.table)
             .field("format", &self.format)
@@ -185,17 +299,18 @@ impl PostgresArgs {
             return Ok(());
         }
 
-        if self.host.trim().is_empty() {
-            return Err(TargetError::Configuration("PostgreSQL host cannot be empty".to_string()));
-        }
-        if self.user.trim().is_empty() {
-            return Err(TargetError::Configuration("PostgreSQL user cannot be empty".to_string()));
-        }
-        if self.database.trim().is_empty() {
-            return Err(TargetError::Configuration("PostgreSQL database cannot be empty".to_string()));
-        }
+        let parsed = PostgresDsn::parse(&self.dsn_string)?;
 
+        if self.schema.trim().is_empty() {
+            return Err(TargetError::Configuration("PostgreSQL schema cannot be empty".to_string()));
+        }
         validate_pg_identifier(&self.schema, "schema")?;
+        if self.schema != parsed.schema {
+            return Err(TargetError::Configuration(format!(
+                "PostgreSQL schema must match DSN search_path first schema ('{}')",
+                parsed.schema
+            )));
+        }
         validate_pg_identifier(&self.table, "table")?;
 
         // TLS pair must be both empty or both set
@@ -263,6 +378,14 @@ pub fn table_probe_sql(schema: &str, table: &str) -> String {
     format!("SELECT 1 FROM {} LIMIT 0", qualified_table(schema, table))
 }
 
+fn ensure_rustls_provider_installed() {
+    if rustls::crypto::CryptoProvider::get_default().is_none()
+        && rustls::crypto::aws_lc_rs::default_provider().install_default().is_err()
+    {
+        debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
+    }
+}
+
 /// Builds a rustls `ClientConfig` for the PostgreSQL connection.
 ///
 /// When `tls_ca` is empty the OS native trust store is used via
@@ -270,6 +393,8 @@ pub fn table_probe_sql(schema: &str, table: &str) -> String {
 /// When `tls_client_cert` and `tls_client_key` are both set the connection
 /// uses mTLS authentication; otherwise no client cert is sent.
 pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, TargetError> {
+    ensure_rustls_provider_installed();
+
     let mut root_store = rustls::RootCertStore::empty();
 
     if args.tls_ca.is_empty() {
@@ -330,14 +455,18 @@ pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, Tar
 /// `args.tls_required` decides whether the connection is plain TCP or wrapped
 /// in rustls. The pool is `Clone` and cheap to share across `clone_box`.
 pub fn build_pool(args: &PostgresArgs) -> Result<Pool, TargetError> {
+    let parsed = PostgresDsn::parse(&args.dsn_string)?;
     let mut pg_config = Config::new();
     pg_config
-        .host(&args.host)
-        .port(args.port)
-        .user(&args.user)
-        .dbname(&args.database);
-    if !args.password.is_empty() {
-        pg_config.password(&args.password);
+        .host(&parsed.host)
+        .port(parsed.port)
+        .user(&parsed.user)
+        .dbname(&parsed.database)
+        .options(format!("-c search_path={}", parsed.schema));
+    if let Some(password) = parsed.password.as_deref()
+        && !password.is_empty()
+    {
+        pg_config.password(password);
     }
 
     let manager_config = ManagerConfig {
@@ -649,11 +778,7 @@ mod tests {
     fn base_args() -> PostgresArgs {
         PostgresArgs {
             enable: true,
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "postgres".to_string(),
-            password: "secret".to_string(),
-            database: "rustfs_events".to_string(),
+            dsn_string: "postgres://postgres:secret@localhost:5432/rustfs_events?search_path=public".to_string(),
             schema: "public".to_string(),
             table: "rustfs_events_namespace".to_string(),
             format: PostgresFormat::Namespace,
@@ -671,9 +796,7 @@ mod tests {
     fn validate_disabled_skips_all_checks() {
         let args = PostgresArgs {
             enable: false,
-            host: String::new(),
-            user: String::new(),
-            database: String::new(),
+            dsn_string: String::new(),
             schema: String::new(),
             table: String::new(),
             ..base_args()
@@ -692,6 +815,7 @@ mod tests {
             "postgres:test".to_string(),
             PostgresArgs {
                 enable: false,
+                dsn_string: "postgres://postgres:secret@localhost:5432/rustfs_events?search_path=public".to_string(),
                 ..base_args()
             },
         )
@@ -701,23 +825,23 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_host() {
+    fn validate_rejects_empty_dsn_string() {
         let args = PostgresArgs {
-            host: String::new(),
+            dsn_string: String::new(),
             ..base_args()
         };
-        let err = args.validate().expect_err("empty host should fail");
-        assert!(err.to_string().contains("host cannot be empty"));
+        let err = args.validate().expect_err("empty dsn string should fail");
+        assert!(err.to_string().contains("dsn_string cannot be empty"));
     }
 
     #[test]
-    fn validate_rejects_empty_database() {
+    fn validate_rejects_invalid_dsn_string() {
         let args = PostgresArgs {
-            database: String::new(),
+            dsn_string: "postgres://".to_string(),
             ..base_args()
         };
-        let err = args.validate().expect_err("empty database should fail");
-        assert!(err.to_string().contains("database cannot be empty"));
+        let err = args.validate().expect_err("invalid dsn should fail");
+        assert!(err.to_string().contains("invalid PostgreSQL dsn_string"));
     }
 
     #[test]
@@ -802,21 +926,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_dsn_extracts_search_path_schema() {
+        let parsed = PostgresDsn::parse("postgres://postgres:secret@localhost:5432/rustfs_events?search_path=audit,public")
+            .expect("dsn should parse");
+        assert_eq!(parsed.host, "localhost");
+        assert_eq!(parsed.port, 5432);
+        assert_eq!(parsed.user, "postgres");
+        assert_eq!(parsed.password.as_deref(), Some("secret"));
+        assert_eq!(parsed.database, "rustfs_events");
+        assert_eq!(parsed.schema, "audit");
+    }
+
+    #[test]
+    fn parse_dsn_defaults_schema_to_public() {
+        let parsed = PostgresDsn::parse("postgres://postgres:secret@localhost:5432/rustfs_events").expect("dsn should parse");
+        assert_eq!(parsed.schema, "public");
+    }
+
+    #[test]
+    fn parse_dsn_rejects_invalid_scheme() {
+        let err = PostgresDsn::parse("mysql://user:pass@localhost:5432/db").expect_err("scheme should fail");
+        assert!(err.to_string().contains("scheme must be postgres or postgresql"));
+    }
+
+    #[test]
+    fn parse_dsn_rejects_invalid_search_path_identifier() {
+        let err = PostgresDsn::parse("postgres://postgres:secret@localhost:5432/rustfs_events?search_path=public;drop")
+            .expect_err("invalid search_path should fail");
+        assert!(err.to_string().contains("schema"));
+    }
+
+    #[test]
+    fn validate_rejects_schema_mismatch_with_dsn_search_path() {
+        let args = PostgresArgs {
+            schema: "public".to_string(),
+            dsn_string: "postgres://postgres:secret@localhost:5432/rustfs_events?search_path=audit".to_string(),
+            ..base_args()
+        };
+        let err = args.validate().expect_err("schema mismatch should fail");
+        assert!(err.to_string().contains("schema must match DSN search_path"));
+    }
+
+    #[test]
     fn debug_masks_password() {
         let args = base_args();
         let rendered = format!("{args:?}");
         assert!(!rendered.contains("secret"), "password leaked: {rendered}");
-        assert!(rendered.contains("***REDACTED***"));
+        assert!(rendered.contains("postgres:***@"));
     }
 
     #[test]
     fn debug_masks_password_when_empty_shows_blank() {
         let args = PostgresArgs {
-            password: String::new(),
+            dsn_string: "postgres://postgres@localhost:5432/rustfs_events?search_path=public".to_string(),
             ..base_args()
         };
         let rendered = format!("{args:?}");
-        assert!(!rendered.contains("***REDACTED***"));
+        assert!(!rendered.contains(":***@"));
     }
 
     #[test]
