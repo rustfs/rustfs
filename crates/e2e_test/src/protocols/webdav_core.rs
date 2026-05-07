@@ -170,6 +170,77 @@ pub async fn test_webdav_core_operations() -> Result<()> {
         );
         info!("PASS: Verified file '{}' is deleted", filename);
 
+        // Test MOVE (rename) file
+        info!("Testing WebDAV: PUT file for MOVE test");
+        let move_filename = "move-source.txt";
+        let move_dest_filename = "move-dest.txt";
+        let move_content = "File to be moved!";
+        let resp = client
+            .put(format!("{}/{}/{}", base_url, bucket_name, move_filename))
+            .header("Authorization", &auth_header)
+            .body(move_content)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "PUT for MOVE test should succeed, got: {}",
+            resp.status()
+        );
+        info!("PASS: PUT file '{}' for MOVE test successful", move_filename);
+
+        // Execute MOVE request
+        info!("Testing WebDAV: MOVE file '{}' to '{}'", move_filename, move_dest_filename);
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MOVE").unwrap(),
+                format!("{}/{}/{}", base_url, bucket_name, move_filename),
+            )
+            .header("Authorization", &auth_header)
+            .header("Destination", format!("/{}/{}", bucket_name, move_dest_filename))
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204 || resp.status().as_u16() == 201,
+            "MOVE should succeed, got: {}",
+            resp.status()
+        );
+        info!(
+            "PASS: MOVE file '{}' to '{}' successful (HTTP {})",
+            move_filename,
+            move_dest_filename,
+            resp.status()
+        );
+
+        // Verify source file is gone
+        info!("Testing WebDAV: Verify source '{}' is deleted after MOVE", move_filename);
+        let resp = client
+            .get(format!("{}/{}/{}", base_url, bucket_name, move_filename))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().as_u16() == 404,
+            "GET moved source should return 404, got: {}",
+            resp.status()
+        );
+        info!("PASS: Source '{}' is deleted after MOVE", move_filename);
+
+        // Verify destination file exists and content matches
+        info!("Testing WebDAV: Verify destination '{}' has correct content", move_dest_filename);
+        let resp = client
+            .get(format!("{}/{}/{}", base_url, bucket_name, move_dest_filename))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success(),
+            "GET destination after MOVE should succeed, got: {}",
+            resp.status()
+        );
+        let moved_content = resp.text().await?;
+        assert_eq!(moved_content, move_content, "Moved file content should match original");
+        info!("PASS: Destination '{}' has correct content after MOVE", move_dest_filename);
+
         // Test DELETE bucket
         info!("Testing WebDAV: DELETE bucket '{}'", bucket_name);
         let resp = client

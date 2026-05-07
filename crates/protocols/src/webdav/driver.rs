@@ -1074,9 +1074,101 @@ where
         .boxed()
     }
 
-    fn rename<'a>(&'a self, _from: &'a DavPath, _to: &'a DavPath) -> FsFuture<'a, ()> {
-        // S3 doesn't support native rename, would need copy + delete
-        async move { Err(FsError::NotImplemented) }.boxed()
+    fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
+        let storage = self.storage.clone();
+        let session_context = self.session_context.clone();
+
+        async move {
+            let (src_bucket, src_key) = self.parse_path(from)?;
+            let (dst_bucket, dst_key) = self.parse_path(to)?;
+
+            if src_bucket.is_empty() || dst_bucket.is_empty() {
+                return Err(FsError::Forbidden);
+            }
+
+            let src_key = src_key.ok_or(FsError::Forbidden)?;
+            let dst_key = dst_key.ok_or(FsError::Forbidden)?;
+
+            let access_key = &session_context.principal.user_identity.credentials.access_key;
+            let secret_key = &session_context.principal.user_identity.credentials.secret_key;
+
+            // Authorize read on source and write on destination
+            authorize_operation(&session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
+                .await
+                .map_err(|_| FsError::Forbidden)?;
+            authorize_operation(&session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                .await
+                .map_err(|_| FsError::Forbidden)?;
+
+            // Get source object content
+            match storage.get_object(&src_bucket, &src_key, access_key, secret_key, None).await {
+                Ok(get_output) => {
+                    // Read all content from source
+                    let body_bytes = if let Some(body) = get_output.body {
+                        let chunks: Vec<Result<Bytes, std::io::Error>> = body.collect().await;
+                        let mut all_data = Vec::new();
+                        for chunk in chunks {
+                            match chunk {
+                                Ok(data) => all_data.extend_from_slice(&data),
+                                Err(e) => {
+                                    error!("Failed to read source object body: {}", e);
+                                    return Err(FsError::GeneralFailure);
+                                }
+                            }
+                        }
+                        Bytes::from(all_data)
+                    } else {
+                        Bytes::new()
+                    };
+
+                    let content_length = body_bytes.len() as i64;
+                    let content_type = get_output.content_type.clone();
+
+                    // Put object to destination
+                    let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body_bytes) });
+                    let streaming_blob = StreamingBlob::wrap(stream);
+
+                    let mut put_builder = PutObjectInput::builder()
+                        .bucket(dst_bucket.clone())
+                        .key(dst_key.clone())
+                        .content_length(Some(content_length))
+                        .body(Some(streaming_blob));
+
+                    if let Some(ref ct) = content_type {
+                        put_builder = put_builder.content_type(Some(ct.clone()));
+                    }
+
+                    let put_input = put_builder.build().map_err(|_| FsError::GeneralFailure)?;
+
+                    match storage.put_object(put_input, access_key, secret_key).await {
+                        Ok(_) => {
+                            debug!("Successfully copied '{}/{}' to '{}/{}", src_bucket, src_key, dst_bucket, dst_key);
+                        }
+                        Err(e) => {
+                            error!("Failed to copy object to destination: {}", e);
+                            return Err(FsError::GeneralFailure);
+                        }
+                    }
+
+                    // Delete source object
+                    match storage.delete_object(&src_bucket, &src_key, access_key, secret_key).await {
+                        Ok(_) => {
+                            debug!("Successfully deleted source '{}/{}' after rename", src_bucket, src_key);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            error!("Failed to delete source object after rename: {}", e);
+                            Err(FsError::GeneralFailure)
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to get source object '{}' in '{}': {}", src_key, src_bucket, e);
+                    Err(FsError::GeneralFailure)
+                }
+            }
+        }
+        .boxed()
     }
 
     fn copy<'a>(&'a self, _from: &'a DavPath, _to: &'a DavPath) -> FsFuture<'a, ()> {
