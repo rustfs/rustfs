@@ -15,8 +15,8 @@
 use crate::{
     AuditEntry, AuditError, AuditResult,
     factory::{
-        KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, RedisTargetFactory, TargetFactory,
-        WebhookTargetFactory,
+        KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory,
+        RedisTargetFactory, TargetFactory, WebhookTargetFactory,
     },
 };
 use futures::StreamExt;
@@ -58,6 +58,8 @@ impl AuditRegistry {
         registry.register(ChannelTargetType::Pulsar.as_str(), Box::new(PulsarTargetFactory));
         registry.register(ChannelTargetType::Kafka.as_str(), Box::new(KafkaTargetFactory));
         registry.register(ChannelTargetType::Redis.as_str(), Box::new(RedisTargetFactory));
+        registry.register(ChannelTargetType::MySql.as_str(), Box::new(MySqlTargetFactory));
+        registry.register(ChannelTargetType::Postgres.as_str(), Box::new(PostgresTargetFactory));
 
         registry
     }

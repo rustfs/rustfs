@@ -26,7 +26,8 @@ use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
 use rustfs_config::COMMENT_KEY;
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::audit::{
-    AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_SUB_SYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_SUB_SYS,
+    AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::notify::{
     NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_SUB_SYS,
@@ -247,11 +248,13 @@ pub fn init() {
     kvs.insert(NOTIFY_REDIS_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_REDIS_KVS.clone());
     kvs.insert(AUDIT_REDIS_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_REDIS_KVS.clone());
     kvs.insert(NOTIFY_POSTGRES_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_POSTGRES_KVS.clone());
+    kvs.insert(AUDIT_POSTGRES_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_POSTGRES_KVS.clone());
     kvs.insert(NOTIFY_PULSAR_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_PULSAR_KVS.clone());
     kvs.insert(AUDIT_PULSAR_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_PULSAR_KVS.clone());
     kvs.insert(NOTIFY_KAFKA_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_KAFKA_KVS.clone());
     kvs.insert(AUDIT_KAFKA_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_KAFKA_KVS.clone());
     kvs.insert(NOTIFY_MYSQL_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_MYSQL_KVS.clone());
+    kvs.insert(AUDIT_MYSQL_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_MYSQL_KVS.clone());
     kvs.insert(IDENTITY_OPENID_SUB_SYS.to_owned(), oidc::DEFAULT_IDENTITY_OPENID_KVS.clone());
 
     // Register all default configurations

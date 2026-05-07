@@ -33,9 +33,10 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::audit::{
-    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS,
-    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS,
-    AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS,
+    AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
+    AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS, AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS,
+    AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
@@ -94,7 +95,7 @@ struct AuditEndpointsResponse {
     audit_endpoints: Vec<AuditEndpoint>,
 }
 
-fn audit_target_specs() -> [AdminTargetSpec; 6] {
+fn audit_target_specs() -> [AdminTargetSpec; 8] {
     [
         AdminTargetSpec {
             subsystem: AUDIT_WEBHOOK_SUB_SYS,
@@ -115,10 +116,22 @@ fn audit_target_specs() -> [AdminTargetSpec; 6] {
             validator: AdminTargetValidator::Mqtt,
         },
         AdminTargetSpec {
+            subsystem: AUDIT_MYSQL_SUB_SYS,
+            service: "mysql",
+            valid_keys: AUDIT_MYSQL_KEYS,
+            validator: AdminTargetValidator::MySql,
+        },
+        AdminTargetSpec {
             subsystem: AUDIT_NATS_SUB_SYS,
             service: "nats",
             valid_keys: AUDIT_NATS_KEYS,
             validator: AdminTargetValidator::Nats(TargetDomain::Audit),
+        },
+        AdminTargetSpec {
+            subsystem: AUDIT_POSTGRES_SUB_SYS,
+            service: "postgres",
+            valid_keys: AUDIT_POSTGRES_KEYS,
+            validator: AdminTargetValidator::Postgres(TargetDomain::Audit),
         },
         AdminTargetSpec {
             subsystem: AUDIT_PULSAR_SUB_SYS,

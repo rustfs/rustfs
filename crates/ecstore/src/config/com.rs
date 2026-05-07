@@ -19,8 +19,9 @@ use crate::global::is_first_cluster_node_local;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::audit::{
-    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS,
-    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS,
+    AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
+    AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::notify::{
     NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
@@ -112,7 +113,7 @@ fn notify_target_descriptors() -> [TargetConfigDescriptor; 8] {
     ]
 }
 
-fn audit_target_descriptors() -> [TargetConfigDescriptor; 6] {
+fn audit_target_descriptors() -> [TargetConfigDescriptor; 8] {
     [
         TargetConfigDescriptor {
             external_key: "webhook",
@@ -133,10 +134,22 @@ fn audit_target_descriptors() -> [TargetConfigDescriptor; 6] {
             valid_keys: AUDIT_MQTT_KEYS,
         },
         TargetConfigDescriptor {
+            external_key: "mysql",
+            subsystem_key: AUDIT_MYSQL_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_MYSQL_KVS,
+            valid_keys: AUDIT_MYSQL_KEYS,
+        },
+        TargetConfigDescriptor {
             external_key: "nats",
             subsystem_key: AUDIT_NATS_SUB_SYS,
             default_kvs: &audit::DEFAULT_AUDIT_NATS_KVS,
             valid_keys: AUDIT_NATS_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "postgres",
+            subsystem_key: AUDIT_POSTGRES_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_POSTGRES_KVS,
+            valid_keys: AUDIT_POSTGRES_KEYS,
         },
         TargetConfigDescriptor {
             external_key: "pulsar",

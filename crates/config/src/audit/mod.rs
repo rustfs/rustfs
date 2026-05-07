@@ -18,14 +18,18 @@
 
 mod kafka;
 mod mqtt;
+mod mysql;
 mod nats;
+mod postgres;
 mod pulsar;
 mod redis;
 mod webhook;
 
 pub use kafka::*;
 pub use mqtt::*;
+pub use mysql::*;
 pub use nats::*;
+pub use postgres::*;
 pub use pulsar::*;
 pub use redis::*;
 pub use webhook::*;
@@ -39,7 +43,9 @@ pub const AUDIT_ROUTE_PREFIX: &str = const_str::concat!(AUDIT_PREFIX, DEFAULT_DE
 pub const AUDIT_WEBHOOK_SUB_SYS: &str = "audit_webhook";
 pub const AUDIT_KAFKA_SUB_SYS: &str = "audit_kafka";
 pub const AUDIT_MQTT_SUB_SYS: &str = "audit_mqtt";
+pub const AUDIT_MYSQL_SUB_SYS: &str = "audit_mysql";
 pub const AUDIT_NATS_SUB_SYS: &str = "audit_nats";
+pub const AUDIT_POSTGRES_SUB_SYS: &str = "audit_postgres";
 pub const AUDIT_PULSAR_SUB_SYS: &str = "audit_pulsar";
 pub const AUDIT_REDIS_SUB_SYS: &str = "audit_redis";
 pub const AUDIT_REDIS_DEFAULT_CHANNEL: &str = "rustfs_audit_channel";
@@ -49,7 +55,9 @@ pub const AUDIT_STORE_EXTENSION: &str = ".audit";
 pub const AUDIT_SUB_SYSTEMS: &[&str] = &[
     AUDIT_KAFKA_SUB_SYS,
     AUDIT_MQTT_SUB_SYS,
+    AUDIT_MYSQL_SUB_SYS,
     AUDIT_NATS_SUB_SYS,
+    AUDIT_POSTGRES_SUB_SYS,
     AUDIT_PULSAR_SUB_SYS,
     AUDIT_REDIS_SUB_SYS,
     AUDIT_WEBHOOK_SUB_SYS,
