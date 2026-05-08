@@ -58,6 +58,10 @@ use tracing::{error, info};
 
 const IAM_FORMAT_FILE: &str = "format.json";
 const IAM_FORMAT_VERSION_1: i32 = 1;
+#[cfg(not(test))]
+const INITIAL_LOAD_RETRY_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const INITIAL_LOAD_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 #[derive(Serialize, Deserialize)]
 struct IAMFormat {
@@ -116,7 +120,7 @@ where
     ///
     /// # Returns
     /// An Arc-wrapped instance of IamSystem
-    pub(crate) async fn new(api: T) -> Arc<Self> {
+    pub(crate) async fn new(api: T) -> Result<Arc<Self>> {
         let (sender, receiver) = mpsc::channel::<i64>(100);
 
         let sys = Arc::new(Self {
@@ -132,8 +136,8 @@ where
             last_sync_duration_millis: AtomicU64::new(0),
         });
 
-        sys.clone().init(receiver).await.unwrap();
-        sys
+        sys.clone().init(receiver).await?;
+        Ok(sys)
     }
 
     /// Initialize the IAM system
@@ -144,19 +148,26 @@ where
 
         // Critical: Load all existing users/policies into memory cache
         const MAX_RETRIES: usize = 3;
+        let mut load_error = None;
         for attempt in 0..MAX_RETRIES {
             if let Err(e) = self.clone().load().await {
                 if attempt == MAX_RETRIES - 1 {
                     self.state.store(IamState::Error as u8, Ordering::SeqCst);
                     warn!("IAM failed to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
+                    load_error = Some(e);
                 } else {
                     warn!("IAM load failed, retrying... attempt {}", attempt + 1);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(INITIAL_LOAD_RETRY_DELAY).await;
                 }
             } else {
                 break;
             }
         }
+
+        if let Some(err) = load_error {
+            return Err(err);
+        }
+
         self.state.store(IamState::Ready as u8, Ordering::SeqCst);
         info!("IAM System successfully initialized and marked as READY");
 
@@ -2023,6 +2034,156 @@ mod tests {
     use rustfs_policy::policy::{Policy, PolicyDoc};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[derive(Clone)]
+    struct FailingInitialLoadStore;
+
+    #[async_trait::async_trait]
+    impl Store for FailingInitialLoadStore {
+        fn has_watcher(&self) -> bool {
+            false
+        }
+
+        async fn save_iam_config<Item: Serialize + Send>(&self, _item: Item, _path: impl AsRef<str> + Send) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_iam_config<Item: serde::de::DeserializeOwned>(&self, _path: impl AsRef<str> + Send) -> Result<Item> {
+            Err(Error::ConfigNotFound)
+        }
+
+        async fn delete_iam_config(&self, _path: impl AsRef<str> + Send) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_user_identity(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _item: UserIdentity,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_user_identity(&self, _name: &str, _user_type: UserType) -> Result<UserIdentity> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_user(&self, _name: &str, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_users(&self, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_secret_key(&self, _name: &str, _user_type: UserType) -> Result<String> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_group_info(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_group(&self, _name: &str, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_groups(&self, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_policy_doc(&self, _name: &str, _item: PolicyDoc) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_policy_doc(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy(&self, _name: &str) -> Result<PolicyDoc> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_doc(&self, _name: &str, _m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_docs(&self, _m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _item: MappedPolicy,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_mapped_policy(&self, _name: &str, _user_type: UserType, _is_group: bool) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_mapped_policies(
+            &self,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_all(&self, _cache: &Cache) -> Result<()> {
+            Err(Error::Io(std::io::Error::other("initial load failed")))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_init_keeps_error_state_when_initial_load_fails() {
+        let (sender, receiver) = mpsc::channel::<i64>(1);
+        let sys = Arc::new(IamCache {
+            api: FailingInitialLoadStore,
+            cache: Cache::default(),
+            state: Arc::new(AtomicU8::new(IamState::Uninitialized as u8)),
+            loading: Arc::new(AtomicBool::new(false)),
+            send_chan: sender,
+            roles: HashMap::new(),
+            last_timestamp: AtomicI64::new(0),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
+        });
+
+        let result = Arc::clone(&sys).init(receiver).await;
+
+        assert!(matches!(result, Err(Error::Io(_))));
+        assert!(!sys.is_ready());
+        assert_eq!(sys.state.load(Ordering::SeqCst), IamState::Error as u8);
+        assert_eq!(sys.sync_failures.load(Ordering::Relaxed), 3);
+    }
 
     #[test]
     fn test_iam_format_new_version_1() {

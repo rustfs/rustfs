@@ -1119,4 +1119,40 @@ mod tests {
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
     }
+
+    #[tokio::test]
+    async fn reset_health_for_store_init_retry_delegates_to_disk_variants() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_path = local_dir.path().to_str().expect("tempdir path should be utf8");
+        let mut local_endpoint = Endpoint::try_from(local_path).expect("local endpoint should parse");
+        local_endpoint.set_pool_index(0);
+        local_endpoint.set_set_index(0);
+        local_endpoint.set_disk_index(0);
+        let local_disk = LocalDisk::new(&local_endpoint, false).await.unwrap();
+        let local_disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
+
+        let mut remote_endpoint = Endpoint::try_from("http://remote-server:9000/data").expect("remote endpoint should parse");
+        remote_endpoint.set_pool_index(0);
+        remote_endpoint.set_set_index(0);
+        remote_endpoint.set_disk_index(1);
+        let remote_disk = RemoteDisk::new(
+            &remote_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+        let remote_disk = Disk::Remote(Box::new(remote_disk));
+
+        for disk in [&local_disk, &remote_disk] {
+            disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Offline);
+
+            disk.reset_health_for_store_init_retry();
+
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+        }
+    }
 }
