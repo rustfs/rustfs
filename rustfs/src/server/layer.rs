@@ -13,10 +13,14 @@
 // limitations under the License.
 
 use crate::admin::console::is_console_path;
+use crate::admin::handlers::health::{build_health_payload, collect_dependency_readiness, health_check_state, probe_from_path};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
-use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
+use crate::server::{
+    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX,
+    RUSTFS_ADMIN_PREFIX,
+};
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
 use bytes::Bytes;
@@ -558,6 +562,87 @@ where
     }
 }
 
+#[derive(Clone)]
+pub struct PublicHealthEndpointLayer;
+
+impl<S> Layer<S> for PublicHealthEndpointLayer {
+    type Service = PublicHealthEndpointService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        PublicHealthEndpointService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct PublicHealthEndpointService<S> {
+    inner: S,
+}
+
+fn health_endpoint_enabled() -> bool {
+    rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE)
+}
+
+fn is_public_health_endpoint_request(method: &Method, path: &str) -> bool {
+    health_endpoint_enabled()
+        && (method == Method::GET || method == Method::HEAD)
+        && (path == HEALTH_PREFIX || path == HEALTH_READY_PATH)
+}
+
+async fn build_public_health_http_response<RestBody, GrpcBody>(
+    method: Method,
+    path: String,
+) -> Response<HybridBody<RestBody, GrpcBody>>
+where
+    RestBody: From<Bytes>,
+{
+    let probe = probe_from_path(&path);
+    let (storage_ready, iam_ready) = collect_dependency_readiness().await;
+    let health = health_check_state(storage_ready, iam_ready, probe);
+    let body = if method == Method::HEAD {
+        Bytes::new()
+    } else {
+        let payload = build_health_payload(health, storage_ready, iam_ready, "rustfs-endpoint", None);
+        Bytes::from(serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec()))
+    };
+
+    Response::builder()
+        .status(health.status_code)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(HybridBody::Rest {
+            rest_body: RestBody::from(body),
+        })
+        .expect("failed to build health response")
+}
+
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for PublicHealthEndpointService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    RestBody: From<Bytes> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        let method = req.method().clone();
+        let path = req.uri().path().to_owned();
+
+        if is_public_health_endpoint_request(&method, &path) {
+            return Box::pin(async move { Ok(build_public_health_http_response(method, path).await) });
+        }
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await })
+    }
+}
+
 fn is_bodyless_status(status: StatusCode) -> bool {
     status.is_informational()
         || status == StatusCode::NO_CONTENT
@@ -935,7 +1020,8 @@ mod tests {
     use http_body_util::Full;
     use std::convert::Infallible;
     use std::sync::Mutex;
-    use temp_env::with_var;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temp_env::{async_with_vars, with_var};
 
     #[derive(Clone, Debug)]
     struct CaptureService;
@@ -978,6 +1064,144 @@ mod tests {
             *self.headers.lock().expect("capture headers") = Some(req.headers().clone());
             ready(Ok(Response::new(Full::from(Bytes::new()))))
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingHybridService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingHybridService {
+        fn calls(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.calls)
+        }
+    }
+
+    impl<B: Send + 'static> Service<Request<B>> for CountingHybridService {
+        type Response = Response<HybridBody<Full<Bytes>, Full<Bytes>>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<B>) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ready(Ok(Response::builder()
+                .status(StatusCode::IM_A_TEAPOT)
+                .body(HybridBody::Rest {
+                    rest_body: Full::from(Bytes::from_static(b"inner")),
+                })
+                .expect("response")))
+        }
+    }
+
+    #[tokio::test]
+    async fn public_health_endpoint_layer_handles_health_before_inner_service() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(HEALTH_PREFIX)
+                        .header(http::header::HOST, "localhost:9000")
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json")
+            );
+
+            let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+            assert!(body.windows(br#""status":"#.len()).any(|window| window == br#""status":"#));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn public_health_endpoint_layer_handles_ready_head_before_inner_service() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri(HEALTH_READY_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert!(response.status() == StatusCode::OK || response.status() == StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+            assert!(body.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn public_health_endpoint_layer_forwards_health_when_endpoint_disabled() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(HEALTH_PREFIX)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("inner response");
+
+            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn public_health_endpoint_layer_forwards_non_health_requests() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = PublicHealthEndpointLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/bucket/object")
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("inner response");
+
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

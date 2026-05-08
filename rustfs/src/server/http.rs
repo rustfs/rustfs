@@ -23,7 +23,7 @@ use crate::server::{
     hybrid::hybrid,
     layer::{
         AdminChunkedContentLengthCompatLayer, BodylessStatusFixLayer, ConditionalCorsLayer, HeadRequestBodyFixLayer,
-        ObjectAttributesEtagFixLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
+        ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
@@ -878,9 +878,12 @@ fn process_connection(
             // response and so no layer (e.g. CORS) re-adds body headers afterward.
             .layer(BodylessStatusFixLayer)
             // HEAD responses must not send body bytes even when the inner S3 layer
-            // serializes an XML error payload. Keep this innermost so the final
-            // HTTP response written to hyper/h2 is bodyless.
+            // serializes an XML error payload.
             .layer(HeadRequestBodyFixLayer)
+            // Health probes are public admin routes, but s3s parses virtual-host
+            // buckets before custom routes. Handle them here so SERVER_DOMAINS
+            // cannot turn /health into an S3 bucket request.
+            .layer(PublicHealthEndpointLayer)
             .service(service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
