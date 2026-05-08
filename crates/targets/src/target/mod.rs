@@ -337,7 +337,7 @@ impl std::fmt::Display for ChannelTargetType {
 }
 
 /// `TargetType` enum represents the type of target in the notification system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetType {
     AuditLog,
     NotifyEvent,

@@ -25,6 +25,22 @@ type BoxedTarget<E> = Box<dyn Target<E> + Send + Sync>;
 type TargetCreateFn<E> = Arc<dyn Fn(String, &KVS) -> Result<BoxedTarget<E>, TargetError> + Send + Sync>;
 type TargetValidateFn = Arc<dyn Fn(&KVS) -> Result<(), TargetError> + Send + Sync>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetRequestValidator {
+    Webhook,
+    Mqtt,
+    Amqp(crate::target::TargetType),
+    Kafka(crate::target::TargetType),
+    MySql,
+    Nats(crate::target::TargetType),
+    Postgres(crate::target::TargetType),
+    Pulsar(crate::target::TargetType),
+    Redis {
+        default_channel: &'static str,
+        target_type: crate::target::TargetType,
+    },
+}
+
 #[derive(Clone)]
 pub struct TargetPluginDescriptor<E>
 where
@@ -76,6 +92,44 @@ where
     #[inline]
     pub fn create_target(&self, id: String, config: &KVS) -> Result<BoxedTarget<E>, TargetError> {
         (self.create_target)(id, config)
+    }
+}
+
+#[derive(Clone)]
+pub struct BuiltinTargetDescriptor<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    plugin: TargetPluginDescriptor<E>,
+    request_validator: TargetRequestValidator,
+    subsystem: &'static str,
+}
+
+impl<E> BuiltinTargetDescriptor<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    pub fn new(subsystem: &'static str, request_validator: TargetRequestValidator, plugin: TargetPluginDescriptor<E>) -> Self {
+        Self {
+            plugin,
+            request_validator,
+            subsystem,
+        }
+    }
+
+    #[inline]
+    pub fn plugin(&self) -> &TargetPluginDescriptor<E> {
+        &self.plugin
+    }
+
+    #[inline]
+    pub fn request_validator(&self) -> TargetRequestValidator {
+        self.request_validator
+    }
+
+    #[inline]
+    pub fn subsystem(&self) -> &'static str {
+        self.subsystem
     }
 }
 

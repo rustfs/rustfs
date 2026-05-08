@@ -15,7 +15,7 @@
 use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
-        AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, TargetEndpointSource, allowed_target_keys,
+        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, allowed_target_keys,
         build_json_response, collect_validated_key_values as shared_collect_validated_key_values,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
@@ -31,13 +31,9 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
+use rustfs_audit::factory::builtin_target_descriptors as builtin_audit_target_descriptors;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
-use rustfs_config::audit::{
-    AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
-    AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS,
-    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS,
-    AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
-};
+use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -96,62 +92,12 @@ struct AuditEndpointsResponse {
 }
 
 fn audit_target_specs() -> [AdminTargetSpec; 9] {
-    [
-        AdminTargetSpec {
-            subsystem: AUDIT_WEBHOOK_SUB_SYS,
-            service: "webhook",
-            valid_keys: AUDIT_WEBHOOK_KEYS,
-            validator: AdminTargetValidator::Webhook,
-        },
-        AdminTargetSpec {
-            subsystem: AUDIT_AMQP_SUB_SYS,
-            service: "amqp",
-            valid_keys: AUDIT_AMQP_KEYS,
-            validator: AdminTargetValidator::Amqp(TargetDomain::Audit),
-        },
-        AdminTargetSpec {
-            subsystem: AUDIT_KAFKA_SUB_SYS,
-            service: "kafka",
-            valid_keys: AUDIT_KAFKA_KEYS,
-            validator: AdminTargetValidator::Kafka(TargetDomain::Audit),
-        },
-        AdminTargetSpec {
-            subsystem: AUDIT_MQTT_SUB_SYS,
-            service: "mqtt",
-            valid_keys: AUDIT_MQTT_KEYS,
-            validator: AdminTargetValidator::Mqtt,
-        },
-        AdminTargetSpec {
-            subsystem: AUDIT_MYSQL_SUB_SYS,
-            service: "mysql",
-            valid_keys: AUDIT_MYSQL_KEYS,
-            validator: AdminTargetValidator::MySql,
-        },
-        AdminTargetSpec {
-            subsystem: AUDIT_NATS_SUB_SYS,
-            service: "nats",
-            valid_keys: AUDIT_NATS_KEYS,
-            validator: AdminTargetValidator::Nats(TargetDomain::Audit),
-        },
-        AdminTargetSpec {
-            subsystem: AUDIT_POSTGRES_SUB_SYS,
-            service: "postgres",
-            valid_keys: AUDIT_POSTGRES_KEYS,
-            validator: AdminTargetValidator::Postgres(TargetDomain::Audit),
-        },
-        AdminTargetSpec {
-            subsystem: AUDIT_PULSAR_SUB_SYS,
-            service: "pulsar",
-            valid_keys: AUDIT_PULSAR_KEYS,
-            validator: AdminTargetValidator::Pulsar(TargetDomain::Audit),
-        },
-        AdminTargetSpec {
-            subsystem: AUDIT_REDIS_SUB_SYS,
-            service: "redis",
-            valid_keys: AUDIT_REDIS_KEYS,
-            validator: AdminTargetValidator::Redis(TargetDomain::Audit, AUDIT_REDIS_DEFAULT_CHANNEL),
-        },
-    ]
+    builtin_audit_target_descriptors()
+        .into_iter()
+        .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("audit builtin target descriptors should remain aligned")
 }
 
 async fn authorize_audit_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
@@ -437,6 +383,7 @@ mod tests {
     use super::*;
     use matchit::Router;
     use rustfs_config::ENV_PREFIX;
+    use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
     use rustfs_ecstore::config::{KV, KVS};
     use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars, with_vars_unset};

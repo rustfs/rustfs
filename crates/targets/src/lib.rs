@@ -26,7 +26,7 @@ pub use check::{
     check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
 };
 pub use error::{StoreError, TargetError};
-pub use plugin::{TargetPluginDescriptor, TargetPluginRegistry, boxed_target};
+pub use plugin::{BuiltinTargetDescriptor, TargetPluginDescriptor, TargetPluginRegistry, TargetRequestValidator, boxed_target};
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};
 pub use sys::user_agent::*;

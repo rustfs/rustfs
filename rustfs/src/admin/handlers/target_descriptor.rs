@@ -21,8 +21,9 @@ use rustfs_config::{
 };
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
-    TargetError, check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available_with_tls,
-    check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
+    BuiltinTargetDescriptor, TargetError, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
+    check_mqtt_broker_available_with_tls, check_nats_server_available, check_postgres_server_available,
+    check_pulsar_broker_available, check_redis_server_available,
     config::{
         build_amqp_args, build_kafka_args, build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args,
         collect_env_target_instance_ids, validate_mysql_config, validate_redis_config,
@@ -55,14 +56,14 @@ pub(crate) struct MergedTargetEndpoint {
     pub source: TargetEndpointSource,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum TargetDomain {
     Notify,
     Audit,
 }
 
 impl TargetDomain {
-    fn runtime_target_type(self) -> TargetType {
+    pub(crate) fn runtime_target_type(self) -> TargetType {
         match self {
             TargetDomain::Notify => TargetType::NotifyEvent,
             TargetDomain::Audit => TargetType::AuditLog,
@@ -70,7 +71,16 @@ impl TargetDomain {
     }
 }
 
-#[derive(Clone, Copy)]
+impl From<TargetType> for TargetDomain {
+    fn from(value: TargetType) -> Self {
+        match value {
+            TargetType::NotifyEvent => TargetDomain::Notify,
+            TargetType::AuditLog => TargetDomain::Audit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum AdminTargetValidator {
     Webhook,
     Mqtt,
@@ -83,12 +93,37 @@ pub(crate) enum AdminTargetValidator {
     Redis(TargetDomain, &'static str),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct AdminTargetSpec {
     pub subsystem: &'static str,
     pub service: &'static str,
     pub valid_keys: &'static [&'static str],
     pub validator: AdminTargetValidator,
+}
+
+pub(crate) fn admin_target_spec_from_builtin<E>(descriptor: &BuiltinTargetDescriptor<E>) -> AdminTargetSpec
+where
+    E: Send + Sync + 'static + Clone + serde::Serialize + serde::de::DeserializeOwned,
+{
+    AdminTargetSpec {
+        subsystem: descriptor.subsystem(),
+        service: descriptor.plugin().target_type(),
+        valid_keys: descriptor.plugin().valid_fields(),
+        validator: match descriptor.request_validator() {
+            TargetRequestValidator::Webhook => AdminTargetValidator::Webhook,
+            TargetRequestValidator::Mqtt => AdminTargetValidator::Mqtt,
+            TargetRequestValidator::Amqp(target_type) => AdminTargetValidator::Amqp(target_type.into()),
+            TargetRequestValidator::Kafka(target_type) => AdminTargetValidator::Kafka(target_type.into()),
+            TargetRequestValidator::MySql => AdminTargetValidator::MySql,
+            TargetRequestValidator::Nats(target_type) => AdminTargetValidator::Nats(target_type.into()),
+            TargetRequestValidator::Postgres(target_type) => AdminTargetValidator::Postgres(target_type.into()),
+            TargetRequestValidator::Pulsar(target_type) => AdminTargetValidator::Pulsar(target_type.into()),
+            TargetRequestValidator::Redis {
+                default_channel,
+                target_type,
+            } => AdminTargetValidator::Redis(target_type.into(), default_channel),
+        },
+    }
 }
 
 pub(crate) fn normalized_endpoint_key(account_id: &str, service: &str) -> EndpointKey {

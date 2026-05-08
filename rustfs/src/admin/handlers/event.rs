@@ -15,7 +15,7 @@
 use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
-        AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, TargetEndpointSource, allowed_target_keys,
+        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, allowed_target_keys,
         build_json_response, collect_validated_key_values as shared_collect_validated_key_values,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
@@ -32,14 +32,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
-use rustfs_config::notify::{
-    NOTIFY_AMQP_KEYS, NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS,
-    NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_KEYS,
-    NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_REDIS_KEYS,
-    NOTIFY_REDIS_SUB_SYS, NOTIFY_ROUTE_PREFIX, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
-};
+use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
+use rustfs_notify::factory::builtin_target_descriptors as builtin_notification_target_descriptors;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
@@ -102,62 +98,12 @@ struct NotificationEndpointsResponse {
 }
 
 fn notification_target_specs() -> [AdminTargetSpec; 9] {
-    [
-        AdminTargetSpec {
-            subsystem: NOTIFY_WEBHOOK_SUB_SYS,
-            service: "webhook",
-            valid_keys: NOTIFY_WEBHOOK_KEYS,
-            validator: AdminTargetValidator::Webhook,
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_AMQP_SUB_SYS,
-            service: "amqp",
-            valid_keys: NOTIFY_AMQP_KEYS,
-            validator: AdminTargetValidator::Amqp(TargetDomain::Notify),
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_KAFKA_SUB_SYS,
-            service: "kafka",
-            valid_keys: NOTIFY_KAFKA_KEYS,
-            validator: AdminTargetValidator::Kafka(TargetDomain::Notify),
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_MQTT_SUB_SYS,
-            service: "mqtt",
-            valid_keys: NOTIFY_MQTT_KEYS,
-            validator: AdminTargetValidator::Mqtt,
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_MYSQL_SUB_SYS,
-            service: "mysql",
-            valid_keys: NOTIFY_MYSQL_KEYS,
-            validator: AdminTargetValidator::MySql,
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_NATS_SUB_SYS,
-            service: "nats",
-            valid_keys: NOTIFY_NATS_KEYS,
-            validator: AdminTargetValidator::Nats(TargetDomain::Notify),
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_POSTGRES_SUB_SYS,
-            service: "postgres",
-            valid_keys: NOTIFY_POSTGRES_KEYS,
-            validator: AdminTargetValidator::Postgres(TargetDomain::Notify),
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_REDIS_SUB_SYS,
-            service: "redis",
-            valid_keys: NOTIFY_REDIS_KEYS,
-            validator: AdminTargetValidator::Redis(TargetDomain::Notify, NOTIFY_REDIS_DEFAULT_CHANNEL),
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_PULSAR_SUB_SYS,
-            service: "pulsar",
-            valid_keys: NOTIFY_PULSAR_KEYS,
-            validator: AdminTargetValidator::Pulsar(TargetDomain::Notify),
-        },
-    ]
+    builtin_notification_target_descriptors()
+        .into_iter()
+        .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("notification builtin target descriptors should remain aligned")
 }
 
 // --- Helper Functions ---
@@ -415,6 +361,7 @@ mod tests {
     use super::*;
     use matchit::Router;
     use rustfs_config::DEFAULT_DELIMITER;
+    use rustfs_config::notify::{NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_ecstore::config::{KV, KVS};
     use rustfs_targets::arn::TargetID;
     use std::collections::{HashMap, HashSet};
