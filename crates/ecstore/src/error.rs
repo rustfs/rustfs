@@ -1037,6 +1037,28 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_system_path_failure_reason() {
+        assert_eq!(classify_system_path_failure_reason(&StorageError::ConfigNotFound), "config_not_found");
+        assert_eq!(classify_system_path_failure_reason(&StorageError::ErasureReadQuorum), "read_quorum");
+        assert_eq!(
+            classify_system_path_failure_reason(&StorageError::InsufficientReadQuorum(
+                "bucket".to_string(),
+                "object".to_string()
+            )),
+            "read_quorum"
+        );
+        assert_eq!(
+            classify_system_path_failure_reason(&StorageError::Io(IoError::new(ErrorKind::TimedOut, "probe"))),
+            "timeout"
+        );
+        assert_eq!(
+            classify_system_path_failure_reason(&StorageError::Io(IoError::new(ErrorKind::PermissionDenied, "probe"))),
+            "io"
+        );
+        assert_eq!(classify_system_path_failure_reason(&StorageError::DiskFull), "other");
+    }
+
+    #[test]
     fn test_storage_error_from_disk_error() {
         // Test conversion from DiskError
         let disk_io = DiskError::Io(IoError::other("disk io error"));
