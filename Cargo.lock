@@ -6980,7 +6980,7 @@ dependencies = [
 [[package]]
 name = "pageant"
 version = "0.2.0"
-source = "git+https://github.com/simon-escapecode/russh?branch=fix%2F697-migrate-stable-crypto-stack#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
+source = "git+https://github.com/simon-escapecode/russh?rev=5cac2ed84945f9b80a52b673e058f2032bbe98ec#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
 dependencies = [
  "byteorder",
  "bytes",
@@ -8698,7 +8698,7 @@ dependencies = [
 [[package]]
 name = "russh"
 version = "0.60.2"
-source = "git+https://github.com/simon-escapecode/russh?branch=fix%2F697-migrate-stable-crypto-stack#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
+source = "git+https://github.com/simon-escapecode/russh?rev=5cac2ed84945f9b80a52b673e058f2032bbe98ec#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
 dependencies = [
  "aead 0.6.0-rc.10",
  "aes 0.8.4",
@@ -8779,7 +8779,7 @@ dependencies = [
 [[package]]
 name = "russh-cryptovec"
 version = "0.59.0"
-source = "git+https://github.com/simon-escapecode/russh?branch=fix%2F697-migrate-stable-crypto-stack#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
+source = "git+https://github.com/simon-escapecode/russh?rev=5cac2ed84945f9b80a52b673e058f2032bbe98ec#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
 dependencies = [
  "log",
  "nix 0.31.2",
@@ -8808,7 +8808,7 @@ dependencies = [
 [[package]]
 name = "russh-util"
 version = "0.52.0"
-source = "git+https://github.com/simon-escapecode/russh?branch=fix%2F697-migrate-stable-crypto-stack#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
+source = "git+https://github.com/simon-escapecode/russh?rev=5cac2ed84945f9b80a52b673e058f2032bbe98ec#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
 dependencies = [
  "chrono",
  "tokio",

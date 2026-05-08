@@ -4,23 +4,10 @@ FTPS, WebDAV, and SFTP protocol end-to-end tests for RustFS.
 
 ## Prerequisites
 
-### Required Tools
-
-```bash
-# Ubuntu/Debian
-sudo apt-get install ssh-keygen
-
-# RHEL/CentOS
-sudo yum install openssh-clients
-
-# macOS
-brew install openssh
-```
-
-`ssh-keygen` is required for the SFTP entries; the test framework generates an
-ed25519 host key under the per-test temp directory before each SFTP server
-spawn. No SSH client tooling on the host is required: russh-sftp drives the
-protocol from the test process directly.
+No external SSH tooling is required. The test framework generates ed25519
+host keys in-process via russh::keys under the per-test temp directory
+before each SFTP server spawn, and russh-sftp drives the protocol from the
+test process directly.
 
 ## Running Tests
 

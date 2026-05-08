@@ -61,7 +61,8 @@ pub const ENV_WEBDAV_REQUEST_TIMEOUT: &str = "RUSTFS_WEBDAV_REQUEST_TIMEOUT";
 /// Default SFTP server bind address.
 pub const DEFAULT_SFTP_ADDRESS: &str = "0.0.0.0:2222";
 
-/// Default directory for SFTP host keys (auto-generated on first start when missing).
+/// Default for SFTP host-key directory. None means no default. Operators
+/// must set RUSTFS_SFTP_HOST_KEY_DIR explicitly when SFTP is enabled.
 pub const DEFAULT_SFTP_HOST_KEY_DIR: Option<&str> = None;
 
 /// SFTP environment variable names.
