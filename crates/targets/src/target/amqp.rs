@@ -243,11 +243,11 @@ pub async fn connect_amqp(args: &AMQPArgs) -> Result<AMQPConnection, TargetError
                 lapin::runtime::default_runtime()
                     .map_err(|e| TargetError::Initialization(format!("Failed to create AMQP runtime: {e}")))?,
             )
-                .await
+            .await
         } else {
             Connection::connect(&url, properties).await
         }
-            .map_err(|e| map_lapin_error(e, "Failed to connect to AMQP broker"))?;
+        .map_err(|e| map_lapin_error(e, "Failed to connect to AMQP broker"))?;
 
         let channel = connection
             .create_channel()
@@ -260,7 +260,8 @@ pub async fn connect_amqp(args: &AMQPArgs) -> Result<AMQPConnection, TargetError
 
         Ok(AMQPConnection { connection, channel })
     })
-        .await.unwrap_or_else(|_| Err(TargetError::Timeout("AMQP connection timed out".to_string())))
+    .await
+    .unwrap_or_else(|_| Err(TargetError::Timeout("AMQP connection timed out".to_string())))
 }
 
 pub struct AMQPConnection {

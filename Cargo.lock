@@ -9475,6 +9475,7 @@ dependencies = [
  "chrono",
  "criterion",
  "deadpool-postgres",
+ "hashbrown 0.17.0",
  "hyper-rustls",
  "lapin",
  "mysql_async",

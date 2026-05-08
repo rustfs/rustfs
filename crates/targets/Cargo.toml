@@ -44,6 +44,7 @@ rustfs-kafka-async = { workspace = true }
 mysql_async = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
