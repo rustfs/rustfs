@@ -5,13 +5,19 @@ description: Apply RustFS security lessons distilled from repository GitHub Secu
 
 # RustFS Security Advisory Lessons
 
-Use this skill as a RustFS-specific security lens before changing or approving code. For the current advisory snapshot and full pattern map, read [advisory-patterns.md](references/advisory-patterns.md).
+Use this skill as a RustFS-specific security lens before changing or approving code. For the distilled advisory lessons and review patterns, read [advisory-patterns.md](references/advisory-patterns.md).
 
-When currentness matters, refresh the advisory inventory first:
+When currentness matters, fetch the live advisory inventory instead of relying on this skill as a status mirror:
 
 ```bash
 gh api repos/rustfs/rustfs/security-advisories --paginate \
-  --jq '.[] | {ghsa_id,state,severity,summary,updated_at,html_url}'
+  --jq '.[] | {ghsa_id,state,severity,summary,updated_at}'
+```
+
+Fetch full advisory details only when the live summary suggests a new or changed lesson:
+
+```bash
+gh api repos/rustfs/rustfs/security-advisories/<GHSA_ID>
 ```
 
 For the full pattern map, read [advisory-patterns.md](references/advisory-patterns.md).
