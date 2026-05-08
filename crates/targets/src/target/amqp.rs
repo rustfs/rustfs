@@ -275,8 +275,8 @@ where
 {
     id: TargetID,
     args: AMQPArgs,
-    connection: Mutex<Option<Arc<AMQPConnection>>>,
-    connect_lock: AsyncMutex<()>,
+    connection: Arc<Mutex<Option<Arc<AMQPConnection>>>>,
+    connect_lock: Arc<AsyncMutex<()>>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: std::marker::PhantomData<E>,
@@ -290,8 +290,8 @@ where
         Box::new(AMQPTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
-            connection: Mutex::new(self.connection.lock().clone()),
-            connect_lock: AsyncMutex::new(()),
+            connection: Arc::clone(&self.connection),
+            connect_lock: Arc::clone(&self.connect_lock),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: std::marker::PhantomData,
@@ -322,8 +322,8 @@ where
         Ok(Self {
             id: target_id,
             args,
-            connection: Mutex::new(None),
-            connect_lock: AsyncMutex::new(()),
+            connection: Arc::new(Mutex::new(None)),
+            connect_lock: Arc::new(AsyncMutex::new(())),
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,

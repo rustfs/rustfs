@@ -97,13 +97,11 @@ struct NotificationEndpointsResponse {
     notification_endpoints: Vec<NotificationEndpoint>,
 }
 
-fn notification_target_specs() -> [AdminTargetSpec; 9] {
+fn notification_target_specs() -> Vec<AdminTargetSpec> {
     builtin_notification_target_descriptors()
         .into_iter()
         .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
-        .collect::<Vec<_>>()
-        .try_into()
-        .expect("notification builtin target descriptors should remain aligned")
+        .collect()
 }
 
 // --- Helper Functions ---

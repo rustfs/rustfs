@@ -91,13 +91,11 @@ struct AuditEndpointsResponse {
     audit_endpoints: Vec<AuditEndpoint>,
 }
 
-fn audit_target_specs() -> [AdminTargetSpec; 9] {
+fn audit_target_specs() -> Vec<AdminTargetSpec> {
     builtin_audit_target_descriptors()
         .into_iter()
         .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
-        .collect::<Vec<_>>()
-        .try_into()
-        .expect("audit builtin target descriptors should remain aligned")
+        .collect()
 }
 
 async fn authorize_audit_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {

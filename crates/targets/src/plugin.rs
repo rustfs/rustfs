@@ -204,7 +204,7 @@ where
             info!(target_type = %target_type, "Start working on target type");
             for (id, merged_config) in collect_target_configs(config, route_prefix, target_type, &valid_fields) {
                 info!(target_type = %target_type, instance_id = %id, "Target is enabled, ready to create");
-                match plugin.create_target(id.clone(), &merged_config) {
+                match self.create_target(target_type, id.clone(), &merged_config) {
                     Ok(target) => {
                         info!(target_type = %target.id().name, instance_id = %id, "Create target successfully");
                         successful_targets.push(target);
