@@ -16,26 +16,17 @@ use crate::Event;
 use async_trait::async_trait;
 use rustfs_config::EVENT_DEFAULT_DIR;
 use rustfs_config::notify::{
-<<<<<<< HEAD
-    NOTIFY_KAFKA_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_MYSQL_KEYS, NOTIFY_NATS_KEYS, NOTIFY_POSTGRES_KEYS, NOTIFY_PULSAR_KEYS,
-    NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_REDIS_KEYS, NOTIFY_WEBHOOK_KEYS,
-=======
-    NOTIFY_AMQP_KEYS, NOTIFY_KAFKA_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_NATS_KEYS, NOTIFY_PULSAR_KEYS, NOTIFY_WEBHOOK_KEYS,
->>>>>>> 56f1dc85 (feat(targets): implement AMQP notification target)
+    NOTIFY_AMQP_KEYS, NOTIFY_KAFKA_KEYS, NOTIFY_MQTT_KEYS, NOTIFY_MYSQL_KEYS, NOTIFY_NATS_KEYS, NOTIFY_POSTGRES_KEYS,
+    NOTIFY_PULSAR_KEYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_REDIS_KEYS, NOTIFY_WEBHOOK_KEYS,
 };
 use rustfs_ecstore::config::KVS;
 use rustfs_targets::{
     Target,
     config::{
-<<<<<<< HEAD
-        build_kafka_args, build_mqtt_args, build_mysql_args, build_nats_args, build_postgres_args, build_pulsar_args,
-        build_redis_args, build_webhook_args, validate_kafka_config, validate_mqtt_config, validate_mysql_config,
-        validate_nats_config, validate_postgres_config, validate_pulsar_config, validate_redis_config, validate_webhook_config,
-=======
-        build_amqp_args, build_kafka_args, build_mqtt_args, build_nats_args, build_pulsar_args, build_webhook_args,
-        validate_amqp_config, validate_kafka_config, validate_mqtt_config, validate_nats_config, validate_pulsar_config,
-        validate_webhook_config,
->>>>>>> 56f1dc85 (feat(targets): implement AMQP notification target)
+        build_amqp_args, build_kafka_args, build_mqtt_args, build_mysql_args, build_nats_args, build_postgres_args,
+        build_pulsar_args, build_redis_args, build_webhook_args, validate_amqp_config, validate_kafka_config,
+        validate_mqtt_config, validate_mysql_config, validate_nats_config, validate_postgres_config, validate_pulsar_config,
+        validate_redis_config, validate_webhook_config,
     },
     error::TargetError,
     target::TargetType,
@@ -191,7 +182,6 @@ impl TargetFactory for KafkaTargetFactory {
     }
 }
 
-<<<<<<< HEAD
 pub struct MySqlTargetFactory;
 
 #[async_trait]
@@ -227,7 +217,9 @@ impl TargetFactory for RedisTargetFactory {
 
     fn get_valid_fields(&self) -> HashSet<String> {
         NOTIFY_REDIS_KEYS.iter().map(|s| s.to_string()).collect()
-=======
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AMQPTargetFactory, TargetFactory};
@@ -265,6 +257,5 @@ mod tests {
         assert_eq!(target_id.id, "primary");
         assert_eq!(target_id.name, "amqp");
         assert!(target.store().is_none());
->>>>>>> 56f1dc85 (feat(targets): implement AMQP notification target)
     }
 }

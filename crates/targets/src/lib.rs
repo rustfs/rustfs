@@ -21,13 +21,8 @@ pub mod sys;
 pub mod target;
 
 pub use check::{
-<<<<<<< HEAD
-    check_kafka_broker_available, check_mqtt_broker_available, check_mqtt_broker_available_with_tls, check_nats_server_available,
-    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
-=======
     check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available, check_mqtt_broker_available_with_tls,
-    check_nats_server_available, check_pulsar_broker_available,
->>>>>>> 56f1dc85 (feat(targets): implement AMQP notification target)
+    check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
 };
 pub use error::{StoreError, TargetError};
 pub use rustfs_s3_common::EventName;

@@ -724,6 +724,8 @@ fn is_target_bool_key(key: &str) -> bool {
     matches!(
         key,
         ENABLE_KEY
+            | rustfs_config::AMQP_MANDATORY
+            | rustfs_config::AMQP_PERSISTENT
             | rustfs_config::WEBHOOK_SKIP_TLS_VERIFY
             | rustfs_config::KAFKA_TLS_ENABLE
             | rustfs_config::MQTT_TLS_TRUST_LEAF_AS_CA
@@ -733,14 +735,31 @@ fn is_target_bool_key(key: &str) -> bool {
     )
 }
 
+fn parse_target_bool_scalar(value: &str) -> Option<bool> {
+    if let Ok(state) = value.parse::<EnableState>() {
+        return Some(state.is_enabled());
+    }
+    if let Ok(boolean) = value.parse::<bool>() {
+        return Some(boolean);
+    }
+    None
+}
+
+fn target_scalar_values_equal(key: &str, lhs: &str, rhs: &str) -> bool {
+    if is_target_bool_key(key)
+        && let (Some(lhs), Some(rhs)) = (parse_target_bool_scalar(lhs), parse_target_bool_scalar(rhs))
+    {
+        return lhs == rhs;
+    }
+
+    lhs == rhs
+}
+
 fn encode_target_scalar_value(key: &str, value: &str) -> Value {
-    if is_target_bool_key(key) {
-        if let Ok(state) = value.parse::<EnableState>() {
-            return Value::Bool(state.is_enabled());
-        }
-        if let Ok(boolean) = value.parse::<bool>() {
-            return Value::Bool(boolean);
-        }
+    if is_target_bool_key(key)
+        && let Some(boolean) = parse_target_bool_scalar(value)
+    {
+        return Value::Bool(boolean);
     }
 
     Value::String(value.to_string())
@@ -766,7 +785,7 @@ fn build_target_instance_diff_object(kvs: &KVS, baseline: &KVS, valid_keys: &[&s
         let baseline_value = baseline.lookup(key).unwrap_or_default();
         let effective_value = kvs.lookup(key).unwrap_or_else(|| baseline_value.clone());
 
-        if effective_value == baseline_value {
+        if target_scalar_values_equal(key, &effective_value, &baseline_value) {
             continue;
         }
 
@@ -2180,7 +2199,7 @@ mod tests {
                 },
                 crate::config::KV {
                     key: rustfs_config::AMQP_MANDATORY.to_string(),
-                    value: EnableState::Off.to_string(),
+                    value: "false".to_string(),
                     hidden_if_empty: false,
                 },
                 crate::config::KV {
@@ -2253,8 +2272,8 @@ mod tests {
         );
         assert_eq!(amqp.get(rustfs_config::AMQP_EXCHANGE).and_then(Value::as_str), Some("rustfs.events"));
         assert_eq!(amqp.get(rustfs_config::AMQP_ROUTING_KEY).and_then(Value::as_str), Some("objects"));
-        assert_eq!(amqp.get(rustfs_config::AMQP_MANDATORY).and_then(Value::as_str), Some("off"));
-        assert_eq!(amqp.get(rustfs_config::AMQP_PERSISTENT).and_then(Value::as_str), Some("false"));
+        assert!(!amqp.contains_key(rustfs_config::AMQP_MANDATORY));
+        assert_eq!(amqp.get(rustfs_config::AMQP_PERSISTENT).and_then(Value::as_bool), Some(false));
     }
 
     #[test]

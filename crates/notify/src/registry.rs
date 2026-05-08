@@ -14,13 +14,8 @@
 
 use crate::Event;
 use crate::factory::{
-<<<<<<< HEAD
-    KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory,
-    RedisTargetFactory, TargetFactory, WebhookTargetFactory,
-=======
-    AMQPTargetFactory, KafkaTargetFactory, MQTTTargetFactory, NATSTargetFactory, PulsarTargetFactory, TargetFactory,
-    WebhookTargetFactory,
->>>>>>> 56f1dc85 (feat(targets): implement AMQP notification target)
+    AMQPTargetFactory, KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PostgresTargetFactory,
+    PulsarTargetFactory, RedisTargetFactory, TargetFactory, WebhookTargetFactory,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::HashMap;
