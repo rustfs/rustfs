@@ -15,16 +15,16 @@
 use hashbrown::HashSet as HbHashSet;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use rustfs_config::{
-    ENABLE_KEY, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_TLS_CA,
+    AMQP_QUEUE_DIR, ENABLE_KEY, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_TLS_CA,
     MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
     MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
-    TargetError, check_kafka_broker_available, check_mqtt_broker_available_with_tls, check_nats_server_available,
-    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
+    TargetError, check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available_with_tls,
+    check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
     config::{
-        build_kafka_args, build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args,
+        build_amqp_args, build_kafka_args, build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args,
         collect_env_target_instance_ids, validate_mysql_config, validate_redis_config,
     },
     target::{TargetType, mqtt::MQTTTlsConfig},
@@ -74,6 +74,7 @@ impl TargetDomain {
 pub(crate) enum AdminTargetValidator {
     Webhook,
     Mqtt,
+    Amqp(TargetDomain),
     Kafka(TargetDomain),
     MySql,
     Nats(TargetDomain),
@@ -355,6 +356,7 @@ pub(crate) async fn validate_target_request(
     match spec.validator {
         AdminTargetValidator::Webhook => validate_webhook_request(kv_map).await,
         AdminTargetValidator::Mqtt => validate_mqtt_request(kv_map).await,
+        AdminTargetValidator::Amqp(domain) => validate_amqp_request(kv_map, default_queue_dir, domain).await,
         AdminTargetValidator::Kafka(domain) => validate_kafka_request(kv_map, default_queue_dir, domain).await,
         AdminTargetValidator::MySql => validate_mysql_request(kv_map, default_queue_dir).await,
         AdminTargetValidator::Nats(domain) => validate_nats_request(kv_map, default_queue_dir, domain).await,
@@ -493,6 +495,18 @@ async fn validate_kafka_request(kv_map: &HashMap<String, String>, default_queue_
     check_kafka_broker_available(&args).await.map_err(|e| match e {
         TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
         _ => s3_error!(InvalidArgument, "Kafka broker check failed: {}", e),
+    })
+}
+
+async fn validate_amqp_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get(AMQP_QUEUE_DIR) {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+    let args = build_amqp_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
+        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    check_amqp_broker_available(&args).await.map_err(|e| match e {
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+        _ => s3_error!(InvalidArgument, "AMQP broker check failed: {}", e),
     })
 }
 
