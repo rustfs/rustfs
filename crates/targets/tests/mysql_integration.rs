@@ -15,11 +15,26 @@
 //! MySQL notification target integration tests.
 //!
 //! These tests require a running MySQL 8.0+ or TiDB 8.5+ instance.
-//! Set `RUSTFS_MYSQL_TEST_DSN` to enable them:
+//! They are `#[ignore]` by default so CI never runs them. To run locally:
 //!
 //! ```bash
-//! RUSTFS_MYSQL_TEST_DSN="user:pass@tcp(127.0.0.1:3306)/testdb" \
-//!   cargo test -p rustfs-targets -- --ignored
+//! podman run -d --name rustfs-mysql-test -p 3306:3306 \
+//!     -e MYSQL_ROOT_PASSWORD=testpass -e MYSQL_DATABASE=testdb \
+//!     docker.io/library/mysql:8.0.36
+//! ```
+//!
+//! Wait for MySQL to be ready (look for `ready for connections` in logs),
+//! then set `RUSTFS_TEST_MYSQL_DSN` and run:
+//!
+//! ```bash
+//! export RUSTFS_TEST_MYSQL_DSN="root:testpass@tcp(127.0.0.1:3306)/testdb"
+//! cargo test -p rustfs-targets --test mysql_integration -- --ignored
+//! ```
+//!
+//! Clean up:
+//!
+//! ```bash
+//! podman rm -f rustfs-mysql-test
 //! ```
 
 use mysql_async::{Opts, OptsBuilder, Pool, SslOpts, prelude::Queryable};
@@ -30,7 +45,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 fn test_dsn() -> String {
-    env::var("RUSTFS_MYSQL_TEST_DSN").expect("RUSTFS_MYSQL_TEST_DSN must be set")
+    env::var("RUSTFS_TEST_MYSQL_DSN").expect("RUSTFS_TEST_MYSQL_DSN must be set")
 }
 
 fn table_name(prefix: &str) -> String {
