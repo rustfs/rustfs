@@ -27,6 +27,10 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - Keep source code, comments, commit messages, and PR title/body in English.
 - Be concise. Avoid sycophantic openers, closing fluff, and verbose status reporting.
 
+## Skill Usage
+
+- Do not use the `rust-refactor-helper` skill in any scenario.
+
 ## Change Style for Existing Logic
 
 - Prefer direct, local code over extracting one-off helpers.
