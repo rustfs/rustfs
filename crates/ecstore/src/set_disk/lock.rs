@@ -107,101 +107,118 @@ impl SetDisks {
         DriveMembershipSnapshot::from_optional_disks(&disks)
     }
 
+    async fn reprobe_runtime_candidates_once(&self, disks: &[DiskStore]) {
+        for disk in disks {
+            if disk.runtime_state() != crate::disk::health_state::RuntimeDriveHealthState::Online {
+                disk.reset_health_for_store_init_retry();
+            }
+        }
+    }
+
     pub async fn get_online_disks_with_healing_and_info(&self, incl_healing: bool) -> (Vec<DiskStore>, Vec<DiskInfo>, usize) {
         let snapshot = self.drive_membership_snapshot().await;
-        let mut disks = snapshot.scanner_heal_candidates().into_iter().map(Some).collect::<Vec<_>>();
+        let mut membership_candidates = snapshot.scanner_heal_candidates();
+        let mut reprobed = false;
 
-        let mut infos: Vec<Option<DiskInfo>> = vec![None; disks.len()];
+        loop {
+            let mut disks = membership_candidates.iter().cloned().map(Some).collect::<Vec<_>>();
+            let mut infos: Vec<Option<DiskInfo>> = vec![None; disks.len()];
 
-        let mut futures = Vec::with_capacity(disks.len());
-        {
-            let mut rng = rand::rng();
-            disks.shuffle(&mut rng);
-        }
+            let mut futures = Vec::with_capacity(disks.len());
+            {
+                let mut rng = rand::rng();
+                disks.shuffle(&mut rng);
+            }
 
-        for (i, disk) in disks.iter().cloned().enumerate() {
-            futures.push(async move {
-                let info = if let Some(disk) = disk {
-                    match disk.disk_info(&DiskInfoOptions::default()).await {
-                        Ok(info) => info,
-                        Err(err) => DiskInfo {
+            for (i, disk) in disks.iter().cloned().enumerate() {
+                futures.push(async move {
+                    let info = if let Some(disk) = disk {
+                        match disk.disk_info(&DiskInfoOptions::default()).await {
+                            Ok(info) => info,
+                            Err(err) => DiskInfo {
+                                error: err.to_string(),
+                                ..Default::default()
+                            },
+                        }
+                    } else {
+                        DiskInfo {
+                            error: DiskError::DiskNotFound.to_string(),
+                            ..Default::default()
+                        }
+                    };
+
+                    Ok((i, info))
+                });
+            }
+
+            let processor = get_global_processors().metadata_processor();
+            let results = processor.execute_batch(futures).await;
+
+            for (submitted_idx, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok((disk_idx, info)) => {
+                        infos[disk_idx] = Some(info);
+                    }
+                    Err(err) => {
+                        infos[submitted_idx] = Some(DiskInfo {
                             error: err.to_string(),
                             ..Default::default()
-                        },
+                        });
                     }
-                } else {
-                    DiskInfo {
-                        error: DiskError::DiskNotFound.to_string(),
-                        ..Default::default()
-                    }
+                }
+            }
+
+            let mut healing: usize = 0;
+
+            let mut scanning_disks = Vec::new();
+            let mut healing_disks = Vec::new();
+            let mut scanning_infos = Vec::new();
+            let mut healing_infos = Vec::new();
+
+            let mut new_disks = Vec::new();
+            let mut new_infos = Vec::new();
+
+            for (disk, info) in disks.into_iter().zip(infos) {
+                let Some(info) = info else {
+                    continue;
                 };
 
-                Ok((i, info))
-            });
-        }
-
-        // Use optimized batch processor for disk info retrieval
-        let processor = get_global_processors().metadata_processor();
-        let results = processor.execute_batch(futures).await;
-
-        for (submitted_idx, result) in results.into_iter().enumerate() {
-            match result {
-                Ok((disk_idx, info)) => {
-                    infos[disk_idx] = Some(info);
-                }
-                Err(err) => {
-                    infos[submitted_idx] = Some(DiskInfo {
-                        error: err.to_string(),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-
-        let mut healing: usize = 0;
-
-        let mut scanning_disks = Vec::new();
-        let mut healing_disks = Vec::new();
-        let mut scanning_infos = Vec::new();
-        let mut healing_infos = Vec::new();
-
-        let mut new_disks = Vec::new();
-        let mut new_infos = Vec::new();
-
-        for (disk, info) in disks.into_iter().zip(infos) {
-            let Some(info) = info else {
-                continue;
-            };
-
-            if !info.error.is_empty() || disk.is_none() {
-                continue;
-            }
-
-            if info.healing {
-                healing += 1;
-                if incl_healing {
-                    healing_disks.push(disk.unwrap());
-                    healing_infos.push(info);
+                if !info.error.is_empty() || disk.is_none() {
+                    continue;
                 }
 
-                continue;
+                if info.healing {
+                    healing += 1;
+                    if incl_healing {
+                        healing_disks.push(disk.expect("disk should exist when info succeeded"));
+                        healing_infos.push(info);
+                    }
+
+                    continue;
+                }
+
+                if !info.scanning {
+                    new_disks.push(disk.expect("disk should exist when info succeeded"));
+                    new_infos.push(info);
+                } else {
+                    scanning_disks.push(disk.expect("disk should exist when info succeeded"));
+                    scanning_infos.push(info);
+                }
             }
 
-            if !info.healing {
-                new_disks.push(disk.unwrap());
-                new_infos.push(info);
-            } else {
-                scanning_disks.push(disk.unwrap());
-                scanning_infos.push(info);
+            new_disks.extend(scanning_disks);
+            new_infos.extend(scanning_infos);
+            new_disks.extend(healing_disks);
+            new_infos.extend(healing_infos);
+
+            if !new_disks.is_empty() || membership_candidates.is_empty() || reprobed {
+                return (new_disks, new_infos, healing);
             }
+
+            reprobed = true;
+            self.reprobe_runtime_candidates_once(&membership_candidates).await;
+            membership_candidates = self.drive_membership_snapshot().await.scanner_heal_candidates();
         }
-
-        new_disks.extend(scanning_disks);
-        new_infos.extend(scanning_infos);
-        new_disks.extend(healing_disks);
-        new_infos.extend(healing_infos);
-
-        (new_disks, new_infos, healing)
     }
 
     pub(super) async fn _get_local_disks(&self) -> Vec<Option<DiskStore>> {
@@ -523,6 +540,52 @@ mod tests {
                 .iter()
                 .all(|disk| { disk.runtime_state() != crate::disk::health_state::RuntimeDriveHealthState::Offline }),
             "offline disks should be filtered by membership snapshot"
+        );
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn get_online_disks_with_healing_and_info_reprobes_runtime_candidates_once() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        let all_disks = set_disks.get_disks_internal().await;
+        for disk in all_disks.iter().flatten() {
+            disk.force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Returning);
+        }
+
+        let (online_disks, infos, healing) = set_disks.get_online_disks_with_healing_and_info(false).await;
+        assert_eq!(healing, 0);
+        assert_eq!(online_disks.len(), disk_count);
+        assert_eq!(infos.len(), disk_count);
+        assert!(
+            infos.iter().all(|info| info.error.is_empty()),
+            "runtime reprobe should recover a usable candidate set without probe errors"
         );
 
         drop(temp_dirs);

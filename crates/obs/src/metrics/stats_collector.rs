@@ -47,6 +47,9 @@ const DRIVE_STATE_OK: &str = "ok";
 const DRIVE_STATE_ONLINE: &str = "online";
 const DRIVE_STATE_UNFORMATTED: &str = "unformatted";
 const DRIVE_RUNTIME_STATE_RETURNING: &str = "returning";
+const CAPACITY_OBSERVATION_LIVE: &str = "live";
+const CAPACITY_OBSERVATION_STALE: &str = "stale";
+const CAPACITY_OBSERVATION_MISSING: &str = "missing";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ErasureSetQuorumShape {
@@ -69,6 +72,25 @@ fn disk_is_online_for_metrics(state: &str, runtime_state: Option<&str>) -> bool 
     }
 
     state_is_acceptable
+}
+
+fn disk_capacity_observation_state(
+    state: &str,
+    total_space: u64,
+    used_space: u64,
+    available_space: u64,
+    offline_duration_seconds: Option<u64>,
+) -> (&'static str, u64) {
+    let age_seconds = offline_duration_seconds.unwrap_or(0);
+
+    if total_space > 0 || used_space > 0 || available_space > 0 {
+        if state.eq_ignore_ascii_case(DRIVE_STATE_OK) {
+            return (CAPACITY_OBSERVATION_LIVE, 0);
+        }
+        return (CAPACITY_OBSERVATION_STALE, age_seconds);
+    }
+
+    (CAPACITY_OBSERVATION_MISSING, age_seconds)
 }
 
 fn derive_erasure_set_quorum_shape(set_drive_count: usize, parity: usize) -> ErasureSetQuorumShape {
@@ -114,6 +136,36 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
     let used: u64 = storage_info.disks.iter().map(|d| d.used_space).sum();
     let usable_capacity = get_total_usable_capacity(&storage_info.disks, &storage_info) as u64;
     let free = get_total_usable_capacity_free(&storage_info.disks, &storage_info) as u64;
+    let stale_capacity_drives = storage_info
+        .disks
+        .iter()
+        .filter(|disk| {
+            disk_capacity_observation_state(
+                disk.state.as_str(),
+                disk.total_space,
+                disk.used_space,
+                disk.available_space,
+                disk.offline_duration_seconds,
+            )
+            .0
+                == CAPACITY_OBSERVATION_STALE
+        })
+        .count() as u64;
+    let missing_capacity_drives = storage_info
+        .disks
+        .iter()
+        .filter(|disk| {
+            disk_capacity_observation_state(
+                disk.state.as_str(),
+                disk.total_space,
+                disk.used_space,
+                disk.available_space,
+                disk.offline_duration_seconds,
+            )
+            .0
+                == CAPACITY_OBSERVATION_MISSING
+        })
+        .count() as u64;
 
     // Get bucket and object counts from data usage info.
     let (buckets_count, objects_count) = match load_data_usage_from_backend(store.clone()).await {
@@ -151,6 +203,8 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
             usable_capacity_bytes: usable_capacity,
             used_bytes: used,
             free_bytes: free,
+            stale_capacity_drives,
+            missing_capacity_drives,
             objects_count,
             buckets_count,
         },
@@ -483,6 +537,13 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
         .iter()
         .map(|disk| {
             let is_online = disk_is_online_for_metrics(disk.state.as_str(), disk.runtime_state.as_deref());
+            let (capacity_observation_state, capacity_observation_age_seconds) = disk_capacity_observation_state(
+                disk.state.as_str(),
+                disk.total_space,
+                disk.used_space,
+                disk.available_space,
+                disk.offline_duration_seconds,
+            );
             if is_online {
                 online_count += 1;
             } else {
@@ -495,6 +556,8 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
                 total_bytes: disk.total_space,
                 used_bytes: disk.used_space,
                 free_bytes: disk.available_space,
+                capacity_observation_state,
+                capacity_observation_age_seconds,
                 used_inodes: 0,
                 free_inodes: 0,
                 total_inodes: 0,
