@@ -20,6 +20,7 @@ async-trait = { workspace = true }
 async-nats = { workspace = true }
 deadpool-postgres = { workspace = true }
 hyper-rustls = { workspace = true }
+lapin = { workspace = true }
 pulsar = { workspace = true }
 reqwest = { workspace = true }
 rumqttc = { workspace = true }
@@ -31,7 +32,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
 tokio-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 tracing = { workspace = true }
