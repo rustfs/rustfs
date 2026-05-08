@@ -673,7 +673,7 @@ mod tests {
             })
         );
     }
-  
+
     #[test]
     fn admin_pool_list_item_saturates_used_size_when_current_exceeds_total() {
         let pool = PoolStatus {
