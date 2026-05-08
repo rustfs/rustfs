@@ -34,6 +34,7 @@ use lapin::{
     options::{BasicPublishOptions, ConfirmSelectOptions},
     tcp::{OwnedIdentity, OwnedTLSConfig},
 };
+use parking_lot::Mutex;
 use rustfs_config::{AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -41,7 +42,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, instrument, warn};
 use url::Url;
 
@@ -274,7 +275,7 @@ where
     id: TargetID,
     args: AMQPArgs,
     connection: Mutex<Option<Arc<AMQPConnection>>>,
-    connect_lock: Mutex<()>,
+    connect_lock: AsyncMutex<()>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: std::marker::PhantomData<E>,
@@ -289,7 +290,7 @@ where
             id: self.id.clone(),
             args: self.args.clone(),
             connection: Mutex::new(self.connection.lock().clone()),
-            connect_lock: Mutex::new(()),
+            connect_lock: AsyncMutex::new(()),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: std::marker::PhantomData,
@@ -321,7 +322,7 @@ where
             id: target_id,
             args,
             connection: Mutex::new(None),
-            connect_lock: Mutex::new(()),
+            connect_lock: AsyncMutex::new(()),
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,
@@ -464,7 +465,7 @@ where
     }
 
     async fn close(&self) -> Result<(), TargetError> {
-        let connection = self.connection.lock().await.take();
+        let connection = self.connection.lock().take();
         if let Some(connection) = connection {
             connection
                 .connection

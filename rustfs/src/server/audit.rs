@@ -35,7 +35,7 @@ pub fn is_audit_module_enabled() -> bool {
 }
 
 fn has_any_audit_targets(config: &rustfs_ecstore::config::Config) -> bool {
-    for subsystem in rustfs_config::audit::AUDIT_SUB_SYSTEMS {
+    for &subsystem in rustfs_config::audit::AUDIT_SUB_SYSTEMS {
         let Some(targets) = config.0.get(subsystem) else {
             continue;
         };
