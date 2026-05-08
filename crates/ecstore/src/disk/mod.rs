@@ -1123,17 +1123,18 @@ mod tests {
     #[tokio::test]
     async fn reset_health_for_store_init_retry_delegates_to_disk_variants() {
         let local_dir = tempfile::tempdir().unwrap();
-        let local_endpoint = Endpoint::try_from(local_dir.path().to_str().unwrap()).unwrap();
+        let local_path = local_dir.path().to_str().expect("tempdir path should be utf8");
+        let mut local_endpoint = Endpoint::try_from(local_path).expect("local endpoint should parse");
+        local_endpoint.set_pool_index(0);
+        local_endpoint.set_set_index(0);
+        local_endpoint.set_disk_index(0);
         let local_disk = LocalDisk::new(&local_endpoint, false).await.unwrap();
         let local_disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
 
-        let remote_endpoint = Endpoint {
-            url: url::Url::parse("http://remote-server:9000/data").unwrap(),
-            is_local: false,
-            pool_idx: 0,
-            set_idx: 0,
-            disk_idx: 0,
-        };
+        let mut remote_endpoint = Endpoint::try_from("http://remote-server:9000/data").expect("remote endpoint should parse");
+        remote_endpoint.set_pool_index(0);
+        remote_endpoint.set_set_index(0);
+        remote_endpoint.set_disk_index(1);
         let remote_disk = RemoteDisk::new(
             &remote_endpoint,
             &DiskOption {
