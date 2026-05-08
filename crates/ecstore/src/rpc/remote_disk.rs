@@ -140,6 +140,11 @@ impl RemoteDisk {
         self.health.force_runtime_state_for_test(state);
     }
 
+    /// Same as [`DiskHealthTracker::reset_for_store_init_retry`]: undo a transient faulty mark before another format load attempt.
+    pub fn reset_health_for_store_init_retry(&self) {
+        self.health.reset_for_store_init_retry(&self.endpoint);
+    }
+
     fn spawn_recovery_monitor_if_needed(&self) {
         if !self.health_check {
             return;

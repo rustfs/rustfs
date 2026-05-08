@@ -437,6 +437,15 @@ impl Disk {
 }
 
 impl Disk {
+    /// Reset drive health so `connect_load_init_formats` retries are not blocked by a prior
+    /// transient mark-faulty (same disk handles are reused across retries).
+    pub fn reset_health_for_store_init_retry(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.reset_health_for_store_init_retry(),
+            Disk::Remote(remote_disk) => remote_disk.reset_health_for_store_init_retry(),
+        }
+    }
+
     /// Enable health monitoring on this disk.
     /// Called after startup format loading completes so that remote peers
     /// have time to come online before being marked as faulty.
