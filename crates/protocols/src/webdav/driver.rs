@@ -1271,8 +1271,17 @@ where
                                                 let chunks: Vec<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> =
                                                     body.collect().await;
                                                 let mut all_data = Vec::new();
-                                                for data in chunks.into_iter().flatten() {
-                                                    all_data.extend_from_slice(&data);
+                                                for chunk in chunks {
+                                                    match chunk {
+                                                        Ok(data) => all_data.extend_from_slice(&data),
+                                                        Err(e) => {
+                                                            error!(
+                                                                "Failed to read object body during directory rename: {}",
+                                                                e
+                                                            );
+                                                            return Err(FsError::GeneralFailure);
+                                                        }
+                                                    }
                                                 }
                                                 Bytes::from(all_data)
                                             } else {
