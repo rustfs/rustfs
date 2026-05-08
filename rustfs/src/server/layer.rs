@@ -583,9 +583,9 @@ fn health_endpoint_enabled() -> bool {
 }
 
 fn is_public_health_endpoint_request(method: &Method, path: &str) -> bool {
-    health_endpoint_enabled()
-        && (method == Method::GET || method == Method::HEAD)
+    (method == Method::GET || method == Method::HEAD)
         && (path == HEALTH_PREFIX || path == HEALTH_READY_PATH)
+        && health_endpoint_enabled()
 }
 
 async fn build_public_health_http_response<RestBody, GrpcBody>(
@@ -631,10 +631,12 @@ where
     }
 
     fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
-        let method = req.method().clone();
-        let path = req.uri().path().to_owned();
+        let method = req.method();
+        let path = req.uri().path();
 
-        if is_public_health_endpoint_request(&method, &path) {
+        if is_public_health_endpoint_request(method, path) {
+            let method = method.clone();
+            let path = path.to_owned();
             return Box::pin(async move { Ok(build_public_health_http_response(method, path).await) });
         }
 
@@ -1018,6 +1020,7 @@ mod tests {
     use http::Request;
     use http_body_util::BodyExt;
     use http_body_util::Full;
+    use serial_test::serial;
     use std::convert::Infallible;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1098,6 +1101,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn public_health_endpoint_layer_handles_health_before_inner_service() {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
@@ -1133,6 +1137,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn public_health_endpoint_layer_handles_ready_head_before_inner_service() {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
@@ -1160,6 +1165,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn public_health_endpoint_layer_forwards_health_when_endpoint_disabled() {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let inner = CountingHybridService::default();
