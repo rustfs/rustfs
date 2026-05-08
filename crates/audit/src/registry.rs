@@ -15,8 +15,8 @@
 use crate::{
     AuditEntry, AuditError, AuditResult,
     factory::{
-        KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory,
-        RedisTargetFactory, TargetFactory, WebhookTargetFactory,
+        AMQPTargetFactory, KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PostgresTargetFactory,
+        PulsarTargetFactory, RedisTargetFactory, TargetFactory, WebhookTargetFactory,
     },
 };
 use futures::StreamExt;
@@ -52,6 +52,7 @@ impl AuditRegistry {
         };
 
         // Register built-in factories
+        registry.register(ChannelTargetType::Amqp.as_str(), Box::new(AMQPTargetFactory));
         registry.register(ChannelTargetType::Webhook.as_str(), Box::new(WebhookTargetFactory));
         registry.register(ChannelTargetType::Mqtt.as_str(), Box::new(MQTTTargetFactory));
         registry.register(ChannelTargetType::Nats.as_str(), Box::new(NATSTargetFactory));
@@ -285,5 +286,18 @@ impl AuditRegistry {
         let key = self.create_key(target_type, target_id);
         self.targets.insert(key, target);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuditRegistry;
+    use rustfs_targets::target::ChannelTargetType;
+
+    #[test]
+    fn registry_registers_amqp_factory() {
+        let registry = AuditRegistry::new();
+
+        assert!(registry.factories.contains_key(ChannelTargetType::Amqp.as_str()));
     }
 }

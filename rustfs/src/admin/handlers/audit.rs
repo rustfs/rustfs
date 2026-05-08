@@ -33,10 +33,10 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::audit::{
-    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS,
-    AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
-    AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS, AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS,
-    AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
+    AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS,
+    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS,
+    AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
@@ -95,13 +95,19 @@ struct AuditEndpointsResponse {
     audit_endpoints: Vec<AuditEndpoint>,
 }
 
-fn audit_target_specs() -> [AdminTargetSpec; 8] {
+fn audit_target_specs() -> [AdminTargetSpec; 9] {
     [
         AdminTargetSpec {
             subsystem: AUDIT_WEBHOOK_SUB_SYS,
             service: "webhook",
             valid_keys: AUDIT_WEBHOOK_KEYS,
             validator: AdminTargetValidator::Webhook,
+        },
+        AdminTargetSpec {
+            subsystem: AUDIT_AMQP_SUB_SYS,
+            service: "amqp",
+            valid_keys: AUDIT_AMQP_KEYS,
+            validator: AdminTargetValidator::Amqp(TargetDomain::Audit),
         },
         AdminTargetSpec {
             subsystem: AUDIT_KAFKA_SUB_SYS,
@@ -549,6 +555,42 @@ mod tests {
     }
 
     #[test]
+    fn merge_audit_endpoints_marks_amqp_env_and_mixed_sources() {
+        let config = Config(HashMap::from([(
+            AUDIT_AMQP_SUB_SYS.to_string(),
+            HashMap::from([("mixed-amqp".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_AUDIT_AMQP_ENABLE_MIXED-AMQP", Some("on")),
+                ("RUSTFS_AUDIT_AMQP_URL_MIXED-AMQP", Some("amqp://127.0.0.1:5672/%2f")),
+                ("RUSTFS_AUDIT_AMQP_ENABLE_ENV-AMQP", Some("on")),
+                ("RUSTFS_AUDIT_AMQP_URL_ENV-AMQP", Some("amqp://127.0.0.1:5672/%2f")),
+            ],
+            || {
+                let runtime = HashMap::from([
+                    (("mixed-amqp".to_string(), "amqp".to_string()), "online".to_string()),
+                    (("env-amqp".to_string(), "amqp".to_string()), "online".to_string()),
+                ]);
+                let merged = merge_audit_endpoints(&config, runtime);
+
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-amqp" && entry.service == "amqp")
+                    .expect("mixed amqp target should be present");
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
+
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-amqp" && entry.service == "amqp")
+                    .expect("env amqp target should be present");
+                assert_eq!(env_only.source, TargetEndpointSource::Env);
+            },
+        );
+    }
+
+    #[test]
     fn audit_target_mutation_block_reason_rejects_env_managed_target() {
         with_vars(
             [
@@ -708,6 +750,14 @@ mod tests {
         let (target_type, target_name) =
             extract_target_params(&supported_kafka_params.params).expect("audit kafka target should be supported");
         assert_eq!(target_type, AUDIT_KAFKA_SUB_SYS);
+        assert_eq!(target_name, "primary");
+
+        let supported_amqp_params = full_router
+            .at("/v3/audit/target/audit_amqp/primary")
+            .expect("route should match");
+        let (target_type, target_name) =
+            extract_target_params(&supported_amqp_params.params).expect("audit amqp target should be supported");
+        assert_eq!(target_type, AUDIT_AMQP_SUB_SYS);
         assert_eq!(target_name, "primary");
 
         let mut partial_router = Router::new();

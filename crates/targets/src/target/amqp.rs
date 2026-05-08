@@ -25,7 +25,7 @@ use crate::{
     store::{Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType,
+        TargetType, queue_store_subdir_name,
     },
 };
 use async_trait::async_trait;
@@ -39,8 +39,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use tokio::sync::Mutex as AsyncMutex;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex};
 use tracing::{error, info, instrument, warn};
 use url::Url;
 
@@ -229,7 +230,7 @@ fn map_lapin_error(err: lapin::Error, context: &str) -> TargetError {
 
 pub async fn connect_amqp(args: &AMQPArgs) -> Result<AMQPConnection, TargetError> {
     args.validate()?;
-    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         let url = connection_url(args)?;
         // Reconnect explicitly so every new channel enables publisher confirms below.
         let properties = ConnectionProperties::default();
@@ -241,11 +242,11 @@ pub async fn connect_amqp(args: &AMQPArgs) -> Result<AMQPConnection, TargetError
                 lapin::runtime::default_runtime()
                     .map_err(|e| TargetError::Initialization(format!("Failed to create AMQP runtime: {e}")))?,
             )
-            .await
+                .await
         } else {
             Connection::connect(&url, properties).await
         }
-        .map_err(|e| map_lapin_error(e, "Failed to connect to AMQP broker"))?;
+            .map_err(|e| map_lapin_error(e, "Failed to connect to AMQP broker"))?;
 
         let channel = connection
             .create_channel()
@@ -258,11 +259,7 @@ pub async fn connect_amqp(args: &AMQPArgs) -> Result<AMQPConnection, TargetError
 
         Ok(AMQPConnection { connection, channel })
     })
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(TargetError::Timeout("AMQP connection timed out".to_string())),
-    }
+        .await.unwrap_or_else(|_| Err(TargetError::Timeout("AMQP connection timed out".to_string())))
 }
 
 pub struct AMQPConnection {
@@ -277,7 +274,7 @@ where
     id: TargetID,
     args: AMQPArgs,
     connection: Mutex<Option<Arc<AMQPConnection>>>,
-    connect_lock: AsyncMutex<()>,
+    connect_lock: Mutex<()>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: std::marker::PhantomData<E>,
@@ -291,8 +288,8 @@ where
         Box::new(AMQPTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
-            connection: Mutex::new(self.connection.lock().unwrap().clone()),
-            connect_lock: AsyncMutex::new(()),
+            connection: Mutex::new(self.connection.lock().clone()),
+            connect_lock: Mutex::new(()),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: std::marker::PhantomData,
@@ -305,7 +302,7 @@ where
         let target_id = TargetID::new(id, ChannelTargetType::Amqp.as_str().to_string());
         let queue_store = if !args.queue_dir.is_empty() {
             let base_path = PathBuf::from(&args.queue_dir);
-            let specific_queue_path = base_path.join(format!("rustfs-{}-{}", ChannelTargetType::Amqp.as_str(), target_id.id));
+            let specific_queue_path = base_path.join(queue_store_subdir_name(ChannelTargetType::Amqp.as_str(), &target_id.id));
             let extension = match args.target_type {
                 TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
                 TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
@@ -324,7 +321,7 @@ where
             id: target_id,
             args,
             connection: Mutex::new(None),
-            connect_lock: AsyncMutex::new(()),
+            connect_lock: Mutex::new(()),
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,
@@ -351,7 +348,7 @@ where
     }
 
     async fn get_or_connect(&self) -> Result<Arc<AMQPConnection>, TargetError> {
-        if let Some(connection) = self.connection.lock().unwrap().clone()
+        if let Some(connection) = self.connection.lock().clone()
             && connection.connection.status().connected()
             && connection.channel.status().connected()
         {
@@ -359,7 +356,7 @@ where
         }
 
         let _guard = self.connect_lock.lock().await;
-        if let Some(connection) = self.connection.lock().unwrap().clone()
+        if let Some(connection) = self.connection.lock().clone()
             && connection.connection.status().connected()
             && connection.channel.status().connected()
         {
@@ -367,13 +364,13 @@ where
         }
 
         let connection = Arc::new(connect_amqp(&self.args).await?);
-        let mut guard = self.connection.lock().unwrap();
+        let mut guard = self.connection.lock();
         *guard = Some(Arc::clone(&connection));
         Ok(connection)
     }
 
     fn clear_connection(&self) {
-        *self.connection.lock().unwrap() = None;
+        *self.connection.lock() = None;
     }
 
     async fn send_body(&self, body: &[u8]) -> Result<(), TargetError> {
@@ -467,7 +464,7 @@ where
     }
 
     async fn close(&self) -> Result<(), TargetError> {
-        let connection = self.connection.lock().unwrap().take();
+        let connection = self.connection.lock().await.take();
         if let Some(connection) = connection {
             connection
                 .connection
@@ -561,7 +558,7 @@ mod tests {
         })
     }
 
-    fn temp_store_dir(name: &str) -> std::path::PathBuf {
+    fn temp_store_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rustfs-amqp-target-{name}-{}", Uuid::new_v4()))
     }
 

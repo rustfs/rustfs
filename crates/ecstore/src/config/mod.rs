@@ -26,7 +26,7 @@ use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
 use rustfs_config::COMMENT_KEY;
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::audit::{
-    AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_SUB_SYS,
+    AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_SUB_SYS,
     AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::notify::{
@@ -244,6 +244,7 @@ pub fn init() {
     kvs.insert(NOTIFY_MQTT_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_MQTT_KVS.clone());
     kvs.insert(AUDIT_MQTT_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_MQTT_KVS.clone());
     kvs.insert(NOTIFY_AMQP_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_AMQP_KVS.clone());
+    kvs.insert(AUDIT_AMQP_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_AMQP_KVS.clone());
     kvs.insert(NOTIFY_NATS_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_NATS_KVS.clone());
     kvs.insert(AUDIT_NATS_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_NATS_KVS.clone());
     kvs.insert(NOTIFY_REDIS_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_REDIS_KVS.clone());
