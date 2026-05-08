@@ -673,6 +673,27 @@ mod tests {
             })
         );
     }
+  
+    #[test]
+    fn admin_pool_list_item_saturates_used_size_when_current_exceeds_total() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                total_size: 100,
+                current_size: 150,
+                ..Default::default()
+            }),
+        };
+
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+
+        assert_eq!(item.total_size, 100);
+        assert_eq!(item.current_size, 150);
+        assert_eq!(item.used_size, 0);
+        assert_eq!(item.used, 0.0);
+    }
 
     #[test]
     fn admin_pool_list_item_maps_running_decommission_status() {
