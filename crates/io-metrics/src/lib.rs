@@ -118,11 +118,11 @@ pub use process_lock_metrics::{
     record_write_lock_held_acquire, record_write_lock_held_release, snapshot_process_lock_counts,
     snapshot_process_platform_stats,
 };
-pub use system_path_metrics::record_system_path_failure;
 pub use sampler::{
     ProcessResourceSnapshot, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_platform, snapshot_process_resource,
     snapshot_process_resource_and_system, snapshot_process_system,
 };
+pub use system_path_metrics::record_system_path_failure;
 
 // Timeout metrics exports
 pub use timeout_metrics::{

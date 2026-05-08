@@ -147,8 +147,7 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
                 disk.available_space,
                 disk.offline_duration_seconds,
             )
-            .0
-                == CAPACITY_OBSERVATION_STALE
+            .0 == CAPACITY_OBSERVATION_STALE
         })
         .count() as u64;
     let missing_capacity_drives = storage_info
@@ -162,8 +161,7 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
                 disk.available_space,
                 disk.offline_duration_seconds,
             )
-            .0
-                == CAPACITY_OBSERVATION_MISSING
+            .0 == CAPACITY_OBSERVATION_MISSING
         })
         .count() as u64;
 

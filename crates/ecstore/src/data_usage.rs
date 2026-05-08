@@ -15,7 +15,11 @@
 pub mod local_snapshot;
 
 use crate::{
-    bucket::metadata_sys::get_replication_config, config::com::read_config, disk::DiskAPI, error::Error, store::ECStore,
+    bucket::metadata_sys::get_replication_config,
+    config::com::read_config,
+    disk::DiskAPI,
+    error::{Error, classify_system_path_failure_reason},
+    store::ECStore,
     store_api::ListOperations,
 };
 pub use local_snapshot::{
@@ -43,24 +47,6 @@ const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
-
-fn classify_system_path_reason(err: &Error) -> &'static str {
-    match err {
-        Error::ConfigNotFound => "config_not_found",
-        Error::ErasureReadQuorum | Error::InsufficientReadQuorum(_, _) => "read_quorum",
-        Error::Io(io_err) => {
-            let msg = io_err.to_string();
-            if msg.contains("list_path_raw: 0 drives provided") {
-                "candidate_empty"
-            } else if msg.contains("timed out") {
-                "timeout"
-            } else {
-                "io"
-            }
-        }
-        _ => "other",
-    }
-}
 
 type UsageMemoryCache = Arc<RwLock<HashMap<String, (u64, SystemTime)>>>;
 type CacheUpdating = Arc<RwLock<bool>>;
@@ -128,7 +114,7 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
     let buf: Vec<u8> = match read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await {
         Ok(data) => data,
         Err(e) => {
-            let reason = classify_system_path_reason(&e);
+            let reason = classify_system_path_failure_reason(&e);
             record_system_path_failure("data_usage", "read_primary", reason);
             error!(
                 path_kind = "data_usage",
@@ -145,7 +131,7 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
                     if e == Error::ConfigNotFound {
                         return Ok(DataUsageInfo::default());
                     }
-                    let reason = classify_system_path_reason(&e);
+                    let reason = classify_system_path_failure_reason(&e);
                     record_system_path_failure("data_usage", "read_backup", reason);
                     error!(
                         path_kind = "data_usage",

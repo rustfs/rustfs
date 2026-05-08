@@ -107,7 +107,7 @@ impl SetDisks {
         DriveMembershipSnapshot::from_optional_disks(&disks)
     }
 
-    async fn reprobe_runtime_candidates_once(&self, disks: &[DiskStore]) {
+    fn reprobe_runtime_candidates_once(&self, disks: &[DiskStore]) {
         for disk in disks {
             if disk.runtime_state() != crate::disk::health_state::RuntimeDriveHealthState::Online {
                 disk.reset_health_for_store_init_retry();
@@ -121,7 +121,7 @@ impl SetDisks {
         let mut reprobed = false;
 
         loop {
-            let mut disks = membership_candidates.iter().cloned().map(Some).collect::<Vec<_>>();
+            let mut disks = membership_candidates.clone();
             let mut infos: Vec<Option<DiskInfo>> = vec![None; disks.len()];
 
             let mut futures = Vec::with_capacity(disks.len());
@@ -132,19 +132,12 @@ impl SetDisks {
 
             for (i, disk) in disks.iter().cloned().enumerate() {
                 futures.push(async move {
-                    let info = if let Some(disk) = disk {
-                        match disk.disk_info(&DiskInfoOptions::default()).await {
-                            Ok(info) => info,
-                            Err(err) => DiskInfo {
-                                error: err.to_string(),
-                                ..Default::default()
-                            },
-                        }
-                    } else {
-                        DiskInfo {
-                            error: DiskError::DiskNotFound.to_string(),
+                    let info = match disk.disk_info(&DiskInfoOptions::default()).await {
+                        Ok(info) => info,
+                        Err(err) => DiskInfo {
+                            error: err.to_string(),
                             ..Default::default()
-                        }
+                        },
                     };
 
                     Ok((i, info))
@@ -183,14 +176,14 @@ impl SetDisks {
                     continue;
                 };
 
-                if !info.error.is_empty() || disk.is_none() {
+                if !info.error.is_empty() {
                     continue;
                 }
 
                 if info.healing {
                     healing += 1;
                     if incl_healing {
-                        healing_disks.push(disk.expect("disk should exist when info succeeded"));
+                        healing_disks.push(disk);
                         healing_infos.push(info);
                     }
 
@@ -198,10 +191,10 @@ impl SetDisks {
                 }
 
                 if !info.scanning {
-                    new_disks.push(disk.expect("disk should exist when info succeeded"));
+                    new_disks.push(disk);
                     new_infos.push(info);
                 } else {
-                    scanning_disks.push(disk.expect("disk should exist when info succeeded"));
+                    scanning_disks.push(disk);
                     scanning_infos.push(info);
                 }
             }
@@ -216,7 +209,7 @@ impl SetDisks {
             }
 
             reprobed = true;
-            self.reprobe_runtime_candidates_once(&membership_candidates).await;
+            self.reprobe_runtime_candidates_once(&membership_candidates);
             membership_candidates = self.drive_membership_snapshot().await.scanner_heal_candidates();
         }
     }

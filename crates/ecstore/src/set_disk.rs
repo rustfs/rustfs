@@ -4153,13 +4153,18 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                 match disk.disk_info(&DiskInfoOptions::default()).await {
                     Ok(res) => {
                         disk.record_capacity_probe(res.total, res.used, res.free);
+                        let state = if runtime_state == crate::disk::health_state::RuntimeDriveHealthState::Online {
+                            "ok".to_owned()
+                        } else {
+                            runtime_state.as_str().to_string()
+                        };
                         ret.push(rustfs_madmin::Disk {
                             endpoint: eps[i].to_string(),
                             local: eps[i].is_local,
                             pool_index: eps[i].pool_idx,
                             set_index: eps[i].set_idx,
                             disk_index: eps[i].disk_idx,
-                            state: "ok".to_owned(),
+                            state,
 
                             root_disk: res.root_disk,
                             drive_path: res.mount_path.clone(),
@@ -4176,13 +4181,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                             used_space: res.used,
                             available_space: res.free,
                             physical_device_ids: (!res.physical_device_ids.is_empty()).then_some(res.physical_device_ids.clone()),
-                            utilization: {
-                                if res.total > 0 {
-                                    res.used as f64 / res.total as f64 * 100_f64
-                                } else {
-                                    0_f64
-                                }
-                            },
+                            utilization: utilization_percent(res.total, res.used),
                             used_inodes: res.used_inodes,
                             free_inodes: res.free_inodes,
                             ..Default::default()
@@ -4204,11 +4203,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                             disk_info.total_space = total;
                             disk_info.used_space = used;
                             disk_info.available_space = free;
-                            disk_info.utilization = if total > 0 {
-                                used as f64 / total as f64 * 100_f64
-                            } else {
-                                0_f64
-                            };
+                            disk_info.utilization = utilization_percent(total, used);
                         }
                         ret.push(disk_info);
                     }
@@ -4261,14 +4256,18 @@ fn build_runtime_snapshot_disk(
         disk.total_space = total;
         disk.used_space = used;
         disk.available_space = free;
-        disk.utilization = if total > 0 {
-            used as f64 / total as f64 * 100_f64
-        } else {
-            0_f64
-        };
+        disk.utilization = utilization_percent(total, used);
     }
 
     disk
+}
+
+fn utilization_percent(total: u64, used: u64) -> f64 {
+    if total > 0 {
+        used as f64 / total as f64 * 100_f64
+    } else {
+        0_f64
+    }
 }
 async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
     // let mut disks = get_disks_info(disks, eps).await;
@@ -5351,7 +5350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_disks_info_uses_runtime_snapshot_for_suspect_and_offline_disks() {
+    async fn test_get_disks_info_preserves_runtime_state_for_suspect_and_offline_disks() {
         let format = FormatV3::new(1, 3);
         let mut temp_dirs = Vec::new();
         let mut endpoints = Vec::new();
@@ -5382,7 +5381,7 @@ mod tests {
 
         assert_eq!(info[1].state, "suspect");
         assert_eq!(info[1].runtime_state.as_deref(), Some("suspect"));
-        assert!(info[1].drive_path.is_empty(), "suspect disk should use runtime snapshot fallback");
+        assert!(!info[1].drive_path.is_empty(), "suspect disk should still probe for fresher disk info");
 
         assert_eq!(info[2].state, "offline");
         assert_eq!(info[2].runtime_state.as_deref(), Some("offline"));

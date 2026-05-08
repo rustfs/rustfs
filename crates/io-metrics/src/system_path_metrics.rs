@@ -21,4 +21,3 @@ pub fn record_system_path_failure(path_kind: &'static str, operation: &'static s
     )
     .increment(1);
 }
-

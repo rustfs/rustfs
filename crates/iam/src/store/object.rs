@@ -22,7 +22,7 @@ use crate::{
 };
 use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::error::{StorageError, classify_system_path_failure_reason};
 use rustfs_ecstore::store_api::{ListOperations as _, ObjectInfoOrErr, WalkOptions};
 use rustfs_ecstore::{
     config::{
@@ -108,24 +108,6 @@ const POLICY_DB_USERS_LIST_KEY: &str = "policydb/users/";
 const POLICY_DB_STS_USERS_LIST_KEY: &str = "policydb/sts-users/";
 const POLICY_DB_GROUPS_LIST_KEY: &str = "policydb/groups/";
 const IAM_LAZY_REWRITE_COOLDOWN: Duration = Duration::from_secs(60);
-
-fn classify_iam_walk_reason(err: &StorageError) -> &'static str {
-    match err {
-        StorageError::ConfigNotFound => "config_not_found",
-        StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => "read_quorum",
-        StorageError::Io(io_err) => {
-            let msg = io_err.to_string();
-            if msg.contains("list_path_raw: 0 drives provided") {
-                "candidate_empty"
-            } else if msg.contains("timed out") {
-                "timeout"
-            } else {
-                "io"
-            }
-        }
-        _ => "other",
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecryptSource {
@@ -384,7 +366,7 @@ impl ObjectStore {
                 .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, WalkOptions::default())
                 .await
             {
-                let reason = classify_iam_walk_reason(&err);
+                let reason = classify_system_path_failure_reason(&err);
                 error!(
                     path_kind = "iam_config",
                     operation = "walk",
