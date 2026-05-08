@@ -5421,6 +5421,27 @@ mod tests {
         assert!(info[2].drive_path.is_empty(), "offline disk should use runtime snapshot fallback");
     }
 
+    #[tokio::test]
+    async fn test_get_disks_info_uses_capacity_snapshot_for_offline_disk() {
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        disk.record_capacity_probe(100, 40, 60);
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].state, "offline");
+        assert_eq!(info[0].runtime_state.as_deref(), Some("offline"));
+        assert_eq!(info[0].capacity_observation_source.as_deref(), Some("snapshot"));
+        assert!(info[0].capacity_observation_age_seconds.unwrap_or(u64::MAX) <= 60);
+        assert_eq!(info[0].total_space, 100);
+        assert_eq!(info[0].used_space, 40);
+        assert_eq!(info[0].available_space, 60);
+        assert_eq!(info[0].utilization, 40.0);
+
+        drop(temp_dir);
+    }
+
     #[test]
     fn test_dangling_meta_errs_count() {
         // Test counting dangling metadata errors
