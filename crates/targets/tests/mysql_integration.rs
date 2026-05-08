@@ -15,7 +15,8 @@
 //! MySQL notification target integration tests.
 //!
 //! These tests require a running MySQL 8.0+ or TiDB 8.5+ instance.
-//! They are `#[ignore]` by default so CI never runs them. To run locally:
+//! They are `#[ignore]` by default so CI never runs them. To run locally
+//! (podman recommended; docker works too):
 //!
 //! ```bash
 //! podman run -d --name rustfs-mysql-test -p 3306:3306 \

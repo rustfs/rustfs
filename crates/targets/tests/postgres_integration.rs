@@ -15,7 +15,8 @@
 //! PostgreSQL notification target integration tests.
 //!
 //! These tests require a running PostgreSQL server. They are `#[ignore]` by
-//! default so CI never runs them. To run locally:
+//! default so CI never runs them. To run locally
+//! (podman recommended; docker works too):
 //!
 //! ```bash
 //! podman run -d --name rustfs-pg-test -p 5432:5432 \
