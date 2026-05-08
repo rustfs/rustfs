@@ -101,7 +101,7 @@ use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OB
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem::{self};
-use std::time::{Instant, SystemTime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
@@ -4172,6 +4172,8 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                             scanning: res.scanning,
                             runtime_state: Some(runtime_state.as_str().to_string()),
                             offline_duration_seconds,
+                            capacity_observation_source: Some("live_probe".to_owned()),
+                            capacity_observation_age_seconds: Some(0),
 
                             uuid: res.id.map_or_else(|| "".to_string(), |id| id.to_string()),
                             major: res.major as u32,
@@ -4204,6 +4206,12 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                             disk_info.used_space = used;
                             disk_info.available_space = free;
                             disk_info.utilization = utilization_percent(total, used);
+                            disk_info.capacity_observation_source = Some("snapshot".to_owned());
+                            disk_info.capacity_observation_age_seconds = capacity_snapshot
+                                .map(|(_, _, _, probe_unix_secs)| capacity_snapshot_age_seconds(probe_unix_secs));
+                        } else {
+                            disk_info.capacity_observation_source = Some("missing".to_owned());
+                            disk_info.capacity_observation_age_seconds = Some(0);
                         }
                         ret.push(disk_info);
                     }
@@ -4217,19 +4225,21 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                 ));
             }
         } else {
-            ret.push(rustfs_madmin::Disk {
+                ret.push(rustfs_madmin::Disk {
                 endpoint: eps[i].to_string(),
                 local: eps[i].is_local,
                 pool_index: eps[i].pool_idx,
                 set_index: eps[i].set_idx,
                 disk_index: eps[i].disk_idx,
-                runtime_state: None,
-                offline_duration_seconds: None,
-                state: DiskError::DiskNotFound.to_string(),
-                ..Default::default()
-            })
+                    runtime_state: None,
+                    offline_duration_seconds: None,
+                    state: DiskError::DiskNotFound.to_string(),
+                    capacity_observation_source: Some("missing".to_owned()),
+                    capacity_observation_age_seconds: Some(0),
+                    ..Default::default()
+                })
+            }
         }
-    }
 
     ret
 }
@@ -4257,6 +4267,12 @@ fn build_runtime_snapshot_disk(
         disk.used_space = used;
         disk.available_space = free;
         disk.utilization = utilization_percent(total, used);
+        disk.capacity_observation_source = Some("snapshot".to_owned());
+        disk.capacity_observation_age_seconds = capacity_snapshot
+            .map(|(_, _, _, probe_unix_secs)| capacity_snapshot_age_seconds(probe_unix_secs));
+    } else {
+        disk.capacity_observation_source = Some("missing".to_owned());
+        disk.capacity_observation_age_seconds = Some(0);
     }
 
     disk
@@ -4268,6 +4284,14 @@ fn utilization_percent(total: u64, used: u64) -> f64 {
     } else {
         0_f64
     }
+}
+
+fn capacity_snapshot_age_seconds(probe_unix_secs: u64) -> u64 {
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_secs())
+        .unwrap_or(probe_unix_secs);
+    now_unix_secs.saturating_sub(probe_unix_secs)
 }
 async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
     // let mut disks = get_disks_info(disks, eps).await;

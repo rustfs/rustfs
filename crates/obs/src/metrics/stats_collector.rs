@@ -74,23 +74,13 @@ fn disk_is_online_for_metrics(state: &str, runtime_state: Option<&str>) -> bool 
     state_is_acceptable
 }
 
-fn disk_capacity_observation_state(
-    state: &str,
-    total_space: u64,
-    used_space: u64,
-    available_space: u64,
-    offline_duration_seconds: Option<u64>,
-) -> (&'static str, u64) {
-    let age_seconds = offline_duration_seconds.unwrap_or(0);
-
-    if total_space > 0 || used_space > 0 || available_space > 0 {
-        if state.eq_ignore_ascii_case(DRIVE_STATE_OK) {
-            return (CAPACITY_OBSERVATION_LIVE, 0);
-        }
-        return (CAPACITY_OBSERVATION_STALE, age_seconds);
+fn disk_capacity_observation_state(source: Option<&str>, age_seconds: Option<u64>) -> (&'static str, u64) {
+    let age_seconds = age_seconds.unwrap_or(0);
+    match source {
+        Some("live_probe") => (CAPACITY_OBSERVATION_LIVE, age_seconds),
+        Some("snapshot") => (CAPACITY_OBSERVATION_STALE, age_seconds),
+        _ => (CAPACITY_OBSERVATION_MISSING, age_seconds),
     }
-
-    (CAPACITY_OBSERVATION_MISSING, age_seconds)
 }
 
 fn derive_erasure_set_quorum_shape(set_drive_count: usize, parity: usize) -> ErasureSetQuorumShape {
@@ -141,11 +131,8 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
         .iter()
         .filter(|disk| {
             disk_capacity_observation_state(
-                disk.state.as_str(),
-                disk.total_space,
-                disk.used_space,
-                disk.available_space,
-                disk.offline_duration_seconds,
+                disk.capacity_observation_source.as_deref(),
+                disk.capacity_observation_age_seconds,
             )
             .0 == CAPACITY_OBSERVATION_STALE
         })
@@ -155,11 +142,8 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
         .iter()
         .filter(|disk| {
             disk_capacity_observation_state(
-                disk.state.as_str(),
-                disk.total_space,
-                disk.used_space,
-                disk.available_space,
-                disk.offline_duration_seconds,
+                disk.capacity_observation_source.as_deref(),
+                disk.capacity_observation_age_seconds,
             )
             .0 == CAPACITY_OBSERVATION_MISSING
         })
@@ -536,11 +520,8 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
         .map(|disk| {
             let is_online = disk_is_online_for_metrics(disk.state.as_str(), disk.runtime_state.as_deref());
             let (capacity_observation_state, capacity_observation_age_seconds) = disk_capacity_observation_state(
-                disk.state.as_str(),
-                disk.total_space,
-                disk.used_space,
-                disk.available_space,
-                disk.offline_duration_seconds,
+                disk.capacity_observation_source.as_deref(),
+                disk.capacity_observation_age_seconds,
             );
             if is_online {
                 online_count += 1;

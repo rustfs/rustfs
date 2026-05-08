@@ -682,10 +682,10 @@ pub fn classify_system_path_failure_reason(err: &Error) -> &'static str {
     match err {
         StorageError::ConfigNotFound => "config_not_found",
         StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => "read_quorum",
-        StorageError::Io(io_err) => {
-            let msg = io_err.to_string();
-            if msg.contains("timed out") { "timeout" } else { "io" }
-        }
+        StorageError::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::TimedOut => "timeout",
+            _ => "io",
+        },
         _ => "other",
     }
 }

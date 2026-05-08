@@ -24,6 +24,7 @@ use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::error::{StorageError, classify_system_path_failure_reason};
 use rustfs_ecstore::store_api::{ListOperations as _, ObjectInfoOrErr, WalkOptions};
+use rustfs_io_metrics::record_system_path_failure;
 use rustfs_ecstore::{
     config::{
         RUSTFS_CONFIG_PREFIX,
@@ -367,6 +368,7 @@ impl ObjectStore {
                 .await
             {
                 let reason = classify_system_path_failure_reason(&err);
+                record_system_path_failure("iam_config", "walk", reason);
                 error!(
                     path_kind = "iam_config",
                     operation = "walk",
@@ -429,6 +431,7 @@ impl ObjectStore {
                     error = %err,
                     "system path list failed"
                 );
+                record_system_path_failure("iam_config", "list_items", "walk_result");
                 ctx.cancel();
 
                 return Err(err);

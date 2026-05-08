@@ -97,6 +97,10 @@ pub struct Disk {
     pub runtime_state: Option<String>,
     #[serde(rename = "offlineDurationSeconds", default, skip_serializing_if = "Option::is_none")]
     pub offline_duration_seconds: Option<u64>,
+    #[serde(rename = "capacityObservationSource", default, skip_serializing_if = "Option::is_none")]
+    pub capacity_observation_source: Option<String>,
+    #[serde(rename = "capacityObservationAgeSeconds", default, skip_serializing_if = "Option::is_none")]
+    pub capacity_observation_age_seconds: Option<u64>,
     /// Leaf physical block devices backing this disk path when the platform can resolve them.
     #[serde(rename = "physicalDeviceIds", default, skip_serializing_if = "Option::is_none")]
     pub physical_device_ids: Option<Vec<String>>,
