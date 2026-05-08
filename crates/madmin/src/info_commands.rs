@@ -519,6 +519,8 @@ mod tests {
             metrics: Some(DiskMetrics::default()),
             runtime_state: Some("online".to_string()),
             offline_duration_seconds: Some(0),
+            capacity_observation_source: None,
+            capacity_observation_age_seconds: None,
             heal_info: None,
             used_inodes: 1000000,
             free_inodes: 9000000,
@@ -620,6 +622,8 @@ mod tests {
             physical_device_ids: Some(vec!["nvme0n1".to_string(), "nvme1n1".to_string()]),
             runtime_state: Some("online".to_string()),
             offline_duration_seconds: Some(0),
+            capacity_observation_source: None,
+            capacity_observation_age_seconds: None,
         };
 
         let mut encoded = Vec::new();

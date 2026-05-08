@@ -130,22 +130,16 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
         .disks
         .iter()
         .filter(|disk| {
-            disk_capacity_observation_state(
-                disk.capacity_observation_source.as_deref(),
-                disk.capacity_observation_age_seconds,
-            )
-            .0 == CAPACITY_OBSERVATION_STALE
+            disk_capacity_observation_state(disk.capacity_observation_source.as_deref(), disk.capacity_observation_age_seconds).0
+                == CAPACITY_OBSERVATION_STALE
         })
         .count() as u64;
     let missing_capacity_drives = storage_info
         .disks
         .iter()
         .filter(|disk| {
-            disk_capacity_observation_state(
-                disk.capacity_observation_source.as_deref(),
-                disk.capacity_observation_age_seconds,
-            )
-            .0 == CAPACITY_OBSERVATION_MISSING
+            disk_capacity_observation_state(disk.capacity_observation_source.as_deref(), disk.capacity_observation_age_seconds).0
+                == CAPACITY_OBSERVATION_MISSING
         })
         .count() as u64;
 

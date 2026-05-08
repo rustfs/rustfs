@@ -4153,18 +4153,13 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                 match disk.disk_info(&DiskInfoOptions::default()).await {
                     Ok(res) => {
                         disk.record_capacity_probe(res.total, res.used, res.free);
-                        let state = if runtime_state == crate::disk::health_state::RuntimeDriveHealthState::Online {
-                            "ok".to_owned()
-                        } else {
-                            runtime_state.as_str().to_string()
-                        };
                         ret.push(rustfs_madmin::Disk {
                             endpoint: eps[i].to_string(),
                             local: eps[i].is_local,
                             pool_index: eps[i].pool_idx,
                             set_index: eps[i].set_idx,
                             disk_index: eps[i].disk_idx,
-                            state,
+                            state: "ok".to_owned(),
 
                             root_disk: res.root_disk,
                             drive_path: res.mount_path.clone(),
@@ -4225,21 +4220,21 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                 ));
             }
         } else {
-                ret.push(rustfs_madmin::Disk {
+            ret.push(rustfs_madmin::Disk {
                 endpoint: eps[i].to_string(),
                 local: eps[i].is_local,
                 pool_index: eps[i].pool_idx,
                 set_index: eps[i].set_idx,
                 disk_index: eps[i].disk_idx,
-                    runtime_state: None,
-                    offline_duration_seconds: None,
-                    state: DiskError::DiskNotFound.to_string(),
-                    capacity_observation_source: Some("missing".to_owned()),
-                    capacity_observation_age_seconds: Some(0),
-                    ..Default::default()
-                })
-            }
+                runtime_state: None,
+                offline_duration_seconds: None,
+                state: DiskError::DiskNotFound.to_string(),
+                capacity_observation_source: Some("missing".to_owned()),
+                capacity_observation_age_seconds: Some(0),
+                ..Default::default()
+            })
         }
+    }
 
     ret
 }
@@ -4268,8 +4263,8 @@ fn build_runtime_snapshot_disk(
         disk.available_space = free;
         disk.utilization = utilization_percent(total, used);
         disk.capacity_observation_source = Some("snapshot".to_owned());
-        disk.capacity_observation_age_seconds = capacity_snapshot
-            .map(|(_, _, _, probe_unix_secs)| capacity_snapshot_age_seconds(probe_unix_secs));
+        disk.capacity_observation_age_seconds =
+            capacity_snapshot.map(|(_, _, _, probe_unix_secs)| capacity_snapshot_age_seconds(probe_unix_secs));
     } else {
         disk.capacity_observation_source = Some("missing".to_owned());
         disk.capacity_observation_age_seconds = Some(0);
@@ -5403,7 +5398,7 @@ mod tests {
         assert_eq!(info[0].runtime_state.as_deref(), Some("online"));
         assert!(!info[0].drive_path.is_empty(), "online disk should keep immediate disk_info probe");
 
-        assert_eq!(info[1].state, "suspect");
+        assert_eq!(info[1].state, "ok");
         assert_eq!(info[1].runtime_state.as_deref(), Some("suspect"));
         assert!(!info[1].drive_path.is_empty(), "suspect disk should still probe for fresher disk info");
 
