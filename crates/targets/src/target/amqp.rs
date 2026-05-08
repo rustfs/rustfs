@@ -231,7 +231,8 @@ pub async fn connect_amqp(args: &AMQPArgs) -> Result<AMQPConnection, TargetError
     args.validate()?;
     match tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let url = connection_url(args)?;
-        let properties = ConnectionProperties::default().enable_auto_recover();
+        // Reconnect explicitly so every new channel enables publisher confirms below.
+        let properties = ConnectionProperties::default();
         let connection = if args.url.scheme() == "amqps" && (!args.tls_ca.is_empty() || !args.tls_client_cert.is_empty()) {
             Connection::connect_with_config(
                 &url,

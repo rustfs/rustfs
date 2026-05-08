@@ -159,6 +159,36 @@ async fn test_direct_publish_delivers_json_payload() {
 
 #[tokio::test]
 #[ignore = "requires running RabbitMQ-compatible AMQP broker"]
+async fn test_publish_reconnects_after_close() {
+    let routing_key = format!("rustfs.reconnect.{}", Uuid::new_v4().simple());
+    let queue = format!("rustfs-test-{}", Uuid::new_v4().simple());
+    let channel = bind_queue(&queue, &routing_key).await;
+    let target = AMQPTarget::new("reconnect".to_string(), test_args(&routing_key)).expect("construct AMQP target");
+
+    target
+        .save(entity_for("bucket1", "object-before-close"))
+        .await
+        .expect("initial publish should succeed");
+    let (payload, _) = read_one(&channel, &queue).await;
+    assert_eq!(payload["Key"], "bucket1/object-before-close");
+
+    target.close().await.expect("close cached AMQP connection");
+
+    target
+        .save(entity_for("bucket1", "object-after-close"))
+        .await
+        .expect("publish should reconnect after close");
+    let (payload, _) = read_one(&channel, &queue).await;
+    assert_eq!(payload["Key"], "bucket1/object-after-close");
+
+    channel
+        .queue_delete(queue.into(), QueueDeleteOptions::default())
+        .await
+        .expect("delete queue");
+}
+
+#[tokio::test]
+#[ignore = "requires running RabbitMQ-compatible AMQP broker"]
 async fn test_queue_replay_delivers_and_removes_stored_payload() {
     let routing_key = format!("rustfs.replay.{}", Uuid::new_v4().simple());
     let queue = format!("rustfs-test-{}", Uuid::new_v4().simple());

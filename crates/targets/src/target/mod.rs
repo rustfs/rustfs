@@ -269,9 +269,12 @@ impl QueuedPayload {
 /// used in the notification system.
 ///
 /// It includes:
+/// - `Amqp`: Represents an AMQP 0-9-1 target for sending notifications to a broker.
 /// - `Webhook`: Represents a webhook target for sending notifications via HTTP requests.
 /// - `Kafka`: Represents a Kafka target for sending notifications to a Kafka topic.
 /// - `Mqtt`: Represents an MQTT target for sending notifications via MQTT protocol.
+/// - `Nats`: Represents a NATS target for sending notifications to a subject.
+/// - `Pulsar`: Represents a Pulsar target for sending notifications to a topic.
 ///
 /// Each variant has an associated string representation that can be used for serialization
 /// or logging purposes.
