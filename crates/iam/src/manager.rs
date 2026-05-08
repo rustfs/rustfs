@@ -58,6 +58,10 @@ use tracing::{error, info};
 
 const IAM_FORMAT_FILE: &str = "format.json";
 const IAM_FORMAT_VERSION_1: i32 = 1;
+#[cfg(not(test))]
+const INITIAL_LOAD_RETRY_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const INITIAL_LOAD_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 #[derive(Serialize, Deserialize)]
 struct IAMFormat {
@@ -116,7 +120,7 @@ where
     ///
     /// # Returns
     /// An Arc-wrapped instance of IamSystem
-    pub(crate) async fn new(api: T) -> Arc<Self> {
+    pub(crate) async fn new(api: T) -> Result<Arc<Self>> {
         let (sender, receiver) = mpsc::channel::<i64>(100);
 
         let sys = Arc::new(Self {
@@ -132,8 +136,8 @@ where
             last_sync_duration_millis: AtomicU64::new(0),
         });
 
-        sys.clone().init(receiver).await.unwrap();
-        sys
+        sys.clone().init(receiver).await?;
+        Ok(sys)
     }
 
     /// Initialize the IAM system
@@ -153,7 +157,7 @@ where
                     load_error = Some(e);
                 } else {
                     warn!("IAM load failed, retrying... attempt {}", attempt + 1);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(INITIAL_LOAD_RETRY_DELAY).await;
                 }
             } else {
                 break;
