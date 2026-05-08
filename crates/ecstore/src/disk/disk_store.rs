@@ -31,7 +31,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicU32, Ordering},
+        atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -138,6 +138,14 @@ pub struct DiskHealthTracker {
     pub offline_since_unix_secs: AtomicI64,
     /// Last runtime state transition timestamp
     pub last_transition_unix_secs: AtomicI64,
+    /// Last successfully probed total space in bytes
+    pub last_capacity_total: AtomicU64,
+    /// Last successfully probed used space in bytes
+    pub last_capacity_used: AtomicU64,
+    /// Last successfully probed free space in bytes
+    pub last_capacity_free: AtomicU64,
+    /// Last successful capacity probe timestamp
+    pub last_capacity_probe_unix_secs: AtomicI64,
 }
 
 impl DiskHealthTracker {
@@ -158,6 +166,10 @@ impl DiskHealthTracker {
             consecutive_successes: AtomicU32::new(0),
             offline_since_unix_secs: AtomicI64::new(0),
             last_transition_unix_secs: AtomicI64::new(now / 1_000_000_000),
+            last_capacity_total: AtomicU64::new(0),
+            last_capacity_used: AtomicU64::new(0),
+            last_capacity_free: AtomicU64::new(0),
+            last_capacity_probe_unix_secs: AtomicI64::new(0),
         }
     }
 
@@ -168,6 +180,28 @@ impl DiskHealthTracker {
             .unwrap()
             .as_nanos() as i64;
         self.last_success.store(now, Ordering::Relaxed);
+    }
+
+    pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
+        self.last_capacity_total.store(total, Ordering::Release);
+        self.last_capacity_used.store(used, Ordering::Release);
+        self.last_capacity_free.store(free, Ordering::Release);
+        self.last_capacity_probe_unix_secs
+            .store(current_unix_secs() as i64, Ordering::Release);
+    }
+
+    pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
+        let ts = self.last_capacity_probe_unix_secs.load(Ordering::Acquire);
+        if ts <= 0 {
+            return None;
+        }
+
+        Some((
+            self.last_capacity_total.load(Ordering::Acquire),
+            self.last_capacity_used.load(Ordering::Acquire),
+            self.last_capacity_free.load(Ordering::Acquire),
+            ts as u64,
+        ))
     }
 
     /// Check if disk is faulty
@@ -461,6 +495,14 @@ impl LocalDiskWrapper {
 
     pub fn offline_duration_secs(&self) -> Option<u64> {
         self.health.offline_duration().map(|duration| duration.as_secs())
+    }
+
+    pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
+        self.health.last_capacity_snapshot()
+    }
+
+    pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
+        self.health.record_capacity_probe(total, used, free);
     }
 
     #[cfg(test)]

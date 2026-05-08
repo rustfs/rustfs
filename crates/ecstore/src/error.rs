@@ -678,6 +678,18 @@ pub fn is_err_read_quorum(err: &Error) -> bool {
     matches!(err, &StorageError::ErasureReadQuorum)
 }
 
+pub fn classify_system_path_failure_reason(err: &Error) -> &'static str {
+    match err {
+        StorageError::ConfigNotFound => "config_not_found",
+        StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => "read_quorum",
+        StorageError::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::TimedOut => "timeout",
+            _ => "io",
+        },
+        _ => "other",
+    }
+}
+
 pub fn is_err_invalid_upload_id(err: &Error) -> bool {
     matches!(err, &StorageError::InvalidUploadID(_, _, _))
 }
