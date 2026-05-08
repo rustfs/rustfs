@@ -648,6 +648,33 @@ mod tests {
     }
 
     #[test]
+    fn admin_pool_list_item_serializes_admin_api_fields() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(PoolStatus {
+            id: 1,
+            cmd_line: "pool-1".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: None,
+        });
+
+        let value = serde_json::to_value(item).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": 1,
+                "cmdline": "pool-1",
+                "lastUpdate": "1970-01-01T00:00:00Z",
+                "totalSize": 0,
+                "currentSize": 0,
+                "usedSize": 0,
+                "used": 0.0,
+                "status": "active",
+                "decommissionInfo": null
+            })
+        );
+    }
+
+    #[test]
     fn admin_pool_list_item_saturates_used_size_when_current_exceeds_total() {
         let pool = PoolStatus {
             id: 0,
