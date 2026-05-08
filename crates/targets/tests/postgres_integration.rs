@@ -55,10 +55,7 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn test_args(table: &str, format: PostgresFormat) -> PostgresArgs {
-    let dsn = env_or(
-        "RUSTFS_TEST_PG_DSN",
-        "postgres://postgres:rustfs@localhost:5432/rustfs_events",
-    );
+    let dsn = env_or("RUSTFS_TEST_PG_DSN", "postgres://postgres:rustfs@localhost:5432/rustfs_events");
     let schema = PostgresDsn::parse(&dsn)
         .expect("RUSTFS_TEST_PG_DSN must be a valid PostgreSQL DSN")
         .schema;
