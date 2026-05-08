@@ -11,28 +11,16 @@ test process directly.
 
 ## Running Tests
 
-Run all protocol tests (FTPS + WebDAV + SFTP):
 ```bash
 RUSTFS_BUILD_FEATURES=ftps,webdav,sftp cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
 ```
 
-Run FTPS tests only:
-```bash
-RUSTFS_BUILD_FEATURES=ftps cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
-```
-
-Run WebDAV tests only:
-```bash
-RUSTFS_BUILD_FEATURES=webdav cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
-```
-
-Run SFTP tests only (core + compliance + read-only + idle-timeout):
-```bash
-RUSTFS_BUILD_FEATURES=sftp cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
-```
-
-`--test-threads=1` is required because every entry spawns a rustfs server on
-fixed bind ports; running entries in parallel would cause port collisions.
+`RUSTFS_BUILD_FEATURES` controls which features the test rustfs binary is
+built with. The protocol test runner schedules every entry (FTPS, WebDAV,
+SFTP) regardless of the feature set, so the binary must include every
+protocol the runner spawns or the corresponding entries will fail.
+`--test-threads=1` is required because every entry spawns a rustfs server
+on fixed bind ports.
 
 ## Test Coverage
 

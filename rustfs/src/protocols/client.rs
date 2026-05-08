@@ -444,7 +444,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.clone();
         let key = input.key.clone();
-        let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
+        let uri: http::Uri = format!("/{}{}", bucket, key).parse().map_err(|e| {
+            s3s::S3Error::with_message(
+                s3s::S3ErrorCode::InvalidRequest,
+                format!("invalid URI for bucket={} key={}: {}", bucket, key, e),
+            )
+        })?;
 
         let req = self
             .create_request(
@@ -507,7 +512,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.clone();
         let key = input.key.clone();
-        let uri: http::Uri = format!("/{}{}?uploads", bucket, key).parse().unwrap_or_default();
+        let uri: http::Uri = format!("/{}{}?uploads", bucket, key).parse().map_err(|e| {
+            s3s::S3Error::with_message(
+                s3s::S3ErrorCode::InvalidRequest,
+                format!("invalid URI for bucket={} key={}: {}", bucket, key, e),
+            )
+        })?;
 
         let req = self
             .create_request(
@@ -546,7 +556,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let upload_id = input.upload_id.clone();
         let uri: http::Uri = format!("/{}{}?partNumber={}&uploadId={}", bucket, key, part_number, upload_id)
             .parse()
-            .unwrap_or_default();
+            .map_err(|e| {
+                s3s::S3Error::with_message(
+                    s3s::S3ErrorCode::InvalidRequest,
+                    format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
+                )
+            })?;
 
         // Set content-length from the body size hint so ecfs can bound
         // the read and validate the part size. Prefer the exact upper
@@ -605,7 +620,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let upload_id = input.upload_id.clone();
         let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id)
             .parse()
-            .unwrap_or_default();
+            .map_err(|e| {
+                s3s::S3Error::with_message(
+                    s3s::S3ErrorCode::InvalidRequest,
+                    format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
+                )
+            })?;
 
         let req = self
             .create_request(
@@ -643,7 +663,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let upload_id = input.upload_id.clone();
         let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id)
             .parse()
-            .unwrap_or_default();
+            .map_err(|e| {
+                s3s::S3Error::with_message(
+                    s3s::S3ErrorCode::InvalidRequest,
+                    format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
+                )
+            })?;
 
         let req = self
             .create_request(
@@ -682,7 +707,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let upload_id = input.upload_id.clone();
         let uri: http::Uri = format!("/{}{}?partNumber={}&uploadId={}", bucket, key, part_number, upload_id)
             .parse()
-            .unwrap_or_default();
+            .map_err(|e| {
+                s3s::S3Error::with_message(
+                    s3s::S3ErrorCode::InvalidRequest,
+                    format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
+                )
+            })?;
 
         let req = self
             .create_request(
