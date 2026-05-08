@@ -109,6 +109,24 @@ const POLICY_DB_STS_USERS_LIST_KEY: &str = "policydb/sts-users/";
 const POLICY_DB_GROUPS_LIST_KEY: &str = "policydb/groups/";
 const IAM_LAZY_REWRITE_COOLDOWN: Duration = Duration::from_secs(60);
 
+fn classify_iam_walk_reason(err: &StorageError) -> &'static str {
+    match err {
+        StorageError::ConfigNotFound => "config_not_found",
+        StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => "read_quorum",
+        StorageError::Io(io_err) => {
+            let msg = io_err.to_string();
+            if msg.contains("list_path_raw: 0 drives provided") {
+                "candidate_empty"
+            } else if msg.contains("timed out") {
+                "timeout"
+            } else {
+                "io"
+            }
+        }
+        _ => "other",
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecryptSource {
     Plaintext,
@@ -366,11 +384,15 @@ impl ObjectStore {
                 .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, WalkOptions::default())
                 .await
             {
+                let reason = classify_iam_walk_reason(&err);
                 error!(
+                    path_kind = "iam_config",
+                    operation = "walk",
+                    reason,
                     bucket = Self::BUCKET_NAME,
                     prefix = %path,
-                    error = ?err,
-                    "list_iam_config_items walk task failed"
+                    error = %err,
+                    "system path walk failed"
                 );
             }
         });
@@ -418,7 +440,13 @@ impl ObjectStore {
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
-                warn!("list_iam_config_items {:?}", err);
+                warn!(
+                    path_kind = "iam_config",
+                    operation = "list_items",
+                    reason = "walk_result",
+                    error = %err,
+                    "system path list failed"
+                );
                 ctx.cancel();
 
                 return Err(err);
