@@ -22,7 +22,7 @@ use crate::server::{
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
-        AdminChunkedContentLengthCompatLayer, BodylessStatusFixLayer, ConditionalCorsLayer, HeadRequestBodyFixLayer,
+        BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
         ObjectAttributesEtagFixLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
@@ -680,7 +680,7 @@ fn process_connection(
         //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
         //  4. SetRequestIdLayer                       — generates X-Request-ID
         //  5. RequestContextLayer                    — creates RequestContext in extensions
-        //  6. AdminChunkedContentLengthCompatLayer    — admin API compat
+        //  6. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for known empty-body API routes
         //  7. CatchPanicLayer                        — panic → 500
         //  8. ReadinessGateLayer                     — blocks until ready
         //  9. KeystoneAuthLayer                      — X-Auth-Token validation
@@ -710,7 +710,7 @@ fn process_connection(
             .option_layer(trusted_proxy_layer)
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(RequestContextLayer)
-            .layer(AdminChunkedContentLengthCompatLayer)
+            .layer(EmptyBodyContentLengthCompatLayer)
             .layer(CatchPanicLayer::new())
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
