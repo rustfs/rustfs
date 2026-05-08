@@ -40,7 +40,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -49,6 +49,19 @@ const MAX_OBJECT_LIST: i32 = 1000;
 // const MAX_PARTS_LIST: i32 = 10000;
 
 const METACACHE_SHARE_PREFIX: bool = false;
+
+fn ensure_non_empty_listing_disks(bucket: &str, path: &str, disks: &[DiskStore]) -> Result<()> {
+    if disks.is_empty() {
+        warn!(
+            bucket = %bucket,
+            path = %path,
+            "listing candidate disks collapsed to empty set"
+        );
+        return Err(StorageError::ErasureReadQuorum);
+    }
+
+    Ok(())
+}
 
 pub fn max_keys_plus_one(max_keys: i32, add_one: bool) -> i32 {
     let mut max_keys = max_keys;
@@ -761,6 +774,7 @@ impl ECStore {
                     };
 
                     let path = base_dir_from_prefix(prefix);
+                    ensure_non_empty_listing_disks(bucket, &path, &disks)?;
 
                     let mut filter_prefix = {
                         prefix
@@ -1253,6 +1267,7 @@ impl SetDisks {
         }
 
         let listing_quorum = ((ask_disks + 1) / 2) as usize;
+        ensure_non_empty_listing_disks(&opts.bucket, &opts.base_dir, &disks)?;
 
         let mut fallback_disks = Vec::new();
 

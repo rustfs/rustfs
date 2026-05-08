@@ -38,6 +38,10 @@ pub struct ClusterStats {
     pub used_bytes: u64,
     /// Available free storage in bytes
     pub free_bytes: u64,
+    /// Number of drives backed by stale capacity snapshots
+    pub stale_capacity_drives: u64,
+    /// Number of drives with no capacity observation
+    pub missing_capacity_drives: u64,
     /// Total number of objects in the cluster
     pub objects_count: u64,
     /// Total number of buckets in the cluster
@@ -54,6 +58,8 @@ pub fn collect_cluster_metrics(stats: &ClusterStats) -> Vec<PrometheusMetric> {
         PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_USABLE_TOTAL_BYTES_MD, stats.usable_capacity_bytes as f64),
         PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_USED_BYTES_MD, stats.used_bytes as f64),
         PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_FREE_BYTES_MD, stats.free_bytes as f64),
+        PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_STALE_DRIVES_MD, stats.stale_capacity_drives as f64),
+        PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_MISSING_DRIVES_MD, stats.missing_capacity_drives as f64),
         PrometheusMetric::from_descriptor(&CLUSTER_OBJECTS_TOTAL_MD, stats.objects_count as f64),
         PrometheusMetric::from_descriptor(&CLUSTER_BUCKETS_TOTAL_MD, stats.buckets_count as f64),
     ]
@@ -71,6 +77,8 @@ mod tests {
             usable_capacity_bytes: 2500,
             used_bytes: 1200,
             free_bytes: 1300,
+            stale_capacity_drives: 1,
+            missing_capacity_drives: 0,
             objects_count: 100,
             buckets_count: 5,
         };
@@ -78,7 +86,7 @@ mod tests {
         let metrics = collect_cluster_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 6);
+        assert_eq!(metrics.len(), 8);
 
         // Verify raw capacity
         let raw_capacity_name = CLUSTER_CAPACITY_RAW_TOTAL_BYTES_MD.get_full_metric_name();
@@ -108,7 +116,7 @@ mod tests {
         let metrics = collect_cluster_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 6);
+        assert_eq!(metrics.len(), 8);
 
         // All values should be zero
         for metric in &metrics {
@@ -124,6 +132,8 @@ mod tests {
         assert_eq!(stats.usable_capacity_bytes, 0);
         assert_eq!(stats.used_bytes, 0);
         assert_eq!(stats.free_bytes, 0);
+        assert_eq!(stats.stale_capacity_drives, 0);
+        assert_eq!(stats.missing_capacity_drives, 0);
         assert_eq!(stats.objects_count, 0);
         assert_eq!(stats.buckets_count, 0);
     }

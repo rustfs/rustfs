@@ -15,7 +15,11 @@
 pub mod local_snapshot;
 
 use crate::{
-    bucket::metadata_sys::get_replication_config, config::com::read_config, disk::DiskAPI, error::Error, store::ECStore,
+    bucket::metadata_sys::get_replication_config,
+    config::com::read_config,
+    disk::DiskAPI,
+    error::{Error, classify_system_path_failure_reason},
+    store::ECStore,
     store_api::ListOperations,
 };
 pub use local_snapshot::{
@@ -26,6 +30,7 @@ pub use local_snapshot::{
 use rustfs_common::data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
+use rustfs_io_metrics::record_system_path_failure;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -109,7 +114,16 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
     let buf: Vec<u8> = match read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await {
         Ok(data) => data,
         Err(e) => {
-            error!("Failed to read data usage info from backend: {}", e);
+            let reason = classify_system_path_failure_reason(&e);
+            record_system_path_failure("data_usage", "read_primary", reason);
+            error!(
+                path_kind = "data_usage",
+                operation = "read_primary",
+                reason,
+                object = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                error = %e,
+                "system path read failed"
+            );
 
             match read_config(store.clone(), format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()).as_str()).await {
                 Ok(data) => data,
@@ -117,7 +131,16 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
                     if e == Error::ConfigNotFound {
                         return Ok(DataUsageInfo::default());
                     }
-                    error!("Failed to read data usage info from backend: {}", e);
+                    let reason = classify_system_path_failure_reason(&e);
+                    record_system_path_failure("data_usage", "read_backup", reason);
+                    error!(
+                        path_kind = "data_usage",
+                        operation = "read_backup",
+                        reason,
+                        object = %format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+                        error = %e,
+                        "system path read failed"
+                    );
                     return Err(Error::other(e));
                 }
             }
