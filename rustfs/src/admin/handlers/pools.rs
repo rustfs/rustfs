@@ -172,10 +172,10 @@ impl Operation for ListPools {
         .await?;
 
         let usecase = DefaultAdminUsecase::from_global();
-        let pools_status = usecase.execute_list_pool_statuses().await.map_err(S3Error::from)?;
+        let pool_items = usecase.execute_list_pools().await.map_err(S3Error::from)?;
 
-        let data = serde_json::to_vec(&pools_status)
-            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
+        let data = serde_json::to_vec(&pool_items)
+            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "serialize pools list failed"))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
