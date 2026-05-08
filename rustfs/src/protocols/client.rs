@@ -618,14 +618,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         let upload_id = input.upload_id.clone();
-        let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id)
-            .parse()
-            .map_err(|e| {
-                s3s::S3Error::with_message(
-                    s3s::S3ErrorCode::InvalidRequest,
-                    format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
-                )
-            })?;
+        let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id).parse().map_err(|e| {
+            s3s::S3Error::with_message(
+                s3s::S3ErrorCode::InvalidRequest,
+                format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
+            )
+        })?;
 
         let req = self
             .create_request(
@@ -661,14 +659,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         let upload_id = input.upload_id.clone();
-        let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id)
-            .parse()
-            .map_err(|e| {
-                s3s::S3Error::with_message(
-                    s3s::S3ErrorCode::InvalidRequest,
-                    format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
-                )
-            })?;
+        let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id).parse().map_err(|e| {
+            s3s::S3Error::with_message(
+                s3s::S3ErrorCode::InvalidRequest,
+                format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
+            )
+        })?;
 
         let req = self
             .create_request(
