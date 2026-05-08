@@ -12,9 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{
-    AuditEntry, AuditError, AuditResult, factory::builtin_target_plugins,
-};
+use crate::{AuditEntry, AuditError, AuditResult, factory::builtin_target_plugins};
 use hashbrown::HashMap;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_ecstore::config::{Config, KVS};

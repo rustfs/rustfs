@@ -47,15 +47,10 @@ pub fn builtin_target_plugins() -> Vec<TargetPluginDescriptor<AuditEntry>> {
                 Ok(boxed_target(rustfs_targets::target::webhook::WebhookTarget::new(id, args)?))
             },
         ),
-        TargetPluginDescriptor::new(
-            ChannelTargetType::Mqtt.as_str(),
-            AUDIT_MQTT_KEYS,
-            validate_mqtt_config,
-            |id, config| {
-                let args = build_mqtt_args(config, AUDIT_DEFAULT_DIR, TargetType::AuditLog)?;
-                Ok(boxed_target(rustfs_targets::target::mqtt::MQTTTarget::new(id, args)?))
-            },
-        ),
+        TargetPluginDescriptor::new(ChannelTargetType::Mqtt.as_str(), AUDIT_MQTT_KEYS, validate_mqtt_config, |id, config| {
+            let args = build_mqtt_args(config, AUDIT_DEFAULT_DIR, TargetType::AuditLog)?;
+            Ok(boxed_target(rustfs_targets::target::mqtt::MQTTTarget::new(id, args)?))
+        }),
         TargetPluginDescriptor::new(
             ChannelTargetType::Nats.as_str(),
             AUDIT_NATS_KEYS,
@@ -88,8 +83,7 @@ pub fn builtin_target_plugins() -> Vec<TargetPluginDescriptor<AuditEntry>> {
             AUDIT_REDIS_KEYS,
             |config| validate_redis_config(config, AUDIT_DEFAULT_DIR, AUDIT_REDIS_DEFAULT_CHANNEL),
             |id, config| {
-                let args =
-                    build_redis_args(config, AUDIT_DEFAULT_DIR, AUDIT_REDIS_DEFAULT_CHANNEL, TargetType::AuditLog)?;
+                let args = build_redis_args(config, AUDIT_DEFAULT_DIR, AUDIT_REDIS_DEFAULT_CHANNEL, TargetType::AuditLog)?;
                 Ok(boxed_target(rustfs_targets::target::redis::RedisTarget::new(id, args)?))
             },
         ),

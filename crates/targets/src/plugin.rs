@@ -100,9 +100,7 @@ where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
     pub fn new() -> Self {
-        Self {
-            plugins: HashMap::new(),
-        }
+        Self { plugins: HashMap::new() }
     }
 
     pub fn register(&mut self, plugin: TargetPluginDescriptor<E>) -> Option<TargetPluginDescriptor<E>> {
