@@ -14,6 +14,8 @@
 
 use rustfs_policy::auth::UserIdentity;
 use std::net::IpAddr;
+#[cfg(test)]
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 /// Protocol types
@@ -22,6 +24,7 @@ pub enum Protocol {
     Ftps,
     Swift,
     WebDav,
+    Sftp,
 }
 
 /// Protocol principal representing an authenticated user
@@ -64,5 +67,44 @@ impl SessionContext {
     /// Get the access key for this session
     pub fn access_key(&self) -> &str {
         self.principal.access_key()
+    }
+}
+
+/// Build a SessionContext suitable for driver-level unit tests. The
+/// principal has an empty access key and an empty secret key. Auth
+/// decisions in tests come from the gateway test override, not from
+/// these credentials. The fields are inspected only when a test
+/// specifically asserts on them. Callers pick the Protocol variant
+/// that matches the driver under test.
+#[cfg(test)]
+pub fn test_session(protocol: Protocol) -> SessionContext {
+    let principal = ProtocolPrincipal::new(Arc::new(UserIdentity::default()));
+    SessionContext::new(principal, protocol, IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+#[cfg(test)]
+mod regression_prevention {
+    use super::*;
+
+    // Compile-time check that every Protocol variant is acknowledged here.
+    // This is intentionally an exhaustive match with no wildcard arm: if a
+    // variant is added without being named, or if any variant is removed,
+    // this test file will fail to compile.
+    #[test]
+    fn protocol_variants_are_named() {
+        fn _check(protocol: Protocol) {
+            match protocol {
+                Protocol::Ftps => {}
+                Protocol::Swift => {}
+                Protocol::WebDav => {}
+                Protocol::Sftp => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_session_carries_supplied_protocol() {
+        assert_eq!(test_session(Protocol::Sftp).protocol, Protocol::Sftp);
+        assert_eq!(test_session(Protocol::Ftps).protocol, Protocol::Ftps);
     }
 }

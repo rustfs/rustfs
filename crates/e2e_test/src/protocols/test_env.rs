@@ -32,8 +32,13 @@ impl ProtocolTestEnvironment {
     /// Create a new test environment
     /// This environment won't stop any server when dropped
     pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let temp_dir = format!("/tmp/rustfs_protocol_test_{}", uuid::Uuid::new_v4());
-        std::fs::create_dir_all(&temp_dir)?;
+        let mut path = std::env::temp_dir();
+        path.push(format!("rustfs_protocol_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path)?;
+        let temp_dir = path
+            .to_str()
+            .ok_or_else(|| format!("temp dir path is not utf-8: {}", path.display()))?
+            .to_string();
 
         Ok(Self { temp_dir })
     }

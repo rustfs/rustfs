@@ -306,6 +306,8 @@ libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.7"
+russh = "0.60.0"
+russh-sftp = "2.1.1"
 
 # WebDAV
 dav-server = "0.11.0"
@@ -325,6 +327,9 @@ pprof = { package = "pprof-pyroscope-fork", version = "0.1500.3", features = ["f
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs"]
+
+[patch.crates-io]
+russh = { git = "https://github.com/simon-escapecode/russh", branch = "fix/697-migrate-stable-crypto-stack" }
 
 [profile.release]
 opt-level = 3

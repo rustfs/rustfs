@@ -1204,6 +1204,60 @@ mod tests {
         ) -> Result<DeleteBucketOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
+
+        async fn copy_object(
+            &self,
+            _input: CopyObjectInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<CopyObjectOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn create_multipart_upload(
+            &self,
+            _input: CreateMultipartUploadInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<CreateMultipartUploadOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn upload_part(
+            &self,
+            _input: UploadPartInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<UploadPartOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn complete_multipart_upload(
+            &self,
+            _input: CompleteMultipartUploadInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            _input: AbortMultipartUploadInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<AbortMultipartUploadOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
+
+        async fn upload_part_copy(
+            &self,
+            _input: UploadPartCopyInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<UploadPartCopyOutput, Self::Error> {
+            unreachable!("parse_path tests should not hit storage")
+        }
     }
 
     fn driver() -> WebDavDriver<DummyStorage> {

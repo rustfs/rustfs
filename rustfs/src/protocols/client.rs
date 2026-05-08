@@ -167,10 +167,11 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let mut headers = HeaderMap::default();
         if let Some(ref body) = input.body {
             let (lower, upper) = body.size_hint();
-            if let Some(len) = upper {
-                headers.insert("content-length", len.to_string().parse().unwrap());
-            } else if lower > 0 {
-                headers.insert("content-length", lower.to_string().parse().unwrap());
+            let resolved_len = upper.or(if lower > 0 { Some(lower) } else { None });
+            if let Some(len) = resolved_len
+                && let Ok(header_value) = len.to_string().parse()
+            {
+                headers.insert("content-length", header_value);
             }
         }
 
@@ -433,6 +434,38 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
     }
 
+    async fn copy_object(
+        &self,
+        input: CopyObjectInput,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<CopyObjectOutput, Self::Error> {
+        trace!("Protocol storage client CopyObject request: bucket={}, key={}", input.bucket, input.key);
+
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
+
+        let req = self
+            .create_request(
+                input,
+                Method::PUT,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket),
+                    object: Some(key),
+                    access_key,
+                    secret_key,
+                },
+            )
+            .await?;
+
+        match self.fs.copy_object(req).await {
+            Ok(response) => Ok(response.output),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn delete_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<DeleteBucketOutput, Self::Error> {
         trace!("Protocol storage client DeleteBucket request: bucket={}", bucket);
 
@@ -456,6 +489,216 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             .await?;
 
         match self.fs.delete_bucket(req).await {
+            Ok(response) => Ok(response.output),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        input: CreateMultipartUploadInput,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<CreateMultipartUploadOutput, Self::Error> {
+        trace!(
+            "Protocol storage client CreateMultipartUpload request: bucket={}, key={}",
+            input.bucket, input.key
+        );
+
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        let uri: http::Uri = format!("/{}{}?uploads", bucket, key).parse().unwrap_or_default();
+
+        let req = self
+            .create_request(
+                input,
+                Method::POST,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket),
+                    object: Some(key),
+                    access_key,
+                    secret_key,
+                },
+            )
+            .await?;
+
+        match self.fs.create_multipart_upload(req).await {
+            Ok(response) => Ok(response.output),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn upload_part(
+        &self,
+        input: UploadPartInput,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<UploadPartOutput, Self::Error> {
+        trace!(
+            "Protocol storage client UploadPart request: bucket={}, key={}, part_number={}",
+            input.bucket, input.key, input.part_number
+        );
+
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        let part_number = input.part_number;
+        let upload_id = input.upload_id.clone();
+        let uri: http::Uri = format!("/{}{}?partNumber={}&uploadId={}", bucket, key, part_number, upload_id)
+            .parse()
+            .unwrap_or_default();
+
+        // Set content-length from the body size hint so ecfs can bound
+        // the read and validate the part size. Prefer the exact upper
+        // bound when the producer knows it (the common case for an
+        // owned-buffer body). Fall back to the lower bound for truly
+        // streaming bodies of unknown length. Omit the header when the
+        // size is wholly unknown. The request then goes chunked and
+        // ecfs reads until EOF. The parse step cannot fail for ASCII
+        // digit strings, but an if-let keeps the code panic-free if a
+        // future refactor changes the source of the length value.
+        let mut headers = HeaderMap::default();
+        if let Some(ref body) = input.body {
+            let (lower, upper) = body.size_hint();
+            let resolved_len = upper.or(if lower > 0 { Some(lower) } else { None });
+            if let Some(len) = resolved_len
+                && let Ok(header_value) = len.to_string().parse()
+            {
+                headers.insert("content-length", header_value);
+            }
+        }
+
+        let req = self
+            .create_request(
+                input,
+                Method::PUT,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket),
+                    object: Some(key),
+                    access_key,
+                    secret_key,
+                },
+            )
+            .await?;
+        let req = S3Request { headers, ..req };
+
+        match self.fs.upload_part(req).await {
+            Ok(response) => Ok(response.output),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        input: CompleteMultipartUploadInput,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
+        trace!(
+            "Protocol storage client CompleteMultipartUpload request: bucket={}, key={}",
+            input.bucket, input.key
+        );
+
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        let upload_id = input.upload_id.clone();
+        let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id)
+            .parse()
+            .unwrap_or_default();
+
+        let req = self
+            .create_request(
+                input,
+                Method::POST,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket),
+                    object: Some(key),
+                    access_key,
+                    secret_key,
+                },
+            )
+            .await?;
+
+        match self.fs.complete_multipart_upload(req).await {
+            Ok(response) => Ok(response.output),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        input: AbortMultipartUploadInput,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<AbortMultipartUploadOutput, Self::Error> {
+        trace!(
+            "Protocol storage client AbortMultipartUpload request: bucket={}, key={}, upload_id={}",
+            input.bucket, input.key, input.upload_id
+        );
+
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        let upload_id = input.upload_id.clone();
+        let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id)
+            .parse()
+            .unwrap_or_default();
+
+        let req = self
+            .create_request(
+                input,
+                Method::DELETE,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket),
+                    object: Some(key),
+                    access_key,
+                    secret_key,
+                },
+            )
+            .await?;
+
+        match self.fs.abort_multipart_upload(req).await {
+            Ok(response) => Ok(response.output),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn upload_part_copy(
+        &self,
+        input: UploadPartCopyInput,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<UploadPartCopyOutput, Self::Error> {
+        trace!(
+            "Protocol storage client UploadPartCopy request: bucket={}, key={}, part_number={}",
+            input.bucket, input.key, input.part_number
+        );
+
+        let bucket = input.bucket.clone();
+        let key = input.key.clone();
+        let part_number = input.part_number;
+        let upload_id = input.upload_id.clone();
+        let uri: http::Uri = format!("/{}{}?partNumber={}&uploadId={}", bucket, key, part_number, upload_id)
+            .parse()
+            .unwrap_or_default();
+
+        let req = self
+            .create_request(
+                input,
+                Method::PUT,
+                uri,
+                RequestParams {
+                    bucket: Some(bucket),
+                    object: Some(key),
+                    access_key,
+                    secret_key,
+                },
+            )
+            .await?;
+
+        match self.fs.upload_part_copy(req).await {
             Ok(response) => Ok(response.output),
             Err(e) => Err(e),
         }
