@@ -22,7 +22,7 @@ use crate::{
 };
 use futures::future::join_all;
 use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::error::StorageError;
+use rustfs_ecstore::error::{StorageError, classify_system_path_failure_reason};
 use rustfs_ecstore::store_api::{ListOperations as _, ObjectInfoOrErr, WalkOptions};
 use rustfs_ecstore::{
     config::{
@@ -32,6 +32,7 @@ use rustfs_ecstore::{
     store::ECStore,
     store_api::{HTTPPreconditions, ObjectInfo, ObjectOptions},
 };
+use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use serde::{Serialize, de::DeserializeOwned};
@@ -366,11 +367,16 @@ impl ObjectStore {
                 .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, WalkOptions::default())
                 .await
             {
+                let reason = classify_system_path_failure_reason(&err);
+                record_system_path_failure("iam_config", "walk", reason);
                 error!(
+                    path_kind = "iam_config",
+                    operation = "walk",
+                    reason,
                     bucket = Self::BUCKET_NAME,
                     prefix = %path,
-                    error = ?err,
-                    "list_iam_config_items walk task failed"
+                    error = %err,
+                    "system path walk failed"
                 );
             }
         });
@@ -418,7 +424,14 @@ impl ObjectStore {
 
         while let Some(v) = rx.recv().await {
             if let Some(err) = v.err {
-                warn!("list_iam_config_items {:?}", err);
+                warn!(
+                    path_kind = "iam_config",
+                    operation = "list_items",
+                    reason = "walk_result",
+                    error = %err,
+                    "system path list failed"
+                );
+                record_system_path_failure("iam_config", "list_items", "walk_result");
                 ctx.cancel();
 
                 return Err(err);

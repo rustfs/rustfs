@@ -60,6 +60,24 @@ pub static DRIVE_TOTAL_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     )
 });
 
+pub static DRIVE_CAPACITY_OBSERVATION_STATE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("capacity_observation_state".to_string()),
+        "Drive capacity observation state (1 for the active state label, 0 otherwise). States: live, stale, missing",
+        &[&ALL_DRIVE_LABELS[..], &["state"]].concat(),
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_CAPACITY_OBSERVATION_AGE_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("capacity_observation_age_seconds".to_string()),
+        "Age in seconds of the drive capacity observation currently exported",
+        &ALL_DRIVE_LABELS[..],
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
 pub static DRIVE_USED_INODES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::DriveUsedInodes,

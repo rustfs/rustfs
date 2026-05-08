@@ -1565,7 +1565,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let (cred, _) = iam_sys
@@ -1588,7 +1588,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let initial_expiration = OffsetDateTime::now_utc() + time::Duration::hours(2);
@@ -1641,7 +1641,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let (cred, _) = iam_sys
@@ -1682,7 +1682,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
@@ -1763,7 +1763,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
@@ -1867,7 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn test_sts_groups_fallback_temp_creds_receive_parent_group_policies() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
@@ -1898,7 +1898,7 @@ mod tests {
     #[tokio::test]
     async fn test_sts_deny_only_session_policy_deny_blocks_when_iam_policies_empty() {
         let store = StsTestMockStore { empty_policies: true };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-empty-parent-policy-test";
@@ -1938,7 +1938,7 @@ mod tests {
     #[tokio::test]
     async fn test_sts_deny_only_session_policy_allow_when_no_deny_on_action() {
         let store = StsTestMockStore { empty_policies: true };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-empty-parent-policy-test";
@@ -1982,7 +1982,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_user_notification_populates_user_and_policy_caches() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         iam_sys.load_user("notify-user", UserType::Reg).await.unwrap();
@@ -2003,7 +2003,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_key_propagates_cache_miss_load_failure() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let result = iam_sys.check_key("load-failure-user").await;
@@ -2014,7 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_auth_eval_matches_prepare_sts_auth_for_parent_policy_fallback() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
@@ -2042,7 +2042,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_auth_detects_existing_object_tag_in_session_policy() {
         let store = StsTestMockStore { empty_policies: true };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
         let sts_access_key = "sts-session-tag-test-user";
 
@@ -2156,7 +2156,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_auth_detects_existing_object_tag_in_encoded_session_policy() {
         let store = StsTestMockStore { empty_policies: true };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
         let sts_access_key = "sts-session-tag-encoded-test-user";
 
@@ -2203,7 +2203,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_auth_service_account_inherited_ignores_session_policy_tag_hint() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let service_account_access_key = "svc-inherited-tag-hint-test-user";
@@ -2266,7 +2266,7 @@ mod tests {
     #[tokio::test]
     async fn test_policy_db_get_skips_nonexistent_groups() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         // "testgroup" exists with "readwrite" policy; "nonexistent-group" does not exist in IAM.
@@ -2287,7 +2287,7 @@ mod tests {
     #[tokio::test]
     async fn test_info_policy_returns_policy_as_json_object() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let policy_info = iam_sys
