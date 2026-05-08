@@ -22,7 +22,7 @@ use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::pools::{PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
+use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_madmin::{Disk, InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
@@ -61,6 +61,28 @@ pub struct QueryPoolStatusRequest {
     pub by_id: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminPoolListItem {
+    #[serde(rename = "id")]
+    pub id: usize,
+    #[serde(rename = "cmdline")]
+    pub cmd_line: String,
+    #[serde(rename = "lastUpdate", with = "time::serde::rfc3339")]
+    pub last_update: time::OffsetDateTime,
+    #[serde(rename = "totalSize")]
+    pub total_size: usize,
+    #[serde(rename = "currentSize")]
+    pub current_size: usize,
+    #[serde(rename = "usedSize")]
+    pub used_size: usize,
+    #[serde(rename = "used")]
+    pub used: f64,
+    #[serde(rename = "status")]
+    pub status: String,
+    #[serde(rename = "decommissionInfo")]
+    pub decommission: Option<PoolDecommissionInfo>,
+}
+
 #[derive(Clone, Default)]
 pub struct DefaultAdminUsecase {
     context: Option<Arc<AppContext>>,
@@ -76,6 +98,11 @@ impl DefaultAdminUsecase {
     const DISK_STATE_OK: &'static str = "ok";
     const DISK_STATE_UNFORMATTED: &'static str = "unformatted";
     const RUNTIME_STATE_RETURNING: &'static str = "returning";
+    const POOL_STATUS_ACTIVE: &'static str = "active";
+    const POOL_STATUS_CANCELED: &'static str = "canceled";
+    const POOL_STATUS_COMPLETE: &'static str = "complete";
+    const POOL_STATUS_FAILED: &'static str = "failed";
+    const POOL_STATUS_RUNNING: &'static str = "running";
 
     #[cfg(test)]
     pub fn without_context() -> Self {
@@ -218,6 +245,11 @@ impl DefaultAdminUsecase {
         Ok(pool_statuses)
     }
 
+    pub async fn execute_list_pools(&self) -> AdminUsecaseResult<Vec<AdminPoolListItem>> {
+        let pool_statuses = self.execute_list_pool_statuses().await?;
+        Ok(pool_statuses.into_iter().map(Self::pool_list_item_from_status).collect())
+    }
+
     pub async fn execute_query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<PoolStatus> {
         let Some(endpoints) = self.endpoints() else {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
@@ -244,6 +276,48 @@ impl DefaultAdminUsecase {
         };
 
         store.status(idx).await.map_err(ApiError::from)
+    }
+
+    fn pool_list_item_from_status(status: PoolStatus) -> AdminPoolListItem {
+        let PoolStatus {
+            id,
+            cmd_line,
+            last_update,
+            decommission,
+        } = status;
+        let total_size = decommission.as_ref().map(|info| info.total_size).unwrap_or_default();
+        let current_size = decommission.as_ref().map(|info| info.current_size).unwrap_or_default();
+        let used_size = total_size.saturating_sub(current_size);
+
+        AdminPoolListItem {
+            id,
+            cmd_line,
+            last_update,
+            total_size,
+            current_size,
+            used_size,
+            used: Self::used_ratio(total_size, used_size),
+            status: Self::pool_list_status(decommission.as_ref()).to_string(),
+            decommission,
+        }
+    }
+
+    fn pool_list_status(decommission: Option<&PoolDecommissionInfo>) -> &'static str {
+        match decommission {
+            Some(info) if info.complete => Self::POOL_STATUS_COMPLETE,
+            Some(info) if info.failed => Self::POOL_STATUS_FAILED,
+            Some(info) if info.canceled => Self::POOL_STATUS_CANCELED,
+            Some(info) if info.start_time.is_some() => Self::POOL_STATUS_RUNNING,
+            _ => Self::POOL_STATUS_ACTIVE,
+        }
+    }
+
+    fn used_ratio(total_size: usize, used_size: usize) -> f64 {
+        if total_size == 0 {
+            return 0.0;
+        }
+
+        used_size as f64 / total_size as f64
     }
 
     fn disk_is_online_for_readiness(disk: &Disk) -> bool {
@@ -406,6 +480,8 @@ impl DefaultAdminUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus};
+    use time::OffsetDateTime;
 
     #[tokio::test]
     async fn execute_query_storage_info_returns_internal_error_when_store_uninitialized() {
@@ -545,5 +621,91 @@ mod tests {
             !DefaultAdminUsecase::storage_ready_from_runtime_state(&info),
             "if any set fails write quorum, readiness must be false"
         );
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_capacity_and_active_status() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let pool = PoolStatus {
+            id: 2,
+            cmd_line: "http://node{1...4}/disk{1...4}".to_string(),
+            last_update: now,
+            decommission: Some(PoolDecommissionInfo {
+                total_size: 1_000,
+                current_size: 250,
+                ..Default::default()
+            }),
+        };
+
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+
+        assert_eq!(item.id, 2);
+        assert_eq!(item.total_size, 1_000);
+        assert_eq!(item.current_size, 250);
+        assert_eq!(item.used_size, 750);
+        assert!((item.used - 0.75).abs() < f64::EPSILON);
+        assert_eq!(item.status, "active");
+    }
+
+    #[test]
+    fn admin_pool_list_item_saturates_used_size_when_current_exceeds_total() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                total_size: 100,
+                current_size: 150,
+                ..Default::default()
+            }),
+        };
+
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+
+        assert_eq!(item.total_size, 100);
+        assert_eq!(item.current_size, 150);
+        assert_eq!(item.used_size, 0);
+        assert_eq!(item.used, 0.0);
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_running_decommission_status() {
+        let pool = PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update: OffsetDateTime::UNIX_EPOCH,
+            decommission: Some(PoolDecommissionInfo {
+                total_size: 1_000,
+                current_size: 500,
+                start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            }),
+        };
+
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+
+        assert_eq!(item.status, "running");
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_terminal_decommission_statuses() {
+        let complete = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+            complete: true,
+            ..Default::default()
+        }));
+        let failed = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+            failed: true,
+            ..Default::default()
+        }));
+        let canceled = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+            canceled: true,
+            ..Default::default()
+        }));
+        let idle = DefaultAdminUsecase::pool_list_status(None);
+
+        assert_eq!(complete, "complete");
+        assert_eq!(failed, "failed");
+        assert_eq!(canceled, "canceled");
+        assert_eq!(idle, "active");
     }
 }
