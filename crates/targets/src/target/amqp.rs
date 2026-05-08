@@ -493,7 +493,10 @@ where
         }
         match self.get_or_connect().await {
             Ok(_) => Ok(()),
-            Err(err) if self.store.is_some() => {
+            Err(err)
+                if self.store.is_some()
+                    && matches!(err, TargetError::Network(_) | TargetError::Timeout(_) | TargetError::NotConnected) =>
+            {
                 warn!(target_id = %self.id, error = %err, "AMQP init failed; events will buffer in store");
                 Ok(())
             }
