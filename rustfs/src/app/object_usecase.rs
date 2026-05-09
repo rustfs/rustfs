@@ -31,6 +31,7 @@ use crate::storage::options::{
 };
 use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
+use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_to_metadata, map_get_object_reader_error};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::*;
 use bytes::Bytes;
@@ -84,7 +85,7 @@ use rustfs_filemeta::{
 use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_rio::{CompressReader, DynReader, HashReader, wrap_reader};
+use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
 use rustfs_s3_common::S3Operation;
 use rustfs_s3select_api::{
     object_store::bytes_stream,
@@ -118,6 +119,7 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
+
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1279,7 +1281,7 @@ impl DefaultObjectUsecase {
         opts: &ObjectOptions,
         part_number: Option<usize>,
     ) -> S3Result<GetObjectPreparedRead<'a>> {
-        let h = HeaderMap::new();
+        let h = req.headers.clone();
         let io_planning = Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
         let store = get_validated_store(bucket).await?;
 
@@ -1306,7 +1308,7 @@ impl DefaultObjectUsecase {
         let reader = store
             .get_object_reader(bucket, key, rs.clone(), h, opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(map_get_object_reader_error)?;
 
         let info = reader.object_info;
 
@@ -1372,13 +1374,9 @@ impl DefaultObjectUsecase {
             metadata: &info.user_defined,
             sse_customer_key: req.input.sse_customer_key.as_ref(),
             sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
-            part_number: None,
-            parts: &info.parts,
-            etag: info.etag.as_deref(),
         };
 
-        let mut response_content_length = content_length;
-        let encrypted_stream = reader.stream;
+        let response_content_length = content_length;
 
         let (
             server_side_encryption,
@@ -1390,27 +1388,18 @@ impl DefaultObjectUsecase {
         ) = match sse_decryption(decryption_request).await? {
             Some(material) => {
                 let server_side_encryption = Some(material.server_side_encryption.clone());
-                let sse_customer_algorithm = Some(material.algorithm.clone());
+                let sse_customer_algorithm = matches!(material.sse_type, SSEType::SseC).then_some(material.algorithm.clone());
                 let sse_customer_key_md5 = material.customer_key_md5.clone();
-                let ssekms_key_id = material.kms_key_id.clone();
-
-                let (decrypted_stream, plaintext_size) = material
-                    .wrap_reader(encrypted_stream, content_length)
-                    .await
-                    .map_err(ApiError::from)?;
-
-                response_content_length = plaintext_size;
-
                 (
                     server_side_encryption,
                     sse_customer_algorithm,
                     sse_customer_key_md5,
-                    ssekms_key_id,
+                    material.kms_key_id,
                     true,
-                    decrypted_stream,
+                    wrap_reader(reader.stream),
                 )
             }
-            None => (None, None, None, None, false, wrap_reader(encrypted_stream)),
+            None => (None, None, None, None, false, wrap_reader(reader.stream)),
         };
 
         Ok(GetObjectReadSetup {
@@ -1896,9 +1885,6 @@ impl DefaultObjectUsecase {
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
 
         let encryption_material = match sse_encryption(encryption_request).await {
@@ -1914,11 +1900,11 @@ impl DefaultObjectUsecase {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
-            let encrypted_reader = material.wrap_reader(reader);
+            let encrypted_reader = EncryptReader::new(reader, material.key_bytes, material.base_nonce);
             reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                 .map_err(ApiError::from)?;
 
-            let encryption_metadata = material.metadata;
+            let encryption_metadata = encryption_material_to_metadata(&material);
             metadata.extend(encryption_metadata.clone());
             opts.user_defined.extend(encryption_metadata);
         }
@@ -2577,6 +2563,7 @@ impl DefaultObjectUsecase {
             sse_customer_algorithm,
             sse_customer_key,
             sse_customer_key_md5,
+            copy_source_sse_customer_algorithm,
             copy_source_sse_customer_key,
             copy_source_sse_customer_key_md5,
             metadata_directive,
@@ -2679,12 +2666,16 @@ impl DefaultObjectUsecase {
             })
         });
 
-        let h = HeaderMap::new();
+        let h = build_ssec_read_headers(
+            copy_source_sse_customer_algorithm.as_ref(),
+            copy_source_sse_customer_key.as_ref(),
+            copy_source_sse_customer_key_md5.as_ref(),
+        );
 
         let gr = store
             .get_object_reader(&src_bucket, &src_key, None, h, &src_get_opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(map_get_object_reader_error)?;
 
         let mut src_info = gr.object_info.clone();
 
@@ -2714,25 +2705,6 @@ impl DefaultObjectUsecase {
 
         if cp_src_dst_same {
             src_info.metadata_only = true;
-        }
-
-        let decryption_request = DecryptionRequest {
-            bucket: &src_bucket,
-            key: &src_key,
-            metadata: &src_info.user_defined,
-            sse_customer_key: copy_source_sse_customer_key.as_ref(),
-            sse_customer_key_md5: copy_source_sse_customer_key_md5.as_ref(),
-            part_number: None,
-            parts: &src_info.parts,
-            etag: src_info.etag.as_deref(),
-        };
-
-        let decryption_material = sse_decryption(decryption_request).await?;
-
-        if let Some(material) = decryption_material.as_ref()
-            && let Some(original) = material.original_size
-        {
-            src_info.actual_size = original;
         }
 
         strip_managed_encryption_metadata(&mut src_info.user_defined);
@@ -2782,67 +2754,20 @@ impl DefaultObjectUsecase {
         }
         apply_bucket_default_lock_retention(&bucket, &mut src_info.user_defined, has_explicit_object_lock_retention).await?;
 
-        let mut reader = match decryption_material {
-            Some(material) => {
-                if material.is_multipart {
-                    let (decrypted_stream, plaintext_size) =
-                        material.wrap_reader(gr.stream, length).await.map_err(ApiError::from)?;
-                    length = plaintext_size;
-
-                    if should_compress {
-                        let hrd = HashReader::from_reader(decrypted_stream, length, actual_size, None, None, false)
-                            .map_err(ApiError::from)?;
-                        length = HashReader::SIZE_PRESERVE_LAYER;
-                        HashReader::from_reader(
-                            CompressReader::new(hrd, CompressionAlgorithm::default()),
-                            length,
-                            actual_size,
-                            None,
-                            None,
-                            false,
-                        )
-                        .map_err(ApiError::from)?
-                    } else {
-                        HashReader::from_reader(decrypted_stream, length, actual_size, None, None, false)
-                            .map_err(ApiError::from)?
-                    }
-                } else if should_compress {
-                    let hrd =
-                        HashReader::from_stream(material.wrap_single_reader(gr.stream), length, actual_size, None, None, false)
-                            .map_err(ApiError::from)?;
-                    length = HashReader::SIZE_PRESERVE_LAYER;
-                    HashReader::from_reader(
-                        CompressReader::new(hrd, CompressionAlgorithm::default()),
-                        length,
-                        actual_size,
-                        None,
-                        None,
-                        false,
-                    )
-                    .map_err(ApiError::from)?
-                } else {
-                    HashReader::from_stream(material.wrap_single_reader(gr.stream), length, actual_size, None, None, false)
-                        .map_err(ApiError::from)?
-                }
-            }
-            None => {
-                if should_compress {
-                    let hrd =
-                        HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
-                    length = HashReader::SIZE_PRESERVE_LAYER;
-                    HashReader::from_reader(
-                        CompressReader::new(hrd, CompressionAlgorithm::default()),
-                        length,
-                        actual_size,
-                        None,
-                        None,
-                        false,
-                    )
-                    .map_err(ApiError::from)?
-                } else {
-                    HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?
-                }
-            }
+        let mut reader = if should_compress {
+            let hrd = HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
+            length = HashReader::SIZE_PRESERVE_LAYER;
+            HashReader::from_reader(
+                CompressReader::new(hrd, CompressionAlgorithm::default()),
+                length,
+                actual_size,
+                None,
+                None,
+                false,
+            )
+            .map_err(ApiError::from)?
+        } else {
+            HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?
         };
 
         let encryption_request = EncryptionRequest {
@@ -2854,20 +2779,17 @@ impl DefaultObjectUsecase {
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
             content_size: actual_size,
-            part_number: None,
-            part_key: None,
-            part_nonce: None,
         };
 
         if let Some(material) = sse_encryption(encryption_request).await? {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
-            let encrypted_reader = material.wrap_reader(reader);
+            let encrypted_reader = EncryptReader::new(reader, material.key_bytes, material.base_nonce);
             reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                 .map_err(ApiError::from)?;
 
-            src_info.user_defined.extend(material.metadata);
+            src_info.user_defined.extend(encryption_material_to_metadata(&material));
         }
 
         src_info.put_object_reader = Some(PutObjReader::new(reader));
@@ -4380,20 +4302,17 @@ impl DefaultObjectUsecase {
                 sse_customer_key: sse_customer_key.clone(),
                 sse_customer_key_md5: sse_customer_key_md5.clone(),
                 content_size: actual_size,
-                part_number: None,
-                part_key: None,
-                part_nonce: None,
             })
             .await?
             {
                 effective_sse = Some(material.server_side_encryption.clone());
                 effective_kms_key_id = material.kms_key_id.clone();
 
-                let encrypted_reader = material.wrap_reader(hrd);
+                let encrypted_reader = EncryptReader::new(hrd, material.key_bytes, material.base_nonce);
                 hrd = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                     .map_err(ApiError::from)?;
 
-                let encryption_metadata = material.metadata;
+                let encryption_metadata = encryption_material_to_metadata(&material);
                 metadata.extend(encryption_metadata.clone());
                 opts.user_defined.extend(encryption_metadata);
             }
@@ -4509,7 +4428,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
-
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,

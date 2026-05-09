@@ -8803,6 +8803,7 @@ dependencies = [
 name = "rustfs-ecstore"
 version = "1.0.0-beta.2"
 dependencies = [
+ "aes-gcm",
  "async-channel",
  "async-recursion",
  "async-trait",
@@ -8860,6 +8861,7 @@ dependencies = [
  "rustfs-credentials",
  "rustfs-filemeta",
  "rustfs-io-metrics",
+ "rustfs-kms",
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-policy",
