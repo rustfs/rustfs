@@ -5428,6 +5428,57 @@ mod tests {
         drop(temp_dir);
     }
 
+    #[tokio::test]
+    async fn list_path_returns_read_quorum_when_runtime_candidates_are_empty() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (dir, endpoint, disk) = make_formatted_local_disk_for_info_test(disk_idx, &format).await;
+            temp_dirs.push(dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        for disk in set_disks.get_disks_internal().await.iter().flatten() {
+            disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let err = set_disks
+            .list_path(
+                CancellationToken::new(),
+                crate::store_list_objects::ListPathOptions {
+                    bucket: "bucket".to_string(),
+                    recursive: true,
+                    ..Default::default()
+                },
+                tx,
+            )
+            .await
+            .expect_err("empty runtime candidate set should fail before list_path_raw");
+
+        assert_eq!(err, StorageError::ErasureReadQuorum);
+
+        drop(temp_dirs);
+    }
+
     #[test]
     fn test_dangling_meta_errs_count() {
         // Test counting dangling metadata errors

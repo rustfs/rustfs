@@ -4,9 +4,9 @@ Applies to `crates/targets/`.
 
 `rustfs-targets` provides the notification target abstraction layer:
 the `Target<E>` trait, built-in implementations (Webhook, Kafka, MQTT,
-NATS, Pulsar, MySQL), persistent queue store, DSN/configuration
-builders, and the `ChannelTargetType` registry that maps target types
-to their runtime factories.
+NATS, Pulsar, MySQL, Postgres, Redis), persistent queue store,
+DSN/configuration builders, and the `ChannelTargetType` registry that
+maps target types to their runtime factories.
 
 ## Library Design
 
@@ -27,34 +27,12 @@ to their runtime factories.
 
 ## Integration Tests
 
-### MySQL Integration Tests
+Integration tests under `tests/` are `#[ignore]` by default so CI never runs
+them. See the module-level doc comment in each test file for prerequisites
+and run commands:
 
-Integration tests in `tests/mysql_integration.rs` require a running MySQL 8.0+
-or TiDB 8.5+ instance. They are `#[ignore]` by default so CI never runs them.
-
-Start a test MySQL instance with Podman:
-
-```bash
-podman run -d --name rustfs-mysql-test \
-  -e MYSQL_ROOT_PASSWORD=testpass \
-  -e MYSQL_DATABASE=testdb \
-  -p 3306:3306 \
-  docker.io/library/mysql:8.0.36
-```
-
-Wait for MySQL to be ready (look for `ready for connections` in logs),
-then run the integration tests:
-
-```bash
-RUSTFS_MYSQL_TEST_DSN="root:testpass@tcp(127.0.0.1:3306)/testdb" \
-  cargo test -p rustfs-targets -- --ignored
-```
-
-Clean up:
-
-```bash
-podman rm -f rustfs-mysql-test
-```
+- `tests/mysql_integration.rs` — MySQL 8.0+ / TiDB 8.5+
+- `tests/postgres_integration.rs` — PostgreSQL
 
 ## Suggested Validation
 
