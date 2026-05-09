@@ -889,6 +889,14 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// stamp mtime. Returning OpUnsupported there causes them to flag
     /// every successful upload as a transfer failure. A silent success
     /// is the only client-compatible answer.
+    ///
+    /// Attributes carried in the request, including any size value,
+    /// are intentionally not applied to the backend. A standalone
+    /// SETSTAT(size=0) request returns Ok without truncating the
+    /// object. Whole-object replacement is available via OPEN with
+    /// CREATE | TRUNCATE, which the rsync truncate-then-fill flow
+    /// chains immediately after SETSTAT, so the unhonoured size has
+    /// no client-visible effect for the common cases.
     #[tracing::instrument(level = "debug", skip(self, _attrs), fields(id, path = %sanitise_control_bytes(&_path)), err(Debug))]
     async fn setstat(&mut self, id: u32, _path: String, _attrs: FileAttributes) -> Result<Status, Self::Error> {
         self.enforce_server_readonly()?;

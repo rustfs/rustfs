@@ -305,12 +305,33 @@ pub async fn test_sftp_core_operations() -> Result<()> {
         // CREATE | EXCLUDE on a key that already exists must fail. The
         // existing renamed.txt is the target. EXCLUDE without WRITE is
         // rejected by the russh-sftp client itself, so WRITE is included.
+        // TRUNCATE is included because the driver requires WRITE | CREATE
+        // | TRUNCATE on every accepted write OPEN.
         info!("Testing SFTP: open with CREATE + EXCLUDE on existing path returns an error");
         let excl_err = sftp
-            .open_with_flags(&renamed, OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE)
+            .open_with_flags(&renamed, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::EXCLUDE | OpenFlags::WRITE)
             .await;
         assert!(excl_err.is_err(), "CREATE+EXCLUDE on existing path must error");
         info!("PASS: CREATE+EXCLUDE on existing path rejected");
+
+        // --- WRITE without CREATE or TRUNCATE is rejected at OPEN ---
+        // The streaming write path overwrites the entire object at
+        // close. A WRITE-only OPEN asks for partial-write semantics
+        // the server cannot honour against S3, so the OPEN is
+        // rejected before any handle is allocated.
+        info!("Testing SFTP: open with WRITE only returns an error");
+        let write_only_err = sftp.open_with_flags(&renamed, OpenFlags::WRITE).await;
+        assert!(write_only_err.is_err(), "WRITE without CREATE or TRUNCATE must be rejected at OPEN");
+        info!("PASS: WRITE only rejected");
+
+        // --- WRITE | CREATE without TRUNCATE is rejected at OPEN ---
+        // Without TRUNCATE the client is asking for create-or-modify-
+        // existing semantics. The server cannot deliver that against
+        // S3, so the OPEN is rejected before any handle is allocated.
+        info!("Testing SFTP: open with WRITE | CREATE without TRUNCATE returns an error");
+        let create_no_trunc_err = sftp.open_with_flags(&renamed, OpenFlags::WRITE | OpenFlags::CREATE).await;
+        assert!(create_no_trunc_err.is_err(), "WRITE | CREATE without TRUNCATE must be rejected at OPEN");
+        info!("PASS: WRITE | CREATE without TRUNCATE rejected");
 
         // --- Spec-letter assertion: bad password is rejected (separate session) ---
         // Fresh russh session with wrong credentials. The authenticated

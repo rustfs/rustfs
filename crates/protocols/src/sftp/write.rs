@@ -211,17 +211,27 @@ pub(super) fn should_abort_on_drop(phase: &WritePhase) -> Option<&str> {
 }
 
 impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
-    /// Write-side OPEN: enforce read-only mode, authorise PutObject, and
-    /// honour the EXCLUDE flag with a HeadObject existence check before
-    /// allocating the handle. No bytes are sent to S3 here. The upload
-    /// happens at CLOSE with a single PutObject call carrying the
-    /// buffered payload.
+    /// Write-side OPEN: enforce read-only mode, authorise PutObject,
+    /// and require WRITE | CREATE | TRUNCATE (with optional EXCLUDE).
+    /// No bytes are sent to S3 here. The upload happens at CLOSE with
+    /// a single PutObject call carrying the buffered payload.
     ///
-    /// EXCLUDE semantics: the existence check is best-effort. A second
-    /// client racing the same path can win the PutObject between this
-    /// HEAD and the eventual CLOSE. The SFTPv3 draft does not guarantee
-    /// atomicity here and S3 has no native CAS primitive, so the race is
-    /// accepted.
+    /// The streaming write path overwrites the entire object at close
+    /// so the only flag combination that matches that semantic is
+    /// CREATE | TRUNCATE. WRITE without CREATE or TRUNCATE,
+    /// WRITE | CREATE without TRUNCATE, and other combinations would
+    /// silently mistranslate partial-write or open-without-truncate
+    /// intent into truncate-and-replace, with data loss for clients
+    /// that requested the former. Those combinations return
+    /// OpUnsupported at OPEN so the client sees a clean error rather
+    /// than a corrupted object at CLOSE.
+    ///
+    /// EXCLUDE adds a HeadObject existence check so the OPEN fails
+    /// when the key already exists. The check is best-effort. A
+    /// second client racing the same path can win the PutObject
+    /// between this HEAD and the eventual CLOSE. The SFTPv3 draft
+    /// does not guarantee atomicity here and S3 has no native CAS
+    /// primitive, so the race is accepted.
     pub(super) async fn open_write(&mut self, id: u32, filename: &str, pflags: OpenFlags) -> Result<Handle, SftpError> {
         self.enforce_server_readonly()?;
 
@@ -235,7 +245,18 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
 
         self.authorize(&S3Action::PutObject, &bucket, Some(&object_key)).await?;
 
-        if pflags.contains(OpenFlags::EXCLUDE) {
+        let creat = pflags.contains(OpenFlags::CREATE);
+        let trunc = pflags.contains(OpenFlags::TRUNCATE);
+        let excl = pflags.contains(OpenFlags::EXCLUDE);
+
+        // Reject any flag combination that would not be honoured by a
+        // single PutObject at CLOSE. See the doc comment above for the
+        // full rationale.
+        if !creat || !trunc {
+            return Err(SftpError::code(StatusCode::OpUnsupported));
+        }
+
+        if excl {
             // EXCLUDE (SSH_FXF_EXCL): check whether the object already
             // exists. HEAD returning Ok means the key is taken. A
             // not-found error means the key is free. Any other error is
@@ -1084,7 +1105,11 @@ mod tests {
 
     // SFTPv3 draft section 6.3 rule: EXCL and TRUNC are modifiers of
     // CREAT. The open() handler boundary check lives in a free function
-    // so these tests exercise it without a StorageBackend mock.
+    // so these tests exercise it without a StorageBackend mock. WRITE
+    // without CREATE or TRUNCATE passes the boundary check.
+    // open_write rejects that combination at the next gate with
+    // OpUnsupported because the streaming write path requires
+    // CREATE | TRUNCATE.
 
     #[test]
     fn open_flags_excl_without_create_is_rejected() {
@@ -1765,6 +1790,85 @@ mod tests {
         );
     }
 
+    // --- open_write strict-flag gate ---
+
+    #[tokio::test]
+    async fn open_write_write_only_returns_op_unsupported() {
+        // OpenFlags::WRITE without CREATE or TRUNCATE is rejected at
+        // OPEN. No HEAD call is issued because the gate is flag-only.
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let err = with_test_auth_override(|_, _, _| true, driver.open_write(7, "/bucket/key", OpenFlags::WRITE))
+            .await
+            .expect_err("WRITE without CREATE or TRUNCATE must be rejected");
+        assert!(matches!(err.0, StatusCode::OpUnsupported));
+        assert!(
+            backend.head_object_calls().is_empty(),
+            "no HEAD call should be issued on the strict-flag rejection path"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_write_create_without_trunc_returns_op_unsupported() {
+        // WRITE | CREATE without TRUNCATE is rejected at OPEN. The
+        // streaming write path cannot honour create-or-modify-existing
+        // semantics, so the rejection is unconditional and no HEAD is
+        // issued.
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let err =
+            with_test_auth_override(|_, _, _| true, driver.open_write(7, "/bucket/key", OpenFlags::WRITE | OpenFlags::CREATE))
+                .await
+                .expect_err("WRITE | CREATE without TRUNCATE must be rejected");
+        assert!(matches!(err.0, StatusCode::OpUnsupported));
+        assert!(
+            backend.head_object_calls().is_empty(),
+            "no HEAD call should be issued on the strict-flag rejection path"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_write_create_and_trunc_succeeds_on_missing_file() {
+        // WRITE | CREATE | TRUNCATE on a missing file: no HEAD
+        // response is queued. If the OPEN attempted a HEAD it would
+        // trigger a DummyBackend panic. The successful return proves
+        // the non-EXCL accept path allocates a handle without
+        // consulting backend object state.
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let handle = with_test_auth_override(
+            |_, _, _| true,
+            driver.open_write(9, "/bucket/missing_key", OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE),
+        )
+        .await
+        .expect("WRITE | CREATE | TRUNCATE on a missing file must allocate a handle");
+        assert!(!handle.handle.is_empty());
+        assert!(backend.head_object_calls().is_empty(), "the non-EXCL accept path must not HEAD");
+    }
+
+    #[tokio::test]
+    async fn open_write_create_and_trunc_succeeds_on_existing_file() {
+        // WRITE | CREATE | TRUNCATE on an existing file: queue a
+        // HEAD-Ok response. The OPEN succeeds and the queued HEAD
+        // response is not consumed, proving the non-EXCL accept path
+        // is independent of backend object state.
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_head_object_ok(42, None);
+        let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let handle = with_test_auth_override(
+            |_, _, _| true,
+            driver.open_write(10, "/bucket/existing_key", OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE),
+        )
+        .await
+        .expect("WRITE | CREATE | TRUNCATE on an existing file must allocate a handle");
+        assert!(!handle.handle.is_empty());
+        assert!(backend.head_object_calls().is_empty(), "the non-EXCL accept path must not HEAD");
+    }
+
     // --- open_write EXCL ---
 
     #[tokio::test]
@@ -1775,7 +1879,11 @@ mod tests {
 
         let err = with_test_auth_override(
             |_, _, _| true,
-            driver.open_write(7, "/bucket/key", OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE),
+            driver.open_write(
+                7,
+                "/bucket/key",
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            ),
         )
         .await
         .expect_err("EXCL on an existing object must fail");
@@ -1794,7 +1902,11 @@ mod tests {
 
         let handle = with_test_auth_override(
             |_, _, _| true,
-            driver.open_write(9, "/bucket/key2", OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE),
+            driver.open_write(
+                9,
+                "/bucket/key2",
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            ),
         )
         .await
         .expect("EXCL on a missing key must allow creation");
