@@ -12,29 +12,20 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{
-    AuditEntry, AuditError, AuditResult,
-    factory::{
-        KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory,
-        RedisTargetFactory, TargetFactory, WebhookTargetFactory,
-    },
-};
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
+use crate::{AuditEntry, AuditError, AuditResult, factory::builtin_target_plugins};
 use hashbrown::HashMap;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::arn::TargetID;
-use rustfs_targets::{Target, TargetError, config::collect_target_configs, target::ChannelTargetType};
-use std::sync::Arc;
+use rustfs_targets::{Target, TargetError, TargetPluginRegistry};
 use tracing::{error, info};
 
 /// Registry for managing audit targets
 pub struct AuditRegistry {
     /// Storage for created targets
     targets: HashMap<String, Box<dyn Target<AuditEntry> + Send + Sync>>,
-    /// Factories for creating targets
-    factories: HashMap<String, Box<dyn TargetFactory>>,
+    /// Registered plugins for creating targets
+    plugins: TargetPluginRegistry<AuditEntry>,
 }
 
 impl Default for AuditRegistry {
@@ -46,31 +37,17 @@ impl Default for AuditRegistry {
 impl AuditRegistry {
     /// Creates a new AuditRegistry
     pub fn new() -> Self {
-        let mut registry = AuditRegistry {
-            factories: HashMap::new(),
+        let mut plugins = TargetPluginRegistry::new();
+        plugins.register_all(builtin_target_plugins());
+
+        AuditRegistry {
             targets: HashMap::new(),
-        };
-
-        // Register built-in factories
-        registry.register(ChannelTargetType::Webhook.as_str(), Box::new(WebhookTargetFactory));
-        registry.register(ChannelTargetType::Mqtt.as_str(), Box::new(MQTTTargetFactory));
-        registry.register(ChannelTargetType::Nats.as_str(), Box::new(NATSTargetFactory));
-        registry.register(ChannelTargetType::Pulsar.as_str(), Box::new(PulsarTargetFactory));
-        registry.register(ChannelTargetType::Kafka.as_str(), Box::new(KafkaTargetFactory));
-        registry.register(ChannelTargetType::Redis.as_str(), Box::new(RedisTargetFactory));
-        registry.register(ChannelTargetType::MySql.as_str(), Box::new(MySqlTargetFactory));
-        registry.register(ChannelTargetType::Postgres.as_str(), Box::new(PostgresTargetFactory));
-
-        registry
+            plugins,
+        }
     }
 
-    /// Registers a new factory for a target type
-    ///
-    /// # Arguments
-    /// * `target_type` - The type of the target (e.g., "webhook", "mqtt").
-    /// * `factory` - The factory instance to create targets of this type.
-    pub fn register(&mut self, target_type: &str, factory: Box<dyn TargetFactory>) {
-        self.factories.insert(target_type.to_string(), factory);
+    pub fn supports_target_type(&self, target_type: &str) -> bool {
+        self.plugins.supports_target_type(target_type)
     }
 
     /// Creates a target of the specified type with the given ID and configuration
@@ -88,16 +65,7 @@ impl AuditRegistry {
         id: String,
         config: &KVS,
     ) -> Result<Box<dyn Target<AuditEntry> + Send + Sync>, TargetError> {
-        let factory = self
-            .factories
-            .get(target_type)
-            .ok_or_else(|| TargetError::Configuration(format!("Unknown target type: {target_type}")))?;
-
-        // Validate configuration before creating target
-        factory.validate_config(&id, config)?;
-
-        // Create target
-        factory.create_target(id, config).await
+        self.plugins.create_target(target_type, id, config)
     }
 
     /// Creates all targets from a configuration
@@ -113,37 +81,10 @@ impl AuditRegistry {
         &self,
         config: &Config,
     ) -> AuditResult<Vec<Box<dyn Target<AuditEntry> + Send + Sync>>> {
-        let mut tasks = FuturesUnordered::new();
-        for (target_type, factory) in &self.factories {
-            tracing::Span::current().record("target_type", target_type.as_str());
-            info!("Start working on target types...");
-            let valid_fields = factory.get_valid_fields();
-            for (id, merged_config) in collect_target_configs(config, AUDIT_ROUTE_PREFIX, target_type, &valid_fields) {
-                info!(instance_id = %id, "Target is enabled, ready to create a task");
-                let tid = id.clone();
-                let merged_config_arc = Arc::new(merged_config);
-                tasks.push(async move {
-                    let result = factory.create_target(tid.clone(), &merged_config_arc).await;
-                    (tid, result)
-                });
-            }
-        }
-
-        let mut successful_targets = Vec::new();
-        while let Some((id, result)) = tasks.next().await {
-            match result {
-                Ok(target) => {
-                    info!(target_type = %target.id().name, instance_id = %id, "Create a target successfully");
-                    successful_targets.push(target);
-                }
-                Err(e) => {
-                    error!(instance_id = %id, error = %e, "Failed to create a target");
-                }
-            }
-        }
-
-        info!(count = successful_targets.len(), "All target processing completed");
-        Ok(successful_targets)
+        self.plugins
+            .create_targets_from_config(config, AUDIT_ROUTE_PREFIX)
+            .await
+            .map_err(AuditError::from)
     }
 
     /// Adds a target to the registry
@@ -285,5 +226,18 @@ impl AuditRegistry {
         let key = self.create_key(target_type, target_id);
         self.targets.insert(key, target);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuditRegistry;
+    use rustfs_targets::target::ChannelTargetType;
+
+    #[test]
+    fn registry_registers_amqp_factory() {
+        let registry = AuditRegistry::new();
+
+        assert!(registry.supports_target_type(ChannelTargetType::Amqp.as_str()));
     }
 }

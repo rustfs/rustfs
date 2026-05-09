@@ -427,6 +427,20 @@ impl Disk {
         }
     }
 
+    pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
+        match self {
+            Disk::Local(local_disk) => local_disk.last_capacity_snapshot(),
+            Disk::Remote(remote_disk) => remote_disk.last_capacity_snapshot(),
+        }
+    }
+
+    pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
+        match self {
+            Disk::Local(local_disk) => local_disk.record_capacity_probe(total, used, free),
+            Disk::Remote(remote_disk) => remote_disk.record_capacity_probe(total, used, free),
+        }
+    }
+
     #[cfg(test)]
     pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
         match self {

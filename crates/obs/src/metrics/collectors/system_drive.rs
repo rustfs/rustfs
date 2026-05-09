@@ -40,6 +40,10 @@ pub struct DriveDetailedStats {
     pub used_bytes: u64,
     /// Free capacity in bytes
     pub free_bytes: u64,
+    /// Capacity observation state: live, stale, or missing
+    pub capacity_observation_state: &'static str,
+    /// Age in seconds of the current capacity observation
+    pub capacity_observation_age_seconds: u64,
     /// Used inodes
     pub used_inodes: u64,
     /// Free inodes
@@ -103,7 +107,7 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
         );
     }
 
-    let mut metrics = Vec::with_capacity(stats.len() * 19);
+    let mut metrics = Vec::with_capacity(stats.len() * 23);
 
     for stat in stats {
         let server_label = stat.server.as_str();
@@ -112,6 +116,24 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
         push_drive_metric(&mut metrics, &DRIVE_TOTAL_BYTES_MD, stat.total_bytes as f64, server_label, drive_label);
         push_drive_metric(&mut metrics, &DRIVE_USED_BYTES_MD, stat.used_bytes as f64, server_label, drive_label);
         push_drive_metric(&mut metrics, &DRIVE_FREE_BYTES_MD, stat.free_bytes as f64, server_label, drive_label);
+        push_drive_metric(
+            &mut metrics,
+            &DRIVE_CAPACITY_OBSERVATION_AGE_SECONDS_MD,
+            stat.capacity_observation_age_seconds as f64,
+            server_label,
+            drive_label,
+        );
+        for state in ["live", "stale", "missing"] {
+            metrics.push(
+                PrometheusMetric::from_descriptor(
+                    &DRIVE_CAPACITY_OBSERVATION_STATE_MD,
+                    if state == stat.capacity_observation_state { 1.0 } else { 0.0 },
+                )
+                .with_label_owned(DRIVE_LABEL, drive_label.to_string())
+                .with_label_owned(SERVER_LABEL, server_label.to_string())
+                .with_label_owned("state", state.to_string()),
+            );
+        }
         push_drive_metric(&mut metrics, &DRIVE_USED_INODES_MD, stat.used_inodes as f64, server_label, drive_label);
         push_drive_metric(&mut metrics, &DRIVE_FREE_INODES_MD, stat.free_inodes as f64, server_label, drive_label);
         push_drive_metric(&mut metrics, &DRIVE_TOTAL_INODES_MD, stat.total_inodes as f64, server_label, drive_label);
@@ -219,6 +241,8 @@ mod tests {
             total_bytes: 1024 * 1024 * 1024 * 100, // 100 GB
             used_bytes: 1024 * 1024 * 1024 * 50,   // 50 GB
             free_bytes: 1024 * 1024 * 1024 * 50,   // 50 GB
+            capacity_observation_state: "live",
+            capacity_observation_age_seconds: 0,
             used_inodes: 100000,
             free_inodes: 900000,
             total_inodes: 1000000,
@@ -240,7 +264,7 @@ mod tests {
         let metrics = collect_drive_detailed_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 19);
+        assert_eq!(metrics.len(), 23);
 
         // Verify total bytes metric
         let total_bytes_name = DRIVE_TOTAL_BYTES_MD.get_full_metric_name();

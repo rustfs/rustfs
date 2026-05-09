@@ -57,6 +57,26 @@ pub static CLUSTER_CAPACITY_FREE_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock
     )
 });
 
+/// Number of drives whose capacity is served from a stale snapshot.
+pub static CLUSTER_CAPACITY_STALE_DRIVES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("capacity_stale_drives".to_string()),
+        "Count of drives whose capacity metrics are served from stale snapshots",
+        &[],
+        subsystems::CLUSTER_BASE_PATH,
+    )
+});
+
+/// Number of drives with no capacity observation available.
+pub static CLUSTER_CAPACITY_MISSING_DRIVES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("capacity_missing_drives".to_string()),
+        "Count of drives with missing capacity observations",
+        &[],
+        subsystems::CLUSTER_BASE_PATH,
+    )
+});
+
 /// Total number of objects in the cluster
 pub static CLUSTER_OBJECTS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(

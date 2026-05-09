@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+pub mod amqp;
 pub mod kafka;
 pub mod mqtt;
 pub mod mysql;
@@ -268,9 +269,12 @@ impl QueuedPayload {
 /// used in the notification system.
 ///
 /// It includes:
+/// - `Amqp`: Represents an AMQP 0-9-1 target for sending notifications to a broker.
 /// - `Webhook`: Represents a webhook target for sending notifications via HTTP requests.
 /// - `Kafka`: Represents a Kafka target for sending notifications to a Kafka topic.
 /// - `Mqtt`: Represents an MQTT target for sending notifications via MQTT protocol.
+/// - `Nats`: Represents a NATS target for sending notifications to a subject.
+/// - `Pulsar`: Represents a Pulsar target for sending notifications to a topic.
 ///
 /// Each variant has an associated string representation that can be used for serialization
 /// or logging purposes.
@@ -289,6 +293,7 @@ impl QueuedPayload {
 /// example output:
 /// Target type: webhook
 pub enum ChannelTargetType {
+    Amqp,
     Webhook,
     Kafka,
     Mqtt,
@@ -302,6 +307,7 @@ pub enum ChannelTargetType {
 impl ChannelTargetType {
     pub fn as_str(&self) -> &'static str {
         match self {
+            ChannelTargetType::Amqp => "amqp",
             ChannelTargetType::Webhook => "webhook",
             ChannelTargetType::Kafka => "kafka",
             ChannelTargetType::Mqtt => "mqtt",
@@ -317,6 +323,7 @@ impl ChannelTargetType {
 impl std::fmt::Display for ChannelTargetType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            ChannelTargetType::Amqp => write!(f, "amqp"),
             ChannelTargetType::Webhook => write!(f, "webhook"),
             ChannelTargetType::Kafka => write!(f, "kafka"),
             ChannelTargetType::Mqtt => write!(f, "mqtt"),
@@ -330,7 +337,7 @@ impl std::fmt::Display for ChannelTargetType {
 }
 
 /// `TargetType` enum represents the type of target in the notification system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetType {
     AuditLog,
     NotifyEvent,
@@ -436,6 +443,12 @@ pub(crate) fn delete_stored_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_target_type_amqp_uses_runtime_name() {
+        assert_eq!(ChannelTargetType::Amqp.as_str(), "amqp");
+        assert_eq!(ChannelTargetType::Amqp.to_string(), "amqp");
+    }
 
     #[test]
     fn queued_payload_round_trips_meta_and_body() {

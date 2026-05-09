@@ -85,7 +85,7 @@ impl Clone for ListPathRawOptions {
 
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
     if opts.disks.is_empty() {
-        return Err(DiskError::other("list_path_raw: 0 drives provided"));
+        return Err(DiskError::ErasureReadQuorum);
     }
 
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
@@ -414,6 +414,15 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 mod tests {
     use super::*;
     use rustfs_filemeta::MetacacheWriter;
+
+    #[tokio::test]
+    async fn list_path_raw_empty_disks_returns_read_quorum() {
+        let err = list_path_raw(CancellationToken::new(), ListPathRawOptions::default())
+            .await
+            .expect_err("empty drive list should fail");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
 
     #[tokio::test]
     async fn peek_with_timeout_times_out_on_silent_reader() {
