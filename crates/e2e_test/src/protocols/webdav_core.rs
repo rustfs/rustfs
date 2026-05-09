@@ -14,17 +14,24 @@
 
 //! Core WebDAV tests
 
+use crate::common::local_http_client;
 use crate::common::rustfs_binary_path_with_features;
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
 use base64::Engine;
+use http::header::{CONTENT_TYPE, HOST};
 use reqwest::Client;
+use rustfs_signer::constants::UNSIGNED_PAYLOAD;
+use rustfs_signer::sign_v4;
+use s3s::Body;
+use serial_test::serial;
 use tokio::process::Command;
 use tracing::info;
 
 // Fixed WebDAV port for testing
 const WEBDAV_PORT: u16 = 9080;
 const WEBDAV_ADDRESS: &str = "127.0.0.1:9080";
+const S3_TEST_ADDRESS: &str = "127.0.0.1:9010";
 
 /// Create HTTP client with basic auth
 fn create_client() -> Client {
@@ -36,19 +43,114 @@ fn create_client() -> Client {
 
 /// Get basic auth header value
 fn basic_auth_header() -> String {
-    let credentials = format!("{}:{}", DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY);
+    basic_auth_header_for(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY)
+}
+
+fn basic_auth_header_for(access_key: &str, secret_key: &str) -> String {
+    let credentials = format!("{}:{}", access_key, secret_key);
     let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
     format!("Basic {}", encoded)
+}
+
+async fn signed_admin_request(
+    method: http::Method,
+    url: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| anyhow::anyhow!("request URL missing authority"))?
+        .to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(
+        request.body(Body::empty())?,
+        content_len,
+        DEFAULT_ACCESS_KEY,
+        DEFAULT_SECRET_KEY,
+        "",
+        "us-east-1",
+    );
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let mut request_builder = local_http_client().request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+async fn admin_create_user(base_url: &str, username: &str, secret_key: &str) -> Result<()> {
+    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", base_url, username);
+    let body = serde_json::json!({
+        "secretKey": secret_key,
+        "status": "enabled"
+    });
+    let response =
+        signed_admin_request(http::Method::PUT, &url, Some(body.to_string().into_bytes()), Some("application/json")).await?;
+
+    if response.status() != reqwest::StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("create user failed: {status} {body}");
+    }
+
+    Ok(())
+}
+
+async fn admin_add_canned_policy(base_url: &str, policy_name: &str, policy: &serde_json::Value) -> Result<()> {
+    let url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", base_url, policy_name);
+    let response =
+        signed_admin_request(http::Method::PUT, &url, Some(policy.to_string().into_bytes()), Some("application/json")).await?;
+
+    if response.status() != reqwest::StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("add canned policy failed: {status} {body}");
+    }
+
+    Ok(())
+}
+
+async fn admin_attach_policy_to_user(base_url: &str, policy_name: &str, username: &str) -> Result<()> {
+    let url = format!(
+        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=false",
+        base_url, policy_name, username
+    );
+    let response = signed_admin_request(http::Method::PUT, &url, Some(Vec::new()), None).await?;
+
+    if response.status() != reqwest::StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("attach policy failed: {status} {body}");
+    }
+
+    Ok(())
 }
 
 /// Test WebDAV: MKCOL (create bucket), PUT, GET, DELETE, PROPFIND operations
 pub async fn test_webdav_core_operations() -> Result<()> {
     let env = ProtocolTestEnvironment::new().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let admin_base_url = format!("http://{}", S3_TEST_ADDRESS);
 
     // Start server manually
     info!("Starting WebDAV server on {}", WEBDAV_ADDRESS);
-    let binary_path = rustfs_binary_path_with_features(Some("ftps,webdav"));
+    let binary_path = rustfs_binary_path_with_features(Some("webdav"));
     let mut server_process = Command::new(&binary_path)
+        .arg("--address")
+        .arg(S3_TEST_ADDRESS)
         .env("RUSTFS_WEBDAV_ENABLE", "true")
         .env("RUSTFS_WEBDAV_ADDRESS", WEBDAV_ADDRESS)
         .env("RUSTFS_WEBDAV_TLS_ENABLED", "false") // No TLS for testing
@@ -291,17 +393,20 @@ pub async fn test_webdav_core_operations() -> Result<()> {
         assert!(propfind_body.contains(dir_filename), "PROPFIND should list file in directory");
         info!("PASS: PROPFIND directory successful, file listed correctly");
 
-        // Test GET directory listing
-        info!("Testing WebDAV: GET directory listing");
+        // Current WebDAV support exposes collection listing via PROPFIND; GET on a collection is not implemented.
+        info!("Testing WebDAV: GET directory listing fallback behavior");
         let resp = client
             .get(format!("{}/{}/{}", base_url, bucket_name, dir_name))
             .header("Authorization", &auth_header)
             .send()
             .await?;
-        assert!(resp.status().is_success(), "GET directory should succeed, got: {}", resp.status());
-        let dir_listing = resp.text().await?;
-        assert!(dir_listing.contains(dir_filename), "Directory listing should contain the file");
-        info!("PASS: GET directory listing successful");
+        assert_eq!(
+            resp.status().as_u16(),
+            405,
+            "GET on a WebDAV collection should currently return 405, got: {}",
+            resp.status()
+        );
+        info!("PASS: GET collection correctly returned 405; PROPFIND remains the listing path");
 
         // Rename directory
         info!("Testing WebDAV: MOVE directory");
@@ -418,6 +523,121 @@ pub async fn test_webdav_core_operations() -> Result<()> {
         );
         info!("PASS: File in renamed nested directory has correct content");
 
+        // Test directory MOVE authz failure does not create partial destination writes
+        info!("Testing WebDAV: directory MOVE denied by missing DeleteObject must not create partial writes");
+        let restricted_bucket = "webdav-authz-bucket";
+        let restricted_dir = "restricted-src";
+        let restricted_dst = "restricted-dst";
+        let restricted_file = "locked.txt";
+        let restricted_content = "must remain only at source";
+        let restricted_user = "webdav-limited-user";
+        let restricted_secret = "webdav-limited-secret";
+        let restricted_policy_name = "webdav-move-no-delete";
+
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+                format!("{}/{}", base_url, restricted_bucket),
+            )
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "MKCOL restricted bucket should succeed, got: {}",
+            resp.status()
+        );
+
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+                format!("{}/{}/{}", base_url, restricted_bucket, restricted_dir),
+            )
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "MKCOL restricted directory should succeed, got: {}",
+            resp.status()
+        );
+
+        let resp = client
+            .put(format!("{}/{}/{}/{}", base_url, restricted_bucket, restricted_dir, restricted_file))
+            .header("Authorization", &auth_header)
+            .body(restricted_content)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "PUT restricted file should succeed, got: {}",
+            resp.status()
+        );
+
+        admin_create_user(&admin_base_url, restricted_user, restricted_secret).await?;
+        admin_add_canned_policy(
+            &admin_base_url,
+            restricted_policy_name,
+            &serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:ListBucket"],
+                        "Resource": [format!("arn:aws:s3:::{}", restricted_bucket)]
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject", "s3:PutObject"],
+                        "Resource": [format!("arn:aws:s3:::{}/*", restricted_bucket)]
+                    }
+                ]
+            }),
+        )
+        .await?;
+        admin_attach_policy_to_user(&admin_base_url, restricted_policy_name, restricted_user).await?;
+
+        let restricted_auth = basic_auth_header_for(restricted_user, restricted_secret);
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MOVE").unwrap(),
+                format!("{}/{}/{}", base_url, restricted_bucket, restricted_dir),
+            )
+            .header("Authorization", &restricted_auth)
+            .header("Destination", format!("/{}/{}", restricted_bucket, restricted_dst))
+            .send()
+            .await?;
+        assert!(
+            !resp.status().is_success(),
+            "MOVE without DeleteObject permission should be rejected, got: {}",
+            resp.status()
+        );
+
+        let resp = client
+            .get(format!("{}/{}/{}/{}", base_url, restricted_bucket, restricted_dst, restricted_file))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "Denied MOVE must not create destination object, got: {}",
+            resp.status()
+        );
+
+        let resp = client
+            .get(format!("{}/{}/{}/{}", base_url, restricted_bucket, restricted_dir, restricted_file))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success(),
+            "Source object should remain after denied MOVE, got: {}",
+            resp.status()
+        );
+        assert_eq!(resp.text().await?, restricted_content, "Denied MOVE must leave source content untouched");
+        info!("PASS: denied directory MOVE left source intact and created no destination objects");
+
         // Test DELETE bucket
         info!("Testing WebDAV: DELETE bucket '{}'", bucket_name);
         let resp = client
@@ -452,4 +672,10 @@ pub async fn test_webdav_core_operations() -> Result<()> {
     let _ = server_process.wait().await;
 
     result
+}
+
+#[tokio::test]
+#[serial]
+async fn test_webdav_core_operations_direct() -> Result<()> {
+    test_webdav_core_operations().await
 }

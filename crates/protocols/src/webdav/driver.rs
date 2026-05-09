@@ -397,6 +397,20 @@ where
     session_context: Arc<SessionContext>,
 }
 
+enum ResolvedPath {
+    File(Box<HeadObjectOutput>),
+    Directory {
+        prefix: String,
+        metadata: Option<Box<HeadObjectOutput>>,
+    },
+}
+
+enum HeadObjectProbe {
+    Forbidden,
+    Missing,
+    Found(Box<HeadObjectOutput>),
+}
+
 impl<S> Debug for WebDavDriver<S>
 where
     S: S3StorageBackend + Debug + Clone + Send + Sync + 'static,
@@ -427,6 +441,194 @@ where
         Self {
             storage,
             session_context,
+        }
+    }
+
+    fn empty_streaming_blob() -> StreamingBlob {
+        StreamingBlob::wrap(stream::once(async { Ok::<Bytes, std::io::Error>(Bytes::new()) }))
+    }
+
+    fn credentials(&self) -> (&str, &str) {
+        (
+            &self.session_context.principal.user_identity.credentials.access_key,
+            &self.session_context.principal.user_identity.credentials.secret_key,
+        )
+    }
+
+    async fn prefix_has_entries(&self, bucket: &str, prefix: &str) -> FsResult<bool> {
+        let (access_key, secret_key) = self.credentials();
+        let list_input = ListObjectsV2Input::builder()
+            .bucket(bucket.to_string())
+            .prefix(Some(prefix.to_string()))
+            .max_keys(Some(1))
+            .build()
+            .map_err(|_| FsError::GeneralFailure)?;
+
+        let output = self
+            .storage
+            .list_objects_v2(list_input, access_key, secret_key)
+            .await
+            .map_err(|e| {
+                error!("Failed to list objects in {} with prefix '{}': {}", bucket, prefix, e);
+                FsError::GeneralFailure
+            })?;
+
+        Ok(output.contents.map(|c| !c.is_empty()).unwrap_or(false)
+            || output.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false))
+    }
+
+    async fn copy_object_streaming(&self, src_bucket: &str, src_key: &str, dst_bucket: &str, dst_key: &str) -> FsResult<()> {
+        let (access_key, secret_key) = self.credentials();
+        let get_output = self
+            .storage
+            .get_object(src_bucket, src_key, access_key, secret_key, None)
+            .await
+            .map_err(|e| {
+                error!("Failed to get source object '{}' in '{}': {}", src_key, src_bucket, e);
+                FsError::GeneralFailure
+            })?;
+
+        let GetObjectOutput {
+            body,
+            content_length,
+            content_type,
+            ..
+        } = get_output;
+
+        let mut put_builder = PutObjectInput::builder()
+            .bucket(dst_bucket.to_string())
+            .key(dst_key.to_string())
+            .body(Some(body.unwrap_or_else(Self::empty_streaming_blob)));
+
+        if let Some(content_length) = content_length {
+            put_builder = put_builder.content_length(Some(content_length));
+        }
+
+        if let Some(content_type) = content_type {
+            put_builder = put_builder.content_type(Some(content_type));
+        }
+
+        let put_input = put_builder.build().map_err(|_| FsError::GeneralFailure)?;
+
+        self.storage
+            .put_object(put_input, access_key, secret_key)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to copy object from '{}/{}' to '{}/{}': {}",
+                    src_bucket, src_key, dst_bucket, dst_key, e
+                );
+                FsError::GeneralFailure
+            })?;
+
+        Ok(())
+    }
+
+    async fn execute_directory_rename_pairs(
+        &self,
+        src_bucket: &str,
+        dst_bucket: &str,
+        rename_pairs: &[(String, String)],
+    ) -> FsResult<()> {
+        let (access_key, secret_key) = self.credentials();
+
+        for (src_obj_key, dst_obj_key) in rename_pairs {
+            self.copy_object_streaming(src_bucket, src_obj_key, dst_bucket, dst_obj_key)
+                .await?;
+        }
+
+        for (src_obj_key, _) in rename_pairs {
+            self.storage
+                .delete_object(src_bucket, src_obj_key, access_key, secret_key)
+                .await
+                .map_err(|e| {
+                    error!("Failed to delete source object '{}' after directory rename: {}", src_obj_key, e);
+                    FsError::GeneralFailure
+                })?;
+        }
+
+        Ok(())
+    }
+
+    async fn probe_head_object(&self, bucket: &str, key: &str) -> FsResult<HeadObjectProbe> {
+        let (access_key, secret_key) = self.credentials();
+
+        if authorize_operation(&self.session_context, &S3Action::HeadObject, bucket, Some(key))
+            .await
+            .is_err()
+        {
+            return Ok(HeadObjectProbe::Forbidden);
+        }
+
+        match self.storage.head_object(bucket, key, access_key, secret_key).await {
+            Ok(output) => Ok(HeadObjectProbe::Found(Box::new(output))),
+            Err(_) => Ok(HeadObjectProbe::Missing),
+        }
+    }
+
+    async fn resolve_path(&self, bucket: &str, key: &str) -> FsResult<ResolvedPath> {
+        let prefix = format!("{}/", key);
+        let mut had_visibility = false;
+
+        match self.probe_head_object(bucket, key).await? {
+            HeadObjectProbe::Found(output) => {
+                let size = output.content_length.unwrap_or(0) as u64;
+                let is_dir_marker = output.content_type.as_deref() == Some("application/x-directory");
+
+                if is_dir_marker {
+                    return Ok(ResolvedPath::Directory {
+                        prefix,
+                        metadata: Some(output),
+                    });
+                }
+
+                if size == 0
+                    && authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
+                        .await
+                        .is_ok()
+                    && self.prefix_has_entries(bucket, &prefix).await?
+                {
+                    return Ok(ResolvedPath::Directory {
+                        prefix,
+                        metadata: Some(output),
+                    });
+                }
+
+                return Ok(ResolvedPath::File(output));
+            }
+            HeadObjectProbe::Missing => {
+                had_visibility = true;
+            }
+            HeadObjectProbe::Forbidden => {}
+        }
+
+        match self.probe_head_object(bucket, &prefix).await? {
+            HeadObjectProbe::Found(output) => {
+                return Ok(ResolvedPath::Directory {
+                    prefix,
+                    metadata: Some(output),
+                });
+            }
+            HeadObjectProbe::Missing => {
+                had_visibility = true;
+            }
+            HeadObjectProbe::Forbidden => {}
+        }
+
+        if authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, Some(&prefix))
+            .await
+            .is_ok()
+        {
+            had_visibility = true;
+            if self.prefix_has_entries(bucket, &prefix).await? {
+                return Ok(ResolvedPath::Directory { prefix, metadata: None });
+            }
+        }
+
+        if had_visibility {
+            Err(FsError::NotFound)
+        } else {
+            Err(FsError::Forbidden)
         }
     }
 
@@ -791,18 +993,8 @@ where
             }
 
             if let Some(key) = key {
-                // Get object metadata
-                match self
-                    .storage
-                    .head_object(
-                        &bucket,
-                        &key,
-                        &self.session_context.principal.user_identity.credentials.access_key,
-                        &self.session_context.principal.user_identity.credentials.secret_key,
-                    )
-                    .await
-                {
-                    Ok(output) => {
+                return match self.resolve_path(&bucket, &key).await? {
+                    ResolvedPath::File(output) => {
                         let size = output.content_length.unwrap_or(0) as u64;
                         let modified = output
                             .last_modified
@@ -812,109 +1004,41 @@ where
                             })
                             .unwrap_or_else(SystemTime::now);
 
-                        // Check if this is a directory marker (0-byte object with children)
-                        let content_type = output.content_type.map(|c| c.to_string());
-                        let is_dir_marker =
-                            content_type.as_deref() == Some("application/x-directory") || (size == 0 && key.ends_with('/'));
-
-                        if is_dir_marker {
-                            return Ok(Box::new(WebDavMetaData {
-                                size: 0,
-                                modified,
-                                created: modified,
-                                is_dir: true,
-                                etag: output.e_tag.as_ref().map(etag_to_string),
-                                content_type,
-                            }) as Box<dyn DavMetaData>);
-                        }
-
-                        // For 0-byte objects, check if there's also a prefix with children
-                        if size == 0 {
-                            let prefix = format!("{}/", key);
-                            let list_input = ListObjectsV2Input::builder()
-                                .bucket(bucket.clone())
-                                .prefix(Some(prefix))
-                                .max_keys(Some(1))
-                                .build()
-                                .map_err(|_| FsError::GeneralFailure)?;
-
-                            if let Ok(list_output) = self
-                                .storage
-                                .list_objects_v2(
-                                    list_input,
-                                    &self.session_context.principal.user_identity.credentials.access_key,
-                                    &self.session_context.principal.user_identity.credentials.secret_key,
-                                )
-                                .await
-                                && (list_output.contents.map(|c| !c.is_empty()).unwrap_or(false)
-                                    || list_output.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false))
-                            {
-                                return Ok(Box::new(WebDavMetaData {
-                                    size: 0,
-                                    modified,
-                                    created: modified,
-                                    is_dir: true,
-                                    etag: output.e_tag.as_ref().map(etag_to_string),
-                                    content_type,
-                                }) as Box<dyn DavMetaData>);
-                            }
-                        }
-
                         Ok(Box::new(WebDavMetaData {
                             size,
                             modified,
                             created: modified,
                             is_dir: false,
                             etag: output.e_tag.as_ref().map(etag_to_string),
-                            content_type,
+                            content_type: output.content_type.map(|c| c.to_string()),
                         }) as Box<dyn DavMetaData>)
                     }
-                    Err(e) => {
-                        // Check if it might be a "directory" (prefix)
-                        let prefix = format!("{}/", key);
-                        let list_input = ListObjectsV2Input::builder()
-                            .bucket(bucket.clone())
-                            .prefix(Some(prefix))
-                            .max_keys(Some(1))
-                            .build()
-                            .map_err(|_| FsError::GeneralFailure)?;
+                    ResolvedPath::Directory { metadata, .. } => {
+                        let modified = metadata
+                            .as_ref()
+                            .and_then(|output| output.last_modified.as_ref())
+                            .map(|dt| {
+                                let offset_dt: time::OffsetDateTime = dt.clone().into();
+                                SystemTime::from(offset_dt)
+                            })
+                            .unwrap_or_else(SystemTime::now);
 
-                        match self
-                            .storage
-                            .list_objects_v2(
-                                list_input,
-                                &self.session_context.principal.user_identity.credentials.access_key,
-                                &self.session_context.principal.user_identity.credentials.secret_key,
-                            )
-                            .await
-                        {
-                            Ok(output) => {
-                                if output.contents.map(|c| !c.is_empty()).unwrap_or(false)
-                                    || output.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false)
-                                {
-                                    // It's a directory
-                                    Ok(Box::new(WebDavMetaData {
-                                        size: 0,
-                                        modified: SystemTime::now(),
-                                        created: SystemTime::now(),
-                                        is_dir: true,
-                                        etag: None,
-                                        content_type: None,
-                                    }) as Box<dyn DavMetaData>)
-                                } else {
-                                    debug!("Object not found: {}/{}: {}", bucket, key, e);
-                                    Err(FsError::NotFound)
-                                }
-                            }
-                            Err(_) => {
-                                debug!("Object not found: {}/{}: {}", bucket, key, e);
-                                Err(FsError::NotFound)
-                            }
-                        }
+                        Ok(Box::new(WebDavMetaData {
+                            size: 0,
+                            modified,
+                            created: modified,
+                            is_dir: true,
+                            etag: metadata.as_ref().and_then(|output| output.e_tag.as_ref().map(etag_to_string)),
+                            content_type: metadata.and_then(|output| output.content_type.map(|c| c.to_string())),
+                        }) as Box<dyn DavMetaData>)
                     }
-                }
+                };
             } else {
                 // Get bucket metadata
+                authorize_operation(&self.session_context, &S3Action::HeadBucket, &bucket, None)
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+
                 match self
                     .storage
                     .head_bucket(
@@ -1152,9 +1276,6 @@ where
     }
 
     fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
-        let storage = self.storage.clone();
-        let session_context = self.session_context.clone();
-
         async move {
             let (src_bucket, src_key) = self.parse_path(from)?;
             let (dst_bucket, dst_key) = self.parse_path(to)?;
@@ -1165,248 +1286,104 @@ where
 
             let src_key = src_key.ok_or(FsError::Forbidden)?;
             let dst_key = dst_key.ok_or(FsError::Forbidden)?;
-
-            let access_key = &session_context.principal.user_identity.credentials.access_key;
-            let secret_key = &session_context.principal.user_identity.credentials.secret_key;
-
-            // Determine if source is a directory
-            let src_is_dir;
-            let src_key_with_slash = if src_key.ends_with('/') {
-                src_is_dir = true;
-                src_key.to_string()
-            } else {
-                // Try head_object first (file)
-                if storage
-                    .head_object(&src_bucket, &src_key, access_key, secret_key)
-                    .await
-                    .is_ok()
-                {
-                    src_is_dir = false;
-                    src_key.clone()
-                } else {
-                    // Try directory marker
-                    let dir_key = format!("{}/", src_key);
-                    if storage
-                        .head_object(&src_bucket, &dir_key, access_key, secret_key)
+            let (access_key, secret_key) = self.credentials();
+            let resolved_src = self.resolve_path(&src_bucket, &src_key).await?;
+            let src_prefix = match resolved_src {
+                ResolvedPath::File(_) => {
+                    authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
                         .await
-                        .is_ok()
-                    {
-                        src_is_dir = true;
-                        dir_key
-                    } else {
-                        // Check if there are objects with this prefix (implicit directory)
-                        let list_input = ListObjectsV2Input::builder()
-                            .bucket(src_bucket.clone())
-                            .prefix(Some(dir_key.clone()))
-                            .max_keys(Some(1))
-                            .build()
-                            .map_err(|_| FsError::GeneralFailure)?;
-                        if let Ok(output) = storage.list_objects_v2(list_input, access_key, secret_key).await {
-                            if output.contents.map(|c| !c.is_empty()).unwrap_or(false) {
-                                src_is_dir = true;
-                                dir_key
-                            } else {
-                                debug!("Source not found: {}/{}", src_bucket, src_key);
-                                return Err(FsError::NotFound);
-                            }
-                        } else {
-                            debug!("Source not found: {}/{}", src_bucket, src_key);
-                            return Err(FsError::NotFound);
-                        }
-                    }
-                }
-            };
+                        .map_err(|_| FsError::Forbidden)?;
+                    authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                        .await
+                        .map_err(|_| FsError::Forbidden)?;
+                    authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
+                        .await
+                        .map_err(|_| FsError::Forbidden)?;
 
-            // Authorize operations
-            if src_is_dir {
-                authorize_operation(&session_context, &S3Action::ListBucket, &src_bucket, Some(&src_key))
-                    .await
-                    .map_err(|_| FsError::Forbidden)?;
-            } else {
-                authorize_operation(&session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
-                    .await
-                    .map_err(|_| FsError::Forbidden)?;
-            }
-            authorize_operation(&session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                    self.copy_object_streaming(&src_bucket, &src_key, &dst_bucket, &dst_key)
+                        .await?;
+
+                    self.storage
+                        .delete_object(&src_bucket, &src_key, access_key, secret_key)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to delete source object after rename: {}", e);
+                            FsError::GeneralFailure
+                        })?;
+
+                    debug!("Successfully renamed file '{}/{}' to '{}/{}'", src_bucket, src_key, dst_bucket, dst_key);
+                    return Ok(());
+                }
+                ResolvedPath::Directory { prefix, .. } => prefix,
+            };
+            let dst_prefix = format!("{}/", dst_key);
+
+            authorize_operation(&self.session_context, &S3Action::ListBucket, &src_bucket, Some(&src_prefix))
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
-            if src_is_dir {
-                // Rename directory: recursively copy all objects, then delete source objects
-                let dst_key_with_slash = if dst_key.ends_with('/') {
-                    dst_key.to_string()
-                } else {
-                    format!("{}/", dst_key)
-                };
+            let mut continuation_token: Option<String> = None;
+            let mut rename_pairs: Vec<(String, String)> = Vec::new();
 
-                // List and copy all objects
-                let prefix = src_key_with_slash.clone();
-                let mut continuation_token: Option<String> = None;
-                let mut source_keys_to_delete: Vec<String> = Vec::new();
+            loop {
+                let mut list_builder = ListObjectsV2Input::builder()
+                    .bucket(src_bucket.clone())
+                    .prefix(Some(src_prefix.clone()));
 
-                loop {
-                    let mut list_builder = ListObjectsV2Input::builder()
-                        .bucket(src_bucket.clone())
-                        .prefix(Some(prefix.clone()));
+                if let Some(ref token) = continuation_token {
+                    list_builder = list_builder.continuation_token(Some(token.clone()));
+                }
 
-                    if let Some(ref token) = continuation_token {
-                        list_builder = list_builder.continuation_token(Some(token.clone()));
-                    }
+                let list_input = list_builder.build().map_err(|_| FsError::GeneralFailure)?;
+                let output = self
+                    .storage
+                    .list_objects_v2(list_input, access_key, secret_key)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to list objects during directory rename: {}", e);
+                        FsError::GeneralFailure
+                    })?;
 
-                    let list_input = list_builder.build().map_err(|_| FsError::GeneralFailure)?;
-
-                    match storage.list_objects_v2(list_input, access_key, secret_key).await {
-                        Ok(output) => {
-                            if let Some(objects) = output.contents {
-                                for obj in objects {
-                                    if let Some(obj_key) = obj.key {
-                                        // Calculate new key by replacing source prefix with destination prefix
-                                        let new_key = obj_key.replacen(&prefix, &dst_key_with_slash, 1);
-
-                                        // Get source object content
-                                        let get_result =
-                                            storage.get_object(&src_bucket, &obj_key, access_key, secret_key, None).await;
-                                        if let Ok(get_output) = get_result {
-                                            let body_bytes = if let Some(body) = get_output.body {
-                                                let chunks: Vec<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> =
-                                                    body.collect().await;
-                                                let mut all_data = Vec::new();
-                                                for chunk in chunks {
-                                                    match chunk {
-                                                        Ok(data) => all_data.extend_from_slice(&data),
-                                                        Err(e) => {
-                                                            error!(
-                                                                "Failed to read object body during directory rename: {}",
-                                                                e
-                                                            );
-                                                            return Err(FsError::GeneralFailure);
-                                                        }
-                                                    }
-                                                }
-                                                Bytes::from(all_data)
-                                            } else {
-                                                Bytes::new()
-                                            };
-
-                                            let content_length = body_bytes.len() as i64;
-                                            let content_type = get_output.content_type.clone();
-
-                                            // Put object to destination
-                                            let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body_bytes) });
-                                            let streaming_blob = StreamingBlob::wrap(stream);
-
-                                            let mut put_builder = PutObjectInput::builder()
-                                                .bucket(dst_bucket.clone())
-                                                .key(new_key.clone())
-                                                .content_length(Some(content_length))
-                                                .body(Some(streaming_blob));
-
-                                            if let Some(ref ct) = content_type {
-                                                put_builder = put_builder.content_type(Some(ct.clone()));
-                                            }
-
-                                            let put_input = put_builder.build().map_err(|_| FsError::GeneralFailure)?;
-                                            if let Err(e) = storage.put_object(put_input, access_key, secret_key).await {
-                                                error!("Failed to copy object during directory rename: {}", e);
-                                                return Err(FsError::GeneralFailure);
-                                            }
-                                        }
-
-                                        source_keys_to_delete.push(obj_key);
-                                    }
-                                }
-                            }
-
-                            if !output.is_truncated.unwrap_or(false) {
-                                break;
-                            }
-                            continuation_token = output.next_continuation_token;
-                        }
-                        Err(e) => {
-                            error!("Failed to list objects during directory rename: {}", e);
-                            return Err(FsError::GeneralFailure);
+                if let Some(objects) = output.contents {
+                    for obj in objects {
+                        if let Some(obj_key) = obj.key {
+                            let new_key = obj_key.replacen(&src_prefix, &dst_prefix, 1);
+                            rename_pairs.push((obj_key, new_key));
                         }
                     }
                 }
 
-                // Delete source objects
-                for src_obj_key in source_keys_to_delete {
-                    let _ = storage.delete_object(&src_bucket, &src_obj_key, access_key, secret_key).await;
+                if !output.is_truncated.unwrap_or(false) {
+                    break;
                 }
-
-                debug!(
-                    "Successfully renamed directory '{}/{}' to '{}/{}'",
-                    src_bucket, src_key, dst_bucket, dst_key
-                );
-                Ok(())
-            } else {
-                // Rename file: copy to destination, then delete source
-                match storage.get_object(&src_bucket, &src_key, access_key, secret_key, None).await {
-                    Ok(get_output) => {
-                        let body_bytes = if let Some(body) = get_output.body {
-                            let chunks: Vec<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> = body.collect().await;
-                            let mut all_data = Vec::new();
-                            for chunk in chunks {
-                                match chunk {
-                                    Ok(data) => all_data.extend_from_slice(&data),
-                                    Err(e) => {
-                                        error!("Failed to read source object body: {}", e);
-                                        return Err(FsError::GeneralFailure);
-                                    }
-                                }
-                            }
-                            Bytes::from(all_data)
-                        } else {
-                            Bytes::new()
-                        };
-
-                        let content_length = body_bytes.len() as i64;
-                        let content_type = get_output.content_type.clone();
-
-                        // Put object to destination
-                        let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body_bytes) });
-                        let streaming_blob = StreamingBlob::wrap(stream);
-
-                        let mut put_builder = PutObjectInput::builder()
-                            .bucket(dst_bucket.clone())
-                            .key(dst_key.clone())
-                            .content_length(Some(content_length))
-                            .body(Some(streaming_blob));
-
-                        if let Some(ref ct) = content_type {
-                            put_builder = put_builder.content_type(Some(ct.clone()));
-                        }
-
-                        let put_input = put_builder.build().map_err(|_| FsError::GeneralFailure)?;
-
-                        match storage.put_object(put_input, access_key, secret_key).await {
-                            Ok(_) => {
-                                debug!("Successfully copied '{}/{}' to '{}/{}'", src_bucket, src_key, dst_bucket, dst_key);
-                            }
-                            Err(e) => {
-                                error!("Failed to copy object to destination: {}", e);
-                                return Err(FsError::GeneralFailure);
-                            }
-                        }
-
-                        // Delete source object
-                        match storage.delete_object(&src_bucket, &src_key, access_key, secret_key).await {
-                            Ok(_) => {
-                                debug!("Successfully deleted source '{}/{}' after rename", src_bucket, src_key);
-                                Ok(())
-                            }
-                            Err(e) => {
-                                error!("Failed to delete source object after rename: {}", e);
-                                Err(FsError::GeneralFailure)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to get source object '{}' in '{}': {}", src_key, src_bucket, e);
-                        Err(FsError::GeneralFailure)
-                    }
-                }
+                continuation_token = output.next_continuation_token;
             }
+
+            if rename_pairs.is_empty() {
+                debug!("Source not found: {}/{}", src_bucket, src_key);
+                return Err(FsError::NotFound);
+            }
+
+            for (src_obj_key, dst_obj_key) in &rename_pairs {
+                authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(src_obj_key))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+                authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(dst_obj_key))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+                authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(src_obj_key))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+            }
+
+            self.execute_directory_rename_pairs(&src_bucket, &dst_bucket, &rename_pairs)
+                .await?;
+
+            debug!(
+                "Successfully renamed directory '{}/{}' to '{}/{}'",
+                src_bucket, src_key, dst_bucket, dst_key
+            );
+            Ok(())
         }
         .boxed()
     }
@@ -1423,14 +1400,17 @@ mod tests {
     use crate::common::client::s3::StorageBackend as S3StorageBackend;
     use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use dav_server::davpath::DavPath;
     use dav_server::fs::FsError;
+    use futures_util::StreamExt;
     use rustfs_credentials::Credentials;
     use rustfs_policy::auth::UserIdentity;
     use s3s::dto::*;
+    use std::collections::{HashMap, HashSet};
     use std::fmt::{Debug, Formatter};
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
     struct DummyStorage;
@@ -1553,6 +1533,190 @@ mod tests {
         WebDavDriver::new(DummyStorage, Arc::new(session_context))
     }
 
+    #[derive(Default)]
+    struct RecordingStorageState {
+        objects: HashMap<(String, String), Vec<u8>>,
+        put_keys: Vec<String>,
+        delete_keys: Vec<String>,
+        fail_delete_keys: HashSet<String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingStorage {
+        state: Arc<Mutex<RecordingStorageState>>,
+    }
+
+    impl Debug for RecordingStorage {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str("RecordingStorage")
+        }
+    }
+
+    #[async_trait]
+    impl S3StorageBackend for RecordingStorage {
+        type Error = std::io::Error;
+
+        async fn get_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+            _start_pos: Option<u64>,
+        ) -> Result<GetObjectOutput, Self::Error> {
+            let data = self
+                .state
+                .lock()
+                .expect("recording storage lock poisoned")
+                .objects
+                .get(&(bucket.to_string(), key.to_string()))
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing object"))?;
+
+            let content_length = data.len() as i64;
+            let body =
+                StreamingBlob::wrap(futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(data)) }));
+
+            Ok(GetObjectOutput {
+                body: Some(body),
+                content_length: Some(content_length),
+                ..Default::default()
+            })
+        }
+
+        async fn get_object_range(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+            _start_pos: u64,
+            _length: u64,
+        ) -> Result<GetObjectOutput, Self::Error> {
+            unreachable!("range reads are not used in rename regression tests")
+        }
+
+        async fn put_object(
+            &self,
+            mut input: PutObjectInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<PutObjectOutput, Self::Error> {
+            let bucket = input.bucket.clone();
+            let key = input.key.clone();
+            let mut bytes = Vec::new();
+
+            if let Some(mut body) = input.body.take() {
+                while let Some(chunk) = body.next().await {
+                    let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
+                    bytes.extend_from_slice(&chunk);
+                }
+            }
+
+            let mut state = self.state.lock().expect("recording storage lock poisoned");
+            state.put_keys.push(key.clone());
+            state.objects.insert((bucket, key), bytes);
+
+            Ok(PutObjectOutput::default())
+        }
+
+        async fn delete_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<DeleteObjectOutput, Self::Error> {
+            let mut state = self.state.lock().expect("recording storage lock poisoned");
+            state.delete_keys.push(key.to_string());
+            if state.fail_delete_keys.contains(key) {
+                return Err(std::io::Error::other("injected delete failure"));
+            }
+            state.objects.remove(&(bucket.to_string(), key.to_string()));
+            Ok(DeleteObjectOutput::default())
+        }
+
+        async fn head_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<HeadObjectOutput, Self::Error> {
+            unreachable!("head_object is not used in rename regression tests")
+        }
+
+        async fn head_bucket(
+            &self,
+            _bucket: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<HeadBucketOutput, Self::Error> {
+            unreachable!("head_bucket is not used in rename regression tests")
+        }
+
+        async fn list_objects_v2(
+            &self,
+            _input: ListObjectsV2Input,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<ListObjectsV2Output, Self::Error> {
+            unreachable!("list_objects_v2 is not used in rename regression tests")
+        }
+
+        async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
+            unreachable!("list_buckets is not used in rename regression tests")
+        }
+
+        async fn create_bucket(
+            &self,
+            _bucket: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<CreateBucketOutput, Self::Error> {
+            unreachable!("create_bucket is not used in rename regression tests")
+        }
+
+        async fn delete_bucket(
+            &self,
+            _bucket: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<DeleteBucketOutput, Self::Error> {
+            unreachable!("delete_bucket is not used in rename regression tests")
+        }
+    }
+
+    fn recording_driver(
+        initial_objects: &[(&str, &str, &[u8])],
+        fail_delete_keys: &[&str],
+    ) -> (WebDavDriver<RecordingStorage>, RecordingStorage) {
+        let storage = RecordingStorage::default();
+        let identity = UserIdentity::new(Credentials {
+            access_key: "ak".to_string(),
+            secret_key: "sk".to_string(),
+            ..Default::default()
+        });
+        let session_context = SessionContext::new(
+            ProtocolPrincipal::new(Arc::new(identity)),
+            Protocol::WebDav,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+
+        let state = RecordingStorageState {
+            objects: initial_objects
+                .iter()
+                .map(|(bucket, key, body)| (((*bucket).to_string(), (*key).to_string()), body.to_vec()))
+                .collect(),
+            fail_delete_keys: fail_delete_keys.iter().map(|key| (*key).to_string()).collect(),
+            ..Default::default()
+        };
+
+        *storage.state.lock().expect("recording storage lock poisoned") = state;
+
+        (WebDavDriver::new(storage.clone(), Arc::new(session_context)), storage)
+    }
+
     #[test]
     fn parse_path_decodes_url_encoded_object_names() {
         let driver = driver();
@@ -1619,14 +1783,52 @@ mod tests {
     }
 
     #[test]
-    fn parse_path_handles_url_encoded_slash_in_object_name() {
+    fn parse_path_handles_url_encoded_spaces_in_object_name() {
         let driver = driver();
-        // %2F is encoded slash - should NOT be decoded to actual slash in object name
         let path = DavPath::new("/bucket/file%20with%20spaces.txt").expect("path should parse");
 
         let (bucket, key) = driver.parse_path(&path).expect("path should decode");
 
         assert_eq!(bucket, "bucket");
         assert_eq!(key.as_deref(), Some("file with spaces.txt"));
+    }
+
+    #[tokio::test]
+    async fn directory_rename_returns_error_when_delete_fails_after_successful_copy() {
+        let (driver, storage) = recording_driver(
+            &[
+                ("bucket", "src/file-a.txt", b"file-a"),
+                ("bucket", "src/file-b.txt", b"file-b"),
+            ],
+            &["src/file-a.txt"],
+        );
+
+        let err = driver
+            .execute_directory_rename_pairs(
+                "bucket",
+                "bucket",
+                &[
+                    ("src/file-a.txt".to_string(), "dst/file-a.txt".to_string()),
+                    ("src/file-b.txt".to_string(), "dst/file-b.txt".to_string()),
+                ],
+            )
+            .await
+            .expect_err("delete failure should be surfaced");
+
+        assert_eq!(err, FsError::GeneralFailure);
+
+        let state = storage.state.lock().expect("recording storage lock poisoned");
+        assert_eq!(state.put_keys, vec!["dst/file-a.txt".to_string(), "dst/file-b.txt".to_string()]);
+        assert_eq!(state.delete_keys, vec!["src/file-a.txt".to_string()]);
+        assert!(
+            state
+                .objects
+                .contains_key(&("bucket".to_string(), "dst/file-a.txt".to_string()))
+        );
+        assert!(
+            state
+                .objects
+                .contains_key(&("bucket".to_string(), "dst/file-b.txt".to_string()))
+        );
     }
 }
