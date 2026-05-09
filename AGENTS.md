@@ -113,5 +113,6 @@ Do not open a PR with code changes when the required checks fail.
 - `crates/iam/AGENTS.md`
 - `crates/kms/AGENTS.md`
 - `crates/policy/AGENTS.md`
+- `crates/targets/AGENTS.md`
 - `rustfs/src/admin/AGENTS.md`
 - `rustfs/src/storage/AGENTS.md`
