@@ -23,7 +23,7 @@ use crate::server::{
     hybrid::hybrid,
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
-        ObjectAttributesEtagFixLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
+        ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
@@ -673,7 +673,7 @@ fn process_connection(
         };
         // ── Canonical Middleware Stack Order (outermost → innermost) ──
         // This order MUST be preserved across refactorings.
-        // Only AddExtensionLayer (layers 1-2) are per-connection; layers 3-15 are stateless.
+        // Only AddExtensionLayer (layers 1-2) are per-connection; most remaining layers are stateless.
         //
         //  1. AddExtensionLayer<RemoteAddr>           — per-connection peer address
         //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
@@ -694,6 +694,7 @@ fn process_connection(
         // 17. RedirectLayer                          — console redirect (conditional)
         // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
         // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 20. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -871,16 +872,19 @@ fn process_connection(
             // Bucket-level CORS takes precedence when configured (handled in router.rs for OPTIONS, and in ecfs.rs for actual requests)
             .layer(ConditionalCorsLayer::new())
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
-            // Must run first on responses: clear the body and remove
+            // Must run before outer response-transforming layers: clear the body and remove
             // Content-Length, Content-Type, and Transfer-Encoding for statuses
-            // that MUST NOT carry a body (1xx/204/304). Kept innermost so all
-            // other response-transforming layers see the already-bodyless
+            // that MUST NOT carry a body (1xx/204/304). Placed inside those
+            // layers so they see the already-bodyless
             // response and so no layer (e.g. CORS) re-adds body headers afterward.
             .layer(BodylessStatusFixLayer)
             // HEAD responses must not send body bytes even when the inner S3 layer
-            // serializes an XML error payload. Keep this innermost so the final
-            // HTTP response written to hyper/h2 is bodyless.
+            // serializes an XML error payload.
             .layer(HeadRequestBodyFixLayer)
+            // Health probes are public admin routes, but s3s parses virtual-host
+            // buckets before custom routes. Handle them here so SERVER_DOMAINS
+            // cannot turn /health into an S3 bucket request.
+            .layer(PublicHealthEndpointLayer)
             .service(service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
