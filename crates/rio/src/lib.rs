@@ -88,7 +88,7 @@ mod compress_reader;
 pub use compress_reader::{CompressReader, DecompressReader};
 
 mod encrypt_reader;
-pub use encrypt_reader::{DecryptReader, EncryptReader};
+pub use encrypt_reader::{DecryptReader, EncryptReader, multipart_part_nonce};
 
 mod hardlimit_reader;
 pub use hardlimit_reader::HardLimitReader;

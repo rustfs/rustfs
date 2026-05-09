@@ -57,6 +57,10 @@ where
             finished: false,
         }
     }
+
+    pub fn new_multipart(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
+        Self::new(inner, key, multipart_part_nonce(base_nonce, part_number))
+    }
 }
 
 impl<R> AsyncRead for EncryptReader<R>
@@ -472,6 +476,10 @@ where
 
 fn derive_block_nonce(base: &[u8; 12], block_index: usize) -> [u8; 12] {
     derive_nonce_offset(base, 8, block_index)
+}
+
+pub fn multipart_part_nonce(base_nonce: [u8; 12], part_number: usize) -> [u8; 12] {
+    derive_part_nonce(&base_nonce, part_number)
 }
 
 fn derive_part_nonce(base: &[u8; 12], part_number: usize) -> [u8; 12] {
