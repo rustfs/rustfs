@@ -19,14 +19,15 @@ use crate::global::is_first_cluster_node_local;
 use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::audit::{
-    AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS,
-    AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS, AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS,
-    AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
+    AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
+    AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS,
+    AUDIT_PULSAR_KEYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_KEYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::notify::{
-    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
-    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS,
-    NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_KEYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
+    NOTIFY_AMQP_KEYS, NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS,
+    NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_KEYS,
+    NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_KEYS, NOTIFY_REDIS_SUB_SYS,
+    NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
@@ -60,13 +61,19 @@ struct TargetConfigDescriptor {
     valid_keys: &'static [&'static str],
 }
 
-fn notify_target_descriptors() -> [TargetConfigDescriptor; 8] {
+fn notify_target_descriptors() -> [TargetConfigDescriptor; 9] {
     [
         TargetConfigDescriptor {
             external_key: "webhook",
             subsystem_key: NOTIFY_WEBHOOK_SUB_SYS,
             default_kvs: &notify::DEFAULT_NOTIFY_WEBHOOK_KVS,
             valid_keys: NOTIFY_WEBHOOK_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "amqp",
+            subsystem_key: NOTIFY_AMQP_SUB_SYS,
+            default_kvs: &notify::DEFAULT_NOTIFY_AMQP_KVS,
+            valid_keys: NOTIFY_AMQP_KEYS,
         },
         TargetConfigDescriptor {
             external_key: "kafka",
@@ -113,13 +120,19 @@ fn notify_target_descriptors() -> [TargetConfigDescriptor; 8] {
     ]
 }
 
-fn audit_target_descriptors() -> [TargetConfigDescriptor; 8] {
+fn audit_target_descriptors() -> [TargetConfigDescriptor; 9] {
     [
         TargetConfigDescriptor {
             external_key: "webhook",
             subsystem_key: AUDIT_WEBHOOK_SUB_SYS,
             default_kvs: &audit::DEFAULT_AUDIT_WEBHOOK_KVS,
             valid_keys: AUDIT_WEBHOOK_KEYS,
+        },
+        TargetConfigDescriptor {
+            external_key: "amqp",
+            subsystem_key: AUDIT_AMQP_SUB_SYS,
+            default_kvs: &audit::DEFAULT_AUDIT_AMQP_KVS,
+            valid_keys: AUDIT_AMQP_KEYS,
         },
         TargetConfigDescriptor {
             external_key: "kafka",
@@ -717,6 +730,8 @@ fn is_target_bool_key(key: &str) -> bool {
     matches!(
         key,
         ENABLE_KEY
+            | rustfs_config::AMQP_MANDATORY
+            | rustfs_config::AMQP_PERSISTENT
             | rustfs_config::WEBHOOK_SKIP_TLS_VERIFY
             | rustfs_config::KAFKA_TLS_ENABLE
             | rustfs_config::MQTT_TLS_TRUST_LEAF_AS_CA
@@ -726,14 +741,31 @@ fn is_target_bool_key(key: &str) -> bool {
     )
 }
 
+fn parse_target_bool_scalar(value: &str) -> Option<bool> {
+    if let Ok(state) = value.parse::<EnableState>() {
+        return Some(state.is_enabled());
+    }
+    if let Ok(boolean) = value.parse::<bool>() {
+        return Some(boolean);
+    }
+    None
+}
+
+fn target_scalar_values_equal(key: &str, lhs: &str, rhs: &str) -> bool {
+    if is_target_bool_key(key)
+        && let (Some(lhs), Some(rhs)) = (parse_target_bool_scalar(lhs), parse_target_bool_scalar(rhs))
+    {
+        return lhs == rhs;
+    }
+
+    lhs == rhs
+}
+
 fn encode_target_scalar_value(key: &str, value: &str) -> Value {
-    if is_target_bool_key(key) {
-        if let Ok(state) = value.parse::<EnableState>() {
-            return Value::Bool(state.is_enabled());
-        }
-        if let Ok(boolean) = value.parse::<bool>() {
-            return Value::Bool(boolean);
-        }
+    if is_target_bool_key(key)
+        && let Some(boolean) = parse_target_bool_scalar(value)
+    {
+        return Value::Bool(boolean);
     }
 
     Value::String(value.to_string())
@@ -759,7 +791,7 @@ fn build_target_instance_diff_object(kvs: &KVS, baseline: &KVS, valid_keys: &[&s
         let baseline_value = baseline.lookup(key).unwrap_or_default();
         let effective_value = kvs.lookup(key).unwrap_or_else(|| baseline_value.clone());
 
-        if effective_value == baseline_value {
+        if target_scalar_values_equal(key, &effective_value, &baseline_value) {
             continue;
         }
 
@@ -1169,8 +1201,10 @@ mod tests {
         ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, WalkOptions,
     };
     use http::HeaderMap;
-    use rustfs_config::audit::{AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
-    use rustfs_config::notify::{NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+    use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
+    use rustfs_config::notify::{
+        NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+    };
     use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
     use rustfs_config::{
         DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
@@ -1816,6 +1850,15 @@ mod tests {
                 "tls_enable":true
               }
             },
+            "amqp":{
+              "primary":{
+                "enable":true,
+                "url":"amqp://127.0.0.1:5672/%2f",
+                "exchange":"rustfs.events",
+                "routing_key":"objects",
+                "persistent":true
+              }
+            },
             "mysql":{
               "primary":{
                 "enable":true,
@@ -1860,6 +1903,15 @@ mod tests {
         assert_eq!(kafka.get(rustfs_config::KAFKA_TOPIC), "events-kafka");
         assert_eq!(kafka.get(rustfs_config::KAFKA_ACKS), "all");
         assert_eq!(kafka.get(rustfs_config::KAFKA_TLS_ENABLE), "true");
+
+        let amqp = cfg
+            .get_value(NOTIFY_AMQP_SUB_SYS, "primary")
+            .expect("amqp target should be decoded");
+        assert_eq!(amqp.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(amqp.get(rustfs_config::AMQP_URL), "amqp://127.0.0.1:5672/%2f");
+        assert_eq!(amqp.get(rustfs_config::AMQP_EXCHANGE), "rustfs.events");
+        assert_eq!(amqp.get(rustfs_config::AMQP_ROUTING_KEY), "objects");
+        assert_eq!(amqp.get(rustfs_config::AMQP_PERSISTENT), "true");
 
         let mysql = cfg
             .get_value(NOTIFY_MYSQL_SUB_SYS, "primary")
@@ -1928,6 +1980,15 @@ mod tests {
                 "queue_dir":"/tmp/audit-queue"
               }
             },
+            "amqp":{
+              "primary":{
+                "enable":true,
+                "url":"amqp://127.0.0.1:5672/%2f",
+                "exchange":"rustfs.audit",
+                "routing_key":"audit",
+                "persistent":true
+              }
+            },
             "mqtt":{
               "default":{
                 "enable":true,
@@ -1958,6 +2019,15 @@ mod tests {
         assert_eq!(webhook.get(ENABLE_KEY), EnableState::On.to_string());
         assert_eq!(webhook.get(rustfs_config::WEBHOOK_ENDPOINT), "https://example.com/audit-hook");
         assert_eq!(webhook.get(rustfs_config::WEBHOOK_QUEUE_DIR), "/tmp/audit-queue");
+
+        let amqp = cfg
+            .get_value(AUDIT_AMQP_SUB_SYS, "primary")
+            .expect("audit amqp target should be decoded");
+        assert_eq!(amqp.get(ENABLE_KEY), EnableState::On.to_string());
+        assert_eq!(amqp.get(rustfs_config::AMQP_URL), "amqp://127.0.0.1:5672/%2f");
+        assert_eq!(amqp.get(rustfs_config::AMQP_EXCHANGE), "rustfs.audit");
+        assert_eq!(amqp.get(rustfs_config::AMQP_ROUTING_KEY), "audit");
+        assert_eq!(amqp.get(rustfs_config::AMQP_PERSISTENT), "true");
 
         let mqtt_default = cfg
             .get_value(AUDIT_MQTT_SUB_SYS, DEFAULT_DELIMITER)
@@ -2127,6 +2197,44 @@ mod tests {
         );
         cfg.0.insert(NOTIFY_KAFKA_SUB_SYS.to_string(), kafka_section);
 
+        let mut amqp_section = std::collections::HashMap::new();
+        amqp_section.insert(
+            "primary".to_string(),
+            crate::config::KVS(vec![
+                crate::config::KV {
+                    key: ENABLE_KEY.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_URL.to_string(),
+                    value: "amqp://127.0.0.1:5672/%2f".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_EXCHANGE.to_string(),
+                    value: "rustfs.events".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_ROUTING_KEY.to_string(),
+                    value: "objects".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_MANDATORY.to_string(),
+                    value: "false".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_PERSISTENT.to_string(),
+                    value: "false".to_string(),
+                    hidden_if_empty: false,
+                },
+            ]),
+        );
+        cfg.0.insert(NOTIFY_AMQP_SUB_SYS.to_string(), amqp_section);
+
         let out = encode_server_config_blob(&cfg, None).expect("encode should succeed");
         let v: Value = serde_json::from_slice(&out).expect("output should be json");
         let notify = v
@@ -2175,6 +2283,21 @@ mod tests {
         );
         assert_eq!(kafka.get(rustfs_config::KAFKA_ACKS).and_then(Value::as_str), Some("all"));
         assert_eq!(kafka.get(rustfs_config::KAFKA_TLS_ENABLE).and_then(Value::as_bool), Some(true));
+
+        let amqp = notify
+            .get("amqp")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get("primary"))
+            .and_then(Value::as_object)
+            .expect("amqp target should be encoded");
+        assert_eq!(
+            amqp.get(rustfs_config::AMQP_URL).and_then(Value::as_str),
+            Some("amqp://127.0.0.1:5672/%2f")
+        );
+        assert_eq!(amqp.get(rustfs_config::AMQP_EXCHANGE).and_then(Value::as_str), Some("rustfs.events"));
+        assert_eq!(amqp.get(rustfs_config::AMQP_ROUTING_KEY).and_then(Value::as_str), Some("objects"));
+        assert!(!amqp.contains_key(rustfs_config::AMQP_MANDATORY));
+        assert_eq!(amqp.get(rustfs_config::AMQP_PERSISTENT).and_then(Value::as_bool), Some(false));
     }
 
     #[test]
@@ -2203,6 +2326,44 @@ mod tests {
             ]),
         );
         cfg.0.insert(AUDIT_WEBHOOK_SUB_SYS.to_string(), webhook_section);
+
+        let mut amqp_section = std::collections::HashMap::new();
+        amqp_section.insert(
+            "primary".to_string(),
+            crate::config::KVS(vec![
+                crate::config::KV {
+                    key: ENABLE_KEY.to_string(),
+                    value: EnableState::On.to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_URL.to_string(),
+                    value: "amqp://127.0.0.1:5672/%2f".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_EXCHANGE.to_string(),
+                    value: "rustfs.audit".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_ROUTING_KEY.to_string(),
+                    value: "audit".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_MANDATORY.to_string(),
+                    value: "false".to_string(),
+                    hidden_if_empty: false,
+                },
+                crate::config::KV {
+                    key: rustfs_config::AMQP_PERSISTENT.to_string(),
+                    value: "false".to_string(),
+                    hidden_if_empty: false,
+                },
+            ]),
+        );
+        cfg.0.insert(AUDIT_AMQP_SUB_SYS.to_string(), amqp_section);
 
         let mut mqtt_default = audit::DEFAULT_AUDIT_MQTT_KVS.clone();
         mqtt_default.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
@@ -2265,6 +2426,21 @@ mod tests {
             Some("https://example.com/audit-hook")
         );
         assert_eq!(webhook.get(ENABLE_KEY).and_then(Value::as_bool), Some(true));
+
+        let amqp = logger
+            .get("amqp")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get("primary"))
+            .and_then(Value::as_object)
+            .expect("audit amqp target should be encoded");
+        assert_eq!(
+            amqp.get(rustfs_config::AMQP_URL).and_then(Value::as_str),
+            Some("amqp://127.0.0.1:5672/%2f")
+        );
+        assert_eq!(amqp.get(rustfs_config::AMQP_EXCHANGE).and_then(Value::as_str), Some("rustfs.audit"));
+        assert_eq!(amqp.get(rustfs_config::AMQP_ROUTING_KEY).and_then(Value::as_str), Some("audit"));
+        assert!(!amqp.contains_key(rustfs_config::AMQP_MANDATORY));
+        assert_eq!(amqp.get(rustfs_config::AMQP_PERSISTENT).and_then(Value::as_bool), Some(false));
 
         let mqtt_default = logger
             .get("mqtt")

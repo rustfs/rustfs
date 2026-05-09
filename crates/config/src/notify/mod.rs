@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod amqp;
 mod arn;
 mod kafka;
 mod mqtt;
@@ -23,6 +24,7 @@ mod redis;
 mod store;
 mod webhook;
 
+pub use amqp::*;
 pub use arn::*;
 pub use kafka::*;
 pub use mqtt::*;
@@ -76,6 +78,7 @@ pub const ENV_NOTIFY_SEND_CONCURRENCY: &str = "RUSTFS_NOTIFY_SEND_CONCURRENCY";
 pub const DEFAULT_NOTIFY_SEND_CONCURRENCY: usize = 64;
 
 pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[
+    NOTIFY_AMQP_SUB_SYS,
     NOTIFY_KAFKA_SUB_SYS,
     NOTIFY_MQTT_SUB_SYS,
     NOTIFY_MYSQL_SUB_SYS,
@@ -95,7 +98,6 @@ pub const NOTIFY_NATS_SUB_SYS: &str = "notify_nats";
 pub const NOTIFY_NSQ_SUB_SYS: &str = "notify_nsq";
 #[allow(dead_code)]
 pub const NOTIFY_ES_SUB_SYS: &str = "notify_elasticsearch";
-#[allow(dead_code)]
 pub const NOTIFY_AMQP_SUB_SYS: &str = "notify_amqp";
 pub const NOTIFY_POSTGRES_SUB_SYS: &str = "notify_postgres";
 #[allow(dead_code)]

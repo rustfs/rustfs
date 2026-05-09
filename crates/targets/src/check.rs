@@ -220,3 +220,23 @@ pub async fn check_redis_server_available(args: &crate::target::redis::RedisArgs
     .await
     .unwrap_or_else(|_| Err(crate::TargetError::Timeout("Redis connection timed out".to_string())))
 }
+
+pub async fn check_amqp_broker_available(args: &crate::target::amqp::AMQPArgs) -> Result<(), crate::TargetError> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let connection = crate::target::amqp::connect_amqp(args).await?;
+        if !connection.connection.status().connected() || !connection.channel.status().connected() {
+            return Err(crate::TargetError::NotConnected);
+        }
+        connection
+            .connection
+            .close(200, "OK".into())
+            .await
+            .map_err(|e| crate::TargetError::Network(format!("Failed to close AMQP check connection: {e}")))?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::TargetError::Timeout("AMQP connection timed out".to_string())),
+    }
+}
