@@ -444,15 +444,19 @@ where
         }
     }
 
-    fn empty_streaming_blob() -> StreamingBlob {
-        StreamingBlob::wrap(stream::once(async { Ok::<Bytes, std::io::Error>(Bytes::new()) }))
-    }
-
     fn credentials(&self) -> (&str, &str) {
         (
             &self.session_context.principal.user_identity.credentials.access_key,
             &self.session_context.principal.user_identity.credentials.secret_key,
         )
+    }
+
+    fn is_missing_head_object_error(error: &str) -> bool {
+        let lower = error.to_ascii_lowercase();
+        lower.contains("nosuchkey")
+            || lower.contains("notfound")
+            || lower.contains("not found")
+            || lower.contains("status code: 404")
     }
 
     async fn prefix_has_entries(&self, bucket: &str, prefix: &str) -> FsResult<bool> {
@@ -494,11 +498,15 @@ where
             content_type,
             ..
         } = get_output;
+        let body = body.ok_or_else(|| {
+            error!("GetObject for source object '{}/{}' returned no body stream", src_bucket, src_key);
+            FsError::GeneralFailure
+        })?;
 
         let mut put_builder = PutObjectInput::builder()
             .bucket(dst_bucket.to_string())
             .key(dst_key.to_string())
-            .body(Some(body.unwrap_or_else(Self::empty_streaming_blob)));
+            .body(Some(body));
 
         if let Some(content_length) = content_length {
             put_builder = put_builder.content_length(Some(content_length));
@@ -562,7 +570,15 @@ where
 
         match self.storage.head_object(bucket, key, access_key, secret_key).await {
             Ok(output) => Ok(HeadObjectProbe::Found(Box::new(output))),
-            Err(_) => Ok(HeadObjectProbe::Missing),
+            Err(e) => {
+                let err_msg = e.to_string();
+                if Self::is_missing_head_object_error(&err_msg) {
+                    Ok(HeadObjectProbe::Missing)
+                } else {
+                    error!("Failed to probe object '{}/{}': {}", bucket, key, err_msg);
+                    Err(FsError::GeneralFailure)
+                }
+            }
         }
     }
 
@@ -1288,7 +1304,7 @@ where
             let dst_key = dst_key.ok_or(FsError::Forbidden)?;
             let (access_key, secret_key) = self.credentials();
             let resolved_src = self.resolve_path(&src_bucket, &src_key).await?;
-            let src_prefix = match resolved_src {
+            let (src_prefix, include_src_marker) = match resolved_src {
                 ResolvedPath::File(_) => {
                     authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
                         .await
@@ -1314,7 +1330,11 @@ where
                     debug!("Successfully renamed file '{}/{}' to '{}/{}'", src_bucket, src_key, dst_bucket, dst_key);
                     return Ok(());
                 }
-                ResolvedPath::Directory { prefix, .. } => prefix,
+                ResolvedPath::Directory { prefix, .. } => {
+                    let include_src_marker =
+                        matches!(self.probe_head_object(&src_bucket, &src_key).await?, HeadObjectProbe::Found(_));
+                    (prefix, include_src_marker)
+                }
             };
             let dst_prefix = format!("{}/", dst_key);
 
@@ -1323,7 +1343,23 @@ where
                 .map_err(|_| FsError::Forbidden)?;
 
             let mut continuation_token: Option<String> = None;
-            let mut rename_pairs: Vec<(String, String)> = Vec::new();
+            let mut renamed_any = false;
+
+            if include_src_marker {
+                authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+                authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+                authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(&src_key))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+
+                self.execute_directory_rename_pairs(&src_bucket, &dst_bucket, &[(src_key.clone(), dst_key.clone())])
+                    .await?;
+                renamed_any = true;
+            }
 
             loop {
                 let mut list_builder = ListObjectsV2Input::builder()
@@ -1344,13 +1380,32 @@ where
                         FsError::GeneralFailure
                     })?;
 
+                let mut page_pairs: Vec<(String, String)> = Vec::new();
                 if let Some(objects) = output.contents {
                     for obj in objects {
                         if let Some(obj_key) = obj.key {
                             let new_key = obj_key.replacen(&src_prefix, &dst_prefix, 1);
-                            rename_pairs.push((obj_key, new_key));
+                            page_pairs.push((obj_key, new_key));
                         }
                     }
+                }
+
+                if !page_pairs.is_empty() {
+                    for (src_obj_key, dst_obj_key) in &page_pairs {
+                        authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(src_obj_key))
+                            .await
+                            .map_err(|_| FsError::Forbidden)?;
+                        authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(dst_obj_key))
+                            .await
+                            .map_err(|_| FsError::Forbidden)?;
+                        authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(src_obj_key))
+                            .await
+                            .map_err(|_| FsError::Forbidden)?;
+                    }
+
+                    self.execute_directory_rename_pairs(&src_bucket, &dst_bucket, &page_pairs)
+                        .await?;
+                    renamed_any = true;
                 }
 
                 if !output.is_truncated.unwrap_or(false) {
@@ -1359,25 +1414,10 @@ where
                 continuation_token = output.next_continuation_token;
             }
 
-            if rename_pairs.is_empty() {
+            if !renamed_any {
                 debug!("Source not found: {}/{}", src_bucket, src_key);
                 return Err(FsError::NotFound);
             }
-
-            for (src_obj_key, dst_obj_key) in &rename_pairs {
-                authorize_operation(&self.session_context, &S3Action::GetObject, &src_bucket, Some(src_obj_key))
-                    .await
-                    .map_err(|_| FsError::Forbidden)?;
-                authorize_operation(&self.session_context, &S3Action::PutObject, &dst_bucket, Some(dst_obj_key))
-                    .await
-                    .map_err(|_| FsError::Forbidden)?;
-                authorize_operation(&self.session_context, &S3Action::DeleteObject, &src_bucket, Some(src_obj_key))
-                    .await
-                    .map_err(|_| FsError::Forbidden)?;
-            }
-
-            self.execute_directory_rename_pairs(&src_bucket, &dst_bucket, &rename_pairs)
-                .await?;
 
             debug!(
                 "Successfully renamed directory '{}/{}' to '{}/{}'",
