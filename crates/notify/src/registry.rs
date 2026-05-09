@@ -13,21 +13,14 @@
 // limitations under the License.
 
 use crate::Event;
-use crate::factory::{
-    KafkaTargetFactory, MQTTTargetFactory, MySqlTargetFactory, NATSTargetFactory, PostgresTargetFactory, PulsarTargetFactory,
-    RedisTargetFactory, TargetFactory, WebhookTargetFactory,
-};
-use futures::stream::{FuturesUnordered, StreamExt};
-use hashbrown::HashMap;
+use crate::factory::builtin_target_plugins;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_ecstore::config::{Config, KVS};
-use rustfs_targets::{Target, TargetError, config::collect_target_configs, target::ChannelTargetType};
-use std::sync::Arc;
-use tracing::{error, info};
+use rustfs_targets::{Target, TargetError, TargetPluginRegistry};
 
 /// Registry for managing target factories
 pub struct TargetRegistry {
-    factories: HashMap<String, Box<dyn TargetFactory>>,
+    plugins: TargetPluginRegistry<Event>,
 }
 
 impl Default for TargetRegistry {
@@ -39,26 +32,14 @@ impl Default for TargetRegistry {
 impl TargetRegistry {
     /// Creates a new TargetRegistry with built-in factories
     pub fn new() -> Self {
-        let mut registry = TargetRegistry {
-            factories: HashMap::new(),
-        };
+        let mut plugins = TargetPluginRegistry::new();
+        plugins.register_all(builtin_target_plugins());
 
-        // Register built-in factories
-        registry.register(ChannelTargetType::Webhook.as_str(), Box::new(WebhookTargetFactory));
-        registry.register(ChannelTargetType::Mqtt.as_str(), Box::new(MQTTTargetFactory));
-        registry.register(ChannelTargetType::Nats.as_str(), Box::new(NATSTargetFactory));
-        registry.register(ChannelTargetType::Postgres.as_str(), Box::new(PostgresTargetFactory));
-        registry.register(ChannelTargetType::Pulsar.as_str(), Box::new(PulsarTargetFactory));
-        registry.register(ChannelTargetType::Kafka.as_str(), Box::new(KafkaTargetFactory));
-        registry.register(ChannelTargetType::MySql.as_str(), Box::new(MySqlTargetFactory));
-        registry.register(ChannelTargetType::Redis.as_str(), Box::new(RedisTargetFactory));
-
-        registry
+        TargetRegistry { plugins }
     }
 
-    /// Registers a new factory for a target type
-    pub fn register(&mut self, target_type: &str, factory: Box<dyn TargetFactory>) {
-        self.factories.insert(target_type.to_string(), factory);
+    pub fn supports_target_type(&self, target_type: &str) -> bool {
+        self.plugins.supports_target_type(target_type)
     }
 
     /// Creates a target from configuration
@@ -68,16 +49,7 @@ impl TargetRegistry {
         id: String,
         config: &KVS,
     ) -> Result<Box<dyn Target<Event> + Send + Sync>, TargetError> {
-        let factory = self
-            .factories
-            .get(target_type)
-            .ok_or_else(|| TargetError::Configuration(format!("Unknown target type: {target_type}")))?;
-
-        // Validate configuration before creating target
-        factory.validate_config(&id, config)?;
-
-        // Create target
-        factory.create_target(id, config).await
+        self.plugins.create_target(target_type, id, config)
     }
 
     /// Creates all targets from a configuration
@@ -93,36 +65,19 @@ impl TargetRegistry {
         &self,
         config: &Config,
     ) -> Result<Vec<Box<dyn Target<Event> + Send + Sync>>, TargetError> {
-        let mut tasks = FuturesUnordered::new();
-        for (target_type, factory) in &self.factories {
-            tracing::Span::current().record("target_type", target_type.as_str());
-            info!("Start working on target types...");
-            let valid_fields = factory.get_valid_fields();
-            for (id, merged_config) in collect_target_configs(config, NOTIFY_ROUTE_PREFIX, target_type, &valid_fields) {
-                info!(instance_id = %id, "Target is enabled, ready to create a task");
-                let tid = id.clone();
-                let merged_config_arc = Arc::new(merged_config);
-                tasks.push(async move {
-                    let result = factory.create_target(tid.clone(), &merged_config_arc).await;
-                    (tid, result)
-                });
-            }
-        }
+        self.plugins.create_targets_from_config(config, NOTIFY_ROUTE_PREFIX).await
+    }
+}
 
-        let mut successful_targets = Vec::new();
-        while let Some((id, result)) = tasks.next().await {
-            match result {
-                Ok(target) => {
-                    info!(instance_id = %id, "Create target successfully");
-                    successful_targets.push(target);
-                }
-                Err(e) => {
-                    error!(instance_id = %id, error = %e, "Failed to create target");
-                }
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::TargetRegistry;
+    use rustfs_targets::target::ChannelTargetType;
 
-        info!(count = successful_targets.len(), "All target processing completed");
-        Ok(successful_targets)
+    #[test]
+    fn registry_registers_amqp_factory() {
+        let registry = TargetRegistry::new();
+
+        assert!(registry.supports_target_type(ChannelTargetType::Amqp.as_str()));
     }
 }

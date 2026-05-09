@@ -16,15 +16,17 @@ pub mod arn;
 mod check;
 pub mod config;
 pub mod error;
+pub mod plugin;
 pub mod store;
 pub mod sys;
 pub mod target;
 
 pub use check::{
-    check_kafka_broker_available, check_mqtt_broker_available, check_mqtt_broker_available_with_tls, check_nats_server_available,
-    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
+    check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available, check_mqtt_broker_available_with_tls,
+    check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
 };
 pub use error::{StoreError, TargetError};
+pub use plugin::{BuiltinTargetDescriptor, TargetPluginDescriptor, TargetPluginRegistry, TargetRequestValidator, boxed_target};
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};
 pub use sys::user_agent::*;

@@ -50,6 +50,19 @@ pub const KAFKA_TLS_CA: &str = "tls_ca";
 pub const KAFKA_TLS_CLIENT_CERT: &str = "tls_client_cert";
 pub const KAFKA_TLS_CLIENT_KEY: &str = "tls_client_key";
 
+pub const AMQP_URL: &str = "url";
+pub const AMQP_EXCHANGE: &str = "exchange";
+pub const AMQP_ROUTING_KEY: &str = "routing_key";
+pub const AMQP_MANDATORY: &str = "mandatory";
+pub const AMQP_PERSISTENT: &str = "persistent";
+pub const AMQP_USERNAME: &str = "username";
+pub const AMQP_PASSWORD: &str = "password";
+pub const AMQP_TLS_CA: &str = "tls_ca";
+pub const AMQP_TLS_CLIENT_CERT: &str = "tls_client_cert";
+pub const AMQP_TLS_CLIENT_KEY: &str = "tls_client_key";
+pub const AMQP_QUEUE_DIR: &str = "queue_dir";
+pub const AMQP_QUEUE_LIMIT: &str = "queue_limit";
+
 pub const NATS_ADDRESS: &str = "address";
 pub const NATS_SUBJECT: &str = "subject";
 pub const NATS_USERNAME: &str = "username";
