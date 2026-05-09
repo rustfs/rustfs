@@ -41,6 +41,7 @@ use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 use tracing::{Span, warn};
@@ -91,11 +92,15 @@ struct AuditEndpointsResponse {
     audit_endpoints: Vec<AuditEndpoint>,
 }
 
-fn audit_target_specs() -> Vec<AdminTargetSpec> {
+static AUDIT_TARGET_SPECS: LazyLock<Vec<AdminTargetSpec>> = LazyLock::new(|| {
     builtin_audit_target_descriptors()
         .into_iter()
         .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
         .collect()
+});
+
+fn audit_target_specs() -> &'static [AdminTargetSpec] {
+    &AUDIT_TARGET_SPECS
 }
 
 async fn authorize_audit_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
@@ -122,7 +127,7 @@ fn has_any_audit_targets(config: &Config) -> bool {
 
 fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
     shared_target_mutation_block_reason(
-        &audit_target_specs(),
+        audit_target_specs(),
         AUDIT_ROUTE_PREFIX,
         config,
         target_type,
@@ -143,7 +148,7 @@ async fn audit_target_operation_block_reason(action: &str) -> Option<String> {
 }
 
 fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<AuditEndpoint> {
-    shared_merge_target_endpoints(&audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)
+    shared_merge_target_endpoints(audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)
         .into_iter()
         .map(|endpoint| AuditEndpoint {
             account_id: endpoint.account_id,
@@ -158,7 +163,7 @@ fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &
     let target_type = params
         .get("target_type")
         .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'target_type'"))?;
-    if target_service_name(&audit_target_specs(), target_type).is_none() {
+    if target_service_name(audit_target_specs(), target_type).is_none() {
         return Err(s3_error!(InvalidArgument, "unsupported audit target type: '{}'", target_type));
     }
     let target_name = params
@@ -264,7 +269,7 @@ impl Operation for AuditTargetConfig {
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for audit target config: {}", e))?;
 
         let specs = audit_target_specs();
-        let allowed_keys: HashSet<&str> = allowed_target_keys(&specs, target_type);
+        let allowed_keys: HashSet<&str> = allowed_target_keys(specs, target_type);
 
         let kv_map = shared_collect_validated_key_values(
             audit_body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
@@ -273,7 +278,7 @@ impl Operation for AuditTargetConfig {
             "audit target",
         )?;
 
-        let spec = target_spec(&specs, target_type)
+        let spec = target_spec(specs, target_type)
             .ok_or_else(|| s3_error!(InvalidArgument, "unsupported audit target type: '{}'", target_type))?;
         timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, AUDIT_DEFAULT_DIR))
             .await

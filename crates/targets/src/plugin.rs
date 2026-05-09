@@ -49,6 +49,7 @@ where
     create_target: TargetCreateFn<E>,
     target_type: &'static str,
     valid_fields: &'static [&'static str],
+    valid_fields_set: Arc<HashSet<String>>,
     validate_config: TargetValidateFn,
 }
 
@@ -70,6 +71,7 @@ where
             create_target: Arc::new(create_target),
             target_type,
             valid_fields,
+            valid_fields_set: Arc::new(valid_fields.iter().map(|field| (*field).to_string()).collect()),
             validate_config: Arc::new(validate_config),
         }
     }
@@ -82,6 +84,11 @@ where
     #[inline]
     pub fn valid_fields(&self) -> &'static [&'static str] {
         self.valid_fields
+    }
+
+    #[inline]
+    pub fn valid_fields_set(&self) -> &HashSet<String> {
+        self.valid_fields_set.as_ref()
     }
 
     #[inline]
@@ -195,14 +202,8 @@ where
         let mut successful_targets = Vec::new();
 
         for (target_type, plugin) in &self.plugins {
-            let valid_fields = plugin
-                .valid_fields()
-                .iter()
-                .map(|field| (*field).to_string())
-                .collect::<HashSet<_>>();
-
             info!(target_type = %target_type, "Start working on target type");
-            for (id, merged_config) in collect_target_configs(config, route_prefix, target_type, &valid_fields) {
+            for (id, merged_config) in collect_target_configs(config, route_prefix, target_type, plugin.valid_fields_set()) {
                 info!(target_type = %target_type, instance_id = %id, "Target is enabled, ready to create");
                 match self.create_target(target_type, id.clone(), &merged_config) {
                     Ok(target) => {

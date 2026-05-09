@@ -41,6 +41,7 @@ use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 use tracing::{Span, info, warn};
@@ -97,11 +98,15 @@ struct NotificationEndpointsResponse {
     notification_endpoints: Vec<NotificationEndpoint>,
 }
 
-fn notification_target_specs() -> Vec<AdminTargetSpec> {
+static NOTIFICATION_TARGET_SPECS: LazyLock<Vec<AdminTargetSpec>> = LazyLock::new(|| {
     builtin_notification_target_descriptors()
         .into_iter()
         .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
         .collect()
+});
+
+fn notification_target_specs() -> &'static [AdminTargetSpec] {
+    &NOTIFICATION_TARGET_SPECS
 }
 
 // --- Helper Functions ---
@@ -122,7 +127,7 @@ fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>>
 
 fn target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
     shared_target_mutation_block_reason(
-        &notification_target_specs(),
+        notification_target_specs(),
         NOTIFY_ROUTE_PREFIX,
         config,
         target_type,
@@ -143,7 +148,7 @@ async fn notification_target_operation_block_reason(action: &str) -> Option<Stri
 }
 
 fn merge_notification_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<NotificationEndpoint> {
-    shared_merge_target_endpoints(&notification_target_specs(), NOTIFY_ROUTE_PREFIX, config, runtime_statuses)
+    shared_merge_target_endpoints(notification_target_specs(), NOTIFY_ROUTE_PREFIX, config, runtime_statuses)
         .into_iter()
         .map(|endpoint| NotificationEndpoint {
             account_id: endpoint.account_id,
@@ -191,7 +196,7 @@ impl Operation for NotificationTarget {
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for target config: {}", e))?;
 
         let specs = notification_target_specs();
-        let allowed_keys: HashSet<&str> = allowed_target_keys(&specs, target_type);
+        let allowed_keys: HashSet<&str> = allowed_target_keys(specs, target_type);
 
         let kv_map = shared_collect_validated_key_values(
             notification_body
@@ -202,7 +207,7 @@ impl Operation for NotificationTarget {
             target_type,
             "target",
         )?;
-        let spec = target_spec(&specs, target_type)
+        let spec = target_spec(specs, target_type)
             .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
         timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, EVENT_DEFAULT_DIR))
             .await
@@ -347,7 +352,7 @@ fn extract_param<'a>(params: &'a Params<'_, '_>, key: &str) -> S3Result<&'a str>
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
     let target_type = extract_param(params, "target_type")?;
-    if target_service_name(&notification_target_specs(), target_type).is_none() {
+    if target_service_name(notification_target_specs(), target_type).is_none() {
         return Err(s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type));
     }
     let target_name = extract_param(params, "target_name")?;
@@ -829,7 +834,7 @@ mod tests {
     #[test]
     fn collect_validated_key_values_accepts_amqp_keys() {
         let specs = notification_target_specs();
-        let allowed_keys = allowed_target_keys(&specs, NOTIFY_AMQP_SUB_SYS);
+        let allowed_keys = allowed_target_keys(specs, NOTIFY_AMQP_SUB_SYS);
 
         let kv_map = shared_collect_validated_key_values(
             [
