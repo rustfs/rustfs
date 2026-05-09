@@ -28,7 +28,10 @@ mod tests {
     use std::error::Error;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio::time::{Duration, timeout};
     use tracing::info;
+
+    const RAW_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn parse_status(raw_response: &str) -> Option<u16> {
         raw_response.lines().next()?.split_whitespace().nth(1)?.parse().ok()
@@ -82,7 +85,9 @@ mod tests {
         stream.flush().await?;
 
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).await?;
+        timeout(RAW_RESPONSE_TIMEOUT, stream.read_to_end(&mut response))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out reading raw DELETE response"))??;
         Ok(String::from_utf8_lossy(&response).into_owned())
     }
 
