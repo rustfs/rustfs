@@ -43,6 +43,7 @@ on fixed bind ports.
 - GET (download file)
 - PROPFIND on bucket (list objects)
 - DELETE file
+- MOVE file (rename object)
 - DELETE bucket
 - Authentication failure test
 
