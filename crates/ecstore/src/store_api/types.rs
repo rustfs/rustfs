@@ -383,6 +383,37 @@ impl ObjectInfo {
         self.etag.as_ref().is_some_and(|v| v.len() != 32)
     }
 
+    pub fn is_encrypted(&self) -> bool {
+        use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
+
+        self.user_defined
+            .keys()
+            .any(|key| rustfs_utils::http::is_encryption_metadata_key(key))
+            || self.user_defined.contains_key(SSEC_ALGORITHM_HEADER)
+            || self.user_defined.contains_key(SSEC_KEY_HEADER)
+            || self.user_defined.contains_key(SSEC_KEY_MD5_HEADER)
+    }
+
+    pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
+        if let Some(size_str) = self
+            .user_defined
+            .get("x-rustfs-encryption-original-size")
+            .or_else(|| self.user_defined.get("x-amz-server-side-encryption-customer-original-size"))
+            && !size_str.is_empty()
+        {
+            let size = size_str
+                .parse::<i64>()
+                .map_err(|e| std::io::Error::other(format!("Failed to parse encryption original size: {e}")))?;
+            return Ok(Some(size));
+        }
+
+        Ok(None)
+    }
+
+    pub fn decrypted_size(&self) -> std::io::Result<i64> {
+        Ok(self.encryption_original_size()?.unwrap_or(self.size))
+    }
+
     pub fn get_actual_size(&self) -> std::io::Result<i64> {
         if self.actual_size > 0 {
             return Ok(self.actual_size);
@@ -410,15 +441,7 @@ impl ObjectInfo {
         // Check if object is encrypted
         // Managed SSE stores original size in x-rustfs-encryption-original-size metadata
         // SSE-C stores original size in x-amz-server-side-encryption-customer-original-size
-        if let Some(size_str) = self
-            .user_defined
-            .get("x-rustfs-encryption-original-size")
-            .or_else(|| self.user_defined.get("x-amz-server-side-encryption-customer-original-size"))
-            && !size_str.is_empty()
-        {
-            let size = size_str
-                .parse::<i64>()
-                .map_err(|e| std::io::Error::other(format!("Failed to parse encryption original size: {e}")))?;
+        if let Some(size) = self.encryption_original_size()? {
             return Ok(size);
         }
 

@@ -88,8 +88,9 @@ use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
 use rustfs_utils::http::{
-    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    contains_key_str, get_header_map, get_str, insert_str, remove_header_map,
+    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE,
+    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC, contains_key_str, get_header_map, get_str,
+    insert_str, is_encryption_metadata_key, remove_header_map,
 };
 use rustfs_utils::{
     HashAlgorithm,
@@ -132,6 +133,13 @@ pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipar
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
     metadata.remove(RUSTFS_MULTIPART_OBJECT_KEY);
+}
+
+fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
+    metadata.keys().any(|key| is_encryption_metadata_key(key))
+        || metadata.contains_key(SSEC_ALGORITHM_HEADER)
+        || metadata.contains_key(SSEC_KEY_HEADER)
+        || metadata.contains_key(SSEC_KEY_MD5_HEADER)
 }
 
 fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
@@ -694,7 +702,7 @@ impl ObjectIO for SetDisks {
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
-        let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h)?;
+        let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h).await?;
 
         // let disks = disks.clone();
         let bucket = bucket.to_owned();
@@ -3510,16 +3518,22 @@ impl MultipartOperations for SetDisks {
 
         fi.metadata.insert("etag".to_owned(), etag);
 
+        let persist_encryption_original_size = should_persist_encryption_original_size(&fi.metadata);
+
         if opts.replication_request {
             if let Some(actual_size) = get_str(&opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP) {
                 insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, actual_size.clone());
-                fi.metadata
-                    .insert("x-rustfs-encryption-original-size".to_string(), actual_size);
+                if persist_encryption_original_size {
+                    fi.metadata
+                        .insert("x-rustfs-encryption-original-size".to_string(), actual_size);
+                }
             }
         } else {
             insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, object_actual_size.to_string());
-            fi.metadata
-                .insert("x-rustfs-encryption-original-size".to_string(), object_actual_size.to_string());
+            if persist_encryption_original_size {
+                fi.metadata
+                    .insert("x-rustfs-encryption-original-size".to_string(), object_actual_size.to_string());
+            }
         }
 
         if fi.is_compressed() {
@@ -5719,6 +5733,20 @@ mod tests {
 
         check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
             .expect("GOVERNANCE shortening with bypass should remain allowed");
+    }
+
+    #[test]
+    fn test_should_persist_encryption_original_size_rejects_plain_metadata() {
+        let metadata = HashMap::from([("content-type".to_string(), "application/octet-stream".to_string())]);
+
+        assert!(!should_persist_encryption_original_size(&metadata));
+    }
+
+    #[test]
+    fn test_should_persist_encryption_original_size_accepts_sse_c_metadata() {
+        let metadata = HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]);
+
+        assert!(should_persist_encryption_original_size(&metadata));
     }
 
     #[test]

@@ -220,23 +220,29 @@ where
     }
 }
 
+/// Adds `Content-Length: 0` for routes whose requests are known to carry no
+/// body, but where some S3-compatible clients omit the header entirely.
+///
+/// The normalization runs before authentication so downstream request
+/// validation sees an explicit empty body length without requiring every
+/// handler to special-case absent `Content-Length`.
 #[derive(Clone)]
-pub struct AdminChunkedContentLengthCompatLayer;
+pub struct EmptyBodyContentLengthCompatLayer;
 
-impl<S> Layer<S> for AdminChunkedContentLengthCompatLayer {
-    type Service = AdminChunkedContentLengthCompatService<S>;
+impl<S> Layer<S> for EmptyBodyContentLengthCompatLayer {
+    type Service = EmptyBodyContentLengthCompatService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        AdminChunkedContentLengthCompatService { inner }
+        EmptyBodyContentLengthCompatService { inner }
     }
 }
 
 #[derive(Clone)]
-pub struct AdminChunkedContentLengthCompatService<S> {
+pub struct EmptyBodyContentLengthCompatService<S> {
     inner: S,
 }
 
-impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for AdminChunkedContentLengthCompatService<S>
+impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for EmptyBodyContentLengthCompatService<S>
 where
     S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
@@ -253,7 +259,7 @@ where
     }
 
     fn call(&mut self, mut req: HttpRequest<ReqBody>) -> Self::Future {
-        if should_force_zero_content_length_for_admin_empty_body(&req) {
+        if should_force_zero_content_length_for_empty_body_route(&req) {
             req.headers_mut()
                 .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
         }
@@ -263,8 +269,20 @@ where
     }
 }
 
-fn should_force_zero_content_length_for_admin_empty_body<B>(req: &HttpRequest<B>) -> bool {
-    is_empty_body_admin_path(req.method(), req.uri().path()) && !req.headers().contains_key(http::header::CONTENT_LENGTH)
+fn should_force_zero_content_length_for_empty_body_route<B>(req: &HttpRequest<B>) -> bool {
+    if req.headers().contains_key(http::header::CONTENT_LENGTH) {
+        return false;
+    }
+
+    if req.headers().contains_key(http::header::TRANSFER_ENCODING) {
+        return false;
+    }
+
+    if is_empty_body_admin_path(req.method(), req.uri().path()) {
+        return true;
+    }
+
+    is_empty_body_s3_path(req.method(), req.uri())
 }
 
 fn is_empty_body_admin_path(method: &Method, path: &str) -> bool {
@@ -289,6 +307,10 @@ fn is_empty_body_admin_path(method: &Method, path: &str) -> bool {
         ),
         _ => false,
     }
+}
+
+fn is_empty_body_s3_path(method: &Method, uri: &http::Uri) -> bool {
+    *method == Method::DELETE && ConditionalCorsLayer::is_s3_path(uri.path())
 }
 
 #[derive(Clone)]
@@ -1218,7 +1240,7 @@ mod tests {
             .body(())
             .expect("request");
 
-        assert!(should_force_zero_content_length_for_admin_empty_body(&request));
+        assert!(should_force_zero_content_length_for_empty_body_route(&request));
     }
 
     #[test]
@@ -1238,17 +1260,17 @@ mod tests {
             let request = Request::builder().method(Method::POST).uri(path).body(()).expect("request");
 
             assert!(
-                should_force_zero_content_length_for_admin_empty_body(&request),
+                should_force_zero_content_length_for_empty_body_route(&request),
                 "{path} should force Content-Length: 0"
             );
         }
     }
 
     #[tokio::test]
-    async fn admin_empty_body_post_layer_inserts_zero_content_length() {
+    async fn empty_body_layer_inserts_zero_content_length_for_admin_post() {
         let capture = HeaderCaptureService::default();
         let headers = capture.headers();
-        let mut service = AdminChunkedContentLengthCompatLayer.layer(capture);
+        let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
         let request = Request::builder()
             .method(Method::POST)
             .uri("/rustfs/admin/v3/rebalance/start")
@@ -1261,6 +1283,88 @@ mod tests {
         assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
     }
 
+    #[tokio::test]
+    async fn empty_body_layer_inserts_zero_content_length_for_admin_put() {
+        let capture = HeaderCaptureService::default();
+        let headers = capture.headers();
+        let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/rustfs/admin/v3/set-group-status?group=test&status=enabled")
+            .body(())
+            .expect("request");
+
+        let _ = service.call(request).await.expect("service call");
+
+        let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+        assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn empty_body_layer_preserves_admin_transfer_encoding_without_content_length() {
+        let capture = HeaderCaptureService::default();
+        let headers = capture.headers();
+        let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/rustfs/admin/v3/set-group-status?group=test&status=enabled")
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        let _ = service.call(request).await.expect("service call");
+
+        let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert_eq!(headers.get(http::header::TRANSFER_ENCODING).unwrap(), "chunked");
+    }
+
+    #[test]
+    fn s3_delete_object_version_without_content_length_is_normalized() {
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri("/bucket/object.txt?versionId=3HL4kqtJlcpXrof3Gj0OmxJnVBH40Nrjfkd")
+            .body(())
+            .expect("request");
+
+        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[tokio::test]
+    async fn empty_body_layer_inserts_zero_content_length_for_s3_delete_object_version() {
+        let capture = HeaderCaptureService::default();
+        let headers = capture.headers();
+        let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri("/bucket/object.txt?versionId=3HL4kqtJlcpXrof3Gj0OmxJnVBH40Nrjfkd")
+            .body(())
+            .expect("request");
+
+        let _ = service.call(request).await.expect("service call");
+
+        let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+        assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn empty_body_layer_preserves_explicit_content_length_header() {
+        let capture = HeaderCaptureService::default();
+        let headers = capture.headers();
+        let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/minio/admin/v3/set-group-status?group=test&status=enabled")
+            .header(http::header::CONTENT_LENGTH, "7")
+            .body(())
+            .expect("request");
+
+        let _ = service.call(request).await.expect("service call");
+
+        let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+        assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "7");
+    }
+
     #[test]
     fn admin_request_with_explicit_content_length_is_left_unchanged() {
         let request = Request::builder()
@@ -1270,18 +1374,75 @@ mod tests {
             .body(())
             .expect("request");
 
-        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
     }
 
     #[test]
-    fn non_admin_chunked_put_is_not_normalized() {
+    fn s3_put_object_is_not_normalized() {
         let request = Request::builder()
             .method(Method::PUT)
             .uri("/bucket/object")
             .body(())
             .expect("request");
 
-        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn s3_delete_bucket_without_content_length_is_normalized() {
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri("/bucket")
+            .body(())
+            .expect("request");
+
+        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn s3_delete_object_without_version_id_is_normalized() {
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn s3_delete_with_transfer_encoding_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri("/bucket/object?versionId=3HL4kqtJlcpXrof3Gj0OmxJnVBH40Nrjfkd")
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn non_s3_delete_paths_are_not_normalized() {
+        let paths = [
+            "/minio/admin/v3/pools/cancel?versionId=unused",
+            "/rustfs/admin/v3/pools/cancel?versionId=unused",
+            "/rustfs/rpc/read_file_stream?versionId=unused",
+            "/rustfs/console/index.html?versionId=unused",
+            "/health?versionId=unused",
+            "/health/ready?versionId=unused",
+            "/profile/cpu?versionId=unused",
+            "/profile/memory?versionId=unused",
+        ];
+
+        for path in paths {
+            let request = Request::builder().method(Method::DELETE).uri(path).body(()).expect("request");
+
+            assert!(
+                !should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should not force Content-Length: 0"
+            );
+        }
     }
 
     #[test]
@@ -1292,7 +1453,7 @@ mod tests {
             .body(())
             .expect("request");
 
-        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
     }
 
     #[test]

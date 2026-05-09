@@ -44,6 +44,7 @@ rustfs-credentials = { workspace = true }
 rustfs-common.workspace = true
 rustfs-policy.workspace = true
 rustfs-protos.workspace = true
+rustfs-kms.workspace = true
 rustfs-s3-common = { workspace = true }
 async-trait.workspace = true
 bytes.workspace = true
@@ -104,6 +105,7 @@ rustix = { workspace = true }
 rustfs-madmin.workspace = true
 rustfs-workers.workspace = true
 reqwest = { workspace = true }
+aes-gcm.workspace = true
 aws-sdk-s3 = { workspace = true }
 urlencoding = { workspace = true }
 smallvec = { workspace = true }
