@@ -362,6 +362,7 @@ mod tests {
     use rustfs_config::notify::{NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_ecstore::config::{KV, KVS};
     use rustfs_targets::arn::TargetID;
+    use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars};
 
@@ -434,6 +435,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_marks_env_and_mixed_sources() {
         let config = Config(HashMap::from([
             (
@@ -481,6 +483,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_marks_kafka_env_and_mixed_sources() {
         let config = Config(HashMap::from([(
             NOTIFY_KAFKA_SUB_SYS.to_string(),
@@ -517,6 +520,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_marks_amqp_env_and_mixed_sources() {
         let config = Config(HashMap::from([(
             NOTIFY_AMQP_SUB_SYS.to_string(),
@@ -553,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn target_mutation_block_reason_rejects_env_managed_target() {
         with_vars(
             [
@@ -569,6 +574,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn notification_target_operation_block_reason_requires_notify_module_enable() {
         with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("false"), || {
             let reason = futures::executor::block_on(notification_target_operation_block_reason(
@@ -580,6 +586,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn notification_target_operation_block_reason_allows_when_notify_module_enabled() {
         with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"), || {
             assert!(
@@ -592,6 +599,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn target_mutation_block_reason_rejects_mixed_target() {
         with_var("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("https://example.com/hook"), || {
             let config = Config(HashMap::from([(
@@ -615,6 +623,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_marks_disabled_config_with_env_override_as_mixed() {
         let config = Config(HashMap::from([(
             NOTIFY_WEBHOOK_SUB_SYS.to_string(),
@@ -639,6 +648,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_includes_env_only_target_without_runtime_status() {
         let config = Config(HashMap::new());
 
@@ -684,6 +694,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_marks_mixed_with_case_insensitive_instance_id() {
         let config = Config(HashMap::from([(
             NOTIFY_WEBHOOK_SUB_SYS.to_string(),
@@ -721,6 +732,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn target_mutation_block_reason_allows_case_insensitive_config_target_lookup() {
         let config = Config(HashMap::from([(
             NOTIFY_WEBHOOK_SUB_SYS.to_string(),

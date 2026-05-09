@@ -383,6 +383,7 @@ mod tests {
     use rustfs_config::ENV_PREFIX;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
     use rustfs_ecstore::config::{KV, KVS};
+    use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars, with_vars_unset};
 
@@ -420,6 +421,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_audit_endpoints_marks_config_env_and_mixed_sources() {
         let config = Config(HashMap::from([(
             AUDIT_WEBHOOK_SUB_SYS.to_string(),
@@ -464,6 +466,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_audit_endpoints_marks_kafka_env_and_mixed_sources() {
         let config = Config(HashMap::from([(
             AUDIT_KAFKA_SUB_SYS.to_string(),
@@ -500,6 +503,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_audit_endpoints_marks_amqp_env_and_mixed_sources() {
         let config = Config(HashMap::from([(
             AUDIT_AMQP_SUB_SYS.to_string(),
@@ -536,6 +540,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn audit_target_mutation_block_reason_rejects_env_managed_target() {
         with_vars(
             [
@@ -552,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn audit_target_operation_block_reason_requires_audit_module_enable() {
         with_var(rustfs_config::ENV_AUDIT_ENABLE, Some("false"), || {
             let reason =
@@ -562,6 +568,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn audit_target_operation_block_reason_allows_when_audit_module_enabled() {
         with_var(rustfs_config::ENV_AUDIT_ENABLE, Some("true"), || {
             assert!(
@@ -572,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn audit_target_mutation_block_reason_rejects_mixed_target() {
         with_var("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY", Some("https://example.com/hook"), || {
             let config = Config(HashMap::from([(
@@ -585,6 +593,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_audit_endpoints_marks_disabled_config_with_env_override_as_mixed() {
         let config = Config(HashMap::from([(
             AUDIT_WEBHOOK_SUB_SYS.to_string(),
@@ -609,6 +618,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_audit_endpoints_includes_env_only_target_without_runtime_status() {
         let config = Config(HashMap::new());
 
@@ -717,6 +727,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_audit_endpoints_marks_mixed_with_case_insensitive_instance_id() {
         let config = Config(HashMap::from([(
             AUDIT_WEBHOOK_SUB_SYS.to_string(),
@@ -741,6 +752,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn audit_target_mutation_block_reason_allows_case_insensitive_config_target_lookup() {
         let config = Config(HashMap::from([(
             AUDIT_WEBHOOK_SUB_SYS.to_string(),

@@ -30,7 +30,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use lapin::{
-    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties,
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, ErrorKind as LapinErrorKind,
     options::{BasicPublishOptions, ConfirmSelectOptions},
     tcp::{OwnedIdentity, OwnedTLSConfig},
 };
@@ -226,7 +226,20 @@ fn build_publish_properties(args: &AMQPArgs) -> BasicProperties {
 }
 
 fn map_lapin_error(err: lapin::Error, context: &str) -> TargetError {
-    TargetError::Network(format!("{context}: {err}"))
+    let message = format!("{context}: {err}");
+    match err.kind() {
+        LapinErrorKind::IOError(io_err) if io_err.kind() == std::io::ErrorKind::TimedOut => TargetError::Timeout(message),
+        LapinErrorKind::IOError(_)
+        | LapinErrorKind::InvalidConnectionState(_)
+        | LapinErrorKind::InvalidChannelState(..)
+        | LapinErrorKind::MissingHeartbeatError
+        | LapinErrorKind::ProtocolError(_)
+            if err.can_be_recovered() =>
+        {
+            TargetError::NotConnected
+        }
+        _ => TargetError::Network(message),
+    }
 }
 
 pub async fn connect_amqp(args: &AMQPArgs) -> Result<AMQPConnection, TargetError> {
@@ -565,10 +578,9 @@ mod tests {
     }
 
     fn assert_connect_failure(err: &TargetError) {
-        let rendered = err.to_string();
         assert!(
-            rendered.contains("Failed to connect to AMQP broker") || rendered.contains("AMQP connection timed out"),
-            "unexpected error: {rendered}"
+            matches!(err, TargetError::NotConnected | TargetError::Timeout(_)),
+            "unexpected error: {err}"
         );
     }
 
