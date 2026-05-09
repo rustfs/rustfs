@@ -1162,7 +1162,7 @@ mod tests {
     fn s3_delete_bucket_without_content_length_is_normalized() {
         let request = Request::builder()
             .method(Method::DELETE)
-            .uri("/bucket?versionId=3HL4kqtJlcpXrof3Gj0OmxJnVBH40Nrjfkd")
+            .uri("/bucket")
             .body(())
             .expect("request");
 
