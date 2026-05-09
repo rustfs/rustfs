@@ -534,6 +534,24 @@ where
             Ok(output) => {
                 let mut entries = Vec::new();
 
+                // Collect common prefix base names for filtering
+                let common_prefix_names: std::collections::HashSet<String> = output
+                    .common_prefixes
+                    .as_ref()
+                    .map(|prefixes| {
+                        prefixes
+                            .iter()
+                            .filter_map(|p| p.prefix.as_ref())
+                            .map(|p| {
+                                std::path::PathBuf::from(p.trim_end_matches('/'))
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| p.clone())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 // Add files (objects)
                 if let Some(objects) = output.contents {
                     for obj in objects {
@@ -555,6 +573,17 @@ where
                                 .unwrap_or_else(|| key.clone());
 
                             let size = obj.size.unwrap_or(0) as u64;
+
+                            // Skip directory markers (keys ending with /)
+                            if key.ends_with('/') {
+                                continue;
+                            }
+
+                            // Skip 0-byte objects that match a directory name (Windows WebDAV duplicates)
+                            if size == 0 && common_prefix_names.contains(&filename) {
+                                continue;
+                            }
+
                             let modified = obj
                                 .last_modified
                                 .map(|dt| {
@@ -783,13 +812,61 @@ where
                             })
                             .unwrap_or_else(SystemTime::now);
 
+                        // Check if this is a directory marker (0-byte object with children)
+                        let content_type = output.content_type.map(|c| c.to_string());
+                        let is_dir_marker =
+                            content_type.as_deref() == Some("application/x-directory") || (size == 0 && key.ends_with('/'));
+
+                        if is_dir_marker {
+                            return Ok(Box::new(WebDavMetaData {
+                                size: 0,
+                                modified,
+                                created: modified,
+                                is_dir: true,
+                                etag: output.e_tag.as_ref().map(etag_to_string),
+                                content_type,
+                            }) as Box<dyn DavMetaData>);
+                        }
+
+                        // For 0-byte objects, check if there's also a prefix with children
+                        if size == 0 {
+                            let prefix = format!("{}/", key);
+                            let list_input = ListObjectsV2Input::builder()
+                                .bucket(bucket.clone())
+                                .prefix(Some(prefix))
+                                .max_keys(Some(1))
+                                .build()
+                                .map_err(|_| FsError::GeneralFailure)?;
+
+                            if let Ok(list_output) = self
+                                .storage
+                                .list_objects_v2(
+                                    list_input,
+                                    &self.session_context.principal.user_identity.credentials.access_key,
+                                    &self.session_context.principal.user_identity.credentials.secret_key,
+                                )
+                                .await
+                                && (list_output.contents.map(|c| !c.is_empty()).unwrap_or(false)
+                                    || list_output.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false))
+                            {
+                                return Ok(Box::new(WebDavMetaData {
+                                    size: 0,
+                                    modified,
+                                    created: modified,
+                                    is_dir: true,
+                                    etag: output.e_tag.as_ref().map(etag_to_string),
+                                    content_type,
+                                }) as Box<dyn DavMetaData>);
+                            }
+                        }
+
                         Ok(Box::new(WebDavMetaData {
                             size,
                             modified,
                             created: modified,
                             is_dir: false,
                             etag: output.e_tag.as_ref().map(etag_to_string),
-                            content_type: output.content_type.map(|c| c.to_string()),
+                            content_type,
                         }) as Box<dyn DavMetaData>)
                     }
                     Err(e) => {
@@ -1074,9 +1151,264 @@ where
         .boxed()
     }
 
-    fn rename<'a>(&'a self, _from: &'a DavPath, _to: &'a DavPath) -> FsFuture<'a, ()> {
-        // S3 doesn't support native rename, would need copy + delete
-        async move { Err(FsError::NotImplemented) }.boxed()
+    fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
+        let storage = self.storage.clone();
+        let session_context = self.session_context.clone();
+
+        async move {
+            let (src_bucket, src_key) = self.parse_path(from)?;
+            let (dst_bucket, dst_key) = self.parse_path(to)?;
+
+            if src_bucket.is_empty() || dst_bucket.is_empty() {
+                return Err(FsError::Forbidden);
+            }
+
+            let src_key = src_key.ok_or(FsError::Forbidden)?;
+            let dst_key = dst_key.ok_or(FsError::Forbidden)?;
+
+            let access_key = &session_context.principal.user_identity.credentials.access_key;
+            let secret_key = &session_context.principal.user_identity.credentials.secret_key;
+
+            // Determine if source is a directory
+            let src_is_dir;
+            let src_key_with_slash = if src_key.ends_with('/') {
+                src_is_dir = true;
+                src_key.to_string()
+            } else {
+                // Try head_object first (file)
+                if storage
+                    .head_object(&src_bucket, &src_key, access_key, secret_key)
+                    .await
+                    .is_ok()
+                {
+                    src_is_dir = false;
+                    src_key.clone()
+                } else {
+                    // Try directory marker
+                    let dir_key = format!("{}/", src_key);
+                    if storage
+                        .head_object(&src_bucket, &dir_key, access_key, secret_key)
+                        .await
+                        .is_ok()
+                    {
+                        src_is_dir = true;
+                        dir_key
+                    } else {
+                        // Check if there are objects with this prefix (implicit directory)
+                        let list_input = ListObjectsV2Input::builder()
+                            .bucket(src_bucket.clone())
+                            .prefix(Some(dir_key.clone()))
+                            .max_keys(Some(1))
+                            .build()
+                            .map_err(|_| FsError::GeneralFailure)?;
+                        if let Ok(output) = storage.list_objects_v2(list_input, access_key, secret_key).await {
+                            if output.contents.map(|c| !c.is_empty()).unwrap_or(false) {
+                                src_is_dir = true;
+                                dir_key
+                            } else {
+                                debug!("Source not found: {}/{}", src_bucket, src_key);
+                                return Err(FsError::NotFound);
+                            }
+                        } else {
+                            debug!("Source not found: {}/{}", src_bucket, src_key);
+                            return Err(FsError::NotFound);
+                        }
+                    }
+                }
+            };
+
+            // Authorize operations
+            if src_is_dir {
+                authorize_operation(&session_context, &S3Action::ListBucket, &src_bucket, Some(&src_key))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+            } else {
+                authorize_operation(&session_context, &S3Action::GetObject, &src_bucket, Some(&src_key))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+            }
+            authorize_operation(&session_context, &S3Action::PutObject, &dst_bucket, Some(&dst_key))
+                .await
+                .map_err(|_| FsError::Forbidden)?;
+
+            if src_is_dir {
+                // Rename directory: recursively copy all objects, then delete source objects
+                let dst_key_with_slash = if dst_key.ends_with('/') {
+                    dst_key.to_string()
+                } else {
+                    format!("{}/", dst_key)
+                };
+
+                // List and copy all objects
+                let prefix = src_key_with_slash.clone();
+                let mut continuation_token: Option<String> = None;
+                let mut source_keys_to_delete: Vec<String> = Vec::new();
+
+                loop {
+                    let mut list_builder = ListObjectsV2Input::builder()
+                        .bucket(src_bucket.clone())
+                        .prefix(Some(prefix.clone()));
+
+                    if let Some(ref token) = continuation_token {
+                        list_builder = list_builder.continuation_token(Some(token.clone()));
+                    }
+
+                    let list_input = list_builder.build().map_err(|_| FsError::GeneralFailure)?;
+
+                    match storage.list_objects_v2(list_input, access_key, secret_key).await {
+                        Ok(output) => {
+                            if let Some(objects) = output.contents {
+                                for obj in objects {
+                                    if let Some(obj_key) = obj.key {
+                                        // Calculate new key by replacing source prefix with destination prefix
+                                        let new_key = obj_key.replacen(&prefix, &dst_key_with_slash, 1);
+
+                                        // Get source object content
+                                        let get_result =
+                                            storage.get_object(&src_bucket, &obj_key, access_key, secret_key, None).await;
+                                        if let Ok(get_output) = get_result {
+                                            let body_bytes = if let Some(body) = get_output.body {
+                                                let chunks: Vec<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> =
+                                                    body.collect().await;
+                                                let mut all_data = Vec::new();
+                                                for chunk in chunks {
+                                                    match chunk {
+                                                        Ok(data) => all_data.extend_from_slice(&data),
+                                                        Err(e) => {
+                                                            error!(
+                                                                "Failed to read object body during directory rename: {}",
+                                                                e
+                                                            );
+                                                            return Err(FsError::GeneralFailure);
+                                                        }
+                                                    }
+                                                }
+                                                Bytes::from(all_data)
+                                            } else {
+                                                Bytes::new()
+                                            };
+
+                                            let content_length = body_bytes.len() as i64;
+                                            let content_type = get_output.content_type.clone();
+
+                                            // Put object to destination
+                                            let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body_bytes) });
+                                            let streaming_blob = StreamingBlob::wrap(stream);
+
+                                            let mut put_builder = PutObjectInput::builder()
+                                                .bucket(dst_bucket.clone())
+                                                .key(new_key.clone())
+                                                .content_length(Some(content_length))
+                                                .body(Some(streaming_blob));
+
+                                            if let Some(ref ct) = content_type {
+                                                put_builder = put_builder.content_type(Some(ct.clone()));
+                                            }
+
+                                            let put_input = put_builder.build().map_err(|_| FsError::GeneralFailure)?;
+                                            if let Err(e) = storage.put_object(put_input, access_key, secret_key).await {
+                                                error!("Failed to copy object during directory rename: {}", e);
+                                                return Err(FsError::GeneralFailure);
+                                            }
+                                        }
+
+                                        source_keys_to_delete.push(obj_key);
+                                    }
+                                }
+                            }
+
+                            if !output.is_truncated.unwrap_or(false) {
+                                break;
+                            }
+                            continuation_token = output.next_continuation_token;
+                        }
+                        Err(e) => {
+                            error!("Failed to list objects during directory rename: {}", e);
+                            return Err(FsError::GeneralFailure);
+                        }
+                    }
+                }
+
+                // Delete source objects
+                for src_obj_key in source_keys_to_delete {
+                    let _ = storage.delete_object(&src_bucket, &src_obj_key, access_key, secret_key).await;
+                }
+
+                debug!(
+                    "Successfully renamed directory '{}/{}' to '{}/{}'",
+                    src_bucket, src_key, dst_bucket, dst_key
+                );
+                Ok(())
+            } else {
+                // Rename file: copy to destination, then delete source
+                match storage.get_object(&src_bucket, &src_key, access_key, secret_key, None).await {
+                    Ok(get_output) => {
+                        let body_bytes = if let Some(body) = get_output.body {
+                            let chunks: Vec<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> = body.collect().await;
+                            let mut all_data = Vec::new();
+                            for chunk in chunks {
+                                match chunk {
+                                    Ok(data) => all_data.extend_from_slice(&data),
+                                    Err(e) => {
+                                        error!("Failed to read source object body: {}", e);
+                                        return Err(FsError::GeneralFailure);
+                                    }
+                                }
+                            }
+                            Bytes::from(all_data)
+                        } else {
+                            Bytes::new()
+                        };
+
+                        let content_length = body_bytes.len() as i64;
+                        let content_type = get_output.content_type.clone();
+
+                        // Put object to destination
+                        let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body_bytes) });
+                        let streaming_blob = StreamingBlob::wrap(stream);
+
+                        let mut put_builder = PutObjectInput::builder()
+                            .bucket(dst_bucket.clone())
+                            .key(dst_key.clone())
+                            .content_length(Some(content_length))
+                            .body(Some(streaming_blob));
+
+                        if let Some(ref ct) = content_type {
+                            put_builder = put_builder.content_type(Some(ct.clone()));
+                        }
+
+                        let put_input = put_builder.build().map_err(|_| FsError::GeneralFailure)?;
+
+                        match storage.put_object(put_input, access_key, secret_key).await {
+                            Ok(_) => {
+                                debug!("Successfully copied '{}/{}' to '{}/{}'", src_bucket, src_key, dst_bucket, dst_key);
+                            }
+                            Err(e) => {
+                                error!("Failed to copy object to destination: {}", e);
+                                return Err(FsError::GeneralFailure);
+                            }
+                        }
+
+                        // Delete source object
+                        match storage.delete_object(&src_bucket, &src_key, access_key, secret_key).await {
+                            Ok(_) => {
+                                debug!("Successfully deleted source '{}/{}' after rename", src_bucket, src_key);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                error!("Failed to delete source object after rename: {}", e);
+                                Err(FsError::GeneralFailure)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to get source object '{}' in '{}': {}", src_key, src_bucket, e);
+                        Err(FsError::GeneralFailure)
+                    }
+                }
+            }
+        }
+        .boxed()
     }
 
     fn copy<'a>(&'a self, _from: &'a DavPath, _to: &'a DavPath) -> FsFuture<'a, ()> {
@@ -1240,5 +1572,61 @@ mod tests {
         let err = driver.parse_path(&path).expect_err("invalid utf8 should be rejected");
 
         assert_eq!(err, FsError::GeneralFailure);
+    }
+
+    #[test]
+    fn parse_path_handles_directory_paths_with_trailing_slash() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/folder/").expect("path should parse");
+
+        let (bucket, key) = driver.parse_path(&path).expect("path should decode");
+
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key.as_deref(), Some("folder"));
+    }
+
+    #[test]
+    fn parse_path_handles_chinese_directory_names() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/%E6%96%B0%E5%BB%BA%E6%96%87%E4%BB%B6%E5%A4%B9%20(4)").expect("path should parse");
+
+        let (bucket, key) = driver.parse_path(&path).expect("path should decode");
+
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key.as_deref(), Some("新建文件夹 (4)"));
+    }
+
+    #[test]
+    fn parse_path_handles_nested_paths() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/dir/subdir/file.txt").expect("path should parse");
+
+        let (bucket, key) = driver.parse_path(&path).expect("path should decode");
+
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key.as_deref(), Some("dir/subdir/file.txt"));
+    }
+
+    #[test]
+    fn parse_path_returns_none_key_for_bucket_root() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/").expect("path should parse");
+
+        let (bucket, key) = driver.parse_path(&path).expect("path should decode");
+
+        assert_eq!(bucket, "bucket");
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn parse_path_handles_url_encoded_slash_in_object_name() {
+        let driver = driver();
+        // %2F is encoded slash - should NOT be decoded to actual slash in object name
+        let path = DavPath::new("/bucket/file%20with%20spaces.txt").expect("path should parse");
+
+        let (bucket, key) = driver.parse_path(&path).expect("path should decode");
+
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key.as_deref(), Some("file with spaces.txt"));
     }
 }

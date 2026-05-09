@@ -170,6 +170,254 @@ pub async fn test_webdav_core_operations() -> Result<()> {
         );
         info!("PASS: Verified file '{}' is deleted", filename);
 
+        // Test MOVE (rename) file
+        info!("Testing WebDAV: PUT file for MOVE test");
+        let move_filename = "move-source.txt";
+        let move_dest_filename = "move-dest.txt";
+        let move_content = "File to be moved!";
+        let resp = client
+            .put(format!("{}/{}/{}", base_url, bucket_name, move_filename))
+            .header("Authorization", &auth_header)
+            .body(move_content)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "PUT for MOVE test should succeed, got: {}",
+            resp.status()
+        );
+        info!("PASS: PUT file '{}' for MOVE test successful", move_filename);
+
+        // Execute MOVE request
+        info!("Testing WebDAV: MOVE file '{}' to '{}'", move_filename, move_dest_filename);
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MOVE").unwrap(),
+                format!("{}/{}/{}", base_url, bucket_name, move_filename),
+            )
+            .header("Authorization", &auth_header)
+            .header("Destination", format!("/{}/{}", bucket_name, move_dest_filename))
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204 || resp.status().as_u16() == 201,
+            "MOVE should succeed, got: {}",
+            resp.status()
+        );
+        info!(
+            "PASS: MOVE file '{}' to '{}' successful (HTTP {})",
+            move_filename,
+            move_dest_filename,
+            resp.status()
+        );
+
+        // Verify source file is gone
+        info!("Testing WebDAV: Verify source '{}' is deleted after MOVE", move_filename);
+        let resp = client
+            .get(format!("{}/{}/{}", base_url, bucket_name, move_filename))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().as_u16() == 404,
+            "GET moved source should return 404, got: {}",
+            resp.status()
+        );
+        info!("PASS: Source '{}' is deleted after MOVE", move_filename);
+
+        // Verify destination file exists and content matches
+        info!("Testing WebDAV: Verify destination '{}' has correct content", move_dest_filename);
+        let resp = client
+            .get(format!("{}/{}/{}", base_url, bucket_name, move_dest_filename))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success(),
+            "GET destination after MOVE should succeed, got: {}",
+            resp.status()
+        );
+        let moved_content = resp.text().await?;
+        assert_eq!(moved_content, move_content, "Moved file content should match original");
+        info!("PASS: Destination '{}' has correct content after MOVE", move_dest_filename);
+
+        // Test directory creation and rename
+        info!("Testing WebDAV: MKCOL directory");
+        let dir_name = "test-directory";
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+                format!("{}/{}/{}", base_url, bucket_name, dir_name),
+            )
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "MKCOL directory should succeed, got: {}",
+            resp.status()
+        );
+        info!("PASS: MKCOL directory successful");
+
+        // Upload file into directory
+        let dir_filename = "dir-file.txt";
+        let dir_file_content = "File inside test directory!";
+        let resp = client
+            .put(format!("{}/{}/{}/{}", base_url, bucket_name, dir_name, dir_filename))
+            .header("Authorization", &auth_header)
+            .body(dir_file_content)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "PUT file into directory should succeed, got: {}",
+            resp.status()
+        );
+        info!("PASS: PUT file into directory successful");
+
+        // Test PROPFIND on directory
+        info!("Testing WebDAV: PROPFIND directory");
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                format!("{}/{}/{}", base_url, bucket_name, dir_name),
+            )
+            .header("Authorization", &auth_header)
+            .header("Depth", "1")
+            .send()
+            .await?;
+        assert!(resp.status().is_success(), "PROPFIND directory should succeed, got: {}", resp.status());
+        let propfind_body = resp.text().await?;
+        assert!(propfind_body.contains(dir_filename), "PROPFIND should list file in directory");
+        info!("PASS: PROPFIND directory successful, file listed correctly");
+
+        // Test GET directory listing
+        info!("Testing WebDAV: GET directory listing");
+        let resp = client
+            .get(format!("{}/{}/{}", base_url, bucket_name, dir_name))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(resp.status().is_success(), "GET directory should succeed, got: {}", resp.status());
+        let dir_listing = resp.text().await?;
+        assert!(dir_listing.contains(dir_filename), "Directory listing should contain the file");
+        info!("PASS: GET directory listing successful");
+
+        // Rename directory
+        info!("Testing WebDAV: MOVE directory");
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MOVE").unwrap(),
+                format!("{}/{}/{}", base_url, bucket_name, dir_name),
+            )
+            .header("Authorization", &auth_header)
+            .header("Destination", format!("/{}/renamed-dir", bucket_name))
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204 || resp.status().as_u16() == 201,
+            "MOVE directory should succeed, got: {}",
+            resp.status()
+        );
+        info!("PASS: MOVE directory successful");
+
+        // Verify source directory is gone
+        info!("Testing WebDAV: Verify source directory is deleted after MOVE");
+        let resp = client
+            .get(format!("{}/{}/{}", base_url, bucket_name, dir_name))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().as_u16() == 404,
+            "GET moved directory should return 404, got: {}",
+            resp.status()
+        );
+        info!("PASS: Source directory is deleted after MOVE");
+
+        // Verify renamed directory exists and file content matches
+        info!("Testing WebDAV: Verify file in renamed directory");
+        let resp = client
+            .get(format!("{}/{}/renamed-dir/{}", base_url, bucket_name, dir_filename))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success(),
+            "GET file in renamed directory should succeed, got: {}",
+            resp.status()
+        );
+        let renamed_dir_content = resp.text().await?;
+        assert_eq!(renamed_dir_content, dir_file_content, "File content in renamed directory should match");
+        info!("PASS: File in renamed directory has correct content");
+
+        // Test nested directory creation and rename
+        info!("Testing WebDAV: MKCOL nested directory");
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").unwrap(),
+                format!("{}/{}/renamed-dir/nested-dir", base_url, bucket_name),
+            )
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "MKCOL nested directory should succeed, got: {}",
+            resp.status()
+        );
+        info!("PASS: MKCOL nested directory successful");
+
+        // Upload file into nested directory
+        let nested_file_content = "File in nested directory!";
+        let resp = client
+            .put(format!("{}/{}/renamed-dir/nested-dir/nested-file.txt", base_url, bucket_name))
+            .header("Authorization", &auth_header)
+            .body(nested_file_content)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "PUT file into nested directory should succeed, got: {}",
+            resp.status()
+        );
+
+        // Rename nested directory
+        info!("Testing WebDAV: MOVE nested directory");
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MOVE").unwrap(),
+                format!("{}/{}/renamed-dir/nested-dir", base_url, bucket_name),
+            )
+            .header("Authorization", &auth_header)
+            .header("Destination", format!("/{}/renamed-dir/new-nested-dir", bucket_name))
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204 || resp.status().as_u16() == 201,
+            "MOVE nested directory should succeed, got: {}",
+            resp.status()
+        );
+        info!("PASS: MOVE nested directory successful");
+
+        // Verify nested file after rename
+        let resp = client
+            .get(format!("{}/{}/renamed-dir/new-nested-dir/nested-file.txt", base_url, bucket_name))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success(),
+            "GET file in renamed nested directory should succeed, got: {}",
+            resp.status()
+        );
+        let nested_content = resp.text().await?;
+        assert_eq!(
+            nested_content, nested_file_content,
+            "File content in renamed nested directory should match"
+        );
+        info!("PASS: File in renamed nested directory has correct content");
+
         // Test DELETE bucket
         info!("Testing WebDAV: DELETE bucket '{}'", bucket_name);
         let resp = client
