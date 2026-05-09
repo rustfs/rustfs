@@ -12,20 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Integration tests for the PostgreSQL notification target.
+//! PostgreSQL notification target integration tests.
 //!
-//! All tests in this file are `#[ignore]` because they require a running
-//! PostgreSQL server. CI does not run them by default. To run locally:
+//! These tests require a running PostgreSQL server. They are `#[ignore]` by
+//! default so CI never runs them. To run locally
+//! (podman recommended; docker works too):
 //!
 //! ```bash
-//! docker run -d --name rustfs-pg -p 5432:5432 \
-//!     -e POSTGRES_PASSWORD=rustfs -e POSTGRES_DB=rustfs_events postgres:16
-//! export RUSTFS_TEST_PG_DSN="postgres://postgres:rustfs@localhost:5432/rustfs_events?search_path=public"
+//! podman run -d --name rustfs-pg-test -p 5432:5432 \
+//!     -e POSTGRES_PASSWORD=rustfs -e POSTGRES_DB=rustfs_events \
+//!     docker.io/library/postgres:16
+//! ```
+//!
+//! Wait for PostgreSQL to be ready (look for `database system is ready` in logs),
+//! then set `RUSTFS_TEST_PG_DSN` and run:
+//!
+//! ```bash
+//! export RUSTFS_TEST_PG_DSN="postgres://postgres:rustfs@localhost:5432/rustfs_events"
 //! cargo test -p rustfs-targets --test postgres_integration -- --ignored
 //! ```
 //!
-//! Connection parameters can be overridden via environment variable:
-//! `RUSTFS_TEST_PG_DSN`.
+//! Clean up:
+//!
+//! ```bash
+//! podman rm -f rustfs-pg-test
+//! ```
 
 use rustfs_s3_common::EventName;
 use rustfs_targets::Target;
@@ -44,10 +55,7 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn test_args(table: &str, format: PostgresFormat) -> PostgresArgs {
-    let dsn = env_or(
-        "RUSTFS_TEST_PG_DSN",
-        "postgres://postgres:rustfs@localhost:5432/rustfs_events?search_path=public",
-    );
+    let dsn = env_or("RUSTFS_TEST_PG_DSN", "postgres://postgres:rustfs@localhost:5432/rustfs_events");
     let schema = PostgresDsn::parse(&dsn)
         .expect("RUSTFS_TEST_PG_DSN must be a valid PostgreSQL DSN")
         .schema;
