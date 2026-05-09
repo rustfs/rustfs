@@ -38,6 +38,38 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+// Procfs (/proc/net/tcp[6]) parsing constants. Format reference:
+// kernel net/ipv4/tcp_ipv4.c::tcp4_seq_show and
+// net/ipv6/tcp_ipv6.c::tcp6_seq_show.
+
+/// Length of an IPv6 address in bytes.
+const IPV6_BYTES: usize = 16;
+/// Length of an IPv4 address in bytes.
+const IPV4_BYTES: usize = 4;
+/// Hex characters used to render one byte in the procfs format
+/// (matches the {:02X} format spec at the call sites).
+const HEX_CHARS_PER_BYTE: usize = 2;
+/// Hex characters used to render the 16-bit port in the procfs format
+/// (matches the {:04X} format spec at the call sites).
+const PORT_HEX_CHARS: usize = 4;
+/// Number of bytes per chunk in the IPv6 procfs format. Bytes inside
+/// each chunk are emitted in reverse (little-endian within the chunk).
+const TCP6_CHUNK_BYTES: usize = 4;
+/// Number of 4-byte chunks the IPv6 procfs format renders. The
+/// const_assert below pins this against IPV6_BYTES so any future drift
+/// surfaces at compile time.
+const TCP6_CHUNK_COUNT: usize = IPV6_BYTES / TCP6_CHUNK_BYTES;
+const _: () = assert!(TCP6_CHUNK_COUNT * TCP6_CHUNK_BYTES == IPV6_BYTES);
+/// First line of /proc/net/tcp[6] is the column header. Data rows
+/// follow.
+const PROC_NET_TCP_HEADER_LINES: usize = 1;
+/// Linux TCP_ESTABLISHED state value (include/uapi/linux/tcp.h).
+const TCP_STATE_ESTABLISHED: u8 = 0x01;
+/// Linux TCP_CLOSE_WAIT state value (include/uapi/linux/tcp.h).
+const TCP_STATE_CLOSE_WAIT: u8 = 0x08;
+/// Procfs renders the TCP state as a hexadecimal byte.
+const TCP_STATE_RADIX: u32 = 16;
+
 /// Per-session activity record. Constructed once per accepted SSH
 /// connection in the accept loop, cloned via Arc into the SshSessionHandler
 /// and the SftpDriver, registered weakly into the SessionRegistry so an
@@ -130,19 +162,22 @@ pub(super) fn probe_tcp_state(local: SocketAddr, peer: SocketAddr) -> Option<Tcp
 fn lookup_tcp_state(content: &str, local: SocketAddr, peer: SocketAddr, ipv6_file: bool) -> Option<TcpState> {
     let local_hex = render_proc_net_tcp_addr(local, ipv6_file)?;
     let peer_hex = render_proc_net_tcp_addr(peer, ipv6_file)?;
-    for line in content.lines().skip(1) {
+    for line in content.lines().skip(PROC_NET_TCP_HEADER_LINES) {
         let mut fields = line.split_whitespace();
         let _sl = fields.next()?;
         let f_local = fields.next()?;
         let f_peer = fields.next()?;
         let f_state = fields.next()?;
         if f_local == local_hex && f_peer == peer_hex {
-            let raw = u8::from_str_radix(f_state, 16).ok()?;
-            return Some(match raw {
-                0x01 => TcpState::Established,
-                0x08 => TcpState::CloseWait,
-                other => TcpState::Other(other),
-            });
+            let raw = u8::from_str_radix(f_state, TCP_STATE_RADIX).ok()?;
+            let state = if raw == TCP_STATE_ESTABLISHED {
+                TcpState::Established
+            } else if raw == TCP_STATE_CLOSE_WAIT {
+                TcpState::CloseWait
+            } else {
+                TcpState::Other(raw)
+            };
+            return Some(state);
         }
     }
     None
@@ -164,32 +199,37 @@ fn lookup_tcp_state(content: &str, local: SocketAddr, peer: SocketAddr, ipv6_fil
 /// before rendering. IPv4-mapped IPv6 SocketAddrs presented to tcp
 /// are unwrapped before rendering. Mismatches return None.
 fn render_proc_net_tcp_addr(addr: SocketAddr, ipv6_file: bool) -> Option<String> {
+    // Rendered length: address bytes encoded as 2 hex chars each + ':'
+    // separator + 4 hex port digits. Same shape for tcp and tcp6;
+    // only the address byte count differs.
+    const COLON_LEN: usize = 1;
     let port = addr.port();
+    let addr_bytes = if ipv6_file { IPV6_BYTES } else { IPV4_BYTES };
+    let rendered_len = addr_bytes * HEX_CHARS_PER_BYTE + COLON_LEN + PORT_HEX_CHARS;
+    let mut s = String::with_capacity(rendered_len);
     if !ipv6_file {
         let v4 = match addr.ip() {
             IpAddr::V4(v4) => v4,
             IpAddr::V6(v6) => v6.to_ipv4_mapped()?,
         };
         let octets = v4.octets();
-        Some(format!(
-            "{:02X}{:02X}{:02X}{:02X}:{:04X}",
-            octets[3], octets[2], octets[1], octets[0], port
-        ))
+        for i in (0..IPV4_BYTES).rev() {
+            write!(&mut s, "{:02X}", octets[i]).ok()?;
+        }
     } else {
-        let bytes: [u8; 16] = match addr.ip() {
+        let bytes: [u8; IPV6_BYTES] = match addr.ip() {
             IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
             IpAddr::V6(v6) => v6.octets(),
         };
-        let mut s = String::with_capacity(33);
-        for chunk_idx in 0..4 {
-            let start = chunk_idx * 4;
-            for i in 0..4 {
-                write!(&mut s, "{:02X}", bytes[start + 3 - i]).ok()?;
+        for chunk_idx in 0..TCP6_CHUNK_COUNT {
+            let start = chunk_idx * TCP6_CHUNK_BYTES;
+            for i in 0..TCP6_CHUNK_BYTES {
+                write!(&mut s, "{:02X}", bytes[start + (TCP6_CHUNK_BYTES - 1) - i]).ok()?;
             }
         }
-        write!(&mut s, ":{:04X}", port).ok()?;
-        Some(s)
     }
+    write!(&mut s, ":{:04X}", port).ok()?;
+    Some(s)
 }
 
 #[cfg(test)]
@@ -228,6 +268,48 @@ mod tests {
         let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 2222, 0, 0));
         // ::1 is not IPv4-mapped, so it cannot be rendered for tcp.
         assert!(render_proc_net_tcp_addr(addr, false).is_none());
+    }
+
+    #[test]
+    fn render_distinct_ipv4_for_tcp_file() {
+        // Distinct octets pin the byte-reversal direction. The
+        // loopback test cannot do this because three of four octets
+        // are zero. Port 0xFFFF pins the port-hex width at 4.
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 0xFFFF));
+        assert_eq!(render_proc_net_tcp_addr(addr, false).as_deref(), Some("04030201:FFFF"));
+    }
+
+    #[test]
+    fn render_distinct_ipv6_bytes_for_tcp6_file() {
+        // Bytes 00..0F, one distinct value per octet, exercise every
+        // index in the chunk-and-reverse loop. Each 4-byte chunk is
+        // emitted little-endian-within-chunk, so chunk 0 (bytes
+        // 00 01 02 03) renders as "03020100" and so on through chunk 3.
+        let addr = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF]),
+            0xCAFE,
+            0,
+            0,
+        ));
+        assert_eq!(
+            render_proc_net_tcp_addr(addr, true).as_deref(),
+            Some("03020100070605040B0A09080F0E0D0C:CAFE")
+        );
+    }
+
+    #[test]
+    fn render_ipv4_mapped_ipv6_for_tcp_file_unwraps() {
+        // ::ffff:1.2.3.4 presented to the tcp file is unwrapped to
+        // 1.2.3.4 and rendered as the IPv4 form. Covers the
+        // to_ipv4_mapped() branch in the tcp arm. Port 0 pins the
+        // leading-zero render.
+        let addr = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 1, 2, 3, 4]),
+            0,
+            0,
+            0,
+        ));
+        assert_eq!(render_proc_net_tcp_addr(addr, false).as_deref(), Some("04030201:0000"));
     }
 
     #[test]

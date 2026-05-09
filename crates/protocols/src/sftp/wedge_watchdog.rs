@@ -68,13 +68,20 @@ use tokio_util::sync::CancellationToken;
 enum WedgeReason {
     /// Two consecutive ticks observed silence past the fast threshold
     /// AND a TCP state of CLOSE_WAIT (peer FIN'd, application has not
-    /// drained the SSH stream).
+    /// drained the SSH stream) on the second tick. The CLOSE_WAIT
+    /// observation on the cancelling tick is the load-bearing claim
+    /// in the operator log line.
     TcpStateCloseWaitConfirmed,
+    /// Two consecutive ticks observed silence past the fast threshold
+    /// AND the TCP-state probe failed to return a known state on the
+    /// second tick (closed dup, missing /proc, kernel without procfs
+    /// entries). Session is not coming back and the kernel state was
+    /// not decisively observable when the cancel fired.
+    ProbeFailedConfirmed,
     /// Silence past WEDGE_FALLBACK_KILL_SILENCE_SECS regardless of
     /// the TCP_STATE probe result. Backstop for the case where the
-    /// probe itself fails (closed dup, missing /proc, kernel without
-    /// procfs entries) or where the wedge surfaces in a state other
-    /// than CLOSE_WAIT.
+    /// wedge surfaces in a state other than CLOSE_WAIT and probes
+    /// kept returning healthy or non-decisive.
     FallbackSilence,
 }
 
@@ -82,6 +89,7 @@ impl WedgeReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::TcpStateCloseWaitConfirmed => "tcp_state_close_wait_confirmed",
+            Self::ProbeFailedConfirmed => "probe_failed_confirmed",
             Self::FallbackSilence => "fallback_silence",
         }
     }
@@ -220,7 +228,12 @@ fn evaluate(silence_secs: u64, probe: Option<TcpState>, wedge_suspected: bool) -
         return Decision::Quiet;
     }
     if wedge_suspected {
-        Decision::Cancel(WedgeReason::TcpStateCloseWaitConfirmed)
+        let reason = if probe.is_none() {
+            WedgeReason::ProbeFailedConfirmed
+        } else {
+            WedgeReason::TcpStateCloseWaitConfirmed
+        };
+        Decision::Cancel(reason)
     } else {
         Decision::SuspectedFirstTick
     }
@@ -269,8 +282,24 @@ mod tests {
     }
 
     #[test]
-    fn probe_failed_silence_above_fast_second_tick_cancels() {
+    fn probe_failed_silence_above_fast_second_tick_cancels_with_probe_failed_reason() {
         let decision = evaluate(WEDGE_FAST_KILL_SILENCE_SECS, None, true);
+        assert_eq!(decision, Decision::Cancel(WedgeReason::ProbeFailedConfirmed));
+    }
+
+    #[test]
+    fn close_wait_first_tick_then_probe_fail_second_tick_cancels_with_probe_failed_reason() {
+        // The cancel reason names the second tick's probe outcome
+        // because that is the kernel state at the moment the cancel
+        // fires. CLOSE_WAIT was no longer observable when the kill
+        // happened, so the operator log should not claim it was.
+        let decision = evaluate(WEDGE_FAST_KILL_SILENCE_SECS, None, true);
+        assert_eq!(decision, Decision::Cancel(WedgeReason::ProbeFailedConfirmed));
+    }
+
+    #[test]
+    fn probe_fail_first_tick_then_close_wait_second_tick_cancels_with_close_wait_reason() {
+        let decision = evaluate(WEDGE_FAST_KILL_SILENCE_SECS, Some(TcpState::CloseWait), true);
         assert_eq!(decision, Decision::Cancel(WedgeReason::TcpStateCloseWaitConfirmed));
     }
 
@@ -278,5 +307,12 @@ mod tests {
     fn silence_above_fallback_cancels_regardless_of_probe() {
         let decision = evaluate(WEDGE_FALLBACK_KILL_SILENCE_SECS, Some(TcpState::Established), false);
         assert_eq!(decision, Decision::Cancel(WedgeReason::FallbackSilence));
+    }
+
+    #[test]
+    fn wedge_reason_as_str_covers_all_variants() {
+        assert_eq!(WedgeReason::TcpStateCloseWaitConfirmed.as_str(), "tcp_state_close_wait_confirmed");
+        assert_eq!(WedgeReason::ProbeFailedConfirmed.as_str(), "probe_failed_confirmed");
+        assert_eq!(WedgeReason::FallbackSilence.as_str(), "fallback_silence");
     }
 }
