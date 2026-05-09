@@ -176,14 +176,6 @@ fn websocket_broker_url(broker: &Url, secure: bool) -> Result<String, TargetErro
     Ok(url.to_string())
 }
 
-fn ensure_rustls_provider_installed() {
-    if rustls::crypto::CryptoProvider::get_default().is_none()
-        && rustls::crypto::aws_lc_rs::default_provider().install_default().is_err()
-    {
-        debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
-    }
-}
-
 fn validate_path_is_absolute(path: &str, field: &str) -> Result<(), TargetError> {
     if !Path::new(path).is_absolute() {
         return Err(TargetError::Configuration(format!("{field} must be an absolute path")));
@@ -215,7 +207,7 @@ fn build_root_store(ca_path: &str, trust_leaf_as_ca: bool) -> Result<rustls::Roo
 }
 
 fn build_mqtt_tls_transport(broker: &Url, tls: &MQTTTlsConfig) -> Result<Transport, TargetError> {
-    ensure_rustls_provider_installed();
+    super::ensure_rustls_provider_installed();
 
     let client_config = match tls
         .policy

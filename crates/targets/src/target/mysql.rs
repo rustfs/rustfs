@@ -304,16 +304,6 @@ fn is_valid_identifier_segment(segment: &str) -> bool {
     true
 }
 
-fn ensure_rustls_provider_installed() {
-    if rustls::crypto::CryptoProvider::get_default().is_some() {
-        return;
-    }
-
-    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
-        debug!("rustls provider already installed or unavailable for mysql target: {err:?}");
-    }
-}
-
 pub(crate) fn validate_table_name(table: &str) -> Result<(), TargetError> {
     let table = table.trim();
 
@@ -571,7 +561,7 @@ where
             .db_name(Some(dsn.database.clone()));
 
         if dsn.tls {
-            ensure_rustls_provider_installed();
+            super::ensure_rustls_provider_installed();
             let mut ssl_opts = SslOpts::default();
             if !self.args.tls_ca.is_empty() {
                 ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(self.args.tls_ca.clone()).into()]);
@@ -690,7 +680,7 @@ where
 /// - `Server(1213|1205|1040)` → `Timeout` (deadlock/lock timeout/too
 ///   many connections, exponential-backoff retry)
 /// - everything else → `Request` (permanent failure)
-fn map_mysql_error(err: mysql_async::Error) -> TargetError {
+pub(crate) fn map_mysql_error(err: mysql_async::Error) -> TargetError {
     match &err {
         mysql_async::Error::Io(_) | mysql_async::Error::Driver(_) => TargetError::NotConnected,
         mysql_async::Error::Server(server_err) => match server_err.code {

@@ -31,7 +31,7 @@ pub enum TargetRequestValidator {
     Mqtt,
     Amqp(crate::target::TargetType),
     Kafka(crate::target::TargetType),
-    MySql,
+    MySql(crate::target::TargetType),
     Nats(crate::target::TargetType),
     Postgres(crate::target::TargetType),
     Pulsar(crate::target::TargetType),

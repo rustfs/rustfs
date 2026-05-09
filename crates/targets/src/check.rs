@@ -123,6 +123,67 @@ pub async fn check_pulsar_broker_available(args: &crate::target::pulsar::PulsarA
     .unwrap_or_else(|_| Err(crate::TargetError::Timeout("Pulsar connection timed out".to_string())))
 }
 
+/// Probes a MySQL server for connectivity and verifies the configured table
+/// is accessible.
+///
+/// 1. Validates `args`.
+/// 2. Parses the DSN and builds a connection pool.
+/// 3. Runs `SELECT 1` to confirm credentials work.
+/// 4. Runs `SELECT 1 FROM <table> LIMIT 0` to confirm the table exists and
+///    the user has read permission.
+///
+/// The whole flow is wrapped in an 8s `tokio::time::timeout`.
+pub async fn check_mysql_server_available(args: &crate::target::mysql::MySqlArgs) -> Result<(), crate::TargetError> {
+    use crate::target::ensure_rustls_provider_installed;
+    use crate::target::mysql::{MySqlDsn, map_mysql_error, quote_table_name, validate_table_name};
+    use mysql_async::{Opts, OptsBuilder, Pool, SslOpts, prelude::Queryable};
+    use std::path::PathBuf;
+
+    args.validate()?;
+    validate_table_name(&args.table)?;
+
+    let dsn = MySqlDsn::parse(&args.dsn_string)?;
+
+    let mut builder = OptsBuilder::default()
+        .user(Some(dsn.user.clone()))
+        .pass(Some(dsn.password.clone()))
+        .ip_or_hostname(dsn.host.clone())
+        .tcp_port(dsn.port)
+        .db_name(Some(dsn.database.clone()));
+
+    if dsn.tls {
+        ensure_rustls_provider_installed();
+        let mut ssl_opts = SslOpts::default();
+        if !args.tls_ca.is_empty() {
+            ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(args.tls_ca.clone()).into()]);
+        }
+        if !args.tls_client_cert.is_empty() && !args.tls_client_key.is_empty() {
+            let identity = mysql_async::ClientIdentity::new(
+                PathBuf::from(args.tls_client_cert.clone()).into(),
+                PathBuf::from(args.tls_client_key.clone()).into(),
+            );
+            ssl_opts = ssl_opts.with_client_identity(Some(identity));
+        }
+        builder = builder.ssl_opts(Some(ssl_opts));
+    }
+
+    let pool = Pool::new(Opts::from(builder));
+    // Pool is dropped at scope exit; pool.disconnect() is deliberately
+    // avoided — integration tests show it hangs indefinitely, exceeding
+    // the 8s timeout. Drops handle cleanup without blocking.
+
+    let timeout = std::time::Duration::from_secs(8);
+    tokio::time::timeout(timeout, async {
+        let mut conn = pool.get_conn().await.map_err(map_mysql_error)?;
+        conn.query_drop("SELECT 1").await.map_err(map_mysql_error)?;
+        let probe_sql = format!("SELECT 1 FROM {} LIMIT 0", quote_table_name(&args.table)?);
+        conn.query_drop(probe_sql).await.map_err(map_mysql_error)?;
+        Ok::<(), crate::TargetError>(())
+    })
+    .await
+    .unwrap_or_else(|_| Err(crate::TargetError::Timeout("MySQL connectivity probe timed out".to_string())))
+}
+
 /// Probes a PostgreSQL server for connectivity and verifies the configured
 /// table is readable.
 ///
