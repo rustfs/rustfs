@@ -270,11 +270,15 @@ fn should_force_zero_content_length_for_empty_body_route<B>(req: &HttpRequest<B>
         return false;
     }
 
+    if req.headers().contains_key(http::header::TRANSFER_ENCODING) {
+        return false;
+    }
+
     if is_empty_body_admin_path(req.method(), req.uri().path()) {
         return true;
     }
 
-    !req.headers().contains_key(http::header::TRANSFER_ENCODING) && is_empty_body_s3_path(req.method(), req.uri())
+    is_empty_body_s3_path(req.method(), req.uri())
 }
 
 fn is_empty_body_admin_path(method: &Method, path: &str) -> bool {
@@ -1064,6 +1068,25 @@ mod tests {
 
         let headers = headers.lock().expect("captured headers").take().expect("captured headers");
         assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn empty_body_layer_preserves_admin_transfer_encoding_without_content_length() {
+        let capture = HeaderCaptureService::default();
+        let headers = capture.headers();
+        let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/rustfs/admin/v3/set-group-status?group=test&status=enabled")
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        let _ = service.call(request).await.expect("service call");
+
+        let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert_eq!(headers.get(http::header::TRANSFER_ENCODING).unwrap(), "chunked");
     }
 
     #[test]
