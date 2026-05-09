@@ -45,12 +45,15 @@ fn redact_target_field_value(field_name: &str, value: &str) -> String {
     if value.is_empty() {
         return value.to_string();
     }
-    // MySQL DSN fields need partial redaction instead of full masking so the
-    // remaining connection details (host, port, database) remain visible in
-    // debug logs while the password is hidden.
+    // Shared DSN fields need target-specific partial redaction so connection
+    // details stay visible in debug logs while passwords remain hidden.
     if field_name == rustfs_config::BASE_DSN_STRING {
         let trimmed = value.trim_start();
-        if trimmed.starts_with("postgres://") || trimmed.starts_with("postgresql://") {
+        if ["postgres://", "postgresql://"].iter().any(|prefix| {
+            trimmed
+                .get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        }) {
             return crate::target::postgres::redact_postgres_dsn(value);
         }
         return crate::target::mysql::redact_mysql_dsn(value);
@@ -344,6 +347,14 @@ mod tests {
         let redacted = redact_target_field_value(rustfs_config::POSTGRES_DSN_STRING, dsn);
         assert_eq!(redacted, "postgres://rustfs:***@pg.example.com:5432/rustfs_events?search_path=public");
         assert_eq!(redact_target_field_value(rustfs_config::POSTGRES_DSN_STRING, ""), "");
+    }
+
+    #[test]
+    fn redact_postgres_dsn_string_handles_case_insensitive_scheme() {
+        let dsn = "POSTGRES://rustfs:secret123@pg.example.com:5432/rustfs_events?search_path=public";
+        let redacted = redact_target_field_value(rustfs_config::POSTGRES_DSN_STRING, dsn);
+
+        assert_eq!(redacted, "postgres://rustfs:***@pg.example.com:5432/rustfs_events?search_path=public");
     }
 
     #[test]

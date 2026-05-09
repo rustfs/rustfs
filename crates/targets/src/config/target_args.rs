@@ -16,6 +16,7 @@ use super::common::{parse_target_bool, parse_url, validate_nats_server_config, v
 use crate::error::TargetError;
 use crate::target::{
     TargetType,
+    amqp::AMQPArgs,
     kafka::KafkaArgs,
     mqtt::{MQTTArgs, MQTTTlsConfig, validate_mqtt_broker_url},
     mysql::MySqlArgs,
@@ -27,22 +28,23 @@ use crate::target::{
 };
 use rumqttc::QoS;
 use rustfs_config::{
-    DEFAULT_LIMIT, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_QUEUE_LIMIT, KAFKA_TLS_CA, KAFKA_TLS_CLIENT_CERT,
-    KAFKA_TLS_CLIENT_KEY, KAFKA_TLS_ENABLE, KAFKA_TOPIC, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS,
-    MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY,
-    MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_DSN_STRING,
-    MYSQL_FORMAT, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT, MYSQL_TABLE, MYSQL_TLS_CA,
-    MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, NATS_ADDRESS, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR,
-    NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN,
-    NATS_USERNAME, POSTGRES_DSN_STRING, POSTGRES_FORMAT, POSTGRES_QUEUE_DIR, POSTGRES_QUEUE_LIMIT, POSTGRES_TABLE,
-    POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_TLS_REQUIRED, PULSAR_AUTH_TOKEN, PULSAR_BROKER,
-    PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA,
-    PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT,
-    REDIS_KEEP_ALIVE_INTERVAL, REDIS_MAX_RETRY_ATTEMPTS, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PASSWORD,
-    REDIS_PIPELINE_BUFFER_SIZE, REDIS_QUEUE_DIR, REDIS_QUEUE_LIMIT, REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT,
-    REDIS_TLS_ALLOW_INSECURE, REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY, REDIS_URL,
-    REDIS_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT,
-    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
+    AMQP_EXCHANGE, AMQP_MANDATORY, AMQP_PASSWORD, AMQP_PERSISTENT, AMQP_QUEUE_DIR, AMQP_QUEUE_LIMIT, AMQP_ROUTING_KEY,
+    AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY, AMQP_URL, AMQP_USERNAME, DEFAULT_LIMIT, KAFKA_ACKS, KAFKA_BROKERS,
+    KAFKA_QUEUE_DIR, KAFKA_QUEUE_LIMIT, KAFKA_TLS_CA, KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY, KAFKA_TLS_ENABLE, KAFKA_TOPIC,
+    MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL,
+    MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC,
+    MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_DSN_STRING, MYSQL_FORMAT, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR,
+    MYSQL_QUEUE_LIMIT, MYSQL_TABLE, MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, NATS_ADDRESS,
+    NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
+    NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, POSTGRES_DSN_STRING, POSTGRES_FORMAT, POSTGRES_QUEUE_DIR,
+    POSTGRES_QUEUE_LIMIT, POSTGRES_TABLE, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY,
+    POSTGRES_TLS_REQUIRED, PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT,
+    PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, REDIS_CHANNEL,
+    REDIS_CONNECTION_TIMEOUT, REDIS_KEEP_ALIVE_INTERVAL, REDIS_MAX_RETRY_ATTEMPTS, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY,
+    REDIS_PASSWORD, REDIS_PIPELINE_BUFFER_SIZE, REDIS_QUEUE_DIR, REDIS_QUEUE_LIMIT, REDIS_RECONNECT_RETRY_ATTEMPTS,
+    REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY,
+    REDIS_TLS_POLICY, REDIS_URL, REDIS_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA,
+    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
 use rustfs_ecstore::config::KVS;
 use std::path::Path;
@@ -64,6 +66,55 @@ fn parse_kafka_acks_value(value: Option<&str>) -> Result<i16, TargetError> {
         "-1" | "all" => Ok(-1),
         _ => Err(TargetError::Configuration("Kafka acks must be one of: 0, 1, -1, all".to_string())),
     }
+}
+
+fn parse_amqp_bool_value(field: &str, config: &KVS, default: bool) -> Result<bool, TargetError> {
+    match config.lookup(field) {
+        Some(value) => parse_target_bool(Some(value.as_str()))
+            .ok_or_else(|| TargetError::Configuration(format!("Invalid AMQP {field} boolean value: {value}"))),
+        None => Ok(default),
+    }
+}
+
+pub fn build_amqp_args(config: &KVS, default_queue_dir: &str, target_type: TargetType) -> Result<AMQPArgs, TargetError> {
+    let url = config
+        .lookup(AMQP_URL)
+        .ok_or_else(|| TargetError::Configuration("Missing AMQP url".to_string()))?;
+    let url = parse_url(url.trim(), "AMQP URL")?;
+
+    let exchange = config
+        .lookup(AMQP_EXCHANGE)
+        .ok_or_else(|| TargetError::Configuration("Missing AMQP exchange".to_string()))?;
+    let routing_key = config
+        .lookup(AMQP_ROUTING_KEY)
+        .ok_or_else(|| TargetError::Configuration("Missing AMQP routing_key".to_string()))?;
+
+    let args = AMQPArgs {
+        enable: true,
+        url,
+        exchange,
+        routing_key,
+        mandatory: parse_amqp_bool_value(AMQP_MANDATORY, config, false)?,
+        persistent: parse_amqp_bool_value(AMQP_PERSISTENT, config, true)?,
+        username: config.lookup(AMQP_USERNAME).unwrap_or_default(),
+        password: config.lookup(AMQP_PASSWORD).unwrap_or_default(),
+        tls_ca: config.lookup(AMQP_TLS_CA).unwrap_or_default(),
+        tls_client_cert: config.lookup(AMQP_TLS_CLIENT_CERT).unwrap_or_default(),
+        tls_client_key: config.lookup(AMQP_TLS_CLIENT_KEY).unwrap_or_default(),
+        queue_dir: config.lookup(AMQP_QUEUE_DIR).unwrap_or_else(|| default_queue_dir.to_string()),
+        queue_limit: config
+            .lookup(AMQP_QUEUE_LIMIT)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LIMIT),
+        target_type,
+    };
+    args.validate()?;
+    Ok(args)
+}
+
+pub fn validate_amqp_config(config: &KVS, default_queue_dir: &str) -> Result<(), TargetError> {
+    let _ = build_amqp_args(config, default_queue_dir, TargetType::NotifyEvent)?;
+    Ok(())
 }
 
 pub fn build_webhook_args(config: &KVS, default_queue_dir: &str, target_type: TargetType) -> Result<WebhookArgs, TargetError> {
@@ -540,18 +591,27 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        build_kafka_args, build_mysql_args, build_postgres_args, build_redis_args, validate_kafka_config, validate_mysql_config,
-        validate_postgres_config, validate_redis_config,
+        build_amqp_args, build_kafka_args, build_mysql_args, build_postgres_args, build_redis_args, validate_amqp_config,
+        validate_kafka_config, validate_mysql_config, validate_postgres_config, validate_redis_config,
     };
     use crate::target::{TargetType, postgres::PostgresFormat};
     use rustfs_config::{
-        KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
-        MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, POSTGRES_DSN_STRING, POSTGRES_FORMAT, POSTGRES_QUEUE_DIR,
-        POSTGRES_TABLE, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, REDIS_CHANNEL,
-        REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE,
-        REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_URL,
+        AMQP_EXCHANGE, AMQP_MANDATORY, AMQP_PASSWORD, AMQP_PERSISTENT, AMQP_QUEUE_DIR, AMQP_ROUTING_KEY, AMQP_TLS_CLIENT_CERT,
+        AMQP_TLS_CLIENT_KEY, AMQP_URL, AMQP_USERNAME, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_TOPIC, MYSQL_DSN_STRING,
+        MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE, MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY,
+        POSTGRES_DSN_STRING, POSTGRES_FORMAT, POSTGRES_QUEUE_DIR, POSTGRES_TABLE, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT,
+        POSTGRES_TLS_CLIENT_KEY, REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY,
+        REDIS_PIPELINE_BUFFER_SIZE, REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_URL,
     };
     use rustfs_ecstore::config::KVS;
+
+    fn amqp_base_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(AMQP_URL.to_string(), "amqp://127.0.0.1:5672/%2f".to_string());
+        config.insert(AMQP_EXCHANGE.to_string(), "rustfs.events".to_string());
+        config.insert(AMQP_ROUTING_KEY.to_string(), "objects".to_string());
+        config
+    }
 
     fn kafka_base_config() -> KVS {
         let mut config = KVS::new();
@@ -568,6 +628,123 @@ mod tests {
         );
         config.insert(MYSQL_TABLE.to_string(), "rustfs_events".to_string());
         config
+    }
+
+    #[test]
+    fn build_amqp_args_accepts_valid_config() {
+        let args = build_amqp_args(&amqp_base_config(), "", TargetType::NotifyEvent).expect("valid AMQP args");
+
+        assert_eq!(args.url.as_str(), "amqp://127.0.0.1:5672/%2f");
+        assert_eq!(args.exchange, "rustfs.events");
+        assert_eq!(args.routing_key, "objects");
+        assert!(!args.mandatory);
+        assert!(args.persistent);
+    }
+
+    #[test]
+    fn build_amqp_args_accepts_bool_aliases() {
+        let mut config = amqp_base_config();
+        config.insert(AMQP_MANDATORY.to_string(), "on".to_string());
+        config.insert(AMQP_PERSISTENT.to_string(), "no".to_string());
+
+        let args = build_amqp_args(&config, "", TargetType::NotifyEvent).expect("valid AMQP bool aliases");
+
+        assert!(args.mandatory);
+        assert!(!args.persistent);
+    }
+
+    #[test]
+    fn validate_amqp_config_rejects_invalid_bool() {
+        let mut config = amqp_base_config();
+        config.insert(AMQP_MANDATORY.to_string(), "sometimes".to_string());
+
+        let err = validate_amqp_config(&config, "").expect_err("invalid AMQP bool should fail");
+
+        assert!(err.to_string().contains("Invalid AMQP mandatory boolean"));
+    }
+
+    #[test]
+    fn validate_amqp_config_rejects_invalid_scheme() {
+        let mut config = amqp_base_config();
+        config.insert(AMQP_URL.to_string(), "http://127.0.0.1:5672".to_string());
+
+        let err = validate_amqp_config(&config, "").expect_err("invalid AMQP scheme should fail");
+
+        assert!(err.to_string().contains("only amqp and amqps"));
+    }
+
+    #[test]
+    fn validate_amqp_config_rejects_missing_url_host() {
+        let mut config = amqp_base_config();
+        config.insert(AMQP_URL.to_string(), "amqp:///objects".to_string());
+
+        let err = validate_amqp_config(&config, "").expect_err("missing AMQP host should fail");
+
+        assert!(err.to_string().contains("missing host"));
+    }
+
+    #[test]
+    fn validate_amqp_config_rejects_missing_exchange() {
+        let mut config = amqp_base_config();
+        config.0.retain(|kv| kv.key != AMQP_EXCHANGE);
+
+        let err = validate_amqp_config(&config, "").expect_err("missing AMQP exchange should fail");
+
+        assert!(err.to_string().contains("Missing AMQP exchange"));
+    }
+
+    #[test]
+    fn validate_amqp_config_rejects_missing_routing_key() {
+        let mut config = amqp_base_config();
+        config.0.retain(|kv| kv.key != AMQP_ROUTING_KEY);
+
+        let err = validate_amqp_config(&config, "").expect_err("missing AMQP routing_key should fail");
+
+        assert!(err.to_string().contains("Missing AMQP routing_key"));
+    }
+
+    #[test]
+    fn validate_amqp_config_rejects_relative_queue_dir() {
+        let mut config = amqp_base_config();
+        config.insert(AMQP_QUEUE_DIR.to_string(), "relative-queue".to_string());
+
+        let err = validate_amqp_config(&config, "").expect_err("relative queue_dir should fail");
+
+        assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn validate_amqp_config_rejects_unpaired_tls_client_cert_key() {
+        let mut config = amqp_base_config();
+        config.insert(AMQP_URL.to_string(), "amqps://127.0.0.1:5671/%2f".to_string());
+        config.insert(AMQP_TLS_CLIENT_CERT.to_string(), "/tmp/client.crt".to_string());
+
+        let err = validate_amqp_config(&config, "").expect_err("unpaired TLS cert should fail");
+
+        assert!(err.to_string().contains("tls_client_cert and tls_client_key"));
+    }
+
+    #[test]
+    fn validate_amqp_config_rejects_tls_paths_without_amqps() {
+        let mut config = amqp_base_config();
+        config.insert(AMQP_TLS_CLIENT_CERT.to_string(), "/tmp/client.crt".to_string());
+        config.insert(AMQP_TLS_CLIENT_KEY.to_string(), "/tmp/client.key".to_string());
+
+        let err = validate_amqp_config(&config, "").expect_err("TLS paths without amqps should fail");
+
+        assert!(err.to_string().contains("only allowed with amqps"));
+    }
+
+    #[test]
+    fn validate_amqp_config_rejects_ambiguous_credentials() {
+        let mut config = amqp_base_config();
+        config.insert(AMQP_URL.to_string(), "amqp://guest:guest@127.0.0.1:5672/%2f".to_string());
+        config.insert(AMQP_USERNAME.to_string(), "user".to_string());
+        config.insert(AMQP_PASSWORD.to_string(), "password".to_string());
+
+        let err = validate_amqp_config(&config, "").expect_err("ambiguous credentials should fail");
+
+        assert!(err.to_string().contains("either in url or username/password"));
     }
 
     #[test]

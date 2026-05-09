@@ -15,7 +15,7 @@
 use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
-        AdminTargetSpec, AdminTargetValidator, EndpointKey, TargetDomain, TargetEndpointSource, allowed_target_keys,
+        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, allowed_target_keys,
         build_json_response, collect_validated_key_values as shared_collect_validated_key_values,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
@@ -32,19 +32,16 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
-use rustfs_config::notify::{
-    NOTIFY_KAFKA_KEYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_KEYS, NOTIFY_MYSQL_SUB_SYS,
-    NOTIFY_NATS_KEYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_KEYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_KEYS,
-    NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_REDIS_KEYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_ROUTE_PREFIX,
-    NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS,
-};
+use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
+use rustfs_notify::factory::builtin_target_descriptors as builtin_notification_target_descriptors;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 use tracing::{Span, info, warn};
@@ -101,57 +98,15 @@ struct NotificationEndpointsResponse {
     notification_endpoints: Vec<NotificationEndpoint>,
 }
 
-fn notification_target_specs() -> [AdminTargetSpec; 8] {
-    [
-        AdminTargetSpec {
-            subsystem: NOTIFY_WEBHOOK_SUB_SYS,
-            service: "webhook",
-            valid_keys: NOTIFY_WEBHOOK_KEYS,
-            validator: AdminTargetValidator::Webhook,
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_KAFKA_SUB_SYS,
-            service: "kafka",
-            valid_keys: NOTIFY_KAFKA_KEYS,
-            validator: AdminTargetValidator::Kafka(TargetDomain::Notify),
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_MQTT_SUB_SYS,
-            service: "mqtt",
-            valid_keys: NOTIFY_MQTT_KEYS,
-            validator: AdminTargetValidator::Mqtt,
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_MYSQL_SUB_SYS,
-            service: "mysql",
-            valid_keys: NOTIFY_MYSQL_KEYS,
-            validator: AdminTargetValidator::MySql,
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_NATS_SUB_SYS,
-            service: "nats",
-            valid_keys: NOTIFY_NATS_KEYS,
-            validator: AdminTargetValidator::Nats(TargetDomain::Notify),
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_POSTGRES_SUB_SYS,
-            service: "postgres",
-            valid_keys: NOTIFY_POSTGRES_KEYS,
-            validator: AdminTargetValidator::Postgres(TargetDomain::Notify),
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_REDIS_SUB_SYS,
-            service: "redis",
-            valid_keys: NOTIFY_REDIS_KEYS,
-            validator: AdminTargetValidator::Redis(TargetDomain::Notify, NOTIFY_REDIS_DEFAULT_CHANNEL),
-        },
-        AdminTargetSpec {
-            subsystem: NOTIFY_PULSAR_SUB_SYS,
-            service: "pulsar",
-            valid_keys: NOTIFY_PULSAR_KEYS,
-            validator: AdminTargetValidator::Pulsar(TargetDomain::Notify),
-        },
-    ]
+static NOTIFICATION_TARGET_SPECS: LazyLock<Vec<AdminTargetSpec>> = LazyLock::new(|| {
+    builtin_notification_target_descriptors()
+        .into_iter()
+        .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
+        .collect()
+});
+
+fn notification_target_specs() -> &'static [AdminTargetSpec] {
+    &NOTIFICATION_TARGET_SPECS
 }
 
 // --- Helper Functions ---
@@ -172,7 +127,7 @@ fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>>
 
 fn target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
     shared_target_mutation_block_reason(
-        &notification_target_specs(),
+        notification_target_specs(),
         NOTIFY_ROUTE_PREFIX,
         config,
         target_type,
@@ -193,7 +148,7 @@ async fn notification_target_operation_block_reason(action: &str) -> Option<Stri
 }
 
 fn merge_notification_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<NotificationEndpoint> {
-    shared_merge_target_endpoints(&notification_target_specs(), NOTIFY_ROUTE_PREFIX, config, runtime_statuses)
+    shared_merge_target_endpoints(notification_target_specs(), NOTIFY_ROUTE_PREFIX, config, runtime_statuses)
         .into_iter()
         .map(|endpoint| NotificationEndpoint {
             account_id: endpoint.account_id,
@@ -241,7 +196,7 @@ impl Operation for NotificationTarget {
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for target config: {}", e))?;
 
         let specs = notification_target_specs();
-        let allowed_keys: HashSet<&str> = allowed_target_keys(&specs, target_type);
+        let allowed_keys: HashSet<&str> = allowed_target_keys(specs, target_type);
 
         let kv_map = shared_collect_validated_key_values(
             notification_body
@@ -252,7 +207,7 @@ impl Operation for NotificationTarget {
             target_type,
             "target",
         )?;
-        let spec = target_spec(&specs, target_type)
+        let spec = target_spec(specs, target_type)
             .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
         timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, EVENT_DEFAULT_DIR))
             .await
@@ -397,7 +352,7 @@ fn extract_param<'a>(params: &'a Params<'_, '_>, key: &str) -> S3Result<&'a str>
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
     let target_type = extract_param(params, "target_type")?;
-    if target_service_name(&notification_target_specs(), target_type).is_none() {
+    if target_service_name(notification_target_specs(), target_type).is_none() {
         return Err(s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type));
     }
     let target_name = extract_param(params, "target_name")?;
@@ -409,8 +364,10 @@ mod tests {
     use super::*;
     use matchit::Router;
     use rustfs_config::DEFAULT_DELIMITER;
+    use rustfs_config::notify::{NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_ecstore::config::{KV, KVS};
     use rustfs_targets::arn::TargetID;
+    use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars};
 
@@ -483,6 +440,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_marks_env_and_mixed_sources() {
         let config = Config(HashMap::from([
             (
@@ -530,6 +488,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_marks_kafka_env_and_mixed_sources() {
         let config = Config(HashMap::from([(
             NOTIFY_KAFKA_SUB_SYS.to_string(),
@@ -566,6 +525,44 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn merge_notification_endpoints_marks_amqp_env_and_mixed_sources() {
+        let config = Config(HashMap::from([(
+            NOTIFY_AMQP_SUB_SYS.to_string(),
+            HashMap::from([("mixed-amqp".to_string(), enabled_kvs("on"))]),
+        )]));
+
+        with_vars(
+            [
+                ("RUSTFS_NOTIFY_AMQP_ENABLE_MIXED-AMQP", Some("on")),
+                ("RUSTFS_NOTIFY_AMQP_URL_MIXED-AMQP", Some("amqp://127.0.0.1:5672/%2f")),
+                ("RUSTFS_NOTIFY_AMQP_ENABLE_ENV-AMQP", Some("on")),
+                ("RUSTFS_NOTIFY_AMQP_URL_ENV-AMQP", Some("amqp://127.0.0.1:5672/%2f")),
+            ],
+            || {
+                let runtime = HashMap::from([
+                    (("mixed-amqp".to_string(), "amqp".to_string()), "online".to_string()),
+                    (("env-amqp".to_string(), "amqp".to_string()), "online".to_string()),
+                ]);
+                let merged = merge_notification_endpoints(&config, runtime);
+
+                let mixed = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "mixed-amqp" && entry.service == "amqp")
+                    .expect("mixed amqp target should be present");
+                assert_eq!(mixed.source, TargetEndpointSource::Mixed);
+
+                let env_only = merged
+                    .iter()
+                    .find(|entry| entry.account_id == "env-amqp" && entry.service == "amqp")
+                    .expect("env amqp target should be present");
+                assert_eq!(env_only.source, TargetEndpointSource::Env);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
     fn target_mutation_block_reason_rejects_env_managed_target() {
         with_vars(
             [
@@ -582,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn notification_target_operation_block_reason_requires_notify_module_enable() {
         with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("false"), || {
             let reason = futures::executor::block_on(notification_target_operation_block_reason(
@@ -593,6 +591,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn notification_target_operation_block_reason_allows_when_notify_module_enabled() {
         with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"), || {
             assert!(
@@ -605,6 +604,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn target_mutation_block_reason_rejects_mixed_target() {
         with_var("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY", Some("https://example.com/hook"), || {
             let config = Config(HashMap::from([(
@@ -628,6 +628,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_marks_disabled_config_with_env_override_as_mixed() {
         let config = Config(HashMap::from([(
             NOTIFY_WEBHOOK_SUB_SYS.to_string(),
@@ -652,6 +653,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_includes_env_only_target_without_runtime_status() {
         let config = Config(HashMap::new());
 
@@ -697,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_notification_endpoints_marks_mixed_with_case_insensitive_instance_id() {
         let config = Config(HashMap::from([(
             NOTIFY_WEBHOOK_SUB_SYS.to_string(),
@@ -734,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn target_mutation_block_reason_allows_case_insensitive_config_target_lookup() {
         let config = Config(HashMap::from([(
             NOTIFY_WEBHOOK_SUB_SYS.to_string(),
@@ -809,6 +813,44 @@ mod tests {
         let (target_type, target_name) = extract_target_params(&params).expect("kafka target type should be accepted");
         assert_eq!(target_type, NOTIFY_KAFKA_SUB_SYS);
         assert_eq!(target_name, "streaming");
+    }
+
+    #[test]
+    fn extract_target_params_accepts_amqp_target_type() {
+        let mut router = Router::new();
+        router
+            .insert("/v3/target/{target_type}/{target_name}", ())
+            .expect("route should insert");
+
+        let params = router
+            .at("/v3/target/notify_amqp/rabbitmq")
+            .expect("route should match")
+            .params;
+        let (target_type, target_name) = extract_target_params(&params).expect("amqp target type should be accepted");
+        assert_eq!(target_type, NOTIFY_AMQP_SUB_SYS);
+        assert_eq!(target_name, "rabbitmq");
+    }
+
+    #[test]
+    fn collect_validated_key_values_accepts_amqp_keys() {
+        let specs = notification_target_specs();
+        let allowed_keys = allowed_target_keys(specs, NOTIFY_AMQP_SUB_SYS);
+
+        let kv_map = shared_collect_validated_key_values(
+            [
+                (rustfs_config::AMQP_URL, "amqp://127.0.0.1:5672/%2f"),
+                (rustfs_config::AMQP_EXCHANGE, "rustfs.events"),
+                (rustfs_config::AMQP_ROUTING_KEY, "objects"),
+            ],
+            &allowed_keys,
+            NOTIFY_AMQP_SUB_SYS,
+            "target",
+        )
+        .expect("amqp keys should be accepted");
+
+        assert_eq!(kv_map.get(rustfs_config::AMQP_URL).map(String::as_str), Some("amqp://127.0.0.1:5672/%2f"));
+        assert!(allowed_keys.contains(rustfs_config::AMQP_MANDATORY));
+        assert!(allowed_keys.contains(rustfs_config::AMQP_PERSISTENT));
     }
 
     fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
