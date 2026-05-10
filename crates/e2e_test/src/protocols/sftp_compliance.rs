@@ -39,8 +39,10 @@
 use crate::protocols::sftp_compliance_tests::{
     cmptst_01, cmptst_02, cmptst_03, cmptst_04, cmptst_05, cmptst_06, cmptst_07, cmptst_08, cmptst_09, cmptst_10, cmptst_11,
     cmptst_12, cmptst_13, cmptst_14, cmptst_15, cmptst_16, cmptst_17, cmptst_18, cmptst_19, cmptst_20, cmptst_21, cmptst_22,
-    cmptst_23, cmptst_24, cmptst_25, cmptst_26, cmptst_27, cmptst_28, cmptst_29, cmptst_32, cmptst_33, spawn_compliance_rustfs,
+    cmptst_23, cmptst_27, cmptst_28, cmptst_29, cmptst_32, cmptst_33, spawn_compliance_rustfs,
 };
+#[cfg(target_os = "linux")]
+use crate::protocols::sftp_compliance_tests::{cmptst_24, cmptst_25, cmptst_26};
 use crate::protocols::sftp_helpers::{build_test_s3_client, connect_sftp_to, wait_for_s3_ready};
 use crate::protocols::test_env::ProtocolTestEnvironment;
 use anyhow::{Result, anyhow};

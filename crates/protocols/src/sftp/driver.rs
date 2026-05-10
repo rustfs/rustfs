@@ -1116,6 +1116,7 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::constants::protocol;
     use super::super::state::WritePhase;
     use super::super::test_support::{TEST_PART_SIZE, build_driver, build_readonly_driver, file_handle, write_handle};
     use super::*;
@@ -1123,7 +1124,47 @@ mod tests {
     use crate::common::gateway::{with_test_auth_override, with_test_iam_unavailable};
     use russh_sftp::server::Handler;
     use rustfs_utils::path;
+    use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn init_advertises_sftp_v3_without_extensions() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(backend, TEST_PART_SIZE);
+        let extensions = HashMap::from([("posix-rename@openssh.com".to_string(), "1".to_string())]);
+
+        let advertised = driver
+            .init(protocol::SFTP_VERSION, extensions)
+            .await
+            .expect("init must succeed");
+
+        assert_eq!(advertised.version, protocol::SFTP_VERSION);
+        assert!(advertised.extensions.is_empty(), "server must not advertise unsupported extensions");
+    }
+
+    #[tokio::test]
+    async fn init_from_newer_client_still_advertises_sftp_v3() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(backend, TEST_PART_SIZE);
+
+        let advertised = driver
+            .init(protocol::SFTP_VERSION + 3, HashMap::new())
+            .await
+            .expect("version negotiation must still reply");
+
+        assert_eq!(advertised.version, protocol::SFTP_VERSION);
+        assert!(advertised.extensions.is_empty());
+    }
+
+    #[test]
+    fn unimplemented_packet_returns_op_unsupported() {
+        let backend = Arc::new(DummyBackend::new());
+        let driver = build_driver(backend, TEST_PART_SIZE);
+
+        let err = <SftpDriver<DummyBackend> as Handler>::unimplemented(&driver);
+
+        assert!(matches!(StatusCode::from(err), StatusCode::OpUnsupported));
+    }
 
     #[tokio::test]
     async fn fstat_on_file_handle_returns_cached_attrs() {
