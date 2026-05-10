@@ -24,6 +24,9 @@ use rustfs::init::{init_ftp_system, init_ftps_system};
 #[cfg(feature = "webdav")]
 use rustfs::init::init_webdav_system;
 
+#[cfg(feature = "sftp")]
+use rustfs::init::init_sftp_system;
+
 use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::license::{current_license, init_license, license_status};
 use rustfs::server::{
@@ -451,6 +454,26 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     #[cfg(not(feature = "webdav"))]
     let webdav_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
 
+    // Initialize SFTP system if enabled
+    #[cfg(feature = "sftp")]
+    let sftp_shutdown_tx = match init_sftp_system().await {
+        Ok(Some(tx)) => {
+            info!("SFTP system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("SFTP system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize SFTP system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "sftp"))]
+    let sftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+
     // Initialize buffer profiling system
     init_buffer_profile_system(&config);
 
@@ -595,9 +618,12 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 &state_manager,
                 s3_shutdown_tx,
                 console_shutdown_tx,
-                ftp_shutdown_tx,
-                ftps_shutdown_tx,
-                webdav_shutdown_tx,
+                ProtocolShutdownSenders {
+                    ftp: ftp_shutdown_tx,
+                    ftps: ftps_shutdown_tx,
+                    webdav: webdav_shutdown_tx,
+                    sftp: sftp_shutdown_tx,
+                },
                 ctx.clone(),
             )
             .await;
@@ -608,9 +634,12 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
                 &state_manager,
                 s3_shutdown_tx,
                 console_shutdown_tx,
-                ftp_shutdown_tx,
-                ftps_shutdown_tx,
-                webdav_shutdown_tx,
+                ProtocolShutdownSenders {
+                    ftp: ftp_shutdown_tx,
+                    ftps: ftps_shutdown_tx,
+                    webdav: webdav_shutdown_tx,
+                    sftp: sftp_shutdown_tx,
+                },
                 ctx.clone(),
             )
             .await;
@@ -621,16 +650,29 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     Ok(())
 }
 
+/// Shutdown channels for every protocol server. None means the protocol was
+/// disabled at startup.
+struct ProtocolShutdownSenders {
+    ftp: Option<tokio::sync::broadcast::Sender<()>>,
+    ftps: Option<tokio::sync::broadcast::Sender<()>>,
+    webdav: Option<tokio::sync::broadcast::Sender<()>>,
+    sftp: Option<tokio::sync::broadcast::Sender<()>>,
+}
+
 /// Handles the shutdown process of the server
 async fn handle_shutdown(
     state_manager: &ServiceStateManager,
     s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
-    ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
-    ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
-    webdav_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    protocols: ProtocolShutdownSenders,
     ctx: CancellationToken,
 ) {
+    let ProtocolShutdownSenders {
+        ftp: ftp_shutdown_tx,
+        ftps: ftps_shutdown_tx,
+        webdav: webdav_shutdown_tx,
+        sftp: sftp_shutdown_tx,
+    } = protocols;
     ctx.cancel();
 
     info!(
@@ -692,6 +734,15 @@ async fn handle_shutdown(
             "Shutting down WebDAV server..."
         );
         let _ = webdav_shutdown_tx.send(());
+    }
+
+    // Shutdown SFTP server
+    if let Some(sftp_shutdown_tx) = sftp_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down SFTP server..."
+        );
+        let _ = sftp_shutdown_tx.send(());
     }
 
     // Stop the notification system

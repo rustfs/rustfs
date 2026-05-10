@@ -54,6 +54,7 @@ swift = [
     "dep:async-compression",
 ]
 webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls", "dep:percent-encoding"]
+sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2"]
 
 [dependencies]
 # Core RustFS dependencies
@@ -100,7 +101,7 @@ sha2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true, features = ["rt"] }
 serde = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
 md5 = { workspace = true, optional = true }
@@ -117,6 +118,17 @@ dav-server = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
+
+# SFTP specific dependencies (optional)
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = "1"
+tracing-subscriber = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

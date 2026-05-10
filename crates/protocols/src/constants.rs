@@ -68,4 +68,8 @@ pub mod defaults {
     /// Default WebDAV server address
     #[cfg(feature = "webdav")]
     pub const DEFAULT_WEBDAV_ADDRESS: &str = "0.0.0.0:8080";
+
+    /// Default SFTP server address
+    #[cfg(feature = "sftp")]
+    pub const DEFAULT_SFTP_ADDRESS: &str = "0.0.0.0:2222";
 }
