@@ -12,11 +12,11 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{AuditEntry, AuditError, AuditRegistry, AuditResult, observability};
+use crate::{AuditEntry, AuditError, AuditRegistry, AuditResult, observability, pipeline::AuditPipeline};
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     ReplayWorkerManager, RuntimeActivation, Target, TargetError, activate_targets_with_replay,
-    init_target_and_optionally_start_replay, start_replay_worker, target::EntityTarget,
+    init_target_and_optionally_start_replay, start_replay_worker,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +58,10 @@ impl Default for AuditSystem {
 }
 
 impl AuditSystem {
+    fn pipeline(&self) -> AuditPipeline {
+        AuditPipeline::new(self.registry.clone())
+    }
+
     /// Creates a new audit system
     pub fn new() -> Self {
         Self {
@@ -249,8 +253,6 @@ impl AuditSystem {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn dispatch(&self, entry: Arc<AuditEntry>) -> AuditResult<()> {
-        let start_time = std::time::Instant::now();
-
         let state = self.state.read().await;
 
         match *state {
@@ -263,77 +265,7 @@ impl AuditSystem {
             }
         }
         drop(state);
-
-        // Collect cloned targets under lock, then dispatch without holding it
-        let targets: Vec<(String, Box<dyn Target<AuditEntry> + Send + Sync>)> = {
-            let registry = self.registry.lock().await;
-            let target_keys = registry.list_targets();
-
-            if target_keys.is_empty() {
-                warn!("No audit targets configured for dispatch");
-                return Ok(());
-            }
-
-            target_keys
-                .into_iter()
-                .filter_map(|key| registry.get_target(&key).map(|t| (key, t.clone_dyn())))
-                .collect()
-        };
-
-        // Dispatch to all targets concurrently (no lock held)
-        let mut tasks = Vec::new();
-
-        for (target_key, target) in targets {
-            let entity_target = EntityTarget {
-                object_name: entry.api.name.clone().unwrap_or_default(),
-                bucket_name: entry.api.bucket.clone().unwrap_or_default(),
-                event_name: entry.event,
-                data: (*entry).clone(),
-            };
-
-            let task = async move {
-                let result = target.save(Arc::new(entity_target)).await;
-                (target_key, result)
-            };
-
-            tasks.push(task);
-        }
-
-        // Execute all dispatch tasks
-        let results = futures::future::join_all(tasks).await;
-
-        let mut errors = Vec::new();
-        let mut success_count = 0;
-
-        for (target_key, result) in results {
-            match result {
-                Ok(_) => {
-                    success_count += 1;
-                    observability::record_target_success();
-                }
-                Err(e) => {
-                    error!(target_id = %target_key, error = %e, "Failed to dispatch audit log to target");
-                    errors.push(e);
-                    observability::record_target_failure();
-                }
-            }
-        }
-
-        let dispatch_time = start_time.elapsed();
-
-        if errors.is_empty() {
-            observability::record_audit_success(dispatch_time);
-        } else {
-            observability::record_audit_failure(dispatch_time);
-            // Log errors but don't fail the entire dispatch
-            warn!(
-                error_count = errors.len(),
-                success_count = success_count,
-                "Some audit targets failed to receive log entry"
-            );
-        }
-
-        Ok(())
+        self.pipeline().dispatch(entry).await
     }
 
     /// Dispatches a batch of audit log entries to all active targets
@@ -344,76 +276,12 @@ impl AuditSystem {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn dispatch_batch(&self, entries: Vec<Arc<AuditEntry>>) -> AuditResult<()> {
-        let start_time = std::time::Instant::now();
-
         let state = self.state.read().await;
         if *state != AuditSystemState::Running {
             return Err(AuditError::NotInitialized("Audit system is not running".to_string()));
         }
         drop(state);
-
-        // Collect targets under lock, then dispatch without holding it
-        let targets: Vec<(String, Box<dyn Target<AuditEntry> + Send + Sync>)> = {
-            let registry = self.registry.lock().await;
-            let target_keys = registry.list_targets();
-
-            if target_keys.is_empty() {
-                warn!("No audit targets configured for batch dispatch");
-                return Ok(());
-            }
-
-            target_keys
-                .into_iter()
-                .filter_map(|key| registry.get_target(&key).map(|t| (key, t.clone_dyn())))
-                .collect()
-        };
-
-        let mut tasks = Vec::new();
-        for (target_key, target) in targets {
-            let entries_clone: Vec<_> = entries.iter().map(Arc::clone).collect();
-            let target_key_clone = target_key.clone();
-
-            let task = async move {
-                let mut success_count = 0;
-                let mut errors = Vec::new();
-                for entry in entries_clone {
-                    let entity_target = EntityTarget {
-                        object_name: entry.api.name.clone().unwrap_or_default(),
-                        bucket_name: entry.api.bucket.clone().unwrap_or_default(),
-                        event_name: entry.event,
-                        data: (*entry).clone(),
-                    };
-                    match target.save(Arc::new(entity_target)).await {
-                        Ok(_) => success_count += 1,
-                        Err(e) => errors.push(e),
-                    }
-                }
-                (target_key_clone, success_count, errors)
-            };
-            tasks.push(task);
-        }
-
-        let results = futures::future::join_all(tasks).await;
-        let mut total_success = 0;
-        let mut total_errors = 0;
-        for (_target_id, success_count, errors) in results {
-            total_success += success_count;
-            total_errors += errors.len();
-            for e in errors {
-                error!("Batch dispatch error: {:?}", e);
-            }
-        }
-
-        let dispatch_time = start_time.elapsed();
-        info!(
-            "Batch dispatched {} entries, success: {}, errors: {}, time: {:?}",
-            entries.len(),
-            total_success,
-            total_errors,
-            dispatch_time
-        );
-
-        Ok(())
+        self.pipeline().dispatch_batch(entries).await
     }
 
     /// Stops all active audit stream tasks by sending cancellation signals.
@@ -607,26 +475,11 @@ impl AuditSystem {
 
     /// Returns per-target delivery metrics for Prometheus collection.
     pub async fn snapshot_target_metrics(&self) -> Vec<AuditTargetMetricSnapshot> {
-        let registry = self.registry.lock().await;
-        registry
-            .list_target_values()
-            .into_iter()
-            .map(|target| {
-                let delivery = target.delivery_snapshot();
-                AuditTargetMetricSnapshot {
-                    failed_messages: delivery.failed_messages,
-                    queue_length: delivery.queue_length,
-                    target_id: target.id().to_string(),
-                    total_messages: delivery.total_messages,
-                }
-            })
-            .collect()
+        self.pipeline().snapshot_target_metrics().await
     }
 
     pub async fn snapshot_target_health(&self) -> Vec<rustfs_targets::RuntimeTargetHealthSnapshot> {
-        let registry = self.registry.lock().await;
-        let manager = registry.runtime_manager();
-        manager.health_snapshots().await
+        self.pipeline().snapshot_target_health().await
     }
 
     pub async fn runtime_status_snapshot(&self) -> rustfs_targets::RuntimeStatusSnapshot {

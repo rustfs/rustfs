@@ -23,6 +23,7 @@ pub mod error;
 pub mod factory;
 pub mod global;
 pub mod observability;
+pub mod pipeline;
 pub mod registry;
 pub mod system;
 
@@ -30,5 +31,6 @@ pub use entity::{ApiDetails, AuditEntry, ObjectVersion};
 pub use error::{AuditError, AuditResult};
 pub use global::*;
 pub use observability::{AuditMetrics, AuditMetricsReport, PerformanceValidation};
+pub use pipeline::AuditPipeline;
 pub use registry::AuditRegistry;
 pub use system::{AuditSystem, AuditTargetMetricSnapshot};
