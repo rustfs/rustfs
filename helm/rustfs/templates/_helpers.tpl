@@ -171,6 +171,12 @@ Render RUSTFS_VOLUMES
 
 {{- $replicas := int .Values.replicaCount -}}
 {{- $drives := int .Values.drivesPerNode -}}
+{{- if lt $replicas 1 -}}
+  {{- fail "rustfs.volumes requires .Values.replicaCount to be >= 1" -}}
+{{- end -}}
+{{- if lt $drives 1 -}}
+  {{- fail "rustfs.volumes requires .Values.drivesPerNode to be >= 1" -}}
+{{- end -}}
 
 {{- if gt $drives 1 -}}
 {{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data/rustfs{0...%d}" $protocol (include "rustfs.fullname" .) (sub $replicas 1) (include "rustfs.fullname" .) .Release.Namespace (.Values.service.endpoint.port | int) (sub $drives 1) }}
