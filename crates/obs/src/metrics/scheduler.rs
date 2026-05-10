@@ -70,6 +70,9 @@ use crate::metrics::config::{
     ENV_NODE_METRICS_INTERVAL, ENV_NOTIFICATION_METRICS_INTERVAL, ENV_RESOURCE_METRICS_INTERVAL,
 };
 use crate::metrics::report::{PrometheusMetric, report_metrics};
+use crate::metrics::schema::bucket_replication::{
+    BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, TARGET_ARN_L,
+};
 use crate::metrics::stats_collector::{
     ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_detail_stats,
     collect_bucket_stats, collect_cluster_and_health_stats, collect_cluster_config_stats, collect_cluster_usage_metric_stats,
@@ -78,9 +81,11 @@ use crate::metrics::stats_collector::{
     collect_scanner_metric_stats, collect_system_cpu_and_memory_stats_with,
 };
 use rustfs_audit::audit_target_metrics;
+use rustfs_ecstore::global::get_global_bucket_monitor;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use sysinfo::System;
 use tokio::time::Instant;
@@ -93,6 +98,11 @@ const DEFAULT_SYSTEM_METRICS_INTERVAL: Duration = Duration::from_secs(15);
 const ENV_SYSTEM_METRICS_INTERVAL: &str = "RUSTFS_METRICS_SYSTEM_INTERVAL_SEC";
 /// Legacy environment variable for system monitoring interval
 const LEGACY_SYSTEM_METRICS_INTERVAL: &str = "RUSTFS_OBS_METRICS_SYSTEM_INTERVAL_MS";
+
+/// Default cycles to emit zero for removed replication bandwidth series before letting them expire.
+const DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES: u8 = 3;
+/// Env var that overrides the zero-emission tombstone cycles for removed replication bandwidth series.
+const ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES: &str = "RUSTFS_METRICS_REPL_BW_ZERO_TOMBSTONE_CYCLES";
 
 /// Initialize all metrics collectors.
 ///
@@ -127,6 +137,13 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     const LEGACY_AUDIT_INTERVAL: &str = "RUSTFS_METRICS_AUDIT_INTERVAL";
     const LEGACY_NOTIFICATION_INTERVAL: &str = "RUSTFS_METRICS_NOTIFICATION_INTERVAL";
     const LEGACY_DEFAULT_INTERVAL: &str = "RUSTFS_METRICS_DEFAULT_INTERVAL";
+
+    fn parse_repl_bw_zero_tombstone_cycles() -> u8 {
+        get_env_opt_u64(ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES)
+            .filter(|&v| v > 0)
+            .map(|v| v.min(u8::MAX as u64) as u8)
+            .unwrap_or(DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES)
+    }
 
     /// Parse metrics interval from environment variables with fallback to default.
     ///
@@ -270,16 +287,79 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(bucket_replication_bandwidth_interval);
+        let repl_bw_zero_tombstone_cycles = parse_repl_bw_zero_tombstone_cycles();
+        type ReplBwKey = (String, String); // (bucket, target_arn)
+        let mut prev_live_keys: HashSet<ReplBwKey> = HashSet::new();
+        let mut zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
+        let mut has_seen_valid_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    let monitor_available = get_global_bucket_monitor().is_some();
                     let stats = collect_bucket_replication_bandwidth_stats();
+
+                    let current_live_keys: HashSet<ReplBwKey> = stats.iter().map(|s| (s.bucket.clone(), s.target_arn.clone()))
+                    .collect();
+
+                    if monitor_available {
+                        if has_seen_valid_snapshot {
+                            for removed in prev_live_keys.difference(&current_live_keys) {
+                                zero_tombstones.insert(removed.clone(), repl_bw_zero_tombstone_cycles);
+                            }
+                        }
+
+                        // Key becomes live again: stop zeroing immediately.
+                        for key in &current_live_keys {
+                            zero_tombstones.remove(key);
+                        }
+
+                        prev_live_keys = current_live_keys;
+                        has_seen_valid_snapshot = true;
+                    } else {
+                        warn!("Bucket monitor unavailable; skip replication bandwidth key-state transition this cycle.");
+                    }
                     let mut metrics = collect_bucket_replication_bandwidth_metrics(&stats);
+
+                    // Phase-1 action: force zero for removed keys during tombstone cycles.
+                    if !zero_tombstones.is_empty() {
+                        let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 2);
+                        for (bucket, target_arn) in zero_tombstones.keys() {
+                            let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
+                            let target_arn_label: Cow<'static, str> = Cow::Owned(target_arn.clone());
+
+                            zero_metrics.push(
+                                PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_LIMIT_MD, 0.0)
+                                    .with_label(BUCKET_L, bucket_label.clone())
+                                    .with_label(TARGET_ARN_L, target_arn_label.clone()),
+                            );
+
+                            zero_metrics.push(
+                                PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_CURRENT_MD, 0.0)
+                                    .with_label(BUCKET_L, bucket_label)
+                                    .with_label(TARGET_ARN_L, target_arn_label),
+                            );
+                        }
+
+                        metrics.extend(zero_metrics);
+                    }
+
                     let bucket_replication = collect_bucket_replication_detail_stats().await;
                     metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
                     let replication = collect_replication_stats().await;
                     metrics.extend(collect_replication_metrics(&replication));
                     report_metrics(&metrics);
+
+                    // Phase-2: after N cycles, stop reporting -> series becomes absent after expiration.
+                    if monitor_available && !zero_tombstones.is_empty() {
+                        zero_tombstones.retain(|_, remaining| {
+                            if *remaining <= 1 {
+                                false
+                            } else {
+                                *remaining -= 1;
+                                true
+                            }
+                        });
+                    }
                 }
                 _ = token_clone.cancelled() => {
                     warn!("Metrics collection for bucket replication bandwidth stats cancelled.");
