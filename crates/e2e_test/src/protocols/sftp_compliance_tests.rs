@@ -106,6 +106,12 @@
 //!   byte-exact with RUSTFS_SFTP_READ_CACHE_WINDOW_BYTES=0.
 
 use crate::common::rustfs_binary_path_with_features;
+#[cfg(target_os = "linux")]
+use crate::protocols::sftp_constants::ENV_SFTP_IDLE_TIMEOUT;
+use crate::protocols::sftp_constants::{
+    ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_PART_SIZE,
+    ENV_SFTP_READ_CACHE_WINDOW_BYTES, ENV_SFTP_READ_ONLY,
+};
 use crate::protocols::sftp_helpers::{
     AcceptAnyServerKey, ServerProcess, build_test_s3_client, connect_sftp_to, generate_host_key, sftp_read_full,
     wait_for_s3_ready,
@@ -118,23 +124,23 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client;
 use russh_sftp::client::{Config, SftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
-use rustfs_config::{
-    ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_IDLE_TIMEOUT,
-    ENV_SFTP_PART_SIZE, ENV_SFTP_READ_CACHE_WINDOW_BYTES, ENV_SFTP_READ_ONLY,
-};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
-use tokio::time::{sleep, timeout};
+#[cfg(target_os = "linux")]
+use tokio::time::sleep;
+use tokio::time::timeout;
 use tracing::info;
 
 // Cross-case constants used by every spawn helper. Pinned to 5 MiB so
@@ -401,11 +407,13 @@ fn capture_server_stdout(child: &mut Child) -> Arc<tokio::sync::Mutex<Vec<String
 /// lifecycle cases (CMPTST-24, CMPTST-25, CMPTST-26) read both fields
 /// to assert the watchdog killed silent sessions on the expected path.
 #[derive(Default)]
+#[cfg(target_os = "linux")]
 struct SessionCounters {
     entered: AtomicUsize,
     finished: AtomicUsize,
 }
 
+#[cfg(target_os = "linux")]
 impl SessionCounters {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -419,6 +427,7 @@ impl SessionCounters {
 /// increments the matching counter for every server-side session
 /// lifecycle event. The task ends when stdout closes (i.e. when the
 /// child is killed at teardown).
+#[cfg(target_os = "linux")]
 fn watch_session_lifecycle_events(child: &mut Child, counters: Arc<SessionCounters>) {
     let Some(stdout) = child.stdout.take() else {
         return;
@@ -448,6 +457,7 @@ fn watch_session_lifecycle_events(child: &mut Child, counters: Arc<SessionCounte
 /// best-effort: if ss is missing on the host the function returns
 /// Ok(None) and the caller skips the assertion. The contract is zero
 /// CLOSE_WAIT entries attributable to the test.
+#[cfg(target_os = "linux")]
 async fn count_close_wait_on_port(port: u16) -> Result<Option<usize>> {
     let output = match Command::new("ss").args(["-tn", "state", "CLOSE-WAIT"]).output().await {
         Ok(o) => o,
@@ -1166,6 +1176,7 @@ pub(crate) mod cmptst_23 {
 }
 
 // CMPTST-24: concurrent half-close burst does not leak server-side session tasks.
+#[cfg(target_os = "linux")]
 pub(crate) mod cmptst_24 {
     use super::*;
 
@@ -1544,6 +1555,7 @@ pub(crate) mod cmptst_24 {
 }
 
 // CMPTST-25: wedge-kill watchdog kills sessions parked behind a CLOSE_WAIT socket.
+#[cfg(target_os = "linux")]
 pub(crate) mod cmptst_25 {
     use super::*;
 
@@ -2076,6 +2088,7 @@ pub(crate) mod cmptst_25 {
 }
 
 // CMPTST-26: healthy idle session past the watchdog fast-kill threshold stays alive.
+#[cfg(target_os = "linux")]
 pub(crate) mod cmptst_26 {
     use super::*;
 

@@ -15,7 +15,7 @@
 //! Write-side state machine: open_write, commit_write, the
 //! write_dispatch chain that flushes a part once part_buffer reaches
 //! part_size, abort_upload_with_auth, close_streaming, and
-//! multipart_copy. Also the cancellation-safety primitives
+//! multipart_copy. Also, the cancellation-safety primitives
 //! (build_write_tombstone, should_abort_on_drop) that the Drop impl
 //! in driver.rs consumes.
 
@@ -43,7 +43,7 @@ use s3s::dto::{
 /// an error in strict mode. The saturating flag controls what happens
 /// on u64 overflow: strict returns Err, saturating returns u64::MAX.
 /// Strict is used by the offset precondition check (entry to the
-/// write_dispatch chain). Saturating is used when refreshing attrs.size
+/// write_dispatch chain). Saturating is used when refreshing attrs. Size
 /// at the tail of the same chain. See write_dispatch for the full call
 /// graph.
 pub(super) fn write_dispatch_byte_count(phase: &WritePhase, part_size: u64, saturating: bool) -> Result<u64, SftpError> {

@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Protocol tests for FTPS, WebDAV, and SFTP
-
-pub mod ftps_core;
-pub mod sftp_compliance;
-mod sftp_compliance_tests;
-pub mod sftp_constants;
-pub mod sftp_core;
-pub mod sftp_helpers;
-pub mod test_env;
-pub mod test_runner;
-pub mod webdav_core;
+pub const ENV_CONSOLE_ENABLE: &str = "RUSTFS_CONSOLE_ENABLE";
+pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
+pub const ENV_SFTP_ENABLE: &str = "RUSTFS_SFTP_ENABLE";
+pub const ENV_SFTP_ADDRESS: &str = "RUSTFS_SFTP_ADDRESS";
+pub const ENV_SFTP_HOST_KEY_DIR: &str = "RUSTFS_SFTP_HOST_KEY_DIR";
+pub const ENV_SFTP_IDLE_TIMEOUT: &str = "RUSTFS_SFTP_IDLE_TIMEOUT";
+pub const ENV_SFTP_PART_SIZE: &str = "RUSTFS_SFTP_PART_SIZE";
+pub const ENV_SFTP_READ_ONLY: &str = "RUSTFS_SFTP_READ_ONLY";
+pub const ENV_SFTP_READ_CACHE_WINDOW_BYTES: &str = "RUSTFS_SFTP_READ_CACHE_WINDOW_BYTES";

@@ -43,7 +43,7 @@ bench = false
 required-features = ["manual-test-runners"]
 
 [features]
-default = ["ftps", "webdav","sftp"]  # Enable common protocols by default
+default = ["ftps", "webdav"]
 metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]

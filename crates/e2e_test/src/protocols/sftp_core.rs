@@ -15,6 +15,10 @@
 //! Core SFTP tests
 
 use crate::common::rustfs_binary_path_with_features;
+use crate::protocols::sftp_constants::{
+    ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_IDLE_TIMEOUT, ENV_SFTP_PART_SIZE,
+    ENV_SFTP_READ_ONLY,
+};
 use crate::protocols::sftp_helpers::{
     AcceptAnyServerKey, ServerProcess, build_test_s3_client, connect_sftp_to, generate_host_key, sftp_read_full,
     wait_for_s3_ready,
@@ -26,10 +30,6 @@ use aws_sdk_s3::primitives::ByteStream;
 use russh::client::{self, Handle};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
-use rustfs_config::{
-    ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_IDLE_TIMEOUT, ENV_SFTP_PART_SIZE,
-    ENV_SFTP_READ_ONLY,
-};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
