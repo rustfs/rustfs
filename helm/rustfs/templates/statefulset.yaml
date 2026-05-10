@@ -247,7 +247,7 @@ spec:
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
         annotations:
-          {{- toYaml $pool.storageclass.pvcAnnotations.logs | nindent 10 }}
+          {{- toYaml (.Values.storageclass.pvcAnnotations.logs | default (dict)) | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $pool.storageclass.name }}
@@ -264,7 +264,7 @@ spec:
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
         annotations:
-          {{- toYaml $pool.storageclass.pvcAnnotations.data | nindent 10 }}
+          {{- toYaml ($.Values.storageclass.pvcAnnotations.data | default (dict)) | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $pool.storageclass.name }}
@@ -280,7 +280,7 @@ spec:
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
         annotations:
-          {{- toYaml $pool.storageclass.pvcAnnotations.data | nindent 10 }}
+          {{- toYaml (.Values.storageclass.pvcAnnotations.data | default (dict)) | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $pool.storageclass.name }}
