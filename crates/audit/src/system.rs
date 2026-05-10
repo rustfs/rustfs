@@ -14,7 +14,7 @@
 
 use crate::{
     AuditEntry, AuditError, AuditRegistry, AuditResult, observability,
-    pipeline::{AuditPipeline, AuditRuntimeView},
+    pipeline::{AuditPipeline, AuditRuntimeFacade, AuditRuntimeView},
 };
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
@@ -67,6 +67,10 @@ impl AuditSystem {
 
     fn runtime_view(&self) -> AuditRuntimeView {
         AuditRuntimeView::new(self.registry.clone())
+    }
+
+    fn runtime_facade(&self) -> AuditRuntimeFacade {
+        AuditRuntimeFacade::new(self.registry.clone(), self.stream_cancellers.clone())
     }
 
     /// Creates a new audit system
@@ -219,11 +223,13 @@ impl AuditSystem {
         info!("Stopping audit system");
 
         // Stop all stream tasks first
-        self.stop_all_streams().await;
-
-        // Close all targets
-        let mut registry = self.registry.lock().await;
-        if let Err(e) = registry.close_all().await {
+        if let Err(e) = async {
+            self.runtime_facade().stop_replay_workers().await;
+            let mut registry = self.registry.lock().await;
+            registry.close_all().await
+        }
+        .await
+        {
             error!(error = %e, "Failed to close some audit targets");
         }
 
@@ -289,12 +295,6 @@ impl AuditSystem {
         }
         drop(state);
         self.pipeline().dispatch_batch(entries).await
-    }
-
-    /// Stops all active audit stream tasks by sending cancellation signals.
-    async fn stop_all_streams(&self) {
-        let mut cancellers = self.stream_cancellers.write().await;
-        cancellers.stop_all("Stopping audit stream").await;
     }
 
     async fn activate_targets_with_replay(
@@ -482,33 +482,26 @@ impl AuditSystem {
 
         observability::record_config_reload();
 
-        // Stop all existing stream tasks first
-        self.stop_all_streams().await;
-
         // Store new configuration
         {
             let mut config_guard = self.config.write().await;
             *config_guard = Some(new_config.clone());
         }
 
-        // Close all existing targets
-        let mut registry = self.registry.lock().await;
-        if let Err(e) = registry.close_all().await {
-            error!(error = %e, "Failed to close existing targets during reload");
-        }
+        let targets = {
+            let registry = self.registry.lock().await;
+            registry.create_audit_targets_from_config(&new_config).await
+        };
 
-        // Create new targets from updated configuration
-        match registry.create_audit_targets_from_config(&new_config).await {
+        match targets {
             Ok(targets) => {
                 info!(target_count = targets.len(), "Reloaded audit targets successfully");
 
                 let activation = self.activate_targets_with_replay(targets).await;
-                for target in activation.targets {
-                    let target_id = target.id().to_string();
-                    info!(target_id = %target_id, "Target initialized (reload)");
-                    registry.add_target(target_id, target.clone_dyn());
+                if let Err(e) = self.runtime_facade().replace_targets(activation).await {
+                    error!(error = %e, "Failed to replace existing targets during reload");
+                    return Err(e);
                 }
-                *self.stream_cancellers.write().await = activation.replay_workers;
 
                 info!("Audit configuration reloaded successfully");
                 Ok(())

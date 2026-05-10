@@ -15,7 +15,7 @@
 use crate::{AuditEntry, AuditResult, observability, system::AuditTargetMetricSnapshot};
 use rustfs_targets::{Target, target::EntityTarget};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -254,5 +254,45 @@ impl AuditRuntimeView {
         registry.add_target(target_id.clone(), target);
         info!(target_id = %target_id, "Target upserted");
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct AuditRuntimeFacade {
+    registry: Arc<Mutex<crate::AuditRegistry>>,
+    replay_workers: Arc<RwLock<rustfs_targets::ReplayWorkerManager>>,
+}
+
+impl AuditRuntimeFacade {
+    pub fn new(
+        registry: Arc<Mutex<crate::AuditRegistry>>,
+        replay_workers: Arc<RwLock<rustfs_targets::ReplayWorkerManager>>,
+    ) -> Self {
+        Self {
+            registry,
+            replay_workers,
+        }
+    }
+
+    pub async fn replace_targets(&self, activation: rustfs_targets::RuntimeActivation<AuditEntry>) -> AuditResult<()> {
+        self.stop_replay_workers().await;
+
+        let mut registry = self.registry.lock().await;
+        registry.close_all().await?;
+
+        for target in activation.targets {
+            let target_id = target.id().to_string();
+            info!(target_id = %target_id, "Target initialized");
+            registry.add_target(target_id, target.clone_dyn());
+        }
+
+        drop(registry);
+        *self.replay_workers.write().await = activation.replay_workers;
+        Ok(())
+    }
+
+    pub async fn stop_replay_workers(&self) {
+        let mut replay_workers = self.replay_workers.write().await;
+        replay_workers.stop_all("Stopping audit stream").await;
     }
 }
