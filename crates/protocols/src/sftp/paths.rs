@@ -21,7 +21,7 @@ use rustfs_utils::path;
 
 /// Prefix the input with "/" if it is empty or relative. SFTP paths are
 /// addressed as absolute against the server root. Clients may submit a
-/// relative form (e.g. "." or "foo/bar"). Both forms normalise to the
+/// relative form (e.g. "." or "foo/bar"). Both forms normalize to the
 /// same absolute starting point before any cleaning or splitting runs.
 pub(super) fn ensure_absolute(path: &str) -> String {
     if path.is_empty() || !path.starts_with('/') {
@@ -44,7 +44,7 @@ pub(super) fn last_path_component(s: &str) -> Option<&str> {
 
 /// Extract the single filename component of full_key relative to prefix.
 /// Returns None when full_key does not start with prefix, when the
-/// residual is empty (key equalled prefix exactly), or when the residual
+/// residual is empty (key equaled prefix exactly), or when the residual
 /// contains a slash (entry belongs under a sub-prefix and should have
 /// appeared via common_prefixes under delimiter="/").
 pub(super) fn relative_filename<'a>(full_key: &'a str, prefix: &str) -> Option<&'a str> {
@@ -55,7 +55,7 @@ pub(super) fn relative_filename<'a>(full_key: &'a str, prefix: &str) -> Option<&
     Some(residual)
 }
 
-/// Canonicalise an incoming SFTP path and split it into an optional bucket
+/// Canonicalize an incoming SFTP path and split it into an optional bucket
 /// and object key.
 ///
 /// An empty input is treated as root ("/"). An input that does not start
@@ -75,7 +75,7 @@ pub(super) fn relative_filename<'a>(full_key: &'a str, prefix: &str) -> Option<&
 /// rejected at this boundary so a path emitted on a tracing field
 /// cannot inject a line into the operator log; downstream warn paths
 /// (skip-abort, stat fallback, REMOVE refusal) emit the bucket and key
-/// without further sanitisation.
+/// without further sanitization.
 pub(super) fn parse_s3_path(input: &str) -> Result<(String, Option<String>), SftpError> {
     if input.contains(['\0', '\r', '\n']) {
         return Err(SftpError::code(StatusCode::BadMessage));

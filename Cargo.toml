@@ -307,8 +307,8 @@ libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.7"
-russh = "0.60.0"
-russh-sftp = "2.1.1"
+russh = "0.60.2"
+russh-sftp = "2.1.2"
 
 # WebDAV
 dav-server = "0.11.0"

@@ -266,3 +266,27 @@ async fn incompatible_schema_init_fails() {
 
     drop_table(&dsn, &table).await;
 }
+
+#[ignore]
+#[tokio::test]
+async fn check_mysql_server_available_succeeds_against_existing_table() {
+    let dsn = test_dsn();
+    let table = table_name("test_check");
+
+    {
+        let pool = build_test_pool(&dsn);
+        let mut conn = pool.get_conn().await.expect("get conn");
+        conn.query_drop(format!(
+            "CREATE TABLE `{table}` (event_time DATETIME(6) NOT NULL, event_data JSON NOT NULL)"
+        ))
+        .await
+        .expect("create table");
+    }
+
+    let args = make_args(&dsn, &table, "");
+    rustfs_targets::check_mysql_server_available(&args)
+        .await
+        .expect("connectivity probe should succeed against existing table");
+
+    drop_table(&dsn, &table).await;
+}

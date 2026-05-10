@@ -321,6 +321,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
         version: u32,
         _extensions: std::collections::HashMap<String, String>,
     ) -> Result<Version, Self::Error> {
+        self.session_diag.stamp();
         if version != super::constants::protocol::SFTP_VERSION {
             tracing::warn!(
                 client_version = version,
@@ -328,10 +329,12 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
                 "SFTP client advertised a non-v3 version. The reply carries v3 and the client must continue with v3 semantics or close the connection.",
             );
         }
-        Ok(Version {
+        let result = Ok(Version {
             version: super::constants::protocol::SFTP_VERSION,
             extensions: std::collections::HashMap::new(),
-        })
+        });
+        self.session_diag.stamp();
+        result
     }
 
     /// SSH_FXP_REALPATH, SFTP Internet Draft section 6.9. Returns a single
@@ -1116,6 +1119,7 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::constants::protocol;
     use super::super::state::WritePhase;
     use super::super::test_support::{TEST_PART_SIZE, build_driver, build_readonly_driver, file_handle, write_handle};
     use super::*;
@@ -1123,7 +1127,65 @@ mod tests {
     use crate::common::gateway::{with_test_auth_override, with_test_iam_unavailable};
     use russh_sftp::server::Handler;
     use rustfs_utils::path;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn init_advertises_sftp_v3_without_extensions() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(backend, TEST_PART_SIZE);
+        let extensions = HashMap::from([("posix-rename@openssh.com".to_string(), "1".to_string())]);
+
+        let advertised = driver
+            .init(protocol::SFTP_VERSION, extensions)
+            .await
+            .expect("init must succeed");
+
+        assert_eq!(advertised.version, protocol::SFTP_VERSION);
+        assert!(advertised.extensions.is_empty(), "server must not advertise unsupported extensions");
+    }
+
+    #[tokio::test]
+    async fn init_from_newer_client_still_advertises_sftp_v3() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(backend, TEST_PART_SIZE);
+
+        let advertised = driver
+            .init(protocol::SFTP_VERSION + 3, HashMap::new())
+            .await
+            .expect("version negotiation must still reply");
+
+        assert_eq!(advertised.version, protocol::SFTP_VERSION);
+        assert!(advertised.extensions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn init_stamps_session_activity() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(backend, TEST_PART_SIZE);
+        driver.session_diag.last_activity_ms.store(1, Ordering::Relaxed);
+
+        driver
+            .init(protocol::SFTP_VERSION, HashMap::new())
+            .await
+            .expect("init must succeed");
+
+        assert!(
+            driver.session_diag.last_activity_ms.load(Ordering::Relaxed) > 1,
+            "init must refresh session activity for watchdog accounting"
+        );
+    }
+
+    #[test]
+    fn unimplemented_packet_returns_op_unsupported() {
+        let backend = Arc::new(DummyBackend::new());
+        let driver = build_driver(backend, TEST_PART_SIZE);
+
+        let err = <SftpDriver<DummyBackend> as Handler>::unimplemented(&driver);
+
+        assert!(matches!(StatusCode::from(err), StatusCode::OpUnsupported));
+    }
 
     #[tokio::test]
     async fn fstat_on_file_handle_returns_cached_attrs() {

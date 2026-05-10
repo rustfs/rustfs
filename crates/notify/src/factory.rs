@@ -85,7 +85,7 @@ pub fn builtin_target_descriptors() -> Vec<BuiltinTargetDescriptor<Event>> {
         ),
         BuiltinTargetDescriptor::new(
             NOTIFY_MYSQL_SUB_SYS,
-            TargetRequestValidator::MySql,
+            TargetRequestValidator::MySql(TargetType::NotifyEvent),
             TargetPluginDescriptor::new(
                 ChannelTargetType::MySql.as_str(),
                 NOTIFY_MYSQL_KEYS,

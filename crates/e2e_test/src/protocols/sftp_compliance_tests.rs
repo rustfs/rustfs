@@ -118,23 +118,29 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client;
 use russh_sftp::client::{Config, SftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+#[cfg(target_os = "linux")]
+use rustfs_config::ENV_SFTP_IDLE_TIMEOUT;
 use rustfs_config::{
-    ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_IDLE_TIMEOUT,
-    ENV_SFTP_PART_SIZE, ENV_SFTP_READ_CACHE_WINDOW_BYTES, ENV_SFTP_READ_ONLY,
+    ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_PART_SIZE,
+    ENV_SFTP_READ_CACHE_WINDOW_BYTES, ENV_SFTP_READ_ONLY,
 };
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
-use tokio::time::{sleep, timeout};
+#[cfg(target_os = "linux")]
+use tokio::time::sleep;
+use tokio::time::timeout;
 use tracing::info;
 
 // Cross-case constants used by every spawn helper. Pinned to 5 MiB so
@@ -294,7 +300,7 @@ async fn seed_large_via_multipart(s3: &S3Client, bucket: &str, key: &str, size_b
     let mut offset: u64 = 0;
     let mut part_number: i32 = 1;
     while offset < size_bytes {
-        let chunk = ((part_size as u64).min(size_bytes - offset)) as usize;
+        let chunk = (part_size as u64).min(size_bytes - offset) as usize;
         let mut body = vec![0u8; chunk];
         for (i, b) in body.iter_mut().enumerate() {
             *b = ((offset + i as u64) as u8).wrapping_mul(THRASH_PATTERN_MULTIPLIER);
@@ -336,7 +342,7 @@ fn calculate_pattern_sha256(size_bytes: u64, multiplier: u8) -> [u8; 32] {
     let mut buf = vec![0u8; chunk];
     let mut written: u64 = 0;
     while written < size_bytes {
-        let n = ((chunk as u64).min(size_bytes - written)) as usize;
+        let n = (chunk as u64).min(size_bytes - written) as usize;
         for (i, b) in buf[..n].iter_mut().enumerate() {
             *b = ((written + i as u64) as u8).wrapping_mul(multiplier);
         }
@@ -401,11 +407,13 @@ fn capture_server_stdout(child: &mut Child) -> Arc<tokio::sync::Mutex<Vec<String
 /// lifecycle cases (CMPTST-24, CMPTST-25, CMPTST-26) read both fields
 /// to assert the watchdog killed silent sessions on the expected path.
 #[derive(Default)]
+#[cfg(target_os = "linux")]
 struct SessionCounters {
     entered: AtomicUsize,
     finished: AtomicUsize,
 }
 
+#[cfg(target_os = "linux")]
 impl SessionCounters {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -419,6 +427,7 @@ impl SessionCounters {
 /// increments the matching counter for every server-side session
 /// lifecycle event. The task ends when stdout closes (i.e. when the
 /// child is killed at teardown).
+#[cfg(target_os = "linux")]
 fn watch_session_lifecycle_events(child: &mut Child, counters: Arc<SessionCounters>) {
     let Some(stdout) = child.stdout.take() else {
         return;
@@ -448,6 +457,7 @@ fn watch_session_lifecycle_events(child: &mut Child, counters: Arc<SessionCounte
 /// best-effort: if ss is missing on the host the function returns
 /// Ok(None) and the caller skips the assertion. The contract is zero
 /// CLOSE_WAIT entries attributable to the test.
+#[cfg(target_os = "linux")]
 async fn count_close_wait_on_port(port: u16) -> Result<Option<usize>> {
     let output = match Command::new("ss").args(["-tn", "state", "CLOSE-WAIT"]).output().await {
         Ok(o) => o,
@@ -1166,6 +1176,7 @@ pub(crate) mod cmptst_23 {
 }
 
 // CMPTST-24: concurrent half-close burst does not leak server-side session tasks.
+#[cfg(target_os = "linux")]
 pub(crate) mod cmptst_24 {
     use super::*;
 
@@ -1486,7 +1497,7 @@ pub(crate) mod cmptst_24 {
             // TCP connection so the loop iterates once and the JoinSet
             // drain emits the "SFTP session task finished" log for
             // every session that the per-session deadline has already
-            // cancelled. Without this, the counters under-report on a
+            // canceled. Without this, the counters under-report on a
             // quiet server.
             for _ in 0..3 {
                 if let Ok(stream) = TcpStream::connect(HALF_CLOSE_SFTP_ADDRESS).await {
@@ -1544,6 +1555,7 @@ pub(crate) mod cmptst_24 {
 }
 
 // CMPTST-25: wedge-kill watchdog kills sessions parked behind a CLOSE_WAIT socket.
+#[cfg(target_os = "linux")]
 pub(crate) mod cmptst_25 {
     use super::*;
 
@@ -2020,7 +2032,7 @@ pub(crate) mod cmptst_25 {
 
             // Tickle the accept loop so JoinSet::try_join_next emits
             // the "SFTP session task finished" log lines for any
-            // session the watchdog has cancelled. Same mechanism the
+            // session the watchdog has canceled. Same mechanism the
             // half-close case uses. Mirrors the accept-loop drain
             // pattern in server.rs.
             for _ in 0..3 {
@@ -2076,6 +2088,7 @@ pub(crate) mod cmptst_25 {
 }
 
 // CMPTST-26: healthy idle session past the watchdog fast-kill threshold stays alive.
+#[cfg(target_os = "linux")]
 pub(crate) mod cmptst_26 {
     use super::*;
 
@@ -3102,7 +3115,7 @@ pub(crate) mod cmptst_31 {
             // Read continuation must complete inside the resume
             // deadline. If it does not, the server-side flush did not
             // unwedge after the SSH window was replenished.
-            let resume_outcome = tokio::time::timeout(Duration::from_secs(PAUSE31_RESUME_DEADLINE_SECS), read_handle).await;
+            let resume_outcome = timeout(Duration::from_secs(PAUSE31_RESUME_DEADLINE_SECS), read_handle).await;
             let (final_total, observed_sha) = match resume_outcome {
                 Ok(join_result) => match join_result {
                     Ok(Ok(p)) => p,
@@ -3141,7 +3154,7 @@ pub(crate) mod cmptst_31 {
             eprintln!("--- end rustfs stdout dump ---");
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(PAUSE31_OVERALL_DEADLINE_SECS), async {
+        let _ = timeout(Duration::from_secs(PAUSE31_OVERALL_DEADLINE_SECS), async {
             server_process.kill_and_wait().await;
         })
         .await;
@@ -3194,7 +3207,7 @@ pub(crate) mod cmptst_32 {
             eprintln!("--- end rustfs stdout dump ---");
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(READ_CACHE_DEADLINE_SECS), async {
+        let _ = timeout(Duration::from_secs(READ_CACHE_DEADLINE_SECS), async {
             server_process.kill_and_wait().await;
         })
         .await;
@@ -3247,7 +3260,7 @@ pub(crate) mod cmptst_33 {
             eprintln!("--- end rustfs stdout dump ---");
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(READ_CACHE_DEADLINE_SECS), async {
+        let _ = timeout(Duration::from_secs(READ_CACHE_DEADLINE_SECS), async {
             server_process.kill_and_wait().await;
         })
         .await;

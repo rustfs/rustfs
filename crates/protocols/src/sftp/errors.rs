@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! SftpError type and the helpers that convert backend errors and
-//! authorisation failures into SftpError, plus the success Status
+//! authorization failures into SftpError, plus the success Status
 //! payload constructor.
 
 use super::constants::{http_error_codes, s3_error_codes};

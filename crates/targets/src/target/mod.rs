@@ -23,7 +23,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub mod amqp;
 pub mod kafka;
@@ -437,6 +437,20 @@ pub(crate) fn delete_stored_payload(
     match store.del(key) {
         Ok(()) | Err(StoreError::NotFound) => Ok(()),
         Err(err) => Err(TargetError::Storage(format!("Failed to delete event from store: {err}"))),
+    }
+}
+
+/// Ensures a rustls crypto provider is installed before any TLS operation.
+///
+/// Multiple target modules (MySQL, Redis, Postgres, MQTT) need this because
+/// each may be the first to perform a TLS handshake. Idempotent: if a
+/// provider is already registered, returns immediately.
+pub(crate) fn ensure_rustls_provider_installed() {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return;
+    }
+    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        debug!("rustls provider already installed or unavailable: {err:?}");
     }
 }
 

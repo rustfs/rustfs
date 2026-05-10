@@ -120,7 +120,7 @@ pub fn builtin_target_descriptors() -> Vec<BuiltinTargetDescriptor<AuditEntry>> 
         ),
         BuiltinTargetDescriptor::new(
             rustfs_config::audit::AUDIT_MYSQL_SUB_SYS,
-            TargetRequestValidator::MySql,
+            TargetRequestValidator::MySql(TargetType::AuditLog),
             TargetPluginDescriptor::new(
                 ChannelTargetType::MySql.as_str(),
                 AUDIT_MYSQL_KEYS,

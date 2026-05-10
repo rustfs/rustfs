@@ -15,7 +15,7 @@
 //! Write-side state machine: open_write, commit_write, the
 //! write_dispatch chain that flushes a part once part_buffer reaches
 //! part_size, abort_upload_with_auth, close_streaming, and
-//! multipart_copy. Also the cancellation-safety primitives
+//! multipart_copy. Also, the cancellation-safety primitives
 //! (build_write_tombstone, should_abort_on_drop) that the Drop impl
 //! in driver.rs consumes.
 

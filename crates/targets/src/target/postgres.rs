@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_postgres::Config;
 use tokio_postgres_rustls::MakeRustlsConnect;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -398,14 +398,6 @@ pub fn table_probe_sql(schema: &str, table: &str) -> String {
     format!("SELECT 1 FROM {} LIMIT 0", qualified_table(schema, table))
 }
 
-fn ensure_rustls_provider_installed() {
-    if rustls::crypto::CryptoProvider::get_default().is_none()
-        && rustls::crypto::aws_lc_rs::default_provider().install_default().is_err()
-    {
-        debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
-    }
-}
-
 /// Builds a rustls `ClientConfig` for the PostgreSQL connection.
 ///
 /// When `tls_ca` is empty the OS native trust store is used via
@@ -413,7 +405,7 @@ fn ensure_rustls_provider_installed() {
 /// When `tls_client_cert` and `tls_client_key` are both set the connection
 /// uses mTLS authentication; otherwise no client cert is sent.
 pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, TargetError> {
-    ensure_rustls_provider_installed();
+    super::ensure_rustls_provider_installed();
 
     let mut root_store = rustls::RootCertStore::empty();
 
