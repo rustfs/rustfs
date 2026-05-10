@@ -80,13 +80,7 @@ config:
     address: ":9000"
     console_enable: "true"
     console_address: ":9001"
-    log_level: "info"
     region: "us-east-1"
-    ## If obs_log_directory is set, a separate volume for logs will be created and the logs will NOT be sent to stdout
-    # obs_log_directory: "/logs"
-    ## Supported values include `production`, `development`, `test`, and `staging`;
-    ## refer to the RustFS configuration documentation/source for the authoritative list.
-    obs_environment: "development"
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"
@@ -100,10 +94,6 @@ config:
       # | 4              | 4            | 0–2          | **2**   |
       # | 8              | 8            | 0–4          | 4       |
       storage_class_standard: "EC:2" # Storage class for standard storage class in erasure coding mode, default is "STANDARD"
-    log_rotation: # Specify log rotation settings
-      # size: 100 # Default value: 100 MB
-      # time: hour # Default value: hour, eg: day,hour,minute,second
-      # keep_files: 30 # number of rotated log files to keep
     scanner:
       # Scanner speed preset: fastest|fast|default|slow|slowest
       speed: ""
@@ -113,10 +103,20 @@ config:
       idle_mode: ""
       # Timeout for scanner cache saves in seconds (minimum 1 second)
       cache_save_timeout_secs: ""
+    log_level: "info"
+    log_rotation: # Specify log rotation settings
+      # size: 100 # Default value: 100 MB
+      # time: hour # Default value: hour, eg: day,hour,minute,second
+      # keep_files: 30 # number of rotated log files to keep
+    ## If obs_log_directory is set, a separate volume for logs will be created and the logs will NOT be sent to stdout
+    # obs_log_directory: "/logs"
+    ## Supported values include `production`, `development`, `test`, and `staging`;
+    ## refer to the RustFS configuration documentation/source for the authoritative list.
+    obs_environment: "development"
     obs_endpoint:
       enabled: false # If true, rustfs will export metrics, traces, logs and profiling data to the specified OTLP endpoints. If false, the individual settings for metrics, traces, logs and profiling endpoints will be ignored and all data will not be exported.
       base_endpoint: "" #Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318
-      use_stdout: false # If true, rustfs will also export logs to stdout in addition to the OTLP logs endpoint.
+      use_stdout: true # If true, rustfs will also export logs to stdout in addition to the OTLP logs endpoint.
       metrics:
         enabled: false
         endpoint: "" # If specified, rustfs will export metrics to this OTLP endpoint. e.g. "http://localhost:4318/v1/metrics"
