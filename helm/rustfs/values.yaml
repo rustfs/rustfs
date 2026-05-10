@@ -2,8 +2,16 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
-# This will set the replicaset count more information can be found here: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
+# Number of StatefulSet pods (nodes in the distributed cluster).
 replicaCount: 4
+
+# Number of data drives (PVCs) per pod. Combined with replicaCount this
+# determines the total drive count seen by rustfs.
+# - drivesPerNode > 1: each pod gets N volumes mounted at /data/rustfs0.../data/rustfsN-1
+# - drivesPerNode = 1: each pod gets a single volume mounted at /data
+# Upgrade note: deployments that previously used replicaCount=16 for one drive
+# per pod should now set replicaCount=16 and drivesPerNode=1 explicitly.
+drivesPerNode: 1
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:
@@ -65,6 +73,9 @@ config:
     # Examples
     # volumes: "/data/rustfs0,/data/rustfs1,/data/rustfs2,/data/rustfs3"
     # volumes: "http://rustfs-{0...3}.rustfs-headless:9000/data/rustfs{0...3}"
+    # NOTE: When overriding volumes manually, the mount paths and drive ranges
+    # must match the number of pods (replicaCount) and drives per pod
+    # (drivesPerNode). Mismatched values will cause broken volume discovery.
     volumes: ""
     address: ":9000"
     console_enable: "true"
@@ -298,12 +309,11 @@ storageclass:
   name: local-path
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
-  pvcAnnotations: {}
-    #pvcAnnotations:
-    #  data:
-    #    key: value
-    #  logs:
-    #    key: value
+  pvcAnnotations:
+    data: {}
+      # key: value
+    logs: {}
+      # key: value
 
 pdb:
   create: false

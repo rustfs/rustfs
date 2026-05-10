@@ -68,19 +68,35 @@ spec:
           imagePullPolicy: {{ .Values.image.initImage.pullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            - name: DRIVES_PER_NODE
+              value: {{ .Values.drivesPerNode | quote }}
           command:
             - sh
             - -c
             - |
               set -e
-              mkdir -p /data
+              if [ "$DRIVES_PER_NODE" -gt 1 ]; then
+                for i in $(seq 0 $(($DRIVES_PER_NODE - 1))); do
+                  mkdir -p /data/rustfs$i
+                done
+              else
+                mkdir -p /data
+              fi
               {{- if $logDir }}
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
               {{- end }}
           volumeMounts:
+            {{- if gt (int .Values.drivesPerNode) 1 }}
+            {{- range $i := until (int $.Values.drivesPerNode) }}
+            - name: data-rustfs-{{ $i }}
+              mountPath: /data/rustfs{{ $i }}
+            {{- end }}
+            {{- else }}
             - name: data
               mountPath: /data
+            {{- end }}
             {{- if $logDir }}
             - name: logs
               mountPath: /mnt/rustfs
@@ -135,8 +151,15 @@ spec:
               mountPath: {{ $logDir }}
               subPath: logs
             {{- end }}
+            {{- if gt (int .Values.drivesPerNode) 1 }}
+            {{- range $i := until (int $.Values.drivesPerNode) }}
+            - name: data-rustfs-{{ $i }}
+              mountPath: /data/rustfs{{ $i }}
+            {{- end }}
+            {{- else }}
             - name: data
               mountPath: /data
+            {{- end }}
       {{- if .Values.mtls.enabled }}
       volumes:
         - name: server-cert
@@ -175,6 +198,22 @@ spec:
           requests:
             storage: {{ .Values.storageclass.logStorageSize }}
     {{- end }}
+    {{- if gt (int .Values.drivesPerNode) 1 }}
+    {{- range $i := until (int .Values.drivesPerNode) }}
+    - metadata:
+        name: data-rustfs-{{ $i }}
+        labels:
+          {{- toYaml $.Values.commonLabels | nindent 10 }}
+        annotations:
+          {{- toYaml $.Values.storageclass.pvcAnnotations.data | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $.Values.storageclass.name }}
+        resources:
+          requests:
+            storage: {{ $.Values.storageclass.dataStorageSize }}
+    {{- end }}
+    {{- else }}
     - metadata:
         name: data
         labels:
@@ -187,4 +226,5 @@ spec:
         resources:
           requests:
             storage: {{ .Values.storageclass.dataStorageSize }}
+    {{- end }}
 {{- end }}
