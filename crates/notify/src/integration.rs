@@ -14,6 +14,7 @@
 
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
+use crate::runtime_facade::NotifyRuntimeFacade;
 use crate::runtime_view::NotifyRuntimeView;
 use crate::{
     Event,
@@ -32,10 +33,7 @@ use rustfs_config::{ENV_NOTIFY_ENABLE, EVENT_DEFAULT_DIR};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
-use rustfs_targets::{
-    ReplayWorkerManager, RuntimeTargetHealthSnapshot, Target, activate_targets_with_replay,
-    init_target_and_optionally_start_replay, start_replay_worker,
-};
+use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, Target};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -251,6 +249,15 @@ impl NotificationSystem {
         NotifyRuntimeView::new(self.notifier.target_list(), self.stream_cancellers.clone())
     }
 
+    fn runtime_facade(&self) -> NotifyRuntimeFacade {
+        NotifyRuntimeFacade::new(
+            self.notifier.clone(),
+            self.stream_cancellers.clone(),
+            self.concurrency_limiter.clone(),
+            self.metrics.clone(),
+        )
+    }
+
     /// Creates a new NotificationSystem
     pub fn new(config: Config) -> Self {
         let concurrency_limiter =
@@ -268,59 +275,6 @@ impl NotificationSystem {
             live_event_sender,
             live_event_history: Arc::new(RwLock::new(LiveEventHistory::default())),
         }
-    }
-
-    /// Initializes targets and starts event streams for those with stores.
-    /// Returns a map of (target_id -> cancel_sender) for streams that were started.
-    async fn activate_targets_with_replay(
-        &self,
-        targets: Vec<Box<dyn Target<Event> + Send + Sync>>,
-    ) -> rustfs_targets::RuntimeActivation<Event> {
-        activate_targets_with_replay(targets, |target| {
-            let metrics = self.metrics.clone();
-            let limiter = self.concurrency_limiter.clone();
-            async move {
-                let target_id = target.id();
-                info!("Initializing target: {}", target_id);
-                init_target_and_optionally_start_replay(
-                    target,
-                    |target_id, has_replay| {
-                        if has_replay {
-                            info!("Event stream processing for target {} is started successfully", target_id);
-                        } else {
-                            info!("Target {} has no replay worker to start", target_id);
-                        }
-                    },
-                    move |store, target| {
-                        start_replay_worker(
-                            store,
-                            target,
-                            Arc::new(move |event| {
-                                let metrics = metrics.clone();
-                                Box::pin(async move {
-                                    match event {
-                                        rustfs_targets::runtime::ReplayEvent::Delivered { .. } => metrics.increment_processed(),
-                                        rustfs_targets::runtime::ReplayEvent::RetryableError { .. } => {}
-                                        rustfs_targets::runtime::ReplayEvent::Dropped { target, .. }
-                                        | rustfs_targets::runtime::ReplayEvent::PermanentFailure { target, .. }
-                                        | rustfs_targets::runtime::ReplayEvent::RetryExhausted { target, .. } => {
-                                            target.record_final_failure();
-                                            metrics.increment_failed();
-                                        }
-                                        rustfs_targets::runtime::ReplayEvent::UnreadableEntry { .. } => {}
-                                    }
-                                })
-                            }),
-                            Some(limiter.clone()),
-                            Duration::from_secs(5),
-                            Duration::from_millis(500),
-                        )
-                    },
-                )
-                .await
-            }
-        })
-        .await
     }
 
     /// Initializes the notification system
@@ -344,13 +298,8 @@ impl NotificationSystem {
         }
 
         // Initialize targets and start event streams
-        let activation = self.activate_targets_with_replay(targets).await;
-
-        // Update canceller collection
-        *self.stream_cancellers.write().await = activation.replay_workers;
-
-        // Initialize the bucket target
-        self.notifier.init_bucket_targets_shared(activation.targets).await?;
+        let activation = self.runtime_facade().activate_targets_with_replay(targets).await;
+        self.runtime_facade().replace_targets(activation).await?;
         info!("Notification system initialized");
         Ok(())
     }
@@ -571,13 +520,6 @@ impl NotificationSystem {
     pub async fn reload_config(&self, new_config: Config) -> Result<(), NotificationError> {
         info!("Reload notification configuration starts");
 
-        // Stop all existing streaming services
-        let mut cancellers = self.stream_cancellers.write().await;
-        cancellers.stop_all("Stop event stream processing for target").await;
-
-        // Clear the target_list and ensure that reload is a replacement reconstruction
-        self.notifier.remove_all_bucket_targets().await;
-
         // Update the config
         self.update_config(new_config.clone()).await;
 
@@ -594,13 +536,8 @@ impl NotificationSystem {
         }
 
         // Initialize targets and start event streams using shared helper
-        let activation = self.activate_targets_with_replay(targets).await;
-
-        // Update canceler collection
-        *cancellers = activation.replay_workers;
-
-        // Initialize the bucket target
-        self.notifier.init_bucket_targets_shared(activation.targets).await?;
+        let activation = self.runtime_facade().activate_targets_with_replay(targets).await;
+        self.runtime_facade().replace_targets(activation).await?;
         info!("Configuration reloaded end");
         Ok(())
     }
@@ -675,18 +612,7 @@ impl NotificationSystem {
 
     // Add a method to shut down the system
     pub async fn shutdown(&self) {
-        info!("Turn off the notification system");
-
-        // Get the number of active targets
-        let active_targets = self.stream_cancellers.read().await.len();
-        info!("Stops {} active event stream processing tasks", active_targets);
-
-        let mut cancellers = self.stream_cancellers.write().await;
-        cancellers.stop_all("Stop event stream processing for target").await;
-        // Wait for a short while to make sure the task has a chance to complete
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        info!("Notify the system to be shut down completed");
+        self.runtime_facade().shutdown().await;
     }
 }
 
