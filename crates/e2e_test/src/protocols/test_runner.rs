@@ -17,6 +17,7 @@
 use crate::common::init_logging;
 use crate::protocols::ftps_core::test_ftps_core_operations;
 use crate::protocols::webdav_core::test_webdav_core_operations;
+use serial_test::serial;
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
@@ -160,6 +161,7 @@ impl ProtocolTestSuite {
 
 /// Test suite
 #[tokio::test]
+#[serial]
 async fn test_protocol_core_suite() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let suite = ProtocolTestSuite::new();
     let results = suite.run_test_suite().await;

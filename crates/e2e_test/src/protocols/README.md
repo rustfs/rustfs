@@ -55,6 +55,7 @@ RUSTFS_BUILD_FEATURES=webdav cargo test --package e2e_test test_protocol_core_su
 - GET (download file)
 - PROPFIND on bucket (list objects)
 - DELETE file
+- MOVE file (rename object)
 - DELETE bucket
 - Authentication failure test
 
