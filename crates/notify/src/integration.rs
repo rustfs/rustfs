@@ -14,6 +14,7 @@
 
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
+use crate::runtime_view::NotifyRuntimeView;
 use crate::{
     Event,
     error::NotificationError,
@@ -246,6 +247,10 @@ pub struct NotificationSystem {
 }
 
 impl NotificationSystem {
+    fn runtime_view(&self) -> NotifyRuntimeView {
+        NotifyRuntimeView::new(self.notifier.target_list(), self.stream_cancellers.clone())
+    }
+
     /// Creates a new NotificationSystem
     pub fn new(config: Config) -> Self {
         let concurrency_limiter =
@@ -355,7 +360,7 @@ impl NotificationSystem {
     /// # Return
     /// A Vec containing all active Targets `TargetID`.
     pub async fn get_active_targets(&self) -> Vec<TargetID> {
-        self.notifier.target_list().read().await.keys()
+        self.runtime_view().get_active_targets().await
     }
 
     /// Gets the complete Target list, including both active and inactive Targets.
@@ -363,7 +368,7 @@ impl NotificationSystem {
     /// # Return
     /// An `Arc<RwLock<TargetList>>` containing all Targets.
     pub async fn get_all_targets(&self) -> Arc<RwLock<TargetList>> {
-        self.notifier.target_list()
+        self.runtime_view().get_all_targets()
     }
 
     /// Gets all Target values, including both active and inactive Targets.
@@ -371,7 +376,7 @@ impl NotificationSystem {
     /// # Return
     /// A Vec containing all Targets.
     pub async fn get_target_values(&self) -> Vec<Arc<dyn Target<Event> + Send + Sync>> {
-        self.notifier.target_list().read().await.values()
+        self.runtime_view().get_target_values().await
     }
 
     /// Checks if there are active subscribers for the given bucket and event name.
@@ -657,32 +662,15 @@ impl NotificationSystem {
     }
 
     pub async fn snapshot_target_metrics(&self) -> Vec<NotificationTargetMetricSnapshot> {
-        let target_list = self.notifier.target_list();
-        let guard = target_list.read().await;
-        guard
-            .runtime_snapshots()
-            .into_iter()
-            .map(|snapshot| NotificationTargetMetricSnapshot {
-                failed_messages: snapshot.failed_messages,
-                queue_length: snapshot.queue_length,
-                target_id: snapshot.target_id,
-                target_type: snapshot.target_type,
-                total_messages: snapshot.total_messages,
-            })
-            .collect()
+        self.runtime_view().snapshot_target_metrics().await
     }
 
     pub async fn snapshot_target_health(&self) -> Vec<RuntimeTargetHealthSnapshot> {
-        let target_list = self.notifier.target_list();
-        let guard = target_list.read().await;
-        guard.runtime_health_snapshots().await
+        self.runtime_view().snapshot_target_health().await
     }
 
     pub async fn runtime_status_snapshot(&self) -> rustfs_targets::RuntimeStatusSnapshot {
-        let replay_workers = self.stream_cancellers.read().await;
-        let target_list = self.notifier.target_list();
-        let guard = target_list.read().await;
-        guard.runtime_status_snapshot(&replay_workers)
+        self.runtime_view().runtime_status_snapshot().await
     }
 
     // Add a method to shut down the system
