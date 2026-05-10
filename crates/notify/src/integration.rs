@@ -12,14 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket_config_manager::NotifyBucketConfigManager;
-use crate::config_manager::NotifyConfigManager;
-use crate::event_bridge::{LiveEventHistory, NotifyEventBridge};
+use crate::event_bridge::LiveEventHistory;
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
-use crate::runtime_facade::NotifyRuntimeFacade;
-use crate::runtime_view::NotifyRuntimeView;
-use crate::status_view::NotifyStatusView;
+use crate::services::NotifyServices;
 use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig,
 };
@@ -152,72 +148,46 @@ pub struct NotificationSystem {
     pub registry: Arc<TargetRegistry>,
     /// The current configuration
     pub config: Arc<RwLock<Config>>,
-    /// Cancel sender for managing stream processing tasks
-    stream_cancellers: Arc<RwLock<ReplayWorkerManager>>,
-    /// Concurrent control signal quantity
-    concurrency_limiter: Arc<Semaphore>,
-    /// Monitoring indicators
-    metrics: Arc<NotificationMetrics>,
-    /// Subscriber view
-    subscriber_view: Arc<NotificationSystemSubscriberView>,
-    /// Live event fan-out for in-process streaming consumers.
-    live_event_sender: broadcast::Sender<Arc<Event>>,
-    /// Recent live event history for peer fan-in consumers.
-    live_event_history: Arc<RwLock<LiveEventHistory>>,
+    services: NotifyServices,
 }
 
 impl NotificationSystem {
-    fn runtime_view(&self) -> NotifyRuntimeView {
-        NotifyRuntimeView::new(self.notifier.target_list(), self.stream_cancellers.clone())
-    }
-
-    fn runtime_facade(&self) -> NotifyRuntimeFacade {
-        NotifyRuntimeFacade::new(
-            self.notifier.clone(),
-            self.stream_cancellers.clone(),
-            self.concurrency_limiter.clone(),
-            self.metrics.clone(),
-        )
-    }
-
-    fn config_manager(&self) -> NotifyConfigManager {
-        NotifyConfigManager::new(self.config.clone(), self.registry.clone(), self.notifier.clone(), self.runtime_facade())
-    }
-
-    fn bucket_config_manager(&self) -> NotifyBucketConfigManager {
-        NotifyBucketConfigManager::new(self.notifier.clone(), self.subscriber_view.clone())
-    }
-
-    fn event_bridge(&self) -> NotifyEventBridge {
-        NotifyEventBridge::new(self.notifier.clone(), self.live_event_sender.clone(), self.live_event_history.clone())
-    }
-
-    fn status_view(&self) -> NotifyStatusView {
-        NotifyStatusView::new(self.metrics.clone())
-    }
-
     /// Creates a new NotificationSystem
     pub fn new(config: Config) -> Self {
         let concurrency_limiter =
             rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
         let (live_event_sender, _) = broadcast::channel(1024);
         let metrics = Arc::new(NotificationMetrics::new());
+        let subscriber_view = Arc::new(NotificationSystemSubscriberView::new());
+        let notifier = Arc::new(EventNotifier::new(metrics.clone()));
+        let registry = Arc::new(TargetRegistry::new());
+        let config = Arc::new(RwLock::new(config));
+        let stream_cancellers = Arc::new(RwLock::new(ReplayWorkerManager::new()));
+        let concurrency_limiter = Arc::new(Semaphore::new(concurrency_limiter)); // Limit the maximum number of concurrent processing events to 20
+        let live_event_history = Arc::new(RwLock::new(LiveEventHistory::default()));
+        let services = NotifyServices::new(
+            notifier.clone(),
+            registry.clone(),
+            config.clone(),
+            stream_cancellers.clone(),
+            concurrency_limiter.clone(),
+            metrics.clone(),
+            subscriber_view.clone(),
+            live_event_sender.clone(),
+            live_event_history.clone(),
+        );
+
         NotificationSystem {
-            subscriber_view: Arc::new(NotificationSystemSubscriberView::new()),
-            notifier: Arc::new(EventNotifier::new(metrics.clone())),
-            registry: Arc::new(TargetRegistry::new()),
-            config: Arc::new(RwLock::new(config)),
-            stream_cancellers: Arc::new(RwLock::new(ReplayWorkerManager::new())),
-            concurrency_limiter: Arc::new(Semaphore::new(concurrency_limiter)), // Limit the maximum number of concurrent processing events to 20
-            metrics,
-            live_event_sender,
-            live_event_history: Arc::new(RwLock::new(LiveEventHistory::default())),
+            notifier,
+            registry,
+            config,
+            services,
         }
     }
 
     /// Initializes the notification system
     pub async fn init(&self) -> Result<(), NotificationError> {
-        self.config_manager().init().await
+        self.services.config_manager.init().await
     }
 
     /// Gets a list of Targets for all currently active (initialized).
@@ -225,7 +195,7 @@ impl NotificationSystem {
     /// # Return
     /// A Vec containing all active Targets `TargetID`.
     pub async fn get_active_targets(&self) -> Vec<TargetID> {
-        self.runtime_view().get_active_targets().await
+        self.services.runtime_view.get_active_targets().await
     }
 
     /// Gets the complete Target list, including both active and inactive Targets.
@@ -233,7 +203,7 @@ impl NotificationSystem {
     /// # Return
     /// An `Arc<RwLock<TargetList>>` containing all Targets.
     pub async fn get_all_targets(&self) -> Arc<RwLock<TargetList>> {
-        self.runtime_view().get_all_targets()
+        self.services.runtime_view.get_all_targets()
     }
 
     /// Gets all Target values, including both active and inactive Targets.
@@ -241,26 +211,29 @@ impl NotificationSystem {
     /// # Return
     /// A Vec containing all Targets.
     pub async fn get_target_values(&self) -> Vec<Arc<dyn Target<Event> + Send + Sync>> {
-        self.runtime_view().get_target_values().await
+        self.services.runtime_view.get_target_values().await
     }
 
     /// Checks if there are active subscribers for the given bucket and event name.
     pub async fn has_subscriber(&self, bucket: &str, event: &EventName) -> bool {
-        self.bucket_config_manager().has_subscriber(bucket, event).await
+        self.services.bucket_config_manager.has_subscriber(bucket, event).await
     }
 
     /// Returns true when at least one in-process consumer is subscribed to live events.
     pub fn has_live_listeners(&self) -> bool {
-        self.event_bridge().has_live_listeners()
+        self.services.event_bridge.has_live_listeners()
     }
 
     /// Subscribes to the in-process live event stream.
     pub fn subscribe_live_events(&self) -> broadcast::Receiver<Arc<Event>> {
-        self.event_bridge().subscribe_live_events()
+        self.services.event_bridge.subscribe_live_events()
     }
 
     pub async fn recent_live_events_since(&self, after_sequence: u64, limit: usize) -> LiveEventBatch {
-        self.event_bridge().recent_live_events_since(after_sequence, limit).await
+        self.services
+            .event_bridge
+            .recent_live_events_since(after_sequence, limit)
+            .await
     }
 
     /// Accurately remove a Target and its related resources through TargetID.
@@ -276,7 +249,7 @@ impl NotificationSystem {
     /// # return
     /// If successful, return `Ok(())`.
     pub async fn remove_target(&self, target_id: &TargetID, target_type: &str) -> Result<(), NotificationError> {
-        self.config_manager().remove_target(target_id, target_type).await
+        self.services.config_manager.remove_target(target_id, target_type).await
     }
 
     /// Set or update a Target configuration.
@@ -292,7 +265,10 @@ impl NotificationSystem {
     /// If the target configuration is successfully set, it returns Ok(()).
     /// If the target configuration is invalid, it returns Err(NotificationError::Configuration).
     pub async fn set_target_config(&self, target_type: &str, target_name: &str, kvs: KVS) -> Result<(), NotificationError> {
-        self.config_manager().set_target_config(target_type, target_name, kvs).await
+        self.services
+            .config_manager
+            .set_target_config(target_type, target_name, kvs)
+            .await
     }
 
     /// Removes all notification configurations for a bucket.
@@ -302,7 +278,10 @@ impl NotificationSystem {
     /// * `bucket` - The name of the bucket whose notification configuration is to be removed.
     ///
     pub async fn remove_bucket_notification_config(&self, bucket: &str) {
-        self.bucket_config_manager().remove_bucket_notification_config(bucket).await;
+        self.services
+            .bucket_config_manager
+            .remove_bucket_notification_config(bucket)
+            .await;
     }
 
     /// Removes a Target configuration.
@@ -318,12 +297,15 @@ impl NotificationSystem {
     /// If the target configuration is successfully removed, it returns Ok(()).
     /// If the target configuration does not exist, it returns Ok(()) without making any changes.
     pub async fn remove_target_config(&self, target_type: &str, target_name: &str) -> Result<(), NotificationError> {
-        self.config_manager().remove_target_config(target_type, target_name).await
+        self.services
+            .config_manager
+            .remove_target_config(target_type, target_name)
+            .await
     }
 
     /// Reloads the configuration
     pub async fn reload_config(&self, new_config: Config) -> Result<(), NotificationError> {
-        self.config_manager().reload_config(new_config).await
+        self.services.config_manager.reload_config(new_config).await
     }
 
     /// Loads the bucket notification configuration
@@ -332,40 +314,41 @@ impl NotificationSystem {
         bucket: &str,
         cfg: &BucketNotificationConfig,
     ) -> Result<(), NotificationError> {
-        self.bucket_config_manager()
+        self.services
+            .bucket_config_manager
             .load_bucket_notification_config(bucket, cfg)
             .await
     }
 
     /// Sends an event
     pub async fn send_event(&self, event: Arc<Event>) {
-        self.event_bridge().send_event(event).await;
+        self.services.event_bridge.send_event(event).await;
     }
 
     /// Obtain system status information
     pub fn get_status(&self) -> HashMap<String, String> {
-        self.status_view().get_status()
+        self.services.status_view.get_status()
     }
 
     pub fn snapshot_metrics(&self) -> NotificationMetricSnapshot {
-        self.status_view().snapshot_metrics()
+        self.services.status_view.snapshot_metrics()
     }
 
     pub async fn snapshot_target_metrics(&self) -> Vec<NotificationTargetMetricSnapshot> {
-        self.runtime_view().snapshot_target_metrics().await
+        self.services.runtime_view.snapshot_target_metrics().await
     }
 
     pub async fn snapshot_target_health(&self) -> Vec<RuntimeTargetHealthSnapshot> {
-        self.runtime_view().snapshot_target_health().await
+        self.services.runtime_view.snapshot_target_health().await
     }
 
     pub async fn runtime_status_snapshot(&self) -> rustfs_targets::RuntimeStatusSnapshot {
-        self.runtime_view().runtime_status_snapshot().await
+        self.services.runtime_view.runtime_status_snapshot().await
     }
 
     // Add a method to shut down the system
     pub async fn shutdown(&self) {
-        self.runtime_facade().shutdown().await;
+        self.services.runtime_facade.shutdown().await;
     }
 }
 

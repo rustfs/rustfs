@@ -32,6 +32,7 @@ pub mod registry;
 pub mod rules;
 mod runtime_facade;
 mod runtime_view;
+mod services;
 mod status_view;
 pub mod stream;
 
@@ -48,4 +49,5 @@ pub use integration::{NotificationMetricSnapshot, NotificationSystem, Notificati
 pub use rules::BucketNotificationConfig;
 pub use runtime_facade::NotifyRuntimeFacade;
 pub use runtime_view::NotifyRuntimeView;
+pub use services::NotifyServices;
 pub use status_view::NotifyStatusView;
