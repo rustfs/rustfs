@@ -398,6 +398,21 @@ impl TargetList {
         self.runtime.values()
     }
 
+    pub fn runtime_snapshots(&self) -> Vec<rustfs_targets::RuntimeTargetSnapshot> {
+        self.runtime.snapshots()
+    }
+
+    pub async fn runtime_health_snapshots(&self) -> Vec<rustfs_targets::RuntimeTargetHealthSnapshot> {
+        self.runtime.health_snapshots().await
+    }
+
+    pub fn runtime_status_snapshot(
+        &self,
+        replay_workers: &rustfs_targets::ReplayWorkerManager,
+    ) -> rustfs_targets::RuntimeStatusSnapshot {
+        self.runtime.status_snapshot(replay_workers)
+    }
+
     /// Returns the number of targets
     pub fn len(&self) -> usize {
         self.runtime.len()

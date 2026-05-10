@@ -32,7 +32,8 @@ use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::{
-    ReplayWorkerManager, Target, activate_targets_with_replay, init_target_and_optionally_start_replay, start_replay_worker,
+    ReplayWorkerManager, RuntimeTargetHealthSnapshot, Target, activate_targets_with_replay,
+    init_target_and_optionally_start_replay, start_replay_worker,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -656,23 +657,32 @@ impl NotificationSystem {
     }
 
     pub async fn snapshot_target_metrics(&self) -> Vec<NotificationTargetMetricSnapshot> {
-        let targets = self.notifier.target_list().read().await.values();
-        let mut snapshots = Vec::with_capacity(targets.len());
+        let target_list = self.notifier.target_list();
+        let guard = target_list.read().await;
+        guard
+            .runtime_snapshots()
+            .into_iter()
+            .map(|snapshot| NotificationTargetMetricSnapshot {
+                failed_messages: snapshot.failed_messages,
+                queue_length: snapshot.queue_length,
+                target_id: snapshot.target_id,
+                target_type: snapshot.target_type,
+                total_messages: snapshot.total_messages,
+            })
+            .collect()
+    }
 
-        for target in targets {
-            let delivery = target.delivery_snapshot();
-            let target_id = target.id();
-            snapshots.push(NotificationTargetMetricSnapshot {
-                failed_messages: delivery.failed_messages,
-                queue_length: delivery.queue_length,
-                target_id: target_id.to_string(),
-                target_type: target_id.name,
-                total_messages: delivery.total_messages,
-            });
-        }
+    pub async fn snapshot_target_health(&self) -> Vec<RuntimeTargetHealthSnapshot> {
+        let target_list = self.notifier.target_list();
+        let guard = target_list.read().await;
+        guard.runtime_health_snapshots().await
+    }
 
-        snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
-        snapshots
+    pub async fn runtime_status_snapshot(&self) -> rustfs_targets::RuntimeStatusSnapshot {
+        let replay_workers = self.stream_cancellers.read().await;
+        let target_list = self.notifier.target_list();
+        let guard = target_list.read().await;
+        guard.runtime_status_snapshot(&replay_workers)
     }
 
     // Add a method to shut down the system

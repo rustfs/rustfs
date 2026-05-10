@@ -53,6 +53,13 @@ impl ReplayWorkerManager {
         self.cancellers.is_empty()
     }
 
+    pub fn snapshot(&self, target_count: usize) -> RuntimeStatusSnapshot {
+        RuntimeStatusSnapshot {
+            replay_worker_count: self.len(),
+            target_count,
+        }
+    }
+
     pub async fn stop_all(&mut self, log_prefix: &str) {
         for (target_id, cancel_tx) in self.cancellers.drain() {
             tracing::info!(target_id = %target_id, "{log_prefix}");
@@ -69,6 +76,12 @@ where
     pub targets: Vec<SharedTarget<E>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeStatusSnapshot {
+    pub replay_worker_count: usize,
+    pub target_count: usize,
+}
+
 /// A read-only runtime snapshot for a target instance.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeTargetSnapshot {
@@ -77,6 +90,23 @@ pub struct RuntimeTargetSnapshot {
     pub target_id: String,
     pub target_type: String,
     pub total_messages: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTargetHealthState {
+    Disabled,
+    Error,
+    Offline,
+    Online,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTargetHealthSnapshot {
+    pub enabled: bool,
+    pub error_message: Option<String>,
+    pub state: RuntimeTargetHealthState,
+    pub target_id: String,
+    pub target_type: String,
 }
 
 pub enum ReplayEvent<E>
@@ -229,6 +259,37 @@ where
             let delivery = target.delivery_snapshot();
             let target_id = target.id();
             snapshots.push(snapshot_from_delivery(target_id, delivery));
+        }
+        snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        snapshots
+    }
+
+    pub fn status_snapshot(&self, replay_workers: &ReplayWorkerManager) -> RuntimeStatusSnapshot {
+        replay_workers.snapshot(self.len())
+    }
+
+    pub async fn health_snapshots(&self) -> Vec<RuntimeTargetHealthSnapshot> {
+        let mut snapshots = Vec::with_capacity(self.targets.len());
+        for target in self.targets.values() {
+            let enabled = target.is_enabled();
+            let target_id = target.id();
+            let (state, error_message) = if !enabled {
+                (RuntimeTargetHealthState::Disabled, None)
+            } else {
+                match target.is_active().await {
+                    Ok(true) => (RuntimeTargetHealthState::Online, None),
+                    Ok(false) => (RuntimeTargetHealthState::Offline, None),
+                    Err(err) => (RuntimeTargetHealthState::Error, Some(err.to_string())),
+                }
+            };
+
+            snapshots.push(RuntimeTargetHealthSnapshot {
+                enabled,
+                error_message,
+                state,
+                target_id: target_id.to_string(),
+                target_type: target_id.name,
+            });
         }
         snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
         snapshots

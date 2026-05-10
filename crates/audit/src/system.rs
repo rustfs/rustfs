@@ -607,21 +607,32 @@ impl AuditSystem {
 
     /// Returns per-target delivery metrics for Prometheus collection.
     pub async fn snapshot_target_metrics(&self) -> Vec<AuditTargetMetricSnapshot> {
-        let targets = self.get_target_values().await;
-        let mut snapshots = Vec::with_capacity(targets.len());
+        let registry = self.registry.lock().await;
+        registry
+            .list_target_values()
+            .into_iter()
+            .map(|target| {
+                let delivery = target.delivery_snapshot();
+                AuditTargetMetricSnapshot {
+                    failed_messages: delivery.failed_messages,
+                    queue_length: delivery.queue_length,
+                    target_id: target.id().to_string(),
+                    total_messages: delivery.total_messages,
+                }
+            })
+            .collect()
+    }
 
-        for target in targets {
-            let delivery = target.delivery_snapshot();
-            snapshots.push(AuditTargetMetricSnapshot {
-                failed_messages: delivery.failed_messages,
-                queue_length: delivery.queue_length,
-                target_id: target.id().to_string(),
-                total_messages: delivery.total_messages,
-            });
-        }
+    pub async fn snapshot_target_health(&self) -> Vec<rustfs_targets::RuntimeTargetHealthSnapshot> {
+        let registry = self.registry.lock().await;
+        let manager = registry.runtime_manager();
+        manager.health_snapshots().await
+    }
 
-        snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
-        snapshots
+    pub async fn runtime_status_snapshot(&self) -> rustfs_targets::RuntimeStatusSnapshot {
+        let replay_workers = self.stream_cancellers.read().await;
+        let registry = self.registry.lock().await;
+        registry.runtime_manager().status_snapshot(&replay_workers)
     }
 
     /// Gets information about a specific target

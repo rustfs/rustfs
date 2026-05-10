@@ -123,6 +123,10 @@ impl AuditRegistry {
         self.targets.values()
     }
 
+    pub fn runtime_manager(&self) -> &TargetRuntimeManager<AuditEntry> {
+        &self.targets
+    }
+
     /// Lists all target IDs
     ///
     /// # Returns

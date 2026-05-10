@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +26,14 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+/// Legacy compatibility shim for historical notify replay helpers.
+///
+/// New runtime orchestration should prefer `rustfs_targets::start_replay_worker`
+/// and the shared runtime helpers in `rustfs_targets::runtime`.
+///
+/// This module is kept temporarily to preserve local call compatibility while
+/// Phase 3 is being completed, but it is no longer the primary runtime path.
+///
 /// Streams events from the store to the target with retry logic
 ///
 /// # Arguments
