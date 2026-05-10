@@ -10,9 +10,7 @@ data:
   RUSTFS_ADDRESS: {{ .address | quote }}
   RUSTFS_CONSOLE_ADDRESS: {{ .console_address | quote }}
   RUSTFS_CONSOLE_ENABLE: {{ .console_enable | quote }}
-  {{- if .obs_log_directory }}
   RUSTFS_OBS_LOG_DIRECTORY: {{ .obs_log_directory | quote }}
-  {{- end }}
   RUSTFS_OBS_LOGGER_LEVEL: {{ .log_level | quote }}
   RUSTFS_OBS_ENVIRONMENT: {{ .obs_environment | quote }}
   {{- if .region }}
