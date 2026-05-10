@@ -43,7 +43,7 @@ use s3s::dto::{
 /// an error in strict mode. The saturating flag controls what happens
 /// on u64 overflow: strict returns Err, saturating returns u64::MAX.
 /// Strict is used by the offset precondition check (entry to the
-/// write_dispatch chain). Saturating is used when refreshing attrs. Size
+/// write_dispatch chain). Saturating is used when refreshing attrs.size
 /// at the tail of the same chain. See write_dispatch for the full call
 /// graph.
 pub(super) fn write_dispatch_byte_count(phase: &WritePhase, part_size: u64, saturating: bool) -> Result<u64, SftpError> {
