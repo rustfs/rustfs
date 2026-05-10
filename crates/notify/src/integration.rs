@@ -169,12 +169,12 @@ impl NotificationSystem {
             notifier.clone(),
             registry.clone(),
             config.clone(),
-            stream_cancellers.clone(),
-            concurrency_limiter.clone(),
-            metrics.clone(),
-            subscriber_view.clone(),
-            live_event_sender.clone(),
-            live_event_history.clone(),
+            stream_cancellers,
+            concurrency_limiter,
+            metrics,
+            subscriber_view,
+            live_event_sender,
+            live_event_history,
         );
 
         NotificationSystem {

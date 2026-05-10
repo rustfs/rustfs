@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use rustfs_config::{
@@ -41,7 +42,7 @@ use url::Url;
 
 pub(crate) type EndpointKey = (String, String);
 type AdminRequestValidatorFn =
-    Arc<dyn Fn(&HashMap<String, String>, &str) -> futures::future::BoxFuture<'static, S3Result<()>> + Send + Sync>;
+    Arc<dyn for<'a> Fn(&'a HashMap<String, String>, &'a str) -> BoxFuture<'a, S3Result<()>> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +65,7 @@ pub(crate) struct AdminTargetSpec {
     pub subsystem: &'static str,
     pub service: &'static str,
     pub valid_keys: &'static [&'static str],
+    valid_keys_set: Arc<HashSet<String>>,
     validator: AdminRequestValidatorFn,
 }
 
@@ -76,6 +78,14 @@ where
         subsystem: admin.subsystem(),
         service: descriptor.plugin().manifest().target_type,
         valid_keys: descriptor.plugin().valid_fields(),
+        valid_keys_set: Arc::new(
+            descriptor
+                .plugin()
+                .valid_fields()
+                .iter()
+                .map(|key| (*key).to_string())
+                .collect(),
+        ),
         validator: validator_from_metadata(admin),
     }
 }
@@ -203,8 +213,7 @@ pub(crate) fn collect_config_entry_keys(specs: &[AdminTargetSpec], config: &Conf
 pub(crate) fn collect_env_endpoint_keys(specs: &[AdminTargetSpec], route_prefix: &str) -> HbHashSet<EndpointKey> {
     let mut endpoints = HbHashSet::new();
     for spec in specs {
-        let valid_keys = spec.valid_keys.iter().map(|key| (*key).to_string()).collect::<HashSet<_>>();
-        for instance_id in collect_env_target_instance_ids(route_prefix, spec.service, &valid_keys) {
+        for instance_id in collect_env_target_instance_ids(route_prefix, spec.service, spec.valid_keys_set.as_ref()) {
             if instance_id != rustfs_config::DEFAULT_DELIMITER && !instance_id.is_empty() {
                 endpoints.insert(normalized_endpoint_key(&instance_id, spec.service));
             }
@@ -226,6 +235,14 @@ pub(crate) fn classify_endpoint_source(
     }
 }
 
+fn collect_endpoint_sources(
+    specs: &[AdminTargetSpec],
+    route_prefix: &str,
+    config: &Config,
+) -> (HbHashSet<EndpointKey>, HbHashSet<EndpointKey>) {
+    (collect_config_entry_keys(specs, config), collect_env_endpoint_keys(specs, route_prefix))
+}
+
 pub(crate) fn endpoint_source(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
@@ -233,8 +250,7 @@ pub(crate) fn endpoint_source(
     target_type: &str,
     target_name: &str,
 ) -> TargetEndpointSource {
-    let config_targets = collect_config_entry_keys(specs, config);
-    let env_targets = collect_env_endpoint_keys(specs, route_prefix);
+    let (config_targets, env_targets) = collect_endpoint_sources(specs, route_prefix, config);
     let service = target_service_name(specs, target_type).unwrap_or_default();
     let key = normalized_endpoint_key(target_name, service);
     classify_endpoint_source(&config_targets, &env_targets, &key)
@@ -291,8 +307,7 @@ pub(crate) fn merge_target_endpoints(
     let mut endpoints = Vec::new();
     let mut seen = HashSet::new();
     let configured_keys = collect_configured_endpoint_keys(specs, config);
-    let config_targets = collect_config_entry_keys(specs, config);
-    let env_targets = collect_env_endpoint_keys(specs, route_prefix);
+    let (config_targets, env_targets) = collect_endpoint_sources(specs, route_prefix, config);
     let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
 
     for ((account_id, service), status) in runtime_statuses {
@@ -470,12 +485,11 @@ async fn validate_webhook_request(kv_map: &HashMap<String, String>) -> S3Result<
     Ok(())
 }
 
-fn validate_webhook_request_entry(
-    kv_map: &HashMap<String, String>,
-    _default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    Box::pin(async move { validate_webhook_request(&kv_map).await })
+fn validate_webhook_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    _default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_webhook_request(kv_map))
 }
 
 async fn validate_mqtt_request(kv_map: &HashMap<String, String>) -> S3Result<()> {
@@ -522,127 +536,100 @@ async fn validate_mqtt_request(kv_map: &HashMap<String, String>) -> S3Result<()>
     Ok(())
 }
 
-fn validate_mqtt_request_entry(
-    kv_map: &HashMap<String, String>,
-    _default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    Box::pin(async move { validate_mqtt_request(&kv_map).await })
+fn validate_mqtt_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    _default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_mqtt_request(kv_map))
 }
 
-fn validate_notify_nats_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_nats_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+fn validate_notify_nats_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_nats_request(kv_map, default_queue_dir, TargetDomain::Notify))
 }
 
-fn validate_audit_nats_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_nats_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+fn validate_audit_nats_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_nats_request(kv_map, default_queue_dir, TargetDomain::Audit))
 }
 
-fn validate_notify_kafka_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_kafka_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+fn validate_notify_kafka_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_kafka_request(kv_map, default_queue_dir, TargetDomain::Notify))
 }
 
-fn validate_audit_kafka_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_kafka_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+fn validate_audit_kafka_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_kafka_request(kv_map, default_queue_dir, TargetDomain::Audit))
 }
 
-fn validate_notify_amqp_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_amqp_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+fn validate_notify_amqp_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_amqp_request(kv_map, default_queue_dir, TargetDomain::Notify))
 }
 
-fn validate_audit_amqp_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_amqp_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+fn validate_audit_amqp_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_amqp_request(kv_map, default_queue_dir, TargetDomain::Audit))
 }
 
-fn validate_notify_pulsar_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_pulsar_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+fn validate_notify_pulsar_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_pulsar_request(kv_map, default_queue_dir, TargetDomain::Notify))
 }
 
-fn validate_audit_pulsar_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_pulsar_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+fn validate_audit_pulsar_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_pulsar_request(kv_map, default_queue_dir, TargetDomain::Audit))
 }
 
-fn validate_mysql_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
+fn validate_mysql_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
     target_type: TargetType,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_mysql_request(&kv_map, &default_queue_dir, target_type).await })
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_mysql_request(kv_map, default_queue_dir, target_type))
 }
 
-fn validate_notify_postgres_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_postgres_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+fn validate_notify_postgres_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_postgres_request(kv_map, default_queue_dir, TargetDomain::Notify))
 }
 
-fn validate_audit_postgres_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_postgres_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+fn validate_audit_postgres_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_postgres_request(kv_map, default_queue_dir, TargetDomain::Audit))
 }
 
 fn validate_notify_redis_request_entry(default_channel: &'static str) -> AdminRequestValidatorFn {
     Arc::new(move |kv_map: &HashMap<String, String>, default_queue_dir: &str| {
-        let kv_map = kv_map.clone();
-        let default_queue_dir = default_queue_dir.to_string();
-        Box::pin(async move { validate_redis_request(&kv_map, &default_queue_dir, TargetDomain::Notify, default_channel).await })
+        Box::pin(validate_redis_request(kv_map, default_queue_dir, TargetDomain::Notify, default_channel))
     })
 }
 
 fn validate_audit_redis_request_entry(default_channel: &'static str) -> AdminRequestValidatorFn {
     Arc::new(move |kv_map: &HashMap<String, String>, default_queue_dir: &str| {
-        let kv_map = kv_map.clone();
-        let default_queue_dir = default_queue_dir.to_string();
-        Box::pin(async move { validate_redis_request(&kv_map, &default_queue_dir, TargetDomain::Audit, default_channel).await })
+        Box::pin(validate_redis_request(kv_map, default_queue_dir, TargetDomain::Audit, default_channel))
     })
 }
 

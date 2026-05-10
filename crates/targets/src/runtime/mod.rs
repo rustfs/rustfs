@@ -446,7 +446,7 @@ async fn stream_replay_worker<E>(
             }
 
             batch_keys.push(key);
-            if batch_keys.len() >= 1 || last_flush.elapsed() >= batch_timeout {
+            if !batch_keys.is_empty() || last_flush.elapsed() >= batch_timeout {
                 process_replay_batch(&mut batch_keys, target.clone(), &hook, semaphore.clone()).await;
                 last_flush = tokio::time::Instant::now();
             }
