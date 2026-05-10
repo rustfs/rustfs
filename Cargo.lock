@@ -9381,6 +9381,7 @@ dependencies = [
 name = "rustfs-audit"
 version = "1.0.0-beta.2"
 dependencies = [
+ "async-trait",
  "chrono",
  "const-str",
  "futures",
