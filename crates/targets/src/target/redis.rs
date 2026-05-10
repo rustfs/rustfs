@@ -290,14 +290,6 @@ fn validate_redis_tls_config(url: &Url, tls: &RedisTlsConfig) -> Result<(), Targ
     Ok(())
 }
 
-fn ensure_rustls_provider_installed() {
-    if rustls::crypto::CryptoProvider::get_default().is_none()
-        && rustls::crypto::aws_lc_rs::default_provider().install_default().is_err()
-    {
-        debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
-    }
-}
-
 pub struct RedisTarget<E>
 where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
@@ -656,7 +648,7 @@ pub(crate) fn build_redis_client(args: &RedisArgs) -> Result<Client, TargetError
 
     let secure_scheme = matches!(args.url.scheme(), "rediss" | "valkeys");
     if secure_scheme {
-        ensure_rustls_provider_installed();
+        super::ensure_rustls_provider_installed();
         let tls_certs = TlsCertificates {
             client_tls: read_client_tls(&args.tls)?,
             root_cert: read_root_cert(&args.tls)?,

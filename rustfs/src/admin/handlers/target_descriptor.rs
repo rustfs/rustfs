@@ -22,11 +22,11 @@ use rustfs_config::{
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     BuiltinTargetDescriptor, TargetError, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
-    check_mqtt_broker_available_with_tls, check_nats_server_available, check_postgres_server_available,
-    check_pulsar_broker_available, check_redis_server_available,
+    check_mqtt_broker_available_with_tls, check_mysql_server_available, check_nats_server_available,
+    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
     config::{
-        build_amqp_args, build_kafka_args, build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args,
-        collect_env_target_instance_ids, validate_mysql_config, validate_redis_config,
+        build_amqp_args, build_kafka_args, build_mysql_args, build_nats_args, build_postgres_args, build_pulsar_args,
+        build_redis_args, collect_env_target_instance_ids, validate_redis_config,
     },
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
@@ -116,7 +116,9 @@ where
                     Arc::new(validate_notify_kafka_request_entry)
                 }
             }
-            TargetRequestValidator::MySql => Arc::new(validate_mysql_request_entry),
+            TargetRequestValidator::MySql(target_type) => {
+                Arc::new(move |kv_map, default_queue_dir| validate_mysql_request_entry(kv_map, default_queue_dir, target_type))
+            }
             TargetRequestValidator::Nats(target_type) => {
                 if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
                     Arc::new(validate_audit_nats_request_entry)
@@ -622,10 +624,11 @@ fn validate_audit_pulsar_request_entry(
 fn validate_mysql_request_entry(
     kv_map: &HashMap<String, String>,
     default_queue_dir: &str,
+    target_type: TargetType,
 ) -> futures::future::BoxFuture<'static, S3Result<()>> {
     let kv_map = kv_map.clone();
     let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_mysql_request(&kv_map, &default_queue_dir).await })
+    Box::pin(async move { validate_mysql_request(&kv_map, &default_queue_dir, target_type).await })
 }
 
 fn validate_notify_postgres_request_entry(
@@ -722,14 +725,21 @@ async fn validate_pulsar_request(
     })
 }
 
-async fn validate_mysql_request(kv_map: &HashMap<String, String>, default_queue_dir: &str) -> S3Result<()> {
+async fn validate_mysql_request(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    target_type: TargetType,
+) -> S3Result<()> {
     if let Some(queue_dir) = kv_map.get(MYSQL_QUEUE_DIR) {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
 
-    validate_mysql_config(&to_kvs(kv_map), default_queue_dir).map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
-
-    Ok(())
+    let args =
+        build_mysql_args(&to_kvs(kv_map), default_queue_dir, target_type).map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    check_mysql_server_available(&args).await.map_err(|e| match e {
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+        _ => s3_error!(InvalidArgument, "MySQL server check failed: {}", e),
+    })
 }
 
 async fn validate_postgres_request(
