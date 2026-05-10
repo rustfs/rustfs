@@ -74,6 +74,9 @@ spec:
           imagePullPolicy: {{ .Values.image.initImage.pullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            - name: DRIVES_PER_NODE
+              value: {{ .Values.drivesPerNode | quote }}
           command:
             - sh
             - -c

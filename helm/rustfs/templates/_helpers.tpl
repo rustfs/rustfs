@@ -163,16 +163,25 @@ Merges (in order of increasing precedence):
 Render RUSTFS_VOLUMES
 */}}
 {{- define "rustfs.volumes" -}}
-{{- if lt (.Values.replicaCount | int) 1 }}
-{{- fail "distributed mode requires replicaCount >= 1" }}
-{{- end }}
+{{- $replicas := int .Values.replicaCount -}}
+{{- $drives := int .Values.drivesPerNode -}}
+{{- if lt $replicas 1 -}}
+{{- fail "rustfs.volumes requires .Values.replicaCount to be >= 1" -}}
+{{- end -}}
+{{- if lt $drives 1 -}}
+{{- fail "rustfs.volumes requires .Values.drivesPerNode to be >= 1" -}}
+{{- end -}}
 
 {{- $protocol := "http" -}}
 {{- if .Values.mtls.enabled -}}
   {{- $protocol = "https" -}}
 {{- end -}}
 
-{{- printf "%s://%s-{0...%d}.%s-headless:%d/data" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) (.Values.service.endpoint.port | int) }}
+{{- if gt $drives 1 -}}
+{{- printf "%s://%s-{0...%d}.%s-headless:%d/data/rustfs{0...%d}" $protocol (include "rustfs.fullname" .) (sub $replicas 1) (include "rustfs.fullname" .) (.Values.service.endpoint.port | int) (sub $drives 1) }}
+{{- else -}}
+{{- printf "%s://%s-{0...%d}.%s-headless:%d/data" $protocol (include "rustfs.fullname" .) (sub $replicas 1) (include "rustfs.fullname" .) (.Values.service.endpoint.port | int) }}
+{{- end -}}
 {{- end }}
 
 {{/*
