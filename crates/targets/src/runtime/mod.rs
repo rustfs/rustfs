@@ -29,6 +29,46 @@ use tokio::sync::{Semaphore, mpsc};
 pub type SharedTarget<E> = Arc<dyn Target<E> + Send + Sync>;
 type ReplayHook<E> = Arc<dyn Fn(ReplayEvent<E>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+#[derive(Debug, Default)]
+pub struct ReplayWorkerManager {
+    cancellers: HashMap<String, mpsc::Sender<()>>,
+}
+
+impl ReplayWorkerManager {
+    pub fn new() -> Self {
+        Self {
+            cancellers: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, target_id: String, cancel_tx: mpsc::Sender<()>) {
+        self.cancellers.insert(target_id, cancel_tx);
+    }
+
+    pub fn len(&self) -> usize {
+        self.cancellers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cancellers.is_empty()
+    }
+
+    pub async fn stop_all(&mut self, log_prefix: &str) {
+        for (target_id, cancel_tx) in self.cancellers.drain() {
+            tracing::info!(target_id = %target_id, "{log_prefix}");
+            let _ = cancel_tx.send(()).await;
+        }
+    }
+}
+
+pub struct RuntimeActivation<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    pub replay_workers: ReplayWorkerManager,
+    pub targets: Vec<SharedTarget<E>>,
+}
+
 /// A read-only runtime snapshot for a target instance.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeTargetSnapshot {
@@ -240,6 +280,34 @@ where
         .map(|store| start_replay(store.boxed_clone(), Arc::clone(&shared)));
     on_replay_start(&target_id, cancel.is_some());
     Some((shared, cancel))
+}
+
+pub async fn activate_targets_with_replay<E, F, Fut>(
+    targets: Vec<Box<dyn Target<E> + Send + Sync>>,
+    mut activate_one: F,
+) -> RuntimeActivation<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    F: FnMut(Box<dyn Target<E> + Send + Sync>) -> Fut,
+    Fut: Future<Output = Option<(SharedTarget<E>, Option<mpsc::Sender<()>>)>>,
+{
+    let mut replay_workers = ReplayWorkerManager::new();
+    let mut shared_targets = Vec::new();
+
+    for target in targets {
+        if let Some((shared_target, cancel_tx)) = activate_one(target).await {
+            let target_id = shared_target.id().to_string();
+            if let Some(cancel_tx) = cancel_tx {
+                replay_workers.insert(target_id, cancel_tx);
+            }
+            shared_targets.push(shared_target);
+        }
+    }
+
+    RuntimeActivation {
+        replay_workers,
+        targets: shared_targets,
+    }
 }
 
 pub fn start_replay_worker<E>(

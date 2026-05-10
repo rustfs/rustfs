@@ -13,12 +13,14 @@
 //  limitations under the License.
 
 use crate::{AuditEntry, AuditError, AuditRegistry, AuditResult, observability};
-use hashbrown::HashMap;
 use rustfs_ecstore::config::Config;
-use rustfs_targets::{Target, TargetError, init_target_and_optionally_start_replay, start_replay_worker, target::EntityTarget};
+use rustfs_targets::{
+    ReplayWorkerManager, RuntimeActivation, Target, TargetError, activate_targets_with_replay,
+    init_target_and_optionally_start_replay, start_replay_worker, target::EntityTarget,
+};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,7 +48,7 @@ pub struct AuditSystem {
     state: Arc<RwLock<AuditSystemState>>,
     config: Arc<RwLock<Option<Config>>>,
     /// Cancellation senders for active audit stream tasks (target_id -> cancel tx)
-    stream_cancellers: Arc<RwLock<HashMap<String, mpsc::Sender<()>>>>,
+    stream_cancellers: Arc<RwLock<ReplayWorkerManager>>,
 }
 
 impl Default for AuditSystem {
@@ -62,7 +64,7 @@ impl AuditSystem {
             registry: Arc::new(Mutex::new(AuditRegistry::new())),
             state: Arc::new(RwLock::new(AuditSystemState::Stopped)),
             config: Arc::new(RwLock::new(None)),
-            stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
+            stream_cancellers: Arc::new(RwLock::new(ReplayWorkerManager::new())),
         }
     }
 
@@ -117,10 +119,12 @@ impl AuditSystem {
 
                 info!(target_count = targets.len(), "Created audit targets successfully");
 
-                // Initialize all targets
-                for target in targets {
-                    self.init_and_register_target(target, &mut registry).await;
+                let activation = self.activate_targets_with_replay(targets).await;
+                for target in activation.targets {
+                    let target_id = target.id().to_string();
+                    registry.add_target(target_id, target.clone_dyn());
                 }
+                *self.stream_cancellers.write().await = activation.replay_workers;
 
                 // Update state to running
                 let mut state = self.state.write().await;
@@ -415,92 +419,96 @@ impl AuditSystem {
     /// Stops all active audit stream tasks by sending cancellation signals.
     async fn stop_all_streams(&self) {
         let mut cancellers = self.stream_cancellers.write().await;
-        for (target_id, cancel_tx) in cancellers.drain() {
-            info!(target_id = %target_id, "Stopping audit stream");
-            let _ = cancel_tx.send(()).await;
-        }
+        cancellers.stop_all("Stopping audit stream").await;
     }
 
-    /// Initializes a single target: runs init(), starts stream if store is present,
-    /// and adds it to the registry. For store-backed targets, registration and stream
-    /// startup proceed even if init() fails so queued entries can be drained later.
-    async fn init_and_register_target(
+    async fn activate_targets_with_replay(
         &self,
-        target: Box<dyn Target<AuditEntry> + Send + Sync>,
-        registry: &mut AuditRegistry,
-    ) -> Option<String> {
-        let state = self.state.clone();
-        let replay = init_target_and_optionally_start_replay(
-            target,
-            |target_id, has_replay| {
-                if has_replay {
-                    info!(target_id = %target_id, "Audit stream processing started");
-                } else {
-                    info!(target_id = %target_id, "No store configured, skip audit stream processing");
-                }
-            },
-            move |store, target| {
-                start_replay_worker(
-                    store,
+        targets: Vec<Box<dyn Target<AuditEntry> + Send + Sync>>,
+    ) -> RuntimeActivation<AuditEntry> {
+        activate_targets_with_replay(targets, |target| {
+            let state = self.state.clone();
+            async move {
+                init_target_and_optionally_start_replay(
                     target,
-                    Arc::new(move |event| {
-                        let state = state.clone();
-                        Box::pin(async move {
-                            if !matches!(
-                                *state.read().await,
-                                AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting
-                            ) {
-                                return;
-                            }
-                            match event {
-                                rustfs_targets::runtime::ReplayEvent::Delivered { key, target } => {
-                                    info!("Successfully sent audit entry, target: {}, key: {}", target.id(), key.to_string());
-                                    observability::record_target_success();
-                                }
-                                rustfs_targets::runtime::ReplayEvent::RetryableError { error, target, .. } => match error {
-                                    TargetError::NotConnected => {
-                                        warn!("Target {} not connected, retrying...", target.id());
+                    |target_id, has_replay| {
+                        if has_replay {
+                            info!(target_id = %target_id, "Audit stream processing started");
+                        } else {
+                            info!(target_id = %target_id, "No store configured, skip audit stream processing");
+                        }
+                    },
+                    move |store, target| {
+                        start_replay_worker(
+                            store,
+                            target,
+                            Arc::new(move |event| {
+                                let state = state.clone();
+                                Box::pin(async move {
+                                    if !matches!(
+                                        *state.read().await,
+                                        AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting
+                                    ) {
+                                        return;
                                     }
-                                    TargetError::Timeout(_) => {
-                                        warn!("Timeout sending to target {}, retrying...", target.id());
+                                    match event {
+                                        rustfs_targets::runtime::ReplayEvent::Delivered { key, target } => {
+                                            info!(
+                                                "Successfully sent audit entry, target: {}, key: {}",
+                                                target.id(),
+                                                key.to_string()
+                                            );
+                                            observability::record_target_success();
+                                        }
+                                        rustfs_targets::runtime::ReplayEvent::RetryableError { error, target, .. } => match error
+                                        {
+                                            TargetError::NotConnected => {
+                                                warn!("Target {} not connected, retrying...", target.id());
+                                            }
+                                            TargetError::Timeout(_) => {
+                                                warn!("Timeout sending to target {}, retrying...", target.id());
+                                            }
+                                            _ => {}
+                                        },
+                                        rustfs_targets::runtime::ReplayEvent::Dropped { reason, target, .. } => {
+                                            warn!("Dropped queued payload for target {}: {}", target.id(), reason);
+                                            observability::record_target_failure();
+                                        }
+                                        rustfs_targets::runtime::ReplayEvent::PermanentFailure { error, target, .. } => {
+                                            error!("Permanent error for target {}: {}", target.id(), error);
+                                            target.record_final_failure();
+                                            observability::record_target_failure();
+                                        }
+                                        rustfs_targets::runtime::ReplayEvent::RetryExhausted { key, target } => {
+                                            warn!(
+                                                "Max retries exceeded for key {}, target: {}, skipping",
+                                                key.to_string(),
+                                                target.id()
+                                            );
+                                            target.record_final_failure();
+                                            observability::record_target_failure();
+                                        }
+                                        rustfs_targets::runtime::ReplayEvent::UnreadableEntry { key, error, target } => {
+                                            warn!(
+                                                "Skipping unreadable audit store entry {} for target {}: {}",
+                                                key,
+                                                target.id(),
+                                                error
+                                            );
+                                        }
                                     }
-                                    _ => {}
-                                },
-                                rustfs_targets::runtime::ReplayEvent::Dropped { reason, target, .. } => {
-                                    warn!("Dropped queued payload for target {}: {}", target.id(), reason);
-                                    observability::record_target_failure();
-                                }
-                                rustfs_targets::runtime::ReplayEvent::PermanentFailure { error, target, .. } => {
-                                    error!("Permanent error for target {}: {}", target.id(), error);
-                                    target.record_final_failure();
-                                    observability::record_target_failure();
-                                }
-                                rustfs_targets::runtime::ReplayEvent::RetryExhausted { key, target } => {
-                                    warn!("Max retries exceeded for key {}, target: {}, skipping", key.to_string(), target.id());
-                                    target.record_final_failure();
-                                    observability::record_target_failure();
-                                }
-                                rustfs_targets::runtime::ReplayEvent::UnreadableEntry { key, error, target } => {
-                                    warn!("Skipping unreadable audit store entry {} for target {}: {}", key, target.id(), error);
-                                }
-                            }
-                        })
-                    }),
-                    None,
-                    Duration::from_millis(500),
-                    Duration::from_millis(500),
+                                })
+                            }),
+                            None,
+                            Duration::from_millis(500),
+                            Duration::from_millis(500),
+                        )
+                    },
                 )
-            },
-        )
-        .await;
-
-        let (shared_target, cancel_tx) = replay?;
-        let target_id = shared_target.id().to_string();
-        registry.add_target(target_id.clone(), shared_target.clone_dyn());
-        if let Some(cancel_tx) = cancel_tx {
-            self.stream_cancellers.write().await.insert(target_id.clone(), cancel_tx);
-        }
-        Some(target_id)
+                .await
+            }
+        })
+        .await
     }
 
     /// Enables a specific target
@@ -660,11 +668,13 @@ impl AuditSystem {
             Ok(targets) => {
                 info!(target_count = targets.len(), "Reloaded audit targets successfully");
 
-                for target in targets {
-                    if let Some(target_id) = self.init_and_register_target(target, &mut registry).await {
-                        info!(target_id = %target_id, "Target initialized (reload)");
-                    }
+                let activation = self.activate_targets_with_replay(targets).await;
+                for target in activation.targets {
+                    let target_id = target.id().to_string();
+                    info!(target_id = %target_id, "Target initialized (reload)");
+                    registry.add_target(target_id, target.clone_dyn());
                 }
+                *self.stream_cancellers.write().await = activation.replay_workers;
 
                 info!("Audit configuration reloaded successfully");
                 Ok(())

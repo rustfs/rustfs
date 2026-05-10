@@ -38,8 +38,8 @@ pub use plugin::{
     boxed_target,
 };
 pub use runtime::{
-    ReplayEvent, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager, init_target_and_optionally_start_replay,
-    start_replay_worker,
+    ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager,
+    activate_targets_with_replay, init_target_and_optionally_start_replay, start_replay_worker,
 };
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};

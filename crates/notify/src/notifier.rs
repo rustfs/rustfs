@@ -296,6 +296,25 @@ impl EventNotifier {
         );
         Ok(()) // Make sure to return a Result
     }
+
+    /// Initializes the targets for buckets from shared target handles.
+    #[instrument(skip(self, targets_to_init))]
+    pub async fn init_bucket_targets_shared(&self, targets_to_init: Vec<SharedTarget<Event>>) -> Result<(), NotificationError> {
+        let mut target_list_guard = self.target_list.write().await;
+        target_list_guard.clear();
+
+        for target in targets_to_init {
+            debug!("init bucket target: {}", target.name());
+            target_list_guard.add(target)?;
+        }
+
+        info!(
+            "Initialized {} shared targets, list size: {}",
+            target_list_guard.len(),
+            target_list_guard.len()
+        );
+        Ok(())
+    }
 }
 
 /// A thread-safe list of targets

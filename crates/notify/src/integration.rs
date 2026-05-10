@@ -31,12 +31,14 @@ use rustfs_config::{ENV_NOTIFY_ENABLE, EVENT_DEFAULT_DIR};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
-use rustfs_targets::{Target, init_target_and_optionally_start_replay, start_replay_worker};
+use rustfs_targets::{
+    ReplayWorkerManager, Target, activate_targets_with_replay, init_target_and_optionally_start_replay, start_replay_worker,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use tokio::sync::{RwLock, Semaphore, broadcast};
 use tracing::{debug, info, warn};
 
 const MAX_RECENT_LIVE_EVENTS: usize = 1024;
@@ -229,7 +231,7 @@ pub struct NotificationSystem {
     /// The current configuration
     pub config: Arc<RwLock<Config>>,
     /// Cancel sender for managing stream processing tasks
-    stream_cancellers: Arc<RwLock<HashMap<TargetID, mpsc::Sender<()>>>>,
+    stream_cancellers: Arc<RwLock<ReplayWorkerManager>>,
     /// Concurrent control signal quantity
     concurrency_limiter: Arc<Semaphore>,
     /// Monitoring indicators
@@ -254,7 +256,7 @@ impl NotificationSystem {
             notifier: Arc::new(EventNotifier::new(metrics.clone())),
             registry: Arc::new(TargetRegistry::new()),
             config: Arc::new(RwLock::new(config)),
-            stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
+            stream_cancellers: Arc::new(RwLock::new(ReplayWorkerManager::new())),
             concurrency_limiter: Arc::new(Semaphore::new(concurrency_limiter)), // Limit the maximum number of concurrent processing events to 20
             metrics,
             live_event_sender,
@@ -264,62 +266,55 @@ impl NotificationSystem {
 
     /// Initializes targets and starts event streams for those with stores.
     /// Returns a map of (target_id -> cancel_sender) for streams that were started.
-    async fn init_targets_and_start_streams(
+    async fn activate_targets_with_replay(
         &self,
-        targets: &[Box<dyn Target<Event> + Send + Sync>],
-    ) -> HashMap<TargetID, mpsc::Sender<()>> {
-        let mut cancellers = HashMap::new();
-        for target in targets {
-            let target_id = target.id();
-            info!("Initializing target: {}", target_id);
-
+        targets: Vec<Box<dyn Target<Event> + Send + Sync>>,
+    ) -> rustfs_targets::RuntimeActivation<Event> {
+        activate_targets_with_replay(targets, |target| {
             let metrics = self.metrics.clone();
             let limiter = self.concurrency_limiter.clone();
-            let replay = init_target_and_optionally_start_replay(
-                target.clone_dyn(),
-                |target_id, has_replay| {
-                    if has_replay {
-                        info!("Event stream processing for target {} is started successfully", target_id);
-                    } else {
-                        info!("Target {} has no replay worker to start", target_id);
-                    }
-                },
-                move |store, target| {
-                    start_replay_worker(
-                        store,
-                        target,
-                        Arc::new(move |event| {
-                            let metrics = metrics.clone();
-                            Box::pin(async move {
-                                match event {
-                                    rustfs_targets::runtime::ReplayEvent::Delivered { .. } => metrics.increment_processed(),
-                                    rustfs_targets::runtime::ReplayEvent::RetryableError { .. } => {}
-                                    rustfs_targets::runtime::ReplayEvent::Dropped { target, .. }
-                                    | rustfs_targets::runtime::ReplayEvent::PermanentFailure { target, .. }
-                                    | rustfs_targets::runtime::ReplayEvent::RetryExhausted { target, .. } => {
-                                        target.record_final_failure();
-                                        metrics.increment_failed();
+            async move {
+                let target_id = target.id();
+                info!("Initializing target: {}", target_id);
+                init_target_and_optionally_start_replay(
+                    target,
+                    |target_id, has_replay| {
+                        if has_replay {
+                            info!("Event stream processing for target {} is started successfully", target_id);
+                        } else {
+                            info!("Target {} has no replay worker to start", target_id);
+                        }
+                    },
+                    move |store, target| {
+                        start_replay_worker(
+                            store,
+                            target,
+                            Arc::new(move |event| {
+                                let metrics = metrics.clone();
+                                Box::pin(async move {
+                                    match event {
+                                        rustfs_targets::runtime::ReplayEvent::Delivered { .. } => metrics.increment_processed(),
+                                        rustfs_targets::runtime::ReplayEvent::RetryableError { .. } => {}
+                                        rustfs_targets::runtime::ReplayEvent::Dropped { target, .. }
+                                        | rustfs_targets::runtime::ReplayEvent::PermanentFailure { target, .. }
+                                        | rustfs_targets::runtime::ReplayEvent::RetryExhausted { target, .. } => {
+                                            target.record_final_failure();
+                                            metrics.increment_failed();
+                                        }
+                                        rustfs_targets::runtime::ReplayEvent::UnreadableEntry { .. } => {}
                                     }
-                                    rustfs_targets::runtime::ReplayEvent::UnreadableEntry { .. } => {}
-                                }
-                            })
-                        }),
-                        Some(limiter.clone()),
-                        Duration::from_secs(5),
-                        Duration::from_millis(500),
-                    )
-                },
-            )
-            .await;
-
-            if let Some((shared_target, cancel_tx)) = replay {
-                let runtime_target_id = shared_target.id();
-                if let Some(cancel_tx) = cancel_tx {
-                    cancellers.insert(runtime_target_id, cancel_tx);
-                }
+                                })
+                            }),
+                            Some(limiter.clone()),
+                            Duration::from_secs(5),
+                            Duration::from_millis(500),
+                        )
+                    },
+                )
+                .await
             }
-        }
-        cancellers
+        })
+        .await
     }
 
     /// Initializes the notification system
@@ -343,13 +338,13 @@ impl NotificationSystem {
         }
 
         // Initialize targets and start event streams
-        let cancellers = self.init_targets_and_start_streams(&targets).await;
+        let activation = self.activate_targets_with_replay(targets).await;
 
         // Update canceller collection
-        *self.stream_cancellers.write().await = cancellers;
+        *self.stream_cancellers.write().await = activation.replay_workers;
 
         // Initialize the bucket target
-        self.notifier.init_bucket_targets(targets).await?;
+        self.notifier.init_bucket_targets_shared(activation.targets).await?;
         info!("Notification system initialized");
         Ok(())
     }
@@ -572,10 +567,7 @@ impl NotificationSystem {
 
         // Stop all existing streaming services
         let mut cancellers = self.stream_cancellers.write().await;
-        for (target_id, cancel_tx) in cancellers.drain() {
-            info!("Stop event stream processing for target {}", target_id);
-            let _ = cancel_tx.send(()).await;
-        }
+        cancellers.stop_all("Stop event stream processing for target").await;
 
         // Clear the target_list and ensure that reload is a replacement reconstruction
         self.notifier.remove_all_bucket_targets().await;
@@ -596,13 +588,13 @@ impl NotificationSystem {
         }
 
         // Initialize targets and start event streams using shared helper
-        let new_cancellers = self.init_targets_and_start_streams(&targets).await;
+        let activation = self.activate_targets_with_replay(targets).await;
 
         // Update canceler collection
-        *cancellers = new_cancellers;
+        *cancellers = activation.replay_workers;
 
         // Initialize the bucket target
-        self.notifier.init_bucket_targets(targets).await?;
+        self.notifier.init_bucket_targets_shared(activation.targets).await?;
         info!("Configuration reloaded end");
         Ok(())
     }
@@ -692,10 +684,7 @@ impl NotificationSystem {
         info!("Stops {} active event stream processing tasks", active_targets);
 
         let mut cancellers = self.stream_cancellers.write().await;
-        for (target_id, cancel_tx) in cancellers.drain() {
-            info!("Stop event stream processing for target {}", target_id);
-            let _ = cancel_tx.send(()).await;
-        }
+        cancellers.stop_all("Stop event stream processing for target").await;
         // Wait for a short while to make sure the task has a chance to complete
         tokio::time::sleep(Duration::from_millis(500)).await;
 
