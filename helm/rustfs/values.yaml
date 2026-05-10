@@ -91,6 +91,14 @@ config:
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"
     ec:
+      # If you change replicaCount, adjust parity accordingly:
+      #
+      # | `replicaCount` | Total drives | Valid parity | Default |
+      # | -------------- | ------------ | ------------ | ------- |
+      # | 1              | 1            | 0            | 0       |
+      # | 2              | 2            | 0–1          | 1       |
+      # | 4              | 4            | 0–2          | **2**   |
+      # | 8              | 8            | 0–4          | 4       |
       storage_class_standard: "EC:2" # Storage class for standard storage class in erasure coding mode, default is "STANDARD"
     log_rotation: # Specify log rotation settings
       # size: 100 # Default value: 100 MB
