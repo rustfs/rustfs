@@ -19,6 +19,7 @@ use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
 use crate::runtime_facade::NotifyRuntimeFacade;
 use crate::runtime_view::NotifyRuntimeView;
+use crate::status_view::NotifyStatusView;
 use crate::{
     Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig,
 };
@@ -191,6 +192,10 @@ impl NotificationSystem {
         NotifyEventBridge::new(self.notifier.clone(), self.live_event_sender.clone(), self.live_event_history.clone())
     }
 
+    fn status_view(&self) -> NotifyStatusView {
+        NotifyStatusView::new(self.metrics.clone())
+    }
+
     /// Creates a new NotificationSystem
     pub fn new(config: Config) -> Self {
         let concurrency_limiter =
@@ -339,19 +344,11 @@ impl NotificationSystem {
 
     /// Obtain system status information
     pub fn get_status(&self) -> HashMap<String, String> {
-        let mut status = HashMap::new();
-
-        status.insert("uptime_seconds".to_string(), self.metrics.uptime().as_secs().to_string());
-        status.insert("processing_events".to_string(), self.metrics.processing_count().to_string());
-        status.insert("processed_events".to_string(), self.metrics.processed_count().to_string());
-        status.insert("failed_events".to_string(), self.metrics.failed_count().to_string());
-        status.insert("skipped_events".to_string(), self.metrics.skipped_count().to_string());
-
-        status
+        self.status_view().get_status()
     }
 
     pub fn snapshot_metrics(&self) -> NotificationMetricSnapshot {
-        self.metrics.snapshot()
+        self.status_view().snapshot_metrics()
     }
 
     pub async fn snapshot_target_metrics(&self) -> Vec<NotificationTargetMetricSnapshot> {
