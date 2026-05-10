@@ -321,6 +321,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
         version: u32,
         _extensions: std::collections::HashMap<String, String>,
     ) -> Result<Version, Self::Error> {
+        self.session_diag.stamp();
         if version != super::constants::protocol::SFTP_VERSION {
             tracing::warn!(
                 client_version = version,
@@ -328,10 +329,12 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
                 "SFTP client advertised a non-v3 version. The reply carries v3 and the client must continue with v3 semantics or close the connection.",
             );
         }
-        Ok(Version {
+        let result = Ok(Version {
             version: super::constants::protocol::SFTP_VERSION,
             extensions: std::collections::HashMap::new(),
-        })
+        });
+        self.session_diag.stamp();
+        result
     }
 
     /// SSH_FXP_REALPATH, SFTP Internet Draft section 6.9. Returns a single
@@ -1126,6 +1129,7 @@ mod tests {
     use rustfs_utils::path;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn init_advertises_sftp_v3_without_extensions() {
@@ -1154,6 +1158,23 @@ mod tests {
 
         assert_eq!(advertised.version, protocol::SFTP_VERSION);
         assert!(advertised.extensions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn init_stamps_session_activity() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(backend, TEST_PART_SIZE);
+        driver.session_diag.last_activity_ms.store(1, Ordering::Relaxed);
+
+        driver
+            .init(protocol::SFTP_VERSION, HashMap::new())
+            .await
+            .expect("init must succeed");
+
+        assert!(
+            driver.session_diag.last_activity_ms.load(Ordering::Relaxed) > 1,
+            "init must refresh session activity for watchdog accounting"
+        );
     }
 
     #[test]
