@@ -12,17 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config_manager::{NotifyConfigManager, notify_configuration_hint};
+use crate::bucket_config_manager::NotifyBucketConfigManager;
+use crate::config_manager::NotifyConfigManager;
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
 use crate::runtime_facade::NotifyRuntimeFacade;
 use crate::runtime_view::NotifyRuntimeView;
 use crate::{
-    Event,
-    error::NotificationError,
-    notifier::EventNotifier,
-    registry::TargetRegistry,
-    rules::{BucketNotificationConfig, ParseConfigError},
+    Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig,
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
@@ -35,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore, broadcast};
-use tracing::{debug, info, warn};
+use tracing::info;
 
 const MAX_RECENT_LIVE_EVENTS: usize = 1024;
 
@@ -203,7 +200,7 @@ pub struct NotificationSystem {
     /// Monitoring indicators
     metrics: Arc<NotificationMetrics>,
     /// Subscriber view
-    subscriber_view: NotificationSystemSubscriberView,
+    subscriber_view: Arc<NotificationSystemSubscriberView>,
     /// Live event fan-out for in-process streaming consumers.
     live_event_sender: broadcast::Sender<Arc<Event>>,
     /// Recent live event history for peer fan-in consumers.
@@ -228,6 +225,10 @@ impl NotificationSystem {
         NotifyConfigManager::new(self.config.clone(), self.registry.clone(), self.notifier.clone(), self.runtime_facade())
     }
 
+    fn bucket_config_manager(&self) -> NotifyBucketConfigManager {
+        NotifyBucketConfigManager::new(self.notifier.clone(), self.subscriber_view.clone())
+    }
+
     /// Creates a new NotificationSystem
     pub fn new(config: Config) -> Self {
         let concurrency_limiter =
@@ -235,7 +236,7 @@ impl NotificationSystem {
         let (live_event_sender, _) = broadcast::channel(1024);
         let metrics = Arc::new(NotificationMetrics::new());
         NotificationSystem {
-            subscriber_view: NotificationSystemSubscriberView::new(),
+            subscriber_view: Arc::new(NotificationSystemSubscriberView::new()),
             notifier: Arc::new(EventNotifier::new(metrics.clone())),
             registry: Arc::new(TargetRegistry::new()),
             config: Arc::new(RwLock::new(config)),
@@ -278,10 +279,7 @@ impl NotificationSystem {
 
     /// Checks if there are active subscribers for the given bucket and event name.
     pub async fn has_subscriber(&self, bucket: &str, event: &EventName) -> bool {
-        if !self.subscriber_view.has_subscriber(bucket, event) {
-            return false;
-        }
-        self.notifier.has_subscriber(bucket, event).await
+        self.bucket_config_manager().has_subscriber(bucket, event).await
     }
 
     /// Returns true when at least one in-process consumer is subscribed to live events.
@@ -338,8 +336,7 @@ impl NotificationSystem {
     /// * `bucket` - The name of the bucket whose notification configuration is to be removed.
     ///
     pub async fn remove_bucket_notification_config(&self, bucket: &str) {
-        self.subscriber_view.clear_bucket(bucket);
-        self.notifier.remove_rules_map(bucket).await;
+        self.bucket_config_manager().remove_bucket_notification_config(bucket).await;
     }
 
     /// Removes a Target configuration.
@@ -369,30 +366,9 @@ impl NotificationSystem {
         bucket: &str,
         cfg: &BucketNotificationConfig,
     ) -> Result<(), NotificationError> {
-        let arn_list = self.notifier.get_arn_list(&cfg.region).await;
-        if arn_list.is_empty() {
-            return Err(NotificationError::Configuration(notify_configuration_hint()));
-        }
-        info!("Available ARNs: {:?}", arn_list);
-        // Validate the configuration against the available ARNs
-        if let Err(e) = cfg.validate(&cfg.region, &arn_list) {
-            debug!("Bucket notification config validation region:{} failed: {}", &cfg.region, e);
-            if !matches!(e, ParseConfigError::ArnNotFound(_)) {
-                return Err(NotificationError::BucketNotification(e.to_string()));
-            }
-            warn!(
-                bucket = %bucket,
-                region = %cfg.region,
-                error = %e,
-                "Bucket notification config references missing target ARN; keeping compatibility and loading remaining rules"
-            );
-        }
-
-        self.subscriber_view.apply_bucket_config(bucket, cfg);
-        let rules_map = cfg.get_rules_map();
-        self.notifier.add_rules_map(bucket, rules_map.clone()).await;
-        info!("Loaded notification config for bucket: {}", bucket);
-        Ok(())
+        self.bucket_config_manager()
+            .load_bucket_notification_config(bucket, cfg)
+            .await
     }
 
     /// Sends an event

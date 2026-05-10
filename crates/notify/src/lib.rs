@@ -18,6 +18,7 @@
 //! It supports sending events to various targets
 //! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
 
+mod bucket_config_manager;
 mod config_manager;
 mod error;
 mod event;
@@ -32,6 +33,7 @@ mod runtime_facade;
 mod runtime_view;
 pub mod stream;
 
+pub use bucket_config_manager::NotifyBucketConfigManager;
 pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
 pub use error::{LifecycleError, NotificationError};
 pub use event::{Event, EventArgs, EventArgsBuilder};
