@@ -18,6 +18,7 @@
 //! It supports sending events to various targets
 //! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
 
+mod config_manager;
 mod error;
 mod event;
 pub mod factory;
@@ -31,6 +32,7 @@ mod runtime_facade;
 mod runtime_view;
 pub mod stream;
 
+pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
 pub use error::{LifecycleError, NotificationError};
 pub use event::{Event, EventArgs, EventArgsBuilder};
 pub use global::{
