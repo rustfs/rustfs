@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Target, TargetError, config::collect_target_configs};
+use crate::{
+    Target, TargetError, catalog::builtin_target_manifest, config::collect_target_configs, manifest::TargetPluginManifest,
+};
 use hashbrown::HashMap;
 use rustfs_ecstore::config::{Config, KVS};
 use serde::Serialize;
@@ -41,12 +43,38 @@ pub enum TargetRequestValidator {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetAdminMetadata {
+    subsystem: &'static str,
+    request_validator: TargetRequestValidator,
+}
+
+impl TargetAdminMetadata {
+    pub fn new(subsystem: &'static str, request_validator: TargetRequestValidator) -> Self {
+        Self {
+            subsystem,
+            request_validator,
+        }
+    }
+
+    #[inline]
+    pub fn subsystem(&self) -> &'static str {
+        self.subsystem
+    }
+
+    #[inline]
+    pub fn request_validator(&self) -> TargetRequestValidator {
+        self.request_validator
+    }
+}
+
 #[derive(Clone)]
 pub struct TargetPluginDescriptor<E>
 where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
     create_target: TargetCreateFn<E>,
+    manifest: TargetPluginManifest,
     target_type: &'static str,
     valid_fields: &'static [&'static str],
     valid_fields_set: Arc<HashSet<String>>,
@@ -67,9 +95,23 @@ where
         Create: Fn(String, &KVS) -> Result<BoxedTarget<E>, TargetError> + Send + Sync + 'static,
         Validate: Fn(&KVS) -> Result<(), TargetError> + Send + Sync + 'static,
     {
+        Self::with_manifest(builtin_target_manifest(target_type), valid_fields, validate_config, create_target)
+    }
+
+    pub fn with_manifest<Create, Validate>(
+        manifest: TargetPluginManifest,
+        valid_fields: &'static [&'static str],
+        validate_config: Validate,
+        create_target: Create,
+    ) -> Self
+    where
+        Create: Fn(String, &KVS) -> Result<BoxedTarget<E>, TargetError> + Send + Sync + 'static,
+        Validate: Fn(&KVS) -> Result<(), TargetError> + Send + Sync + 'static,
+    {
         Self {
             create_target: Arc::new(create_target),
-            target_type,
+            manifest,
+            target_type: manifest.target_type,
             valid_fields,
             valid_fields_set: Arc::new(valid_fields.iter().map(|field| (*field).to_string()).collect()),
             validate_config: Arc::new(validate_config),
@@ -79,6 +121,11 @@ where
     #[inline]
     pub fn target_type(&self) -> &'static str {
         self.target_type
+    }
+
+    #[inline]
+    pub fn manifest(&self) -> &TargetPluginManifest {
+        &self.manifest
     }
 
     #[inline]
@@ -108,8 +155,7 @@ where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
     plugin: TargetPluginDescriptor<E>,
-    request_validator: TargetRequestValidator,
-    subsystem: &'static str,
+    admin: TargetAdminMetadata,
 }
 
 impl<E> BuiltinTargetDescriptor<E>
@@ -119,8 +165,7 @@ where
     pub fn new(subsystem: &'static str, request_validator: TargetRequestValidator, plugin: TargetPluginDescriptor<E>) -> Self {
         Self {
             plugin,
-            request_validator,
-            subsystem,
+            admin: TargetAdminMetadata::new(subsystem, request_validator),
         }
     }
 
@@ -130,13 +175,18 @@ where
     }
 
     #[inline]
+    pub fn admin_metadata(&self) -> TargetAdminMetadata {
+        self.admin
+    }
+
+    #[inline]
     pub fn request_validator(&self) -> TargetRequestValidator {
-        self.request_validator
+        self.admin.request_validator()
     }
 
     #[inline]
     pub fn subsystem(&self) -> &'static str {
-        self.subsystem
+        self.admin.subsystem()
     }
 }
 

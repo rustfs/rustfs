@@ -21,9 +21,9 @@ use rustfs_config::{
 };
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
-    BuiltinTargetDescriptor, TargetError, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
-    check_mqtt_broker_available_with_tls, check_mysql_server_available, check_nats_server_available,
-    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
+    BuiltinTargetDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator, check_amqp_broker_available,
+    check_kafka_broker_available, check_mqtt_broker_available_with_tls, check_mysql_server_available,
+    check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
     config::{
         build_amqp_args, build_kafka_args, build_mysql_args, build_nats_args, build_postgres_args, build_pulsar_args,
         build_redis_args, collect_env_target_instance_ids, validate_redis_config,
@@ -59,30 +59,6 @@ pub(crate) struct MergedTargetEndpoint {
     pub source: TargetEndpointSource,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum TargetDomain {
-    Notify,
-    Audit,
-}
-
-impl TargetDomain {
-    pub(crate) fn runtime_target_type(self) -> TargetType {
-        match self {
-            TargetDomain::Notify => TargetType::NotifyEvent,
-            TargetDomain::Audit => TargetType::AuditLog,
-        }
-    }
-}
-
-impl From<TargetType> for TargetDomain {
-    fn from(value: TargetType) -> Self {
-        match value {
-            TargetType::NotifyEvent => TargetDomain::Notify,
-            TargetType::AuditLog => TargetDomain::Audit,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct AdminTargetSpec {
     pub subsystem: &'static str,
@@ -95,62 +71,67 @@ pub(crate) fn admin_target_spec_from_builtin<E>(descriptor: &BuiltinTargetDescri
 where
     E: Send + Sync + 'static + Clone + serde::Serialize + serde::de::DeserializeOwned,
 {
+    let admin = descriptor.admin_metadata();
     AdminTargetSpec {
-        subsystem: descriptor.subsystem(),
-        service: descriptor.plugin().target_type(),
+        subsystem: admin.subsystem(),
+        service: descriptor.plugin().manifest().target_type,
         valid_keys: descriptor.plugin().valid_fields(),
-        validator: match descriptor.request_validator() {
-            TargetRequestValidator::Webhook => Arc::new(validate_webhook_request_entry),
-            TargetRequestValidator::Mqtt => Arc::new(validate_mqtt_request_entry),
-            TargetRequestValidator::Amqp(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_amqp_request_entry)
-                } else {
-                    Arc::new(validate_notify_amqp_request_entry)
-                }
+        validator: validator_from_metadata(admin),
+    }
+}
+
+fn validator_from_metadata(metadata: TargetAdminMetadata) -> AdminRequestValidatorFn {
+    match metadata.request_validator() {
+        TargetRequestValidator::Webhook => Arc::new(validate_webhook_request_entry),
+        TargetRequestValidator::Mqtt => Arc::new(validate_mqtt_request_entry),
+        TargetRequestValidator::Amqp(target_type) => {
+            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                Arc::new(validate_audit_amqp_request_entry)
+            } else {
+                Arc::new(validate_notify_amqp_request_entry)
             }
-            TargetRequestValidator::Kafka(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_kafka_request_entry)
-                } else {
-                    Arc::new(validate_notify_kafka_request_entry)
-                }
+        }
+        TargetRequestValidator::Kafka(target_type) => {
+            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                Arc::new(validate_audit_kafka_request_entry)
+            } else {
+                Arc::new(validate_notify_kafka_request_entry)
             }
-            TargetRequestValidator::MySql(target_type) => {
-                Arc::new(move |kv_map, default_queue_dir| validate_mysql_request_entry(kv_map, default_queue_dir, target_type))
+        }
+        TargetRequestValidator::MySql(target_type) => {
+            Arc::new(move |kv_map, default_queue_dir| validate_mysql_request_entry(kv_map, default_queue_dir, target_type))
+        }
+        TargetRequestValidator::Nats(target_type) => {
+            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                Arc::new(validate_audit_nats_request_entry)
+            } else {
+                Arc::new(validate_notify_nats_request_entry)
             }
-            TargetRequestValidator::Nats(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_nats_request_entry)
-                } else {
-                    Arc::new(validate_notify_nats_request_entry)
-                }
+        }
+        TargetRequestValidator::Postgres(target_type) => {
+            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                Arc::new(validate_audit_postgres_request_entry)
+            } else {
+                Arc::new(validate_notify_postgres_request_entry)
             }
-            TargetRequestValidator::Postgres(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_postgres_request_entry)
-                } else {
-                    Arc::new(validate_notify_postgres_request_entry)
-                }
+        }
+        TargetRequestValidator::Pulsar(target_type) => {
+            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                Arc::new(validate_audit_pulsar_request_entry)
+            } else {
+                Arc::new(validate_notify_pulsar_request_entry)
             }
-            TargetRequestValidator::Pulsar(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_pulsar_request_entry)
-                } else {
-                    Arc::new(validate_notify_pulsar_request_entry)
-                }
+        }
+        TargetRequestValidator::Redis {
+            default_channel,
+            target_type,
+        } => {
+            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                validate_audit_redis_request_entry(default_channel)
+            } else {
+                validate_notify_redis_request_entry(default_channel)
             }
-            TargetRequestValidator::Redis {
-                default_channel,
-                target_type,
-            } => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    validate_audit_redis_request_entry(default_channel)
-                } else {
-                    validate_notify_redis_request_entry(default_channel)
-                }
-            }
-        },
+        }
     }
 }
 
