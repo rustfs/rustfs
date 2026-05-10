@@ -20,7 +20,6 @@ use crate::{
     notifier::EventNotifier,
     registry::TargetRegistry,
     rules::{BucketNotificationConfig, ParseConfigError},
-    stream,
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{
@@ -32,9 +31,7 @@ use rustfs_config::{ENV_NOTIFY_ENABLE, EVENT_DEFAULT_DIR};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
-use rustfs_targets::store::{Key, Store};
-use rustfs_targets::target::QueuedPayload;
-use rustfs_targets::{StoreError, Target};
+use rustfs_targets::{Target, init_target_and_optionally_start_replay, start_replay_worker};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -276,48 +273,50 @@ impl NotificationSystem {
             let target_id = target.id();
             info!("Initializing target: {}", target_id);
 
-            let has_store = target.store().is_some();
+            let metrics = self.metrics.clone();
+            let limiter = self.concurrency_limiter.clone();
+            let replay = init_target_and_optionally_start_replay(
+                target.clone_dyn(),
+                |target_id, has_replay| {
+                    if has_replay {
+                        info!("Event stream processing for target {} is started successfully", target_id);
+                    } else {
+                        info!("Target {} has no replay worker to start", target_id);
+                    }
+                },
+                move |store, target| {
+                    start_replay_worker(
+                        store,
+                        target,
+                        Arc::new(move |event| {
+                            let metrics = metrics.clone();
+                            Box::pin(async move {
+                                match event {
+                                    rustfs_targets::runtime::ReplayEvent::Delivered { .. } => metrics.increment_processed(),
+                                    rustfs_targets::runtime::ReplayEvent::RetryableError { .. } => {}
+                                    rustfs_targets::runtime::ReplayEvent::Dropped { target, .. }
+                                    | rustfs_targets::runtime::ReplayEvent::PermanentFailure { target, .. }
+                                    | rustfs_targets::runtime::ReplayEvent::RetryExhausted { target, .. } => {
+                                        target.record_final_failure();
+                                        metrics.increment_failed();
+                                    }
+                                    rustfs_targets::runtime::ReplayEvent::UnreadableEntry { .. } => {}
+                                }
+                            })
+                        }),
+                        Some(limiter.clone()),
+                        Duration::from_secs(5),
+                        Duration::from_millis(500),
+                    )
+                },
+            )
+            .await;
 
-            if let Err(e) = target.init().await {
-                warn!("Target {} Initialization failed: {}", target_id, e);
-                // For targets without a store, init failure is fatal — skip.
-                // For store-backed targets, still start the stream so queued events
-                // can be drained when connectivity recovers (send_from_store retries).
-                if !has_store {
-                    continue;
+            if let Some((shared_target, cancel_tx)) = replay {
+                let runtime_target_id = shared_target.id();
+                if let Some(cancel_tx) = cancel_tx {
+                    cancellers.insert(runtime_target_id, cancel_tx);
                 }
-                warn!(
-                    "Target {} has a store, starting stream despite init failure — \
-                     connectivity will be retried by send_from_store",
-                    target_id
-                );
-            } else {
-                debug!("Target {} initialized successfully, enabled: {}", target_id, target.is_enabled());
-            }
-
-            if !target.is_enabled() {
-                info!("Target {} is not enabled, event stream processing is skipped", target_id);
-                continue;
-            }
-
-            if let Some(store) = target.store() {
-                info!("Start event stream processing for target {}", target_id);
-
-                let store_clone = store.boxed_clone();
-                let target_arc = Arc::from(target.clone_dyn());
-
-                let cancel_tx = self.enhanced_start_event_stream(
-                    store_clone,
-                    target_arc,
-                    self.metrics.clone(),
-                    self.concurrency_limiter.clone(),
-                );
-
-                let target_id_clone = target_id.clone();
-                cancellers.insert(target_id, cancel_tx);
-                info!("Event stream processing for target {} is started successfully", target_id_clone);
-            } else {
-                info!("Target {} No storage is configured, event stream processing is skipped", target_id);
             }
         }
         cancellers
@@ -559,17 +558,6 @@ impl NotificationSystem {
         }
 
         config_result
-    }
-
-    /// Enhanced event stream startup function, including monitoring and concurrency control
-    fn enhanced_start_event_stream(
-        &self,
-        store: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>,
-        target: Arc<dyn Target<Event> + Send + Sync>,
-        metrics: Arc<NotificationMetrics>,
-        semaphore: Arc<Semaphore>,
-    ) -> mpsc::Sender<()> {
-        stream::start_event_stream_with_batching(store, target, metrics, semaphore)
     }
 
     /// Update configuration

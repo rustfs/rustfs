@@ -15,12 +15,9 @@
 use crate::{AuditEntry, AuditError, AuditRegistry, AuditResult, observability};
 use hashbrown::HashMap;
 use rustfs_ecstore::config::Config;
-use rustfs_targets::{
-    StoreError, Target, TargetError,
-    store::{Key, Store},
-    target::{EntityTarget, QueuedPayload},
-};
+use rustfs_targets::{Target, TargetError, init_target_and_optionally_start_replay, start_replay_worker, target::EntityTarget};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info, warn};
 
@@ -432,150 +429,78 @@ impl AuditSystem {
         target: Box<dyn Target<AuditEntry> + Send + Sync>,
         registry: &mut AuditRegistry,
     ) -> Option<String> {
-        let target_id = target.id().to_string();
-        let has_store = target.store().is_some();
-
-        if let Err(e) = target.init().await {
-            error!(target_id = %target_id, error = %e, "Failed to initialize audit target");
-            // Non-store targets: init failure is fatal.
-            if !has_store {
-                return None;
-            }
-            // Store-backed targets: still register and start the stream so queued
-            // entries can be drained when connectivity recovers.
-            warn!(
-                target_id = %target_id,
-                "Proceeding with store-backed audit target despite init failure"
-            );
-        }
-
-        if target.is_enabled() {
-            if let Some(store) = target.store() {
-                info!(target_id = %target_id, "Start audit stream processing for target");
-                let store_clone: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send> = store.boxed_clone();
-                let target_arc: Arc<dyn Target<AuditEntry> + Send + Sync> = Arc::from(target.clone_dyn());
-                let cancel_tx = self.start_audit_stream_with_batching(store_clone, target_arc);
-
-                self.stream_cancellers.write().await.insert(target_id.clone(), cancel_tx);
-                info!(target_id = %target_id, "Audit stream processing started");
-            } else {
-                info!(target_id = %target_id, "No store configured, skip audit stream processing");
-            }
-        } else {
-            info!(target_id = %target_id, "Target disabled, skip audit stream processing");
-        }
-
-        registry.add_target(target_id.clone(), target);
-        Some(target_id)
-    }
-
-    /// Starts the audit stream processing for a target with batching and retry logic
-    ///
-    /// # Arguments
-    /// * `store` - The store from which to read audit entries
-    /// * `target` - The target to which audit entries will be sent
-    ///
-    /// This function spawns a background task that continuously reads audit entries from the provided store
-    /// and attempts to send them to the specified target. It implements retry logic with exponential backoff
-    fn start_audit_stream_with_batching(
-        &self,
-        store: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>,
-        target: Arc<dyn Target<AuditEntry> + Send + Sync>,
-    ) -> mpsc::Sender<()> {
-        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         let state = self.state.clone();
-
-        tokio::spawn(async move {
-            use std::time::Duration;
-            use tokio::time::sleep;
-
-            info!("Starting audit stream for target: {}", target.id());
-
-            const MAX_RETRIES: usize = 5;
-            const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
-
-            loop {
-                // Check for cancellation signal
-                if cancel_rx.try_recv().is_ok() {
-                    info!("Audit stream cancelled for target: {}", target.id());
-                    break;
+        let replay = init_target_and_optionally_start_replay(
+            target,
+            |target_id, has_replay| {
+                if has_replay {
+                    info!(target_id = %target_id, "Audit stream processing started");
+                } else {
+                    info!(target_id = %target_id, "No store configured, skip audit stream processing");
                 }
-
-                match *state.read().await {
-                    AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {}
-                    _ => {
-                        info!("Audit stream stopped for target: {}", target.id());
-                        break;
-                    }
-                }
-
-                let keys: Vec<Key> = store.list();
-                if keys.is_empty() {
-                    tokio::select! {
-                        _ = sleep(Duration::from_millis(500)) => {},
-                        _ = cancel_rx.recv() => {
-                            info!("Audit stream cancelled during idle for target: {}", target.id());
-                            return;
-                        }
-                    }
-                    continue;
-                }
-
-                for key in keys {
-                    if cancel_rx.try_recv().is_ok() {
-                        info!("Audit stream cancelled during processing for target: {}", target.id());
-                        return;
-                    }
-
-                    let mut retries = 0usize;
-                    let mut success = false;
-
-                    while retries < MAX_RETRIES && !success {
-                        match target.send_from_store(key.clone()).await {
-                            Ok(_) => {
-                                info!("Successfully sent audit entry, target: {}, key: {}", target.id(), key.to_string());
-                                observability::record_target_success();
-                                success = true;
+            },
+            move |store, target| {
+                start_replay_worker(
+                    store,
+                    target,
+                    Arc::new(move |event| {
+                        let state = state.clone();
+                        Box::pin(async move {
+                            if !matches!(
+                                *state.read().await,
+                                AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting
+                            ) {
+                                return;
                             }
-                            Err(e) => {
-                                match &e {
+                            match event {
+                                rustfs_targets::runtime::ReplayEvent::Delivered { key, target } => {
+                                    info!("Successfully sent audit entry, target: {}, key: {}", target.id(), key.to_string());
+                                    observability::record_target_success();
+                                }
+                                rustfs_targets::runtime::ReplayEvent::RetryableError { error, target, .. } => match error {
                                     TargetError::NotConnected => {
                                         warn!("Target {} not connected, retrying...", target.id());
                                     }
                                     TargetError::Timeout(_) => {
                                         warn!("Timeout sending to target {}, retrying...", target.id());
                                     }
-                                    TargetError::Dropped(reason) => {
-                                        warn!("Dropped queued payload for target {}: {}", target.id(), reason);
-                                        observability::record_target_failure();
-                                        break;
-                                    }
-                                    _ => {
-                                        error!("Permanent error for target {}: {}", target.id(), e);
-                                        target.record_final_failure();
-                                        observability::record_target_failure();
-                                        break;
-                                    }
+                                    _ => {}
+                                },
+                                rustfs_targets::runtime::ReplayEvent::Dropped { reason, target, .. } => {
+                                    warn!("Dropped queued payload for target {}: {}", target.id(), reason);
+                                    observability::record_target_failure();
                                 }
-                                retries += 1;
-                                let backoff = BASE_RETRY_DELAY * (1 << retries);
-                                sleep(backoff).await;
+                                rustfs_targets::runtime::ReplayEvent::PermanentFailure { error, target, .. } => {
+                                    error!("Permanent error for target {}: {}", target.id(), error);
+                                    target.record_final_failure();
+                                    observability::record_target_failure();
+                                }
+                                rustfs_targets::runtime::ReplayEvent::RetryExhausted { key, target } => {
+                                    warn!("Max retries exceeded for key {}, target: {}, skipping", key.to_string(), target.id());
+                                    target.record_final_failure();
+                                    observability::record_target_failure();
+                                }
+                                rustfs_targets::runtime::ReplayEvent::UnreadableEntry { key, error, target } => {
+                                    warn!("Skipping unreadable audit store entry {} for target {}: {}", key, target.id(), error);
+                                }
                             }
-                        }
-                    }
+                        })
+                    }),
+                    None,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                )
+            },
+        )
+        .await;
 
-                    if retries >= MAX_RETRIES && !success {
-                        warn!("Max retries exceeded for key {}, target: {}, skipping", key.to_string(), target.id());
-                        target.record_final_failure();
-                        observability::record_target_failure();
-                    }
-                }
-
-                sleep(Duration::from_millis(100)).await;
-            }
-        });
-
-        cancel_tx
+        let (shared_target, cancel_tx) = replay?;
+        let target_id = shared_target.id().to_string();
+        registry.add_target(target_id.clone(), shared_target.clone_dyn());
+        if let Some(cancel_tx) = cancel_tx {
+            self.stream_cancellers.write().await.insert(target_id.clone(), cancel_tx);
+        }
+        Some(target_id)
     }
 
     /// Enables a specific target

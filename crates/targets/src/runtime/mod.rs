@@ -14,14 +14,20 @@
 
 use crate::Target;
 use crate::arn::TargetID;
+use crate::store::{Key, Store, ensure_store_entry_raw_readable};
+use crate::target::QueuedPayload;
 use crate::target::TargetDeliverySnapshot;
+use crate::{StoreError, TargetError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Debug};
+use std::{future::Future, pin::Pin, time::Duration};
+use tokio::sync::{Semaphore, mpsc};
 
 /// Shared target trait object used by the runtime manager.
 pub type SharedTarget<E> = Arc<dyn Target<E> + Send + Sync>;
+type ReplayHook<E> = Arc<dyn Fn(ReplayEvent<E>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// A read-only runtime snapshot for a target instance.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,6 +37,41 @@ pub struct RuntimeTargetSnapshot {
     pub target_id: String,
     pub target_type: String,
     pub total_messages: u64,
+}
+
+pub enum ReplayEvent<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    Delivered {
+        key: Key,
+        target: SharedTarget<E>,
+    },
+    RetryableError {
+        error: TargetError,
+        key: Key,
+        retry_count: usize,
+        target: SharedTarget<E>,
+    },
+    Dropped {
+        key: Key,
+        reason: String,
+        target: SharedTarget<E>,
+    },
+    PermanentFailure {
+        error: TargetError,
+        key: Key,
+        target: SharedTarget<E>,
+    },
+    RetryExhausted {
+        key: Key,
+        target: SharedTarget<E>,
+    },
+    UnreadableEntry {
+        error: StoreError,
+        key: Key,
+        target: SharedTarget<E>,
+    },
 }
 
 /// Shared runtime container for managing instantiated targets.
@@ -161,6 +202,214 @@ fn snapshot_from_delivery(target_id: TargetID, delivery: TargetDeliverySnapshot)
         target_id: target_id.to_string(),
         target_type: target_id.name,
         total_messages: delivery.total_messages,
+    }
+}
+
+pub async fn init_target_and_optionally_start_replay<E, F, G>(
+    target: Box<dyn Target<E> + Send + Sync>,
+    on_replay_start: F,
+    start_replay: G,
+) -> Option<(SharedTarget<E>, Option<mpsc::Sender<()>>)>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    F: FnOnce(&str, bool),
+    G: FnOnce(Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>, SharedTarget<E>) -> mpsc::Sender<()>,
+{
+    let target_id = target.id().to_string();
+    let has_store = target.store().is_some();
+
+    if let Err(err) = target.init().await {
+        tracing::error!(target_id = %target_id, error = %err, "Failed to initialize target");
+        if !has_store {
+            return None;
+        }
+        tracing::warn!(
+            target_id = %target_id,
+            "Proceeding with store-backed target despite init failure"
+        );
+    }
+
+    let shared: SharedTarget<E> = Arc::from(target);
+    if !shared.is_enabled() {
+        on_replay_start(&target_id, false);
+        return Some((shared, None));
+    }
+
+    let cancel = shared
+        .store()
+        .map(|store| start_replay(store.boxed_clone(), Arc::clone(&shared)));
+    on_replay_start(&target_id, cancel.is_some());
+    Some((shared, cancel))
+}
+
+pub fn start_replay_worker<E>(
+    mut store: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>,
+    target: SharedTarget<E>,
+    hook: ReplayHook<E>,
+    semaphore: Option<Arc<Semaphore>>,
+    batch_timeout: Duration,
+    idle_sleep: Duration,
+) -> mpsc::Sender<()>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    let (cancel_tx, cancel_rx) = mpsc::channel(1);
+
+    tokio::spawn(async move {
+        stream_replay_worker(&mut *store, target, cancel_rx, hook, semaphore, batch_timeout, idle_sleep).await;
+    });
+
+    cancel_tx
+}
+
+async fn stream_replay_worker<E>(
+    store: &mut (dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send),
+    target: SharedTarget<E>,
+    mut cancel_rx: mpsc::Receiver<()>,
+    hook: ReplayHook<E>,
+    semaphore: Option<Arc<Semaphore>>,
+    batch_timeout: Duration,
+    idle_sleep: Duration,
+) where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    const MAX_RETRIES: usize = 5;
+    const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+    let mut batch_keys = Vec::with_capacity(1);
+    let mut last_flush = tokio::time::Instant::now();
+
+    loop {
+        if cancel_rx.try_recv().is_ok() {
+            return;
+        }
+
+        let keys = store.list();
+        if keys.is_empty() {
+            if !batch_keys.is_empty() && last_flush.elapsed() >= batch_timeout {
+                process_replay_batch(&mut batch_keys, target.clone(), &hook, semaphore.clone()).await;
+                last_flush = tokio::time::Instant::now();
+            }
+            tokio::time::sleep(idle_sleep).await;
+            continue;
+        }
+
+        for key in keys {
+            if cancel_rx.try_recv().is_ok() {
+                if !batch_keys.is_empty() {
+                    process_replay_batch(&mut batch_keys, target.clone(), &hook, semaphore.clone()).await;
+                }
+                return;
+            }
+
+            match ensure_store_entry_raw_readable(&*store, &key) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(err) => {
+                    hook(ReplayEvent::UnreadableEntry {
+                        error: err,
+                        key,
+                        target: target.clone(),
+                    })
+                    .await;
+                    continue;
+                }
+            }
+
+            batch_keys.push(key);
+            if batch_keys.len() >= 1 || last_flush.elapsed() >= batch_timeout {
+                process_replay_batch(&mut batch_keys, target.clone(), &hook, semaphore.clone()).await;
+                last_flush = tokio::time::Instant::now();
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    async fn process_replay_batch<E>(
+        batch_keys: &mut Vec<Key>,
+        target: SharedTarget<E>,
+        hook: &ReplayHook<E>,
+        semaphore: Option<Arc<Semaphore>>,
+    ) where
+        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    {
+        if batch_keys.is_empty() {
+            return;
+        }
+
+        let _permit = match semaphore {
+            Some(ref semaphore) => match semaphore.clone().acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(err) => {
+                    tracing::error!(error = %err, "Failed to acquire replay semaphore permit");
+                    return;
+                }
+            },
+            None => None,
+        };
+
+        for key in batch_keys.iter() {
+            let mut retry_count = 0usize;
+            let mut success = false;
+
+            while retry_count < MAX_RETRIES && !success {
+                match target.send_from_store(key.clone()).await {
+                    Ok(_) => {
+                        hook(ReplayEvent::Delivered {
+                            key: key.clone(),
+                            target: target.clone(),
+                        })
+                        .await;
+                        success = true;
+                    }
+                    Err(err) => match err {
+                        TargetError::NotConnected | TargetError::Timeout(_) => {
+                            retry_count += 1;
+                            hook(ReplayEvent::RetryableError {
+                                error: err,
+                                key: key.clone(),
+                                retry_count,
+                                target: target.clone(),
+                            })
+                            .await;
+
+                            let jitter = Duration::from_millis(key.to_string().len() as u64 % 500);
+                            let backoff = 1u32 << retry_count as u32;
+                            tokio::time::sleep(BASE_RETRY_DELAY * backoff + jitter).await;
+                        }
+                        TargetError::Dropped(reason) => {
+                            hook(ReplayEvent::Dropped {
+                                key: key.clone(),
+                                reason,
+                                target: target.clone(),
+                            })
+                            .await;
+                            break;
+                        }
+                        other => {
+                            hook(ReplayEvent::PermanentFailure {
+                                error: other,
+                                key: key.clone(),
+                                target: target.clone(),
+                            })
+                            .await;
+                            break;
+                        }
+                    },
+                }
+            }
+
+            if retry_count >= MAX_RETRIES && !success {
+                hook(ReplayEvent::RetryExhausted {
+                    key: key.clone(),
+                    target: target.clone(),
+                })
+                .await;
+            }
+        }
+
+        batch_keys.clear();
     }
 }
 
