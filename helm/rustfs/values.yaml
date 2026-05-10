@@ -85,14 +85,16 @@ config:
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"
     ec:
-      # If you change replicaCount, adjust parity accordingly:
+      # Total drives = replicaCount * drivesPerNode.
+      # If you change replicaCount or drivesPerNode, adjust parity accordingly:
       #
-      # | `replicaCount` | Total drives | Valid parity | Default |
-      # | -------------- | ------------ | ------------ | ------- |
-      # | 1              | 1            | 0            | 0       |
-      # | 2              | 2            | 0–1          | 1       |
-      # | 4              | 4            | 0–2          | **2**   |
-      # | 8              | 8            | 0–4          | 4       |
+      # | replicaCount | drivesPerNode | Total drives | Valid parity | Default |
+      # | ------------ | ------------- | ------------ | ------------ | ------- |
+      # | 1            | 1             | 1            | 0            | 0       |
+      # | 4            | 1             | 4            | 0–2          | *2*     |
+      # | 4            | 2             | 8            | 0–4          | 4       |
+      # | 8            | 1             | 8            | 0–4          | 4       |
+      # | 16           | 1             | 16           | 0–8          | 4       |
       storage_class_standard: "EC:2" # Storage class for standard storage class in erasure coding mode, default is "STANDARD"
     scanner:
       # Scanner speed preset: fastest|fast|default|slow|slowest
