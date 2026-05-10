@@ -169,12 +169,14 @@ Render RUSTFS_VOLUMES
   {{- $protocol = "https" -}}
 {{- end -}}
 
-{{- if eq (int .Values.replicaCount) 4 }}
-{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data/rustfs{0...%d}" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" . ) .Release.Namespace (.Values.service.endpoint.port | int) (sub (.Values.replicaCount | int) 1) }}
-{{- end }}
-{{- if eq (int .Values.replicaCount) 16 }}
-{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) .Release.Namespace (.Values.service.endpoint.port | int) }}
-{{- end }}
+{{- $replicas := int .Values.replicaCount -}}
+{{- $drives := int .Values.drivesPerNode -}}
+
+{{- if gt $drives 1 -}}
+{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data/rustfs{0...%d}" $protocol (include "rustfs.fullname" .) (sub $replicas 1) (include "rustfs.fullname" .) .Release.Namespace (.Values.service.endpoint.port | int) (sub $drives 1) }}
+{{- else -}}
+{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data" $protocol (include "rustfs.fullname" .) (sub $replicas 1) (include "rustfs.fullname" .) .Release.Namespace (.Values.service.endpoint.port | int) }}
+{{- end -}}
 {{- end }}
 
 {{/*

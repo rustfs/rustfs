@@ -2,8 +2,14 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
-# This will set the replicaset count more information can be found here: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
+# Number of StatefulSet pods (nodes in the distributed cluster).
 replicaCount: 4
+
+# Number of data drives (PVCs) per pod. Combined with replicaCount this
+# determines the total drive count seen by rustfs.
+# - drivesPerNode > 1: each pod gets N volumes mounted at /data/rustfs0.../data/rustfsN-1
+# - drivesPerNode = 1: each pod gets a single volume mounted at /data
+drivesPerNode: 4
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:
