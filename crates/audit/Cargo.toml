@@ -30,7 +30,6 @@ rustfs-targets = { workspace = true }
 rustfs-config = { workspace = true, features = ["audit", "constants"] }
 rustfs-ecstore = { workspace = true }
 rustfs-s3-common = { workspace = true }
-async-trait = { workspace = true }
 chrono = { workspace = true }
 const-str = { workspace = true }
 futures = { workspace = true }

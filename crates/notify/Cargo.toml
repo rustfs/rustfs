@@ -34,7 +34,6 @@ rustfs-utils = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-futures = { workspace = true }
 form_urlencoded = { workspace = true }
 hashbrown = { workspace = true }
 rayon = { workspace = true }

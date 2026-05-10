@@ -51,7 +51,7 @@
 //!   per-session watchdog that observes the SFTP-handler activity stamp
 //!   and the kernel TCP state for the connection. Sessions that fall
 //!   silent at the SFTP layer while the kernel reports CLOSE_WAIT are
-//!   cancelled on a bounded schedule. The watchdog backstops resource
+//!   canceled on a bounded schedule. The watchdog backstops resource
 //!   accumulation regardless of which layer stalled. On Linux the
 //!   detection latency is on the order of 45 seconds; on non-Linux
 //!   targets the watchdog falls back to an inactivity ceiling on the
@@ -63,7 +63,7 @@
 //!   the rest. Subsequent reads inside that window are served from
 //!   memory. Total cache memory across every live handle is bounded by
 //!   a shared atomic accumulator enforced against the process-wide
-//!   ceiling. On ceiling breach the populate is skipped and the read
+//!   ceiling. On ceiling breach the population is skipped and the read
 //!   serves correctly via a single backend call without storing the
 //!   bytes for re-use.
 //!
