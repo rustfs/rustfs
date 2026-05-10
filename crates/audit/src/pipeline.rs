@@ -212,4 +212,47 @@ impl AuditRuntimeView {
         let registry = self.registry.lock().await;
         registry.get_target(target_id).map(|target| target.id().to_string())
     }
+
+    pub async fn enable_target(&self, target_id: &str) -> AuditResult<()> {
+        let registry = self.registry.lock().await;
+        if registry.get_target(target_id).is_some() {
+            info!(target_id = %target_id, "Target enabled");
+            Ok(())
+        } else {
+            Err(crate::AuditError::Configuration(format!("Target not found: {target_id}"), None))
+        }
+    }
+
+    pub async fn disable_target(&self, target_id: &str) -> AuditResult<()> {
+        let registry = self.registry.lock().await;
+        if registry.get_target(target_id).is_some() {
+            info!(target_id = %target_id, "Target disabled");
+            Ok(())
+        } else {
+            Err(crate::AuditError::Configuration(format!("Target not found: {target_id}"), None))
+        }
+    }
+
+    pub async fn remove_target(&self, target_id: &str) -> AuditResult<()> {
+        let mut registry = self.registry.lock().await;
+        if registry.remove_target(target_id).await.is_some() {
+            info!(target_id = %target_id, "Target removed");
+            Ok(())
+        } else {
+            Err(crate::AuditError::Configuration(format!("Target not found: {target_id}"), None))
+        }
+    }
+
+    pub async fn upsert_target(&self, target_id: String, target: Box<dyn Target<AuditEntry> + Send + Sync>) -> AuditResult<()> {
+        let mut registry = self.registry.lock().await;
+
+        if let Err(err) = target.init().await {
+            return Err(crate::AuditError::Target(err));
+        }
+
+        let _ = registry.remove_target(&target_id).await;
+        registry.add_target(target_id.clone(), target);
+        info!(target_id = %target_id, "Target upserted");
+        Ok(())
+    }
 }

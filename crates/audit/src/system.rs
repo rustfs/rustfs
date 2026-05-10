@@ -394,15 +394,7 @@ impl AuditSystem {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn enable_target(&self, target_id: &str) -> AuditResult<()> {
-        // This would require storing enabled/disabled state per target
-        // For now, just check if target exists
-        let registry = self.registry.lock().await;
-        if registry.get_target(target_id).is_some() {
-            info!(target_id = %target_id, "Target enabled");
-            Ok(())
-        } else {
-            Err(AuditError::Configuration(format!("Target not found: {target_id}"), None))
-        }
+        self.runtime_view().enable_target(target_id).await
     }
 
     /// Disables a specific target
@@ -413,15 +405,7 @@ impl AuditSystem {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn disable_target(&self, target_id: &str) -> AuditResult<()> {
-        // This would require storing enabled/disabled state per target
-        // For now, just check if target exists
-        let registry = self.registry.lock().await;
-        if registry.get_target(target_id).is_some() {
-            info!(target_id = %target_id, "Target disabled");
-            Ok(())
-        } else {
-            Err(AuditError::Configuration(format!("Target not found: {target_id}"), None))
-        }
+        self.runtime_view().disable_target(target_id).await
     }
 
     /// Removes a target from the system
@@ -432,13 +416,7 @@ impl AuditSystem {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn remove_target(&self, target_id: &str) -> AuditResult<()> {
-        let mut registry = self.registry.lock().await;
-        if registry.remove_target(target_id).await.is_some() {
-            info!(target_id = %target_id, "Target removed");
-            Ok(())
-        } else {
-            Err(AuditError::Configuration(format!("Target not found: {target_id}"), None))
-        }
+        self.runtime_view().remove_target(target_id).await
     }
 
     /// Updates or inserts a target
@@ -450,19 +428,7 @@ impl AuditSystem {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn upsert_target(&self, target_id: String, target: Box<dyn Target<AuditEntry> + Send + Sync>) -> AuditResult<()> {
-        let mut registry = self.registry.lock().await;
-
-        // Initialize the target
-        if let Err(e) = target.init().await {
-            return Err(AuditError::Target(e));
-        }
-
-        // Remove existing target if present
-        let _ = registry.remove_target(&target_id).await;
-
-        registry.add_target(target_id.clone(), target);
-        info!(target_id = %target_id, "Target upserted");
-        Ok(())
+        self.runtime_view().upsert_target(target_id, target).await
     }
 
     /// Lists all targets
