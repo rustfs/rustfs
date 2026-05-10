@@ -704,3 +704,87 @@ pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sende
         Ok(Some(shutdown_tx))
     }
 }
+
+/// Start the SFTP server when RUSTFS_SFTP_ENABLE is set. Loads host
+/// keys from the configured directory, validates the SSH configuration,
+/// and spawns the listener task.
+#[cfg(feature = "sftp")]
+#[instrument(skip_all)]
+pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+    {
+        use crate::protocols::ProtocolStorageClient;
+        use rustfs_config::{
+            DEFAULT_SFTP_ADDRESS, DEFAULT_SFTP_BANNER, DEFAULT_SFTP_IDLE_TIMEOUT, DEFAULT_SFTP_PART_SIZE, DEFAULT_SFTP_READ_ONLY,
+            ENV_SFTP_ADDRESS, ENV_SFTP_BACKEND_OP_TIMEOUT_SECS, ENV_SFTP_BANNER, ENV_SFTP_ENABLE, ENV_SFTP_HANDLES_PER_SESSION,
+            ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_IDLE_TIMEOUT, ENV_SFTP_PART_SIZE, ENV_SFTP_READ_CACHE_TOTAL_MEM_BYTES,
+            ENV_SFTP_READ_CACHE_WINDOW_BYTES, ENV_SFTP_READ_ONLY,
+        };
+        use rustfs_protocols::{SftpConfig, SftpServer};
+
+        let enabled = rustfs_utils::get_env_bool(ENV_SFTP_ENABLE, false);
+        if !enabled {
+            debug!("SFTP system is disabled");
+            return Ok(None);
+        }
+
+        let addr_str = rustfs_utils::get_env_str(ENV_SFTP_ADDRESS, DEFAULT_SFTP_ADDRESS);
+        let addr = rustfs_utils::net::parse_and_resolve_address(&addr_str)
+            .map_err(|e| format!("Invalid SFTP address '{}': {}", addr_str, e))?;
+
+        let host_key_dir = rustfs_utils::get_env_opt_str(ENV_SFTP_HOST_KEY_DIR)
+            .ok_or("RUSTFS_SFTP_HOST_KEY_DIR is required when SFTP is enabled")?;
+
+        let idle_timeout = rustfs_utils::get_env_u64(ENV_SFTP_IDLE_TIMEOUT, DEFAULT_SFTP_IDLE_TIMEOUT);
+        let part_size = rustfs_utils::get_env_u64(ENV_SFTP_PART_SIZE, DEFAULT_SFTP_PART_SIZE);
+        let handles_per_session =
+            SftpConfig::resolve_handles_per_session(rustfs_utils::get_env_opt_usize(ENV_SFTP_HANDLES_PER_SESSION));
+        let backend_op_timeout_secs =
+            SftpConfig::resolve_backend_op_timeout_secs(rustfs_utils::get_env_opt_u64(ENV_SFTP_BACKEND_OP_TIMEOUT_SECS));
+        let read_cache_window_bytes =
+            SftpConfig::resolve_read_cache_window_bytes(rustfs_utils::get_env_opt_u64(ENV_SFTP_READ_CACHE_WINDOW_BYTES));
+        let read_cache_total_mem_bytes =
+            SftpConfig::resolve_read_cache_total_mem_bytes(rustfs_utils::get_env_opt_u64(ENV_SFTP_READ_CACHE_TOTAL_MEM_BYTES));
+        let read_only = rustfs_utils::get_env_bool(ENV_SFTP_READ_ONLY, DEFAULT_SFTP_READ_ONLY);
+        let banner = rustfs_utils::get_env_str(ENV_SFTP_BANNER, DEFAULT_SFTP_BANNER);
+
+        let config = SftpConfig {
+            bind_addr: addr,
+            host_key_dir: std::path::PathBuf::from(&host_key_dir),
+            idle_timeout_secs: idle_timeout,
+            part_size,
+            handles_per_session,
+            backend_op_timeout_secs,
+            read_cache_window_bytes,
+            read_cache_total_mem_bytes,
+            read_only,
+            banner,
+        };
+
+        config.validate().await?;
+
+        // Load and validate host keys. Fails if zero found or any key
+        // file has insecure permissions.
+        let host_keys = SftpConfig::load_host_keys(&config.host_key_dir).await?;
+
+        let fs = crate::storage::ecfs::FS::new();
+        let storage_client = ProtocolStorageClient::new(fs);
+
+        let server = SftpServer::new(config.clone(), storage_client, host_keys)?;
+
+        info!("SFTP server configured on {}", config.bind_addr);
+
+        // Hook into shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        // Start SFTP server in background task
+        tokio::spawn(async move {
+            if let Err(e) = server.start(shutdown_rx).await {
+                error!("SFTP server error: {}", e);
+            }
+            info!("SFTP server shutdown completed");
+        });
+
+        info!("SFTP system initialized successfully");
+        Ok(Some(shutdown_tx))
+    }
+}

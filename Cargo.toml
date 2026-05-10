@@ -307,6 +307,8 @@ libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.7"
+russh = "0.60.0"
+russh-sftp = "2.1.1"
 
 # WebDAV
 dav-server = "0.11.0"
@@ -326,6 +328,12 @@ pprof = { package = "pprof-pyroscope-fork", version = "0.1500.3", features = ["f
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs"]
+
+[patch.crates-io]
+# Pinned to the simon-escapecode/russh fork carrying the upstream fix at
+# https://github.com/Eugeny/russh/pull/702. Drops out when a russh release
+# containing the fix is published.
+russh = { git = "https://github.com/simon-escapecode/russh", rev = "5cac2ed84945f9b80a52b673e058f2032bbe98ec" }
 
 [profile.release]
 opt-level = 3

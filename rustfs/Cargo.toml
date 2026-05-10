@@ -48,10 +48,11 @@ metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
+sftp = ["rustfs-protocols/sftp"]
 license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
-full = ["metrics-gpu", "ftps", "swift", "webdav"]
+full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp"]
 manual-test-runners = []
 
 [lints]
