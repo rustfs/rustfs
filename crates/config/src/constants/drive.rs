@@ -66,3 +66,10 @@ pub const DEFAULT_DRIVE_OFFLINE_GRACE_PERIOD_SECS: u64 = 30;
 /// Duration in seconds after which a recovered drive is classified as long offline.
 pub const ENV_DRIVE_LONG_OFFLINE_THRESHOLD_SECS: &str = "RUSTFS_DRIVE_LONG_OFFLINE_THRESHOLD_SECS";
 pub const DEFAULT_DRIVE_LONG_OFFLINE_THRESHOLD_SECS: u64 = 172_800;
+
+pub const ENV_NETWORK_MOUNT_MODE: &str = "RUSTFS_NETWORK_MOUNT_MODE";
+pub const DEFAULT_NETWORK_MOUNT_MODE: bool = false;
+
+/// Fixed timeout in seconds applied to drive operations when network mount mode is enabled.
+/// Explicit per-operation overrides (`RUSTFS_DRIVE_*_TIMEOUT_SECS`) take precedence.
+pub const NETWORK_MOUNT_DRIVE_TIMEOUT_SECS: u64 = 60;
