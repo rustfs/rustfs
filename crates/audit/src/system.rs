@@ -12,7 +12,10 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{AuditEntry, AuditError, AuditRegistry, AuditResult, observability, pipeline::AuditPipeline};
+use crate::{
+    AuditEntry, AuditError, AuditRegistry, AuditResult, observability,
+    pipeline::{AuditPipeline, AuditRuntimeView},
+};
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     ReplayWorkerManager, RuntimeActivation, Target, TargetError, activate_targets_with_replay,
@@ -60,6 +63,10 @@ impl Default for AuditSystem {
 impl AuditSystem {
     fn pipeline(&self) -> AuditPipeline {
         AuditPipeline::new(self.registry.clone())
+    }
+
+    fn runtime_view(&self) -> AuditRuntimeView {
+        AuditRuntimeView::new(self.registry.clone())
     }
 
     /// Creates a new audit system
@@ -463,14 +470,12 @@ impl AuditSystem {
     /// # Returns
     /// * `Vec<String>` - List of target IDs
     pub async fn list_targets(&self) -> Vec<String> {
-        let registry = self.registry.lock().await;
-        registry.list_targets()
+        self.runtime_view().list_targets().await
     }
 
     /// Returns cloned target values for read-only runtime inspection.
     pub async fn get_target_values(&self) -> Vec<rustfs_targets::SharedTarget<AuditEntry>> {
-        let registry = self.registry.lock().await;
-        registry.list_target_values()
+        self.runtime_view().get_target_values().await
     }
 
     /// Returns per-target delivery metrics for Prometheus collection.
@@ -496,8 +501,7 @@ impl AuditSystem {
     /// # Returns
     /// * `Option<String>` - Target ID if found
     pub async fn get_target(&self, target_id: &str) -> Option<String> {
-        let registry = self.registry.lock().await;
-        registry.get_target(target_id).map(|target| target.id().to_string())
+        self.runtime_view().get_target(target_id).await
     }
 
     /// Reloads configuration and updates targets

@@ -31,6 +31,6 @@ pub use entity::{ApiDetails, AuditEntry, ObjectVersion};
 pub use error::{AuditError, AuditResult};
 pub use global::*;
 pub use observability::{AuditMetrics, AuditMetricsReport, PerformanceValidation};
-pub use pipeline::AuditPipeline;
+pub use pipeline::{AuditPipeline, AuditRuntimeView};
 pub use registry::AuditRegistry;
 pub use system::{AuditSystem, AuditTargetMetricSnapshot};

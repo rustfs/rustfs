@@ -187,3 +187,29 @@ impl AuditPipeline {
         registry.runtime_manager().health_snapshots().await
     }
 }
+
+#[derive(Clone)]
+pub struct AuditRuntimeView {
+    registry: Arc<Mutex<crate::AuditRegistry>>,
+}
+
+impl AuditRuntimeView {
+    pub fn new(registry: Arc<Mutex<crate::AuditRegistry>>) -> Self {
+        Self { registry }
+    }
+
+    pub async fn list_targets(&self) -> Vec<String> {
+        let registry = self.registry.lock().await;
+        registry.list_targets()
+    }
+
+    pub async fn get_target_values(&self) -> Vec<rustfs_targets::SharedTarget<AuditEntry>> {
+        let registry = self.registry.lock().await;
+        registry.list_target_values()
+    }
+
+    pub async fn get_target(&self, target_id: &str) -> Option<String> {
+        let registry = self.registry.lock().await;
+        registry.get_target(target_id).map(|target| target.id().to_string())
+    }
+}
