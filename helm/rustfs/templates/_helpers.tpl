@@ -224,9 +224,14 @@ One volume expression per server pool, joined with spaces (the server splits
 RUSTFS_VOLUMES on spaces, one pool per expression).
 */}}
 {{- define "rustfs.volumes" -}}
-{{- if lt (.Values.replicaCount | int) 1 }}
-{{- fail "distributed mode requires replicaCount >= 1" }}
-{{- end }}
+{{- $replicas := int .Values.replicaCount -}}
+{{- $drives := int .Values.drivesPerNode -}}
+{{- if lt $replicas 1 -}}
+{{- fail "rustfs.volumes requires .Values.replicaCount to be >= 1" -}}
+{{- end -}}
+{{- if lt $drives 1 -}}
+{{- fail "rustfs.volumes requires .Values.drivesPerNode to be >= 1" -}}
+{{- end -}}
 
 {{- $protocol := "http" -}}
 {{- if .Values.mtls.enabled -}}
