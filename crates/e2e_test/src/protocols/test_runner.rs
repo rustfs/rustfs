@@ -16,6 +16,10 @@
 
 use crate::common::init_logging;
 use crate::protocols::ftps_core::test_ftps_core_operations;
+use crate::protocols::sftp_compliance::{
+    test_sftp_compliance_readonly, test_sftp_compliance_standalone, test_sftp_compliance_suite,
+};
+use crate::protocols::sftp_core::{test_sftp_core_operations, test_sftp_idle_timeout_disconnects};
 use crate::protocols::webdav_core::test_webdav_core_operations;
 use serial_test::serial;
 use std::time::Instant;
@@ -68,6 +72,21 @@ impl ProtocolTestSuite {
             TestDefinition {
                 name: "test_webdav_core_operations".to_string(),
             },
+            TestDefinition {
+                name: "test_sftp_core_operations".to_string(),
+            },
+            TestDefinition {
+                name: "test_sftp_compliance_suite".to_string(),
+            },
+            TestDefinition {
+                name: "test_sftp_compliance_readonly".to_string(),
+            },
+            TestDefinition {
+                name: "test_sftp_idle_timeout_disconnects".to_string(),
+            },
+            TestDefinition {
+                name: "test_sftp_compliance_standalone".to_string(),
+            },
         ];
 
         Self { tests }
@@ -93,6 +112,26 @@ impl ProtocolTestSuite {
                 "test_webdav_core_operations" => {
                     info!("=== Starting WebDAV Core Test ===");
                     "WebDAV core operations (MKCOL, PUT, GET, DELETE, PROPFIND)"
+                }
+                "test_sftp_core_operations" => {
+                    info!("=== Starting SFTP Core Test ===");
+                    "SFTP core operations (banner, mkdir, put, get with SHA compare, rename, delete, rmdir)"
+                }
+                "test_sftp_compliance_suite" => {
+                    info!("=== Starting SFTP Compliance Suite ===");
+                    "SFTP compliance regression suite (zero-byte, mutation rejection, traversal, rename, implicit dirs, FSETSTAT)"
+                }
+                "test_sftp_compliance_readonly" => {
+                    info!("=== Starting SFTP Read-Only Compliance Suite ===");
+                    "SFTP read-only mode (RUSTFS_SFTP_READ_ONLY=true rejects mutations and allows reads)"
+                }
+                "test_sftp_idle_timeout_disconnects" => {
+                    info!("=== Starting SFTP Idle-Timeout Test ===");
+                    "SFTP idle-timeout disconnects (server closes the session past RUSTFS_SFTP_IDLE_TIMEOUT)"
+                }
+                "test_sftp_compliance_standalone" => {
+                    info!("=== Starting SFTP Standalone-Server Compliance Suite ===");
+                    "SFTP standalone-server compliance suite"
                 }
                 _ => "",
             };
@@ -133,6 +172,11 @@ impl ProtocolTestSuite {
         match test_def.name.as_str() {
             "test_ftps_core_operations" => test_ftps_core_operations().await.map_err(|e| e.into()),
             "test_webdav_core_operations" => test_webdav_core_operations().await.map_err(|e| e.into()),
+            "test_sftp_core_operations" => test_sftp_core_operations().await.map_err(|e| e.into()),
+            "test_sftp_compliance_suite" => test_sftp_compliance_suite().await.map_err(|e| e.into()),
+            "test_sftp_compliance_readonly" => test_sftp_compliance_readonly().await.map_err(|e| e.into()),
+            "test_sftp_idle_timeout_disconnects" => test_sftp_idle_timeout_disconnects().await.map_err(|e| e.into()),
+            "test_sftp_compliance_standalone" => test_sftp_compliance_standalone().await.map_err(|e| e.into()),
             _ => Err(format!("Test {} not implemented", test_def.name).into()),
         }
     }

@@ -133,6 +133,14 @@ pub fn is_s3code_retryable(s3code: &str) -> bool {
     RETRYABLE_S3CODES.contains(&s3code.to_string())
 }
 
+/// Like is_s3code_retryable but matches by substring containment on
+/// the supplied message. Use this when only the rendered error string
+/// is available (for example, inside protocol drivers that consume
+/// StorageBackend::Error: Display) rather than a parsed S3 error code.
+pub fn is_s3code_in_message_retryable(message: &str) -> bool {
+    RETRYABLE_S3CODES.iter().any(|code| message.contains(code))
+}
+
 pub fn is_http_status_retryable(http_statuscode: &http::StatusCode) -> bool {
     RETRYABLE_HTTP_STATUSCODES.contains(http_statuscode)
 }
@@ -195,5 +203,51 @@ mod tests {
         let mut retry_timer = RetryTimer::new(0, Duration::from_millis(1), Duration::from_millis(2), NO_JITTER, 0);
 
         assert_eq!(retry_timer.next().await, None);
+    }
+
+    #[test]
+    fn is_s3code_in_message_retryable_matches_each_retryable_code() {
+        for code in [
+            "RequestError",
+            "RequestTimeout",
+            "Throttling",
+            "ThrottlingException",
+            "RequestLimitExceeded",
+            "RequestThrottled",
+            "InternalError",
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "SlowDown",
+        ] {
+            assert!(is_s3code_in_message_retryable(code), "bare code {code} must be classified retryable");
+        }
+    }
+
+    #[test]
+    fn is_s3code_in_message_retryable_matches_substring_in_longer_message() {
+        assert!(is_s3code_in_message_retryable("S3Error: SlowDown please retry"));
+        assert!(is_s3code_in_message_retryable("aws-sdk error code=Throttling status=503"));
+    }
+
+    #[test]
+    fn is_s3code_in_message_retryable_rejects_terminal_codes() {
+        assert!(!is_s3code_in_message_retryable("AccessDenied"));
+        assert!(!is_s3code_in_message_retryable("NoSuchBucket: bucket-name"));
+        assert!(!is_s3code_in_message_retryable("InvalidArgument: key"));
+    }
+
+    #[test]
+    fn is_s3code_in_message_retryable_rejects_empty_string() {
+        assert!(!is_s3code_in_message_retryable(""));
+    }
+
+    #[test]
+    fn is_s3code_in_message_retryable_is_case_sensitive() {
+        // Pin the contract: a backend that down-cases its error
+        // strings would not be classified retryable. If a future
+        // backend needs case-insensitive matching, change the helper
+        // and update this test in the same change.
+        assert!(!is_s3code_in_message_retryable("slowdown"));
+        assert!(!is_s3code_in_message_retryable("THROTTLING"));
     }
 }

@@ -26,8 +26,10 @@ workspace = true
 [features]
 default = []
 ftps = []
+sftp = []
 
 [dependencies]
+rustfs-config.workspace = true
 rustfs-ecstore.workspace = true
 rustfs-common.workspace = true
 rustfs-rio.workspace = true
@@ -72,5 +74,7 @@ suppaftp = { workspace = true, features = ["tokio", "rustls-aws-lc-rs"] }
 rcgen.workspace = true
 anyhow.workspace = true
 rustls.workspace = true
+russh = { workspace = true }
+russh-sftp = { workspace = true }
 zip.workspace = true
 clap.workspace = true
