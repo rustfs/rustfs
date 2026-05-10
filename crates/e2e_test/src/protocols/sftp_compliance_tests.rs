@@ -406,7 +406,6 @@ fn capture_server_stdout(child: &mut Child) -> Arc<tokio::sync::Mutex<Vec<String
 /// or "SFTP session task panicked" log emits a finish. The session-
 /// lifecycle cases (CMPTST-24, CMPTST-25, CMPTST-26) read both fields
 /// to assert the watchdog killed silent sessions on the expected path.
-#[cfg(target_os = "linux")]
 #[derive(Default)]
 #[cfg(target_os = "linux")]
 struct SessionCounters {

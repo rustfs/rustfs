@@ -63,7 +63,7 @@
 //!   the rest. Subsequent reads inside that window are served from
 //!   memory. Total cache memory across every live handle is bounded by
 //!   a shared atomic accumulator enforced against the process-wide
-//!   ceiling. On ceiling breach the populated is skipped and the read
+//!   ceiling. On ceiling breach the population is skipped and the read
 //!   serves correctly via a single backend call without storing the
 //!   bytes for re-use.
 //!
