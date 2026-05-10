@@ -14,6 +14,7 @@
 
 use crate::bucket_config_manager::NotifyBucketConfigManager;
 use crate::config_manager::NotifyConfigManager;
+use crate::event_bridge::{LiveEventHistory, NotifyEventBridge};
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
 use crate::runtime_facade::NotifyRuntimeFacade;
@@ -27,60 +28,17 @@ use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, Target};
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore, broadcast};
 use tracing::info;
 
-const MAX_RECENT_LIVE_EVENTS: usize = 1024;
-
 #[derive(Clone)]
 pub struct LiveEventBatch {
     pub events: Vec<Arc<Event>>,
     pub next_sequence: u64,
     pub truncated: bool,
-}
-
-#[derive(Default)]
-struct LiveEventHistory {
-    next_sequence: u64,
-    events: VecDeque<(u64, Arc<Event>)>,
-}
-
-impl LiveEventHistory {
-    fn record(&mut self, event: Arc<Event>) {
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        self.events.push_back((self.next_sequence, event));
-        while self.events.len() > MAX_RECENT_LIVE_EVENTS {
-            self.events.pop_front();
-        }
-    }
-
-    fn snapshot_since(&self, after_sequence: u64, limit: usize) -> LiveEventBatch {
-        let mut events = Vec::new();
-        let mut next_sequence = after_sequence;
-        let mut truncated = false;
-
-        for (sequence, event) in self.events.iter() {
-            if *sequence <= after_sequence {
-                continue;
-            }
-            if events.len() >= limit {
-                truncated = true;
-                break;
-            }
-            next_sequence = *sequence;
-            events.push(event.clone());
-        }
-
-        LiveEventBatch {
-            events,
-            next_sequence,
-            truncated,
-        }
-    }
 }
 
 /// Notify the system of monitoring indicators
@@ -229,6 +187,10 @@ impl NotificationSystem {
         NotifyBucketConfigManager::new(self.notifier.clone(), self.subscriber_view.clone())
     }
 
+    fn event_bridge(&self) -> NotifyEventBridge {
+        NotifyEventBridge::new(self.notifier.clone(), self.live_event_sender.clone(), self.live_event_history.clone())
+    }
+
     /// Creates a new NotificationSystem
     pub fn new(config: Config) -> Self {
         let concurrency_limiter =
@@ -284,17 +246,16 @@ impl NotificationSystem {
 
     /// Returns true when at least one in-process consumer is subscribed to live events.
     pub fn has_live_listeners(&self) -> bool {
-        self.live_event_sender.receiver_count() > 0
+        self.event_bridge().has_live_listeners()
     }
 
     /// Subscribes to the in-process live event stream.
     pub fn subscribe_live_events(&self) -> broadcast::Receiver<Arc<Event>> {
-        self.live_event_sender.subscribe()
+        self.event_bridge().subscribe_live_events()
     }
 
     pub async fn recent_live_events_since(&self, after_sequence: u64, limit: usize) -> LiveEventBatch {
-        let history = self.live_event_history.read().await;
-        history.snapshot_since(after_sequence, limit.max(1))
+        self.event_bridge().recent_live_events_since(after_sequence, limit).await
     }
 
     /// Accurately remove a Target and its related resources through TargetID.
@@ -373,9 +334,7 @@ impl NotificationSystem {
 
     /// Sends an event
     pub async fn send_event(&self, event: Arc<Event>) {
-        self.live_event_history.write().await.record(event.clone());
-        let _ = self.live_event_sender.send(event.clone());
-        self.notifier.send(event).await;
+        self.event_bridge().send_event(event).await;
     }
 
     /// Obtain system status information
