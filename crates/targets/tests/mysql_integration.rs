@@ -290,14 +290,3 @@ async fn check_mysql_server_available_succeeds_against_existing_table() {
 
     drop_table(&dsn, &table).await;
 }
-
-#[ignore]
-#[tokio::test]
-async fn check_mysql_server_available_fails_for_missing_table() {
-    let dsn = test_dsn();
-    let table = table_name("test_missing");
-
-    let args = make_args(&dsn, &table, "");
-    let result = rustfs_targets::check_mysql_server_available(&args).await;
-    assert!(result.is_err(), "missing table should fail the probe");
-}

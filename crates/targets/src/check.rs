@@ -123,24 +123,18 @@ pub async fn check_pulsar_broker_available(args: &crate::target::pulsar::PulsarA
     .unwrap_or_else(|_| Err(crate::TargetError::Timeout("Pulsar connection timed out".to_string())))
 }
 
-/// Probes a MySQL server for connectivity and verifies the configured table
-/// is accessible.
+/// Probes a MySQL server for connectivity.
 ///
 /// 1. Validates `args`.
 /// 2. Parses the DSN and builds a connection pool.
 /// 3. Runs `SELECT 1` to confirm credentials work.
-/// 4. Runs `SELECT 1 FROM <table> LIMIT 0` to confirm the table exists and
-///    the user has read permission.
-///
-/// The whole flow is wrapped in an 8s `tokio::time::timeout`.
 pub async fn check_mysql_server_available(args: &crate::target::mysql::MySqlArgs) -> Result<(), crate::TargetError> {
     use crate::target::ensure_rustls_provider_installed;
-    use crate::target::mysql::{MySqlDsn, map_mysql_error, quote_table_name, validate_table_name};
+    use crate::target::mysql::{MySqlDsn, map_mysql_error};
     use mysql_async::{Opts, OptsBuilder, Pool, SslOpts, prelude::Queryable};
     use std::path::PathBuf;
 
     args.validate()?;
-    validate_table_name(&args.table)?;
 
     let dsn = MySqlDsn::parse(&args.dsn_string)?;
 
@@ -174,10 +168,13 @@ pub async fn check_mysql_server_available(args: &crate::target::mysql::MySqlArgs
 
     let timeout = std::time::Duration::from_secs(8);
     tokio::time::timeout(timeout, async {
-        let mut conn = pool.get_conn().await.map_err(map_mysql_error)?;
-        conn.query_drop("SELECT 1").await.map_err(map_mysql_error)?;
-        let probe_sql = format!("SELECT 1 FROM {} LIMIT 0", quote_table_name(&args.table)?);
-        conn.query_drop(probe_sql).await.map_err(map_mysql_error)?;
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|err| map_mysql_error(err, "MySQL connectivity probe failed to acquire connection"))?;
+        conn.query_drop("SELECT 1")
+            .await
+            .map_err(|err| map_mysql_error(err, "MySQL connectivity probe failed"))?;
         Ok::<(), crate::TargetError>(())
     })
     .await

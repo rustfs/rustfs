@@ -656,7 +656,7 @@ where
 
         conn.exec_drop(sql, (event_time.as_str(), event_data))
             .await
-            .map_err(map_mysql_error)?;
+            .map_err(|err| map_mysql_error(err, "Failed to insert event"))?;
 
         self.delivery_counters.record_success();
         debug!(target_id = %self.id, "MySQL event inserted");
@@ -680,16 +680,16 @@ where
 /// - `Server(1213|1205|1040)` → `Timeout` (deadlock/lock timeout/too
 ///   many connections, exponential-backoff retry)
 /// - everything else → `Request` (permanent failure)
-pub(crate) fn map_mysql_error(err: mysql_async::Error) -> TargetError {
+pub(crate) fn map_mysql_error(err: mysql_async::Error, operation: &str) -> TargetError {
     match &err {
         mysql_async::Error::Io(_) | mysql_async::Error::Driver(_) => TargetError::NotConnected,
         mysql_async::Error::Server(server_err) => match server_err.code {
             1213 | 1205 | 1040 => {
                 TargetError::Timeout(format!("MySQL transient server error {}: {}", server_err.code, server_err.message))
             }
-            _ => TargetError::Request(format!("Failed to insert event: {err}")),
+            _ => TargetError::Request(format!("{operation}: {err}")),
         },
-        _ => TargetError::Request(format!("Failed to insert event: {err}")),
+        _ => TargetError::Request(format!("{operation}: {err}")),
     }
 }
 
