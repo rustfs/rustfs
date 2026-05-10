@@ -13,12 +13,11 @@
 // limitations under the License.
 
 use crate::{error::NotificationError, event::Event, integration::NotificationMetrics, rules::RulesMap};
-use hashbrown::HashMap;
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
 use rustfs_s3_common::EventName;
-use rustfs_targets::Target;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;
+use rustfs_targets::{SharedTarget, Target, TargetRuntimeManager};
 use starshard::AsyncShardedHashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
@@ -302,7 +301,7 @@ impl EventNotifier {
 /// A thread-safe list of targets
 pub struct TargetList {
     /// Map of TargetID to Target
-    targets: HashMap<TargetID, Arc<dyn Target<Event> + Send + Sync>>,
+    runtime: TargetRuntimeManager<Event>,
 }
 
 impl Default for TargetList {
@@ -314,7 +313,9 @@ impl Default for TargetList {
 impl TargetList {
     /// Creates a new TargetList
     pub fn new() -> Self {
-        TargetList { targets: HashMap::new() }
+        TargetList {
+            runtime: TargetRuntimeManager::new(),
+        }
     }
 
     /// Adds a target to the list
@@ -326,17 +327,17 @@ impl TargetList {
     /// Returns `Ok(())` if the target was added successfully, or a `NotificationError` if an error occurred.
     pub fn add(&mut self, target: Arc<dyn Target<Event> + Send + Sync>) -> Result<(), NotificationError> {
         let id = target.id();
-        if self.targets.contains_key(&id) {
+        if self.runtime.get_by_target_id(&id).is_some() {
             // Potentially update or log a warning/error if replacing an existing target.
             warn!("Target with ID {} already exists in TargetList. It will be overwritten.", id);
         }
-        self.targets.insert(id, target);
+        self.runtime.add_arc(target);
         Ok(())
     }
 
     /// Clears all targets from the list
     pub fn clear(&mut self) {
-        self.targets.clear();
+        self.runtime.clear();
     }
 
     /// Removes a target by ID. Note: This does not stop its associated event stream.
@@ -347,30 +348,14 @@ impl TargetList {
     ///
     /// # Returns
     /// Returns the removed target if it existed, otherwise `None`.
-    pub async fn remove_target_only(&mut self, id: &TargetID) -> Option<Arc<dyn Target<Event> + Send + Sync>> {
-        if let Some(target_arc) = self.targets.remove(id) {
-            if let Err(e) = target_arc.close().await {
-                // Target's own close logic
-                error!("Failed to close target {} during removal: {}", id, e);
-            }
-            Some(target_arc)
-        } else {
-            None
-        }
+    pub async fn remove_target_only(&mut self, id: &TargetID) -> Option<SharedTarget<Event>> {
+        self.runtime.remove_by_target_id_and_close(id).await
     }
 
     /// Clears all targets from the list. Note: This does not stop their associated event streams.
     /// Stream cancellation should be handled by EventNotifier.
     pub async fn clear_targets_only(&mut self) {
-        let target_ids_to_clear: Vec<TargetID> = self.targets.keys().cloned().collect();
-        for id in target_ids_to_clear {
-            if let Some(target_arc) = self.targets.remove(&id)
-                && let Err(e) = target_arc.close().await
-            {
-                error!("Failed to close target {} during clear: {}", id, e);
-            }
-        }
-        self.targets.clear();
+        self.runtime.clear_and_close().await;
     }
 
     /// Returns a target by ID
@@ -380,28 +365,28 @@ impl TargetList {
     ///
     /// # Returns
     /// Returns the target if it exists, otherwise `None`.
-    pub fn get(&self, id: &TargetID) -> Option<Arc<dyn Target<Event> + Send + Sync>> {
-        self.targets.get(id).cloned()
+    pub fn get(&self, id: &TargetID) -> Option<SharedTarget<Event>> {
+        self.runtime.get_by_target_id(id)
     }
 
     /// Returns all target IDs
     pub fn keys(&self) -> Vec<TargetID> {
-        self.targets.keys().cloned().collect()
+        self.runtime.target_ids()
     }
 
     /// Returns all targets in the list
-    pub fn values(&self) -> Vec<Arc<dyn Target<Event> + Send + Sync>> {
-        self.targets.values().cloned().collect()
+    pub fn values(&self) -> Vec<SharedTarget<Event>> {
+        self.runtime.values()
     }
 
     /// Returns the number of targets
     pub fn len(&self) -> usize {
-        self.targets.len()
+        self.runtime.len()
     }
 
     /// is_empty can be derived from len()
     pub fn is_empty(&self) -> bool {
-        self.targets.is_empty()
+        self.runtime.is_empty()
     }
 }
 

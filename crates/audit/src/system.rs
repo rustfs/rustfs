@@ -625,10 +625,7 @@ impl AuditSystem {
     /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn remove_target(&self, target_id: &str) -> AuditResult<()> {
         let mut registry = self.registry.lock().await;
-        if let Some(target) = registry.remove_target(target_id) {
-            if let Err(e) = target.close().await {
-                error!(target_id = %target_id, error = %e, "Failed to close removed target");
-            }
+        if registry.remove_target(target_id).await.is_some() {
             info!(target_id = %target_id, "Target removed");
             Ok(())
         } else {
@@ -653,11 +650,7 @@ impl AuditSystem {
         }
 
         // Remove existing target if present
-        if let Some(old_target) = registry.remove_target(&target_id)
-            && let Err(e) = old_target.close().await
-        {
-            error!(target_id = %target_id, error = %e, "Failed to close old target during upsert");
-        }
+        let _ = registry.remove_target(&target_id).await;
 
         registry.add_target(target_id.clone(), target);
         info!(target_id = %target_id, "Target upserted");
@@ -674,7 +667,7 @@ impl AuditSystem {
     }
 
     /// Returns cloned target values for read-only runtime inspection.
-    pub async fn get_target_values(&self) -> Vec<Box<dyn Target<AuditEntry> + Send + Sync>> {
+    pub async fn get_target_values(&self) -> Vec<rustfs_targets::SharedTarget<AuditEntry>> {
         let registry = self.registry.lock().await;
         registry.list_target_values()
     }

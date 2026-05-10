@@ -20,6 +20,7 @@ pub mod domain;
 pub mod error;
 pub mod manifest;
 pub mod plugin;
+pub mod runtime;
 pub mod store;
 pub mod sys;
 pub mod target;
@@ -36,6 +37,7 @@ pub use plugin::{
     BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetPluginRegistry, TargetRequestValidator,
     boxed_target,
 };
+pub use runtime::{RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager};
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};
 pub use sys::user_agent::*;
