@@ -17,7 +17,6 @@
 pub mod ftps_core;
 pub mod sftp_compliance;
 mod sftp_compliance_tests;
-pub mod sftp_constants;
 pub mod sftp_core;
 pub mod sftp_helpers;
 pub mod test_env;

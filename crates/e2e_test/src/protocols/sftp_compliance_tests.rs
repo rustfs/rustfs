@@ -106,12 +106,6 @@
 //!   byte-exact with RUSTFS_SFTP_READ_CACHE_WINDOW_BYTES=0.
 
 use crate::common::rustfs_binary_path_with_features;
-#[cfg(target_os = "linux")]
-use crate::protocols::sftp_constants::ENV_SFTP_IDLE_TIMEOUT;
-use crate::protocols::sftp_constants::{
-    ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_PART_SIZE,
-    ENV_SFTP_READ_CACHE_WINDOW_BYTES, ENV_SFTP_READ_ONLY,
-};
 use crate::protocols::sftp_helpers::{
     AcceptAnyServerKey, ServerProcess, build_test_s3_client, connect_sftp_to, generate_host_key, sftp_read_full,
     wait_for_s3_ready,
@@ -124,6 +118,12 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client;
 use russh_sftp::client::{Config, SftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+#[cfg(target_os = "linux")]
+use rustfs_config::ENV_SFTP_IDLE_TIMEOUT;
+use rustfs_config::{
+    ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_PART_SIZE,
+    ENV_SFTP_READ_CACHE_WINDOW_BYTES, ENV_SFTP_READ_ONLY,
+};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -300,7 +300,7 @@ async fn seed_large_via_multipart(s3: &S3Client, bucket: &str, key: &str, size_b
     let mut offset: u64 = 0;
     let mut part_number: i32 = 1;
     while offset < size_bytes {
-        let chunk = ((part_size as u64).min(size_bytes - offset)) as usize;
+        let chunk = (part_size as u64).min(size_bytes - offset) as usize;
         let mut body = vec![0u8; chunk];
         for (i, b) in body.iter_mut().enumerate() {
             *b = ((offset + i as u64) as u8).wrapping_mul(THRASH_PATTERN_MULTIPLIER);
@@ -342,7 +342,7 @@ fn calculate_pattern_sha256(size_bytes: u64, multiplier: u8) -> [u8; 32] {
     let mut buf = vec![0u8; chunk];
     let mut written: u64 = 0;
     while written < size_bytes {
-        let n = ((chunk as u64).min(size_bytes - written)) as usize;
+        let n = (chunk as u64).min(size_bytes - written) as usize;
         for (i, b) in buf[..n].iter_mut().enumerate() {
             *b = ((written + i as u64) as u8).wrapping_mul(multiplier);
         }
@@ -406,6 +406,7 @@ fn capture_server_stdout(child: &mut Child) -> Arc<tokio::sync::Mutex<Vec<String
 /// or "SFTP session task panicked" log emits a finish. The session-
 /// lifecycle cases (CMPTST-24, CMPTST-25, CMPTST-26) read both fields
 /// to assert the watchdog killed silent sessions on the expected path.
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 #[cfg(target_os = "linux")]
 struct SessionCounters {
@@ -1497,7 +1498,7 @@ pub(crate) mod cmptst_24 {
             // TCP connection so the loop iterates once and the JoinSet
             // drain emits the "SFTP session task finished" log for
             // every session that the per-session deadline has already
-            // cancelled. Without this, the counters under-report on a
+            // canceled. Without this, the counters under-report on a
             // quiet server.
             for _ in 0..3 {
                 if let Ok(stream) = TcpStream::connect(HALF_CLOSE_SFTP_ADDRESS).await {
@@ -2032,7 +2033,7 @@ pub(crate) mod cmptst_25 {
 
             // Tickle the accept loop so JoinSet::try_join_next emits
             // the "SFTP session task finished" log lines for any
-            // session the watchdog has cancelled. Same mechanism the
+            // session the watchdog has canceled. Same mechanism the
             // half-close case uses. Mirrors the accept-loop drain
             // pattern in server.rs.
             for _ in 0..3 {
@@ -3115,7 +3116,7 @@ pub(crate) mod cmptst_31 {
             // Read continuation must complete inside the resume
             // deadline. If it does not, the server-side flush did not
             // unwedge after the SSH window was replenished.
-            let resume_outcome = tokio::time::timeout(Duration::from_secs(PAUSE31_RESUME_DEADLINE_SECS), read_handle).await;
+            let resume_outcome = timeout(Duration::from_secs(PAUSE31_RESUME_DEADLINE_SECS), read_handle).await;
             let (final_total, observed_sha) = match resume_outcome {
                 Ok(join_result) => match join_result {
                     Ok(Ok(p)) => p,
@@ -3154,7 +3155,7 @@ pub(crate) mod cmptst_31 {
             eprintln!("--- end rustfs stdout dump ---");
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(PAUSE31_OVERALL_DEADLINE_SECS), async {
+        let _ = timeout(Duration::from_secs(PAUSE31_OVERALL_DEADLINE_SECS), async {
             server_process.kill_and_wait().await;
         })
         .await;
@@ -3207,7 +3208,7 @@ pub(crate) mod cmptst_32 {
             eprintln!("--- end rustfs stdout dump ---");
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(READ_CACHE_DEADLINE_SECS), async {
+        let _ = timeout(Duration::from_secs(READ_CACHE_DEADLINE_SECS), async {
             server_process.kill_and_wait().await;
         })
         .await;
@@ -3260,7 +3261,7 @@ pub(crate) mod cmptst_33 {
             eprintln!("--- end rustfs stdout dump ---");
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(READ_CACHE_DEADLINE_SECS), async {
+        let _ = timeout(Duration::from_secs(READ_CACHE_DEADLINE_SECS), async {
             server_process.kill_and_wait().await;
         })
         .await;
