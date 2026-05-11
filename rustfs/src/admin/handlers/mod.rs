@@ -28,6 +28,7 @@ pub mod kms_management;
 pub mod metrics;
 pub mod module_switch;
 pub mod oidc;
+pub mod plugins_catalog;
 pub mod policies;
 pub mod pools;
 pub mod profile;
@@ -57,6 +58,7 @@ mod tests {
         let _account_handler = account_info::AccountInfoHandler {};
         let _list_audit_targets = audit::ListAuditTargets {};
         let _get_module_switches = module_switch::GetModuleSwitchesHandler {};
+        let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
         let _update_module_switches = module_switch::UpdateModuleSwitchesHandler {};
         let _service_handler = system::ServiceHandle {};
         let _server_info_handler = system::ServerInfoHandler {};
