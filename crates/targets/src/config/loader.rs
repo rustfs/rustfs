@@ -13,10 +13,9 @@
 // limitations under the License.
 
 use super::common::{is_target_enabled, split_env_field_and_instance};
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, EnableState};
+use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
 use rustfs_ecstore::config::{Config, KVS};
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use tracing::{debug, warn};
 
 pub fn collect_target_configs(
@@ -72,6 +71,17 @@ fn redacted_target_config(config: &KVS) -> Vec<(String, String)> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergedTargetConfigRecord {
+    pub instance_id: String,
+    pub effective_config: KVS,
+    pub enabled: bool,
+    pub has_file_default: bool,
+    pub has_file_instance: bool,
+    pub has_env_default: bool,
+    pub has_env_instance: bool,
+}
+
 pub fn collect_env_target_instance_ids(route_prefix: &str, target_type: &str, valid_fields: &HashSet<String>) -> HashSet<String> {
     collect_env_target_instance_ids_from_env(route_prefix, target_type, valid_fields, std::env::vars())
 }
@@ -113,25 +123,40 @@ pub fn collect_target_configs_from_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let all_env: Vec<(String, String)> = env_vars.into_iter().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
-    let section_name = format!("{route_prefix}{target_type}").to_lowercase();
-    let file_configs = config.0.get(&section_name).cloned().unwrap_or_default();
-    let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
+    collect_merged_target_configs_from_env(
+        config,
+        &format!("{route_prefix}{target_type}").to_lowercase(),
+        route_prefix,
+        target_type,
+        valid_fields,
+        env_vars,
+    )
+    .into_iter()
+    .filter(|record| record.enabled)
+    .map(|record| (record.instance_id, record.effective_config))
+    .collect()
+}
 
-    let enable_prefix =
-        format!("{ENV_PREFIX}{route_prefix}{target_type}{DEFAULT_DELIMITER}{ENABLE_KEY}{DEFAULT_DELIMITER}").to_uppercase();
+pub(crate) fn collect_merged_target_configs_from_env<I>(
+    config: &Config,
+    section_name: &str,
+    route_prefix: &str,
+    target_type: &str,
+    valid_fields: &HashSet<String>,
+    env_vars: I,
+) -> Vec<MergedTargetConfigRecord>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let all_env: Vec<(String, String)> = env_vars.into_iter().filter(|(key, _)| key.starts_with(ENV_PREFIX)).collect();
+    let file_configs = config.0.get(section_name).cloned().unwrap_or_default();
+    let default_cfg = file_configs.get(DEFAULT_DELIMITER).cloned().unwrap_or_default();
+    let has_file_default = file_configs.contains_key(DEFAULT_DELIMITER);
+
     let env_prefix = format!("{ENV_PREFIX}{route_prefix}{target_type}{DEFAULT_DELIMITER}").to_uppercase();
 
-    let mut instance_ids_from_env = HashSet::new();
     let mut env_overrides: HashMap<String, KVS> = HashMap::new();
     for (key, value) in &all_env {
-        if EnableState::from_str(value).ok().map(|s| s.is_enabled()).unwrap_or(false)
-            && let Some(id) = key.strip_prefix(&enable_prefix)
-            && !id.is_empty()
-        {
-            instance_ids_from_env.insert(id.to_lowercase());
-        }
-
         let Some(rest) = key.strip_prefix(&env_prefix) else {
             continue;
         };
@@ -158,6 +183,7 @@ where
     }
 
     let mut effective_default = default_cfg;
+    let has_env_default = env_overrides.contains_key(DEFAULT_DELIMITER);
     if let Some(default_env_cfg) = env_overrides.remove(DEFAULT_DELIMITER) {
         effective_default.extend(default_env_cfg);
     }
@@ -167,16 +193,18 @@ where
         .filter(|key| key.as_str() != DEFAULT_DELIMITER)
         .cloned()
         .collect();
-    all_instance_ids.extend(instance_ids_from_env);
+    all_instance_ids.extend(env_overrides.keys().filter(|key| key.as_str() != DEFAULT_DELIMITER).cloned());
     all_instance_ids.sort();
     all_instance_ids.dedup();
 
     let mut merged_configs = Vec::new();
     for id in all_instance_ids {
         let mut merged_config = effective_default.clone();
+        let has_file_instance = file_configs.contains_key(&id);
         if let Some(file_instance_cfg) = file_configs.get(&id) {
             merged_config.extend(file_instance_cfg.clone());
         }
+        let has_env_instance = env_overrides.contains_key(&id);
         if let Some(env_instance_cfg) = env_overrides.get(&id) {
             merged_config.extend(env_instance_cfg.clone());
         }
@@ -185,9 +213,15 @@ where
             let redacted_config = redacted_target_config(&merged_config);
             debug!(instance_id = %id, ?redacted_config, "Merged target configuration");
         }
-        if is_target_enabled(&merged_config) {
-            merged_configs.push((id, merged_config));
-        }
+        merged_configs.push(MergedTargetConfigRecord {
+            instance_id: id,
+            enabled: is_target_enabled(&merged_config),
+            effective_config: merged_config,
+            has_file_default,
+            has_file_instance,
+            has_env_default,
+            has_env_instance,
+        });
     }
 
     merged_configs
