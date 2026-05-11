@@ -30,7 +30,10 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::EncodingType;
+    use futures::{StreamExt, stream};
     use serial_test::serial;
+    use std::collections::HashSet;
     use tracing::info;
 
     /// Helper function to create an S3 client for testing
@@ -55,6 +58,235 @@ mod tests {
                 }
             }
         }
+    }
+
+    async fn list_all_objects_v2(client: &Client, bucket: &str, prefix: &str, page_size: i32) -> Vec<String> {
+        let mut continuation_token: Option<String> = None;
+        let mut page_count = 0usize;
+        let mut last_key: Option<String> = None;
+        let mut listed_keys = Vec::new();
+        let mut seen = HashSet::new();
+
+        loop {
+            let mut request = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .max_keys(page_size)
+                .fetch_owner(true)
+                .encoding_type(EncodingType::Url);
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let output = request.send().await.expect("Failed to list objects");
+            let contents = output.contents();
+            assert!(
+                contents.len() <= page_size as usize,
+                "ListObjectsV2 page exceeded requested max_keys: {} > {}",
+                contents.len(),
+                page_size
+            );
+
+            for object in contents {
+                let key = object.key().expect("Listed object should have a key");
+                assert!(key.starts_with(prefix), "Listed key escaped prefix {prefix}: {key}");
+
+                if let Some(previous) = &last_key {
+                    assert!(
+                        key > previous.as_str(),
+                        "ListObjectsV2 did not make lexicographic progress: {key} <= {previous}"
+                    );
+                }
+
+                assert!(seen.insert(key.to_string()), "Duplicate key returned across pages: {key}");
+                listed_keys.push(key.to_string());
+                last_key = Some(key.to_string());
+            }
+
+            page_count += 1;
+
+            if output.is_truncated().unwrap_or(false) {
+                continuation_token = Some(
+                    output
+                        .next_continuation_token()
+                        .expect("NextContinuationToken must be present when IsTruncated is true")
+                        .to_string(),
+                );
+            } else {
+                assert!(
+                    output.next_continuation_token().is_none(),
+                    "NextContinuationToken should be absent on the final page"
+                );
+                break;
+            }
+
+            assert!(page_count <= 64, "Too many ListObjectsV2 pages, possible continuation-token loop");
+        }
+
+        info!(
+            "Recursive ListObjectsV2 returned all {} objects under {:?} in {} pages",
+            listed_keys.len(),
+            prefix,
+            page_count
+        );
+
+        listed_keys
+    }
+
+    async fn list_all_objects_v1(client: &Client, bucket: &str, prefix: &str, page_size: i32) -> Vec<String> {
+        let mut marker: Option<String> = None;
+        let mut page_count = 0usize;
+        let mut last_key: Option<String> = None;
+        let mut listed_keys = Vec::new();
+        let mut seen = HashSet::new();
+
+        loop {
+            let mut request = client.list_objects().bucket(bucket).prefix(prefix).max_keys(page_size);
+            if let Some(token) = marker.take() {
+                request = request.marker(token);
+            }
+
+            let output = request.send().await.expect("Failed to list objects via V1 API");
+            let contents = output.contents();
+            assert!(
+                contents.len() <= page_size as usize,
+                "ListObjects page exceeded requested max_keys: {} > {}",
+                contents.len(),
+                page_size
+            );
+
+            for object in contents {
+                let key = object.key().expect("Listed object should have a key");
+                assert!(key.starts_with(prefix), "Listed key escaped prefix {prefix}: {key}");
+
+                if let Some(previous) = &last_key {
+                    assert!(
+                        key > previous.as_str(),
+                        "ListObjects did not make lexicographic progress: {key} <= {previous}"
+                    );
+                }
+
+                assert!(seen.insert(key.to_string()), "Duplicate key returned across V1 pages: {key}");
+                listed_keys.push(key.to_string());
+                last_key = Some(key.to_string());
+            }
+
+            page_count += 1;
+
+            if output.is_truncated().unwrap_or(false) {
+                marker = Some(
+                    output
+                        .next_marker()
+                        .or_else(|| contents.last().and_then(|object| object.key()))
+                        .expect("NextMarker or last key must be present when IsTruncated is true")
+                        .to_string(),
+                );
+            } else {
+                assert!(output.next_marker().is_none(), "NextMarker should be absent on the final page");
+                break;
+            }
+
+            assert!(page_count <= 64, "Too many ListObjects pages, possible marker loop");
+        }
+
+        info!(
+            "Recursive ListObjects returned all {} objects under {:?} in {} pages",
+            listed_keys.len(),
+            prefix,
+            page_count
+        );
+
+        listed_keys
+    }
+
+    /// Regression test for Issue #2775: recursive ListObjectsV2 must not stop
+    /// around the previously reported ~6,888-key cap when a single prefix has
+    /// more than 10k readable objects, including a repeated path component that
+    /// exercises continuation-token forwarding.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_recursive_single_prefix_returns_all_pages() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 recursive single-prefix pagination beyond 10k objects");
+
+        const OBJECT_COUNT: usize = 10_050;
+        const PAGE_SIZE: i32 = 1000;
+        const UPLOAD_CONCURRENCY: usize = 64;
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
+            .await
+            .expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-recursive-list-cap";
+        let prefix = "engineering/";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let expected_keys: Vec<String> = (0..OBJECT_COUNT)
+            .map(|idx| {
+                format!(
+                    "{prefix}engineering/project-{project:03}/artifact-{idx:05}/blobs/sha256/{digest:064x}",
+                    project = idx % 128,
+                    digest = idx
+                )
+            })
+            .collect();
+
+        let upload_results: Vec<_> = stream::iter(expected_keys.iter().cloned())
+            .map(|key| {
+                let client = client.clone();
+                async move {
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(&key)
+                        .body(ByteStream::from_static(b"x"))
+                        .send()
+                        .await
+                        .map(|_| key)
+                }
+            })
+            .buffer_unordered(UPLOAD_CONCURRENCY)
+            .collect()
+            .await;
+
+        for result in upload_results {
+            result.expect("Failed to put object");
+        }
+
+        let prefix_keys = list_all_objects_v2(&client, bucket, prefix, PAGE_SIZE).await;
+        let root_keys = list_all_objects_v2(&client, bucket, "", PAGE_SIZE).await;
+        let prefix_keys_v1 = list_all_objects_v1(&client, bucket, prefix, PAGE_SIZE).await;
+        let seen: HashSet<String> = prefix_keys.iter().cloned().collect();
+
+        assert_eq!(
+            prefix_keys.len(),
+            OBJECT_COUNT,
+            "Issue #2775 regression: expected all {OBJECT_COUNT} objects under {prefix}, got {}",
+            prefix_keys.len()
+        );
+        assert_eq!(
+            root_keys.len(),
+            OBJECT_COUNT,
+            "Issue #2775 regression: expected whole-bucket recursive ListObjectsV2 to return all {OBJECT_COUNT} objects, got {}",
+            root_keys.len()
+        );
+        assert_eq!(
+            prefix_keys_v1.len(),
+            OBJECT_COUNT,
+            "Issue #2775 regression: expected V1 marker pagination under {prefix} to return all {OBJECT_COUNT} objects, got {}",
+            prefix_keys_v1.len()
+        );
+        assert_eq!(seen.len(), OBJECT_COUNT, "Listed keys must be unique");
+
+        for key in &expected_keys {
+            assert!(seen.contains(key), "Missing expected key after recursive ListObjectsV2 pagination: {key}");
+        }
+
+        env.stop_server();
     }
 
     /// Test that IsTruncated is false when all objects fit within max_keys

@@ -1247,29 +1247,16 @@ impl LocalDisk {
         W: AsyncWrite + Unpin + Send,
     {
         let forward = {
-            opts.forward_to.as_ref().filter(|v| v.starts_with(&*current)).map(|v| {
-                let forward = v.trim_start_matches(&*current);
-                if let Some(idx) = forward.find('/') {
-                    forward[..idx].to_owned()
-                } else {
-                    forward.to_owned()
-                }
-            })
-            // if let Some(forward_to) = &opts.forward_to {
-
-            // } else {
-            //     None
-            // }
-            // if !opts.forward_to.is_empty() && opts.forward_to.starts_with(&*current) {
-            //     let forward = opts.forward_to.trim_start_matches(&*current);
-            //     if let Some(idx) = forward.find('/') {
-            //         &forward[..idx]
-            //     } else {
-            //         forward
-            //     }
-            // } else {
-            //     ""
-            // }
+            opts.forward_to
+                .as_ref()
+                .and_then(|v| v.strip_prefix(&current))
+                .map(|forward| {
+                    if let Some(idx) = forward.find('/') {
+                        forward[..idx].to_owned()
+                    } else {
+                        forward.to_owned()
+                    }
+                })
         };
 
         if opts.limit > 0 && *objs_returned >= opts.limit {
@@ -3235,6 +3222,48 @@ mod test {
         assert_eq!(names.iter().filter(|name| *name == "marker/subdir/file.txt").count(), 1);
         assert_eq!(names.iter().filter(|name| *name == "marker/subdir/").count(), 1);
         assert_eq!(names.iter().filter(|name| *name == "marker/file.txt").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_forward_to_repeated_prefix_component() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        for idx in 0..4 {
+            fs::create_dir_all(bucket_dir.join(format!("engineering/engineering/repo-{idx:04}")))
+                .await
+                .unwrap();
+            fs::write(bucket_dir.join(format!("engineering/engineering/repo-{idx:04}/xl.meta")), b"meta")
+                .await
+                .unwrap();
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let mut writer = tokio::io::sink();
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "engineering/".to_string(),
+            recursive: true,
+            forward_to: Some("engineering/engineering/repo-0001".to_string()),
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("engineering/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        assert_eq!(
+            objs_returned, 3,
+            "forward_to must not skip a child directory whose name repeats the base prefix"
+        );
     }
 
     #[tokio::test]
