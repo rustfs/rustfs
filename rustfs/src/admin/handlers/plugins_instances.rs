@@ -34,6 +34,7 @@ use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, b
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use url::form_urlencoded;
 
 pub fn register_plugin_instance_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -98,6 +99,130 @@ fn map_instance_source(source: TargetEndpointSource) -> PluginInstanceSource {
 
 fn kvs_to_map(config: KVS) -> HashMap<String, String> {
     config.0.into_iter().map(|kv| (kv.key, kv.value)).collect()
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PluginInstanceFilters {
+    domain: Option<PluginContractDomain>,
+    service: Option<String>,
+    status: Option<String>,
+    source: Option<PluginInstanceSource>,
+    enabled: Option<bool>,
+    query: Option<String>,
+}
+
+fn extract_plugin_instance_filters(req: &S3Request<Body>) -> S3Result<PluginInstanceFilters> {
+    let mut filters = PluginInstanceFilters::default();
+
+    if let Some(query) = req.uri.query() {
+        for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+
+            match key.as_ref() {
+                "domain" => filters.domain = Some(parse_plugin_contract_domain(value)?),
+                "service" => filters.service = Some(value.to_ascii_lowercase()),
+                "status" => filters.status = Some(parse_instance_status(value)?),
+                "source" => filters.source = Some(parse_plugin_instance_source(value)?),
+                "enabled" => filters.enabled = Some(parse_bool_filter(value)?),
+                "q" => filters.query = Some(value.to_ascii_lowercase()),
+                _ => {}
+            }
+        }
+    }
+
+    Ok(filters)
+}
+
+fn parse_plugin_contract_domain(value: &str) -> S3Result<PluginContractDomain> {
+    match value.to_ascii_lowercase().as_str() {
+        "audit" => Ok(PluginContractDomain::Audit),
+        "notify" => Ok(PluginContractDomain::Notify),
+        _ => Err(s3_error!(InvalidArgument, "invalid plugin instance domain filter: '{}'", value)),
+    }
+}
+
+fn parse_instance_status(value: &str) -> S3Result<String> {
+    match value.to_ascii_lowercase().as_str() {
+        "online" | "offline" => Ok(value.to_ascii_lowercase()),
+        _ => Err(s3_error!(InvalidArgument, "invalid plugin instance status filter: '{}'", value)),
+    }
+}
+
+fn parse_plugin_instance_source(value: &str) -> S3Result<PluginInstanceSource> {
+    match value.to_ascii_lowercase().as_str() {
+        "config" => Ok(PluginInstanceSource::Config),
+        "env" => Ok(PluginInstanceSource::Env),
+        "mixed" => Ok(PluginInstanceSource::Mixed),
+        "runtime" => Ok(PluginInstanceSource::Runtime),
+        _ => Err(s3_error!(InvalidArgument, "invalid plugin instance source filter: '{}'", value)),
+    }
+}
+
+fn parse_bool_filter(value: &str) -> S3Result<bool> {
+    value
+        .parse::<bool>()
+        .map_err(|_| s3_error!(InvalidArgument, "invalid plugin instance enabled filter: '{}'", value))
+}
+
+fn filter_plugin_instances(mut instances: Vec<PluginInstanceEntry>, filters: &PluginInstanceFilters) -> Vec<PluginInstanceEntry> {
+    instances.retain(|instance| plugin_instance_matches_filters(instance, filters));
+    instances
+}
+
+fn plugin_instance_matches_filters(instance: &PluginInstanceEntry, filters: &PluginInstanceFilters) -> bool {
+    if let Some(domain) = filters.domain
+        && instance.domain != domain
+    {
+        return false;
+    }
+
+    if let Some(service) = filters.service.as_deref()
+        && !instance.service.eq_ignore_ascii_case(service)
+    {
+        return false;
+    }
+
+    if let Some(status) = filters.status.as_deref()
+        && !instance.status.eq_ignore_ascii_case(status)
+    {
+        return false;
+    }
+
+    if let Some(source) = filters.source
+        && instance.source != source
+    {
+        return false;
+    }
+
+    if let Some(enabled) = filters.enabled
+        && instance.enabled != enabled
+    {
+        return false;
+    }
+
+    if let Some(query) = filters.query.as_deref()
+        && !plugin_instance_matches_query(instance, query)
+    {
+        return false;
+    }
+
+    true
+}
+
+fn plugin_instance_matches_query(instance: &PluginInstanceEntry, query: &str) -> bool {
+    let query = query.to_ascii_lowercase();
+    [
+        instance.id.as_str(),
+        instance.plugin_id.as_str(),
+        instance.subsystem.as_str(),
+        instance.account_id.as_str(),
+        instance.service.as_str(),
+    ]
+    .into_iter()
+    .any(|field| field.to_ascii_lowercase().contains(&query))
 }
 
 async fn authorize_plugin_instance_request(req: &S3Request<Body>) -> S3Result<()> {
@@ -171,7 +296,8 @@ pub struct ListPluginInstancesHandler {}
 impl Operation for ListPluginInstancesHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_plugin_instance_request(&req).await?;
-        let instances = collect_all_instances().await?;
+        let filters = extract_plugin_instance_filters(&req)?;
+        let instances = filter_plugin_instances(collect_all_instances().await?, &filters);
         let data = serde_json::to_vec(&PluginInstancesResponse { instances })
             .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
         Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
@@ -216,17 +342,23 @@ impl Operation for GetPluginInstanceHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::map_instance;
+    use super::{
+        PluginInstanceFilters, extract_plugin_instance_filters, filter_plugin_instances, map_instance, parse_bool_filter,
+        parse_instance_status, parse_plugin_contract_domain, parse_plugin_instance_source,
+    };
     use crate::admin::handlers::target_descriptor::{
         TargetEndpointSource, TargetInstanceReadModel, canonical_target_instance_id, collect_target_instances,
     };
-    use crate::admin::plugin_contract::PluginContractDomain;
+    use crate::admin::plugin_contract::{PluginContractDomain, PluginInstanceEntry, PluginInstanceSource};
+    use http::{Extensions, HeaderMap, Uri};
+    use hyper::Method;
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
     use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::{ENABLE_KEY, WEBHOOK_ENDPOINT};
     use rustfs_ecstore::config::{Config, KV, KVS};
     use rustfs_targets::TargetDomain;
+    use s3s::{Body, S3Request};
     use std::collections::HashMap;
 
     fn enabled_kvs(value: &str) -> KVS {
@@ -359,6 +491,173 @@ mod tests {
             canonical_target_instance_id("builtin:webhook", TargetDomain::Notify, "PrimaryCase"),
             "builtin:webhook:notify:primarycase"
         );
+    }
+
+    #[test]
+    fn extract_plugin_instance_filters_parses_supported_query_fields() {
+        let req = build_plugin_instances_request(
+            "/rustfs/admin/v4/plugins/instances?domain=notify&service=webhook&status=offline&source=env&enabled=true&q=Primary",
+        );
+
+        let filters = extract_plugin_instance_filters(&req).expect("query should parse");
+        assert_eq!(
+            filters,
+            PluginInstanceFilters {
+                domain: Some(PluginContractDomain::Notify),
+                service: Some("webhook".to_string()),
+                status: Some("offline".to_string()),
+                source: Some(PluginInstanceSource::Env),
+                enabled: Some(true),
+                query: Some("primary".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn extract_plugin_instance_filters_rejects_invalid_enum_values() {
+        let err = parse_plugin_contract_domain("invalid").expect_err("invalid domain should fail");
+        assert!(err.to_string().contains("invalid plugin instance domain filter"));
+
+        let err = parse_plugin_instance_source("weird").expect_err("invalid source should fail");
+        assert!(err.to_string().contains("invalid plugin instance source filter"));
+
+        let err = parse_instance_status("unknown").expect_err("invalid status should fail");
+        assert!(err.to_string().contains("invalid plugin instance status filter"));
+
+        let err = parse_bool_filter("maybe").expect_err("invalid bool should fail");
+        assert!(err.to_string().contains("invalid plugin instance enabled filter"));
+    }
+
+    #[test]
+    fn filter_plugin_instances_applies_all_supported_filters() {
+        let matched = sample_instance(SampleInstance {
+            id: "builtin:webhook:notify:primary",
+            plugin_id: "builtin:webhook",
+            domain: PluginContractDomain::Notify,
+            subsystem: "notify_webhook",
+            account_id: "primary",
+            service: "webhook",
+            status: "offline",
+            source: PluginInstanceSource::Env,
+            enabled: true,
+        });
+        let filtered = filter_plugin_instances(
+            vec![
+                matched.clone(),
+                sample_instance(SampleInstance {
+                    id: "builtin:webhook:audit:primary",
+                    plugin_id: "builtin:webhook",
+                    domain: PluginContractDomain::Audit,
+                    subsystem: "audit_webhook",
+                    account_id: "primary",
+                    service: "webhook",
+                    status: "offline",
+                    source: PluginInstanceSource::Env,
+                    enabled: true,
+                }),
+                sample_instance(SampleInstance {
+                    id: "builtin:kafka:notify:secondary",
+                    plugin_id: "builtin:kafka",
+                    domain: PluginContractDomain::Notify,
+                    subsystem: "notify_kafka",
+                    account_id: "secondary",
+                    service: "kafka",
+                    status: "online",
+                    source: PluginInstanceSource::Config,
+                    enabled: false,
+                }),
+            ],
+            &PluginInstanceFilters {
+                domain: Some(PluginContractDomain::Notify),
+                service: Some("webhook".to_string()),
+                status: Some("offline".to_string()),
+                source: Some(PluginInstanceSource::Env),
+                enabled: Some(true),
+                query: Some("primary".to_string()),
+            },
+        );
+
+        assert_eq!(filtered, vec![matched]);
+    }
+
+    #[test]
+    fn filter_plugin_instances_search_matches_multiple_identity_fields_case_insensitively() {
+        let instances = vec![
+            sample_instance(SampleInstance {
+                id: "builtin:webhook:notify:primary",
+                plugin_id: "builtin:webhook",
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_webhook",
+                account_id: "Primary",
+                service: "webhook",
+                status: "offline",
+                source: PluginInstanceSource::Config,
+                enabled: true,
+            }),
+            sample_instance(SampleInstance {
+                id: "builtin:kafka:notify:secondary",
+                plugin_id: "builtin:kafka",
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_kafka",
+                account_id: "secondary",
+                service: "kafka",
+                status: "online",
+                source: PluginInstanceSource::Runtime,
+                enabled: true,
+            }),
+        ];
+
+        let filtered = filter_plugin_instances(
+            instances,
+            &PluginInstanceFilters {
+                query: Some("NOTIFY_KAFKA".to_string().to_ascii_lowercase()),
+                ..PluginInstanceFilters::default()
+            },
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].plugin_id, "builtin:kafka");
+    }
+
+    struct SampleInstance<'a> {
+        id: &'a str,
+        plugin_id: &'a str,
+        domain: PluginContractDomain,
+        subsystem: &'a str,
+        account_id: &'a str,
+        service: &'a str,
+        status: &'a str,
+        source: PluginInstanceSource,
+        enabled: bool,
+    }
+
+    fn sample_instance(input: SampleInstance<'_>) -> PluginInstanceEntry {
+        PluginInstanceEntry {
+            id: input.id.to_string(),
+            plugin_id: input.plugin_id.to_string(),
+            domain: input.domain,
+            subsystem: input.subsystem.to_string(),
+            account_id: input.account_id.to_string(),
+            service: input.service.to_string(),
+            status: input.status.to_string(),
+            source: input.source,
+            enabled: input.enabled,
+            config: HashMap::new(),
+        }
+    }
+
+    fn build_plugin_instances_request(uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
     }
 
     fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
