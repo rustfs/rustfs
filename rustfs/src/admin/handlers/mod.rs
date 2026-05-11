@@ -29,6 +29,7 @@ pub mod metrics;
 pub mod module_switch;
 pub mod oidc;
 pub mod plugins_catalog;
+pub mod plugins_instances;
 pub mod policies;
 pub mod pools;
 pub mod profile;
@@ -59,6 +60,8 @@ mod tests {
         let _list_audit_targets = audit::ListAuditTargets {};
         let _get_module_switches = module_switch::GetModuleSwitchesHandler {};
         let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
+        let _list_plugin_instances = plugins_instances::ListPluginInstancesHandler {};
+        let _get_plugin_instance = plugins_instances::GetPluginInstanceHandler {};
         let _update_module_switches = module_switch::UpdateModuleSwitchesHandler {};
         let _service_handler = system::ServiceHandle {};
         let _server_info_handler = system::ServerInfoHandler {};

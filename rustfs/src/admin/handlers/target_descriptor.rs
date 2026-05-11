@@ -67,6 +67,20 @@ pub(crate) struct MergedTargetEndpoint {
     pub source: TargetEndpointSource,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetInstanceReadModel {
+    pub canonical_id: String,
+    pub plugin_id: String,
+    pub domain: TargetDomain,
+    pub subsystem: String,
+    pub account_id: String,
+    pub service: String,
+    pub status: String,
+    pub source: TargetEndpointSource,
+    pub enabled: bool,
+    pub config: KVS,
+}
+
 struct TargetEndpointSnapshot {
     configured_keys: Vec<EndpointKey>,
     config_targets: HbHashSet<EndpointKey>,
@@ -185,7 +199,11 @@ pub(crate) fn classify_endpoint_source(
     env_targets: &HbHashSet<EndpointKey>,
     key: &EndpointKey,
 ) -> TargetEndpointSource {
-    match (config_targets.contains(key), env_targets.contains(key)) {
+    classify_endpoint_source_flags(config_targets.contains(key), env_targets.contains(key))
+}
+
+fn classify_endpoint_source_flags(has_config_source: bool, has_env_source: bool) -> TargetEndpointSource {
+    match (has_config_source, has_env_source) {
         (true, true) => TargetEndpointSource::Mixed,
         (true, false) => TargetEndpointSource::Config,
         (false, true) => TargetEndpointSource::Env,
@@ -340,6 +358,90 @@ pub(crate) fn merge_target_endpoints(
     endpoints
 }
 
+pub(crate) fn canonical_target_instance_id(plugin_id: &str, domain: TargetDomain, instance_id: &str) -> String {
+    format!("{plugin_id}:{}:{}", canonical_domain_label(domain), instance_id.to_lowercase())
+}
+
+pub(crate) fn collect_target_instances(
+    specs: &[AdminTargetSpec],
+    route_prefix: &str,
+    config: &Config,
+    runtime_statuses: HashMap<EndpointKey, String>,
+) -> Vec<TargetInstanceReadModel> {
+    let mut instances = Vec::new();
+    let mut seen = HashSet::new();
+    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
+    let domain = inferred_target_domain(route_prefix);
+
+    for ((account_id, service), status) in runtime_statuses {
+        let normalized = normalized_endpoint_key(&account_id, &service);
+        normalized_runtime_statuses
+            .entry(normalized)
+            .or_insert((account_id, service, status));
+    }
+
+    for instance in normalized_target_instances(specs, route_prefix, config) {
+        let key = normalized_endpoint_key(&instance.instance_id, &instance.target_type);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+
+        let status = normalized_runtime_statuses
+            .remove(&key)
+            .map(|(_, _, status)| status)
+            .unwrap_or_else(|| "offline".to_string());
+        let source = classify_endpoint_source_flags(instance_has_config_entry(&instance), instance_has_env_entry(&instance));
+
+        instances.push(TargetInstanceReadModel {
+            canonical_id: canonical_target_instance_id(&instance.plugin_id, domain, &instance.instance_id),
+            plugin_id: instance.plugin_id,
+            domain,
+            subsystem: instance.subsystem,
+            account_id: instance.instance_id,
+            service: instance.target_type,
+            status,
+            source,
+            enabled: instance.enabled,
+            config: instance.effective_config,
+        });
+    }
+
+    for (normalized, (account_id, service, status)) in normalized_runtime_statuses {
+        if !seen.insert(normalized) {
+            continue;
+        }
+
+        let plugin_id = builtin_plugin_id_for_service(&service);
+        instances.push(TargetInstanceReadModel {
+            canonical_id: canonical_target_instance_id(plugin_id, domain, &account_id),
+            plugin_id: plugin_id.to_string(),
+            domain,
+            subsystem: format!("{}_{}", canonical_domain_label(domain), service),
+            account_id,
+            service,
+            status,
+            source: TargetEndpointSource::Runtime,
+            enabled: true,
+            config: KVS::new(),
+        });
+    }
+
+    instances.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
+    instances
+}
+
+pub(crate) fn find_target_instance(
+    specs: &[AdminTargetSpec],
+    route_prefix: &str,
+    config: &Config,
+    runtime_statuses: HashMap<EndpointKey, String>,
+    canonical_id: &str,
+) -> Option<TargetInstanceReadModel> {
+    collect_target_instances(specs, route_prefix, config, runtime_statuses)
+        .into_iter()
+        .find(|instance| instance.canonical_id == canonical_id)
+}
+
 pub(crate) fn allowed_target_keys(specs: &[AdminTargetSpec], target_type: &str) -> HashSet<&'static str> {
     target_spec(specs, target_type)
         .map(|spec| spec.valid_keys.iter().copied().collect())
@@ -465,6 +567,28 @@ fn inferred_target_domain(route_prefix: &str) -> TargetDomain {
         rustfs_config::notify::NOTIFY_ROUTE_PREFIX => TargetDomain::Notify,
         rustfs_config::audit::AUDIT_ROUTE_PREFIX => TargetDomain::Audit,
         _ => TargetDomain::Notify,
+    }
+}
+
+fn canonical_domain_label(domain: TargetDomain) -> &'static str {
+    match domain {
+        TargetDomain::Notify => "notify",
+        TargetDomain::Audit => "audit",
+    }
+}
+
+fn builtin_plugin_id_for_service(service: &str) -> &'static str {
+    match service {
+        "webhook" => "builtin:webhook",
+        "mqtt" => "builtin:mqtt",
+        "kafka" => "builtin:kafka",
+        "amqp" => "builtin:amqp",
+        "nats" => "builtin:nats",
+        "pulsar" => "builtin:pulsar",
+        "mysql" => "builtin:mysql",
+        "redis" => "builtin:redis",
+        "postgres" => "builtin:postgres",
+        _ => "custom:target",
     }
 }
 
