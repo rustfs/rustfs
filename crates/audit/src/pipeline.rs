@@ -16,7 +16,7 @@ use crate::{
     AuditEntry, AuditResult, observability,
     system::{AuditSystemState, AuditTargetMetricSnapshot},
 };
-use rustfs_targets::{Target, target::EntityTarget};
+use rustfs_targets::{SharedTarget, Target, target::EntityTarget};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -35,24 +35,21 @@ impl AuditPipeline {
     pub async fn dispatch(&self, entry: Arc<AuditEntry>) -> AuditResult<()> {
         let start_time = std::time::Instant::now();
 
-        let targets: Vec<(String, Box<dyn Target<AuditEntry> + Send + Sync>)> = {
+        let targets: Vec<SharedTarget<AuditEntry>> = {
             let registry = self.registry.lock().await;
-            let target_keys = registry.list_targets();
+            let targets = registry.list_target_values();
 
-            if target_keys.is_empty() {
+            if targets.is_empty() {
                 warn!("No audit targets configured for dispatch");
                 return Ok(());
             }
 
-            target_keys
-                .into_iter()
-                .filter_map(|key| registry.get_target(&key).map(|t| (key, t.clone_dyn())))
-                .collect()
+            targets
         };
 
         let mut tasks = Vec::new();
 
-        for (target_key, target) in targets {
+        for target in targets {
             let entity_target = EntityTarget {
                 object_name: entry.api.name.clone().unwrap_or_default(),
                 bucket_name: entry.api.bucket.clone().unwrap_or_default(),
@@ -62,7 +59,7 @@ impl AuditPipeline {
 
             let task = async move {
                 let result = target.save(Arc::new(entity_target)).await;
-                (target_key, result)
+                (target.id().to_string(), result)
             };
 
             tasks.push(task);
@@ -106,25 +103,21 @@ impl AuditPipeline {
     pub async fn dispatch_batch(&self, entries: Vec<Arc<AuditEntry>>) -> AuditResult<()> {
         let start_time = std::time::Instant::now();
 
-        let targets: Vec<(String, Box<dyn Target<AuditEntry> + Send + Sync>)> = {
+        let targets: Vec<SharedTarget<AuditEntry>> = {
             let registry = self.registry.lock().await;
-            let target_keys = registry.list_targets();
+            let targets = registry.list_target_values();
 
-            if target_keys.is_empty() {
+            if targets.is_empty() {
                 warn!("No audit targets configured for batch dispatch");
                 return Ok(());
             }
 
-            target_keys
-                .into_iter()
-                .filter_map(|key| registry.get_target(&key).map(|t| (key, t.clone_dyn())))
-                .collect()
+            targets
         };
 
         let mut tasks = Vec::new();
-        for (target_key, target) in targets {
+        for target in targets {
             let entries_clone: Vec<_> = entries.iter().map(Arc::clone).collect();
-            let target_key_clone = target_key.clone();
 
             let task = async move {
                 let mut success_count = 0;
@@ -141,7 +134,7 @@ impl AuditPipeline {
                         Err(e) => errors.push(e),
                     }
                 }
-                (target_key_clone, success_count, errors)
+                (target.id().to_string(), success_count, errors)
             };
             tasks.push(task);
         }
@@ -248,14 +241,14 @@ impl AuditRuntimeView {
     }
 
     pub async fn upsert_target(&self, target_id: String, target: Box<dyn Target<AuditEntry> + Send + Sync>) -> AuditResult<()> {
-        let mut registry = self.registry.lock().await;
-
         if let Err(err) = target.init().await {
             return Err(crate::AuditError::Target(err));
         }
 
+        let shared_target: SharedTarget<AuditEntry> = Arc::from(target);
+        let mut registry = self.registry.lock().await;
         let _ = registry.remove_target(&target_id).await;
-        registry.add_target(target_id.clone(), target);
+        registry.add_shared_target(target_id.clone(), shared_target);
         info!(target_id = %target_id, "Target upserted");
         Ok(())
     }
@@ -287,7 +280,7 @@ impl AuditRuntimeFacade {
         for target in activation.targets {
             let target_id = target.id().to_string();
             info!(target_id = %target_id, "Target initialized");
-            registry.add_target(target_id, target.clone_dyn());
+            registry.add_shared_target(target_id, target);
         }
 
         drop(registry);

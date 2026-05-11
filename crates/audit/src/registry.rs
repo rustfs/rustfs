@@ -16,7 +16,7 @@ use crate::{AuditEntry, AuditError, AuditResult, factory::builtin_target_plugins
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::arn::TargetID;
-use rustfs_targets::{Target, TargetError, TargetPluginRegistry, TargetRuntimeManager};
+use rustfs_targets::{SharedTarget, Target, TargetError, TargetPluginRegistry, TargetRuntimeManager};
 use tracing::info;
 
 /// Registry for managing audit targets
@@ -94,6 +94,11 @@ impl AuditRegistry {
     pub fn add_target(&mut self, id: String, target: Box<dyn Target<AuditEntry> + Send + Sync>) {
         debug_assert_eq!(id, target.id().to_string());
         self.targets.add_boxed(target);
+    }
+
+    pub fn add_shared_target(&mut self, id: String, target: SharedTarget<AuditEntry>) {
+        debug_assert_eq!(id, target.id().to_string());
+        self.targets.add_arc(target);
     }
 
     /// Removes a target from the registry
