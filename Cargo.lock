@@ -9974,6 +9974,7 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "quick-xml 0.39.4",
+ "rcgen",
  "regex",
  "russh",
  "russh-sftp",
