@@ -26,6 +26,7 @@ use rustfs_ecstore::{
         UpdateMetadataOpts, error::DiskError,
     },
     get_global_lock_client,
+    global::GLOBAL_TierConfigMgr,
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
     new_object_layer_fn,
     rpc::{LocalPeerS3Client, PeerS3Client},
@@ -894,7 +895,23 @@ impl Node for NodeService {
         &self,
         _request: Request<LoadTransitionTierConfigRequest>,
     ) -> Result<Response<LoadTransitionTierConfigResponse>, Status> {
-        Err(unimplemented_rpc("load_transition_tier_config"))
+        let Some(store) = new_object_layer_fn() else {
+            return Ok(Response::new(LoadTransitionTierConfigResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+
+        match GLOBAL_TierConfigMgr.write().await.reload(store).await {
+            Ok(_) => Ok(Response::new(LoadTransitionTierConfigResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(LoadTransitionTierConfigResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
     }
 }
 
@@ -2229,6 +2246,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_load_transition_tier_config_no_object_layer() {
+        let service = create_test_node_service();
+
+        let response = service
+            .load_transition_tier_config(Request::new(LoadTransitionTierConfigRequest::default()))
+            .await;
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("errServerNotInitialized"));
+    }
+
+    #[tokio::test]
     async fn test_delete_bucket_metadata() {
         let service = create_test_node_service();
 
@@ -2460,12 +2493,6 @@ mod tests {
                 .update_metacache_listing(Request::new(UpdateMetacacheListingRequest::default()))
                 .await,
             "update_metacache_listing",
-        );
-        assert_unimplemented_status(
-            service
-                .load_transition_tier_config(Request::new(LoadTransitionTierConfigRequest::default()))
-                .await,
-            "load_transition_tier_config",
         );
     }
 
