@@ -750,13 +750,14 @@ impl Operation for DeletePluginInstanceHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginInstanceFilters, extract_plugin_instance_filters, filter_plugin_instances, map_instance, paginate_plugin_instances,
-        parse_bool_filter, parse_instance_status, parse_limit_filter, parse_plugin_contract_domain, parse_plugin_instance_source,
+        PluginContractDomain, PluginInstanceFilters, extract_plugin_instance_filters, filter_plugin_instances, map_instance,
+        paginate_plugin_instances, parse_bool_filter, parse_instance_status, parse_limit_filter, parse_plugin_contract_domain,
+        parse_plugin_instance_id, parse_plugin_instance_source, resolve_plugin_instance_target,
     };
     use crate::admin::handlers::target_descriptor::{
         TargetEndpointSource, TargetInstanceReadModel, canonical_target_instance_id, collect_target_instances,
     };
-    use crate::admin::plugin_contract::{PluginContractDomain, PluginInstanceEntry, PluginInstanceSource};
+    use crate::admin::plugin_contract::{PluginInstanceEntry, PluginInstanceSource};
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
@@ -918,6 +919,33 @@ mod tests {
             canonical_target_instance_id("builtin:webhook", TargetDomain::Notify, "PrimaryCase"),
             "builtin:webhook:notify:primarycase"
         );
+    }
+
+    #[test]
+    fn parse_plugin_instance_id_extracts_plugin_domain_and_name() {
+        let (plugin_id, domain, target_name) =
+            parse_plugin_instance_id("builtin:webhook:notify:PrimaryCase").expect("instance id should parse");
+
+        assert_eq!(plugin_id, "builtin:webhook");
+        assert_eq!(domain, PluginContractDomain::Notify);
+        assert_eq!(target_name, "primarycase");
+    }
+
+    #[test]
+    fn parse_plugin_instance_id_rejects_invalid_shape() {
+        let err = parse_plugin_instance_id("builtin:webhook").expect_err("truncated id should fail");
+        assert!(err.to_string().contains("invalid plugin instance id"));
+    }
+
+    #[test]
+    fn resolve_plugin_instance_target_uses_shared_specs() {
+        let resolved =
+            resolve_plugin_instance_target("builtin:webhook:audit:Primary").expect("builtin audit instance should resolve");
+
+        assert_eq!(resolved.domain, PluginContractDomain::Audit);
+        assert_eq!(resolved.target_name, "primary");
+        assert_eq!(resolved.target_spec.service, "webhook");
+        assert_eq!(resolved.target_spec.subsystem, AUDIT_WEBHOOK_SUB_SYS);
     }
 
     #[test]

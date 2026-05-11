@@ -62,6 +62,8 @@ mod tests {
         let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
         let _list_plugin_instances = plugins_instances::ListPluginInstancesHandler {};
         let _get_plugin_instance = plugins_instances::GetPluginInstanceHandler {};
+        let _put_plugin_instance = plugins_instances::PutPluginInstanceHandler {};
+        let _delete_plugin_instance = plugins_instances::DeletePluginInstanceHandler {};
         let _update_module_switches = module_switch::UpdateModuleSwitchesHandler {};
         let _service_handler = system::ServiceHandle {};
         let _server_info_handler = system::ServerInfoHandler {};
