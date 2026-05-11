@@ -34,8 +34,8 @@ pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};
 pub use manifest::TargetPluginManifest;
 pub use plugin::{
-    BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetPluginRegistry, TargetRequestValidator,
-    boxed_target,
+    BuiltinTargetAdminDescriptor, BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetPluginRegistry,
+    TargetRequestValidator, boxed_target,
 };
 pub use runtime::{
     ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeStatusSnapshot, RuntimeTargetHealthSnapshot,

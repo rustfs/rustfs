@@ -68,6 +68,38 @@ impl TargetAdminMetadata {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinTargetAdminDescriptor {
+    manifest: TargetPluginManifest,
+    valid_fields: &'static [&'static str],
+    admin: TargetAdminMetadata,
+}
+
+impl BuiltinTargetAdminDescriptor {
+    pub fn new(manifest: TargetPluginManifest, valid_fields: &'static [&'static str], admin: TargetAdminMetadata) -> Self {
+        Self {
+            manifest,
+            valid_fields,
+            admin,
+        }
+    }
+
+    #[inline]
+    pub fn manifest(&self) -> &TargetPluginManifest {
+        &self.manifest
+    }
+
+    #[inline]
+    pub fn valid_fields(&self) -> &'static [&'static str] {
+        self.valid_fields
+    }
+
+    #[inline]
+    pub fn admin_metadata(&self) -> TargetAdminMetadata {
+        self.admin
+    }
+}
+
 #[derive(Clone)]
 pub struct TargetPluginDescriptor<E>
 where
@@ -187,6 +219,19 @@ where
     #[inline]
     pub fn subsystem(&self) -> &'static str {
         self.admin.subsystem()
+    }
+}
+
+impl<E> From<BuiltinTargetDescriptor<E>> for BuiltinTargetAdminDescriptor
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    fn from(descriptor: BuiltinTargetDescriptor<E>) -> Self {
+        Self::new(
+            *descriptor.plugin().manifest(),
+            descriptor.plugin().valid_fields(),
+            descriptor.admin_metadata(),
+        )
     }
 }
 

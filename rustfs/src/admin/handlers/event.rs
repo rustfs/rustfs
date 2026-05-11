@@ -35,8 +35,8 @@ use matchit::Params;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
-use rustfs_notify::factory::builtin_target_descriptors as builtin_notification_target_descriptors;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -99,7 +99,7 @@ struct NotificationEndpointsResponse {
 }
 
 static NOTIFICATION_TARGET_SPECS: LazyLock<Vec<AdminTargetSpec>> = LazyLock::new(|| {
-    builtin_notification_target_descriptors()
+    builtin_notify_target_admin_descriptors()
         .into_iter()
         .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
         .collect()

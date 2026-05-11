@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::plugin::{BuiltinTargetDescriptor, TargetPluginDescriptor, TargetRequestValidator, boxed_target};
+use crate::plugin::{
+    BuiltinTargetAdminDescriptor, BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetRequestValidator,
+    boxed_target,
+};
 use crate::target::{ChannelTargetType, TargetType};
 use crate::{Target, TargetError};
 use rustfs_config::audit::{
@@ -63,6 +66,81 @@ where
         request_validator,
         TargetPluginDescriptor::new(target_type, valid_fields, validate_config, create_target),
     )
+}
+
+fn build_admin_descriptor(
+    subsystem: &'static str,
+    request_validator: TargetRequestValidator,
+    target_type: &'static str,
+    valid_fields: &'static [&'static str],
+) -> BuiltinTargetAdminDescriptor {
+    BuiltinTargetAdminDescriptor::new(
+        crate::manifest::builtin_target_manifest(target_type),
+        valid_fields,
+        TargetAdminMetadata::new(subsystem, request_validator),
+    )
+}
+
+pub fn builtin_audit_target_admin_descriptors() -> Vec<BuiltinTargetAdminDescriptor> {
+    vec![
+        build_admin_descriptor(
+            AUDIT_AMQP_SUB_SYS,
+            TargetRequestValidator::Amqp(TargetType::AuditLog),
+            ChannelTargetType::Amqp.as_str(),
+            AUDIT_AMQP_KEYS,
+        ),
+        build_admin_descriptor(
+            AUDIT_WEBHOOK_SUB_SYS,
+            TargetRequestValidator::Webhook,
+            ChannelTargetType::Webhook.as_str(),
+            AUDIT_WEBHOOK_KEYS,
+        ),
+        build_admin_descriptor(
+            AUDIT_MQTT_SUB_SYS,
+            TargetRequestValidator::Mqtt,
+            ChannelTargetType::Mqtt.as_str(),
+            AUDIT_MQTT_KEYS,
+        ),
+        build_admin_descriptor(
+            AUDIT_NATS_SUB_SYS,
+            TargetRequestValidator::Nats(TargetType::AuditLog),
+            ChannelTargetType::Nats.as_str(),
+            AUDIT_NATS_KEYS,
+        ),
+        build_admin_descriptor(
+            AUDIT_PULSAR_SUB_SYS,
+            TargetRequestValidator::Pulsar(TargetType::AuditLog),
+            ChannelTargetType::Pulsar.as_str(),
+            AUDIT_PULSAR_KEYS,
+        ),
+        build_admin_descriptor(
+            AUDIT_KAFKA_SUB_SYS,
+            TargetRequestValidator::Kafka(TargetType::AuditLog),
+            ChannelTargetType::Kafka.as_str(),
+            AUDIT_KAFKA_KEYS,
+        ),
+        build_admin_descriptor(
+            AUDIT_REDIS_SUB_SYS,
+            TargetRequestValidator::Redis {
+                default_channel: AUDIT_REDIS_DEFAULT_CHANNEL,
+                target_type: TargetType::AuditLog,
+            },
+            ChannelTargetType::Redis.as_str(),
+            AUDIT_REDIS_KEYS,
+        ),
+        build_admin_descriptor(
+            AUDIT_MYSQL_SUB_SYS,
+            TargetRequestValidator::MySql(TargetType::AuditLog),
+            ChannelTargetType::MySql.as_str(),
+            AUDIT_MYSQL_KEYS,
+        ),
+        build_admin_descriptor(
+            AUDIT_POSTGRES_SUB_SYS,
+            TargetRequestValidator::Postgres(TargetType::AuditLog),
+            ChannelTargetType::Postgres.as_str(),
+            AUDIT_POSTGRES_KEYS,
+        ),
+    ]
 }
 
 pub fn builtin_audit_target_descriptors<E>() -> Vec<BuiltinTargetDescriptor<E>>
@@ -171,6 +249,68 @@ where
                 let args = build_postgres_args(config, AUDIT_DEFAULT_DIR, TargetType::AuditLog)?;
                 Ok(boxed_target(crate::target::postgres::PostgresTarget::<E>::new(id, args)?))
             },
+        ),
+    ]
+}
+
+pub fn builtin_notify_target_admin_descriptors() -> Vec<BuiltinTargetAdminDescriptor> {
+    vec![
+        build_admin_descriptor(
+            NOTIFY_WEBHOOK_SUB_SYS,
+            TargetRequestValidator::Webhook,
+            ChannelTargetType::Webhook.as_str(),
+            NOTIFY_WEBHOOK_KEYS,
+        ),
+        build_admin_descriptor(
+            NOTIFY_AMQP_SUB_SYS,
+            TargetRequestValidator::Amqp(TargetType::NotifyEvent),
+            ChannelTargetType::Amqp.as_str(),
+            NOTIFY_AMQP_KEYS,
+        ),
+        build_admin_descriptor(
+            NOTIFY_KAFKA_SUB_SYS,
+            TargetRequestValidator::Kafka(TargetType::NotifyEvent),
+            ChannelTargetType::Kafka.as_str(),
+            NOTIFY_KAFKA_KEYS,
+        ),
+        build_admin_descriptor(
+            NOTIFY_MQTT_SUB_SYS,
+            TargetRequestValidator::Mqtt,
+            ChannelTargetType::Mqtt.as_str(),
+            NOTIFY_MQTT_KEYS,
+        ),
+        build_admin_descriptor(
+            NOTIFY_MYSQL_SUB_SYS,
+            TargetRequestValidator::MySql(TargetType::NotifyEvent),
+            ChannelTargetType::MySql.as_str(),
+            NOTIFY_MYSQL_KEYS,
+        ),
+        build_admin_descriptor(
+            NOTIFY_NATS_SUB_SYS,
+            TargetRequestValidator::Nats(TargetType::NotifyEvent),
+            ChannelTargetType::Nats.as_str(),
+            NOTIFY_NATS_KEYS,
+        ),
+        build_admin_descriptor(
+            NOTIFY_POSTGRES_SUB_SYS,
+            TargetRequestValidator::Postgres(TargetType::NotifyEvent),
+            ChannelTargetType::Postgres.as_str(),
+            NOTIFY_POSTGRES_KEYS,
+        ),
+        build_admin_descriptor(
+            NOTIFY_REDIS_SUB_SYS,
+            TargetRequestValidator::Redis {
+                default_channel: NOTIFY_REDIS_DEFAULT_CHANNEL,
+                target_type: TargetType::NotifyEvent,
+            },
+            ChannelTargetType::Redis.as_str(),
+            NOTIFY_REDIS_KEYS,
+        ),
+        build_admin_descriptor(
+            NOTIFY_PULSAR_SUB_SYS,
+            TargetRequestValidator::Pulsar(TargetType::NotifyEvent),
+            ChannelTargetType::Pulsar.as_str(),
+            NOTIFY_PULSAR_KEYS,
         ),
     ]
 }

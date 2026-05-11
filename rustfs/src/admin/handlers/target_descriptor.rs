@@ -22,9 +22,10 @@ use rustfs_config::{
 };
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
-    BuiltinTargetDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator, check_amqp_broker_available,
-    check_kafka_broker_available, check_mqtt_broker_available_with_tls, check_mysql_server_available,
-    check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
+    BuiltinTargetAdminDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator,
+    check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available_with_tls,
+    check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
+    check_redis_server_available,
     config::{
         build_amqp_args, build_kafka_args, build_mysql_args, build_nats_args, build_postgres_args, build_pulsar_args,
         build_redis_args, collect_env_target_instance_ids, validate_redis_config,
@@ -69,23 +70,13 @@ pub(crate) struct AdminTargetSpec {
     validator: AdminRequestValidatorFn,
 }
 
-pub(crate) fn admin_target_spec_from_builtin<E>(descriptor: &BuiltinTargetDescriptor<E>) -> AdminTargetSpec
-where
-    E: Send + Sync + 'static + Clone + serde::Serialize + serde::de::DeserializeOwned,
-{
+pub(crate) fn admin_target_spec_from_builtin(descriptor: &BuiltinTargetAdminDescriptor) -> AdminTargetSpec {
     let admin = descriptor.admin_metadata();
     AdminTargetSpec {
         subsystem: admin.subsystem(),
-        service: descriptor.plugin().manifest().target_type,
-        valid_keys: descriptor.plugin().valid_fields(),
-        valid_keys_set: Arc::new(
-            descriptor
-                .plugin()
-                .valid_fields()
-                .iter()
-                .map(|key| (*key).to_string())
-                .collect(),
-        ),
+        service: descriptor.manifest().target_type,
+        valid_keys: descriptor.valid_fields(),
+        valid_keys_set: Arc::new(descriptor.valid_fields().iter().map(|key| (*key).to_string()).collect()),
         validator: validator_from_metadata(admin),
     }
 }
