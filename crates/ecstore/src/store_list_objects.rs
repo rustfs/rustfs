@@ -1488,7 +1488,11 @@ mod test {
         };
 
         let marker = opts.encode_marker("photos/2026/image.jpg");
-        assert_eq!(marker, "photos/2026/image.jpg[rustfs_cache:v1,id:list-cache-id,p:3,s:7]");
+        let expected_marker = format!(
+            "photos/2026/image.jpg[rustfs_cache:{},id:list-cache-id,p:3,s:7]",
+            super::MARKER_TAG_VERSION
+        );
+        assert_eq!(marker, expected_marker);
 
         let mut parsed = ListPathOptions {
             marker: Some(marker),
