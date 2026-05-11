@@ -18,6 +18,7 @@ use crate::admin::{
         AdminTargetSpec, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin, build_json_response,
         collect_runtime_statuses, collect_target_instances, find_target_instance,
     },
+    plugin_contract::{PluginContractDomain, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse},
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
@@ -29,10 +30,8 @@ use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_targets::TargetDomain;
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
-use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -49,42 +48,6 @@ pub fn register_plugin_instance_route(r: &mut S3Router<AdminOperation>) -> std::
     )?;
 
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TargetDomainName {
-    Audit,
-    Notify,
-}
-
-impl From<TargetDomain> for TargetDomainName {
-    fn from(value: TargetDomain) -> Self {
-        match value {
-            TargetDomain::Audit => Self::Audit,
-            TargetDomain::Notify => Self::Notify,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct PluginInstanceEntry {
-    id: String,
-    plugin_id: String,
-    domain: TargetDomainName,
-    subsystem: String,
-    account_id: String,
-    service: String,
-    status: String,
-    source: TargetEndpointSource,
-    enabled: bool,
-    config: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct PluginInstancesResponse {
-    instances: Vec<PluginInstanceEntry>,
 }
 
 static NOTIFICATION_TARGET_SPECS: LazyLock<Vec<AdminTargetSpec>> = LazyLock::new(|| {
@@ -113,14 +76,23 @@ fn map_instance(instance: TargetInstanceReadModel) -> PluginInstanceEntry {
     PluginInstanceEntry {
         id: instance.canonical_id,
         plugin_id: instance.plugin_id,
-        domain: instance.domain.into(),
+        domain: PluginContractDomain::from(instance.domain),
         subsystem: instance.subsystem,
         account_id: instance.account_id,
         service: instance.service,
         status: instance.status,
-        source: instance.source,
+        source: map_instance_source(instance.source),
         enabled: instance.enabled,
         config: kvs_to_map(instance.config),
+    }
+}
+
+fn map_instance_source(source: TargetEndpointSource) -> PluginInstanceSource {
+    match source {
+        TargetEndpointSource::Config => PluginInstanceSource::Config,
+        TargetEndpointSource::Env => PluginInstanceSource::Env,
+        TargetEndpointSource::Mixed => PluginInstanceSource::Mixed,
+        TargetEndpointSource::Runtime => PluginInstanceSource::Runtime,
     }
 }
 
@@ -244,10 +216,11 @@ impl Operation for GetPluginInstanceHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{TargetDomainName, map_instance};
+    use super::map_instance;
     use crate::admin::handlers::target_descriptor::{
         TargetEndpointSource, TargetInstanceReadModel, canonical_target_instance_id, collect_target_instances,
     };
+    use crate::admin::plugin_contract::PluginContractDomain;
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
     use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
@@ -377,7 +350,7 @@ mod tests {
 
         let mapped = map_instance(instance.clone());
         assert_eq!(mapped.id, instance.canonical_id);
-        assert_eq!(mapped.domain, TargetDomainName::Audit);
+        assert_eq!(mapped.domain, PluginContractDomain::Audit);
     }
 
     #[test]

@@ -14,6 +14,10 @@
 
 use crate::admin::{
     auth::validate_admin_request,
+    plugin_contract::{
+        PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain, PluginContractEntrypointKind,
+        PluginContractPackaging,
+    },
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
@@ -23,10 +27,7 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
-use rustfs_targets::{
-    BuiltinTargetAdminDescriptor, TargetDomain, TargetPluginEntrypointKind, TargetPluginPackaging,
-    builtin_target_marketplace_manifest,
-};
+use rustfs_targets::{BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -42,90 +43,11 @@ pub fn register_plugin_catalog_route(r: &mut S3Router<AdminOperation>) -> std::i
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct PluginCatalogDomainEntry {
-    domain: TargetDomainName,
-    subsystem: &'static str,
-    valid_fields: &'static [&'static str],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct PluginCatalogEntry {
-    plugin_id: &'static str,
-    target_type: &'static str,
-    display_name: &'static str,
-    provider: &'static str,
-    version: &'static str,
-    packaging: PluginPackagingName,
-    entrypoint_kind: PluginEntrypointKindName,
-    api_compatibility_version: &'static str,
-    supported_domains: Vec<TargetDomainName>,
-    secret_fields: &'static [&'static str],
-    domain_configs: Vec<PluginCatalogDomainEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct PluginCatalogResponse {
-    plugins: Vec<PluginCatalogEntry>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TargetDomainName {
-    Audit,
-    Notify,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum PluginPackagingName {
-    Builtin,
-    External,
-}
-
-impl From<TargetPluginPackaging> for PluginPackagingName {
-    fn from(value: TargetPluginPackaging) -> Self {
-        match value {
-            TargetPluginPackaging::Builtin => Self::Builtin,
-            TargetPluginPackaging::External => Self::External,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum PluginEntrypointKindName {
-    Builtin,
-    Sidecar,
-    Wasm,
-}
-
-impl From<TargetPluginEntrypointKind> for PluginEntrypointKindName {
-    fn from(value: TargetPluginEntrypointKind) -> Self {
-        match value {
-            TargetPluginEntrypointKind::Builtin => Self::Builtin,
-            TargetPluginEntrypointKind::Sidecar => Self::Sidecar,
-            TargetPluginEntrypointKind::Wasm => Self::Wasm,
-        }
-    }
-}
-
-impl From<TargetDomain> for TargetDomainName {
-    fn from(value: TargetDomain) -> Self {
-        match value {
-            TargetDomain::Audit => Self::Audit,
-            TargetDomain::Notify => Self::Notify,
-        }
-    }
-}
-
-fn target_domain_name_from_subsystem(subsystem: &str) -> TargetDomainName {
+fn target_domain_name_from_subsystem(subsystem: &str) -> PluginContractDomain {
     if subsystem.starts_with("audit_") {
-        TargetDomainName::Audit
+        PluginContractDomain::Audit
     } else {
-        TargetDomainName::Notify
+        PluginContractDomain::Notify
     }
 }
 
@@ -140,7 +62,7 @@ fn build_catalog_response() -> PluginCatalogResponse {
     }
 
     let mut plugins = plugins.into_values().collect::<Vec<_>>();
-    plugins.sort_by(|a, b| a.target_type.cmp(b.target_type));
+    plugins.sort_by(|a, b| a.target_type.cmp(&b.target_type));
     for plugin in &mut plugins {
         plugin.supported_domains.sort();
         plugin.domain_configs.sort_by_key(|a| a.domain);
@@ -155,21 +77,21 @@ fn merge_catalog_descriptor(plugins: &mut HashMap<&'static str, PluginCatalogEnt
     let domain = target_domain_name_from_subsystem(descriptor.admin_metadata().subsystem());
     let domain_entry = PluginCatalogDomainEntry {
         domain,
-        subsystem: descriptor.admin_metadata().subsystem(),
-        valid_fields: descriptor.valid_fields(),
+        subsystem: descriptor.admin_metadata().subsystem().to_string(),
+        valid_fields: descriptor.valid_fields().iter().map(|field| (*field).to_string()).collect(),
     };
 
     let entry = plugins.entry(manifest.plugin_id).or_insert_with(|| PluginCatalogEntry {
-        plugin_id: manifest.plugin_id,
-        target_type: manifest.target_type,
-        display_name: manifest.display_name,
-        provider: manifest.provider,
-        version: manifest.version,
-        packaging: marketplace.packaging.into(),
-        entrypoint_kind: marketplace.entrypoint_kind.into(),
-        api_compatibility_version: marketplace.api_compatibility_version,
+        plugin_id: manifest.plugin_id.to_string(),
+        target_type: manifest.target_type.to_string(),
+        display_name: manifest.display_name.to_string(),
+        provider: manifest.provider.to_string(),
+        version: manifest.version.to_string(),
+        packaging: PluginContractPackaging::from(marketplace.packaging),
+        entrypoint_kind: PluginContractEntrypointKind::from(marketplace.entrypoint_kind),
+        api_compatibility_version: marketplace.api_compatibility_version.to_string(),
         supported_domains: manifest.supported_domains.iter().copied().map(Into::into).collect(),
-        secret_fields: manifest.secret_fields,
+        secret_fields: manifest.secret_fields.iter().map(|field| (*field).to_string()).collect(),
         domain_configs: Vec::new(),
     });
 
@@ -223,7 +145,8 @@ impl Operation for GetPluginCatalogHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginEntrypointKindName, PluginPackagingName, TargetDomainName, build_catalog_response};
+    use super::build_catalog_response;
+    use crate::admin::plugin_contract::{PluginContractDomain, PluginContractEntrypointKind, PluginContractPackaging};
 
     #[test]
     fn plugin_catalog_handlers_require_admin_authorization_contract() {
@@ -247,11 +170,11 @@ mod tests {
             .expect("builtin webhook plugin should be present");
         assert_eq!(webhook.target_type, "webhook");
         assert_eq!(webhook.display_name, "Webhook");
-        assert_eq!(webhook.packaging, PluginPackagingName::Builtin);
-        assert_eq!(webhook.entrypoint_kind, PluginEntrypointKindName::Builtin);
+        assert_eq!(webhook.packaging, PluginContractPackaging::Builtin);
+        assert_eq!(webhook.entrypoint_kind, PluginContractEntrypointKind::Builtin);
         assert_eq!(webhook.api_compatibility_version, "rustfs.target-plugin.v1");
-        assert!(webhook.supported_domains.contains(&TargetDomainName::Audit));
-        assert!(webhook.supported_domains.contains(&TargetDomainName::Notify));
+        assert!(webhook.supported_domains.contains(&PluginContractDomain::Audit));
+        assert!(webhook.supported_domains.contains(&PluginContractDomain::Notify));
         assert!(
             webhook
                 .domain_configs
@@ -284,7 +207,7 @@ mod tests {
             .find(|plugin| plugin.plugin_id == "builtin:webhook")
             .expect("builtin webhook plugin should be present");
 
-        assert!(webhook.secret_fields.contains(&"auth_token"));
+        assert!(webhook.secret_fields.contains(&"auth_token".to_string()));
         assert!(!webhook.secret_fields.iter().any(|field| field.contains("https://")));
         assert!(!webhook.secret_fields.iter().any(|field| field.contains("password=")));
     }

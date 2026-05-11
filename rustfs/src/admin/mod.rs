@@ -15,6 +15,7 @@
 mod auth;
 pub mod console;
 pub mod handlers;
+mod plugin_contract;
 pub mod router;
 pub mod service;
 pub mod site_replication_identity;
