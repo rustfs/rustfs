@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -21,6 +22,7 @@ use rustfs_config::{
     MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
 use rustfs_ecstore::config::Config;
+use rustfs_targets::SharedTarget;
 use rustfs_targets::{
     BuiltinTargetAdminDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator,
     check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available_with_tls,
@@ -38,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use url::Url;
 
@@ -274,6 +277,33 @@ pub(crate) fn build_json_response(
         header.insert("x-request-id", v.clone());
     }
     S3Response::with_headers((status, body), header)
+}
+
+pub(crate) async fn collect_runtime_statuses<E>(targets: Vec<SharedTarget<E>>) -> HashMap<EndpointKey, String>
+where
+    E: Send + Sync + 'static + Clone + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let semaphore = Arc::new(Semaphore::new(10));
+    let mut futures = futures::stream::FuturesUnordered::new();
+
+    for target in targets {
+        let sem = Arc::clone(&semaphore);
+        futures.push(async move {
+            let _permit = sem.acquire().await;
+            let status = match tokio::time::timeout(Duration::from_secs(3), target.is_active()).await {
+                Ok(Ok(true)) => "online",
+                _ => "offline",
+            };
+            ((target.id().id, target.id().name), status.to_string())
+        });
+    }
+
+    let mut runtime_statuses = HashMap::new();
+    while let Some((key, status)) = futures.next().await {
+        runtime_statuses.insert(key, status);
+    }
+
+    runtime_statuses
 }
 
 pub(crate) fn merge_target_endpoints(

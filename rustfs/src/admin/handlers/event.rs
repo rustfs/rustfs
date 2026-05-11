@@ -16,7 +16,7 @@ use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, allowed_target_keys,
-        build_json_response, collect_validated_key_values as shared_collect_validated_key_values,
+        build_json_response, collect_runtime_statuses, collect_validated_key_values as shared_collect_validated_key_values,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
         validate_target_request,
@@ -28,7 +28,6 @@ use crate::server::{
     ADMIN_PREFIX, RemoteAddr, is_notify_module_enabled, refresh_notify_module_enabled,
     refresh_persisted_module_switches_from_store,
 };
-use futures::stream::{FuturesUnordered, StreamExt};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -42,7 +41,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::LazyLock;
-use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 use tracing::{Span, info, warn};
 
@@ -237,26 +235,7 @@ impl Operation for ListNotificationTargets {
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
         let ns = get_notification_system()?;
 
-        let targets = ns.get_target_values().await;
-        let semaphore = Arc::new(Semaphore::new(10));
-        let mut futures = FuturesUnordered::new();
-
-        for target in targets {
-            let sem = Arc::clone(&semaphore);
-            futures.push(async move {
-                let _permit = sem.acquire().await;
-                let status = match timeout(Duration::from_secs(3), target.is_active()).await {
-                    Ok(Ok(true)) => "online",
-                    _ => "offline",
-                };
-                ((target.id().id, target.id().name), status.to_string())
-            });
-        }
-
-        let mut runtime_statuses = HashMap::new();
-        while let Some((key, status)) = futures.next().await {
-            runtime_statuses.insert(key, status);
-        }
+        let runtime_statuses = collect_runtime_statuses(ns.get_target_values().await).await;
         let config = ns.config.read().await.clone();
         let notification_endpoints = merge_notification_endpoints(&config, runtime_statuses);
 
@@ -283,30 +262,15 @@ impl Operation for ListTargetsArns {
         }
         let ns = get_notification_system()?;
 
-        let targets = ns.get_target_values().await;
         let region = req
             .region
             .clone()
             .ok_or_else(|| s3_error!(InvalidRequest, "region not found"))?;
-        let semaphore = Arc::new(Semaphore::new(10));
-        let mut futures = FuturesUnordered::new();
-
-        for target in targets {
-            let sem = Arc::clone(&semaphore);
-            futures.push(async move {
-                let _permit = sem.acquire().await;
-                let status = match timeout(Duration::from_secs(3), target.is_active()).await {
-                    Ok(Ok(true)) => "online",
-                    _ => "offline",
-                };
-                (target.id(), status.to_string())
-            });
-        }
-
-        let mut target_statuses = Vec::new();
-        while let Some(target_status) = futures.next().await {
-            target_statuses.push(target_status);
-        }
+        let target_statuses = collect_runtime_statuses(ns.get_target_values().await)
+            .await
+            .into_iter()
+            .map(|((account_id, service), status)| (rustfs_targets::arn::TargetID::new(account_id, service), status))
+            .collect();
 
         let data_target_arn_list = collect_online_target_arns(region.as_str(), target_statuses);
 

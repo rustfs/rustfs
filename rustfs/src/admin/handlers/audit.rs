@@ -16,7 +16,7 @@ use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, allowed_target_keys,
-        build_json_response, collect_validated_key_values as shared_collect_validated_key_values,
+        build_json_response, collect_runtime_statuses, collect_validated_key_values as shared_collect_validated_key_values,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
         validate_target_request,
@@ -27,7 +27,6 @@ use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{
     ADMIN_PREFIX, RemoteAddr, is_audit_module_enabled, refresh_audit_module_enabled, refresh_persisted_module_switches_from_store,
 };
-use futures::stream::{FuturesUnordered, StreamExt};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -40,9 +39,7 @@ use rustfs_targets::catalog::builtin::builtin_audit_target_admin_descriptors;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::LazyLock;
-use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 use tracing::{Span, warn};
 
@@ -315,25 +312,7 @@ impl Operation for ListAuditTargets {
 
         let mut runtime_statuses = HashMap::new();
         if let Some(system) = audit_system() {
-            let targets = system.get_target_values().await;
-            let semaphore = Arc::new(Semaphore::new(10));
-            let mut futures = FuturesUnordered::new();
-
-            for target in targets {
-                let sem = Arc::clone(&semaphore);
-                futures.push(async move {
-                    let _permit = sem.acquire().await;
-                    let status = match timeout(Duration::from_secs(3), target.is_active()).await {
-                        Ok(Ok(true)) => "online",
-                        _ => "offline",
-                    };
-                    ((target.id().id, target.id().name), status.to_string())
-                });
-            }
-
-            while let Some((key, status)) = futures.next().await {
-                runtime_statuses.insert(key, status);
-            }
+            runtime_statuses = collect_runtime_statuses(system.get_target_values().await).await;
         }
 
         let config = load_server_config_from_store().await?;
