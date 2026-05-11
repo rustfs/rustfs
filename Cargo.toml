@@ -277,7 +277,7 @@ thiserror = "2.0.18"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.5"
 tracing-error = "0.2.1"
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = { version = "0.32.1",git = "https://github.com/houseme/tracing-opentelemetry",rev = "66acd7b5abd279eed1699706c35c16365c3f64ec" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"
@@ -295,9 +295,9 @@ zstd = "0.13.3"
 metrics = "0.24.5"
 dial9-tokio-telemetry = "0.3"
 opentelemetry = { version = "0.32.0" }
-opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
+opentelemetry-appender-tracing = { version = "0.32.0", features = ["experimental_span_attributes", "experimental_metadata_attributes"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["gzip-http", "reqwest-rustls"] }
-opentelemetry_sdk = { version = "0.32.0" }
+opentelemetry_sdk = { version = "0.32.0",features = ["rt-tokio"] }
 opentelemetry-semantic-conventions = { version = "0.32.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.32.0" }
 pyroscope = { version = "2.0.3", features = ["backend-pprof-rs"] }

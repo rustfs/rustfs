@@ -4496,7 +4496,7 @@ dependencies = [
  "tonic-prost",
  "tower",
  "tracing",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.32.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -7066,15 +7066,14 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-appender-tracing"
-version = "0.31.1"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef6a1ac5ca3accf562b8c306fa8483c85f4390f768185ab775f242f7fe8fdcc2"
+checksum = "2c0080f0dc1d7c786f467cd85a4e395fcab11ee852004f39a29a18ab7c25d837"
 dependencies = [
- "opentelemetry 0.31.0",
+ "opentelemetry 0.32.0",
  "tracing",
  "tracing-core",
  "tracing-log",
- "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
@@ -9351,7 +9350,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.32.1 (git+https://github.com/houseme/tracing-opentelemetry?rev=66acd7b5abd279eed1699706c35c16365c3f64ec)",
  "tracing-subscriber",
  "url",
  "urlencoding",
@@ -9564,7 +9563,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.32.1 (git+https://github.com/houseme/tracing-opentelemetry?rev=66acd7b5abd279eed1699706c35c16365c3f64ec)",
  "tracing-subscriber",
  "url",
  "urlencoding",
@@ -9909,7 +9908,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-error",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.32.1 (git+https://github.com/houseme/tracing-opentelemetry?rev=66acd7b5abd279eed1699706c35c16365c3f64ec)",
  "tracing-subscriber",
  "zstd",
 ]
@@ -12201,6 +12200,19 @@ checksum = "1ac28f2d093c6c477eaa76b23525478f38de514fa9aeb1285738d4b97a9552fc"
 dependencies = [
  "js-sys",
  "opentelemetry 0.31.0",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
+ "web-time",
+]
+
+[[package]]
+name = "tracing-opentelemetry"
+version = "0.32.1"
+source = "git+https://github.com/houseme/tracing-opentelemetry?rev=66acd7b5abd279eed1699706c35c16365c3f64ec#66acd7b5abd279eed1699706c35c16365c3f64ec"
+dependencies = [
+ "js-sys",
+ "opentelemetry 0.32.0",
  "smallvec",
  "tracing",
  "tracing-core",
