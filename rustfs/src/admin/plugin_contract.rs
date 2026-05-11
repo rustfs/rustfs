@@ -122,6 +122,8 @@ pub(crate) struct PluginInstanceEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PluginInstancesResponse {
     pub instances: Vec<PluginInstanceEntry>,
+    pub truncated: bool,
+    pub next_marker: Option<String>,
 }
 
 #[cfg(test)]
@@ -198,6 +200,8 @@ mod tests {
                     ("endpoint".to_string(), "https://example.com/hook".to_string()),
                 ]),
             }],
+            truncated: false,
+            next_marker: None,
         };
 
         let value = serde_json::to_value(response).expect("instance response should serialize");
@@ -218,7 +222,9 @@ mod tests {
                         "enable": "on",
                         "endpoint": "https://example.com/hook"
                     }
-                }]
+                }],
+                "truncated": false,
+                "next_marker": null
             })
         );
     }

@@ -109,6 +109,8 @@ struct PluginInstanceFilters {
     source: Option<PluginInstanceSource>,
     enabled: Option<bool>,
     query: Option<String>,
+    limit: Option<usize>,
+    marker: Option<String>,
 }
 
 fn extract_plugin_instance_filters(req: &S3Request<Body>) -> S3Result<PluginInstanceFilters> {
@@ -128,6 +130,8 @@ fn extract_plugin_instance_filters(req: &S3Request<Body>) -> S3Result<PluginInst
                 "source" => filters.source = Some(parse_plugin_instance_source(value)?),
                 "enabled" => filters.enabled = Some(parse_bool_filter(value)?),
                 "q" => filters.query = Some(value.to_ascii_lowercase()),
+                "limit" => filters.limit = Some(parse_limit_filter(value)?),
+                "marker" => filters.marker = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -167,9 +171,47 @@ fn parse_bool_filter(value: &str) -> S3Result<bool> {
         .map_err(|_| s3_error!(InvalidArgument, "invalid plugin instance enabled filter: '{}'", value))
 }
 
+fn parse_limit_filter(value: &str) -> S3Result<usize> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| s3_error!(InvalidArgument, "invalid plugin instance limit filter: '{}'", value))?;
+    if limit == 0 {
+        return Err(s3_error!(InvalidArgument, "invalid plugin instance limit filter: '{}'", value));
+    }
+    Ok(limit)
+}
+
 fn filter_plugin_instances(mut instances: Vec<PluginInstanceEntry>, filters: &PluginInstanceFilters) -> Vec<PluginInstanceEntry> {
     instances.retain(|instance| plugin_instance_matches_filters(instance, filters));
     instances
+}
+
+fn paginate_plugin_instances(
+    instances: Vec<PluginInstanceEntry>,
+    filters: &PluginInstanceFilters,
+) -> S3Result<(Vec<PluginInstanceEntry>, bool, Option<String>)> {
+    let start_index = if let Some(marker) = filters.marker.as_deref() {
+        instances
+            .iter()
+            .position(|instance| instance.id == marker)
+            .map(|index| index + 1)
+            .ok_or_else(|| s3_error!(InvalidArgument, "invalid plugin instance marker: '{}'", marker))?
+    } else {
+        0
+    };
+
+    if start_index >= instances.len() {
+        return Ok((Vec::new(), false, None));
+    }
+
+    let remaining = &instances[start_index..];
+    let limit = filters.limit.unwrap_or(remaining.len());
+    let page_len = remaining.len().min(limit);
+    let page = remaining[..page_len].to_vec();
+    let truncated = start_index + page_len < instances.len();
+    let next_marker = truncated.then(|| page.last().expect("paginated page should not be empty").id.clone());
+
+    Ok((page, truncated, next_marker))
 }
 
 fn plugin_instance_matches_filters(instance: &PluginInstanceEntry, filters: &PluginInstanceFilters) -> bool {
@@ -298,8 +340,13 @@ impl Operation for ListPluginInstancesHandler {
         authorize_plugin_instance_request(&req).await?;
         let filters = extract_plugin_instance_filters(&req)?;
         let instances = filter_plugin_instances(collect_all_instances().await?, &filters);
-        let data = serde_json::to_vec(&PluginInstancesResponse { instances })
-            .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+        let (instances, truncated, next_marker) = paginate_plugin_instances(instances, &filters)?;
+        let data = serde_json::to_vec(&PluginInstancesResponse {
+            instances,
+            truncated,
+            next_marker,
+        })
+        .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
         Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
 }
@@ -343,8 +390,8 @@ impl Operation for GetPluginInstanceHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginInstanceFilters, extract_plugin_instance_filters, filter_plugin_instances, map_instance, parse_bool_filter,
-        parse_instance_status, parse_plugin_contract_domain, parse_plugin_instance_source,
+        PluginInstanceFilters, extract_plugin_instance_filters, filter_plugin_instances, map_instance, paginate_plugin_instances,
+        parse_bool_filter, parse_instance_status, parse_limit_filter, parse_plugin_contract_domain, parse_plugin_instance_source,
     };
     use crate::admin::handlers::target_descriptor::{
         TargetEndpointSource, TargetInstanceReadModel, canonical_target_instance_id, collect_target_instances,
@@ -496,7 +543,7 @@ mod tests {
     #[test]
     fn extract_plugin_instance_filters_parses_supported_query_fields() {
         let req = build_plugin_instances_request(
-            "/rustfs/admin/v4/plugins/instances?domain=notify&service=webhook&status=offline&source=env&enabled=true&q=Primary",
+            "/rustfs/admin/v4/plugins/instances?domain=notify&service=webhook&status=offline&source=env&enabled=true&q=Primary&limit=25&marker=builtin:webhook:notify:seed",
         );
 
         let filters = extract_plugin_instance_filters(&req).expect("query should parse");
@@ -509,6 +556,8 @@ mod tests {
                 source: Some(PluginInstanceSource::Env),
                 enabled: Some(true),
                 query: Some("primary".to_string()),
+                limit: Some(25),
+                marker: Some("builtin:webhook:notify:seed".to_string()),
             }
         );
     }
@@ -526,6 +575,9 @@ mod tests {
 
         let err = parse_bool_filter("maybe").expect_err("invalid bool should fail");
         assert!(err.to_string().contains("invalid plugin instance enabled filter"));
+
+        let err = parse_limit_filter("0").expect_err("zero limit should fail");
+        assert!(err.to_string().contains("invalid plugin instance limit filter"));
     }
 
     #[test]
@@ -574,6 +626,8 @@ mod tests {
                 source: Some(PluginInstanceSource::Env),
                 enabled: Some(true),
                 query: Some("primary".to_string()),
+                limit: None,
+                marker: None,
             },
         );
 
@@ -617,6 +671,135 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].plugin_id, "builtin:kafka");
+    }
+
+    #[test]
+    fn paginate_plugin_instances_returns_requested_page_and_next_marker() {
+        let instances = vec![
+            sample_instance(SampleInstance {
+                id: "builtin:amqp:notify:a",
+                plugin_id: "builtin:amqp",
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_amqp",
+                account_id: "a",
+                service: "amqp",
+                status: "offline",
+                source: PluginInstanceSource::Config,
+                enabled: true,
+            }),
+            sample_instance(SampleInstance {
+                id: "builtin:kafka:notify:b",
+                plugin_id: "builtin:kafka",
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_kafka",
+                account_id: "b",
+                service: "kafka",
+                status: "online",
+                source: PluginInstanceSource::Env,
+                enabled: true,
+            }),
+            sample_instance(SampleInstance {
+                id: "builtin:webhook:notify:c",
+                plugin_id: "builtin:webhook",
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_webhook",
+                account_id: "c",
+                service: "webhook",
+                status: "offline",
+                source: PluginInstanceSource::Runtime,
+                enabled: true,
+            }),
+        ];
+
+        let (page, truncated, next_marker) = paginate_plugin_instances(
+            instances,
+            &PluginInstanceFilters {
+                limit: Some(2),
+                ..PluginInstanceFilters::default()
+            },
+        )
+        .expect("pagination should succeed");
+
+        assert_eq!(page.len(), 2);
+        assert!(truncated);
+        assert_eq!(next_marker.as_deref(), Some("builtin:kafka:notify:b"));
+    }
+
+    #[test]
+    fn paginate_plugin_instances_respects_marker_after_filtered_results() {
+        let instances = vec![
+            sample_instance(SampleInstance {
+                id: "builtin:amqp:notify:a",
+                plugin_id: "builtin:amqp",
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_amqp",
+                account_id: "a",
+                service: "amqp",
+                status: "offline",
+                source: PluginInstanceSource::Config,
+                enabled: true,
+            }),
+            sample_instance(SampleInstance {
+                id: "builtin:kafka:notify:b",
+                plugin_id: "builtin:kafka",
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_kafka",
+                account_id: "b",
+                service: "kafka",
+                status: "online",
+                source: PluginInstanceSource::Env,
+                enabled: true,
+            }),
+            sample_instance(SampleInstance {
+                id: "builtin:webhook:notify:c",
+                plugin_id: "builtin:webhook",
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_webhook",
+                account_id: "c",
+                service: "webhook",
+                status: "offline",
+                source: PluginInstanceSource::Runtime,
+                enabled: true,
+            }),
+        ];
+
+        let (page, truncated, next_marker) = paginate_plugin_instances(
+            instances,
+            &PluginInstanceFilters {
+                marker: Some("builtin:amqp:notify:a".to_string()),
+                ..PluginInstanceFilters::default()
+            },
+        )
+        .expect("pagination should succeed");
+
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].id, "builtin:kafka:notify:b");
+        assert!(!truncated);
+        assert_eq!(next_marker, None);
+    }
+
+    #[test]
+    fn paginate_plugin_instances_rejects_unknown_marker() {
+        let err = paginate_plugin_instances(
+            vec![sample_instance(SampleInstance {
+                id: "builtin:webhook:notify:c",
+                plugin_id: "builtin:webhook",
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_webhook",
+                account_id: "c",
+                service: "webhook",
+                status: "offline",
+                source: PluginInstanceSource::Runtime,
+                enabled: true,
+            })],
+            &PluginInstanceFilters {
+                marker: Some("missing".to_string()),
+                ..PluginInstanceFilters::default()
+            },
+        )
+        .expect_err("unknown marker should fail");
+
+        assert!(err.to_string().contains("invalid plugin instance marker"));
     }
 
     struct SampleInstance<'a> {
