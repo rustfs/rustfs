@@ -25,12 +25,14 @@ use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::SharedTarget;
 use rustfs_targets::{
     BuiltinTargetAdminDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator,
+    catalog::builtin_target_manifest,
     check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available_with_tls,
     check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
     check_redis_server_available,
     config::{
-        build_amqp_args, build_kafka_args, build_mysql_args, build_nats_args, build_postgres_args, build_pulsar_args,
-        build_redis_args, collect_env_target_instance_ids, validate_redis_config,
+        LegacyTargetInstanceDescriptor, TargetPluginInstance, build_amqp_args, build_kafka_args, build_mysql_args,
+        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, normalize_legacy_target_instances,
+        validate_redis_config,
     },
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
@@ -65,12 +67,17 @@ pub(crate) struct MergedTargetEndpoint {
     pub source: TargetEndpointSource,
 }
 
+struct TargetEndpointSnapshot {
+    configured_keys: Vec<EndpointKey>,
+    config_targets: HbHashSet<EndpointKey>,
+    env_targets: HbHashSet<EndpointKey>,
+}
+
 #[derive(Clone)]
 pub(crate) struct AdminTargetSpec {
     pub subsystem: &'static str,
     pub service: &'static str,
     pub valid_keys: &'static [&'static str],
-    valid_keys_set: Arc<HashSet<String>>,
     validator: AdminRequestValidatorFn,
 }
 
@@ -80,7 +87,6 @@ pub(crate) fn admin_target_spec_from_builtin(descriptor: &BuiltinTargetAdminDesc
         subsystem: admin.subsystem(),
         service: descriptor.manifest().target_type,
         valid_keys: descriptor.valid_fields(),
-        valid_keys_set: Arc::new(descriptor.valid_fields().iter().map(|key| (*key).to_string()).collect()),
         validator: validator_from_metadata(admin),
     }
 }
@@ -174,55 +180,6 @@ pub(crate) fn extract_supported_target_params<'a>(
     Ok((target_type, target_name))
 }
 
-pub(crate) fn collect_configured_endpoint_keys(specs: &[AdminTargetSpec], config: &Config) -> Vec<EndpointKey> {
-    let mut endpoints = Vec::new();
-    for spec in specs {
-        let Some(targets) = config.0.get(spec.subsystem) else {
-            continue;
-        };
-
-        for (target_name, kvs) in targets {
-            if target_name == rustfs_config::DEFAULT_DELIMITER {
-                continue;
-            }
-            let enabled = kvs.lookup(ENABLE_KEY).as_deref().map(config_enable_is_on).unwrap_or(false);
-            if enabled {
-                endpoints.push((target_name.clone(), spec.service.to_string()));
-            }
-        }
-    }
-    endpoints
-}
-
-pub(crate) fn collect_config_entry_keys(specs: &[AdminTargetSpec], config: &Config) -> HbHashSet<EndpointKey> {
-    let mut endpoints = HbHashSet::new();
-    for spec in specs {
-        let Some(targets) = config.0.get(spec.subsystem) else {
-            continue;
-        };
-
-        for target_name in targets.keys() {
-            if target_name == rustfs_config::DEFAULT_DELIMITER {
-                continue;
-            }
-            endpoints.insert(normalized_endpoint_key(target_name, spec.service));
-        }
-    }
-    endpoints
-}
-
-pub(crate) fn collect_env_endpoint_keys(specs: &[AdminTargetSpec], route_prefix: &str) -> HbHashSet<EndpointKey> {
-    let mut endpoints = HbHashSet::new();
-    for spec in specs {
-        for instance_id in collect_env_target_instance_ids(route_prefix, spec.service, spec.valid_keys_set.as_ref()) {
-            if instance_id != rustfs_config::DEFAULT_DELIMITER && !instance_id.is_empty() {
-                endpoints.insert(normalized_endpoint_key(&instance_id, spec.service));
-            }
-        }
-    }
-    endpoints
-}
-
 pub(crate) fn classify_endpoint_source(
     config_targets: &HbHashSet<EndpointKey>,
     env_targets: &HbHashSet<EndpointKey>,
@@ -236,14 +193,6 @@ pub(crate) fn classify_endpoint_source(
     }
 }
 
-fn collect_endpoint_sources(
-    specs: &[AdminTargetSpec],
-    route_prefix: &str,
-    config: &Config,
-) -> (HbHashSet<EndpointKey>, HbHashSet<EndpointKey>) {
-    (collect_config_entry_keys(specs, config), collect_env_endpoint_keys(specs, route_prefix))
-}
-
 pub(crate) fn endpoint_source(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
@@ -251,10 +200,10 @@ pub(crate) fn endpoint_source(
     target_type: &str,
     target_name: &str,
 ) -> TargetEndpointSource {
-    let (config_targets, env_targets) = collect_endpoint_sources(specs, route_prefix, config);
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
     let service = target_service_name(specs, target_type).unwrap_or_default();
     let key = normalized_endpoint_key(target_name, service);
-    classify_endpoint_source(&config_targets, &env_targets, &key)
+    classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &key)
 }
 
 pub(crate) fn target_mutation_block_reason(
@@ -334,8 +283,7 @@ pub(crate) fn merge_target_endpoints(
 ) -> Vec<MergedTargetEndpoint> {
     let mut endpoints = Vec::new();
     let mut seen = HashSet::new();
-    let configured_keys = collect_configured_endpoint_keys(specs, config);
-    let (config_targets, env_targets) = collect_endpoint_sources(specs, route_prefix, config);
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
     let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
 
     for ((account_id, service), status) in runtime_statuses {
@@ -345,7 +293,7 @@ pub(crate) fn merge_target_endpoints(
             .or_insert((account_id, service, status));
     }
 
-    for key in configured_keys {
+    for key in snapshot.configured_keys {
         let normalized = normalized_endpoint_key(&key.0, &key.1);
         if !seen.insert(normalized.clone()) {
             continue;
@@ -360,7 +308,7 @@ pub(crate) fn merge_target_endpoints(
             account_id: key.0,
             service: key.1,
             status,
-            source: classify_endpoint_source(&config_targets, &env_targets, &normalized),
+            source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &normalized),
         });
     }
 
@@ -370,12 +318,12 @@ pub(crate) fn merge_target_endpoints(
                 account_id,
                 service,
                 status,
-                source: classify_endpoint_source(&config_targets, &env_targets, &normalized),
+                source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &normalized),
             });
         }
     }
 
-    for key in &env_targets {
+    for key in &snapshot.env_targets {
         if !seen.insert(key.clone()) {
             continue;
         }
@@ -384,7 +332,7 @@ pub(crate) fn merge_target_endpoints(
             account_id: key.0.clone(),
             service: key.1.clone(),
             status: "offline".to_string(),
-            source: classify_endpoint_source(&config_targets, &env_targets, key),
+            source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, key),
         });
     }
 
@@ -485,8 +433,66 @@ where
     Ok(kvs)
 }
 
-fn config_enable_is_on(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1")
+fn instance_has_config_entry(instance: &TargetPluginInstance) -> bool {
+    instance.source_hints.has_file_instance
+}
+
+fn instance_has_env_entry(instance: &TargetPluginInstance) -> bool {
+    instance.source_hints.has_env_instance
+}
+
+fn normalized_target_instances(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> Vec<TargetPluginInstance> {
+    specs
+        .iter()
+        .flat_map(|spec| {
+            normalize_legacy_target_instances(
+                config,
+                &LegacyTargetInstanceDescriptor {
+                    domain: inferred_target_domain(route_prefix),
+                    plugin_id: builtin_target_manifest(spec.service).plugin_id,
+                    target_type: spec.service,
+                    subsystem: spec.subsystem,
+                    route_prefix,
+                    valid_fields: spec.valid_keys,
+                },
+            )
+        })
+        .collect()
+}
+
+fn inferred_target_domain(route_prefix: &str) -> TargetDomain {
+    match route_prefix {
+        rustfs_config::notify::NOTIFY_ROUTE_PREFIX => TargetDomain::Notify,
+        rustfs_config::audit::AUDIT_ROUTE_PREFIX => TargetDomain::Audit,
+        _ => TargetDomain::Notify,
+    }
+}
+
+fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> TargetEndpointSnapshot {
+    let mut configured_keys = Vec::new();
+    let mut config_targets = HbHashSet::new();
+    let mut env_targets = HbHashSet::new();
+
+    for instance in normalized_target_instances(specs, route_prefix, config) {
+        let key = normalized_endpoint_key(&instance.instance_id, &instance.target_type);
+
+        if instance_has_config_entry(&instance) {
+            config_targets.insert(key.clone());
+            if instance.enabled {
+                configured_keys.push((instance.instance_id.clone(), instance.target_type.clone()));
+            }
+        }
+
+        if instance_has_env_entry(&instance) {
+            env_targets.insert(key);
+        }
+    }
+
+    TargetEndpointSnapshot {
+        configured_keys,
+        config_targets,
+        env_targets,
+    }
 }
 
 async fn retry_with_backoff<F, Fut, T>(mut operation: F, max_attempts: usize, base_delay: Duration) -> Result<T, Error>
