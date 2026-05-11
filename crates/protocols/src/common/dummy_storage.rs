@@ -44,23 +44,21 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::Notify;
 
-/// Error type returned by DummyBackend. Display strings include substrings
-/// the driver's error-mapping helpers match against, so a queued NoSuchKey
-/// error is reported as a not-found status at the protocol layer and an
-/// AccessDenied error is reported as a permission-denied status.
+/// Error type returned by DummyBackend. Variants model the backend error
+/// categories that SFTP maps onto wire status codes.
 #[derive(Debug, Error)]
 pub enum DummyError {
-    /// Display includes the NoSuchKey substring. S3-style error mappers
-    /// map this to not-found.
     #[error("NoSuchKey: {0}")]
     NoSuchKey(String),
-    /// Display includes the NoSuchBucket substring. S3-style error mappers
-    /// map this to not-found.
     #[error("NoSuchBucket: {0}")]
     NoSuchBucket(String),
-    /// Free-form error string pre-seeded by a test. Must contain one of the
-    /// S3 error-code substrings if the test wants a specific status code
-    /// from the driver's error-mapping helper.
+    #[error("AccessDenied: {0}")]
+    AccessDenied(String),
+    #[error("NoSuchUpload: {0}")]
+    NoSuchUpload(String),
+    /// Free-form backend failure pre-seeded by a test. SFTP status-code
+    /// classification ignores this text; use a typed variant above when a test
+    /// needs a specific wire status.
     #[error("{0}")]
     Injected(String),
     /// Default response when the per-method queue is empty and the method
@@ -295,9 +293,7 @@ impl DummyBackend {
         self.inner.lock().expect("lock").upload_part.push_back(Ok(out));
     }
 
-    /// Queue an upload_part error. The error string flows through the
-    /// driver's error-mapping helper, so Injected("AccessDenied") produces
-    /// a permission-denied status at the driver boundary.
+    /// Queue an upload_part error.
     pub fn queue_upload_part_err(&self, err: DummyError) {
         self.inner.lock().expect("lock").upload_part.push_back(Err(err));
     }

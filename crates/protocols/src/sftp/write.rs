@@ -2049,7 +2049,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn run_backend_with_err_passes_backend_error_through_unchanged() {
         let backend = Arc::new(DummyBackend::new());
-        backend.queue_head_object_err(DummyError::Injected("AccessDenied: pinned".to_string()));
+        backend.queue_head_object_err(DummyError::AccessDenied("pinned".to_string()));
         let driver = build_driver(backend, TEST_PART_SIZE);
 
         let result = driver
@@ -2057,7 +2057,7 @@ mod tests {
             .await;
 
         match result {
-            Ok(Err(e)) => assert!(format!("{e}").contains("AccessDenied")),
+            Ok(Err(e)) => assert!(matches!(e, DummyError::AccessDenied(_))),
             other => panic!("expected backend Err passed through; got {other:?}"),
         }
     }
@@ -2120,7 +2120,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn commit_write_does_not_retry_on_access_denied() {
         let backend = Arc::new(DummyBackend::new());
-        backend.queue_put_object_err(DummyError::Injected("AccessDenied: policy".into()));
+        backend.queue_put_object_err(DummyError::AccessDenied("policy".into()));
         // A second response so a retry attempt would surface a
         // wrong-status assertion failure rather than the
         // configured-miss default. If the loop wrongly retries, the
