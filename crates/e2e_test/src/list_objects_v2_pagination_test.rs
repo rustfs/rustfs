@@ -154,9 +154,20 @@ mod tests {
 
         create_bucket(&client, bucket).await.expect("Failed to create bucket");
 
-        let expected_keys: Vec<String> = (0..5)
-            .map(|idx| format!("{prefix}engineering/project-{idx:03}/artifact.txt"))
-            .collect();
+        let expected_keys = vec![
+            format!("{prefix}alpha-000/artifact.txt"),
+            format!("{prefix}engineering/engineering/project-000/artifact.txt"),
+            format!("{prefix}engineering/engineering/project-001/artifact.txt"),
+            format!("{prefix}engineering/project-000/artifact.txt"),
+            format!("{prefix}engineering/project-001/artifact.txt"),
+            format!("{prefix}engineering/project-002/artifact.txt"),
+            format!("{prefix}zulu-000/artifact.txt"),
+        ];
+        let noise_keys = [
+            "different/prefix/prefix/project-000/artifact.txt",
+            "engineering-other/project-000/artifact.txt",
+            "unrelated/engineering/project-000/artifact.txt",
+        ];
 
         for key in &expected_keys {
             client
@@ -168,10 +179,24 @@ mod tests {
                 .await
                 .expect("Failed to put object");
         }
+        for key in noise_keys {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .expect("Failed to put noise object");
+        }
 
         let listed_keys = list_all_objects_v2(&client, bucket, prefix, PAGE_SIZE).await;
         let seen: HashSet<String> = listed_keys.iter().cloned().collect();
 
+        assert_eq!(
+            listed_keys, expected_keys,
+            "Issue #2775 regression: repeated-prefix pagination must return exactly the expected keys in lexicographic order"
+        );
         assert_eq!(
             listed_keys.len(),
             expected_keys.len(),
