@@ -192,6 +192,34 @@ pub(crate) struct PluginInstanceEntry {
     pub source: PluginInstanceSource,
     pub enabled: bool,
     pub config: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_codes: Vec<PluginInstanceDiagnosticCode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PluginInstanceDiagnosticCode {
+    ModuleDisabled,
+    InstanceDisabled,
+    EnvironmentManaged,
+    MixedSource,
+    NotLoadedInRuntime,
+    RuntimeOffline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct PluginInstanceDiagnostic {
+    pub code: PluginInstanceDiagnosticCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PluginInstanceDetail {
+    #[serde(flatten)]
+    pub instance: PluginInstanceEntry,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<PluginInstanceDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -205,8 +233,9 @@ pub(crate) struct PluginInstancesResponse {
 mod tests {
     use super::{
         PluginArtifactContract, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
-        PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginInstanceEntry,
-        PluginInstanceSource, PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
+        PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginInstanceDetail,
+        PluginInstanceDiagnostic, PluginInstanceDiagnosticCode, PluginInstanceEntry, PluginInstanceSource,
+        PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -285,6 +314,7 @@ mod tests {
                     ("enable".to_string(), "on".to_string()),
                     ("endpoint".to_string(), "https://example.com/hook".to_string()),
                 ]),
+                diagnostic_codes: vec![PluginInstanceDiagnosticCode::NotLoadedInRuntime],
             }],
             truncated: false,
             next_marker: None,
@@ -307,10 +337,58 @@ mod tests {
                     "config": {
                         "enable": "on",
                         "endpoint": "https://example.com/hook"
-                    }
+                    },
+                    "diagnostic_codes": ["not_loaded_in_runtime"]
                 }],
                 "truncated": false,
                 "next_marker": null
+            })
+        );
+    }
+
+    #[test]
+    fn plugin_instance_detail_contract_serializes_diagnostics_when_present() {
+        let detail = PluginInstanceDetail {
+            instance: PluginInstanceEntry {
+                id: "builtin:webhook:notify:primary".to_string(),
+                plugin_id: "builtin:webhook".to_string(),
+                domain: PluginContractDomain::Notify,
+                subsystem: "notify_webhook".to_string(),
+                account_id: "primary".to_string(),
+                service: "webhook".to_string(),
+                status: "offline".to_string(),
+                source: PluginInstanceSource::Config,
+                enabled: true,
+                config: HashMap::from([("endpoint".to_string(), "https://example.com/hook".to_string())]),
+                diagnostic_codes: vec![PluginInstanceDiagnosticCode::NotLoadedInRuntime],
+            },
+            diagnostics: vec![PluginInstanceDiagnostic {
+                code: PluginInstanceDiagnosticCode::NotLoadedInRuntime,
+                message: "plugin instance is enabled in config but not currently loaded in runtime".to_string(),
+            }],
+        };
+
+        let value = serde_json::to_value(detail).expect("instance detail should serialize");
+        assert_eq!(
+            value,
+            json!({
+                "id": "builtin:webhook:notify:primary",
+                "plugin_id": "builtin:webhook",
+                "domain": "notify",
+                "subsystem": "notify_webhook",
+                "account_id": "primary",
+                "service": "webhook",
+                "status": "offline",
+                "source": "config",
+                "enabled": true,
+                "config": {
+                    "endpoint": "https://example.com/hook"
+                },
+                "diagnostic_codes": ["not_loaded_in_runtime"],
+                "diagnostics": [{
+                    "code": "not_loaded_in_runtime",
+                    "message": "plugin instance is enabled in config but not currently loaded in runtime"
+                }]
             })
         );
     }

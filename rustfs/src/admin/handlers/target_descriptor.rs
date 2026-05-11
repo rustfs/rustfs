@@ -76,6 +76,7 @@ pub(crate) struct TargetInstanceReadModel {
     pub account_id: String,
     pub service: String,
     pub status: String,
+    pub runtime_present: bool,
     pub source: TargetEndpointSource,
     pub enabled: bool,
     pub config: KVS,
@@ -386,6 +387,7 @@ pub(crate) fn collect_target_instances(
             continue;
         }
 
+        let runtime_present = normalized_runtime_statuses.contains_key(&key);
         let status = normalized_runtime_statuses
             .remove(&key)
             .map(|(_, _, status)| status)
@@ -400,6 +402,7 @@ pub(crate) fn collect_target_instances(
             account_id: instance.instance_id,
             service: instance.target_type,
             status,
+            runtime_present,
             source,
             enabled: instance.enabled,
             config: instance.effective_config,
@@ -422,6 +425,7 @@ pub(crate) fn collect_target_instances(
             account_id,
             service,
             status,
+            runtime_present: true,
             source: TargetEndpointSource::Runtime,
             enabled: true,
             config: KVS::new(),
