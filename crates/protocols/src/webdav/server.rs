@@ -30,7 +30,7 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -61,6 +61,7 @@ where
 
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         info!("WebDAV server listening on {}", self.config.bind_addr);
+        let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
         // Setup TLS if enabled
         let tls_acceptor = if self.config.tls_enabled {
@@ -69,7 +70,8 @@ where
 
                 let resolver = ReloadableCertResolver::load_from_directory(cert_dir)
                     .map_err(|e| WebDavInitError::Tls(format!("Failed to create certificate resolver: {}", e)))?;
-                spawn_cert_reload_loop("webdav", cert_dir.clone(), resolver.clone());
+                let _reload_task =
+                    spawn_cert_reload_loop("webdav", cert_dir.clone(), resolver.clone(), reload_shutdown_rx.clone());
 
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -124,11 +126,13 @@ where
                 }
                 _ = shutdown_rx.recv() => {
                     info!("WebDAV server received shutdown signal");
+                    let _ = reload_shutdown_tx.send(true);
                     break;
                 }
             }
         }
 
+        let _ = reload_shutdown_tx.send(true);
         info!("WebDAV server stopped");
         Ok(())
     }

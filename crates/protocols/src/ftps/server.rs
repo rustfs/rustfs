@@ -24,6 +24,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use unftp_core::auth::{
     AuthenticationError, Authenticator, Credentials, Principal, UserDetail, UserDetailError, UserDetailProvider,
@@ -79,6 +80,7 @@ where
     /// then spawns the server loop in a background task.
     pub async fn start(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), FtpsInitError> {
         info!("Initializing FTPS server on {}", self.config.bind_addr);
+        let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
         let storage_clone = self.storage.clone();
         let mut server_builder = libunftp::ServerBuilder::with_user_detail_provider(
@@ -114,7 +116,7 @@ where
 
                 let resolver = ReloadableCertResolver::load_from_directory(cert_dir)
                     .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to create certificate resolver: {}", e)))?;
-                spawn_cert_reload_loop("ftps", cert_dir.clone(), resolver.clone());
+                let _reload_task = spawn_cert_reload_loop("ftps", cert_dir.clone(), resolver.clone(), reload_shutdown_rx.clone());
 
                 // Build ServerConfig with SNI support
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -154,6 +156,7 @@ where
         // Wait for shutdown signal or server failure
         tokio::select! {
             result = server_handle => {
+                let _ = reload_shutdown_tx.send(true);
                 match result {
                     Ok(Ok(())) => {
                         info!("FTPS server stopped normally");
@@ -171,6 +174,7 @@ where
             }
             _ = shutdown_rx.recv() => {
                 info!("FTPS server received shutdown signal");
+                let _ = reload_shutdown_tx.send(true);
                 // libunftp listen() is not easily cancellable gracefully without dropping the future.
                 // The select! dropping server_handle will close the listener.
                 Ok(())

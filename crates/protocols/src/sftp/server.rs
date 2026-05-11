@@ -51,7 +51,7 @@ use std::sync::atomic::AtomicU64;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::sftp::constants::limits::SHUTDOWN_DRAIN_TIMEOUT_SECS;
@@ -193,17 +193,31 @@ impl SshConfigHolder {
 
 fn fingerprint_host_keys(host_keys: &[PrivateKey]) -> u64 {
     let mut hasher = DefaultHasher::new();
+    let mut public_keys: Vec<(u8, String)> = host_keys
+        .iter()
+        .map(|key| (host_key_algorithm_rank(key.algorithm()), key.public_key_base64()))
+        .collect();
+    public_keys.sort_unstable();
 
-    for key in host_keys {
-        let public_key_bytes = key.public_key_bytes();
-        hasher.write_usize(public_key_bytes.len());
-        hasher.write(&public_key_bytes);
+    for (algorithm_rank, public_key_base64) in public_keys {
+        hasher.write_u8(algorithm_rank);
+        hasher.write_usize(public_key_base64.len());
+        hasher.write(public_key_base64.as_bytes());
     }
 
     hasher.finish()
 }
 
-fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>) {
+fn host_key_algorithm_rank(algorithm: keys::Algorithm) -> u8 {
+    match algorithm {
+        keys::Algorithm::Ed25519 => 0,
+        keys::Algorithm::Ecdsa { .. } => 1,
+        keys::Algorithm::Rsa { .. } => 2,
+        _ => 3,
+    }
+}
+
+fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, shutdown_token: CancellationToken) {
     let enabled = rustfs_utils::get_env_bool(ENV_SFTP_HOST_KEY_RELOAD_ENABLE, DEFAULT_SFTP_HOST_KEY_RELOAD_ENABLE);
     if !enabled {
         tracing::debug!(
@@ -224,8 +238,16 @@ fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>) 
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        interval.tick().await;
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = shutdown_token.cancelled() => {
+                    tracing::info!(host_key_dir = %config.host_key_dir.display(), "SFTP host key hot reload task stopped");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
 
             match holder.reload_from_config(&config).await {
                 Ok(Some(host_key_count)) => {
@@ -330,8 +352,6 @@ where
             .map_err(|e| SftpInitError::Server(format!("failed to bind {}: {}", self.config.bind_addr, e)))?;
         tracing::info!(bind_addr = %self.config.bind_addr, "SFTP server listening");
 
-        spawn_host_key_reload_loop(self.config.clone(), Arc::clone(&self.ssh_config));
-
         let mut sessions: JoinSet<()> = JoinSet::new();
         // Parent cancellation token for the lifetime of this listener.
         // Each per-session cancel_token is a child via child_token(),
@@ -345,6 +365,7 @@ where
         // the SHUTDOWN_DRAIN_TIMEOUT_SECS ceiling because no session
         // has to wait for the watchdog's natural tick to fire.
         let server_shutdown_token = CancellationToken::new();
+        spawn_host_key_reload_loop(self.config.clone(), Arc::clone(&self.ssh_config), server_shutdown_token.child_token());
 
         loop {
             self.drain_finished_tasks(&mut sessions);
@@ -576,6 +597,20 @@ mod hot_reload_tests {
 
         let reloaded = holder.reload_from_config(&config).await.expect("reload host keys");
         assert_eq!(reloaded, None);
+    }
+
+    #[tokio::test]
+    async fn fingerprint_host_keys_is_order_independent() {
+        let dir = TempDir::new().expect("tempdir");
+        write_file_with_mode(&dir.path().join("ssh_host_ed25519_key"), &test_ed25519_pem(), 0o600);
+        write_file_with_mode(&dir.path().join("ssh_host_ecdsa_key"), &test_ecdsa_pem(), 0o600);
+
+        let keys = SftpConfig::load_host_keys(dir.path()).await.expect("load keys");
+        let forward = fingerprint_host_keys(&keys);
+        let reversed_keys: Vec<_> = keys.into_iter().rev().collect();
+        let reversed = fingerprint_host_keys(&reversed_keys);
+
+        assert_eq!(forward, reversed);
     }
 }
 

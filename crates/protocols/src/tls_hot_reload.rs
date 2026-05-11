@@ -25,6 +25,9 @@ use std::hash::Hasher;
 use std::io::{self, Error};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 #[derive(Debug)]
@@ -150,14 +153,19 @@ impl ResolvesServerCert for ReloadableCertResolver {
     }
 }
 
-pub(crate) fn spawn_cert_reload_loop(protocol: &'static str, cert_dir: String, resolver: Arc<ReloadableCertResolver>) {
+pub(crate) fn spawn_cert_reload_loop(
+    protocol: &'static str,
+    cert_dir: String,
+    resolver: Arc<ReloadableCertResolver>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
     let enabled = rustfs_utils::get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE);
     if !enabled {
         debug!(
             protocol,
             "TLS certificate hot reload is disabled (set {}=1 to enable)", ENV_TLS_RELOAD_ENABLE
         );
-        return;
+        return None;
     }
 
     let interval_secs = rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5);
@@ -168,10 +176,22 @@ pub(crate) fn spawn_cert_reload_loop(protocol: &'static str, cert_dir: String, r
         interval_secs
     );
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        interval.tick().await;
+
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!(protocol, cert_dir = %cert_dir, "TLS certificate hot reload task stopped");
+                        break;
+                    }
+                    continue;
+                }
+                _ = interval.tick() => {}
+            }
 
             match resolver.reload_from_directory(&cert_dir) {
                 Ok(Some(cert_count)) => {
@@ -195,7 +215,7 @@ pub(crate) fn spawn_cert_reload_loop(protocol: &'static str, cert_dir: String, r
                 }
             }
         }
-    });
+    }))
 }
 
 #[cfg(test)]
