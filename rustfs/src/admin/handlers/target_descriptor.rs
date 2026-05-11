@@ -411,12 +411,14 @@ pub(crate) fn collect_target_instances(
             continue;
         }
 
-        let plugin_id = builtin_plugin_id_for_service(&service);
+        let (plugin_id, subsystem) = target_spec_by_service(specs, &service)
+            .map(|spec| (builtin_target_manifest(spec.service).plugin_id.to_string(), spec.subsystem.to_string()))
+            .unwrap_or_else(|| ("custom:target".to_string(), format!("{}_{}", canonical_domain_label(domain), service)));
         instances.push(TargetInstanceReadModel {
-            canonical_id: canonical_target_instance_id(plugin_id, domain, &account_id),
-            plugin_id: plugin_id.to_string(),
+            canonical_id: canonical_target_instance_id(&plugin_id, domain, &account_id),
+            plugin_id,
             domain,
-            subsystem: format!("{}_{}", canonical_domain_label(domain), service),
+            subsystem,
             account_id,
             service,
             status,
@@ -581,19 +583,8 @@ fn canonical_domain_label(domain: TargetDomain) -> &'static str {
     }
 }
 
-fn builtin_plugin_id_for_service(service: &str) -> &'static str {
-    match service {
-        "webhook" => "builtin:webhook",
-        "mqtt" => "builtin:mqtt",
-        "kafka" => "builtin:kafka",
-        "amqp" => "builtin:amqp",
-        "nats" => "builtin:nats",
-        "pulsar" => "builtin:pulsar",
-        "mysql" => "builtin:mysql",
-        "redis" => "builtin:redis",
-        "postgres" => "builtin:postgres",
-        _ => "custom:target",
-    }
+fn target_spec_by_service<'a>(specs: &'a [AdminTargetSpec], service: &str) -> Option<&'a AdminTargetSpec> {
+    specs.iter().find(|spec| spec.service == service)
 }
 
 fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> TargetEndpointSnapshot {

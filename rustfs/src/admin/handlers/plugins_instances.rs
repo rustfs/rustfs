@@ -510,6 +510,8 @@ mod tests {
 
         assert_eq!(runtime_only.source, TargetEndpointSource::Runtime);
         assert_eq!(runtime_only.status, "online");
+        assert_eq!(runtime_only.plugin_id, "builtin:webhook");
+        assert_eq!(runtime_only.subsystem, NOTIFY_WEBHOOK_SUB_SYS);
     }
 
     #[test]
