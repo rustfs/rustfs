@@ -15,11 +15,10 @@
 use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
-        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, allowed_target_keys,
+        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
         build_json_response, collect_runtime_statuses, collect_validated_key_values as shared_collect_validated_key_values,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
-        target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
-        validate_target_request,
+        target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name,
     },
     router::{AdminOperation, Operation, S3Router},
 };
@@ -32,15 +31,14 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
-use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::builtin_audit_target_admin_descriptors;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::LazyLock;
-use tokio::time::{Duration, timeout};
 use tracing::{Span, warn};
 
 pub fn register_audit_target_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -266,26 +264,14 @@ impl Operation for AuditTargetConfig {
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for audit target config: {}", e))?;
 
         let specs = audit_target_specs();
-        let allowed_keys: HashSet<&str> = allowed_target_keys(specs, target_type);
-
-        let kv_map = shared_collect_validated_key_values(
+        let kvs = build_enabled_target_kvs(
+            specs,
             audit_body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
-            &allowed_keys,
             target_type,
+            AUDIT_DEFAULT_DIR,
             "audit target",
-        )?;
-
-        let spec = target_spec(specs, target_type)
-            .ok_or_else(|| s3_error!(InvalidArgument, "unsupported audit target type: '{}'", target_type))?;
-        timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, AUDIT_DEFAULT_DIR))
-            .await
-            .map_err(|_| s3_error!(InvalidArgument, "audit target validation timed out"))??;
-
-        let mut kvs = rustfs_ecstore::config::KVS::new();
-        for (key, value) in kv_map {
-            kvs.insert(key, value);
-        }
-        kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        )
+        .await?;
 
         update_audit_config_and_reload(|config| {
             config

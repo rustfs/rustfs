@@ -17,11 +17,11 @@ use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use rustfs_config::{
-    AMQP_QUEUE_DIR, ENABLE_KEY, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_TLS_CA,
-    MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
-    MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
+    AMQP_QUEUE_DIR, ENABLE_KEY, EnableState, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS,
+    MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC,
+    MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
-use rustfs_ecstore::config::Config;
+use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::SharedTarget;
 use rustfs_targets::{
     BuiltinTargetAdminDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator,
@@ -41,7 +41,7 @@ use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
 use url::Url;
 
 pub(crate) type EndpointKey = (String, String);
@@ -437,6 +437,32 @@ pub(crate) async fn validate_target_request(
     default_queue_dir: &str,
 ) -> S3Result<()> {
     spec.validate_request(kv_map, default_queue_dir).await
+}
+
+pub(crate) async fn build_enabled_target_kvs<'a, I>(
+    specs: &[AdminTargetSpec],
+    key_values: I,
+    target_type: &str,
+    default_queue_dir: &str,
+    target_label: &str,
+) -> S3Result<KVS>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let allowed_keys = allowed_target_keys(specs, target_type);
+    let kv_map = collect_validated_key_values(key_values, &allowed_keys, target_type, target_label)?;
+    let spec = target_spec(specs, target_type)
+        .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
+    timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, default_queue_dir))
+        .await
+        .map_err(|_| s3_error!(InvalidArgument, "target validation timed out"))??;
+
+    let mut kvs = KVS::new();
+    for (key, value) in kv_map {
+        kvs.insert(key, value);
+    }
+    kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+    Ok(kvs)
 }
 
 fn config_enable_is_on(value: &str) -> bool {
