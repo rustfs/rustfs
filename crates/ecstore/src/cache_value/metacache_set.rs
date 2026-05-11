@@ -45,6 +45,10 @@ async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>
     }
 }
 
+fn completion_error_for_tolerated_reader_errors(errs: &[Option<DiskError>]) -> Option<DiskError> {
+    errs.iter().flatten().find(|err| **err == DiskError::Timeout).cloned()
+}
+
 #[derive(Default)]
 pub struct ListPathRawOptions {
     pub disks: Vec<Option<DiskStore>>,
@@ -358,6 +362,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 {
                     finished_fn(&errs).await;
                 }
+                if let Some(err) = completion_error_for_tolerated_reader_errors(&errs) {
+                    return Err(err);
+                }
 
                 // error!("list_path_raw: at_eof + has_err == readers.len() break {:?}", &errs);
                 break;
@@ -422,6 +429,20 @@ mod tests {
             .expect_err("empty drive list should fail");
 
         assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn completion_error_returns_timeout_for_stalled_reader() {
+        let errs = [Some(DiskError::Timeout), None];
+
+        assert_eq!(completion_error_for_tolerated_reader_errors(&errs), Some(DiskError::Timeout));
+    }
+
+    #[test]
+    fn completion_error_allows_non_timeout_reader_errors() {
+        let errs = [Some(DiskError::DiskNotFound), None];
+
+        assert_eq!(completion_error_for_tolerated_reader_errors(&errs), None);
     }
 
     #[tokio::test]
