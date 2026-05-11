@@ -41,7 +41,9 @@ use walkdir::WalkDir;
 // Common constants for all E2E tests
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
+pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
+const RUSTFS_FULL_FEATURE: &str = "full";
 
 fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, provider_name: &'static str) -> Config {
     let credentials = Credentials::new(access_key, secret_key, None, None, provider_name);
@@ -83,6 +85,7 @@ pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> Pat
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
         return PathBuf::from(path);
     }
+    let requested_features = requested_features.and_then(normalize_rustfs_build_features);
 
     let mut binary_path = workspace_root();
     binary_path.push("target");
@@ -90,7 +93,7 @@ pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> Pat
     binary_path.push(profile_dir);
     binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
 
-    let features_match = binary_features_match(&binary_path, requested_features);
+    let features_match = binary_features_match(&binary_path, requested_features.as_deref());
     let source_is_newer = workspace_sources_newer_than_binary(&binary_path);
     let can_reuse_inside_e2e = running_inside_e2e_test_binary() && requested_features.is_none() && features_match;
     if binary_path.is_file() && features_match && (!source_is_newer || can_reuse_inside_e2e) {
@@ -105,7 +108,7 @@ pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> Pat
     }
 
     info!("Building RustFS binary to ensure it's up to date...");
-    build_rustfs_binary(requested_features);
+    build_rustfs_binary(requested_features.as_deref());
 
     info!("Using RustFS binary at {:?}", binary_path);
     binary_path
@@ -134,11 +137,31 @@ fn running_inside_e2e_test_binary() -> bool {
     std::env::var("CARGO_PKG_NAME").is_ok_and(|value| value == "e2e_test")
 }
 
-fn requested_rustfs_build_features() -> Option<String> {
-    std::env::var("RUSTFS_BUILD_FEATURES")
+pub fn requested_rustfs_build_features() -> Option<String> {
+    std::env::var(ENV_RUSTFS_BUILD_FEATURES)
         .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .and_then(|value| normalize_rustfs_build_features(&value))
+}
+
+pub fn normalize_rustfs_build_features(features: &str) -> Option<String> {
+    let features = features
+        .split(',')
+        .map(str::trim)
+        .filter(|feature| !feature.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    if features.is_empty() { None } else { Some(features.join(",")) }
+}
+
+pub fn rustfs_build_feature_enabled(requested_features: Option<&str>, required_feature: &str) -> bool {
+    let Some(requested_features) = requested_features.and_then(normalize_rustfs_build_features) else {
+        return true;
+    };
+
+    requested_features
+        .split(',')
+        .any(|feature| feature.eq_ignore_ascii_case(RUSTFS_FULL_FEATURE) || feature.eq_ignore_ascii_case(required_feature))
 }
 
 fn rustfs_binary_features_stamp_path(binary_path: &Path) -> PathBuf {
@@ -147,11 +170,14 @@ fn rustfs_binary_features_stamp_path(binary_path: &Path) -> PathBuf {
 
 fn binary_features_match(binary_path: &Path, requested_features: Option<&str>) -> bool {
     let stamp_path = rustfs_binary_features_stamp_path(binary_path);
-    let recorded = stdfs::read_to_string(stamp_path).ok().map(|value| value.trim().to_string());
+    let recorded = stdfs::read_to_string(stamp_path)
+        .ok()
+        .and_then(|value| normalize_rustfs_build_features(&value));
+    let requested = requested_features.and_then(normalize_rustfs_build_features);
 
-    match requested_features {
+    match requested.as_deref() {
         Some(features) => recorded.as_deref() == Some(features),
-        None => recorded.as_deref().is_none_or(str::is_empty),
+        None => recorded.is_none(),
     }
 }
 
@@ -898,5 +924,38 @@ impl Drop for RustFSTestClusterEnvironment {
         if let Err(e) = std::fs::remove_dir_all(&self.temp_dir) {
             warn!("Failed to clean up cluster temp directory {}: {}", self.temp_dir, e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_rustfs_build_features() {
+        assert_eq!(
+            normalize_rustfs_build_features(" SFTP, ftps ,, WebDAV "),
+            Some("sftp,ftps,webdav".to_string())
+        );
+        assert_eq!(normalize_rustfs_build_features(" , "), None);
+    }
+
+    #[test]
+    fn full_feature_enables_any_required_feature() {
+        assert!(rustfs_build_feature_enabled(Some("full"), "sftp"));
+        assert!(rustfs_build_feature_enabled(Some("ftps, full"), "webdav"));
+    }
+
+    #[test]
+    fn binary_feature_stamp_matching_uses_normalized_features() {
+        let binary_path = std::env::temp_dir().join(format!("rustfs-feature-stamp-test-{}", Uuid::new_v4()));
+        let stamp_path = rustfs_binary_features_stamp_path(&binary_path);
+
+        stdfs::write(&stamp_path, " SFTP, ftps ").expect("write feature stamp");
+        assert!(binary_features_match(&binary_path, Some("sftp,ftps")));
+        assert!(binary_features_match(&binary_path, Some(" SFTP, FTPS ")));
+        assert!(!binary_features_match(&binary_path, Some("sftp")));
+
+        stdfs::remove_file(stamp_path).ok();
     }
 }
