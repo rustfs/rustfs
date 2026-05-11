@@ -31,7 +31,6 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::EncodingType;
-    use futures::{StreamExt, stream};
     use serial_test::serial;
     use std::collections::HashSet;
     use tracing::info;
@@ -126,72 +125,6 @@ mod tests {
 
         info!(
             "Recursive ListObjectsV2 returned all {} objects under {:?} in {} pages",
-            listed_keys.len(),
-            prefix,
-            page_count
-        );
-
-        listed_keys
-    }
-
-    async fn list_all_objects_v1(client: &Client, bucket: &str, prefix: &str, page_size: i32) -> Vec<String> {
-        let mut marker: Option<String> = None;
-        let mut page_count = 0usize;
-        let mut last_key: Option<String> = None;
-        let mut listed_keys = Vec::new();
-        let mut seen = HashSet::new();
-
-        loop {
-            let mut request = client.list_objects().bucket(bucket).prefix(prefix).max_keys(page_size);
-            if let Some(token) = marker.take() {
-                request = request.marker(token);
-            }
-
-            let output = request.send().await.expect("Failed to list objects via V1 API");
-            let contents = output.contents();
-            assert!(
-                contents.len() <= page_size as usize,
-                "ListObjects page exceeded requested max_keys: {} > {}",
-                contents.len(),
-                page_size
-            );
-
-            for object in contents {
-                let key = object.key().expect("Listed object should have a key");
-                assert!(key.starts_with(prefix), "Listed key escaped prefix {prefix}: {key}");
-
-                if let Some(previous) = &last_key {
-                    assert!(
-                        key > previous.as_str(),
-                        "ListObjects did not make lexicographic progress: {key} <= {previous}"
-                    );
-                }
-
-                assert!(seen.insert(key.to_string()), "Duplicate key returned across V1 pages: {key}");
-                listed_keys.push(key.to_string());
-                last_key = Some(key.to_string());
-            }
-
-            page_count += 1;
-
-            if output.is_truncated().unwrap_or(false) {
-                marker = Some(
-                    output
-                        .next_marker()
-                        .or_else(|| contents.last().and_then(|object| object.key()))
-                        .expect("NextMarker or last key must be present when IsTruncated is true")
-                        .to_string(),
-                );
-            } else {
-                assert!(output.next_marker().is_none(), "NextMarker should be absent on the final page");
-                break;
-            }
-
-            assert!(page_count <= 64, "Too many ListObjects pages, possible marker loop");
-        }
-
-        info!(
-            "Recursive ListObjects returned all {} objects under {:?} in {} pages",
             listed_keys.len(),
             prefix,
             page_count
