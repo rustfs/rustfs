@@ -269,7 +269,7 @@ snafu = "0.9.0"
 snap = "1.1.1"
 starshard = { version = "1.1.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }
-sysinfo = "0.39.0"
+sysinfo = "0.39.1"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.3.1"
@@ -294,12 +294,12 @@ zstd = "0.13.3"
 # Observability and Metrics
 metrics = "0.24.5"
 dial9-tokio-telemetry = "0.3"
-opentelemetry = { version = "0.31.0" }
+opentelemetry = { version = "0.32.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
-opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rustls"] }
-opentelemetry_sdk = { version = "0.31.0" }
-opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
-opentelemetry-stdout = { version = "0.31.0" }
+opentelemetry-otlp = { version = "0.32.0", features = ["gzip-http", "reqwest-rustls"] }
+opentelemetry_sdk = { version = "0.32.0" }
+opentelemetry-semantic-conventions = { version = "0.32.0", features = ["semconv_experimental"] }
+opentelemetry-stdout = { version = "0.32.0" }
 pyroscope = { version = "2.0.3", features = ["backend-pprof-rs"] }
 
 # FTP and SFTP
