@@ -86,54 +86,41 @@ fn validator_from_metadata(metadata: TargetAdminMetadata) -> AdminRequestValidat
         TargetRequestValidator::Webhook => Arc::new(validate_webhook_request_entry),
         TargetRequestValidator::Mqtt => Arc::new(validate_mqtt_request_entry),
         TargetRequestValidator::Amqp(target_type) => {
-            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                Arc::new(validate_audit_amqp_request_entry)
-            } else {
-                Arc::new(validate_notify_amqp_request_entry)
-            }
+            domain_request_validator(TargetDomain::from(target_type), validate_amqp_request)
         }
         TargetRequestValidator::Kafka(target_type) => {
-            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                Arc::new(validate_audit_kafka_request_entry)
-            } else {
-                Arc::new(validate_notify_kafka_request_entry)
-            }
+            domain_request_validator(TargetDomain::from(target_type), validate_kafka_request)
         }
         TargetRequestValidator::MySql(target_type) => {
             Arc::new(move |kv_map, default_queue_dir| validate_mysql_request_entry(kv_map, default_queue_dir, target_type))
         }
         TargetRequestValidator::Nats(target_type) => {
-            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                Arc::new(validate_audit_nats_request_entry)
-            } else {
-                Arc::new(validate_notify_nats_request_entry)
-            }
+            domain_request_validator(TargetDomain::from(target_type), validate_nats_request)
         }
         TargetRequestValidator::Postgres(target_type) => {
-            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                Arc::new(validate_audit_postgres_request_entry)
-            } else {
-                Arc::new(validate_notify_postgres_request_entry)
-            }
+            domain_request_validator(TargetDomain::from(target_type), validate_postgres_request)
         }
         TargetRequestValidator::Pulsar(target_type) => {
-            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                Arc::new(validate_audit_pulsar_request_entry)
-            } else {
-                Arc::new(validate_notify_pulsar_request_entry)
-            }
+            domain_request_validator(TargetDomain::from(target_type), validate_pulsar_request)
         }
         TargetRequestValidator::Redis {
             default_channel,
             target_type,
-        } => {
-            if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                validate_audit_redis_request_entry(default_channel)
-            } else {
-                validate_notify_redis_request_entry(default_channel)
-            }
-        }
+        } => redis_request_validator(TargetDomain::from(target_type), default_channel),
     }
+}
+
+fn domain_request_validator(
+    domain: TargetDomain,
+    validator: for<'a> fn(&'a HashMap<String, String>, &'a str, TargetDomain) -> BoxFuture<'a, S3Result<()>>,
+) -> AdminRequestValidatorFn {
+    Arc::new(move |kv_map, default_queue_dir| validator(kv_map, default_queue_dir, domain))
+}
+
+fn redis_request_validator(domain: TargetDomain, default_channel: &'static str) -> AdminRequestValidatorFn {
+    Arc::new(move |kv_map, default_queue_dir| {
+        Box::pin(validate_redis_request(kv_map, default_queue_dir, domain, default_channel))
+    })
 }
 
 impl std::fmt::Debug for AdminTargetSpec {
@@ -534,62 +521,6 @@ fn validate_mqtt_request_entry<'a>(
     Box::pin(validate_mqtt_request(kv_map))
 }
 
-fn validate_notify_nats_request_entry<'a>(
-    kv_map: &'a HashMap<String, String>,
-    default_queue_dir: &'a str,
-) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_nats_request(kv_map, default_queue_dir, TargetDomain::Notify))
-}
-
-fn validate_audit_nats_request_entry<'a>(
-    kv_map: &'a HashMap<String, String>,
-    default_queue_dir: &'a str,
-) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_nats_request(kv_map, default_queue_dir, TargetDomain::Audit))
-}
-
-fn validate_notify_kafka_request_entry<'a>(
-    kv_map: &'a HashMap<String, String>,
-    default_queue_dir: &'a str,
-) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_kafka_request(kv_map, default_queue_dir, TargetDomain::Notify))
-}
-
-fn validate_audit_kafka_request_entry<'a>(
-    kv_map: &'a HashMap<String, String>,
-    default_queue_dir: &'a str,
-) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_kafka_request(kv_map, default_queue_dir, TargetDomain::Audit))
-}
-
-fn validate_notify_amqp_request_entry<'a>(
-    kv_map: &'a HashMap<String, String>,
-    default_queue_dir: &'a str,
-) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_amqp_request(kv_map, default_queue_dir, TargetDomain::Notify))
-}
-
-fn validate_audit_amqp_request_entry<'a>(
-    kv_map: &'a HashMap<String, String>,
-    default_queue_dir: &'a str,
-) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_amqp_request(kv_map, default_queue_dir, TargetDomain::Audit))
-}
-
-fn validate_notify_pulsar_request_entry<'a>(
-    kv_map: &'a HashMap<String, String>,
-    default_queue_dir: &'a str,
-) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_pulsar_request(kv_map, default_queue_dir, TargetDomain::Notify))
-}
-
-fn validate_audit_pulsar_request_entry<'a>(
-    kv_map: &'a HashMap<String, String>,
-    default_queue_dir: &'a str,
-) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_pulsar_request(kv_map, default_queue_dir, TargetDomain::Audit))
-}
-
 fn validate_mysql_request_entry<'a>(
     kv_map: &'a HashMap<String, String>,
     default_queue_dir: &'a str,
@@ -598,33 +529,19 @@ fn validate_mysql_request_entry<'a>(
     Box::pin(validate_mysql_request(kv_map, default_queue_dir, target_type))
 }
 
-fn validate_notify_postgres_request_entry<'a>(
+fn validate_nats_request<'a>(
     kv_map: &'a HashMap<String, String>,
     default_queue_dir: &'a str,
+    domain: TargetDomain,
 ) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_postgres_request(kv_map, default_queue_dir, TargetDomain::Notify))
+    Box::pin(async move { validate_nats_request_impl(kv_map, default_queue_dir, domain).await })
 }
 
-fn validate_audit_postgres_request_entry<'a>(
-    kv_map: &'a HashMap<String, String>,
-    default_queue_dir: &'a str,
-) -> BoxFuture<'a, S3Result<()>> {
-    Box::pin(validate_postgres_request(kv_map, default_queue_dir, TargetDomain::Audit))
-}
-
-fn validate_notify_redis_request_entry(default_channel: &'static str) -> AdminRequestValidatorFn {
-    Arc::new(move |kv_map: &HashMap<String, String>, default_queue_dir: &str| {
-        Box::pin(validate_redis_request(kv_map, default_queue_dir, TargetDomain::Notify, default_channel))
-    })
-}
-
-fn validate_audit_redis_request_entry(default_channel: &'static str) -> AdminRequestValidatorFn {
-    Arc::new(move |kv_map: &HashMap<String, String>, default_queue_dir: &str| {
-        Box::pin(validate_redis_request(kv_map, default_queue_dir, TargetDomain::Audit, default_channel))
-    })
-}
-
-async fn validate_nats_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
+async fn validate_nats_request_impl(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+) -> S3Result<()> {
     if let Some(queue_dir) = kv_map.get("queue_dir") {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
@@ -636,7 +553,19 @@ async fn validate_nats_request(kv_map: &HashMap<String, String>, default_queue_d
     })
 }
 
-async fn validate_kafka_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
+fn validate_kafka_request<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+    domain: TargetDomain,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(async move { validate_kafka_request_impl(kv_map, default_queue_dir, domain).await })
+}
+
+async fn validate_kafka_request_impl(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+) -> S3Result<()> {
     if let Some(queue_dir) = kv_map.get(KAFKA_QUEUE_DIR) {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
@@ -656,7 +585,19 @@ async fn validate_kafka_request(kv_map: &HashMap<String, String>, default_queue_
     })
 }
 
-async fn validate_amqp_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
+fn validate_amqp_request<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+    domain: TargetDomain,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(async move { validate_amqp_request_impl(kv_map, default_queue_dir, domain).await })
+}
+
+async fn validate_amqp_request_impl(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+) -> S3Result<()> {
     if let Some(queue_dir) = kv_map.get(AMQP_QUEUE_DIR) {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
@@ -668,7 +609,15 @@ async fn validate_amqp_request(kv_map: &HashMap<String, String>, default_queue_d
     })
 }
 
-async fn validate_pulsar_request(
+fn validate_pulsar_request<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+    domain: TargetDomain,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(async move { validate_pulsar_request_impl(kv_map, default_queue_dir, domain).await })
+}
+
+async fn validate_pulsar_request_impl(
     kv_map: &HashMap<String, String>,
     default_queue_dir: &str,
     domain: TargetDomain,
@@ -701,7 +650,15 @@ async fn validate_mysql_request(
     })
 }
 
-async fn validate_postgres_request(
+fn validate_postgres_request<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+    domain: TargetDomain,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(async move { validate_postgres_request_impl(kv_map, default_queue_dir, domain).await })
+}
+
+async fn validate_postgres_request_impl(
     kv_map: &HashMap<String, String>,
     default_queue_dir: &str,
     domain: TargetDomain,
