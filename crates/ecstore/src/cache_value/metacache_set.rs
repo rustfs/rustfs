@@ -45,8 +45,11 @@ async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>
     }
 }
 
-fn completion_error_for_tolerated_reader_errors(errs: &[Option<DiskError>]) -> Option<DiskError> {
-    errs.iter().flatten().find(|err| **err == DiskError::Timeout).cloned()
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TestReaderBehavior {
+    Eof,
+    Stall,
 }
 
 #[derive(Default)]
@@ -64,6 +67,10 @@ pub struct ListPathRawOptions {
     pub agreed: Option<AgreedFn>,
     pub partial: Option<PartialFn>,
     pub finished: Option<FinishedFn>,
+    #[cfg(test)]
+    pub(crate) test_reader_behaviors: Vec<TestReaderBehavior>,
+    #[cfg(test)]
+    pub(crate) peek_timeout: Option<Duration>,
     // pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
     // pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
     // pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
@@ -82,6 +89,10 @@ impl Clone for ListPathRawOptions {
             min_disks: self.min_disks,
             report_not_found: self.report_not_found,
             per_disk_limit: self.per_disk_limit,
+            #[cfg(test)]
+            test_reader_behaviors: self.test_reader_behaviors.clone(),
+            #[cfg(test)]
+            peek_timeout: self.peek_timeout,
             ..Default::default()
         }
     }
@@ -98,14 +109,29 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
     let cancel_rx = CancellationToken::new();
 
-    for disk in opts.disks.iter() {
+    for (disk_idx, disk) in opts.disks.iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = disk_idx;
         let opdisk = disk.clone();
         let opts_clone = opts.clone();
         let mut fds_clone = fds.clone();
         let cancel_rx_clone = cancel_rx.clone();
-        let (rd, mut wr) = tokio::io::duplex(64);
+        let (rd, wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
         jobs.push(spawn(async move {
+            #[cfg(test)]
+            if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).copied() {
+                match behavior {
+                    TestReaderBehavior::Eof => return Ok(()),
+                    TestReaderBehavior::Stall => {
+                        let _held_writer = wr;
+                        cancel_rx_clone.cancelled().await;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let mut wr = wr;
             let wakl_opts = WalkDirOptions {
                 bucket: opts_clone.bucket.clone(),
                 base_dir: opts_clone.path.clone(),
@@ -183,6 +209,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     }
 
     let revjob = spawn(async move {
+        #[cfg(test)]
+        let peek_timeout = opts.peek_timeout.unwrap_or_else(get_drive_walkdir_stall_timeout);
+        #[cfg(not(test))]
         let peek_timeout = get_drive_walkdir_stall_timeout();
         let mut errs: Vec<Option<DiskError>> = Vec::with_capacity(readers.len());
         for _ in 0..readers.len() {
@@ -362,8 +391,8 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 {
                     finished_fn(&errs).await;
                 }
-                if let Some(err) = completion_error_for_tolerated_reader_errors(&errs) {
-                    return Err(err);
+                if errs.iter().flatten().any(|err| *err == DiskError::Timeout) {
+                    return Err(DiskError::Timeout);
                 }
 
                 // error!("list_path_raw: at_eof + has_err == readers.len() break {:?}", &errs);
@@ -431,18 +460,22 @@ mod tests {
         assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
-    #[test]
-    fn completion_error_returns_timeout_for_stalled_reader() {
-        let errs = [Some(DiskError::Timeout), None];
+    #[tokio::test]
+    async fn list_path_raw_returns_timeout_when_reader_stalls_before_completion() {
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::Stall, TestReaderBehavior::Eof],
+                peek_timeout: Some(Duration::from_millis(20)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("stalled reader should make listing fail explicitly");
 
-        assert_eq!(completion_error_for_tolerated_reader_errors(&errs), Some(DiskError::Timeout));
-    }
-
-    #[test]
-    fn completion_error_allows_non_timeout_reader_errors() {
-        let errs = [Some(DiskError::DiskNotFound), None];
-
-        assert_eq!(completion_error_for_tolerated_reader_errors(&errs), None);
+        assert_eq!(err, DiskError::Timeout);
     }
 
     #[tokio::test]
