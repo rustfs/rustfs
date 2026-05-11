@@ -18,7 +18,8 @@
 
 use super::constants::{http_error_codes, s3_error_codes};
 use russh_sftp::protocol::{Status, StatusCode};
-use std::fmt::Display;
+use s3s::{S3Error, S3ErrorCode};
+use std::{any::Any, fmt::Display};
 
 /// Error type for SFTP operations. Converts to StatusCode for the wire.
 #[derive(Debug)]
@@ -36,26 +37,72 @@ impl SftpError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendErrorKind {
+    NotFound,
+    PermissionDenied,
+    NoSuchUpload,
+    Other,
+}
+
+fn classify_s3_code(code: &S3ErrorCode) -> BackendErrorKind {
+    match code {
+        S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchBucket => BackendErrorKind::NotFound,
+        S3ErrorCode::AccessDenied => BackendErrorKind::PermissionDenied,
+        S3ErrorCode::NoSuchUpload => BackendErrorKind::NoSuchUpload,
+        _ => match code.as_str() {
+            s3_error_codes::NO_SUCH_KEY
+            | s3_error_codes::NO_SUCH_BUCKET
+            | s3_error_codes::NOT_FOUND
+            | http_error_codes::NOT_FOUND => BackendErrorKind::NotFound,
+            s3_error_codes::ACCESS_DENIED | s3_error_codes::FORBIDDEN | http_error_codes::FORBIDDEN => {
+                BackendErrorKind::PermissionDenied
+            }
+            s3_error_codes::NO_SUCH_UPLOAD => BackendErrorKind::NoSuchUpload,
+            _ => BackendErrorKind::Other,
+        },
+    }
+}
+
+#[cfg(test)]
+fn classify_dummy_error(err: &crate::common::dummy_storage::DummyError) -> BackendErrorKind {
+    match err {
+        crate::common::dummy_storage::DummyError::NoSuchKey(_) | crate::common::dummy_storage::DummyError::NoSuchBucket(_) => {
+            BackendErrorKind::NotFound
+        }
+        crate::common::dummy_storage::DummyError::AccessDenied(_) => BackendErrorKind::PermissionDenied,
+        crate::common::dummy_storage::DummyError::NoSuchUpload(_) => BackendErrorKind::NoSuchUpload,
+        crate::common::dummy_storage::DummyError::Injected(_) | crate::common::dummy_storage::DummyError::Unconfigured(_) => {
+            BackendErrorKind::Other
+        }
+    }
+}
+
+fn classify_backend_error<E: Display + 'static>(err: &E) -> BackendErrorKind {
+    let any = err as &dyn Any;
+    if let Some(err) = any.downcast_ref::<S3Error>() {
+        return classify_s3_code(err.code());
+    }
+
+    #[cfg(test)]
+    if let Some(err) = any.downcast_ref::<crate::common::dummy_storage::DummyError>() {
+        return classify_dummy_error(err);
+    }
+
+    BackendErrorKind::Other
+}
+
 /// Map an S3 backend error into an SFTP status code and log the underlying
 /// detail server-side. The wire response only carries the status code. The
-/// full error is written to the server log for operator diagnosis. Error
-/// strings that mention the common "not found" or "access denied" patterns
-/// are mapped to the matching SFTP status. Everything else is Failure.
-pub(super) fn s3_error_to_sftp<E: Display>(op: &str, err: E) -> SftpError {
+/// full error is written to the server log for operator diagnosis. Typed
+/// backend errors are mapped to the matching SFTP status. Everything else is
+/// Failure.
+pub(super) fn s3_error_to_sftp<E: Display + 'static>(op: &str, err: E) -> SftpError {
     let msg = err.to_string();
-    let code = if msg.contains(s3_error_codes::NO_SUCH_KEY)
-        || msg.contains(s3_error_codes::NO_SUCH_BUCKET)
-        || msg.contains(s3_error_codes::NOT_FOUND)
-        || msg.contains(http_error_codes::NOT_FOUND)
-    {
-        StatusCode::NoSuchFile
-    } else if msg.contains(s3_error_codes::ACCESS_DENIED)
-        || msg.contains(s3_error_codes::FORBIDDEN)
-        || msg.contains(http_error_codes::FORBIDDEN)
-    {
-        StatusCode::PermissionDenied
-    } else {
-        StatusCode::Failure
+    let code = match classify_backend_error(&err) {
+        BackendErrorKind::NotFound => StatusCode::NoSuchFile,
+        BackendErrorKind::PermissionDenied => StatusCode::PermissionDenied,
+        BackendErrorKind::NoSuchUpload | BackendErrorKind::Other => StatusCode::Failure,
     };
     tracing::warn!(op = %op, err = %msg, "SFTP backend error");
     SftpError::code(code)
@@ -94,20 +141,23 @@ pub(super) fn ok_status(id: u32) -> Status {
     }
 }
 
-/// Classify an S3 backend error string as the not-found category that
+/// Classify a backend error as the not-found category that
 /// distinguishes the EXCLUDE create accept path (object does not exist)
-/// from a backend failure that needs propagating. Mirrors the prefix set
+/// from a backend failure that needs propagating. Mirrors the typed set
 /// recognised by s3_error_to_sftp.
-pub(super) fn is_not_found_error<E: Display>(err: &E) -> bool {
-    let msg = err.to_string();
-    msg.contains(s3_error_codes::NO_SUCH_KEY)
-        || msg.contains(s3_error_codes::NO_SUCH_BUCKET)
-        || msg.contains(s3_error_codes::NOT_FOUND)
-        || msg.contains(http_error_codes::NOT_FOUND)
+pub(super) fn is_not_found_error<E: Display + 'static>(err: &E) -> bool {
+    classify_backend_error(err) == BackendErrorKind::NotFound
+}
+
+/// Returns true when AbortMultipartUpload reports an already-missing upload.
+pub(super) fn is_no_such_upload_error<E: Display + 'static>(err: &E) -> bool {
+    classify_backend_error(err) == BackendErrorKind::NoSuchUpload
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::common::dummy_storage::DummyError;
+
     use super::*;
 
     #[test]
@@ -120,23 +170,30 @@ mod tests {
     }
 
     #[test]
-    fn is_not_found_recognises_standard_error_patterns() {
-        struct E(&'static str);
-        impl std::fmt::Display for E {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.0)
-            }
-        }
-        assert!(is_not_found_error(&E("S3Error: NoSuchKey")));
-        assert!(is_not_found_error(&E("backend returned NoSuchBucket")));
-        assert!(is_not_found_error(&E("NotFound (404)")));
-        assert!(is_not_found_error(&E("response status 404")));
-        assert!(!is_not_found_error(&E("AccessDenied")));
-        assert!(!is_not_found_error(&E("generic backend failure")));
+    fn is_not_found_uses_s3_error_code_not_message_text() {
+        let err = S3Error::with_message(S3ErrorCode::NoSuchKey, "object missing");
+        assert!(is_not_found_error(&err));
+
+        let err = S3Error::with_message(S3ErrorCode::NoSuchBucket, "bucket missing");
+        assert!(is_not_found_error(&err));
+
+        let err = S3Error::with_message(S3ErrorCode::AccessDenied, "not found text in deny message");
+        assert!(!is_not_found_error(&err));
     }
 
     #[test]
-    fn s3_error_to_sftp_maps_access_denied_to_permission_denied() {
+    fn s3_error_to_sftp_uses_s3_error_code_not_message_text() {
+        let check = |code, msg| -> StatusCode { StatusCode::from(s3_error_to_sftp("test", S3Error::with_message(code, msg))) };
+        assert!(matches!(check(S3ErrorCode::AccessDenied, "policy denied"), StatusCode::PermissionDenied));
+        assert!(matches!(check(S3ErrorCode::NoSuchKey, "object missing"), StatusCode::NoSuchFile));
+        assert!(matches!(
+            check(S3ErrorCode::InternalError, "AccessDenied appears only in message"),
+            StatusCode::Failure
+        ));
+    }
+
+    #[test]
+    fn unknown_errors_do_not_classify_by_display_substrings() {
         struct E(&'static str);
         impl std::fmt::Display for E {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -144,10 +201,22 @@ mod tests {
             }
         }
         let check = |msg: &'static str| -> StatusCode { StatusCode::from(s3_error_to_sftp("test", E(msg))) };
-        assert!(matches!(check("AccessDenied"), StatusCode::PermissionDenied));
-        assert!(matches!(check("Forbidden"), StatusCode::PermissionDenied));
-        assert!(matches!(check("403"), StatusCode::PermissionDenied));
-        assert!(matches!(check("NoSuchKey"), StatusCode::NoSuchFile));
+        assert!(matches!(check("AccessDenied"), StatusCode::Failure));
+        assert!(matches!(check("Forbidden"), StatusCode::Failure));
+        assert!(matches!(check("403"), StatusCode::Failure));
+        assert!(matches!(check("NoSuchKey"), StatusCode::Failure));
         assert!(matches!(check("something unexpected"), StatusCode::Failure));
+    }
+
+    #[test]
+    fn no_such_upload_uses_s3_error_code() {
+        let err = S3Error::with_message(S3ErrorCode::NoSuchUpload, "upload is already gone");
+        assert!(is_no_such_upload_error(&err));
+
+        let err = S3Error::with_message(S3ErrorCode::InternalError, "NoSuchUpload appears only in message");
+        assert!(!is_no_such_upload_error(&err));
+
+        let err = DummyError::NoSuchUpload("upload is already gone".to_string());
+        assert!(is_no_such_upload_error(&err));
     }
 }
