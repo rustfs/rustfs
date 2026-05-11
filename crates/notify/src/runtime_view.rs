@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{Event, NotificationTargetMetricSnapshot, notifier::TargetList};
-use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, Target, arn::TargetID};
+use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, SharedTarget, arn::TargetID};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -39,7 +39,7 @@ impl NotifyRuntimeView {
         self.target_list.clone()
     }
 
-    pub async fn get_target_values(&self) -> Vec<Arc<dyn Target<Event> + Send + Sync>> {
+    pub async fn get_target_values(&self) -> Vec<SharedTarget<Event>> {
         self.target_list.read().await.values()
     }
 

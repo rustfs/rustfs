@@ -263,40 +263,6 @@ impl EventNotifier {
         info!("Event processing initiated for {} targets for bucket: {}", target_ids_len, bucket_name);
     }
 
-    /// Initializes the targets for buckets
-    ///
-    /// # Arguments
-    /// * `targets_to_init` - A vector of boxed targets to initialize
-    ///
-    /// # Returns
-    /// Returns `Ok(())` if initialization is successful, otherwise returns a `NotificationError`.
-    #[instrument(skip(self, targets_to_init))]
-    pub async fn init_bucket_targets(
-        &self,
-        targets_to_init: Vec<Box<dyn Target<Event> + Send + Sync>>,
-    ) -> Result<(), NotificationError> {
-        // Currently active, simpler logic
-        let mut target_list_guard = self.target_list.write().await; //Gets a write lock for the TargetList
-
-        // Clear existing targets first - rebuild from scratch to ensure consistency with new configuration
-        target_list_guard.clear();
-
-        for target_boxed in targets_to_init {
-            // Traverse the incoming Box<dyn Target >
-            debug!("init bucket target: {}", target_boxed.name());
-            // TargetList::add method expectations Arc<dyn Target + Send + Sync>
-            // Therefore, you need to convert Box<dyn Target + Send + Sync> to Arc<dyn Target + Send + Sync>
-            let target_arc: Arc<dyn Target<Event> + Send + Sync> = Arc::from(target_boxed);
-            target_list_guard.add(target_arc)?; // Add Arc<dyn Target> to the list
-        }
-        info!(
-            "Initialized {} targets, list size: {}", // Clearer logs
-            target_list_guard.len(),
-            target_list_guard.len()
-        );
-        Ok(()) // Make sure to return a Result
-    }
-
     /// Initializes the targets for buckets from shared target handles.
     #[instrument(skip(self, targets_to_init))]
     pub async fn init_bucket_targets_shared(&self, targets_to_init: Vec<SharedTarget<Event>>) -> Result<(), NotificationError> {

@@ -24,7 +24,7 @@ use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
-use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, Target};
+use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, SharedTarget};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -210,7 +210,7 @@ impl NotificationSystem {
     ///
     /// # Return
     /// A Vec containing all Targets.
-    pub async fn get_target_values(&self) -> Vec<Arc<dyn Target<Event> + Send + Sync>> {
+    pub async fn get_target_values(&self) -> Vec<SharedTarget<Event>> {
         self.services.runtime_view.get_target_values().await
     }
 
