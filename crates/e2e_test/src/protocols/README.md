@@ -16,9 +16,9 @@ RUSTFS_BUILD_FEATURES=ftps,webdav,sftp cargo test --package e2e_test test_protoc
 ```
 
 `RUSTFS_BUILD_FEATURES` controls which features the test rustfs binary is
-built with. The protocol test runner schedules every entry (FTPS, WebDAV,
-SFTP) regardless of the feature set, so the binary must include every
-protocol the runner spawns or the corresponding entries will fail.
+built with. When this variable is set, the protocol test runner schedules
+only entries whose protocol is present in the requested feature list. Leave
+it unset to run every protocol entry.
 `--test-threads=1` is required because every entry spawns a rustfs server
 on fixed bind ports.
 

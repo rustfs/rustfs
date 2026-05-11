@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{error::NotificationError, event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine};
+use crate::{error::NotificationError, event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine,
+    rules::{RulesMap, TargetIdSet},
+};
+use hashbrown::HashMap;
+use percent_encoding::percent_decode_str;
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;
@@ -22,6 +26,22 @@ use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 
 pub type SharedNotifyTargetList = Arc<RwLock<TargetList>>;
+fn decoded_object_key_for_matching(object_key: &str) -> Option<String> {
+    if !object_key.contains('%') {
+        return None;
+    }
+
+    let decoded = percent_decode_str(object_key).decode_utf8().ok()?;
+    (decoded != object_key).then(|| decoded.into_owned())
+}
+
+fn match_event_targets(rules: &RulesMap, event_name: rustfs_s3_common::EventName, object_key: &str) -> TargetIdSet {
+    let mut target_ids = rules.match_rules(event_name, object_key);
+    if let Some(decoded_key) = decoded_object_key_for_matching(object_key) {
+        target_ids.extend(rules.match_rules(event_name, &decoded_key));
+    }
+    target_ids
+}
 
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
@@ -97,6 +117,13 @@ impl EventNotifier {
         let event_name = event.event_name;
 
         let target_ids = self.rule_engine.match_targets(bucket_name, event_name, object_key).await;
+        // let Some(rules) = self.bucket_rules_map.get(bucket_name).await else {
+        //     debug!("No rules found for bucket: {}", bucket_name);
+        //     self.metrics.increment_skipped();
+        //     return;
+        // };
+
+        // let target_ids = match_event_targets(&rules, event_name, object_key);
         if target_ids.is_empty() {
             debug!("No matching targets for event in bucket: {}", bucket_name);
             self.metrics.increment_skipped();
@@ -316,6 +343,30 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn encoded_event_key_matches_raw_prefix_suffix_filter() {
+        let target_id = TargetID::new("primary".to_string(), "webhook".to_string());
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), target_id.clone());
+
+        let targets = match_event_targets(&rules_map, EventName::ObjectCreatedPut, "uploads%2Freport.csv");
+
+        assert!(targets.contains(&target_id));
+    }
+
+    #[test]
+    fn encoded_event_key_does_not_bypass_suffix_filter() {
+        let target_id = TargetID::new("primary".to_string(), "webhook".to_string());
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), target_id);
+
+        let root_targets = match_event_targets(&rules_map, EventName::ObjectCreatedPut, "report.csv");
+        let suffix_targets = match_event_targets(&rules_map, EventName::ObjectCreatedPut, "uploads%2Freport.txt");
+
+        assert!(root_targets.is_empty());
+        assert!(suffix_targets.is_empty());
+    }
 
     #[derive(Clone)]
     struct TestTarget {
