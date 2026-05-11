@@ -183,12 +183,24 @@ pub(crate) fn spawn_cert_reload_loop(
 
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!(protocol, cert_dir = %cert_dir, "TLS certificate hot reload task stopped");
-                        break;
+                changed = shutdown_rx.changed() => {
+                    match changed {
+                        Ok(()) => {
+                            if *shutdown_rx.borrow() {
+                                info!(protocol, cert_dir = %cert_dir, "TLS certificate hot reload task stopped");
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(_) => {
+                            info!(
+                                protocol,
+                                cert_dir = %cert_dir,
+                                "TLS certificate hot reload task stopped because the shutdown channel closed"
+                            );
+                            break;
+                        }
                     }
-                    continue;
                 }
                 _ = interval.tick() => {}
             }
