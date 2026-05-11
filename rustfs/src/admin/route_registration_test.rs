@@ -106,6 +106,8 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v4/plugins/catalog"));
     assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances"));
     assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances/example-id"));
+    assert_route(&router, Method::PUT, &admin_path("/v4/plugins/instances/example-id"));
+    assert_route(&router, Method::DELETE, &admin_path("/v4/plugins/instances/example-id"));
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));

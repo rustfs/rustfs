@@ -15,25 +15,31 @@
 use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
-        AdminTargetSpec, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin, build_json_response,
-        collect_runtime_statuses, collect_target_instances, find_target_instance,
+        AdminTargetSpec, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin, build_enabled_target_kvs,
+        build_json_response, collect_runtime_statuses, collect_target_instances, find_target_instance,
+        target_module_disabled_reason, target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     plugin_contract::{PluginContractDomain, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse},
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::{
+    ADMIN_PREFIX, RemoteAddr, is_audit_module_enabled, is_notify_module_enabled, refresh_audit_module_enabled,
+    refresh_notify_module_enabled, refresh_persisted_module_switches_from_store,
+};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_audit::audit_system;
+use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
+use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use tracing::warn;
 use url::form_urlencoded;
 
 pub fn register_plugin_instance_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -46,6 +52,16 @@ pub fn register_plugin_instance_route(r: &mut S3Router<AdminOperation>) -> std::
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v4/plugins/instances/{id}").as_str(),
         AdminOperation(&GetPluginInstanceHandler {}),
+    )?;
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v4/plugins/instances/{id}").as_str(),
+        AdminOperation(&PutPluginInstanceHandler {}),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v4/plugins/instances/{id}").as_str(),
+        AdminOperation(&DeletePluginInstanceHandler {}),
     )?;
 
     Ok(())
@@ -99,6 +115,24 @@ fn map_instance_source(source: TargetEndpointSource) -> PluginInstanceSource {
 
 fn kvs_to_map(config: KVS) -> HashMap<String, String> {
     config.0.into_iter().map(|kv| (kv.key, kv.value)).collect()
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPluginInstanceTarget {
+    domain: PluginContractDomain,
+    target_name: String,
+    target_spec: AdminTargetSpec,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct KeyValue {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PluginInstanceBody {
+    key_values: Vec<KeyValue>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -179,6 +213,49 @@ fn parse_limit_filter(value: &str) -> S3Result<usize> {
         return Err(s3_error!(InvalidArgument, "invalid plugin instance limit filter: '{}'", value));
     }
     Ok(limit)
+}
+
+fn parse_plugin_instance_id(instance_id: &str) -> S3Result<(String, PluginContractDomain, String)> {
+    let mut parts = instance_id.rsplitn(3, ':');
+    let Some(target_name) = parts.next() else {
+        return Err(s3_error!(InvalidArgument, "invalid plugin instance id: '{}'", instance_id));
+    };
+    let Some(domain) = parts.next() else {
+        return Err(s3_error!(InvalidArgument, "invalid plugin instance id: '{}'", instance_id));
+    };
+    let Some(plugin_id) = parts.next() else {
+        return Err(s3_error!(InvalidArgument, "invalid plugin instance id: '{}'", instance_id));
+    };
+
+    if target_name.is_empty() || plugin_id.is_empty() {
+        return Err(s3_error!(InvalidArgument, "invalid plugin instance id: '{}'", instance_id));
+    }
+
+    Ok((
+        plugin_id.to_string(),
+        parse_plugin_contract_domain(domain)?,
+        target_name.to_ascii_lowercase(),
+    ))
+}
+
+fn resolve_plugin_instance_target(instance_id: &str) -> S3Result<ResolvedPluginInstanceTarget> {
+    let (plugin_id, domain, target_name) = parse_plugin_instance_id(instance_id)?;
+    let specs = match domain {
+        PluginContractDomain::Notify => notification_target_specs(),
+        PluginContractDomain::Audit => audit_target_specs(),
+    };
+
+    let target_spec = specs
+        .iter()
+        .find(|spec| rustfs_targets::builtin_target_marketplace_manifest(spec.service).plugin_id == plugin_id)
+        .cloned()
+        .ok_or_else(|| s3_error!(InvalidArgument, "unsupported plugin instance id: '{}'", instance_id))?;
+
+    Ok(ResolvedPluginInstanceTarget {
+        domain,
+        target_name,
+        target_spec,
+    })
 }
 
 fn filter_plugin_instances(mut instances: Vec<PluginInstanceEntry>, filters: &PluginInstanceFilters) -> Vec<PluginInstanceEntry> {
@@ -286,6 +363,25 @@ async fn authorize_plugin_instance_request(req: &S3Request<Body>) -> S3Result<()
     .await
 }
 
+async fn authorize_plugin_instance_write_request(req: &S3Request<Body>) -> S3Result<()> {
+    let Some(input_cred) = &req.credentials else {
+        return Err(s3_error!(InvalidRequest, "authentication required"));
+    };
+
+    let (cred, owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+    validate_admin_request(
+        &req.headers,
+        &cred,
+        owner,
+        false,
+        vec![Action::AdminAction(AdminAction::SetBucketTargetAction)],
+        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+    )
+    .await
+}
+
 async fn load_server_config_from_store() -> S3Result<Config> {
     let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
         return Ok(Config::new());
@@ -294,6 +390,108 @@ async fn load_server_config_from_store() -> S3Result<Config> {
     rustfs_ecstore::config::com::read_config_without_migrate(store)
         .await
         .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))
+}
+
+fn has_any_audit_targets(config: &Config) -> bool {
+    for spec in audit_target_specs() {
+        let Some(targets) = config.0.get(spec.subsystem) else {
+            continue;
+        };
+        if targets.keys().any(|key| key != rustfs_config::DEFAULT_DELIMITER) {
+            return true;
+        }
+    }
+    false
+}
+
+async fn apply_audit_runtime_config(config: Config) -> S3Result<()> {
+    let has_targets = has_any_audit_targets(&config);
+
+    if let Some(system) = audit_system() {
+        match system.get_state().await {
+            AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {
+                if has_targets {
+                    system
+                        .reload_config(config)
+                        .await
+                        .map_err(|e| s3_error!(InternalError, "failed to reload audit config: {}", e))?;
+                } else {
+                    system
+                        .close()
+                        .await
+                        .map_err(|e| s3_error!(InternalError, "failed to stop audit system: {}", e))?;
+                }
+            }
+            AuditSystemState::Stopped | AuditSystemState::Stopping => {
+                if has_targets {
+                    system
+                        .start(config)
+                        .await
+                        .map_err(|e| s3_error!(InternalError, "failed to start audit system: {}", e))?;
+                }
+            }
+        }
+    } else if has_targets {
+        start_global_audit_system(config)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to start audit system: {}", e))?;
+    }
+
+    Ok(())
+}
+
+async fn update_audit_config_and_reload<F>(mut modifier: F) -> S3Result<()>
+where
+    F: FnMut(&mut Config) -> bool,
+{
+    let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
+        return Err(s3_error!(InternalError, "server storage not initialized"));
+    };
+
+    let mut config = rustfs_ecstore::config::com::read_config_without_migrate(store.clone())
+        .await
+        .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))?;
+
+    if !modifier(&mut config) {
+        return Ok(());
+    }
+
+    rustfs_ecstore::config::com::save_server_config(store, &config)
+        .await
+        .map_err(|e| s3_error!(InternalError, "failed to save audit config: {}", e))?;
+
+    apply_audit_runtime_config(config).await
+}
+
+fn plugin_instance_mutation_block_reason(
+    specs: &[AdminTargetSpec],
+    route_prefix: &str,
+    config: &Config,
+    target_type: &str,
+    target_name: &str,
+    target_label: &str,
+) -> Option<String> {
+    shared_target_mutation_block_reason(specs, route_prefix, config, target_type, target_name, target_label)
+}
+
+async fn plugin_instance_operation_block_reason(domain: PluginContractDomain, action: &str) -> Option<String> {
+    if let Err(err) = refresh_persisted_module_switches_from_store().await {
+        warn!(
+            error = %err,
+            "failed to reload persisted module switches before checking plugin instance operation gating"
+        );
+    }
+
+    match domain {
+        PluginContractDomain::Notify => {
+            refresh_notify_module_enabled();
+            target_module_disabled_reason("notify", rustfs_config::ENV_NOTIFY_ENABLE, is_notify_module_enabled(), action)
+        }
+        PluginContractDomain::Audit => {
+            refresh_audit_module_enabled();
+            target_module_disabled_reason("audit", rustfs_config::ENV_AUDIT_ENABLE, is_audit_module_enabled(), action)
+        }
+    }
 }
 
 async fn collect_notification_instances() -> S3Result<Vec<PluginInstanceEntry>> {
@@ -387,6 +585,168 @@ impl Operation for GetPluginInstanceHandler {
     }
 }
 
+pub struct PutPluginInstanceHandler {}
+
+#[async_trait::async_trait]
+impl Operation for PutPluginInstanceHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_plugin_instance_write_request(&req).await?;
+        let instance_id = params
+            .get("id")
+            .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'id'"))?;
+        let resolved = resolve_plugin_instance_target(instance_id)?;
+
+        if let Some(reason) =
+            plugin_instance_operation_block_reason(resolved.domain, "managing plugin instances from the console").await
+        {
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
+
+        let mut input = req.input;
+        let body_bytes = input
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|_| s3_error!(InvalidRequest, "failed to read request body"))?;
+        let body: PluginInstanceBody = serde_json::from_slice(&body_bytes)
+            .map_err(|e| s3_error!(InvalidArgument, "invalid json body for plugin instance config: {}", e))?;
+
+        match resolved.domain {
+            PluginContractDomain::Notify => {
+                let ns = rustfs_notify::notification_system()
+                    .ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))?;
+                let config_snapshot = ns.config.read().await.clone();
+                if let Some(reason) = plugin_instance_mutation_block_reason(
+                    notification_target_specs(),
+                    NOTIFY_ROUTE_PREFIX,
+                    &config_snapshot,
+                    resolved.target_spec.subsystem,
+                    &resolved.target_name,
+                    "plugin instance",
+                ) {
+                    return Err(s3_error!(InvalidRequest, "{reason}"));
+                }
+
+                let kvs = build_enabled_target_kvs(
+                    notification_target_specs(),
+                    body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+                    resolved.target_spec.subsystem,
+                    EVENT_DEFAULT_DIR,
+                    "plugin instance",
+                )
+                .await?;
+
+                ns.set_target_config(resolved.target_spec.subsystem, &resolved.target_name, kvs)
+                    .await
+                    .map_err(|e| s3_error!(InternalError, "failed to set plugin instance config: {}", e))?;
+            }
+            PluginContractDomain::Audit => {
+                let config_snapshot = load_server_config_from_store().await?;
+                if let Some(reason) = plugin_instance_mutation_block_reason(
+                    audit_target_specs(),
+                    AUDIT_ROUTE_PREFIX,
+                    &config_snapshot,
+                    resolved.target_spec.subsystem,
+                    &resolved.target_name,
+                    "plugin instance",
+                ) {
+                    return Err(s3_error!(InvalidRequest, "{reason}"));
+                }
+
+                let kvs = build_enabled_target_kvs(
+                    audit_target_specs(),
+                    body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+                    resolved.target_spec.subsystem,
+                    AUDIT_DEFAULT_DIR,
+                    "plugin instance",
+                )
+                .await?;
+
+                update_audit_config_and_reload(|config| {
+                    config
+                        .0
+                        .entry(resolved.target_spec.subsystem.to_lowercase())
+                        .or_default()
+                        .insert(resolved.target_name.to_lowercase(), kvs.clone());
+                    true
+                })
+                .await?;
+            }
+        }
+
+        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+    }
+}
+
+pub struct DeletePluginInstanceHandler {}
+
+#[async_trait::async_trait]
+impl Operation for DeletePluginInstanceHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_plugin_instance_write_request(&req).await?;
+        let instance_id = params
+            .get("id")
+            .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'id'"))?;
+        let resolved = resolve_plugin_instance_target(instance_id)?;
+
+        if let Some(reason) =
+            plugin_instance_operation_block_reason(resolved.domain, "managing plugin instances from the console").await
+        {
+            return Err(s3_error!(InvalidRequest, "{reason}"));
+        }
+
+        match resolved.domain {
+            PluginContractDomain::Notify => {
+                let ns = rustfs_notify::notification_system()
+                    .ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))?;
+                let config_snapshot = ns.config.read().await.clone();
+                if let Some(reason) = plugin_instance_mutation_block_reason(
+                    notification_target_specs(),
+                    NOTIFY_ROUTE_PREFIX,
+                    &config_snapshot,
+                    resolved.target_spec.subsystem,
+                    &resolved.target_name,
+                    "plugin instance",
+                ) {
+                    return Err(s3_error!(InvalidRequest, "{reason}"));
+                }
+
+                ns.remove_target_config(resolved.target_spec.subsystem, &resolved.target_name)
+                    .await
+                    .map_err(|e| s3_error!(InternalError, "failed to remove plugin instance config: {}", e))?;
+            }
+            PluginContractDomain::Audit => {
+                let config_snapshot = load_server_config_from_store().await?;
+                if let Some(reason) = plugin_instance_mutation_block_reason(
+                    audit_target_specs(),
+                    AUDIT_ROUTE_PREFIX,
+                    &config_snapshot,
+                    resolved.target_spec.subsystem,
+                    &resolved.target_name,
+                    "plugin instance",
+                ) {
+                    return Err(s3_error!(InvalidRequest, "{reason}"));
+                }
+
+                update_audit_config_and_reload(|config| {
+                    let mut changed = false;
+                    if let Some(targets) = config.0.get_mut(&resolved.target_spec.subsystem.to_lowercase()) {
+                        if targets.remove(&resolved.target_name.to_lowercase()).is_some() {
+                            changed = true;
+                        }
+                        if targets.is_empty() {
+                            config.0.remove(&resolved.target_spec.subsystem.to_lowercase());
+                        }
+                    }
+                    changed
+                })
+                .await?;
+            }
+        }
+
+        Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -424,7 +784,17 @@ mod tests {
             "impl Operation for ListPluginInstancesHandler",
             "pub struct GetPluginInstanceHandler",
         );
-        let detail_block = extract_block_between_markers(src, "impl Operation for GetPluginInstanceHandler", "#[cfg(test)]");
+        let detail_block = extract_block_between_markers(
+            src,
+            "impl Operation for GetPluginInstanceHandler",
+            "pub struct PutPluginInstanceHandler",
+        );
+        let put_block = extract_block_between_markers(
+            src,
+            "impl Operation for PutPluginInstanceHandler",
+            "pub struct DeletePluginInstanceHandler",
+        );
+        let delete_block = extract_block_between_markers(src, "impl Operation for DeletePluginInstanceHandler", "#[cfg(test)]");
 
         assert!(
             list_block.contains("authorize_plugin_instance_request(&req).await?;"),
@@ -433,6 +803,14 @@ mod tests {
         assert!(
             detail_block.contains("authorize_plugin_instance_request(&req).await?;"),
             "plugin instance detail should require admin authorization"
+        );
+        assert!(
+            put_block.contains("authorize_plugin_instance_write_request(&req).await?;"),
+            "plugin instance writes should require SetBucketTargetAction"
+        );
+        assert!(
+            delete_block.contains("authorize_plugin_instance_write_request(&req).await?;"),
+            "plugin instance deletion should require SetBucketTargetAction"
         );
     }
 
