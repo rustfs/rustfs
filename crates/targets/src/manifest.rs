@@ -33,6 +33,39 @@ pub struct TargetPluginManifest {
     pub secret_fields: &'static [&'static str],
 }
 
+/// Declares how a plugin is packaged relative to the RustFS process boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPluginPackaging {
+    Builtin,
+    External,
+}
+
+/// Declares what kind of entrypoint a plugin would use when instantiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPluginEntrypointKind {
+    Builtin,
+    Sidecar,
+    Wasm,
+}
+
+/// Marketplace-oriented manifest metadata that is explicit about future
+/// installable plugin boundaries without introducing any loading behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetPluginMarketplaceManifest {
+    pub plugin_id: &'static str,
+    pub display_name: &'static str,
+    pub provider: &'static str,
+    pub version: &'static str,
+    pub target_type: &'static str,
+    pub supported_domains: &'static [TargetDomain],
+    pub secret_fields: &'static [&'static str],
+    pub packaging: TargetPluginPackaging,
+    pub entrypoint_kind: TargetPluginEntrypointKind,
+    pub api_compatibility_version: &'static str,
+}
+
+const BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION: &str = "rustfs.target-plugin.v1";
+
 const SUPPORTED_BUILTIN_DOMAINS: &[TargetDomain] = &[TargetDomain::Audit, TargetDomain::Notify];
 const NO_SECRET_FIELDS: &[&str] = &[];
 
@@ -79,6 +112,28 @@ pub fn builtin_target_manifest(target_type: &'static str) -> TargetPluginManifes
 }
 
 #[inline]
+pub fn builtin_target_marketplace_manifest(target_type: &'static str) -> TargetPluginMarketplaceManifest {
+    TargetPluginMarketplaceManifest::from(builtin_target_manifest(target_type))
+}
+
+impl From<TargetPluginManifest> for TargetPluginMarketplaceManifest {
+    fn from(value: TargetPluginManifest) -> Self {
+        Self {
+            plugin_id: value.plugin_id,
+            display_name: value.display_name,
+            provider: value.provider,
+            version: value.version,
+            target_type: value.target_type,
+            supported_domains: value.supported_domains,
+            secret_fields: value.secret_fields,
+            packaging: TargetPluginPackaging::Builtin,
+            entrypoint_kind: TargetPluginEntrypointKind::Builtin,
+            api_compatibility_version: BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION,
+        }
+    }
+}
+
+#[inline]
 fn builtin_plugin_id(target_type: &'static str) -> &'static str {
     match target_type {
         "webhook" => "builtin:webhook",
@@ -96,7 +151,11 @@ fn builtin_plugin_id(target_type: &'static str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::builtin_target_manifest;
+    use super::{
+        TargetPluginEntrypointKind, TargetPluginMarketplaceManifest, TargetPluginPackaging, builtin_target_manifest,
+        builtin_target_marketplace_manifest,
+    };
+    use crate::domain::TargetDomain;
     use rustfs_config::{WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY};
 
     #[test]
@@ -108,5 +167,35 @@ mod tests {
         assert!(manifest.secret_fields.contains(&WEBHOOK_AUTH_TOKEN));
         assert!(manifest.secret_fields.contains(&WEBHOOK_CLIENT_CERT));
         assert!(manifest.secret_fields.contains(&WEBHOOK_CLIENT_KEY));
+    }
+
+    #[test]
+    fn builtin_manifest_derives_marketplace_boundary_metadata() {
+        let manifest = builtin_target_marketplace_manifest("webhook");
+
+        assert_eq!(manifest.plugin_id, "builtin:webhook");
+        assert_eq!(manifest.display_name, "Webhook");
+        assert_eq!(manifest.target_type, "webhook");
+        assert_eq!(manifest.packaging, TargetPluginPackaging::Builtin);
+        assert_eq!(manifest.entrypoint_kind, TargetPluginEntrypointKind::Builtin);
+        assert_eq!(manifest.api_compatibility_version, "rustfs.target-plugin.v1");
+    }
+
+    #[test]
+    fn marketplace_manifest_preserves_supported_domains() {
+        let manifest = builtin_target_marketplace_manifest("kafka");
+
+        assert_eq!(manifest.supported_domains, &[TargetDomain::Audit, TargetDomain::Notify]);
+    }
+
+    #[test]
+    fn marketplace_manifest_from_builtin_manifest_is_stable() {
+        let base = builtin_target_manifest("redis");
+        let derived = TargetPluginMarketplaceManifest::from(base);
+
+        assert_eq!(derived.plugin_id, "builtin:redis");
+        assert_eq!(derived.target_type, "redis");
+        assert_eq!(derived.packaging, TargetPluginPackaging::Builtin);
+        assert_eq!(derived.entrypoint_kind, TargetPluginEntrypointKind::Builtin);
     }
 }

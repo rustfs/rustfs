@@ -32,7 +32,10 @@ pub use check::{
 };
 pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};
-pub use manifest::TargetPluginManifest;
+pub use manifest::{
+    TargetPluginEntrypointKind, TargetPluginManifest, TargetPluginMarketplaceManifest, TargetPluginPackaging,
+    builtin_target_marketplace_manifest,
+};
 pub use plugin::{
     BuiltinTargetAdminDescriptor, BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetPluginRegistry,
     TargetRequestValidator, boxed_target,
