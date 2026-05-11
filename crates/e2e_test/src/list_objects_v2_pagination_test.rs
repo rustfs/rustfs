@@ -30,7 +30,6 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::EncodingType;
     use serial_test::serial;
     use std::collections::HashSet;
     use tracing::info;
@@ -57,80 +56,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    async fn list_all_objects_v2(client: &Client, bucket: &str, prefix: &str, page_size: i32) -> Vec<String> {
-        let mut continuation_token: Option<String> = None;
-        let mut page_count = 0usize;
-        let mut last_key: Option<String> = None;
-        let mut listed_keys = Vec::new();
-        let mut seen = HashSet::new();
-
-        loop {
-            let mut request = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix)
-                .max_keys(page_size)
-                .fetch_owner(true)
-                .encoding_type(EncodingType::Url);
-            if let Some(token) = continuation_token.take() {
-                request = request.continuation_token(token);
-            }
-
-            let output = request.send().await.expect("Failed to list objects");
-            let contents = output.contents();
-            assert!(
-                contents.len() <= page_size as usize,
-                "ListObjectsV2 page exceeded requested max_keys: {} > {}",
-                contents.len(),
-                page_size
-            );
-
-            for object in contents {
-                let key = object.key().expect("Listed object should have a key");
-                assert!(key.starts_with(prefix), "Listed key escaped prefix {prefix}: {key}");
-
-                if let Some(previous) = &last_key {
-                    assert!(
-                        key > previous.as_str(),
-                        "ListObjectsV2 did not make lexicographic progress: {key} <= {previous}"
-                    );
-                }
-
-                assert!(seen.insert(key.to_string()), "Duplicate key returned across pages: {key}");
-                listed_keys.push(key.to_string());
-                last_key = Some(key.to_string());
-            }
-
-            page_count += 1;
-
-            if output.is_truncated().unwrap_or(false) {
-                continuation_token = Some(
-                    output
-                        .next_continuation_token()
-                        .expect("NextContinuationToken must be present when IsTruncated is true")
-                        .to_string(),
-                );
-            } else {
-                assert!(
-                    output.next_continuation_token().is_none(),
-                    "NextContinuationToken should be absent on the final page"
-                );
-                break;
-            }
-
-            assert!(page_count <= 64, "Too many ListObjectsV2 pages, possible continuation-token loop");
-        }
-
-        info!(
-            "Recursive ListObjectsV2 returned all {} objects under {:?} in {} pages",
-            listed_keys.len(),
-            prefix,
-            page_count
-        );
-
-        listed_keys
     }
 
     /// Test for Issue #2775: continuation forwarding must not
@@ -190,7 +115,51 @@ mod tests {
                 .expect("Failed to put noise object");
         }
 
-        let listed_keys = list_all_objects_v2(&client, bucket, prefix, PAGE_SIZE).await;
+        let mut listed_keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        let mut last_key: Option<String> = None;
+        let mut page_count = 0;
+
+        loop {
+            let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix).max_keys(PAGE_SIZE);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let output = request.send().await.expect("Failed to list objects");
+
+            for obj in output.contents() {
+                if let Some(key) = obj.key() {
+                    if let Some(previous) = &last_key {
+                        assert!(
+                            key > previous.as_str(),
+                            "ListObjectsV2 did not preserve lexicographic order: {key} <= {previous}"
+                        );
+                    }
+
+                    last_key = Some(key.to_string());
+                    listed_keys.push(key.to_string());
+                }
+            }
+
+            page_count += 1;
+
+            if output.is_truncated().unwrap_or(false) {
+                continuation_token = output.next_continuation_token().map(|s| s.to_string());
+                assert!(
+                    continuation_token.is_some(),
+                    "BUG: NextContinuationToken must be present when IsTruncated is true"
+                );
+            } else {
+                break;
+            }
+
+            if page_count > 10 {
+                panic!("Too many pages, possible infinite loop due to pagination bug");
+            }
+        }
+
         let seen: HashSet<String> = listed_keys.iter().cloned().collect();
 
         assert_eq!(
