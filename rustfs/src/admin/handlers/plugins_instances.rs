@@ -89,6 +89,31 @@ fn audit_target_specs() -> &'static [AdminTargetSpec] {
     &AUDIT_TARGET_SPECS
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PluginInstanceDomainContext {
+    domain: PluginContractDomain,
+    specs: &'static [AdminTargetSpec],
+    route_prefix: &'static str,
+    default_queue_dir: &'static str,
+}
+
+fn plugin_instance_domain_context(domain: PluginContractDomain) -> PluginInstanceDomainContext {
+    match domain {
+        PluginContractDomain::Notify => PluginInstanceDomainContext {
+            domain,
+            specs: notification_target_specs(),
+            route_prefix: NOTIFY_ROUTE_PREFIX,
+            default_queue_dir: EVENT_DEFAULT_DIR,
+        },
+        PluginContractDomain::Audit => PluginInstanceDomainContext {
+            domain,
+            specs: audit_target_specs(),
+            route_prefix: AUDIT_ROUTE_PREFIX,
+            default_queue_dir: AUDIT_DEFAULT_DIR,
+        },
+    }
+}
+
 fn map_instance(instance: TargetInstanceReadModel) -> PluginInstanceEntry {
     PluginInstanceEntry {
         id: instance.canonical_id,
@@ -119,7 +144,7 @@ fn kvs_to_map(config: KVS) -> HashMap<String, String> {
 
 #[derive(Debug, Clone)]
 struct ResolvedPluginInstanceTarget {
-    domain: PluginContractDomain,
+    context: PluginInstanceDomainContext,
     target_name: String,
     target_spec: AdminTargetSpec,
 }
@@ -240,19 +265,17 @@ fn parse_plugin_instance_id(instance_id: &str) -> S3Result<(String, PluginContra
 
 fn resolve_plugin_instance_target(instance_id: &str) -> S3Result<ResolvedPluginInstanceTarget> {
     let (plugin_id, domain, target_name) = parse_plugin_instance_id(instance_id)?;
-    let specs = match domain {
-        PluginContractDomain::Notify => notification_target_specs(),
-        PluginContractDomain::Audit => audit_target_specs(),
-    };
+    let context = plugin_instance_domain_context(domain);
 
-    let target_spec = specs
+    let target_spec = context
+        .specs
         .iter()
         .find(|spec| rustfs_targets::builtin_target_marketplace_manifest(spec.service).plugin_id == plugin_id)
         .cloned()
         .ok_or_else(|| s3_error!(InvalidArgument, "unsupported plugin instance id: '{}'", instance_id))?;
 
     Ok(ResolvedPluginInstanceTarget {
-        domain,
+        context,
         target_name,
         target_spec,
     })
@@ -464,17 +487,16 @@ where
 }
 
 fn plugin_instance_mutation_block_reason(
-    specs: &[AdminTargetSpec],
-    route_prefix: &str,
+    context: PluginInstanceDomainContext,
     config: &Config,
     target_type: &str,
     target_name: &str,
     target_label: &str,
 ) -> Option<String> {
-    shared_target_mutation_block_reason(specs, route_prefix, config, target_type, target_name, target_label)
+    shared_target_mutation_block_reason(context.specs, context.route_prefix, config, target_type, target_name, target_label)
 }
 
-async fn plugin_instance_operation_block_reason(domain: PluginContractDomain, action: &str) -> Option<String> {
+async fn plugin_instance_operation_block_reason(context: PluginInstanceDomainContext, action: &str) -> Option<String> {
     if let Err(err) = refresh_persisted_module_switches_from_store().await {
         warn!(
             error = %err,
@@ -482,7 +504,7 @@ async fn plugin_instance_operation_block_reason(domain: PluginContractDomain, ac
         );
     }
 
-    match domain {
+    match context.domain {
         PluginContractDomain::Notify => {
             refresh_notify_module_enabled();
             target_module_disabled_reason("notify", rustfs_config::ENV_NOTIFY_ENABLE, is_notify_module_enabled(), action)
@@ -499,13 +521,12 @@ async fn collect_notification_instances() -> S3Result<Vec<PluginInstanceEntry>> 
         rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))?;
     let runtime_statuses = collect_runtime_statuses(ns.get_target_values().await).await;
     let config = ns.config.read().await.clone();
+    let context = plugin_instance_domain_context(PluginContractDomain::Notify);
 
-    Ok(
-        collect_target_instances(notification_target_specs(), NOTIFY_ROUTE_PREFIX, &config, runtime_statuses)
-            .into_iter()
-            .map(map_instance)
-            .collect(),
-    )
+    Ok(collect_target_instances(context.specs, context.route_prefix, &config, runtime_statuses)
+        .into_iter()
+        .map(map_instance)
+        .collect())
 }
 
 async fn collect_audit_instances() -> S3Result<Vec<PluginInstanceEntry>> {
@@ -514,13 +535,12 @@ async fn collect_audit_instances() -> S3Result<Vec<PluginInstanceEntry>> {
         runtime_statuses = collect_runtime_statuses(system.get_target_values().await).await;
     }
     let config = load_server_config_from_store().await?;
+    let context = plugin_instance_domain_context(PluginContractDomain::Audit);
 
-    Ok(
-        collect_target_instances(audit_target_specs(), AUDIT_ROUTE_PREFIX, &config, runtime_statuses)
-            .into_iter()
-            .map(map_instance)
-            .collect(),
-    )
+    Ok(collect_target_instances(context.specs, context.route_prefix, &config, runtime_statuses)
+        .into_iter()
+        .map(map_instance)
+        .collect())
 }
 
 async fn collect_all_instances() -> S3Result<Vec<PluginInstanceEntry>> {
@@ -528,6 +548,37 @@ async fn collect_all_instances() -> S3Result<Vec<PluginInstanceEntry>> {
     instances.extend(collect_audit_instances().await?);
     instances.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
     Ok(instances)
+}
+
+async fn find_notification_instance(instance_id: &str) -> S3Result<Option<TargetInstanceReadModel>> {
+    let ns =
+        rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))?;
+    let runtime_statuses = collect_runtime_statuses(ns.get_target_values().await).await;
+    let config = ns.config.read().await.clone();
+    let context = plugin_instance_domain_context(PluginContractDomain::Notify);
+    Ok(find_target_instance(
+        context.specs,
+        context.route_prefix,
+        &config,
+        runtime_statuses,
+        instance_id,
+    ))
+}
+
+async fn find_audit_instance(instance_id: &str) -> S3Result<Option<TargetInstanceReadModel>> {
+    let mut runtime_statuses = HashMap::new();
+    if let Some(system) = audit_system() {
+        runtime_statuses = collect_runtime_statuses(system.get_target_values().await).await;
+    }
+    let config = load_server_config_from_store().await?;
+    let context = plugin_instance_domain_context(PluginContractDomain::Audit);
+    Ok(find_target_instance(
+        context.specs,
+        context.route_prefix,
+        &config,
+        runtime_statuses,
+        instance_id,
+    ))
 }
 
 pub struct ListPluginInstancesHandler {}
@@ -559,23 +610,11 @@ impl Operation for GetPluginInstanceHandler {
             .get("id")
             .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'id'"))?;
 
-        let notification_match = {
-            let ns = rustfs_notify::notification_system()
-                .ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))?;
-            let runtime_statuses = collect_runtime_statuses(ns.get_target_values().await).await;
-            let config = ns.config.read().await.clone();
-            find_target_instance(notification_target_specs(), NOTIFY_ROUTE_PREFIX, &config, runtime_statuses, instance_id)
-        };
-
-        let instance = if let Some(instance) = notification_match {
+        let instance = if let Some(instance) = find_notification_instance(instance_id).await? {
             instance
         } else {
-            let mut runtime_statuses = HashMap::new();
-            if let Some(system) = audit_system() {
-                runtime_statuses = collect_runtime_statuses(system.get_target_values().await).await;
-            }
-            let config = load_server_config_from_store().await?;
-            find_target_instance(audit_target_specs(), AUDIT_ROUTE_PREFIX, &config, runtime_statuses, instance_id)
+            find_audit_instance(instance_id)
+                .await?
                 .ok_or_else(|| s3_error!(NoSuchKey, "plugin instance not found"))?
         };
 
@@ -595,9 +634,9 @@ impl Operation for PutPluginInstanceHandler {
             .get("id")
             .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'id'"))?;
         let resolved = resolve_plugin_instance_target(instance_id)?;
+        let context = resolved.context;
 
-        if let Some(reason) =
-            plugin_instance_operation_block_reason(resolved.domain, "managing plugin instances from the console").await
+        if let Some(reason) = plugin_instance_operation_block_reason(context, "managing plugin instances from the console").await
         {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
@@ -610,14 +649,13 @@ impl Operation for PutPluginInstanceHandler {
         let body: PluginInstanceBody = serde_json::from_slice(&body_bytes)
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for plugin instance config: {}", e))?;
 
-        match resolved.domain {
+        match context.domain {
             PluginContractDomain::Notify => {
                 let ns = rustfs_notify::notification_system()
                     .ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))?;
                 let config_snapshot = ns.config.read().await.clone();
                 if let Some(reason) = plugin_instance_mutation_block_reason(
-                    notification_target_specs(),
-                    NOTIFY_ROUTE_PREFIX,
+                    context,
                     &config_snapshot,
                     resolved.target_spec.subsystem,
                     &resolved.target_name,
@@ -627,10 +665,10 @@ impl Operation for PutPluginInstanceHandler {
                 }
 
                 let kvs = build_enabled_target_kvs(
-                    notification_target_specs(),
+                    context.specs,
                     body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
                     resolved.target_spec.subsystem,
-                    EVENT_DEFAULT_DIR,
+                    context.default_queue_dir,
                     "plugin instance",
                 )
                 .await?;
@@ -642,8 +680,7 @@ impl Operation for PutPluginInstanceHandler {
             PluginContractDomain::Audit => {
                 let config_snapshot = load_server_config_from_store().await?;
                 if let Some(reason) = plugin_instance_mutation_block_reason(
-                    audit_target_specs(),
-                    AUDIT_ROUTE_PREFIX,
+                    context,
                     &config_snapshot,
                     resolved.target_spec.subsystem,
                     &resolved.target_name,
@@ -653,10 +690,10 @@ impl Operation for PutPluginInstanceHandler {
                 }
 
                 let kvs = build_enabled_target_kvs(
-                    audit_target_specs(),
+                    context.specs,
                     body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
                     resolved.target_spec.subsystem,
-                    AUDIT_DEFAULT_DIR,
+                    context.default_queue_dir,
                     "plugin instance",
                 )
                 .await?;
@@ -687,21 +724,20 @@ impl Operation for DeletePluginInstanceHandler {
             .get("id")
             .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'id'"))?;
         let resolved = resolve_plugin_instance_target(instance_id)?;
+        let context = resolved.context;
 
-        if let Some(reason) =
-            plugin_instance_operation_block_reason(resolved.domain, "managing plugin instances from the console").await
+        if let Some(reason) = plugin_instance_operation_block_reason(context, "managing plugin instances from the console").await
         {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        match resolved.domain {
+        match context.domain {
             PluginContractDomain::Notify => {
                 let ns = rustfs_notify::notification_system()
                     .ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))?;
                 let config_snapshot = ns.config.read().await.clone();
                 if let Some(reason) = plugin_instance_mutation_block_reason(
-                    notification_target_specs(),
-                    NOTIFY_ROUTE_PREFIX,
+                    context,
                     &config_snapshot,
                     resolved.target_spec.subsystem,
                     &resolved.target_name,
@@ -717,8 +753,7 @@ impl Operation for DeletePluginInstanceHandler {
             PluginContractDomain::Audit => {
                 let config_snapshot = load_server_config_from_store().await?;
                 if let Some(reason) = plugin_instance_mutation_block_reason(
-                    audit_target_specs(),
-                    AUDIT_ROUTE_PREFIX,
+                    context,
                     &config_snapshot,
                     resolved.target_spec.subsystem,
                     &resolved.target_name,
@@ -942,7 +977,7 @@ mod tests {
         let resolved =
             resolve_plugin_instance_target("builtin:webhook:audit:Primary").expect("builtin audit instance should resolve");
 
-        assert_eq!(resolved.domain, PluginContractDomain::Audit);
+        assert_eq!(resolved.context.domain, PluginContractDomain::Audit);
         assert_eq!(resolved.target_name, "primary");
         assert_eq!(resolved.target_spec.service, "webhook");
         assert_eq!(resolved.target_spec.subsystem, AUDIT_WEBHOOK_SUB_SYS);
