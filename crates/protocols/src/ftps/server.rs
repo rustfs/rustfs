@@ -17,8 +17,8 @@ use super::driver::FtpsDriver;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
 use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
+use crate::tls_hot_reload::{ReloadableCertResolver, spawn_cert_reload_loop};
 use libunftp::options::FtpsRequired;
-use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::path::Path;
@@ -112,28 +112,16 @@ where
             if let Some(cert_dir) = &self.config.cert_dir {
                 debug!("Enabling FTPS with multi-certificate support from directory: {}", cert_dir);
 
-                // Load all certificates from directory
-                let cert_key_pairs = rustfs_utils::load_all_certs_from_directory(
-                    rustfs_utils::CertDirectoryLoadOptions::builder(cert_dir, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
-                )
-                .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to load certificates: {}", e)))?;
-
-                if cert_key_pairs.is_empty() {
-                    return Err(FtpsInitError::InvalidConfig("No valid certificates found in directory".into()));
-                }
-
-                debug!("Loaded {} certificates for FTPS", cert_key_pairs.len());
-
-                // Create multi-certificate resolver with SNI support
-                let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)
+                let resolver = ReloadableCertResolver::load_from_directory(cert_dir)
                     .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to create certificate resolver: {}", e)))?;
+                spawn_cert_reload_loop("ftps", cert_dir.clone(), resolver.clone());
 
                 // Build ServerConfig with SNI support
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
                 let server_config = rustls::ServerConfig::builder()
                     .with_no_client_auth()
-                    .with_cert_resolver(Arc::new(resolver));
+                    .with_cert_resolver(resolver);
 
                 server_builder = server_builder.ftps_manual::<std::path::PathBuf>(Arc::new(server_config));
 

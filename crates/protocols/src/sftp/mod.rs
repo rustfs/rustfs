@@ -36,8 +36,9 @@
 //! - read_cache: per-handle in-memory read-ahead cache with a process-wide
 //!   memory ceiling.
 //!
-//! Configuration contract. Eleven RUSTFS_SFTP_* environment variables drive
+//! Configuration contract. Thirteen RUSTFS_SFTP_* environment variables drive
 //! the server: RUSTFS_SFTP_ENABLE, RUSTFS_SFTP_ADDRESS, RUSTFS_SFTP_HOST_KEY_DIR,
+//! RUSTFS_SFTP_HOST_KEY_RELOAD_ENABLE, RUSTFS_SFTP_HOST_KEY_RELOAD_INTERVAL,
 //! RUSTFS_SFTP_IDLE_TIMEOUT, RUSTFS_SFTP_PART_SIZE, RUSTFS_SFTP_READ_ONLY,
 //! RUSTFS_SFTP_BANNER, RUSTFS_SFTP_HANDLES_PER_SESSION,
 //! RUSTFS_SFTP_BACKEND_OP_TIMEOUT_SECS, RUSTFS_SFTP_READ_CACHE_WINDOW_BYTES,
