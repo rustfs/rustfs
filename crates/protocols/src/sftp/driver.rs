@@ -25,8 +25,7 @@
 
 use super::attrs;
 use super::constants::limits::S3_COPY_OBJECT_MAX_SIZE;
-use super::constants::s3_error_codes;
-use super::errors::{SftpError, auth_err, auth_err_unreachable, ok_status, s3_error_to_sftp};
+use super::errors::{SftpError, auth_err, auth_err_unreachable, is_no_such_upload_error, ok_status, s3_error_to_sftp};
 use super::lifecycle::SessionDiag;
 use super::paths::{parse_s3_path, sanitise_control_bytes};
 use super::state::{HandleState, WritePhase};
@@ -227,7 +226,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     pub(super) async fn run_backend<F, T, E>(&self, op: &'static str, fut: F) -> Result<T, SftpError>
     where
         F: std::future::Future<Output = Result<T, E>>,
-        E: std::fmt::Display,
+        E: std::fmt::Display + 'static,
     {
         match tokio::time::timeout(std::time::Duration::from_secs(self.backend_op_timeout_secs), fut).await {
             Ok(Ok(v)) => Ok(v),
@@ -1076,8 +1075,7 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                         // successful CompleteMultipartUpload, returning
                         // NoSuchUpload. Log at debug to keep error-level
                         // logs reserved for genuine abort failures.
-                        let msg = e.to_string();
-                        if msg.contains(s3_error_codes::NO_SUCH_UPLOAD) {
+                        if is_no_such_upload_error(&e) {
                             tracing::debug!(
                                 bucket = %bucket,
                                 key = %key,
