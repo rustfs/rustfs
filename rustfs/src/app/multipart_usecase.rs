@@ -45,13 +45,13 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
+#[cfg(test)]
+use rustfs_ecstore::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
+use rustfs_ecstore::rio::{HashReader, WriteEncryption, WritePlan};
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
-use rustfs_rio::{CompressReader, EncryptReader, HashReader};
-#[cfg(test)]
-use rustfs_rio::{DecryptReader, HardLimitReader, boxed_reader, wrap_reader};
 use rustfs_s3_common::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -710,7 +710,9 @@ impl DefaultMultipartUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
+        let mut write_plan = WritePlan::new();
         let mut reader = if is_compressible {
+            let algorithm = CompressionAlgorithm::default();
             let mut hrd = HashReader::from_stream(body, size, actual_size, md5hex.take(), sha256hex.take(), false)
                 .map_err(ApiError::from)?;
 
@@ -719,15 +721,8 @@ impl DefaultMultipartUsecase {
             }
 
             size = HashReader::SIZE_PRESERVE_LAYER;
-            HashReader::from_reader(
-                CompressReader::new(hrd, CompressionAlgorithm::default()),
-                size,
-                actual_size,
-                None,
-                None,
-                false,
-            )
-            .map_err(ApiError::from)?
+            write_plan = write_plan.with_compression(algorithm);
+            hrd
         } else {
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
         };
@@ -787,16 +782,8 @@ impl DefaultMultipartUsecase {
                 Some(material) => {
                     let requested_sse = Some(material.server_side_encryption.clone());
                     let requested_kms_key_id = material.kms_key_id.clone();
-                    let encrypted_reader = EncryptReader::new_multipart(reader, material.key_bytes, material.base_nonce, part_id);
-                    reader = HashReader::from_reader(
-                        encrypted_reader,
-                        HashReader::SIZE_PRESERVE_LAYER,
-                        actual_size,
-                        None,
-                        None,
-                        false,
-                    )
-                    .map_err(ApiError::from)?;
+                    write_plan =
+                        write_plan.with_encryption(WriteEncryption::multipart(material.key_bytes, material.base_nonce, part_id));
                     (requested_sse, requested_kms_key_id)
                 }
                 None => (None, None),
@@ -811,14 +798,17 @@ impl DefaultMultipartUsecase {
             })
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
-            let encrypted_reader =
-                EncryptReader::new_multipart(reader, managed_material.key_bytes, managed_material.base_nonce, part_id);
-            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
+            write_plan = write_plan.with_encryption(WriteEncryption::multipart(
+                managed_material.key_bytes,
+                managed_material.base_nonce,
+                part_id,
+            ));
             (Some(server_side_encryption), ssekms_key_id)
         } else {
             (None, None)
         };
+
+        reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         let mut reader = PutObjReader::new(reader);
 
@@ -1070,22 +1060,15 @@ impl DefaultMultipartUsecase {
         let is_compressible = rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         let actual_size = length;
-        let mut size = length;
 
+        let mut write_plan = WritePlan::new();
         let mut reader = if is_compressible {
-            let hrd = HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?;
-            size = HashReader::SIZE_PRESERVE_LAYER;
-            HashReader::from_reader(
-                CompressReader::new(hrd, CompressionAlgorithm::default()),
-                size,
-                actual_size,
-                None,
-                None,
-                false,
-            )
-            .map_err(ApiError::from)?
+            let algorithm = CompressionAlgorithm::default();
+            let hrd = HashReader::from_stream(src_stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
+            write_plan = write_plan.with_compression(algorithm);
+            hrd
         } else {
-            HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+            HashReader::from_stream(src_stream, length, actual_size, None, None, false).map_err(ApiError::from)?
         };
 
         let server_side_encryption = mp_info
@@ -1132,16 +1115,8 @@ impl DefaultMultipartUsecase {
                 Some(material) => {
                     let requested_sse = Some(material.server_side_encryption.clone());
                     let requested_kms_key_id = material.kms_key_id.clone();
-                    let encrypted_reader = EncryptReader::new_multipart(reader, material.key_bytes, material.base_nonce, part_id);
-                    reader = HashReader::from_reader(
-                        encrypted_reader,
-                        HashReader::SIZE_PRESERVE_LAYER,
-                        actual_size,
-                        None,
-                        None,
-                        false,
-                    )
-                    .map_err(ApiError::from)?;
+                    write_plan =
+                        write_plan.with_encryption(WriteEncryption::multipart(material.key_bytes, material.base_nonce, part_id));
                     (requested_sse, requested_kms_key_id, mp_info.user_defined.clone())
                 }
                 None => (None, None, mp_info.user_defined.clone()),
@@ -1156,14 +1131,17 @@ impl DefaultMultipartUsecase {
             })
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
-            let encrypted_reader =
-                EncryptReader::new_multipart(reader, managed_material.key_bytes, managed_material.base_nonce, part_id);
-            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
+            write_plan = write_plan.with_encryption(WriteEncryption::multipart(
+                managed_material.key_bytes,
+                managed_material.base_nonce,
+                part_id,
+            ));
             (Some(server_side_encryption), ssekms_key_id, mp_info.user_defined.clone())
         } else {
             (None, None, mp_info.user_defined.clone())
         };
+
+        reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         if let Some(checksum_algorithm) = mp_info
             .user_defined

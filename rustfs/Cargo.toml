@@ -54,6 +54,7 @@ io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp"]
 manual-test-runners = []
+rio-v2 = ["rustfs-ecstore/rio-v2"]
 
 [lints]
 workspace = true

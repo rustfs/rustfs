@@ -32,11 +32,13 @@ workspace = true
 
 [features]
 default = []
+rio-v2 = ["dep:rustfs-rio-v2"]
 
 [dependencies]
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
+rustfs-rio-v2 = { workspace = true, optional = true }
 rustfs-signer.workspace = true
 rustfs-checksums.workspace = true
 rustfs-config = { workspace = true, features = ["constants", "notify", "audit"] }

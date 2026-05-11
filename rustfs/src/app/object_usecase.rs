@@ -73,6 +73,7 @@ use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::rio::{DynReader, HashReader, WriteEncryption, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{
     HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
@@ -85,7 +86,6 @@ use rustfs_filemeta::{
 use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
 use rustfs_s3_common::S3Operation;
 use rustfs_s3select_api::{
     object_store::bytes_stream,
@@ -1842,7 +1842,9 @@ impl DefaultObjectUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        let mut reader = if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+        let should_compress = is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64;
+        let mut write_plan = WritePlan::new();
+        let mut reader = if should_compress {
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
@@ -1859,8 +1861,8 @@ impl DefaultObjectUsecase {
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             size = HashReader::SIZE_PRESERVE_LAYER;
-            HashReader::from_reader(CompressReader::new(hrd, algorithm), size, actual_size, None, None, false)
-                .map_err(ApiError::from)?
+            write_plan = write_plan.with_compression(algorithm);
+            hrd
         } else {
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
         };
@@ -1900,14 +1902,14 @@ impl DefaultObjectUsecase {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
-            let encrypted_reader = EncryptReader::new(reader, material.key_bytes, material.base_nonce);
-            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
+            write_plan = write_plan.with_encryption(WriteEncryption::singlepart(material.key_bytes, material.base_nonce));
 
             let encryption_metadata = encryption_material_to_metadata(&material);
             metadata.extend(encryption_metadata.clone());
             opts.user_defined.extend(encryption_metadata);
         }
+
+        reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         let mut reader = PutObjReader::new(reader);
 
@@ -2711,7 +2713,7 @@ impl DefaultObjectUsecase {
 
         let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
 
-        let mut length = actual_size;
+        let length = actual_size;
 
         let mut compress_metadata = HashMap::new();
 
@@ -2754,18 +2756,12 @@ impl DefaultObjectUsecase {
         }
         apply_bucket_default_lock_retention(&bucket, &mut src_info.user_defined, has_explicit_object_lock_retention).await?;
 
+        let mut write_plan = WritePlan::new();
         let mut reader = if should_compress {
+            let algorithm = CompressionAlgorithm::default();
             let hrd = HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
-            length = HashReader::SIZE_PRESERVE_LAYER;
-            HashReader::from_reader(
-                CompressReader::new(hrd, CompressionAlgorithm::default()),
-                length,
-                actual_size,
-                None,
-                None,
-                false,
-            )
-            .map_err(ApiError::from)?
+            write_plan = write_plan.with_compression(algorithm);
+            hrd
         } else {
             HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?
         };
@@ -2785,12 +2781,12 @@ impl DefaultObjectUsecase {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
-            let encrypted_reader = EncryptReader::new(reader, material.key_bytes, material.base_nonce);
-            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
+            write_plan = write_plan.with_encryption(WriteEncryption::singlepart(material.key_bytes, material.base_nonce));
 
             src_info.user_defined.extend(encryption_material_to_metadata(&material));
         }
+
+        reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         src_info.put_object_reader = Some(PutObjReader::new(reader));
 
@@ -4264,24 +4260,18 @@ impl DefaultObjectUsecase {
 
             let should_compress = !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64;
 
+            let mut write_plan = WritePlan::new();
             let mut hrd = if is_dir {
                 HashReader::from_stream(std::io::Cursor::new(Vec::new()), size, actual_size, None, None, false)
                     .map_err(ApiError::from)?
             } else if should_compress {
-                insert_str(&mut metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
+                let algorithm = CompressionAlgorithm::default();
+                insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
                 let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;
-                size = HashReader::SIZE_PRESERVE_LAYER;
-                HashReader::from_reader(
-                    CompressReader::new(hrd, CompressionAlgorithm::default()),
-                    size,
-                    actual_size,
-                    None,
-                    None,
-                    false,
-                )
-                .map_err(ApiError::from)?
+                write_plan = write_plan.with_compression(algorithm);
+                hrd
             } else {
                 HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?
             };
@@ -4308,14 +4298,13 @@ impl DefaultObjectUsecase {
                 effective_sse = Some(material.server_side_encryption.clone());
                 effective_kms_key_id = material.kms_key_id.clone();
 
-                let encrypted_reader = EncryptReader::new(hrd, material.key_bytes, material.base_nonce);
-                hrd = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
+                write_plan = write_plan.with_encryption(WriteEncryption::singlepart(material.key_bytes, material.base_nonce));
 
                 let encryption_metadata = encryption_material_to_metadata(&material);
                 metadata.extend(encryption_metadata.clone());
                 opts.user_defined.extend(encryption_metadata);
             }
+            hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
             opts.user_defined.extend(metadata);
             let mut reader = PutObjReader::new(hrd);
 

@@ -9547,6 +9547,7 @@ dependencies = [
  "rustfs-policy",
  "rustfs-protos",
  "rustfs-rio",
+ "rustfs-rio-v2",
  "rustfs-s3-common",
  "rustfs-signer",
  "rustfs-utils",
@@ -10052,6 +10053,13 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-rio-v2"
+version = "1.0.0-beta.2"
+dependencies = [
+ "rustfs-rio",
 ]
 
 [[package]]

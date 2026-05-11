@@ -6,10 +6,11 @@ use aes_gcm::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use md5::{Digest, Md5};
 use rustfs_kms::{service_manager::get_global_encryption_service, types::ObjectEncryptionContext};
-use rustfs_rio::DecryptReader;
 use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 use std::collections::HashMap;
 use std::env;
+
+use crate::rio::{DecryptReader, Index};
 
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
@@ -31,9 +32,9 @@ fn restore_request_active(opts: &ObjectOptions) -> bool {
     restore.type_.is_some() || restore.days.is_some() || restore.output_location.is_some() || restore.select_parameters.is_some()
 }
 
-fn decode_compression_index(index: Option<&bytes::Bytes>) -> Option<rustfs_rio::Index> {
+fn decode_compression_index(index: Option<&bytes::Bytes>) -> Option<Index> {
     let bytes = index?;
-    let mut decoded = rustfs_rio::Index::new();
+    let mut decoded = Index::new();
     if decoded.load(bytes.as_ref()).is_ok() {
         Some(decoded)
     } else {
@@ -127,16 +128,40 @@ struct EncryptionMaterial {
     base_nonce: [u8; 12],
 }
 
-impl GetObjectReader {
-    pub async fn new(
-        reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
-        rs: Option<HTTPRangeSpec>,
-        oi: &ObjectInfo,
-        opts: &ObjectOptions,
-        h: &HeaderMap<HeaderValue>,
-    ) -> Result<(Self, usize, i64)> {
-        let mut rs = rs;
+#[derive(Debug, Clone)]
+enum ReadTransform {
+    Plain {
+        visible_offset: usize,
+        visible_length: i64,
+    },
+    Compressed {
+        algorithm: CompressionAlgorithm,
+        decompressed_offset: usize,
+        decompressed_length: i64,
+        total_plaintext_size: usize,
+    },
+    Encrypted {
+        material: EncryptionMaterial,
+        is_multipart: bool,
+        part_numbers: Vec<usize>,
+        plaintext_offset: usize,
+        plaintext_length: i64,
+        total_plaintext_size: usize,
+        compression: Option<CompressionAlgorithm>,
+    },
+}
 
+#[derive(Debug, Clone)]
+struct ReadPlan {
+    storage_offset: usize,
+    storage_length: i64,
+    object_size: i64,
+    transform: ReadTransform,
+}
+
+impl ReadPlan {
+    async fn build(rs: Option<HTTPRangeSpec>, oi: &ObjectInfo, opts: &ObjectOptions, h: &HeaderMap<HeaderValue>) -> Result<Self> {
+        let mut rs = rs;
         if let Some(part_number) = opts.part_number
             && rs.is_none()
         {
@@ -153,137 +178,200 @@ impl GetObjectReader {
 
         if is_compressed && !is_encrypted {
             let actual_size = oi.get_actual_size()?;
-            let (off, length, dec_off, dec_length) = if let Some(rs) = rs {
+            let (storage_offset, storage_length, decompressed_offset, decompressed_length) = if let Some(rs) = rs {
                 let (req_off, req_length) = rs.get_offset_length(actual_size)?;
                 let (physical_off, decompressed_skip, _, _, _) = get_compressed_offsets(oi, req_off as i64);
-                (physical_off as usize, oi.size - physical_off, decompressed_skip as usize, req_length)
+                let storage_offset = usize::try_from(physical_off)
+                    .map_err(|_| Error::other(format!("invalid compressed offset {physical_off}")))?;
+                (storage_offset, oi.size - physical_off, decompressed_skip as usize, req_length)
             } else {
                 (0, oi.size, 0, actual_size)
             };
 
-            let dec_reader = DecompressReader::new(reader, algo);
+            let total_plaintext_size =
+                usize::try_from(actual_size).map_err(|_| Error::other(format!("invalid decompressed size {actual_size}")))?;
 
-            let actual_size_usize = if actual_size >= 0 {
-                actual_size as usize
-            } else {
-                return Err(Error::other(format!("invalid decompressed size {actual_size}")));
-            };
-
-            let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if dec_off > 0 || dec_length != actual_size {
-                // Use RangedDecompressReader for streaming range processing
-                // The new implementation supports any offset size by streaming and skipping data
-                match RangedDecompressReader::new(dec_reader, dec_off, dec_length, actual_size_usize) {
-                    Ok(ranged_reader) => {
-                        tracing::debug!(
-                            "Successfully created RangedDecompressReader for offset={}, length={}",
-                            dec_off,
-                            dec_length
-                        );
-                        Box::new(ranged_reader)
-                    }
-                    Err(e) => {
-                        // Only fail if the range parameters are fundamentally invalid (e.g., offset >= file size)
-                        tracing::error!("RangedDecompressReader failed with invalid range parameters: {}", e);
-                        return Err(e);
-                    }
-                }
-            } else {
-                Box::new(LimitReader::new(dec_reader, actual_size_usize))
-            };
-
-            let mut oi = oi.clone();
-            oi.size = dec_length;
-
-            return Ok((
-                GetObjectReader {
-                    stream: final_reader,
-                    object_info: oi,
+            return Ok(Self {
+                storage_offset,
+                storage_length,
+                object_size: decompressed_length,
+                transform: ReadTransform::Compressed {
+                    algorithm: algo,
+                    decompressed_offset,
+                    decompressed_length,
+                    total_plaintext_size,
                 },
-                off,
-                length,
-            ));
+            });
         }
 
         if is_encrypted {
             let material = resolve_encryption_material(oi, h).await?;
             let is_multipart = is_multipart_encrypted_object(&oi.parts, oi.etag.as_deref());
             let plaintext_size = encrypted_plaintext_size(oi, is_multipart, is_compressed)?;
-            let plaintext_size_usize =
+            let total_plaintext_size =
                 usize::try_from(plaintext_size).map_err(|_| Error::other(format!("invalid decrypted size {plaintext_size}")))?;
-            let (plain_offset, plain_length) = if let Some(rs) = rs {
+            let (plaintext_offset, plaintext_length) = if let Some(rs) = rs {
                 rs.get_offset_length(plaintext_size)?
             } else {
                 (0, plaintext_size)
             };
 
-            let decrypted_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_multipart {
-                Box::new(DecryptReader::new_multipart(
-                    reader,
-                    material.key_bytes,
-                    material.base_nonce,
-                    multipart_part_numbers(&oi.parts),
-                ))
-            } else {
-                Box::new(DecryptReader::new(reader, material.key_bytes, material.base_nonce))
-            };
+            return Ok(Self {
+                storage_offset: 0,
+                storage_length: oi.size,
+                object_size: plaintext_length,
+                transform: ReadTransform::Encrypted {
+                    material,
+                    is_multipart,
+                    part_numbers: multipart_part_numbers(&oi.parts),
+                    plaintext_offset,
+                    plaintext_length,
+                    total_plaintext_size,
+                    compression: is_compressed.then_some(algo),
+                },
+            });
+        }
 
-            let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_compressed {
-                let decompressed_reader = DecompressReader::new(decrypted_reader, algo);
-                if plain_offset > 0 || plain_length != plaintext_size {
+        let (visible_offset, visible_length) = if let Some(rs) = rs {
+            rs.get_offset_length(oi.size)?
+        } else {
+            (0, oi.size)
+        };
+
+        Ok(Self {
+            storage_offset: visible_offset,
+            storage_length: visible_length,
+            object_size: oi.size,
+            transform: ReadTransform::Plain {
+                visible_offset,
+                visible_length,
+            },
+        })
+    }
+
+    fn into_reader(
+        self,
+        reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        oi: &ObjectInfo,
+    ) -> Result<(GetObjectReader, usize, i64)> {
+        match self.transform {
+            ReadTransform::Plain { .. } => Ok((
+                GetObjectReader {
+                    stream: reader,
+                    object_info: oi.clone(),
+                },
+                self.storage_offset,
+                self.storage_length,
+            )),
+            ReadTransform::Compressed {
+                algorithm,
+                decompressed_offset,
+                decompressed_length,
+                total_plaintext_size,
+            } => {
+                let dec_reader = DecompressReader::new(reader, algorithm);
+                let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if decompressed_offset > 0
+                    || decompressed_length != total_plaintext_size as i64
+                {
+                    match RangedDecompressReader::new(dec_reader, decompressed_offset, decompressed_length, total_plaintext_size)
+                    {
+                        Ok(ranged_reader) => {
+                            tracing::debug!(
+                                "Successfully created RangedDecompressReader for offset={}, length={}",
+                                decompressed_offset,
+                                decompressed_length
+                            );
+                            Box::new(ranged_reader)
+                        }
+                        Err(e) => {
+                            tracing::error!("RangedDecompressReader failed with invalid range parameters: {}", e);
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    Box::new(LimitReader::new(dec_reader, total_plaintext_size))
+                };
+
+                let mut object_info = oi.clone();
+                object_info.size = self.object_size;
+
+                Ok((
+                    GetObjectReader {
+                        stream: final_reader,
+                        object_info,
+                    },
+                    self.storage_offset,
+                    self.storage_length,
+                ))
+            }
+            ReadTransform::Encrypted {
+                material,
+                is_multipart,
+                part_numbers,
+                plaintext_offset,
+                plaintext_length,
+                total_plaintext_size,
+                compression,
+            } => {
+                let decrypted_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_multipart {
+                    Box::new(DecryptReader::new_multipart(
+                        reader,
+                        material.key_bytes,
+                        material.base_nonce,
+                        part_numbers,
+                    ))
+                } else {
+                    Box::new(DecryptReader::new(reader, material.key_bytes, material.base_nonce))
+                };
+
+                let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if let Some(algo) = compression {
+                    let decompressed_reader = DecompressReader::new(decrypted_reader, algo);
+                    if plaintext_offset > 0 || plaintext_length != total_plaintext_size as i64 {
+                        Box::new(RangedDecompressReader::new(
+                            decompressed_reader,
+                            plaintext_offset,
+                            plaintext_length,
+                            total_plaintext_size,
+                        )?)
+                    } else {
+                        Box::new(LimitReader::new(decompressed_reader, total_plaintext_size))
+                    }
+                } else if plaintext_offset > 0 || plaintext_length != total_plaintext_size as i64 {
                     Box::new(RangedDecompressReader::new(
-                        decompressed_reader,
-                        plain_offset,
-                        plain_length,
-                        plaintext_size_usize,
+                        decrypted_reader,
+                        plaintext_offset,
+                        plaintext_length,
+                        total_plaintext_size,
                     )?)
                 } else {
-                    Box::new(LimitReader::new(decompressed_reader, plaintext_size_usize))
-                }
-            } else if plain_offset > 0 || plain_length != plaintext_size {
-                Box::new(RangedDecompressReader::new(
-                    decrypted_reader,
-                    plain_offset,
-                    plain_length,
-                    plaintext_size_usize,
-                )?)
-            } else {
-                Box::new(LimitReader::new(decrypted_reader, plaintext_size_usize))
-            };
+                    Box::new(LimitReader::new(decrypted_reader, total_plaintext_size))
+                };
 
-            let mut object_info = oi.clone();
-            object_info.size = plain_length;
+                let mut object_info = oi.clone();
+                object_info.size = self.object_size;
 
-            return Ok((
-                GetObjectReader {
-                    stream: final_reader,
-                    object_info,
-                },
-                0,
-                oi.size,
-            ));
+                Ok((
+                    GetObjectReader {
+                        stream: final_reader,
+                        object_info,
+                    },
+                    self.storage_offset,
+                    self.storage_length,
+                ))
+            }
         }
+    }
+}
 
-        if let Some(rs) = rs {
-            let (off, length) = rs.get_offset_length(oi.size)?;
-
-            Ok((
-                GetObjectReader {
-                    stream: reader,
-                    object_info: oi.clone(),
-                },
-                off,
-                length,
-            ))
-        } else {
-            Ok((
-                GetObjectReader {
-                    stream: reader,
-                    object_info: oi.clone(),
-                },
-                0,
-                oi.size,
-            ))
-        }
+impl GetObjectReader {
+    pub async fn new(
+        reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        rs: Option<HTTPRangeSpec>,
+        oi: &ObjectInfo,
+        opts: &ObjectOptions,
+        h: &HeaderMap<HeaderValue>,
+    ) -> Result<(Self, usize, i64)> {
+        ReadPlan::build(rs, oi, opts, h).await?.into_reader(reader, oi)
     }
     pub async fn read_all(&mut self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
@@ -1186,6 +1274,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_plan_restore_request_uses_plain_range() {
+        let object_info = ObjectInfo {
+            size: 10,
+            user_defined: HashMap::from([
+                ("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string()),
+                ("x-rustfs-encryption-original-size".to_string(), "20".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: true,
+            start: 4,
+            end: -1,
+        };
+
+        let mut opts = ObjectOptions::default();
+        opts.transition.restore_request.days = Some(1);
+
+        let plan = ReadPlan::build(Some(range), &object_info, &opts, &HeaderMap::new())
+            .await
+            .expect("restore requests should bypass rio transforms");
+
+        assert_eq!(plan.storage_offset, 6);
+        assert_eq!(plan.storage_length, 4);
+        assert_eq!(plan.object_size, 10);
+        assert!(matches!(
+            plan.transform,
+            ReadTransform::Plain {
+                visible_offset: 6,
+                visible_length: 4
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn test_get_object_reader_allows_encrypted_full_object_passthrough() {
         async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
             let plaintext = b"managed-full-object".to_vec();
@@ -1194,7 +1318,7 @@ mod tests {
             let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
 
             let mut encrypted = Vec::new();
-            rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+            crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
                 .read_to_end(&mut encrypted)
                 .await
                 .expect("encrypt managed object");
@@ -1245,7 +1369,7 @@ mod tests {
                 let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
 
                 let mut encrypted = Vec::new();
-                rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+                crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
                     .read_to_end(&mut encrypted)
                     .await
                     .expect("encrypt managed object with local fallback key");
@@ -1283,7 +1407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_object_reader_compressed_range_returns_physical_offset_from_index() {
-        let mut index = rustfs_rio::Index::new();
+        let mut index = crate::rio::Index::new();
         index.add(0, 0).unwrap();
         index.add(1_048_576, 2_097_152).unwrap();
 
@@ -1327,6 +1451,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_plan_compressed_range_tracks_storage_and_visible_offsets() {
+        let mut index = crate::rio::Index::new();
+        index.add(0, 0).unwrap();
+        index.add(1_048_576, 2_097_152).unwrap();
+
+        let object_info = ObjectInfo {
+            size: 3_000_000,
+            parts: vec![ObjectPartInfo {
+                etag: String::new(),
+                number: 1,
+                size: 3_000_000,
+                actual_size: 4_194_304,
+                index: Some(index.into_vec()),
+                ..Default::default()
+            }],
+            user_defined: HashMap::from([
+                ("x-minio-internal-compression".to_string(), "gzip".to_string()),
+                ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 2_097_152,
+            end: 2_097_161,
+        };
+
+        let plan = ReadPlan::build(Some(range), &object_info, &ObjectOptions::default(), &HeaderMap::new())
+            .await
+            .expect("compressed range should plan physical offset and visible range");
+
+        assert!(plan.storage_offset > 0);
+        assert!(plan.storage_offset < 2_097_152);
+        assert_eq!(plan.storage_length, object_info.size - plan.storage_offset as i64);
+        assert_eq!(plan.object_size, 10);
+
+        assert!(matches!(
+            plan.transform,
+            ReadTransform::Compressed {
+                decompressed_offset,
+                decompressed_length: 10,
+                ..
+            } if decompressed_offset < 2_097_152
+        ));
+    }
+
+    #[tokio::test]
     async fn test_get_object_reader_decrypts_ssec_full_object() {
         let plaintext = b"ecstore-ssec-full-object".to_vec();
         let key_bytes = [0x31; 32];
@@ -1337,7 +1509,7 @@ mod tests {
         base_nonce.copy_from_slice(&nonce[..12]);
 
         let mut encrypted = Vec::new();
-        rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
+        crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt object");
@@ -1390,7 +1562,7 @@ mod tests {
         base_nonce.copy_from_slice(&nonce[..12]);
 
         let mut encrypted = Vec::new();
-        rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
+        crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt ranged object");
@@ -1448,13 +1620,13 @@ mod tests {
         base_nonce.copy_from_slice(&nonce[..12]);
 
         let mut compressed = Vec::new();
-        rustfs_rio::CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default())
+        crate::rio::CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default())
             .read_to_end(&mut compressed)
             .await
             .expect("compress plaintext");
 
         let mut encrypted = Vec::new();
-        rustfs_rio::EncryptReader::new(Cursor::new(compressed), key_bytes, base_nonce)
+        crate::rio::EncryptReader::new(Cursor::new(compressed), key_bytes, base_nonce)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt compressed plaintext");
