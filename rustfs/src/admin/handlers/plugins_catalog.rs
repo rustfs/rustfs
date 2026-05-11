@@ -23,7 +23,10 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
-use rustfs_targets::{BuiltinTargetAdminDescriptor, TargetDomain};
+use rustfs_targets::{
+    BuiltinTargetAdminDescriptor, TargetDomain, TargetPluginEntrypointKind, TargetPluginPackaging,
+    builtin_target_marketplace_manifest,
+};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -55,6 +58,9 @@ struct PluginCatalogEntry {
     display_name: &'static str,
     provider: &'static str,
     version: &'static str,
+    packaging: PluginPackagingName,
+    entrypoint_kind: PluginEntrypointKindName,
+    api_compatibility_version: &'static str,
     supported_domains: Vec<TargetDomainName>,
     secret_fields: &'static [&'static str],
     domain_configs: Vec<PluginCatalogDomainEntry>,
@@ -70,6 +76,40 @@ struct PluginCatalogResponse {
 enum TargetDomainName {
     Audit,
     Notify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PluginPackagingName {
+    Builtin,
+    External,
+}
+
+impl From<TargetPluginPackaging> for PluginPackagingName {
+    fn from(value: TargetPluginPackaging) -> Self {
+        match value {
+            TargetPluginPackaging::Builtin => Self::Builtin,
+            TargetPluginPackaging::External => Self::External,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PluginEntrypointKindName {
+    Builtin,
+    Sidecar,
+    Wasm,
+}
+
+impl From<TargetPluginEntrypointKind> for PluginEntrypointKindName {
+    fn from(value: TargetPluginEntrypointKind) -> Self {
+        match value {
+            TargetPluginEntrypointKind::Builtin => Self::Builtin,
+            TargetPluginEntrypointKind::Sidecar => Self::Sidecar,
+            TargetPluginEntrypointKind::Wasm => Self::Wasm,
+        }
+    }
 }
 
 impl From<TargetDomain> for TargetDomainName {
@@ -111,6 +151,7 @@ fn build_catalog_response() -> PluginCatalogResponse {
 
 fn merge_catalog_descriptor(plugins: &mut HashMap<&'static str, PluginCatalogEntry>, descriptor: &BuiltinTargetAdminDescriptor) {
     let manifest = descriptor.manifest();
+    let marketplace = builtin_target_marketplace_manifest(manifest.target_type);
     let domain = target_domain_name_from_subsystem(descriptor.admin_metadata().subsystem());
     let domain_entry = PluginCatalogDomainEntry {
         domain,
@@ -124,6 +165,9 @@ fn merge_catalog_descriptor(plugins: &mut HashMap<&'static str, PluginCatalogEnt
         display_name: manifest.display_name,
         provider: manifest.provider,
         version: manifest.version,
+        packaging: marketplace.packaging.into(),
+        entrypoint_kind: marketplace.entrypoint_kind.into(),
+        api_compatibility_version: marketplace.api_compatibility_version,
         supported_domains: manifest.supported_domains.iter().copied().map(Into::into).collect(),
         secret_fields: manifest.secret_fields,
         domain_configs: Vec::new(),
@@ -179,7 +223,7 @@ impl Operation for GetPluginCatalogHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{TargetDomainName, build_catalog_response};
+    use super::{PluginEntrypointKindName, PluginPackagingName, TargetDomainName, build_catalog_response};
 
     #[test]
     fn plugin_catalog_handlers_require_admin_authorization_contract() {
@@ -203,6 +247,9 @@ mod tests {
             .expect("builtin webhook plugin should be present");
         assert_eq!(webhook.target_type, "webhook");
         assert_eq!(webhook.display_name, "Webhook");
+        assert_eq!(webhook.packaging, PluginPackagingName::Builtin);
+        assert_eq!(webhook.entrypoint_kind, PluginEntrypointKindName::Builtin);
+        assert_eq!(webhook.api_compatibility_version, "rustfs.target-plugin.v1");
         assert!(webhook.supported_domains.contains(&TargetDomainName::Audit));
         assert!(webhook.supported_domains.contains(&TargetDomainName::Notify));
         assert!(
