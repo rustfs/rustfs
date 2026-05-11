@@ -17,8 +17,8 @@ use crate::admin::{
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
         build_json_response, collect_runtime_statuses, collect_validated_key_values as shared_collect_validated_key_values,
-        merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
-        target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name,
+        extract_supported_target_params, merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
+        target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     router::{AdminOperation, Operation, S3Router},
 };
@@ -155,16 +155,7 @@ fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey,
 }
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
-    let target_type = params
-        .get("target_type")
-        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'target_type'"))?;
-    if target_service_name(audit_target_specs(), target_type).is_none() {
-        return Err(s3_error!(InvalidArgument, "unsupported audit target type: '{}'", target_type));
-    }
-    let target_name = params
-        .get("target_name")
-        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'target_name'"))?;
-    Ok((target_type, target_name))
+    extract_supported_target_params(audit_target_specs(), params, "audit")
 }
 
 async fn load_server_config_from_store() -> S3Result<Config> {

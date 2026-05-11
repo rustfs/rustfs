@@ -154,6 +154,28 @@ pub(crate) fn target_service_name(specs: &[AdminTargetSpec], target_type: &str) 
     target_spec(specs, target_type).map(|spec| spec.service)
 }
 
+pub(crate) fn extract_supported_target_params<'a>(
+    specs: &[AdminTargetSpec],
+    params: &'a matchit::Params<'_, '_>,
+    unsupported_target_label: &str,
+) -> S3Result<(&'a str, &'a str)> {
+    let target_type = params
+        .get("target_type")
+        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'target_type'"))?;
+    if target_service_name(specs, target_type).is_none() {
+        return Err(s3_error!(
+            InvalidArgument,
+            "unsupported {} target type: '{}'",
+            unsupported_target_label,
+            target_type
+        ));
+    }
+    let target_name = params
+        .get("target_name")
+        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'target_name'"))?;
+    Ok((target_type, target_name))
+}
+
 pub(crate) fn collect_configured_endpoint_keys(specs: &[AdminTargetSpec], config: &Config) -> Vec<EndpointKey> {
     let mut endpoints = Vec::new();
     for spec in specs {
