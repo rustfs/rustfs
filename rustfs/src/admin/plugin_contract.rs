@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use rustfs_targets::{
-    TargetDomain, TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract, TargetPluginPackaging,
-    TargetPluginRuntimeTransport,
+    TargetDomain, TargetPluginDistributionManifest, TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract,
+    TargetPluginPackaging, TargetPluginRuntimeTransport,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -103,6 +103,24 @@ impl From<TargetPluginExternalRuntimeContract> for PluginRuntimeContract {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct PluginDistributionContract {
+    pub download_uri: String,
+    pub digest_sha256: String,
+    pub size_bytes: u64,
+}
+
+impl From<TargetPluginDistributionManifest> for PluginDistributionContract {
+    fn from(value: TargetPluginDistributionManifest) -> Self {
+        Self {
+            download_uri: value.download_uri.to_string(),
+            digest_sha256: value.digest_sha256.to_string(),
+            size_bytes: value.size_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PluginInstanceSource {
@@ -132,6 +150,7 @@ pub(crate) struct PluginCatalogEntry {
     pub entrypoint_kind: PluginContractEntrypointKind,
     pub api_compatibility_version: String,
     pub runtime_contract: PluginRuntimeContract,
+    pub distribution: Option<PluginDistributionContract>,
     pub supported_domains: Vec<PluginContractDomain>,
     pub secret_fields: Vec<String>,
     pub domain_configs: Vec<PluginCatalogDomainEntry>,
@@ -168,8 +187,8 @@ pub(crate) struct PluginInstancesResponse {
 mod tests {
     use super::{
         PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain, PluginContractEntrypointKind,
-        PluginContractPackaging, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse, PluginRuntimeContract,
-        PluginRuntimeTransport,
+        PluginContractPackaging, PluginDistributionContract, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse,
+        PluginRuntimeContract, PluginRuntimeTransport,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -190,6 +209,7 @@ mod tests {
                     protocol_version: "rustfs.target-runtime.v1".to_string(),
                     transport: PluginRuntimeTransport::InProcess,
                 },
+                distribution: None,
                 supported_domains: vec![PluginContractDomain::Audit, PluginContractDomain::Notify],
                 secret_fields: vec!["auth_token".to_string()],
                 domain_configs: vec![PluginCatalogDomainEntry {
@@ -217,6 +237,7 @@ mod tests {
                         "protocol_version": "rustfs.target-runtime.v1",
                         "transport": "in_process"
                     },
+                    "distribution": null,
                     "supported_domains": ["audit", "notify"],
                     "secret_fields": ["auth_token"],
                     "domain_configs": [{
@@ -274,5 +295,36 @@ mod tests {
                 "next_marker": null
             })
         );
+    }
+
+    #[test]
+    fn plugin_catalog_distribution_contract_serializes_when_present() {
+        let entry = PluginCatalogEntry {
+            plugin_id: "external:webhook".to_string(),
+            target_type: "webhook".to_string(),
+            display_name: "Webhook+".to_string(),
+            provider: "example".to_string(),
+            version: "1.2.3".to_string(),
+            packaging: PluginContractPackaging::Builtin,
+            entrypoint_kind: PluginContractEntrypointKind::Sidecar,
+            api_compatibility_version: "rustfs.target-plugin.v1".to_string(),
+            runtime_contract: PluginRuntimeContract {
+                protocol_version: "rustfs.target-runtime.v1".to_string(),
+                transport: PluginRuntimeTransport::Grpc,
+            },
+            distribution: Some(PluginDistributionContract {
+                download_uri: "https://plugins.example.test/webhook.tar.zst".to_string(),
+                digest_sha256: "0123456789abcdef".to_string(),
+                size_bytes: 4096,
+            }),
+            supported_domains: vec![PluginContractDomain::Notify],
+            secret_fields: Vec::new(),
+            domain_configs: Vec::new(),
+        };
+
+        let value = serde_json::to_value(entry).expect("catalog entry should serialize");
+        assert_eq!(value["distribution"]["download_uri"], "https://plugins.example.test/webhook.tar.zst");
+        assert_eq!(value["distribution"]["digest_sha256"], "0123456789abcdef");
+        assert_eq!(value["distribution"]["size_bytes"], 4096);
     }
 }

@@ -64,6 +64,14 @@ pub struct TargetPluginExternalRuntimeContract {
     pub transport: TargetPluginRuntimeTransport,
 }
 
+/// Declarative distribution metadata for an installable target plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetPluginDistributionManifest {
+    pub download_uri: &'static str,
+    pub digest_sha256: &'static str,
+    pub size_bytes: u64,
+}
+
 /// Marketplace-oriented manifest metadata that is explicit about future
 /// installable plugin boundaries without introducing any loading behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +87,7 @@ pub struct TargetPluginMarketplaceManifest {
     pub entrypoint_kind: TargetPluginEntrypointKind,
     pub api_compatibility_version: &'static str,
     pub runtime_contract: TargetPluginExternalRuntimeContract,
+    pub distribution: Option<TargetPluginDistributionManifest>,
 }
 
 const BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION: &str = "rustfs.target-plugin.v1";
@@ -151,7 +160,31 @@ impl From<TargetPluginManifest> for TargetPluginMarketplaceManifest {
                 protocol_version: BUILTIN_PLUGIN_RUNTIME_PROTOCOL_VERSION,
                 transport: TargetPluginRuntimeTransport::InProcess,
             },
+            distribution: None,
         }
+    }
+}
+
+#[inline]
+pub fn installable_target_marketplace_manifest(
+    base: TargetPluginManifest,
+    entrypoint_kind: TargetPluginEntrypointKind,
+    runtime_contract: TargetPluginExternalRuntimeContract,
+    distribution: TargetPluginDistributionManifest,
+) -> TargetPluginMarketplaceManifest {
+    TargetPluginMarketplaceManifest {
+        plugin_id: base.plugin_id,
+        display_name: base.display_name,
+        provider: base.provider,
+        version: base.version,
+        target_type: base.target_type,
+        supported_domains: base.supported_domains,
+        secret_fields: base.secret_fields,
+        packaging: TargetPluginPackaging::External,
+        entrypoint_kind,
+        api_compatibility_version: BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION,
+        runtime_contract,
+        distribution: Some(distribution),
     }
 }
 
@@ -174,8 +207,9 @@ fn builtin_plugin_id(target_type: &'static str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract, TargetPluginMarketplaceManifest, TargetPluginPackaging,
-        TargetPluginRuntimeTransport, builtin_target_manifest, builtin_target_marketplace_manifest,
+        TargetPluginDistributionManifest, TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract,
+        TargetPluginMarketplaceManifest, TargetPluginPackaging, TargetPluginRuntimeTransport, builtin_target_manifest,
+        builtin_target_marketplace_manifest, installable_target_marketplace_manifest,
     };
     use crate::domain::TargetDomain;
     use rustfs_config::{WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY};
@@ -208,6 +242,7 @@ mod tests {
                 transport: TargetPluginRuntimeTransport::InProcess,
             }
         );
+        assert_eq!(manifest.distribution, None);
     }
 
     #[test]
@@ -227,5 +262,36 @@ mod tests {
         assert_eq!(derived.packaging, TargetPluginPackaging::Builtin);
         assert_eq!(derived.entrypoint_kind, TargetPluginEntrypointKind::Builtin);
         assert_eq!(derived.runtime_contract.transport, TargetPluginRuntimeTransport::InProcess);
+        assert_eq!(derived.distribution, None);
+    }
+
+    #[test]
+    fn installable_manifest_expresses_external_boundary_declaratively() {
+        let base = builtin_target_manifest("webhook");
+        let manifest = installable_target_marketplace_manifest(
+            base,
+            TargetPluginEntrypointKind::Sidecar,
+            TargetPluginExternalRuntimeContract {
+                protocol_version: "rustfs.target-runtime.v1",
+                transport: TargetPluginRuntimeTransport::Grpc,
+            },
+            TargetPluginDistributionManifest {
+                download_uri: "https://plugins.example.test/webhook-plugin.tar.zst",
+                digest_sha256: "0123456789abcdef",
+                size_bytes: 4096,
+            },
+        );
+
+        assert_eq!(manifest.packaging, TargetPluginPackaging::External);
+        assert_eq!(manifest.entrypoint_kind, TargetPluginEntrypointKind::Sidecar);
+        assert_eq!(manifest.runtime_contract.transport, TargetPluginRuntimeTransport::Grpc);
+        assert_eq!(
+            manifest.distribution,
+            Some(TargetPluginDistributionManifest {
+                download_uri: "https://plugins.example.test/webhook-plugin.tar.zst",
+                digest_sha256: "0123456789abcdef",
+                size_bytes: 4096,
+            })
+        );
     }
 }
