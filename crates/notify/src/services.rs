@@ -16,10 +16,10 @@ use crate::{
     Event,
     bucket_config_manager::NotifyBucketConfigManager,
     config_manager::NotifyConfigManager,
-    event_bridge::{LiveEventHistory, NotifyEventBridge},
     integration::NotificationMetrics,
     notification_system_subscriber::NotificationSystemSubscriberView,
     notifier::{EventNotifier, SharedNotifyTargetList},
+    pipeline::{LiveEventHistory, NotifyPipeline},
     registry::TargetRegistry,
     runtime_facade::NotifyRuntimeFacade,
     runtime_view::NotifyRuntimeView,
@@ -34,7 +34,7 @@ use tokio::sync::{RwLock, Semaphore, broadcast};
 pub struct NotifyServices {
     pub bucket_config_manager: NotifyBucketConfigManager,
     pub config_manager: NotifyConfigManager,
-    pub event_bridge: NotifyEventBridge,
+    pub pipeline: NotifyPipeline,
     pub runtime_facade: NotifyRuntimeFacade,
     pub runtime_view: NotifyRuntimeView,
     pub status_view: NotifyStatusView,
@@ -58,13 +58,13 @@ impl NotifyServices {
         let runtime_facade = NotifyRuntimeFacade::new(target_list, stream_cancellers, concurrency_limiter, metrics.clone());
         let config_manager = NotifyConfigManager::new(config, registry, notifier.clone(), runtime_facade.clone());
         let bucket_config_manager = NotifyBucketConfigManager::new(notifier.clone(), subscriber_view);
-        let event_bridge = NotifyEventBridge::new(notifier, live_event_sender, live_event_history);
+        let pipeline = NotifyPipeline::new(notifier, live_event_sender, live_event_history);
         let status_view = NotifyStatusView::new(metrics);
 
         Self {
             bucket_config_manager,
             config_manager,
-            event_bridge,
+            pipeline,
             runtime_facade,
             runtime_view,
             status_view,
@@ -76,8 +76,8 @@ impl NotifyServices {
 mod tests {
     use super::NotifyServices;
     use crate::{
-        event_bridge::LiveEventHistory, integration::NotificationMetrics,
-        notification_system_subscriber::NotificationSystemSubscriberView, notifier::EventNotifier, registry::TargetRegistry,
+        integration::NotificationMetrics, notification_system_subscriber::NotificationSystemSubscriberView,
+        notifier::EventNotifier, pipeline::LiveEventHistory, registry::TargetRegistry,
     };
     use rustfs_ecstore::config::Config;
     use rustfs_targets::ReplayWorkerManager;

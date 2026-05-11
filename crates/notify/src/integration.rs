@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::event_bridge::LiveEventHistory;
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::{EventNotifier, TargetList};
 use crate::services::NotifyServices;
-use crate::{Event, error::NotificationError, registry::TargetRegistry, rules::BucketNotificationConfig};
+use crate::{
+    Event, error::NotificationError, pipeline::LiveEventHistory, registry::TargetRegistry, rules::BucketNotificationConfig,
+};
 use hashbrown::HashMap;
 use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
 use rustfs_ecstore::config::{Config, KVS};
@@ -221,19 +222,16 @@ impl NotificationSystem {
 
     /// Returns true when at least one in-process consumer is subscribed to live events.
     pub fn has_live_listeners(&self) -> bool {
-        self.services.event_bridge.has_live_listeners()
+        self.services.pipeline.has_live_listeners()
     }
 
     /// Subscribes to the in-process live event stream.
     pub fn subscribe_live_events(&self) -> broadcast::Receiver<Arc<Event>> {
-        self.services.event_bridge.subscribe_live_events()
+        self.services.pipeline.subscribe_live_events()
     }
 
     pub async fn recent_live_events_since(&self, after_sequence: u64, limit: usize) -> LiveEventBatch {
-        self.services
-            .event_bridge
-            .recent_live_events_since(after_sequence, limit)
-            .await
+        self.services.pipeline.recent_live_events_since(after_sequence, limit).await
     }
 
     /// Accurately remove a Target and its related resources through TargetID.
@@ -322,7 +320,7 @@ impl NotificationSystem {
 
     /// Sends an event
     pub async fn send_event(&self, event: Arc<Event>) {
-        self.services.event_bridge.send_event(event).await;
+        self.services.pipeline.send_event(event).await;
     }
 
     /// Obtain system status information
@@ -407,5 +405,24 @@ mod tests {
         assert!(batch.truncated);
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].s3.object.key, "one");
+    }
+
+    #[tokio::test]
+    async fn notification_system_exposes_live_event_pipeline() {
+        let system = NotificationSystem::new(Config::default());
+        assert!(!system.has_live_listeners());
+
+        let _rx = system.subscribe_live_events();
+        assert!(system.has_live_listeners());
+
+        system
+            .send_event(Arc::new(Event::new_test_event("bucket", "object", EventName::ObjectCreatedPut)))
+            .await;
+
+        let batch = system.recent_live_events_since(0, 16).await;
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].s3.object.key, "object");
+        assert_eq!(batch.next_sequence, 1);
+        assert!(!batch.truncated);
     }
 }

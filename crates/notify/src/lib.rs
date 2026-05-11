@@ -28,6 +28,7 @@ mod global;
 pub mod integration;
 mod notification_system_subscriber;
 pub mod notifier;
+mod pipeline;
 pub mod registry;
 pub mod rules;
 mod runtime_facade;
@@ -46,6 +47,7 @@ pub use global::{
     notification_target_metrics, notifier_global,
 };
 pub use integration::{NotificationMetricSnapshot, NotificationSystem, NotificationTargetMetricSnapshot};
+pub use pipeline::NotifyPipeline;
 pub use rules::BucketNotificationConfig;
 pub use runtime_facade::NotifyRuntimeFacade;
 pub use runtime_view::NotifyRuntimeView;
