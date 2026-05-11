@@ -30,6 +30,11 @@ pub use check::{
     check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
     check_redis_server_available,
 };
+pub use config::{
+    LegacyTargetInstanceDescriptor, TargetInstanceSourceClass, TargetInstanceSourceHints, TargetPluginInstance,
+    TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, normalize_legacy_target_instances,
+    normalize_legacy_target_instances_from_env, normalize_target_plugin_instances, normalize_target_plugin_instances_from_env,
+};
 pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};
 pub use manifest::{

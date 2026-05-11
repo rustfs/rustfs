@@ -19,7 +19,8 @@ mod target_args;
 
 pub use instance::{
     LegacyTargetInstanceDescriptor, TargetInstanceSourceClass, TargetInstanceSourceHints, TargetPluginInstance,
-    normalize_legacy_target_instances, normalize_legacy_target_instances_from_env,
+    TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, normalize_legacy_target_instances,
+    normalize_legacy_target_instances_from_env, normalize_target_plugin_instances, normalize_target_plugin_instances_from_env,
 };
 pub use loader::{
     collect_env_target_instance_ids, collect_env_target_instance_ids_from_env, collect_target_configs,

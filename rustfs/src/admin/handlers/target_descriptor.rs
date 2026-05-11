@@ -30,8 +30,8 @@ use rustfs_targets::{
     check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
     check_redis_server_available,
     config::{
-        LegacyTargetInstanceDescriptor, TargetPluginInstance, build_amqp_args, build_kafka_args, build_mysql_args,
-        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, normalize_legacy_target_instances,
+        TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, build_amqp_args, build_kafka_args, build_mysql_args,
+        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, normalize_target_plugin_instances,
         validate_redis_config,
     },
     target::{TargetType, mqtt::MQTTTlsConfig},
@@ -535,21 +535,25 @@ where
     Ok(kvs)
 }
 
-fn instance_has_config_entry(instance: &TargetPluginInstance) -> bool {
+fn instance_has_config_entry(instance: &TargetPluginInstanceRecord) -> bool {
     instance.source_hints.has_file_instance
 }
 
-fn instance_has_env_entry(instance: &TargetPluginInstance) -> bool {
+fn instance_has_env_entry(instance: &TargetPluginInstanceRecord) -> bool {
     instance.source_hints.has_env_instance
 }
 
-fn normalized_target_instances(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> Vec<TargetPluginInstance> {
+fn normalized_target_instances(
+    specs: &[AdminTargetSpec],
+    route_prefix: &str,
+    config: &Config,
+) -> Vec<TargetPluginInstanceRecord> {
     specs
         .iter()
         .flat_map(|spec| {
-            normalize_legacy_target_instances(
+            normalize_target_plugin_instances(
                 config,
-                &LegacyTargetInstanceDescriptor {
+                &TargetPluginInstanceCompatDescriptor {
                     domain: inferred_target_domain(route_prefix),
                     plugin_id: builtin_target_manifest(spec.service).plugin_id,
                     target_type: spec.service,

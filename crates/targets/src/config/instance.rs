@@ -18,7 +18,7 @@ use rustfs_ecstore::config::{Config, KVS};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LegacyTargetInstanceDescriptor<'a> {
+pub struct TargetPluginInstanceCompatDescriptor<'a> {
     pub domain: TargetDomain,
     pub plugin_id: &'a str,
     pub target_type: &'a str,
@@ -65,7 +65,7 @@ impl TargetInstanceSourceHints {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetPluginInstance {
+pub struct TargetPluginInstanceRecord {
     pub domain: TargetDomain,
     pub plugin_id: String,
     pub target_type: String,
@@ -76,18 +76,21 @@ pub struct TargetPluginInstance {
     pub effective_config: KVS,
 }
 
-pub fn normalize_legacy_target_instances(
+pub type LegacyTargetInstanceDescriptor<'a> = TargetPluginInstanceCompatDescriptor<'a>;
+pub type TargetPluginInstance = TargetPluginInstanceRecord;
+
+pub fn normalize_target_plugin_instances(
     config: &Config,
-    descriptor: &LegacyTargetInstanceDescriptor<'_>,
-) -> Vec<TargetPluginInstance> {
-    normalize_legacy_target_instances_from_env(config, descriptor, std::env::vars())
+    descriptor: &TargetPluginInstanceCompatDescriptor<'_>,
+) -> Vec<TargetPluginInstanceRecord> {
+    normalize_target_plugin_instances_from_env(config, descriptor, std::env::vars())
 }
 
-pub fn normalize_legacy_target_instances_from_env<I>(
+pub fn normalize_target_plugin_instances_from_env<I>(
     config: &Config,
-    descriptor: &LegacyTargetInstanceDescriptor<'_>,
+    descriptor: &TargetPluginInstanceCompatDescriptor<'_>,
     env_vars: I,
-) -> Vec<TargetPluginInstance>
+) -> Vec<TargetPluginInstanceRecord>
 where
     I: IntoIterator<Item = (String, String)>,
 {
@@ -106,7 +109,7 @@ where
         env_vars,
     )
     .into_iter()
-    .map(|record| TargetPluginInstance {
+    .map(|record| TargetPluginInstanceRecord {
         domain: descriptor.domain,
         plugin_id: descriptor.plugin_id.to_string(),
         target_type: descriptor.target_type.to_string(),
@@ -124,9 +127,30 @@ where
     .collect()
 }
 
+pub fn normalize_legacy_target_instances(
+    config: &Config,
+    descriptor: &LegacyTargetInstanceDescriptor<'_>,
+) -> Vec<TargetPluginInstance> {
+    normalize_target_plugin_instances(config, descriptor)
+}
+
+pub fn normalize_legacy_target_instances_from_env<I>(
+    config: &Config,
+    descriptor: &LegacyTargetInstanceDescriptor<'_>,
+    env_vars: I,
+) -> Vec<TargetPluginInstance>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    normalize_target_plugin_instances_from_env(config, descriptor, env_vars)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LegacyTargetInstanceDescriptor, TargetInstanceSourceClass, normalize_legacy_target_instances_from_env};
+    use super::{
+        TargetInstanceSourceClass, TargetPluginInstanceCompatDescriptor, normalize_legacy_target_instances_from_env,
+        normalize_target_plugin_instances_from_env,
+    };
     use crate::domain::TargetDomain;
     use crate::manifest::builtin_target_manifest;
     use rustfs_config::audit::{AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
@@ -135,8 +159,8 @@ mod tests {
     use rustfs_ecstore::config::{Config, KVS};
     use std::collections::HashMap;
 
-    fn notify_webhook_descriptor() -> LegacyTargetInstanceDescriptor<'static> {
-        LegacyTargetInstanceDescriptor {
+    fn notify_webhook_descriptor() -> TargetPluginInstanceCompatDescriptor<'static> {
+        TargetPluginInstanceCompatDescriptor {
             domain: TargetDomain::Notify,
             plugin_id: builtin_target_manifest("webhook").plugin_id,
             target_type: "webhook",
@@ -146,8 +170,8 @@ mod tests {
         }
     }
 
-    fn audit_webhook_descriptor() -> LegacyTargetInstanceDescriptor<'static> {
-        LegacyTargetInstanceDescriptor {
+    fn audit_webhook_descriptor() -> TargetPluginInstanceCompatDescriptor<'static> {
+        TargetPluginInstanceCompatDescriptor {
             domain: TargetDomain::Audit,
             plugin_id: builtin_target_manifest("webhook").plugin_id,
             target_type: "webhook",
@@ -298,5 +322,25 @@ mod tests {
         );
 
         assert!(instances.is_empty());
+    }
+
+    #[test]
+    fn compatibility_wrapper_matches_canonical_instance_model() {
+        let mut cfg = Config(HashMap::new());
+        let mut subsystem = HashMap::new();
+
+        let mut primary = KVS::new();
+        primary.insert(ENABLE_KEY.to_string(), "on".to_string());
+        primary.insert(WEBHOOK_ENDPOINT.to_string(), "https://example.com/primary".to_string());
+        subsystem.insert("primary".to_string(), primary);
+        cfg.0.insert(NOTIFY_WEBHOOK_SUB_SYS.to_string(), subsystem);
+
+        let descriptor = notify_webhook_descriptor();
+        let env = vec![("RUSTFS_NOTIFY_WEBHOOK_QUEUE_LIMIT".to_string(), "7".to_string())];
+
+        let canonical = normalize_target_plugin_instances_from_env(&cfg, &descriptor, env.clone());
+        let compatibility = normalize_legacy_target_instances_from_env(&cfg, &descriptor, env);
+
+        assert_eq!(canonical, compatibility);
     }
 }
