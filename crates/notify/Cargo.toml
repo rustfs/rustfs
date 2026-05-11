@@ -36,6 +36,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 form_urlencoded = { workspace = true }
 hashbrown = { workspace = true }
+percent-encoding = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
