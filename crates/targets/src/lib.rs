@@ -38,9 +38,9 @@ pub use config::{
 pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};
 pub use manifest::{
-    TargetPluginDistributionManifest, TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract, TargetPluginManifest,
-    TargetPluginMarketplaceManifest, TargetPluginPackaging, TargetPluginRuntimeTransport, builtin_target_marketplace_manifest,
-    installable_target_marketplace_manifest,
+    TargetPluginArtifactManifest, TargetPluginDistributionManifest, TargetPluginEntrypointKind,
+    TargetPluginExternalRuntimeContract, TargetPluginManifest, TargetPluginMarketplaceManifest, TargetPluginPackaging,
+    TargetPluginRuntimeTransport, builtin_target_marketplace_manifest, installable_target_marketplace_manifest,
 };
 pub use plugin::{
     BuiltinTargetAdminDescriptor, BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetPluginRegistry,

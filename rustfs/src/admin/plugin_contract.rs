@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use rustfs_targets::{
-    TargetDomain, TargetPluginDistributionManifest, TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract,
-    TargetPluginPackaging, TargetPluginRuntimeTransport,
+    TargetDomain, TargetPluginArtifactManifest, TargetPluginDistributionManifest, TargetPluginEntrypointKind,
+    TargetPluginExternalRuntimeContract, TargetPluginPackaging, TargetPluginRuntimeTransport,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -105,18 +105,36 @@ impl From<TargetPluginExternalRuntimeContract> for PluginRuntimeContract {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct PluginDistributionContract {
+pub(crate) struct PluginArtifactContract {
+    pub artifact_id: String,
+    pub target_triple: String,
     pub download_uri: String,
     pub digest_sha256: String,
     pub size_bytes: u64,
 }
 
-impl From<TargetPluginDistributionManifest> for PluginDistributionContract {
-    fn from(value: TargetPluginDistributionManifest) -> Self {
+impl From<TargetPluginArtifactManifest> for PluginArtifactContract {
+    fn from(value: TargetPluginArtifactManifest) -> Self {
         Self {
+            artifact_id: value.artifact_id.to_string(),
+            target_triple: value.target_triple.to_string(),
             download_uri: value.download_uri.to_string(),
             digest_sha256: value.digest_sha256.to_string(),
             size_bytes: value.size_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct PluginDistributionContract {
+    pub artifacts: Vec<PluginArtifactContract>,
+}
+
+impl From<TargetPluginDistributionManifest> for PluginDistributionContract {
+    fn from(value: TargetPluginDistributionManifest) -> Self {
+        Self {
+            artifacts: value.artifacts.iter().copied().map(PluginArtifactContract::from).collect(),
         }
     }
 }
@@ -186,9 +204,9 @@ pub(crate) struct PluginInstancesResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain, PluginContractEntrypointKind,
-        PluginContractPackaging, PluginDistributionContract, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse,
-        PluginRuntimeContract, PluginRuntimeTransport,
+        PluginArtifactContract, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
+        PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginInstanceEntry,
+        PluginInstanceSource, PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -313,9 +331,13 @@ mod tests {
                 transport: PluginRuntimeTransport::Grpc,
             },
             distribution: Some(PluginDistributionContract {
-                download_uri: "https://plugins.example.test/webhook.tar.zst".to_string(),
-                digest_sha256: "0123456789abcdef".to_string(),
-                size_bytes: 4096,
+                artifacts: vec![PluginArtifactContract {
+                    artifact_id: "sidecar-linux-amd64".to_string(),
+                    target_triple: "x86_64-unknown-linux-gnu".to_string(),
+                    download_uri: "https://plugins.example.test/webhook.tar.zst".to_string(),
+                    digest_sha256: "0123456789abcdef".to_string(),
+                    size_bytes: 4096,
+                }],
             }),
             supported_domains: vec![PluginContractDomain::Notify],
             secret_fields: Vec::new(),
@@ -323,8 +345,13 @@ mod tests {
         };
 
         let value = serde_json::to_value(entry).expect("catalog entry should serialize");
-        assert_eq!(value["distribution"]["download_uri"], "https://plugins.example.test/webhook.tar.zst");
-        assert_eq!(value["distribution"]["digest_sha256"], "0123456789abcdef");
-        assert_eq!(value["distribution"]["size_bytes"], 4096);
+        assert_eq!(value["distribution"]["artifacts"][0]["artifact_id"], "sidecar-linux-amd64");
+        assert_eq!(value["distribution"]["artifacts"][0]["target_triple"], "x86_64-unknown-linux-gnu");
+        assert_eq!(
+            value["distribution"]["artifacts"][0]["download_uri"],
+            "https://plugins.example.test/webhook.tar.zst"
+        );
+        assert_eq!(value["distribution"]["artifacts"][0]["digest_sha256"], "0123456789abcdef");
+        assert_eq!(value["distribution"]["artifacts"][0]["size_bytes"], 4096);
     }
 }

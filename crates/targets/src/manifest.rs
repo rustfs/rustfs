@@ -66,10 +66,18 @@ pub struct TargetPluginExternalRuntimeContract {
 
 /// Declarative distribution metadata for an installable target plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TargetPluginDistributionManifest {
+pub struct TargetPluginArtifactManifest {
+    pub artifact_id: &'static str,
+    pub target_triple: &'static str,
     pub download_uri: &'static str,
     pub digest_sha256: &'static str,
     pub size_bytes: u64,
+}
+
+/// Declarative distribution metadata for an installable target plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetPluginDistributionManifest {
+    pub artifacts: &'static [TargetPluginArtifactManifest],
 }
 
 /// Marketplace-oriented manifest metadata that is explicit about future
@@ -207,9 +215,10 @@ fn builtin_plugin_id(target_type: &'static str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        TargetPluginDistributionManifest, TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract,
-        TargetPluginMarketplaceManifest, TargetPluginPackaging, TargetPluginRuntimeTransport, builtin_target_manifest,
-        builtin_target_marketplace_manifest, installable_target_marketplace_manifest,
+        TargetPluginArtifactManifest, TargetPluginDistributionManifest, TargetPluginEntrypointKind,
+        TargetPluginExternalRuntimeContract, TargetPluginMarketplaceManifest, TargetPluginPackaging,
+        TargetPluginRuntimeTransport, builtin_target_manifest, builtin_target_marketplace_manifest,
+        installable_target_marketplace_manifest,
     };
     use crate::domain::TargetDomain;
     use rustfs_config::{WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY};
@@ -276,9 +285,13 @@ mod tests {
                 transport: TargetPluginRuntimeTransport::Grpc,
             },
             TargetPluginDistributionManifest {
-                download_uri: "https://plugins.example.test/webhook-plugin.tar.zst",
-                digest_sha256: "0123456789abcdef",
-                size_bytes: 4096,
+                artifacts: &[TargetPluginArtifactManifest {
+                    artifact_id: "sidecar-linux-amd64",
+                    target_triple: "x86_64-unknown-linux-gnu",
+                    download_uri: "https://plugins.example.test/webhook-plugin.tar.zst",
+                    digest_sha256: "0123456789abcdef",
+                    size_bytes: 4096,
+                }],
             },
         );
 
@@ -288,9 +301,13 @@ mod tests {
         assert_eq!(
             manifest.distribution,
             Some(TargetPluginDistributionManifest {
-                download_uri: "https://plugins.example.test/webhook-plugin.tar.zst",
-                digest_sha256: "0123456789abcdef",
-                size_bytes: 4096,
+                artifacts: &[TargetPluginArtifactManifest {
+                    artifact_id: "sidecar-linux-amd64",
+                    target_triple: "x86_64-unknown-linux-gnu",
+                    download_uri: "https://plugins.example.test/webhook-plugin.tar.zst",
+                    digest_sha256: "0123456789abcdef",
+                    size_bytes: 4096,
+                }],
             })
         );
     }
