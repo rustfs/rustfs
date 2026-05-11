@@ -130,7 +130,10 @@ impl NotifyRuntimeFacade {
 #[cfg(test)]
 mod tests {
     use super::NotifyRuntimeFacade;
-    use crate::{Event, integration::NotificationMetrics, notifier::EventNotifier, runtime_view::NotifyRuntimeView};
+    use crate::{
+        Event, integration::NotificationMetrics, notifier::EventNotifier, rule_engine::NotifyRuleEngine,
+        runtime_view::NotifyRuntimeView,
+    };
     use async_trait::async_trait;
     use rustfs_targets::arn::TargetID;
     use rustfs_targets::store::{Key, Store};
@@ -201,7 +204,7 @@ mod tests {
 
     fn build_facade() -> (NotifyRuntimeFacade, Arc<EventNotifier>, Arc<RwLock<ReplayWorkerManager>>) {
         let metrics = Arc::new(NotificationMetrics::new());
-        let notifier = Arc::new(EventNotifier::new(metrics.clone()));
+        let notifier = Arc::new(EventNotifier::new(metrics.clone(), NotifyRuleEngine::new()));
         let target_list = notifier.target_list();
         let replay_workers = Arc::new(RwLock::new(ReplayWorkerManager::new()));
         let facade = NotifyRuntimeFacade::new(target_list, replay_workers.clone(), Arc::new(Semaphore::new(4)), metrics);

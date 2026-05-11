@@ -14,7 +14,8 @@
 
 use crate::{
     BucketNotificationConfig, NotificationError, config_manager::notify_configuration_hint,
-    notification_system_subscriber::NotificationSystemSubscriberView, notifier::EventNotifier, rules::ParseConfigError,
+    notification_system_subscriber::NotificationSystemSubscriberView, notifier::EventNotifier, rule_engine::NotifyRuleEngine,
+    rules::ParseConfigError,
 };
 use rustfs_s3_common::EventName;
 use std::sync::Arc;
@@ -23,13 +24,19 @@ use tracing::{debug, info, warn};
 #[derive(Clone)]
 pub struct NotifyBucketConfigManager {
     notifier: Arc<EventNotifier>,
+    rule_engine: NotifyRuleEngine,
     subscriber_view: Arc<NotificationSystemSubscriberView>,
 }
 
 impl NotifyBucketConfigManager {
-    pub fn new(notifier: Arc<EventNotifier>, subscriber_view: Arc<NotificationSystemSubscriberView>) -> Self {
+    pub fn new(
+        notifier: Arc<EventNotifier>,
+        rule_engine: NotifyRuleEngine,
+        subscriber_view: Arc<NotificationSystemSubscriberView>,
+    ) -> Self {
         Self {
             notifier,
+            rule_engine,
             subscriber_view,
         }
     }
@@ -38,7 +45,7 @@ impl NotifyBucketConfigManager {
         if !self.subscriber_view.has_subscriber(bucket, event) {
             return false;
         }
-        self.notifier.has_subscriber(bucket, event).await
+        self.rule_engine.has_subscriber(bucket, event).await
     }
 
     pub async fn load_bucket_notification_config(
@@ -66,14 +73,14 @@ impl NotifyBucketConfigManager {
         }
 
         self.subscriber_view.apply_bucket_config(bucket, cfg);
-        self.notifier.add_rules_map(bucket, cfg.get_rules_map().clone()).await;
+        self.rule_engine.set_bucket_rules(bucket, cfg.get_rules_map().clone()).await;
         info!("Loaded notification config for bucket: {}", bucket);
         Ok(())
     }
 
     pub async fn remove_bucket_notification_config(&self, bucket: &str) {
         self.subscriber_view.clear_bucket(bucket);
-        self.notifier.remove_rules_map(bucket).await;
+        self.rule_engine.clear_bucket_rules(bucket).await;
     }
 }
 
@@ -82,7 +89,7 @@ mod tests {
     use super::NotifyBucketConfigManager;
     use crate::{
         BucketNotificationConfig, integration::NotificationMetrics,
-        notification_system_subscriber::NotificationSystemSubscriberView, notifier::EventNotifier,
+        notification_system_subscriber::NotificationSystemSubscriberView, notifier::EventNotifier, rule_engine::NotifyRuleEngine,
     };
     use rustfs_s3_common::EventName;
     use rustfs_targets::arn::TargetID;
@@ -90,9 +97,10 @@ mod tests {
 
     fn build_manager() -> NotifyBucketConfigManager {
         let metrics = Arc::new(NotificationMetrics::new());
-        let notifier = Arc::new(EventNotifier::new(metrics));
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier::new(metrics, rule_engine.clone()));
         let subscriber_view = Arc::new(NotificationSystemSubscriberView::new());
-        NotifyBucketConfigManager::new(notifier, subscriber_view)
+        NotifyBucketConfigManager::new(notifier, rule_engine, subscriber_view)
     }
 
     #[tokio::test]

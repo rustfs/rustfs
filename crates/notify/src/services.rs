@@ -21,6 +21,7 @@ use crate::{
     notifier::{EventNotifier, SharedNotifyTargetList},
     pipeline::{LiveEventHistory, NotifyPipeline},
     registry::TargetRegistry,
+    rule_engine::NotifyRuleEngine,
     runtime_facade::NotifyRuntimeFacade,
     runtime_view::NotifyRuntimeView,
     status_view::NotifyStatusView,
@@ -44,6 +45,7 @@ impl NotifyServices {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         notifier: Arc<EventNotifier>,
+        rule_engine: NotifyRuleEngine,
         target_list: SharedNotifyTargetList,
         registry: Arc<TargetRegistry>,
         config: Arc<RwLock<Config>>,
@@ -56,8 +58,8 @@ impl NotifyServices {
     ) -> Self {
         let runtime_view = NotifyRuntimeView::new(target_list.clone(), stream_cancellers.clone());
         let runtime_facade = NotifyRuntimeFacade::new(target_list, stream_cancellers, concurrency_limiter, metrics.clone());
-        let config_manager = NotifyConfigManager::new(config, registry, notifier.clone(), runtime_facade.clone());
-        let bucket_config_manager = NotifyBucketConfigManager::new(notifier.clone(), subscriber_view);
+        let config_manager = NotifyConfigManager::new(config, registry, rule_engine.clone(), runtime_facade.clone());
+        let bucket_config_manager = NotifyBucketConfigManager::new(notifier.clone(), rule_engine, subscriber_view);
         let pipeline = NotifyPipeline::new(notifier, live_event_sender, live_event_history);
         let status_view = NotifyStatusView::new(metrics);
 
@@ -77,7 +79,7 @@ mod tests {
     use super::NotifyServices;
     use crate::{
         integration::NotificationMetrics, notification_system_subscriber::NotificationSystemSubscriberView,
-        notifier::EventNotifier, pipeline::LiveEventHistory, registry::TargetRegistry,
+        notifier::EventNotifier, pipeline::LiveEventHistory, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
     };
     use rustfs_ecstore::config::Config;
     use rustfs_targets::ReplayWorkerManager;
@@ -87,7 +89,8 @@ mod tests {
     #[tokio::test]
     async fn services_build_empty_runtime_views() {
         let metrics = Arc::new(NotificationMetrics::new());
-        let notifier = Arc::new(EventNotifier::new(metrics.clone()));
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
         let target_list = notifier.target_list();
         let registry = Arc::new(TargetRegistry::new());
         let config = Arc::new(RwLock::new(Config::default()));
@@ -99,6 +102,7 @@ mod tests {
 
         let services = NotifyServices::new(
             notifier,
+            rule_engine,
             target_list,
             registry,
             config,

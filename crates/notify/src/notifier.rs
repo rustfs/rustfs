@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{error::NotificationError, event::Event, integration::NotificationMetrics, rules::RulesMap};
+use crate::{error::NotificationError, event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine};
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
-use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;
 use rustfs_targets::{SharedTarget, Target, TargetRuntimeManager};
-use starshard::AsyncShardedHashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
@@ -28,14 +26,14 @@ pub type SharedNotifyTargetList = Arc<RwLock<TargetList>>;
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
     metrics: Arc<NotificationMetrics>,
+    rule_engine: NotifyRuleEngine,
     target_list: SharedNotifyTargetList,
-    bucket_rules_map: Arc<AsyncShardedHashMap<String, RulesMap, rustc_hash::FxBuildHasher>>,
     send_limiter: Arc<Semaphore>,
 }
 
 impl Default for EventNotifier {
     fn default() -> Self {
-        Self::new(Arc::new(NotificationMetrics::new()))
+        Self::new(Arc::new(NotificationMetrics::new()), NotifyRuleEngine::new())
     }
 }
 
@@ -44,32 +42,14 @@ impl EventNotifier {
     ///
     /// # Returns
     /// Returns a new instance of EventNotifier.
-    pub fn new(metrics: Arc<NotificationMetrics>) -> Self {
+    pub fn new(metrics: Arc<NotificationMetrics>, rule_engine: NotifyRuleEngine) -> Self {
         let max_inflight = rustfs_utils::get_env_usize(ENV_NOTIFY_SEND_CONCURRENCY, DEFAULT_NOTIFY_SEND_CONCURRENCY);
         EventNotifier {
             metrics,
+            rule_engine,
             target_list: Arc::new(RwLock::new(TargetList::new())),
-            bucket_rules_map: Arc::new(AsyncShardedHashMap::new(0)),
             send_limiter: Arc::new(Semaphore::new(max_inflight)),
         }
-    }
-
-    /// Checks whether a TargetID is still referenced by any bucket's rules.
-    ///
-    /// # Arguments
-    /// * `target_id` - The TargetID to check.
-    ///
-    /// # Returns
-    /// Returns `true` if the TargetID is bound to any bucket, otherwise `false`.
-    pub async fn is_target_bound_to_any_bucket(&self, target_id: &TargetID) -> bool {
-        // `AsyncShardedHashMap::iter()`: Traverse (bucket_name, rules_map)
-        let items = self.bucket_rules_map.iter().await;
-        for (_bucket, rules_map) in items {
-            if rules_map.contains_target_id(target_id) {
-                return true;
-            }
-        }
-        false
     }
 
     /// Returns a reference to the target list
@@ -79,19 +59,6 @@ impl EventNotifier {
     /// Returns an `Arc<RwLock<TargetList>>` representing the target list.
     pub fn target_list(&self) -> SharedNotifyTargetList {
         Arc::clone(&self.target_list)
-    }
-
-    /// Removes all notification rules for a bucket
-    ///
-    /// # Arguments
-    /// * `bucket` - The name of the bucket for which to remove rules
-    ///
-    /// This method removes all rules associated with the specified bucket name.
-    /// It will log a message indicating the removal of rules.
-    pub async fn remove_rules_map(&self, bucket: &str) {
-        if self.bucket_rules_map.remove(&bucket.to_string()).await.is_some() {
-            info!("Removed all notification rules for bucket: {}", bucket);
-        }
     }
 
     /// Returns a list of ARNs for the registered targets
@@ -110,40 +77,6 @@ impl EventNotifier {
             .collect()
     }
 
-    /// Adds a rules map for a bucket
-    ///
-    /// # Arguments
-    /// * `bucket` - The name of the bucket for which to add the rules map
-    /// * `rules_map` - The rules map to add for the bucket
-    pub async fn add_rules_map(&self, bucket: &str, rules_map: RulesMap) {
-        if rules_map.is_empty() {
-            self.bucket_rules_map.remove(&bucket.to_string()).await;
-        } else {
-            self.bucket_rules_map.insert(bucket.to_string(), rules_map).await;
-        }
-        info!("Added rules for bucket: {}", bucket);
-    }
-
-    /// Gets the rules map for a specific bucket.
-    ///
-    /// # Arguments
-    /// * `bucket` - The name of the bucket for which to get the rules map
-    ///
-    /// # Returns
-    /// Returns `Some(RulesMap)` if rules exist for the bucket, otherwise returns `None`.
-    pub async fn get_rules_map(&self, bucket: &str) -> Option<RulesMap> {
-        self.bucket_rules_map.get(&bucket.to_string()).await
-    }
-
-    /// Removes notification rules for a bucket
-    ///
-    /// # Arguments
-    /// * `bucket` - The name of the bucket for which to remove notification rules
-    pub async fn remove_notification(&self, bucket: &str) {
-        self.bucket_rules_map.remove(&bucket.to_string()).await;
-        info!("Removed notification rules for bucket: {}", bucket);
-    }
-
     /// Removes all targets
     pub async fn remove_all_bucket_targets(&self) {
         let mut target_list_guard = self.target_list.write().await;
@@ -151,26 +84,6 @@ impl EventNotifier {
         // TargetList::clear_targets_only already handles calling target.close().
         target_list_guard.clear_targets_only().await; // Modified clear to not re-cancel
         info!("Removed all targets and their streams");
-    }
-
-    /// Checks if there are active subscribers for the given bucket and event name.
-    ///
-    /// # Parameters
-    /// * `bucket_name` - bucket name.
-    /// * `event_name` - Event name.
-    ///
-    /// # Return value
-    /// Return `true` if at least one matching notification rule exists.
-    pub async fn has_subscriber(&self, bucket_name: &str, event_name: &EventName) -> bool {
-        // Rules to check if the bucket exists
-        if let Some(rules_map) = self.bucket_rules_map.get(&bucket_name.to_string()).await {
-            // A composite event (such as ObjectCreatedAll) is expanded to multiple single events.
-            // We need to check whether any of these single events have the rules configured.
-            rules_map.has_subscriber(event_name)
-        } else {
-            // If no bucket is found, no subscribers
-            false
-        }
     }
 
     /// Sends an event to the appropriate targets based on the bucket rules
@@ -183,13 +96,7 @@ impl EventNotifier {
         let object_key = &event.s3.object.key;
         let event_name = event.event_name;
 
-        let Some(rules) = self.bucket_rules_map.get(bucket_name).await else {
-            debug!("No rules found for bucket: {}", bucket_name);
-            self.metrics.increment_skipped();
-            return;
-        };
-
-        let target_ids = rules.match_rules(event_name, object_key);
+        let target_ids = self.rule_engine.match_targets(bucket_name, event_name, object_key).await;
         if target_ids.is_empty() {
             debug!("No matching targets for event in bucket: {}", bucket_name);
             self.metrics.increment_skipped();
@@ -395,6 +302,7 @@ impl TargetList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{rule_engine::NotifyRuleEngine, rules::RulesMap};
     use async_trait::async_trait;
     use rustfs_s3_common::EventName;
     use rustfs_targets::StoreError;
@@ -472,7 +380,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_event_skips_disabled_target() {
-        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()));
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), rule_engine.clone());
 
         let enabled_target = TestTarget::new("enabled-target", "webhook", true);
         let disabled_target = TestTarget::new("disabled-target", "webhook", false);
@@ -481,7 +390,7 @@ mod tests {
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), enabled_target.id.clone());
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), disabled_target.id.clone());
 
-        notifier.add_rules_map("bucket", rules_map).await;
+        rule_engine.set_bucket_rules("bucket", rules_map).await;
         notifier
             .target_list()
             .write()

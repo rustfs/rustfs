@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Event, NotificationError, notifier::EventNotifier, registry::TargetRegistry, runtime_facade::NotifyRuntimeFacade};
+use crate::{
+    Event, NotificationError, registry::TargetRegistry, rule_engine::NotifyRuleEngine, runtime_facade::NotifyRuntimeFacade,
+};
 use rustfs_config::notify::{
     NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS,
     NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
@@ -59,7 +61,7 @@ pub fn runtime_target_id_for_subsystem(target_type: &str, target_name: &str) -> 
 pub struct NotifyConfigManager {
     config: Arc<RwLock<Config>>,
     registry: Arc<TargetRegistry>,
-    notifier: Arc<EventNotifier>,
+    rule_engine: NotifyRuleEngine,
     runtime_facade: NotifyRuntimeFacade,
 }
 
@@ -67,13 +69,13 @@ impl NotifyConfigManager {
     pub fn new(
         config: Arc<RwLock<Config>>,
         registry: Arc<TargetRegistry>,
-        notifier: Arc<EventNotifier>,
+        rule_engine: NotifyRuleEngine,
         runtime_facade: NotifyRuntimeFacade,
     ) -> Self {
         Self {
             config,
             registry,
-            notifier,
+            rule_engine,
             runtime_facade,
         }
     }
@@ -146,7 +148,7 @@ impl NotifyConfigManager {
         let tname = target_name.to_lowercase();
         let target_id = runtime_target_id_for_subsystem(&ttype, &tname);
 
-        if self.notifier.is_target_bound_to_any_bucket(&target_id).await {
+        if self.rule_engine.is_target_bound_to_any_bucket(&target_id).await {
             return Err(NotificationError::Configuration(format!(
                 "Target is still bound to bucket rules and deletion is prohibited: type={} name={}",
                 ttype, tname
@@ -234,7 +236,8 @@ impl NotifyConfigManager {
 mod tests {
     use super::{NotifyConfigManager, runtime_target_id_for_subsystem};
     use crate::{
-        integration::NotificationMetrics, notifier::EventNotifier, registry::TargetRegistry, runtime_facade::NotifyRuntimeFacade,
+        integration::NotificationMetrics, notifier::EventNotifier, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
+        runtime_facade::NotifyRuntimeFacade,
     };
     use rustfs_config::notify::{
         NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_SUB_SYS,
@@ -249,7 +252,8 @@ mod tests {
         let config = Arc::new(RwLock::new(Config::default()));
         let registry = Arc::new(TargetRegistry::new());
         let metrics = Arc::new(NotificationMetrics::new());
-        let notifier = Arc::new(EventNotifier::new(metrics.clone()));
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
         let target_list = notifier.target_list();
         let runtime_facade = NotifyRuntimeFacade::new(
             target_list,
@@ -258,7 +262,7 @@ mod tests {
             metrics,
         );
 
-        NotifyConfigManager::new(config, registry, notifier, runtime_facade)
+        NotifyConfigManager::new(config, registry, rule_engine, runtime_facade)
     }
 
     #[tokio::test]

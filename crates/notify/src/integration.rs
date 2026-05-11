@@ -16,7 +16,8 @@ use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::{EventNotifier, TargetList};
 use crate::services::NotifyServices;
 use crate::{
-    Event, error::NotificationError, pipeline::LiveEventHistory, registry::TargetRegistry, rules::BucketNotificationConfig,
+    Event, error::NotificationError, pipeline::LiveEventHistory, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
+    rules::BucketNotificationConfig,
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
@@ -158,7 +159,8 @@ impl NotificationSystem {
         let (live_event_sender, _) = broadcast::channel(1024);
         let metrics = Arc::new(NotificationMetrics::new());
         let subscriber_view = Arc::new(NotificationSystemSubscriberView::new());
-        let notifier = Arc::new(EventNotifier::new(metrics.clone()));
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
         let target_list = notifier.target_list();
         let registry = Arc::new(TargetRegistry::new());
         let config = Arc::new(RwLock::new(config));
@@ -167,6 +169,7 @@ impl NotificationSystem {
         let live_event_history = Arc::new(RwLock::new(LiveEventHistory::default()));
         let services = NotifyServices::new(
             notifier.clone(),
+            rule_engine,
             target_list,
             registry.clone(),
             config.clone(),

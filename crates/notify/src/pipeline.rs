@@ -104,14 +104,14 @@ pub type NotifyEventBridge = NotifyPipeline;
 #[cfg(test)]
 mod tests {
     use super::{LiveEventHistory, NotifyPipeline};
-    use crate::{Event, integration::NotificationMetrics, notifier::EventNotifier};
+    use crate::{Event, integration::NotificationMetrics, notifier::EventNotifier, rule_engine::NotifyRuleEngine};
     use rustfs_s3_common::EventName;
     use std::sync::Arc;
     use tokio::sync::{RwLock, broadcast};
 
     fn build_pipeline() -> NotifyPipeline {
         let metrics = Arc::new(NotificationMetrics::new());
-        let notifier = Arc::new(EventNotifier::new(metrics));
+        let notifier = Arc::new(EventNotifier::new(metrics, NotifyRuleEngine::new()));
         let (live_event_sender, _) = broadcast::channel(16);
         NotifyPipeline::new(notifier, live_event_sender, Arc::new(RwLock::new(LiveEventHistory::default())))
     }
