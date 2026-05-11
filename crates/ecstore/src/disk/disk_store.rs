@@ -65,8 +65,7 @@ pub fn get_max_timeout_duration() -> Duration {
 }
 
 fn get_drive_timeout_duration(env_key: &str, default_secs: u64) -> Duration {
-    let explicit =
-        rustfs_utils::get_env_opt_u64_with_aliases(env_key, &[rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION]);
+    let explicit = rustfs_utils::get_env_opt_u64_with_aliases(env_key, &[rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION]);
     if let Some(v) = explicit {
         return Duration::from_secs(v);
     }
