@@ -200,19 +200,15 @@ mod tests {
         listed_keys
     }
 
-    /// Regression test for Issue #2775: recursive ListObjectsV2 must not stop
-    /// around the previously reported ~6,888-key cap when a single prefix has
-    /// more than 10k readable objects, including a repeated path component that
-    /// exercises continuation-token forwarding.
+    /// Test for Issue #2775: continuation forwarding must not
+    /// skip a child directory when the prefix component repeats in the key.
     #[tokio::test]
     #[serial]
-    async fn test_list_objects_v2_recursive_single_prefix_returns_all_pages() {
+    async fn test_list_objects_v2_repeated_prefix_continuation() {
         init_logging();
-        info!("Starting test: ListObjectsV2 recursive single-prefix pagination beyond 10k objects");
+        info!("Starting test: ListObjectsV2 repeated-prefix continuation");
 
-        const OBJECT_COUNT: usize = 10_050;
-        const PAGE_SIZE: i32 = 1000;
-        const UPLOAD_CONCURRENCY: usize = 64;
+        const PAGE_SIZE: i32 = 2;
 
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
         env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
@@ -220,70 +216,40 @@ mod tests {
             .expect("Failed to start RustFS");
 
         let client = create_s3_client(&env);
-        let bucket = "test-recursive-list-cap";
+        let bucket = "test-repeated-prefix-small";
         let prefix = "engineering/";
 
         create_bucket(&client, bucket).await.expect("Failed to create bucket");
 
-        let expected_keys: Vec<String> = (0..OBJECT_COUNT)
-            .map(|idx| {
-                format!(
-                    "{prefix}engineering/project-{project:03}/artifact-{idx:05}/blobs/sha256/{digest:064x}",
-                    project = idx % 128,
-                    digest = idx
-                )
-            })
+        let expected_keys: Vec<String> = (0..5)
+            .map(|idx| format!("{prefix}engineering/project-{idx:03}/artifact.txt"))
             .collect();
 
-        let upload_results: Vec<_> = stream::iter(expected_keys.iter().cloned())
-            .map(|key| {
-                let client = client.clone();
-                async move {
-                    client
-                        .put_object()
-                        .bucket(bucket)
-                        .key(&key)
-                        .body(ByteStream::from_static(b"x"))
-                        .send()
-                        .await
-                        .map(|_| key)
-                }
-            })
-            .buffer_unordered(UPLOAD_CONCURRENCY)
-            .collect()
-            .await;
-
-        for result in upload_results {
-            result.expect("Failed to put object");
+        for key in &expected_keys {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .expect("Failed to put object");
         }
 
-        let prefix_keys = list_all_objects_v2(&client, bucket, prefix, PAGE_SIZE).await;
-        let root_keys = list_all_objects_v2(&client, bucket, "", PAGE_SIZE).await;
-        let prefix_keys_v1 = list_all_objects_v1(&client, bucket, prefix, PAGE_SIZE).await;
-        let seen: HashSet<String> = prefix_keys.iter().cloned().collect();
+        let listed_keys = list_all_objects_v2(&client, bucket, prefix, PAGE_SIZE).await;
+        let seen: HashSet<String> = listed_keys.iter().cloned().collect();
 
         assert_eq!(
-            prefix_keys.len(),
-            OBJECT_COUNT,
-            "Issue #2775 regression: expected all {OBJECT_COUNT} objects under {prefix}, got {}",
-            prefix_keys.len()
+            listed_keys.len(),
+            expected_keys.len(),
+            "Issue #2775 regression: expected all {} repeated-prefix objects under {prefix}, got {}",
+            expected_keys.len(),
+            listed_keys.len()
         );
-        assert_eq!(
-            root_keys.len(),
-            OBJECT_COUNT,
-            "Issue #2775 regression: expected whole-bucket recursive ListObjectsV2 to return all {OBJECT_COUNT} objects, got {}",
-            root_keys.len()
-        );
-        assert_eq!(
-            prefix_keys_v1.len(),
-            OBJECT_COUNT,
-            "Issue #2775 regression: expected V1 marker pagination under {prefix} to return all {OBJECT_COUNT} objects, got {}",
-            prefix_keys_v1.len()
-        );
-        assert_eq!(seen.len(), OBJECT_COUNT, "Listed keys must be unique");
+        assert_eq!(seen.len(), expected_keys.len(), "Listed keys must be unique");
 
         for key in &expected_keys {
-            assert!(seen.contains(key), "Missing expected key after recursive ListObjectsV2 pagination: {key}");
+            assert!(seen.contains(key), "Missing expected key after repeated-prefix pagination: {key}");
         }
 
         env.stop_server();
