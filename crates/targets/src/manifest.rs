@@ -48,6 +48,22 @@ pub enum TargetPluginEntrypointKind {
     Wasm,
 }
 
+/// Declares the transport boundary RustFS would use to communicate with a
+/// plugin runtime without committing to any concrete loader implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPluginRuntimeTransport {
+    InProcess,
+    Grpc,
+    WasmHost,
+}
+
+/// Declarative external runtime contract for future installable plugins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetPluginExternalRuntimeContract {
+    pub protocol_version: &'static str,
+    pub transport: TargetPluginRuntimeTransport,
+}
+
 /// Marketplace-oriented manifest metadata that is explicit about future
 /// installable plugin boundaries without introducing any loading behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,9 +78,11 @@ pub struct TargetPluginMarketplaceManifest {
     pub packaging: TargetPluginPackaging,
     pub entrypoint_kind: TargetPluginEntrypointKind,
     pub api_compatibility_version: &'static str,
+    pub runtime_contract: TargetPluginExternalRuntimeContract,
 }
 
 const BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION: &str = "rustfs.target-plugin.v1";
+const BUILTIN_PLUGIN_RUNTIME_PROTOCOL_VERSION: &str = "rustfs.target-runtime.v1";
 
 const SUPPORTED_BUILTIN_DOMAINS: &[TargetDomain] = &[TargetDomain::Audit, TargetDomain::Notify];
 const NO_SECRET_FIELDS: &[&str] = &[];
@@ -129,6 +147,10 @@ impl From<TargetPluginManifest> for TargetPluginMarketplaceManifest {
             packaging: TargetPluginPackaging::Builtin,
             entrypoint_kind: TargetPluginEntrypointKind::Builtin,
             api_compatibility_version: BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION,
+            runtime_contract: TargetPluginExternalRuntimeContract {
+                protocol_version: BUILTIN_PLUGIN_RUNTIME_PROTOCOL_VERSION,
+                transport: TargetPluginRuntimeTransport::InProcess,
+            },
         }
     }
 }
@@ -152,8 +174,8 @@ fn builtin_plugin_id(target_type: &'static str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        TargetPluginEntrypointKind, TargetPluginMarketplaceManifest, TargetPluginPackaging, builtin_target_manifest,
-        builtin_target_marketplace_manifest,
+        TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract, TargetPluginMarketplaceManifest, TargetPluginPackaging,
+        TargetPluginRuntimeTransport, builtin_target_manifest, builtin_target_marketplace_manifest,
     };
     use crate::domain::TargetDomain;
     use rustfs_config::{WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY};
@@ -179,6 +201,13 @@ mod tests {
         assert_eq!(manifest.packaging, TargetPluginPackaging::Builtin);
         assert_eq!(manifest.entrypoint_kind, TargetPluginEntrypointKind::Builtin);
         assert_eq!(manifest.api_compatibility_version, "rustfs.target-plugin.v1");
+        assert_eq!(
+            manifest.runtime_contract,
+            TargetPluginExternalRuntimeContract {
+                protocol_version: "rustfs.target-runtime.v1",
+                transport: TargetPluginRuntimeTransport::InProcess,
+            }
+        );
     }
 
     #[test]
@@ -197,5 +226,6 @@ mod tests {
         assert_eq!(derived.target_type, "redis");
         assert_eq!(derived.packaging, TargetPluginPackaging::Builtin);
         assert_eq!(derived.entrypoint_kind, TargetPluginEntrypointKind::Builtin);
+        assert_eq!(derived.runtime_contract.transport, TargetPluginRuntimeTransport::InProcess);
     }
 }

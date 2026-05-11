@@ -16,7 +16,7 @@ use crate::admin::{
     auth::validate_admin_request,
     plugin_contract::{
         PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain, PluginContractEntrypointKind,
-        PluginContractPackaging,
+        PluginContractPackaging, PluginRuntimeContract,
     },
     router::{AdminOperation, Operation, S3Router},
 };
@@ -90,6 +90,7 @@ fn merge_catalog_descriptor(plugins: &mut HashMap<&'static str, PluginCatalogEnt
         packaging: PluginContractPackaging::from(marketplace.packaging),
         entrypoint_kind: PluginContractEntrypointKind::from(marketplace.entrypoint_kind),
         api_compatibility_version: marketplace.api_compatibility_version.to_string(),
+        runtime_contract: PluginRuntimeContract::from(marketplace.runtime_contract),
         supported_domains: manifest.supported_domains.iter().copied().map(Into::into).collect(),
         secret_fields: manifest.secret_fields.iter().map(|field| (*field).to_string()).collect(),
         domain_configs: Vec::new(),
@@ -146,7 +147,9 @@ impl Operation for GetPluginCatalogHandler {
 #[cfg(test)]
 mod tests {
     use super::build_catalog_response;
-    use crate::admin::plugin_contract::{PluginContractDomain, PluginContractEntrypointKind, PluginContractPackaging};
+    use crate::admin::plugin_contract::{
+        PluginContractDomain, PluginContractEntrypointKind, PluginContractPackaging, PluginRuntimeTransport,
+    };
 
     #[test]
     fn plugin_catalog_handlers_require_admin_authorization_contract() {
@@ -173,6 +176,8 @@ mod tests {
         assert_eq!(webhook.packaging, PluginContractPackaging::Builtin);
         assert_eq!(webhook.entrypoint_kind, PluginContractEntrypointKind::Builtin);
         assert_eq!(webhook.api_compatibility_version, "rustfs.target-plugin.v1");
+        assert_eq!(webhook.runtime_contract.protocol_version, "rustfs.target-runtime.v1");
+        assert_eq!(webhook.runtime_contract.transport, PluginRuntimeTransport::InProcess);
         assert!(webhook.supported_domains.contains(&PluginContractDomain::Audit));
         assert!(webhook.supported_domains.contains(&PluginContractDomain::Notify));
         assert!(
