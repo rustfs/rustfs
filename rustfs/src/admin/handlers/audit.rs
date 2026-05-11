@@ -16,8 +16,8 @@ use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
-        build_json_response, collect_runtime_statuses, collect_validated_key_values as shared_collect_validated_key_values,
-        extract_supported_target_params, merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
+        build_json_response, collect_runtime_statuses, extract_supported_target_params,
+        merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     router::{AdminOperation, Operation, S3Router},
@@ -31,7 +31,7 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
-use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::builtin_audit_target_admin_descriptors;
@@ -340,9 +340,10 @@ impl Operation for RemoveAuditTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::handlers::target_descriptor::collect_validated_key_values as shared_collect_validated_key_values;
     use matchit::Router;
-    use rustfs_config::ENV_PREFIX;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
+    use rustfs_config::{ENABLE_KEY, ENV_PREFIX};
     use rustfs_ecstore::config::{KV, KVS};
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};

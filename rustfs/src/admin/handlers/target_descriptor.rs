@@ -47,6 +47,7 @@ use url::Url;
 pub(crate) type EndpointKey = (String, String);
 type AdminRequestValidatorFn =
     Arc<dyn for<'a> Fn(&'a HashMap<String, String>, &'a str) -> BoxFuture<'a, S3Result<()>> + Send + Sync>;
+type DomainScopedValidatorFn = for<'a> fn(&'a HashMap<String, String>, &'a str, TargetDomain) -> BoxFuture<'a, S3Result<()>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -113,10 +114,7 @@ fn validator_from_metadata(metadata: TargetAdminMetadata) -> AdminRequestValidat
     }
 }
 
-fn domain_request_validator(
-    domain: TargetDomain,
-    validator: for<'a> fn(&'a HashMap<String, String>, &'a str, TargetDomain) -> BoxFuture<'a, S3Result<()>>,
-) -> AdminRequestValidatorFn {
+fn domain_request_validator(domain: TargetDomain, validator: DomainScopedValidatorFn) -> AdminRequestValidatorFn {
     Arc::new(move |kv_map, default_queue_dir| validator(kv_map, default_queue_dir, domain))
 }
 

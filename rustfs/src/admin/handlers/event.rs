@@ -15,9 +15,8 @@
 use crate::admin::{
     auth::validate_admin_request,
     handlers::target_descriptor::{
-        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, allowed_target_keys,
-        build_enabled_target_kvs, build_json_response, collect_runtime_statuses,
-        collect_validated_key_values as shared_collect_validated_key_values, extract_supported_target_params,
+        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
+        build_json_response, collect_runtime_statuses, extract_supported_target_params,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
@@ -32,7 +31,7 @@ use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
-use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
@@ -303,9 +302,12 @@ fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::handlers::target_descriptor::{
+        allowed_target_keys, collect_validated_key_values as shared_collect_validated_key_values,
+    };
     use matchit::Router;
-    use rustfs_config::DEFAULT_DELIMITER;
     use rustfs_config::notify::{NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+    use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY};
     use rustfs_ecstore::config::{KV, KVS};
     use rustfs_targets::arn::TargetID;
     use serial_test::serial;
