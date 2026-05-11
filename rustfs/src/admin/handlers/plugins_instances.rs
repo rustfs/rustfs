@@ -20,8 +20,8 @@ use crate::admin::{
         target_module_disabled_reason, target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     plugin_contract::{
-        PluginContractDomain, PluginInstanceDetail, PluginInstanceDiagnostic, PluginInstanceDiagnosticCode, PluginInstanceEntry,
-        PluginInstanceSource, PluginInstancesResponse,
+        PluginContractDomain, PluginInstanceDetail, PluginInstanceDiagnostic, PluginInstanceDiagnosticCode,
+        PluginInstanceDiagnosticCount, PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse,
     },
     router::{AdminOperation, Operation, S3Router},
 };
@@ -40,7 +40,7 @@ use rustfs_ecstore::config::{Config, KVS};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use tracing::warn;
 use url::form_urlencoded;
@@ -407,6 +407,20 @@ fn paginate_plugin_instances(
     Ok((page, truncated, next_marker))
 }
 
+fn collect_diagnostic_counts(instances: &[PluginInstanceEntry]) -> Vec<PluginInstanceDiagnosticCount> {
+    let mut counts = BTreeMap::<PluginInstanceDiagnosticCode, usize>::new();
+    for instance in instances {
+        for code in &instance.diagnostic_codes {
+            *counts.entry(code.clone()).or_default() += 1;
+        }
+    }
+
+    counts
+        .into_iter()
+        .map(|(code, count)| PluginInstanceDiagnosticCount { code, count })
+        .collect()
+}
+
 fn plugin_instance_matches_filters(instance: &PluginInstanceEntry, filters: &PluginInstanceFilters) -> bool {
     if let Some(domain) = filters.domain
         && instance.domain != domain
@@ -688,9 +702,11 @@ impl Operation for ListPluginInstancesHandler {
         authorize_plugin_instance_request(&req).await?;
         let filters = extract_plugin_instance_filters(&req)?;
         let instances = filter_plugin_instances(collect_all_instances().await?, &filters);
+        let diagnostic_counts = collect_diagnostic_counts(&instances);
         let (instances, truncated, next_marker) = paginate_plugin_instances(instances, &filters)?;
         let data = serde_json::to_vec(&PluginInstancesResponse {
             instances,
+            diagnostic_counts,
             truncated,
             next_marker,
         })
@@ -884,15 +900,17 @@ impl Operation for DeletePluginInstanceHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginContractDomain, PluginInstanceFilters, collect_instance_diagnostics, extract_plugin_instance_filters,
-        filter_plugin_instances, map_instance, paginate_plugin_instances, parse_bool_filter, parse_instance_status,
-        parse_limit_filter, parse_plugin_contract_domain, parse_plugin_instance_diagnostic_code, parse_plugin_instance_id,
-        parse_plugin_instance_source, resolve_plugin_instance_target,
+        PluginContractDomain, PluginInstanceFilters, collect_diagnostic_counts, collect_instance_diagnostics,
+        extract_plugin_instance_filters, filter_plugin_instances, map_instance, paginate_plugin_instances, parse_bool_filter,
+        parse_instance_status, parse_limit_filter, parse_plugin_contract_domain, parse_plugin_instance_diagnostic_code,
+        parse_plugin_instance_id, parse_plugin_instance_source, resolve_plugin_instance_target,
     };
     use crate::admin::handlers::target_descriptor::{
         TargetEndpointSource, TargetInstanceReadModel, canonical_target_instance_id, collect_target_instances,
     };
-    use crate::admin::plugin_contract::{PluginInstanceDiagnosticCode, PluginInstanceEntry, PluginInstanceSource};
+    use crate::admin::plugin_contract::{
+        PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry, PluginInstanceSource,
+    };
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
@@ -1260,6 +1278,57 @@ mod tests {
         );
 
         assert_eq!(filtered, vec![matched]);
+    }
+
+    #[test]
+    fn collect_diagnostic_counts_aggregates_filtered_instance_summaries() {
+        let mut first = sample_instance(SampleInstance {
+            id: "builtin:webhook:notify:primary",
+            plugin_id: "builtin:webhook",
+            domain: PluginContractDomain::Notify,
+            subsystem: "notify_webhook",
+            account_id: "primary",
+            service: "webhook",
+            status: "offline",
+            source: PluginInstanceSource::Config,
+            enabled: true,
+        });
+        first.diagnostic_codes = vec![
+            PluginInstanceDiagnosticCode::ModuleDisabled,
+            PluginInstanceDiagnosticCode::NotLoadedInRuntime,
+        ];
+
+        let mut second = sample_instance(SampleInstance {
+            id: "builtin:kafka:notify:secondary",
+            plugin_id: "builtin:kafka",
+            domain: PluginContractDomain::Notify,
+            subsystem: "notify_kafka",
+            account_id: "secondary",
+            service: "kafka",
+            status: "offline",
+            source: PluginInstanceSource::Runtime,
+            enabled: true,
+        });
+        second.diagnostic_codes = vec![PluginInstanceDiagnosticCode::RuntimeOffline];
+
+        let counts = collect_diagnostic_counts(&[first, second]);
+        assert_eq!(
+            counts,
+            vec![
+                PluginInstanceDiagnosticCount {
+                    code: PluginInstanceDiagnosticCode::ModuleDisabled,
+                    count: 1,
+                },
+                PluginInstanceDiagnosticCount {
+                    code: PluginInstanceDiagnosticCode::NotLoadedInRuntime,
+                    count: 1,
+                },
+                PluginInstanceDiagnosticCount {
+                    code: PluginInstanceDiagnosticCode::RuntimeOffline,
+                    count: 1,
+                },
+            ]
+        );
     }
 
     #[test]

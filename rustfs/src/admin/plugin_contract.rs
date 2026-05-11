@@ -196,7 +196,7 @@ pub(crate) struct PluginInstanceEntry {
     pub diagnostic_codes: Vec<PluginInstanceDiagnosticCode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PluginInstanceDiagnosticCode {
     ModuleDisabled,
@@ -215,6 +215,13 @@ pub(crate) struct PluginInstanceDiagnostic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct PluginInstanceDiagnosticCount {
+    pub code: PluginInstanceDiagnosticCode,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PluginInstanceDetail {
     #[serde(flatten)]
     pub instance: PluginInstanceEntry,
@@ -225,6 +232,8 @@ pub(crate) struct PluginInstanceDetail {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PluginInstancesResponse {
     pub instances: Vec<PluginInstanceEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_counts: Vec<PluginInstanceDiagnosticCount>,
     pub truncated: bool,
     pub next_marker: Option<String>,
 }
@@ -234,8 +243,8 @@ mod tests {
     use super::{
         PluginArtifactContract, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
         PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginInstanceDetail,
-        PluginInstanceDiagnostic, PluginInstanceDiagnosticCode, PluginInstanceEntry, PluginInstanceSource,
-        PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
+        PluginInstanceDiagnostic, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry,
+        PluginInstanceSource, PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -316,6 +325,10 @@ mod tests {
                 ]),
                 diagnostic_codes: vec![PluginInstanceDiagnosticCode::NotLoadedInRuntime],
             }],
+            diagnostic_counts: vec![PluginInstanceDiagnosticCount {
+                code: PluginInstanceDiagnosticCode::NotLoadedInRuntime,
+                count: 1,
+            }],
             truncated: false,
             next_marker: None,
         };
@@ -339,6 +352,10 @@ mod tests {
                         "endpoint": "https://example.com/hook"
                     },
                     "diagnostic_codes": ["not_loaded_in_runtime"]
+                }],
+                "diagnostic_counts": [{
+                    "code": "not_loaded_in_runtime",
+                    "count": 1
                 }],
                 "truncated": false,
                 "next_marker": null
