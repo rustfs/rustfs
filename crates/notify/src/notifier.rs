@@ -23,10 +23,12 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 
+pub type SharedNotifyTargetList = Arc<RwLock<TargetList>>;
+
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
     metrics: Arc<NotificationMetrics>,
-    target_list: Arc<RwLock<TargetList>>,
+    target_list: SharedNotifyTargetList,
     bucket_rules_map: Arc<AsyncShardedHashMap<String, RulesMap, rustc_hash::FxBuildHasher>>,
     send_limiter: Arc<Semaphore>,
 }
@@ -75,7 +77,7 @@ impl EventNotifier {
     ///
     /// # Returns
     /// Returns an `Arc<RwLock<TargetList>>` representing the target list.
-    pub fn target_list(&self) -> Arc<RwLock<TargetList>> {
+    pub fn target_list(&self) -> SharedNotifyTargetList {
         Arc::clone(&self.target_list)
     }
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Event, NotificationError, integration::NotificationMetrics, notifier::EventNotifier};
+use crate::{Event, NotificationError, integration::NotificationMetrics, notifier::SharedNotifyTargetList};
 use rustfs_targets::{
     ReplayEvent, ReplayWorkerManager, RuntimeActivation, Target, activate_targets_with_replay,
     init_target_and_optionally_start_replay, start_replay_worker,
@@ -24,7 +24,7 @@ use tracing::info;
 
 #[derive(Clone)]
 pub struct NotifyRuntimeFacade {
-    notifier: Arc<EventNotifier>,
+    target_list: SharedNotifyTargetList,
     replay_workers: Arc<RwLock<ReplayWorkerManager>>,
     concurrency_limiter: Arc<Semaphore>,
     metrics: Arc<NotificationMetrics>,
@@ -32,13 +32,13 @@ pub struct NotifyRuntimeFacade {
 
 impl NotifyRuntimeFacade {
     pub fn new(
-        notifier: Arc<EventNotifier>,
+        target_list: SharedNotifyTargetList,
         replay_workers: Arc<RwLock<ReplayWorkerManager>>,
         concurrency_limiter: Arc<Semaphore>,
         metrics: Arc<NotificationMetrics>,
     ) -> Self {
         Self {
-            notifier,
+            target_list,
             replay_workers,
             concurrency_limiter,
             metrics,
@@ -98,8 +98,13 @@ impl NotifyRuntimeFacade {
 
     pub async fn replace_targets(&self, activation: RuntimeActivation<Event>) -> Result<(), NotificationError> {
         self.stop_replay_workers().await;
-        self.notifier.remove_all_bucket_targets().await;
-        self.notifier.init_bucket_targets_shared(activation.targets).await?;
+        {
+            let mut target_list = self.target_list.write().await;
+            target_list.clear_targets_only().await;
+            for target in activation.targets {
+                target_list.add(target)?;
+            }
+        }
         *self.replay_workers.write().await = activation.replay_workers;
         Ok(())
     }
@@ -197,8 +202,9 @@ mod tests {
     fn build_facade() -> (NotifyRuntimeFacade, Arc<EventNotifier>, Arc<RwLock<ReplayWorkerManager>>) {
         let metrics = Arc::new(NotificationMetrics::new());
         let notifier = Arc::new(EventNotifier::new(metrics.clone()));
+        let target_list = notifier.target_list();
         let replay_workers = Arc::new(RwLock::new(ReplayWorkerManager::new()));
-        let facade = NotifyRuntimeFacade::new(notifier.clone(), replay_workers.clone(), Arc::new(Semaphore::new(4)), metrics);
+        let facade = NotifyRuntimeFacade::new(target_list, replay_workers.clone(), Arc::new(Semaphore::new(4)), metrics);
         (facade, notifier, replay_workers)
     }
 

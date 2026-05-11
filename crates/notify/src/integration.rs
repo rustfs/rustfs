@@ -14,11 +14,9 @@
 
 use crate::event_bridge::LiveEventHistory;
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
-use crate::notifier::TargetList;
+use crate::notifier::{EventNotifier, TargetList};
 use crate::services::NotifyServices;
-use crate::{
-    Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig,
-};
+use crate::{Event, error::NotificationError, registry::TargetRegistry, rules::BucketNotificationConfig};
 use hashbrown::HashMap;
 use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
 use rustfs_ecstore::config::{Config, KVS};
@@ -160,6 +158,7 @@ impl NotificationSystem {
         let metrics = Arc::new(NotificationMetrics::new());
         let subscriber_view = Arc::new(NotificationSystemSubscriberView::new());
         let notifier = Arc::new(EventNotifier::new(metrics.clone()));
+        let target_list = notifier.target_list();
         let registry = Arc::new(TargetRegistry::new());
         let config = Arc::new(RwLock::new(config));
         let stream_cancellers = Arc::new(RwLock::new(ReplayWorkerManager::new()));
@@ -167,6 +166,7 @@ impl NotificationSystem {
         let live_event_history = Arc::new(RwLock::new(LiveEventHistory::default()));
         let services = NotifyServices::new(
             notifier.clone(),
+            target_list,
             registry.clone(),
             config.clone(),
             stream_cancellers,

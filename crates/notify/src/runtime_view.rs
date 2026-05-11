@@ -12,19 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Event, NotificationTargetMetricSnapshot, notifier::TargetList};
+use crate::{Event, NotificationTargetMetricSnapshot, notifier::SharedNotifyTargetList};
 use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, SharedTarget, arn::TargetID};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct NotifyRuntimeView {
-    target_list: Arc<RwLock<TargetList>>,
+    target_list: SharedNotifyTargetList,
     stream_cancellers: Arc<RwLock<ReplayWorkerManager>>,
 }
 
 impl NotifyRuntimeView {
-    pub fn new(target_list: Arc<RwLock<TargetList>>, stream_cancellers: Arc<RwLock<ReplayWorkerManager>>) -> Self {
+    pub fn new(target_list: SharedNotifyTargetList, stream_cancellers: Arc<RwLock<ReplayWorkerManager>>) -> Self {
         Self {
             target_list,
             stream_cancellers,
@@ -35,7 +35,7 @@ impl NotifyRuntimeView {
         self.target_list.read().await.keys()
     }
 
-    pub fn get_all_targets(&self) -> Arc<RwLock<TargetList>> {
+    pub fn get_all_targets(&self) -> SharedNotifyTargetList {
         self.target_list.clone()
     }
 

@@ -153,35 +153,26 @@ impl NotifyConfigManager {
             )));
         }
 
-        let config_result = self
-            .update_config_and_reload(|config| {
-                let mut changed = false;
-                if let Some(targets) = config.0.get_mut(&ttype) {
-                    if targets.remove(&tname).is_some() {
-                        changed = true;
-                    }
-                    if targets.is_empty() {
-                        config.0.remove(&ttype);
-                    }
+        self.update_config_and_reload(|config| {
+            let mut changed = false;
+            if let Some(targets) = config.0.get_mut(&ttype) {
+                if targets.remove(&tname).is_some() {
+                    changed = true;
                 }
-                if !changed {
-                    info!("Target {} of type {} not found, no changes made.", target_name, target_type);
+                if targets.is_empty() {
+                    config.0.remove(&ttype);
                 }
-                debug!(
-                    subsystem_count = config.0.len(),
-                    "Target config removal processed and configuration summary updated"
-                );
-                changed
-            })
-            .await;
-
-        if config_result.is_ok() {
-            let target_list = self.notifier.target_list();
-            let mut target_list_guard = target_list.write().await;
-            let _ = target_list_guard.remove_target_only(&target_id).await;
-        }
-
-        config_result
+            }
+            if !changed {
+                info!("Target {} of type {} not found, no changes made.", target_name, target_type);
+            }
+            debug!(
+                subsystem_count = config.0.len(),
+                "Target config removal processed and configuration summary updated"
+            );
+            changed
+        })
+        .await
     }
 
     pub async fn reload_config(&self, new_config: Config) -> Result<(), NotificationError> {
@@ -259,8 +250,9 @@ mod tests {
         let registry = Arc::new(TargetRegistry::new());
         let metrics = Arc::new(NotificationMetrics::new());
         let notifier = Arc::new(EventNotifier::new(metrics.clone()));
+        let target_list = notifier.target_list();
         let runtime_facade = NotifyRuntimeFacade::new(
-            notifier.clone(),
+            target_list,
             Arc::new(RwLock::new(ReplayWorkerManager::new())),
             Arc::new(Semaphore::new(4)),
             metrics,

@@ -19,7 +19,7 @@ use crate::{
     event_bridge::{LiveEventHistory, NotifyEventBridge},
     integration::NotificationMetrics,
     notification_system_subscriber::NotificationSystemSubscriberView,
-    notifier::EventNotifier,
+    notifier::{EventNotifier, SharedNotifyTargetList},
     registry::TargetRegistry,
     runtime_facade::NotifyRuntimeFacade,
     runtime_view::NotifyRuntimeView,
@@ -44,6 +44,7 @@ impl NotifyServices {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         notifier: Arc<EventNotifier>,
+        target_list: SharedNotifyTargetList,
         registry: Arc<TargetRegistry>,
         config: Arc<RwLock<Config>>,
         stream_cancellers: Arc<RwLock<ReplayWorkerManager>>,
@@ -53,8 +54,8 @@ impl NotifyServices {
         live_event_sender: broadcast::Sender<Arc<Event>>,
         live_event_history: Arc<RwLock<LiveEventHistory>>,
     ) -> Self {
-        let runtime_view = NotifyRuntimeView::new(notifier.target_list(), stream_cancellers.clone());
-        let runtime_facade = NotifyRuntimeFacade::new(notifier.clone(), stream_cancellers, concurrency_limiter, metrics.clone());
+        let runtime_view = NotifyRuntimeView::new(target_list.clone(), stream_cancellers.clone());
+        let runtime_facade = NotifyRuntimeFacade::new(target_list, stream_cancellers, concurrency_limiter, metrics.clone());
         let config_manager = NotifyConfigManager::new(config, registry, notifier.clone(), runtime_facade.clone());
         let bucket_config_manager = NotifyBucketConfigManager::new(notifier.clone(), subscriber_view);
         let event_bridge = NotifyEventBridge::new(notifier, live_event_sender, live_event_history);
@@ -87,6 +88,7 @@ mod tests {
     async fn services_build_empty_runtime_views() {
         let metrics = Arc::new(NotificationMetrics::new());
         let notifier = Arc::new(EventNotifier::new(metrics.clone()));
+        let target_list = notifier.target_list();
         let registry = Arc::new(TargetRegistry::new());
         let config = Arc::new(RwLock::new(Config::default()));
         let stream_cancellers = Arc::new(RwLock::new(ReplayWorkerManager::new()));
@@ -97,6 +99,7 @@ mod tests {
 
         let services = NotifyServices::new(
             notifier,
+            target_list,
             registry,
             config,
             stream_cancellers,
