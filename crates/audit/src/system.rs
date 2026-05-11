@@ -79,6 +79,46 @@ impl AuditSystem {
         }
     }
 
+    async fn create_targets_from_config(&self, config: &Config) -> AuditResult<Vec<Box<dyn Target<AuditEntry> + Send + Sync>>> {
+        let registry = self.registry.lock().await;
+        registry.create_audit_targets_from_config(config).await
+    }
+
+    async fn clear_runtime_targets(&self) -> AuditResult<()> {
+        self.runtime_facade().stop_replay_workers().await;
+        let mut registry = self.registry.lock().await;
+        registry.close_all().await?;
+        drop(registry);
+
+        let mut state = self.state.write().await;
+        *state = AuditSystemState::Stopped;
+        Ok(())
+    }
+
+    async fn commit_runtime_targets(
+        &self,
+        targets: Vec<Box<dyn Target<AuditEntry> + Send + Sync>>,
+        final_state: AuditSystemState,
+    ) -> AuditResult<()> {
+        if targets.is_empty() {
+            info!("No enabled audit targets found, keeping audit system stopped");
+            self.clear_runtime_targets().await?;
+            return Ok(());
+        }
+
+        info!(target_count = targets.len(), "Created audit targets successfully");
+
+        let activation = self
+            .runtime_facade()
+            .activate_targets_with_replay(self.state.clone(), targets)
+            .await;
+        self.runtime_facade().replace_targets(activation).await?;
+
+        let mut state = self.state.write().await;
+        *state = final_state;
+        Ok(())
+    }
+
     /// Starts the audit system with the given configuration
     ///
     /// # Arguments
@@ -113,36 +153,14 @@ impl AuditSystem {
             *config_guard = Some(config.clone());
         }
 
-        // Create targets from configuration
-        let mut registry = self.registry.lock().await;
-        match registry.create_audit_targets_from_config(&config).await {
+        match self.create_targets_from_config(&config).await {
             Ok(targets) => {
-                if targets.is_empty() {
-                    info!("No enabled audit targets found, keeping audit system stopped");
-                    drop(registry);
-                    return Ok(());
-                }
-
                 {
                     let mut state = self.state.write().await;
                     *state = AuditSystemState::Starting;
                 }
 
-                info!(target_count = targets.len(), "Created audit targets successfully");
-
-                let activation = self
-                    .runtime_facade()
-                    .activate_targets_with_replay(self.state.clone(), targets)
-                    .await;
-                for target in activation.targets {
-                    let target_id = target.id().to_string();
-                    registry.add_target(target_id, target.clone_dyn());
-                }
-                *self.stream_cancellers.write().await = activation.replay_workers;
-
-                // Update state to running
-                let mut state = self.state.write().await;
-                *state = AuditSystemState::Running;
+                self.commit_runtime_targets(targets, AuditSystemState::Running).await?;
                 info!("Audit system started successfully");
                 Ok(())
             }
@@ -222,19 +240,9 @@ impl AuditSystem {
         info!("Stopping audit system");
 
         // Stop all stream tasks first
-        if let Err(e) = async {
-            self.runtime_facade().stop_replay_workers().await;
-            let mut registry = self.registry.lock().await;
-            registry.close_all().await
-        }
-        .await
-        {
+        if let Err(e) = self.clear_runtime_targets().await {
             error!(error = %e, "Failed to close some audit targets");
         }
-
-        // Update state to stopped
-        let mut state = self.state.write().await;
-        *state = AuditSystemState::Stopped;
 
         // Clear configuration
         let mut config_guard = self.config.write().await;
@@ -398,24 +406,14 @@ impl AuditSystem {
             *config_guard = Some(new_config.clone());
         }
 
-        let targets = {
-            let registry = self.registry.lock().await;
-            registry.create_audit_targets_from_config(&new_config).await
+        let final_state = match self.get_state().await {
+            AuditSystemState::Paused => AuditSystemState::Paused,
+            _ => AuditSystemState::Running,
         };
 
-        match targets {
+        match self.create_targets_from_config(&new_config).await {
             Ok(targets) => {
-                info!(target_count = targets.len(), "Reloaded audit targets successfully");
-
-                let activation = self
-                    .runtime_facade()
-                    .activate_targets_with_replay(self.state.clone(), targets)
-                    .await;
-                if let Err(e) = self.runtime_facade().replace_targets(activation).await {
-                    error!(error = %e, "Failed to replace existing targets during reload");
-                    return Err(e);
-                }
-
+                self.commit_runtime_targets(targets, final_state).await?;
                 info!("Audit configuration reloaded successfully");
                 Ok(())
             }
@@ -445,5 +443,108 @@ impl AuditSystem {
     /// Resets all metrics to initial state
     pub async fn reset_metrics(&self) {
         observability::reset_metrics().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuditSystem, AuditSystemState};
+    use async_trait::async_trait;
+    use rustfs_targets::ReplayWorkerManager;
+    use rustfs_targets::arn::TargetID;
+    use rustfs_targets::store::{Key, Store};
+    use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
+    use rustfs_targets::{StoreError, Target, TargetError};
+    use serde::{Serialize, de::DeserializeOwned};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    struct TestTarget {
+        close_calls: Arc<AtomicUsize>,
+        id: TargetID,
+    }
+
+    impl TestTarget {
+        fn new(id: &str, name: &str) -> Self {
+            Self {
+                close_calls: Arc::new(AtomicUsize::new(0)),
+                id: TargetID::new(id.to_string(), name.to_string()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<E> Target<E> for TestTarget
+    where
+        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    {
+        fn id(&self) -> TargetID {
+            self.id.clone()
+        }
+
+        async fn is_active(&self) -> Result<bool, TargetError> {
+            Ok(true)
+        }
+
+        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), TargetError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
+            None
+        }
+
+        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
+            Box::new(self.clone())
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_with_empty_config_stops_existing_runtime() {
+        let system = AuditSystem::new();
+        let target = TestTarget::new("primary", "webhook");
+        let close_calls = Arc::clone(&target.close_calls);
+
+        {
+            let mut registry = system.registry.lock().await;
+            registry.add_target("primary:webhook".to_string(), Box::new(target));
+        }
+        {
+            let mut state = system.state.write().await;
+            *state = AuditSystemState::Running;
+        }
+        {
+            let mut replay_workers = system.stream_cancellers.write().await;
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            replay_workers.insert("primary:webhook".to_string(), cancel_tx);
+            assert_eq!(replay_workers.len(), 1);
+        }
+
+        system
+            .reload_config(rustfs_ecstore::config::Config(HashMap::new()))
+            .await
+            .expect("reload with empty config should succeed");
+
+        assert_eq!(system.get_state().await, AuditSystemState::Stopped);
+        assert!(system.list_targets().await.is_empty());
+        assert_eq!(system.runtime_status_snapshot().await, ReplayWorkerManager::new().snapshot(0));
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*system.config.read().await, Some(rustfs_ecstore::config::Config(HashMap::new())));
     }
 }
