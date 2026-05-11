@@ -13,11 +13,21 @@
 // limitations under the License.
 
 use crate::rules::{RulesMap, TargetIdSet};
+use percent_encoding::percent_decode_str;
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use starshard::AsyncShardedHashMap;
 use std::sync::Arc;
 use tracing::info;
+
+fn decoded_object_key_for_matching(object_key: &str) -> Option<String> {
+    if !object_key.contains('%') {
+        return None;
+    }
+
+    let decoded = percent_decode_str(object_key).decode_utf8().ok()?;
+    (decoded != object_key).then(|| decoded.into_owned())
+}
 
 #[derive(Clone)]
 pub struct NotifyRuleEngine {
@@ -69,7 +79,13 @@ impl NotifyRuleEngine {
     pub async fn match_targets(&self, bucket: &str, event_name: EventName, object_key: &str) -> TargetIdSet {
         self.get_bucket_rules(bucket)
             .await
-            .map_or_else(TargetIdSet::new, |rules_map| rules_map.match_rules(event_name, object_key))
+            .map_or_else(TargetIdSet::new, |rules_map| {
+                let mut target_ids = rules_map.match_rules(event_name, object_key);
+                if let Some(decoded_key) = decoded_object_key_for_matching(object_key) {
+                    target_ids.extend(rules_map.match_rules(event_name, &decoded_key));
+                }
+                target_ids
+            })
     }
 }
 
