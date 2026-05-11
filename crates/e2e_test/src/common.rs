@@ -41,6 +41,7 @@ use walkdir::WalkDir;
 // Common constants for all E2E tests
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
+pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 
 fn build_test_s3_config(endpoint_url: &str, access_key: &str, secret_key: &str, provider_name: &'static str) -> Config {
@@ -135,7 +136,7 @@ fn running_inside_e2e_test_binary() -> bool {
 }
 
 fn requested_rustfs_build_features() -> Option<String> {
-    std::env::var("RUSTFS_BUILD_FEATURES")
+    std::env::var(ENV_RUSTFS_BUILD_FEATURES)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
