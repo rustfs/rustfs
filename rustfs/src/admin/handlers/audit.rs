@@ -14,6 +14,7 @@
 
 use crate::admin::{
     auth::validate_admin_request,
+    handlers::audit_runtime_config::{load_server_config_from_store, update_audit_config_and_reload},
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
         build_json_response, collect_runtime_statuses, extract_supported_target_params,
@@ -29,9 +30,9 @@ use crate::server::{
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
-use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
+use rustfs_audit::audit_system;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
-use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::{AUDIT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::builtin_audit_target_admin_descriptors;
@@ -108,18 +109,6 @@ async fn authorize_audit_admin_request(req: &S3Request<Body>, action: AdminActio
     validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
 }
 
-fn has_any_audit_targets(config: &Config) -> bool {
-    for spec in audit_target_specs() {
-        let Some(targets) = config.0.get(spec.subsystem) else {
-            continue;
-        };
-        if targets.keys().any(|key| key != DEFAULT_DELIMITER) {
-            return true;
-        }
-    }
-    false
-}
-
 fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
     shared_target_mutation_block_reason(
         audit_target_specs(),
@@ -156,75 +145,6 @@ fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey,
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
     extract_supported_target_params(audit_target_specs(), params, "audit")
-}
-
-async fn load_server_config_from_store() -> S3Result<Config> {
-    let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
-        return Ok(Config::new());
-    };
-
-    rustfs_ecstore::config::com::read_config_without_migrate(store)
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))
-}
-
-async fn apply_audit_runtime_config(config: Config) -> S3Result<()> {
-    let has_targets = has_any_audit_targets(&config);
-
-    if let Some(system) = audit_system() {
-        match system.get_state().await {
-            AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {
-                if has_targets {
-                    system
-                        .reload_config(config)
-                        .await
-                        .map_err(|e| s3_error!(InternalError, "failed to reload audit config: {}", e))?;
-                } else {
-                    system
-                        .close()
-                        .await
-                        .map_err(|e| s3_error!(InternalError, "failed to stop audit system: {}", e))?;
-                }
-            }
-            AuditSystemState::Stopped | AuditSystemState::Stopping => {
-                if has_targets {
-                    system
-                        .start(config)
-                        .await
-                        .map_err(|e| s3_error!(InternalError, "failed to start audit system: {}", e))?;
-                }
-            }
-        }
-    } else if has_targets {
-        start_global_audit_system(config)
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to start audit system: {}", e))?;
-    }
-
-    Ok(())
-}
-
-async fn update_audit_config_and_reload<F>(mut modifier: F) -> S3Result<()>
-where
-    F: FnMut(&mut Config) -> bool,
-{
-    let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
-        return Err(s3_error!(InternalError, "server storage not initialized"));
-    };
-
-    let mut config = rustfs_ecstore::config::com::read_config_without_migrate(store.clone())
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))?;
-
-    if !modifier(&mut config) {
-        return Ok(());
-    }
-
-    rustfs_ecstore::config::com::save_server_config(store, &config)
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to save audit config: {}", e))?;
-
-    apply_audit_runtime_config(config).await
 }
 
 pub struct AuditTargetConfig {}
@@ -264,7 +184,7 @@ impl Operation for AuditTargetConfig {
         )
         .await?;
 
-        update_audit_config_and_reload(|config| {
+        update_audit_config_and_reload(audit_target_specs(), |config| {
             config
                 .0
                 .entry(target_type.to_lowercase())
@@ -319,7 +239,7 @@ impl Operation for RemoveAuditTarget {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        update_audit_config_and_reload(|config| {
+        update_audit_config_and_reload(audit_target_specs(), |config| {
             let mut changed = false;
             if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
                 if targets.remove(&target_name.to_lowercase()).is_some() {
@@ -343,7 +263,7 @@ mod tests {
     use crate::admin::handlers::target_descriptor::collect_validated_key_values as shared_collect_validated_key_values;
     use matchit::Router;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
-    use rustfs_config::{ENABLE_KEY, ENV_PREFIX};
+    use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX};
     use rustfs_ecstore::config::{KV, KVS};
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};

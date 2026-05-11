@@ -14,6 +14,7 @@
 
 pub mod account_info;
 pub mod audit;
+mod audit_runtime_config;
 pub mod bucket_meta;
 pub mod event;
 pub mod group;
@@ -27,6 +28,7 @@ pub mod kms_keys;
 pub mod kms_management;
 pub mod metrics;
 pub mod module_switch;
+mod notify_runtime_access;
 pub mod oidc;
 pub mod plugins_catalog;
 pub mod plugins_instances;

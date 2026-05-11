@@ -83,6 +83,7 @@ pub(crate) struct TargetInstanceReadModel {
 }
 
 struct TargetEndpointSnapshot {
+    normalized_instances: Vec<TargetPluginInstanceRecord>,
     configured_keys: Vec<EndpointKey>,
     config_targets: HbHashSet<EndpointKey>,
     env_targets: HbHashSet<EndpointKey>,
@@ -373,6 +374,7 @@ pub(crate) fn collect_target_instances(
     let mut seen = HashSet::new();
     let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
     let domain = inferred_target_domain(route_prefix);
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
 
     for ((account_id, service), status) in runtime_statuses {
         let normalized = normalized_endpoint_key(&account_id, &service);
@@ -381,7 +383,7 @@ pub(crate) fn collect_target_instances(
             .or_insert((account_id, service, status));
     }
 
-    for instance in normalized_target_instances(specs, route_prefix, config) {
+    for instance in snapshot.normalized_instances {
         let key = normalized_endpoint_key(&instance.instance_id, &instance.target_type);
         if !seen.insert(key.clone()) {
             continue;
@@ -592,11 +594,12 @@ fn target_spec_by_service<'a>(specs: &'a [AdminTargetSpec], service: &str) -> Op
 }
 
 fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> TargetEndpointSnapshot {
+    let normalized_instances = normalized_target_instances(specs, route_prefix, config);
     let mut configured_keys = Vec::new();
     let mut config_targets = HbHashSet::new();
     let mut env_targets = HbHashSet::new();
 
-    for instance in normalized_target_instances(specs, route_prefix, config) {
+    for instance in &normalized_instances {
         let key = normalized_endpoint_key(&instance.instance_id, &instance.target_type);
 
         if instance_has_config_entry(&instance) {
@@ -612,6 +615,7 @@ fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, conf
     }
 
     TargetEndpointSnapshot {
+        normalized_instances,
         configured_keys,
         config_targets,
         env_targets,

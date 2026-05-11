@@ -14,6 +14,7 @@
 
 use crate::admin::{
     auth::validate_admin_request,
+    handlers::notify_runtime_access::{get_notification_system, load_notification_config_snapshot},
     handlers::target_descriptor::{
         AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
         build_json_response, collect_runtime_statuses, extract_supported_target_params,
@@ -38,7 +39,6 @@ use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::LazyLock;
 use tracing::{Span, info, warn};
 
@@ -117,10 +117,6 @@ async fn authorize_notification_admin_request(req: &S3Request<Body>, action: Adm
     validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
 }
 
-fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {
-    rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))
-}
-
 fn target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
     shared_target_mutation_block_reason(
         notification_target_specs(),
@@ -176,8 +172,7 @@ impl Operation for NotificationTarget {
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
-        let ns = get_notification_system()?;
-        let config_snapshot = ns.config.read().await.clone();
+        let (ns, config_snapshot) = load_notification_config_snapshot().await?;
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
@@ -220,10 +215,8 @@ impl Operation for ListNotificationTargets {
         let span = Span::current();
         let _enter = span.enter();
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
-        let ns = get_notification_system()?;
-
+        let (ns, config) = load_notification_config_snapshot().await?;
         let runtime_statuses = collect_runtime_statuses(ns.get_target_values().await).await;
-        let config = ns.config.read().await.clone();
         let notification_endpoints = merge_notification_endpoints(&config, runtime_statuses);
 
         let data = serde_json::to_vec(&NotificationEndpointsResponse { notification_endpoints })
@@ -280,8 +273,7 @@ impl Operation for RemoveNotificationTarget {
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
-        let ns = get_notification_system()?;
-        let config_snapshot = ns.config.read().await.clone();
+        let (ns, config_snapshot) = load_notification_config_snapshot().await?;
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
