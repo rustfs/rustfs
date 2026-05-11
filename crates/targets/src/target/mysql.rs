@@ -150,10 +150,7 @@ impl MySqlDsn {
             return Err(TargetError::Configuration("MySQL dsn_string cannot be empty".to_string()));
         }
 
-        let remainder = input
-            .strip_prefix("mysql://")
-            .or_else(|| input.strip_prefix("MYSQL://"))
-            .unwrap_or(input);
+        let (_, remainder) = split_mysql_scheme(input);
 
         let (body, query) = match remainder.split_once('?') {
             Some((b, q)) => (b, Some(q)),
@@ -253,6 +250,15 @@ impl MySqlDsn {
     }
 }
 
+fn split_mysql_scheme(input: &str) -> (&str, &str) {
+    const MYSQL_SCHEME: &str = "mysql://";
+
+    match input.get(..MYSQL_SCHEME.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(MYSQL_SCHEME) => input.split_at(MYSQL_SCHEME.len()),
+        _ => ("", input),
+    }
+}
+
 /// Returns a redacted version of the DSN string with the password replaced by `***`.
 pub(crate) fn redact_mysql_dsn(dsn_string: &str) -> String {
     let input = dsn_string.trim();
@@ -260,18 +266,7 @@ pub(crate) fn redact_mysql_dsn(dsn_string: &str) -> String {
         return String::new();
     }
 
-    let remainder = input
-        .strip_prefix("mysql://")
-        .or_else(|| input.strip_prefix("MYSQL://"))
-        .unwrap_or(input);
-
-    let prefix = if input.starts_with("mysql://") {
-        "mysql://"
-    } else if input.starts_with("MYSQL://") {
-        "MYSQL://"
-    } else {
-        ""
-    };
+    let (prefix, remainder) = split_mysql_scheme(input);
 
     match remainder.split_once('@') {
         Some((credentials, host_part)) => match credentials.split_once(':') {
@@ -883,6 +878,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_dsn_with_mixed_case_mysql_prefix() {
+        let dsn = MySqlDsn::parse("MySQL://rustfs:password@tcp(127.0.0.1:3306)/mydb").expect("valid DSN with mixed-case prefix");
+        assert_eq!(dsn.user, "rustfs");
+        assert_eq!(dsn.password, "password");
+        assert_eq!(dsn.host, "127.0.0.1");
+        assert_eq!(dsn.port, 3306);
+        assert_eq!(dsn.database, "mydb");
+    }
+
+    #[test]
     fn parse_dsn_with_tls_true() {
         let dsn = MySqlDsn::parse("rustfs:password@tcp(127.0.0.1:3306)/mydb?tls=true").expect("valid DSN with TLS");
         assert!(dsn.tls);
@@ -937,6 +942,12 @@ mod tests {
     fn redact_dsn_with_mysql_prefix() {
         let redacted = redact_mysql_dsn("mysql://rustfs:secret123@tcp(127.0.0.1:3306)/mydb");
         assert_eq!(redacted, "mysql://rustfs:***@tcp(127.0.0.1:3306)/mydb");
+    }
+
+    #[test]
+    fn redact_dsn_with_mixed_case_mysql_prefix() {
+        let redacted = redact_mysql_dsn("MySQL://rustfs:secret123@tcp(127.0.0.1:3306)/mydb");
+        assert_eq!(redacted, "MySQL://rustfs:***@tcp(127.0.0.1:3306)/mydb");
     }
 
     #[test]
