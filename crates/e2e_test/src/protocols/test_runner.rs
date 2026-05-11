@@ -14,8 +14,8 @@
 
 //! Protocol test runner
 
-use crate::common::ENV_RUSTFS_BUILD_FEATURES;
 use crate::common::init_logging;
+use crate::common::{requested_rustfs_build_features, rustfs_build_feature_enabled};
 use crate::protocols::ftps_core::test_ftps_core_operations;
 use crate::protocols::sftp_compliance::{
     test_sftp_compliance_readonly, test_sftp_compliance_standalone, test_sftp_compliance_suite,
@@ -74,7 +74,7 @@ impl ProtocolTestSuite {
     fn with_requested_features(requested_features: Option<&str>) -> Self {
         let tests = all_protocol_tests()
             .into_iter()
-            .filter(|test| feature_enabled(requested_features, test.required_feature))
+            .filter(|test| rustfs_build_feature_enabled(requested_features, test.required_feature))
             .collect();
         Self { tests }
     }
@@ -227,24 +227,6 @@ fn all_protocol_tests() -> Vec<TestDefinition> {
     ]
 }
 
-fn requested_rustfs_build_features() -> Option<String> {
-    std::env::var(ENV_RUSTFS_BUILD_FEATURES)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn feature_enabled(requested_features: Option<&str>, required_feature: &str) -> bool {
-    let Some(requested_features) = requested_features else {
-        return true;
-    };
-
-    requested_features
-        .split(',')
-        .map(str::trim)
-        .any(|feature| feature.eq_ignore_ascii_case(required_feature))
-}
-
 /// Test suite
 #[tokio::test]
 #[serial]
@@ -309,6 +291,17 @@ mod tests {
 
         assert_eq!(names.len(), 5);
         assert!(names.iter().all(|name| name.contains("sftp")));
+    }
+
+    #[test]
+    fn full_feature_schedules_all_protocol_tests() {
+        let names = scheduled_names(ProtocolTestSuite::with_requested_features(Some("full")));
+
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"test_ftps_core_operations"));
+        assert!(names.contains(&"test_webdav_core_operations"));
+        assert!(names.contains(&"test_sftp_core_operations"));
+        assert!(names.contains(&"test_sftp_compliance_standalone"));
     }
 
     #[test]
