@@ -821,10 +821,15 @@ impl ECStore {
 
             if !get_global_endpoints().as_ref().get(idx).is_some_and(|v| {
                 info!("start_rebalance: pool {} endpoints: {:?}", idx, v.endpoints);
-                v.endpoints.as_ref().first().is_some_and(|e| {
-                    info!("start_rebalance: pool {} endpoint: {:?}, is_local: {}", idx, e, e.is_local);
-                    e.is_local
-                })
+                rebalance_local_pool_available(
+                    v.endpoints
+                        .as_ref()
+                        .iter()
+                        .inspect(|e| {
+                            info!("start_rebalance: pool {} endpoint: {:?}, is_local: {}", idx, e, e.is_local);
+                        })
+                        .map(|e| e.is_local),
+                )
             }) {
                 info!("start_rebalance: pool {} is not local, skipping", idx);
                 continue;
@@ -1441,6 +1446,13 @@ fn should_skip_start_rebalance(cancel_attached: bool, in_progress: bool) -> bool
     cancel_attached && in_progress
 }
 
+fn rebalance_local_pool_available<I>(endpoint_local_states: I) -> bool
+where
+    I: IntoIterator<Item = bool>,
+{
+    endpoint_local_states.into_iter().any(|is_local| is_local)
+}
+
 fn is_rebalance_stopped_terminal_event(terminal_event: &RebalanceTerminalEvent) -> bool {
     matches!(terminal_event, RebalanceTerminalEvent::Stopped { .. })
 }
@@ -1874,9 +1886,10 @@ mod rebalance_unit_tests {
         clone_rebalance_pool_stats, complete_rebalance_pools_at_goal, ensure_rebalance_listing_disks_available,
         ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
         load_rebalance_bucket_configs, mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
-        rebalance_delete_marker_opts, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
-        rebalance_meta_load_unknown_version_error, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
-        resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
+        rebalance_delete_marker_opts, rebalance_local_pool_available, rebalance_meta_load_no_data_error,
+        rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
+        resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
+        resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
         resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
@@ -3325,6 +3338,17 @@ mod rebalance_unit_tests {
         assert!(!should_skip_start_rebalance(true, false));
         assert!(!should_skip_start_rebalance(false, true));
         assert!(!should_skip_start_rebalance(false, false));
+    }
+
+    #[test]
+    fn test_rebalance_local_pool_available_accepts_any_local_endpoint() {
+        assert!(rebalance_local_pool_available([false, false, true]));
+    }
+
+    #[test]
+    fn test_rebalance_local_pool_available_rejects_empty_or_remote_only_endpoints() {
+        assert!(!rebalance_local_pool_available([]));
+        assert!(!rebalance_local_pool_available([false, false]));
     }
 
     #[test]
