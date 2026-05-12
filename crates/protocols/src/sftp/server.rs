@@ -600,6 +600,26 @@ mod hot_reload_tests {
     }
 
     #[tokio::test]
+    async fn ssh_config_holder_reload_failure_keeps_current_host_keys() {
+        let dir = TempDir::new().expect("tempdir");
+        write_file_with_mode(&dir.path().join("ssh_host_ed25519_key"), &test_ed25519_pem(), 0o600);
+
+        let config = test_config(dir.path());
+        let initial_keys = SftpConfig::load_host_keys(dir.path()).await.expect("initial key load");
+        let holder = SshConfigHolder::new(build_ssh_config(initial_keys, config.idle_timeout_secs, &config.banner));
+        assert!(matches!(holder.get().keys[0].algorithm(), russh::keys::Algorithm::Ed25519));
+
+        std::fs::remove_file(dir.path().join("ssh_host_ed25519_key")).expect("remove old key");
+
+        let err = holder
+            .reload_from_config(&config)
+            .await
+            .expect_err("empty host key directory must fail reload");
+        assert!(matches!(err, SftpInitError::NoHostKeysFound { .. }));
+        assert!(matches!(holder.get().keys[0].algorithm(), russh::keys::Algorithm::Ed25519));
+    }
+
+    #[tokio::test]
     async fn fingerprint_host_keys_is_order_independent() {
         let dir = TempDir::new().expect("tempdir");
         write_file_with_mode(&dir.path().join("ssh_host_ed25519_key"), &test_ed25519_pem(), 0o600);
