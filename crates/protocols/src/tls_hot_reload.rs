@@ -237,6 +237,20 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn cert_key_pair(san: &str) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let cert = generate_simple_self_signed(vec![san.to_string()]).unwrap();
+        (
+            vec![cert.cert.der().clone()],
+            PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap(),
+        )
+    }
+
+    fn clone_cert_key_pair(
+        cert_key_pair: &(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+    ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        (cert_key_pair.0.clone(), cert_key_pair.1.clone_key())
+    }
+
     fn write_default_cert(dir: &std::path::Path, san: &str) {
         let cert = generate_simple_self_signed(vec![san.to_string()]).unwrap();
         fs::write(dir.join(RUSTFS_TLS_CERT), cert.cert.pem()).unwrap();
@@ -275,5 +289,29 @@ mod tests {
         let resolver = ReloadableCertResolver::load_from_directory(temp_dir.path().to_str().unwrap()).unwrap();
         let outcome = resolver.reload_from_directory(temp_dir.path().to_str().unwrap()).unwrap();
         assert_eq!(outcome, None);
+    }
+
+    #[test]
+    fn resolver_state_fingerprint_is_stable_across_domain_ordering() {
+        let default_cert = cert_key_pair("localhost");
+        let api_cert = cert_key_pair("api.example.com");
+        let web_cert = cert_key_pair("web.example.com");
+
+        let mut first = HashMap::new();
+        first.insert("default".to_string(), clone_cert_key_pair(&default_cert));
+        first.insert("api.example.com".to_string(), clone_cert_key_pair(&api_cert));
+        first.insert("web.example.com".to_string(), clone_cert_key_pair(&web_cert));
+
+        let mut second = HashMap::new();
+        second.insert("web.example.com".to_string(), clone_cert_key_pair(&web_cert));
+        second.insert("default".to_string(), clone_cert_key_pair(&default_cert));
+        second.insert("api.example.com".to_string(), clone_cert_key_pair(&api_cert));
+
+        let first_state = ResolverState::from_cert_key_pairs(first).unwrap();
+        let second_state = ResolverState::from_cert_key_pairs(second).unwrap();
+
+        assert_eq!(first_state.cert_count, 3);
+        assert_eq!(second_state.cert_count, 3);
+        assert_eq!(first_state.fingerprint, second_state.fingerprint);
     }
 }
