@@ -1976,6 +1976,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sts_claim_policy_ignores_unsafe_and_missing_policy_names() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let sts_access_key = "sts-mixed-claim-policy-test-user";
+        let sts_user = UserIdentity::from(Credentials {
+            access_key: sts_access_key.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            session_token: "sts-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: parent_user.to_string(),
+            ..Default::default()
+        });
+        Cache::add_or_update(&iam_sys.store.cache.sts_accounts, sts_access_key, &sts_user, OffsetDateTime::now_utc());
+
+        let mut claims = HashMap::new();
+        claims.insert(
+            POLICYNAME.to_string(),
+            Value::String(format!("unsafe/policy, missing-sts-claim-policy, {CUSTOM_STS_CLAIM_POLICY}")),
+        );
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: sts_access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Sts { .. }));
+        assert!(
+            iam_sys.eval_prepared(&prepared, &args).await,
+            "STS policy claims should ignore unsafe or unresolved names without dropping a resolvable canned policy"
+        );
+    }
+
+    #[tokio::test]
     async fn test_sts_claim_policy_custom_canned_policy_does_not_grant_other_actions() {
         let store = StsTestMockStore { empty_policies: true };
         let cache_manager = IamCache::new(store).await.unwrap();
