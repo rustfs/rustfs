@@ -19,7 +19,7 @@
 //! (build_write_tombstone, should_abort_on_drop) that the Drop impl
 //! in driver.rs consumes.
 
-use super::attrs::s3_attrs_to_sftp;
+use super::attrs::{s3_attrs_to_sftp, sftp_attrs_to_user_metadata};
 use super::constants::limits::{
     COMMIT_WRITE_BACKOFF_MS, COMMIT_WRITE_MAX_RETRIES, S3_MAX_MULTIPART_PARTS, S3_MAX_PART_SIZE, S3_MIN_PART_SIZE,
 };
@@ -173,6 +173,7 @@ pub(super) fn build_write_tombstone(
         bucket: bucket.to_string(),
         key: key.to_string(),
         attrs: attrs.clone(),
+        open_attrs: FileAttributes::default(),
         phase: WritePhase::Failed {
             upload_id,
             abort_authorized,
@@ -232,7 +233,13 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// between this HEAD and the eventual CLOSE. The SFTPv3 draft
     /// does not guarantee atomicity here and S3 has no native CAS
     /// primitive, so the race is accepted.
-    pub(super) async fn open_write(&mut self, id: u32, filename: &str, pflags: OpenFlags) -> Result<Handle, SftpError> {
+    pub(super) async fn open_write(
+        &mut self,
+        id: u32,
+        filename: &str,
+        pflags: OpenFlags,
+        open_attrs: FileAttributes,
+    ) -> Result<Handle, SftpError> {
         self.enforce_server_readonly()?;
 
         let (bucket, key) = parse_s3_path(filename)?;
@@ -275,11 +282,25 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             }
         }
 
-        let attrs = s3_attrs_to_sftp(0, None, false);
+        let mut attrs = s3_attrs_to_sftp(0, None, false);
+        if open_attrs.mtime.is_some() {
+            attrs.mtime = open_attrs.mtime;
+            attrs.atime = open_attrs.mtime;
+        }
+        if open_attrs.permissions.is_some() {
+            attrs.permissions = open_attrs.permissions;
+        }
+        if open_attrs.uid.is_some() {
+            attrs.uid = open_attrs.uid;
+        }
+        if open_attrs.gid.is_some() {
+            attrs.gid = open_attrs.gid;
+        }
         let handle = self.allocate_handle(HandleState::Write {
             bucket,
             key: object_key,
             attrs,
+            open_attrs,
             phase: WritePhase::Buffering { part_buffer: Vec::new() },
         })?;
         Ok(Handle { id, handle })
@@ -302,7 +323,13 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// run_backend deadline still propagates immediately as Failure
     /// rather than retrying, because a stuck backend is not a
     /// transient classification the retry set targets.
-    pub(super) async fn commit_write(&self, bucket: &str, key: &str, buffer: Vec<u8>) -> Result<(), SftpError> {
+    pub(super) async fn commit_write(
+        &self,
+        bucket: &str,
+        key: &str,
+        attrs: &FileAttributes,
+        buffer: Vec<u8>,
+    ) -> Result<(), SftpError> {
         let size = buffer.len() as i64;
         let body_bytes = Bytes::from(buffer);
 
@@ -324,6 +351,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 .bucket(bucket.to_string())
                 .key(key.to_string())
                 .content_length(Some(size))
+                .metadata(sftp_attrs_to_user_metadata(attrs))
                 .body(Some(streaming))
                 .build()
                 .map_err(|e| s3_error_to_sftp("build_put_object", e))?;
@@ -429,7 +457,12 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// passes an empty conditions map. Only unconditional Allow/Deny is
     /// honoured. This is a gateway-wide limitation, not specific to
     /// this cache.
-    pub(super) async fn start_multipart_upload(&self, bucket: &str, key: &str) -> Result<MultipartUpload, SftpError> {
+    pub(super) async fn start_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        attrs: &FileAttributes,
+    ) -> Result<MultipartUpload, SftpError> {
         self.authorize(&S3Action::CreateMultipartUpload, bucket, Some(key)).await?;
 
         // Probe AbortMultipartUpload authorisation immediately after
@@ -450,6 +483,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let input = CreateMultipartUploadInput::builder()
             .bucket(bucket.to_string())
             .key(key.to_string())
+            .metadata(sftp_attrs_to_user_metadata(attrs))
             .build()
             .map_err(|e| s3_error_to_sftp("build_create_multipart_upload", e))?;
 
@@ -553,6 +587,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             bucket,
             key,
             attrs,
+            open_attrs,
             phase,
         } = state
         else {
@@ -575,7 +610,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
 
         while write_dispatch_has_full_part(phase, part_size) {
             if matches!(phase, WritePhase::Buffering { .. }) {
-                self.write_dispatch_begin_streaming(handle, phase, &bucket_owned, &key_owned)
+                self.write_dispatch_begin_streaming(handle, phase, &bucket_owned, &key_owned, open_attrs)
                     .await?;
             }
             self.write_dispatch_flush_one_part(phase, &bucket_owned, &key_owned, part_size)
@@ -602,6 +637,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         phase: &mut WritePhase,
         bucket: &str,
         key: &str,
+        attrs: &FileAttributes,
     ) -> Result<(), SftpError> {
         if !matches!(phase, WritePhase::Buffering { .. }) {
             return Ok(());
@@ -611,7 +647,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // authorize_operation(AbortMultipartUpload) result. The pair is
         // stored on the Streaming variant so Drop (which cannot await)
         // has a pre-decided policy answer.
-        let mp = self.start_multipart_upload(bucket, key).await?;
+        let mp = self.start_multipart_upload(bucket, key, attrs).await?;
         let existing_buffer = match phase {
             WritePhase::Buffering { part_buffer } => std::mem::take(part_buffer),
             _ => {
@@ -635,7 +671,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // synchronous window between start_multipart_upload returning
         // Ok and this insert contains no await, so cancellation cannot
         // fire in it.
-        let tombstone = build_write_tombstone(bucket, key, &FileAttributes::default(), mp.upload_id, mp.abort_authorized);
+        let tombstone = build_write_tombstone(bucket, key, attrs, mp.upload_id, mp.abort_authorized);
         self.handles.insert(handle.to_string(), tombstone);
         Ok(())
     }
@@ -915,7 +951,9 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // abort_authorized flag is carried on the MultipartUpload so
         // close_abort_or_skip can honour a Deny-Abort policy without a
         // second IAM probe per error path.
-        let mp = self.start_multipart_upload(dst_bucket, dst_key).await?;
+        let mp = self
+            .start_multipart_upload(dst_bucket, dst_key, &FileAttributes::default())
+            .await?;
 
         let result: Result<Vec<CompletedPart>, SftpError> = async {
             let mut uploaded_parts = Vec::new();
@@ -1550,9 +1588,12 @@ mod tests {
             part_buffer: vec![1, 2, 3, 4],
         };
 
-        with_test_auth_override(|_, _, _| true, driver.write_dispatch_begin_streaming(&handle_id, &mut phase, "b", "k"))
-            .await
-            .expect("begin_streaming must succeed on queued Create Ok");
+        with_test_auth_override(
+            |_, _, _| true,
+            driver.write_dispatch_begin_streaming(&handle_id, &mut phase, "b", "k", &FileAttributes::default()),
+        )
+        .await
+        .expect("begin_streaming must succeed on queued Create Ok");
 
         // Tombstone invariant: the driver.handles entry under handle_id
         // is now a Failed-variant HandleState carrying the upload_id.
@@ -1589,11 +1630,55 @@ mod tests {
         backend.queue_create_multipart_upload_ok("UP-ALLOW");
         let driver = build_driver(backend, TEST_PART_SIZE);
 
-        let mp = with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k"))
+        let mp = with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &FileAttributes::default()))
             .await
             .expect("start_multipart_upload must succeed on Allow");
         assert_eq!(mp.upload_id, "UP-ALLOW");
         assert!(mp.abort_authorized, "Allow on AbortMultipartUpload probe must cache as true");
+    }
+
+    #[tokio::test]
+    async fn start_multipart_upload_preserves_open_attrs_as_metadata() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_create_multipart_upload_ok("UP-ATTRS");
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+        let attrs = FileAttributes {
+            size: None,
+            uid: Some(1000),
+            gid: Some(1001),
+            user: None,
+            group: None,
+            permissions: Some(0o100640),
+            atime: None,
+            mtime: Some(1_777_992_333),
+        };
+
+        with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &attrs))
+            .await
+            .expect("start_multipart_upload must succeed");
+
+        let calls = backend.create_multipart_calls();
+        assert_eq!(calls.len(), 1);
+        let metadata = calls[0].metadata.as_ref().expect("OPEN attrs must become S3 user metadata");
+        assert_eq!(metadata.get("mtime").map(String::as_str), Some("1777992333"));
+        assert_eq!(metadata.get("mode").map(String::as_str), Some("33184"));
+        assert_eq!(metadata.get("uid").map(String::as_str), Some("1000"));
+        assert_eq!(metadata.get("gid").map(String::as_str), Some("1001"));
+    }
+
+    #[tokio::test]
+    async fn start_multipart_upload_omits_metadata_when_open_attrs_empty() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_create_multipart_upload_ok("UP-NO-ATTRS");
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &FileAttributes::default()))
+            .await
+            .expect("start_multipart_upload must succeed");
+
+        let calls = backend.create_multipart_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].metadata.is_none(), "empty OPEN attrs must not write default metadata");
     }
 
     #[tokio::test]
@@ -1606,7 +1691,7 @@ mod tests {
         // a WORM-shaped IAM policy a principal can meet in production.
         let mp = with_test_auth_override(
             |action, _bucket, _object| !matches!(action, S3Action::AbortMultipartUpload),
-            driver.start_multipart_upload("b", "k"),
+            driver.start_multipart_upload("b", "k", &FileAttributes::default()),
         )
         .await
         .expect("Create Allow must succeed even when Abort is Deny");
@@ -1628,7 +1713,7 @@ mod tests {
 
         let err = with_test_auth_override(
             |action, _, _| !matches!(action, S3Action::CreateMultipartUpload),
-            driver.start_multipart_upload("b", "k"),
+            driver.start_multipart_upload("b", "k", &FileAttributes::default()),
         )
         .await
         .expect_err("Deny on CreateMultipartUpload must fail fast");
@@ -1790,6 +1875,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn commit_write_preserves_open_attrs_as_metadata() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_put_object_ok();
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+        let attrs = FileAttributes {
+            size: None,
+            uid: Some(501),
+            gid: Some(20),
+            user: None,
+            group: None,
+            permissions: Some(0o100600),
+            atime: None,
+            mtime: Some(1_777_992_348),
+        };
+
+        driver
+            .commit_write("b", "k", &attrs, b"hello".to_vec())
+            .await
+            .expect("commit_write must succeed");
+
+        let calls = backend.put_object_calls();
+        assert_eq!(calls.len(), 1);
+        let metadata = calls[0].metadata.as_ref().expect("OPEN attrs must become S3 user metadata");
+        assert_eq!(metadata.get("mtime").map(String::as_str), Some("1777992348"));
+        assert_eq!(metadata.get("mode").map(String::as_str), Some("33152"));
+        assert_eq!(metadata.get("uid").map(String::as_str), Some("501"));
+        assert_eq!(metadata.get("gid").map(String::as_str), Some("20"));
+    }
+
+    #[tokio::test]
+    async fn commit_write_omits_metadata_when_open_attrs_empty() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_put_object_ok();
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        driver
+            .commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec())
+            .await
+            .expect("commit_write must succeed");
+
+        let calls = backend.put_object_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].metadata.is_none(), "empty OPEN attrs must not write default metadata");
+    }
+
     // --- open_write strict-flag gate ---
 
     #[tokio::test]
@@ -1799,9 +1930,12 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
-        let err = with_test_auth_override(|_, _, _| true, driver.open_write(7, "/bucket/key", OpenFlags::WRITE))
-            .await
-            .expect_err("WRITE without CREATE or TRUNCATE must be rejected");
+        let err = with_test_auth_override(
+            |_, _, _| true,
+            driver.open_write(7, "/bucket/key", OpenFlags::WRITE, FileAttributes::default()),
+        )
+        .await
+        .expect_err("WRITE without CREATE or TRUNCATE must be rejected");
         assert!(matches!(err.0, StatusCode::OpUnsupported));
         assert!(
             backend.head_object_calls().is_empty(),
@@ -1818,10 +1952,12 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
-        let err =
-            with_test_auth_override(|_, _, _| true, driver.open_write(7, "/bucket/key", OpenFlags::WRITE | OpenFlags::CREATE))
-                .await
-                .expect_err("WRITE | CREATE without TRUNCATE must be rejected");
+        let err = with_test_auth_override(
+            |_, _, _| true,
+            driver.open_write(7, "/bucket/key", OpenFlags::WRITE | OpenFlags::CREATE, FileAttributes::default()),
+        )
+        .await
+        .expect_err("WRITE | CREATE without TRUNCATE must be rejected");
         assert!(matches!(err.0, StatusCode::OpUnsupported));
         assert!(
             backend.head_object_calls().is_empty(),
@@ -1841,7 +1977,12 @@ mod tests {
 
         let handle = with_test_auth_override(
             |_, _, _| true,
-            driver.open_write(9, "/bucket/missing_key", OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE),
+            driver.open_write(
+                9,
+                "/bucket/missing_key",
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+                FileAttributes::default(),
+            ),
         )
         .await
         .expect("WRITE | CREATE | TRUNCATE on a missing file must allocate a handle");
@@ -1861,7 +2002,12 @@ mod tests {
 
         let handle = with_test_auth_override(
             |_, _, _| true,
-            driver.open_write(10, "/bucket/existing_key", OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE),
+            driver.open_write(
+                10,
+                "/bucket/existing_key",
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+                FileAttributes::default(),
+            ),
         )
         .await
         .expect("WRITE | CREATE | TRUNCATE on an existing file must allocate a handle");
@@ -1883,6 +2029,7 @@ mod tests {
                 7,
                 "/bucket/key",
                 OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                FileAttributes::default(),
             ),
         )
         .await
@@ -1906,6 +2053,7 @@ mod tests {
                 9,
                 "/bucket/key2",
                 OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                FileAttributes::default(),
             ),
         )
         .await
@@ -2028,7 +2176,11 @@ mod tests {
         // so the assertion failure mode distinguishes "driver did not
         // honour the deadline" (outer fires) from "deadline fired but
         // mapped to the wrong status" (Ok(Err) with non-Failure).
-        let outcome = tokio::time::timeout(Duration::from_secs(10), driver.commit_write("b", "k", b"hello".to_vec())).await;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            driver.commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec()),
+        )
+        .await;
 
         let inner = outcome.expect("driver deadline must fire before the outer 10 s guard");
         let err = inner.expect_err("stalling backend must surface as Err");
@@ -2049,7 +2201,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn run_backend_with_err_passes_backend_error_through_unchanged() {
         let backend = Arc::new(DummyBackend::new());
-        backend.queue_head_object_err(DummyError::Injected("AccessDenied: pinned".to_string()));
+        backend.queue_head_object_err(DummyError::AccessDenied("pinned".to_string()));
         let driver = build_driver(backend, TEST_PART_SIZE);
 
         let result = driver
@@ -2057,7 +2209,7 @@ mod tests {
             .await;
 
         match result {
-            Ok(Err(e)) => assert!(format!("{e}").contains("AccessDenied")),
+            Ok(Err(e)) => assert!(matches!(e, DummyError::AccessDenied(_))),
             other => panic!("expected backend Err passed through; got {other:?}"),
         }
     }
@@ -2079,7 +2231,7 @@ mod tests {
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
         driver
-            .commit_write("b", "k", b"hello".to_vec())
+            .commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec())
             .await
             .expect("commit_write must succeed once a retry returns Ok");
         assert_eq!(
@@ -2102,7 +2254,7 @@ mod tests {
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
         let err = driver
-            .commit_write("b", "k", b"hello".to_vec())
+            .commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec())
             .await
             .expect_err("commit_write must surface the final retryable error after the cap");
         assert!(matches!(err.0, StatusCode::Failure));
@@ -2120,7 +2272,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn commit_write_does_not_retry_on_access_denied() {
         let backend = Arc::new(DummyBackend::new());
-        backend.queue_put_object_err(DummyError::Injected("AccessDenied: policy".into()));
+        backend.queue_put_object_err(DummyError::AccessDenied("policy".into()));
         // A second response so a retry attempt would surface a
         // wrong-status assertion failure rather than the
         // configured-miss default. If the loop wrongly retries, the
@@ -2130,7 +2282,7 @@ mod tests {
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
         let err = driver
-            .commit_write("b", "k", b"hello".to_vec())
+            .commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec())
             .await
             .expect_err("commit_write must surface AccessDenied without retrying");
         assert!(matches!(err.0, StatusCode::PermissionDenied));

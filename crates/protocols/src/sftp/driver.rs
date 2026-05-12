@@ -25,8 +25,7 @@
 
 use super::attrs;
 use super::constants::limits::S3_COPY_OBJECT_MAX_SIZE;
-use super::constants::s3_error_codes;
-use super::errors::{SftpError, auth_err, auth_err_unreachable, ok_status, s3_error_to_sftp};
+use super::errors::{SftpError, auth_err, auth_err_unreachable, is_no_such_upload_error, ok_status, s3_error_to_sftp};
 use super::lifecycle::SessionDiag;
 use super::paths::{parse_s3_path, sanitise_control_bytes};
 use super::state::{HandleState, WritePhase};
@@ -227,7 +226,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     pub(super) async fn run_backend<F, T, E>(&self, op: &'static str, fut: F) -> Result<T, SftpError>
     where
         F: std::future::Future<Output = Result<T, E>>,
-        E: std::fmt::Display,
+        E: std::fmt::Display + 'static,
     {
         match tokio::time::timeout(std::time::Duration::from_secs(self.backend_op_timeout_secs), fut).await {
             Ok(Ok(v)) => Ok(v),
@@ -474,14 +473,8 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// in-place edit cycle (download, modify, upload). Clients that need
     /// that pattern (rare for SFTP) get a clear protocol error rather
     /// than a data loss path.
-    #[tracing::instrument(level = "info", skip(self, _attrs), fields(id, path = %sanitise_control_bytes(&filename), pflags = ?pflags), err(Debug))]
-    async fn open(
-        &mut self,
-        id: u32,
-        filename: String,
-        pflags: OpenFlags,
-        _attrs: FileAttributes,
-    ) -> Result<Handle, Self::Error> {
+    #[tracing::instrument(level = "info", skip(self, attrs), fields(id, path = %sanitise_control_bytes(&filename), pflags = ?pflags), err(Debug))]
+    async fn open(&mut self, id: u32, filename: String, pflags: OpenFlags, attrs: FileAttributes) -> Result<Handle, Self::Error> {
         if pflags.contains(OpenFlags::APPEND) {
             return Err(SftpError::code(StatusCode::OpUnsupported));
         }
@@ -503,7 +496,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
             return Err(SftpError::code(StatusCode::OpUnsupported));
         }
         if is_write {
-            return self.open_write(id, &filename, pflags).await;
+            return self.open_write(id, &filename, pflags, attrs).await;
         }
         if is_read {
             return self.open_read(id, &filename).await;
@@ -565,6 +558,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
             bucket,
             key,
             attrs,
+            open_attrs,
             phase,
         }) = removed
         else {
@@ -575,7 +569,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
             WritePhase::Buffering { part_buffer } => {
                 // Small-file path. No multipart state exists so nothing
                 // to abort on failure.
-                self.commit_write(&bucket, &key, part_buffer).await?;
+                self.commit_write(&bucket, &key, &open_attrs, part_buffer).await?;
             }
             WritePhase::Streaming {
                 upload_id,
@@ -687,6 +681,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
             bucket,
             key,
             attrs,
+            open_attrs: _,
             phase:
                 WritePhase::Streaming {
                     upload_id,
@@ -1076,8 +1071,7 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                         // successful CompleteMultipartUpload, returning
                         // NoSuchUpload. Log at debug to keep error-level
                         // logs reserved for genuine abort failures.
-                        let msg = e.to_string();
-                        if msg.contains(s3_error_codes::NO_SUCH_UPLOAD) {
+                        if is_no_such_upload_error(&e) {
                             tracing::debug!(
                                 bucket = %bucket,
                                 key = %key,

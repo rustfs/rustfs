@@ -39,28 +39,26 @@ use s3s::dto::{
     ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, UploadPartCopyInput,
     UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::Notify;
 
-/// Error type returned by DummyBackend. Display strings include substrings
-/// the driver's error-mapping helpers match against, so a queued NoSuchKey
-/// error is reported as a not-found status at the protocol layer and an
-/// AccessDenied error is reported as a permission-denied status.
+/// Error type returned by DummyBackend. Variants model the backend error
+/// categories that SFTP maps onto wire status codes.
 #[derive(Debug, Error)]
 pub enum DummyError {
-    /// Display includes the NoSuchKey substring. S3-style error mappers
-    /// map this to not-found.
     #[error("NoSuchKey: {0}")]
     NoSuchKey(String),
-    /// Display includes the NoSuchBucket substring. S3-style error mappers
-    /// map this to not-found.
     #[error("NoSuchBucket: {0}")]
     NoSuchBucket(String),
-    /// Free-form error string pre-seeded by a test. Must contain one of the
-    /// S3 error-code substrings if the test wants a specific status code
-    /// from the driver's error-mapping helper.
+    #[error("AccessDenied: {0}")]
+    AccessDenied(String),
+    #[error("NoSuchUpload: {0}")]
+    NoSuchUpload(String),
+    /// Free-form backend failure pre-seeded by a test. SFTP status-code
+    /// classification ignores this text; use a typed variant above when a test
+    /// needs a specific wire status.
     #[error("{0}")]
     Injected(String),
     /// Default response when the per-method queue is empty and the method
@@ -88,6 +86,22 @@ pub struct UploadPartCall {
     pub upload_id: String,
     pub part_number: i32,
     pub content_length: Option<i64>,
+}
+
+/// Recorded invocation of put_object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutObjectCall {
+    pub bucket: String,
+    pub key: String,
+    pub metadata: Option<HashMap<String, String>>,
+}
+
+/// Recorded invocation of create_multipart_upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateMultipartCall {
+    pub bucket: String,
+    pub key: String,
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 /// Recorded invocation of complete_multipart_upload.
@@ -128,6 +142,8 @@ struct Inner {
 
     // Observation logs.
     abort_multipart_calls: Vec<AbortCall>,
+    put_object_calls: Vec<PutObjectCall>,
+    create_multipart_calls: Vec<CreateMultipartCall>,
     upload_part_calls: Vec<UploadPartCall>,
     complete_multipart_calls: Vec<CompleteCall>,
     head_object_calls: Vec<HeadObjectCall>,
@@ -175,6 +191,8 @@ impl Inner {
             abort_multipart_upload: VecDeque::new(),
             upload_part_copy: VecDeque::new(),
             abort_multipart_calls: Vec::new(),
+            put_object_calls: Vec::new(),
+            create_multipart_calls: Vec::new(),
             upload_part_calls: Vec::new(),
             complete_multipart_calls: Vec::new(),
             head_object_calls: Vec::new(),
@@ -295,9 +313,7 @@ impl DummyBackend {
         self.inner.lock().expect("lock").upload_part.push_back(Ok(out));
     }
 
-    /// Queue an upload_part error. The error string flows through the
-    /// driver's error-mapping helper, so Injected("AccessDenied") produces
-    /// a permission-denied status at the driver boundary.
+    /// Queue an upload_part error.
     pub fn queue_upload_part_err(&self, err: DummyError) {
         self.inner.lock().expect("lock").upload_part.push_back(Err(err));
     }
@@ -426,6 +442,16 @@ impl DummyBackend {
         self.inner.lock().expect("lock").abort_multipart_calls.clone()
     }
 
+    /// Snapshot the put_object call log.
+    pub fn put_object_calls(&self) -> Vec<PutObjectCall> {
+        self.inner.lock().expect("lock").put_object_calls.clone()
+    }
+
+    /// Snapshot the create_multipart_upload call log.
+    pub fn create_multipart_calls(&self) -> Vec<CreateMultipartCall> {
+        self.inner.lock().expect("lock").create_multipart_calls.clone()
+    }
+
     /// Snapshot the upload_part call log.
     pub fn upload_part_calls(&self) -> Vec<UploadPartCall> {
         self.inner.lock().expect("lock").upload_part_calls.clone()
@@ -475,12 +501,17 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn put_object(&self, _input: PutObjectInput, _ak: &str, _sk: &str) -> Result<PutObjectOutput, Self::Error> {
+    async fn put_object(&self, input: PutObjectInput, _ak: &str, _sk: &str) -> Result<PutObjectOutput, Self::Error> {
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across
         // an await point.
         let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
+            inner.put_object_calls.push(PutObjectCall {
+                bucket: input.bucket.to_string(),
+                key: input.key.to_string(),
+                metadata: input.metadata.clone(),
+            });
             let stall = inner.stall_put_object;
             let entered = inner.put_object_entered.clone();
             let popped = if stall { None } else { inner.put_object.pop_front() };
@@ -586,10 +617,18 @@ impl StorageBackend for DummyBackend {
 
     async fn create_multipart_upload(
         &self,
-        _input: CreateMultipartUploadInput,
+        input: CreateMultipartUploadInput,
         _ak: &str,
         _sk: &str,
     ) -> Result<CreateMultipartUploadOutput, Self::Error> {
+        {
+            let mut inner = self.inner.lock().expect("lock");
+            inner.create_multipart_calls.push(CreateMultipartCall {
+                bucket: input.bucket.to_string(),
+                key: input.key.to_string(),
+                metadata: input.metadata.clone(),
+            });
+        }
         match self.inner.lock().expect("lock").create_multipart_upload.pop_front() {
             Some(r) => r,
             None => Err(DummyError::Unconfigured("create_multipart_upload")),
