@@ -457,6 +457,21 @@ mod tests {
     }
 
     #[test]
+    fn encoded_event_key_matches_raw_and_decoded_rule_targets() {
+        let raw_target = TargetID::new("raw".to_string(), "webhook".to_string());
+        let decoded_target = TargetID::new("decoded".to_string(), "webhook".to_string());
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads%2F*.csv".to_string(), raw_target.clone());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), decoded_target.clone());
+
+        let targets = match_event_targets(&rules_map, EventName::ObjectCreatedPut, "uploads%2Freport.csv");
+
+        assert_eq!(targets.len(), 2);
+        assert!(targets.contains(&raw_target));
+        assert!(targets.contains(&decoded_target));
+    }
+
+    #[test]
     fn encoded_event_key_does_not_bypass_suffix_filter() {
         let target_id = TargetID::new("primary".to_string(), "webhook".to_string());
         let mut rules_map = RulesMap::new();
