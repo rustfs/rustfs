@@ -311,6 +311,7 @@ mod tests {
         let second_state = ResolverState::from_cert_key_pairs(second).unwrap();
 
         assert_eq!(first_state.cert_count, 3);
+        assert_eq!(second_state.cert_count, 3);
         assert_eq!(first_state.fingerprint, second_state.fingerprint);
     }
 }
