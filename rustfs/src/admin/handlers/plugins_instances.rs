@@ -14,8 +14,12 @@
 
 use crate::admin::{
     auth::validate_admin_request,
-    handlers::audit_runtime_config::{load_server_config_from_store, update_audit_config_and_reload},
-    handlers::notify_runtime_access::load_notification_config_snapshot,
+    handlers::audit_runtime_config::{
+        load_server_config_from_store, remove_audit_target_config, set_audit_target_config,
+    },
+    handlers::notify_runtime_access::{
+        load_notification_config_snapshot, remove_notification_target_config, set_notification_target_config,
+    },
     handlers::target_descriptor::{
         AdminTargetSpec, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin, build_enabled_target_kvs,
         build_json_response, collect_runtime_statuses, collect_target_instances, find_target_instance,
@@ -609,6 +613,35 @@ async fn find_plugin_instance(instance_id: &str) -> S3Result<Option<TargetInstan
     ))
 }
 
+async fn set_plugin_instance_config(
+    context: PluginInstanceDomainContext,
+    resolved: &ResolvedPluginInstanceTarget,
+    kvs: KVS,
+) -> S3Result<()> {
+    match context.domain {
+        PluginContractDomain::Notify => {
+            set_notification_target_config(resolved.target_spec.subsystem, &resolved.target_name, kvs).await
+        }
+        PluginContractDomain::Audit => {
+            set_audit_target_config(audit_target_specs(), resolved.target_spec.subsystem, &resolved.target_name, kvs).await
+        }
+    }
+}
+
+async fn remove_plugin_instance_config(
+    context: PluginInstanceDomainContext,
+    resolved: &ResolvedPluginInstanceTarget,
+) -> S3Result<()> {
+    match context.domain {
+        PluginContractDomain::Notify => {
+            remove_notification_target_config(resolved.target_spec.subsystem, &resolved.target_name).await
+        }
+        PluginContractDomain::Audit => {
+            remove_audit_target_config(audit_target_specs(), resolved.target_spec.subsystem, &resolved.target_name).await
+        }
+    }
+}
+
 pub struct ListPluginInstancesHandler {}
 
 #[async_trait::async_trait]
@@ -677,7 +710,7 @@ impl Operation for PutPluginInstanceHandler {
 
         match context.domain {
             PluginContractDomain::Notify => {
-                let (ns, config_snapshot) = load_notification_config_snapshot().await?;
+                let (_ns, config_snapshot) = load_notification_config_snapshot().await?;
                 if let Some(reason) = plugin_instance_mutation_block_reason(
                     context,
                     &config_snapshot,
@@ -697,9 +730,7 @@ impl Operation for PutPluginInstanceHandler {
                 )
                 .await?;
 
-                ns.set_target_config(resolved.target_spec.subsystem, &resolved.target_name, kvs)
-                    .await
-                    .map_err(|e| s3_error!(InternalError, "failed to set plugin instance config: {}", e))?;
+                set_plugin_instance_config(context, &resolved, kvs).await?;
             }
             PluginContractDomain::Audit => {
                 let config_snapshot = load_server_config_from_store().await?;
@@ -722,15 +753,7 @@ impl Operation for PutPluginInstanceHandler {
                 )
                 .await?;
 
-                update_audit_config_and_reload(audit_target_specs(), |config| {
-                    config
-                        .0
-                        .entry(resolved.target_spec.subsystem.to_lowercase())
-                        .or_default()
-                        .insert(resolved.target_name.to_lowercase(), kvs.clone());
-                    true
-                })
-                .await?;
+                set_plugin_instance_config(context, &resolved, kvs).await?;
             }
         }
 
@@ -757,7 +780,7 @@ impl Operation for DeletePluginInstanceHandler {
 
         match context.domain {
             PluginContractDomain::Notify => {
-                let (ns, config_snapshot) = load_notification_config_snapshot().await?;
+                let (_ns, config_snapshot) = load_notification_config_snapshot().await?;
                 if let Some(reason) = plugin_instance_mutation_block_reason(
                     context,
                     &config_snapshot,
@@ -768,9 +791,7 @@ impl Operation for DeletePluginInstanceHandler {
                     return Err(s3_error!(InvalidRequest, "{reason}"));
                 }
 
-                ns.remove_target_config(resolved.target_spec.subsystem, &resolved.target_name)
-                    .await
-                    .map_err(|e| s3_error!(InternalError, "failed to remove plugin instance config: {}", e))?;
+                remove_plugin_instance_config(context, &resolved).await?;
             }
             PluginContractDomain::Audit => {
                 let config_snapshot = load_server_config_from_store().await?;
@@ -784,19 +805,7 @@ impl Operation for DeletePluginInstanceHandler {
                     return Err(s3_error!(InvalidRequest, "{reason}"));
                 }
 
-                update_audit_config_and_reload(audit_target_specs(), |config| {
-                    let mut changed = false;
-                    if let Some(targets) = config.0.get_mut(&resolved.target_spec.subsystem.to_lowercase()) {
-                        if targets.remove(&resolved.target_name.to_lowercase()).is_some() {
-                            changed = true;
-                        }
-                        if targets.is_empty() {
-                            config.0.remove(&resolved.target_spec.subsystem.to_lowercase());
-                        }
-                    }
-                    changed
-                })
-                .await?;
+                remove_plugin_instance_config(context, &resolved).await?;
             }
         }
 

@@ -95,3 +95,36 @@ where
 
     apply_audit_runtime_config(specs, config).await
 }
+
+pub(crate) async fn set_audit_target_config(
+    specs: &[AdminTargetSpec],
+    subsystem: &str,
+    target_name: &str,
+    kvs: rustfs_ecstore::config::KVS,
+) -> S3Result<()> {
+    update_audit_config_and_reload(specs, |config| {
+        config
+            .0
+            .entry(subsystem.to_lowercase())
+            .or_default()
+            .insert(target_name.to_lowercase(), kvs.clone());
+        true
+    })
+    .await
+}
+
+pub(crate) async fn remove_audit_target_config(specs: &[AdminTargetSpec], subsystem: &str, target_name: &str) -> S3Result<()> {
+    update_audit_config_and_reload(specs, |config| {
+        let mut changed = false;
+        if let Some(targets) = config.0.get_mut(&subsystem.to_lowercase()) {
+            if targets.remove(&target_name.to_lowercase()).is_some() {
+                changed = true;
+            }
+            if targets.is_empty() {
+                config.0.remove(&subsystem.to_lowercase());
+            }
+        }
+        changed
+    })
+    .await
+}
