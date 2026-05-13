@@ -19,7 +19,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, is_connectivity_error, open_target_queue_store, persist_queued_payload_to_store,
+        TargetType, build_queued_payload, invalidate_cache_on_connectivity_error, is_connectivity_error,
+        mark_target_disconnected_on_connectivity_error, open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -383,9 +384,7 @@ where
             Ok(_) => Ok(()),
             Err(err) => {
                 let mapped = map_redis_error(err);
-                if is_retryable_target_error(&mapped) {
-                    self.invalidate_cached_publisher().await;
-                }
+                invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_publisher()).await;
                 Err(mapped)
             }
         }
@@ -429,9 +428,7 @@ where
                 }
                 Err(err) => {
                     let mapped = map_redis_error(err);
-                    if is_retryable_target_error(&mapped) {
-                        self.invalidate_cached_publisher().await;
-                    }
+                    invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_publisher()).await;
 
                     warn!(
                         target_id = %self.id,
@@ -442,7 +439,7 @@ where
                         "Redis publish attempt failed"
                     );
 
-                    if !is_retryable_target_error(&mapped) || attempt >= self.args.max_retry_attempts {
+                    if !is_connectivity_error(&mapped) || attempt >= self.args.max_retry_attempts {
                         last_error = Some(mapped);
                         break;
                     }
@@ -484,14 +481,15 @@ where
                 Ok(true)
             }
             Ok(Err(err)) => {
-                self.invalidate_cached_publisher().await;
-                self.connected.store(false, Ordering::SeqCst);
+                invalidate_cache_on_connectivity_error(&err, || self.invalidate_cached_publisher()).await;
+                mark_target_disconnected_on_connectivity_error(&self.connected, &err);
                 Err(err)
             }
             Err(_) => {
-                self.invalidate_cached_publisher().await;
-                self.connected.store(false, Ordering::SeqCst);
-                Err(TargetError::Timeout("Redis connection timed out".to_string()))
+                let timeout_err = TargetError::Timeout("Redis connection timed out".to_string());
+                invalidate_cache_on_connectivity_error(&timeout_err, || self.invalidate_cached_publisher()).await;
+                mark_target_disconnected_on_connectivity_error(&self.connected, &timeout_err);
+                Err(timeout_err)
             }
         }
     }
@@ -716,10 +714,6 @@ fn map_redis_error(err: RedisError) -> TargetError {
         _ if err.is_unrecoverable_error() => TargetError::NotConnected,
         _ => TargetError::Request(err.to_string()),
     }
-}
-
-fn is_retryable_target_error(err: &TargetError) -> bool {
-    matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_))
 }
 
 fn compute_retry_delay(attempt: usize, min_delay: Duration, max_delay: Duration) -> Duration {

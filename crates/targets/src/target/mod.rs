@@ -20,9 +20,10 @@ use rustfs_s3_common::EventName;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -490,6 +491,22 @@ pub(crate) fn is_connectivity_error(err: &TargetError) -> bool {
     matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_))
 }
 
+pub(crate) async fn invalidate_cache_on_connectivity_error<F, Fut>(err: &TargetError, invalidate: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    if is_connectivity_error(err) {
+        invalidate().await;
+    }
+}
+
+pub(crate) fn mark_target_disconnected_on_connectivity_error(connected: &AtomicBool, err: &TargetError) {
+    if is_connectivity_error(err) {
+        connected.store(false, Ordering::SeqCst);
+    }
+}
+
 pub(crate) fn delete_stored_payload(
     store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync),
     key: &Key,
@@ -742,6 +759,40 @@ mod tests {
         assert!(is_connectivity_error(&TargetError::Network("network".to_string())));
         assert!(!is_connectivity_error(&TargetError::Storage("storage".to_string())));
         assert!(!is_connectivity_error(&TargetError::Serialization("serialization".to_string())));
+    }
+
+    #[tokio::test]
+    async fn invalidate_cache_on_connectivity_error_only_runs_for_connectivity_failures() {
+        let marker = Arc::new(AtomicBool::new(false));
+        invalidate_cache_on_connectivity_error(&TargetError::NotConnected, {
+            let marker = Arc::clone(&marker);
+            move || async move {
+                marker.store(true, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert!(marker.load(Ordering::SeqCst));
+
+        marker.store(false, Ordering::SeqCst);
+        invalidate_cache_on_connectivity_error(&TargetError::Request("request failed".to_string()), {
+            let marker = Arc::clone(&marker);
+            move || async move {
+                marker.store(true, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert!(!marker.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mark_target_disconnected_on_connectivity_error_only_marks_connectivity_failures() {
+        let connected = AtomicBool::new(true);
+        mark_target_disconnected_on_connectivity_error(&connected, &TargetError::Timeout("timeout".to_string()));
+        assert!(!connected.load(Ordering::SeqCst));
+
+        connected.store(true, Ordering::SeqCst);
+        mark_target_disconnected_on_connectivity_error(&connected, &TargetError::Request("request failed".to_string()));
+        assert!(connected.load(Ordering::SeqCst));
     }
 
     #[test]

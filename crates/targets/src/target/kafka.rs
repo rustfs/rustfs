@@ -19,7 +19,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, is_connectivity_error, open_target_queue_store, persist_queued_payload_to_store,
+        TargetType, build_queued_payload, invalidate_cache_on_connectivity_error, open_target_queue_store,
+        persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -213,9 +214,7 @@ where
 
         if let Err(err) = producer.send(&Record::from_value(&self.args.topic, body.as_slice())).await {
             let mapped = Self::map_kafka_error(err, "Failed to send message to Kafka");
-            if is_connectivity_error(&mapped) {
-                self.invalidate_cached_producer().await;
-            }
+            invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_producer()).await;
             return Err(mapped);
         }
 

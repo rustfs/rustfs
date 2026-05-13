@@ -19,7 +19,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload_with_records, open_target_queue_store, persist_queued_payload_to_store,
+        TargetType, build_queued_payload_with_records, mark_target_disconnected_on_connectivity_error, open_target_queue_store,
+        persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -639,9 +640,10 @@ where
             .await
             .map_err(|e| {
                 if e.to_string().contains("Connection") || e.to_string().contains("Timeout") {
-                    self.connected.store(false, Ordering::SeqCst);
                     warn!(target_id = %self.id, error = %e, "Publish failed due to connection issue, marking as not connected.");
-                    TargetError::NotConnected
+                    let err = TargetError::NotConnected;
+                    mark_target_disconnected_on_connectivity_error(&self.connected, &err);
+                    err
                 } else {
                     TargetError::Request(format!("Failed to publish message: {e}"))
                 }
