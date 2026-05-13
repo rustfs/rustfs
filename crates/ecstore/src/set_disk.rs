@@ -1937,8 +1937,11 @@ impl ObjectOperations for SetDisks {
             None
         };
 
+        // Use the same full xl.meta read path as GetObject metadata resolution.
+        // This avoids HEAD/GetObject metadata visibility skew immediately after
+        // PutObject/CompleteMultipartUpload.
         let (fi, _, _) = self
-            .get_object_fileinfo(bucket, object, opts, false)
+            .get_object_fileinfo(bucket, object, opts, true)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 

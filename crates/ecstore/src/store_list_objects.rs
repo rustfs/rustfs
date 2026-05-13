@@ -217,7 +217,7 @@ impl ListPathOptions {
                 MARKER_TAG_VERSION,
                 id.to_owned(),
                 self.pool_idx.unwrap_or_default(),
-                self.pool_idx.unwrap_or_default(),
+                self.set_idx.unwrap_or_default(),
             )
         } else {
             format!("{marker}[rustfs_cache:{MARKER_TAG_VERSION},return:]")
@@ -320,7 +320,7 @@ impl ECStore {
                 ..Default::default()
             });
 
-        if let Some(err) = list_result.err.clone()
+        if let Some(err) = list_result.err.take()
             && err != rustfs_filemeta::Error::Unexpected
         {
             return Err(to_object_err(err.into(), vec![bucket, prefix]));
@@ -433,7 +433,7 @@ impl ECStore {
                 ..Default::default()
             });
 
-        if let Some(err) = list_result.err.clone()
+        if let Some(err) = list_result.err.take()
             && err != rustfs_filemeta::Error::Unexpected
         {
             return Err(to_object_err(err.into(), vec![bucket, prefix]));
@@ -617,6 +617,11 @@ impl ECStore {
 
         // wait spawns exit
         join_all(vec![job1, job2]).await;
+
+        if let Ok(err) = err_rx.try_recv() {
+            error!("list_path err_rx.try_recv() ok {:?}", &err);
+            result.err = Some(err.as_ref().clone().into());
+        }
 
         if result.err.is_some() {
             return Ok(result);
@@ -1346,7 +1351,7 @@ impl SetDisks {
             },
         )
         .await
-        .map_err(Error::other)
+        .map_err(Error::from)
     }
 }
 
@@ -1411,7 +1416,7 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use super::{MAX_OBJECT_LIST, max_keys_plus_one};
+    use super::{ListPathOptions, MAX_OBJECT_LIST, max_keys_plus_one};
     use uuid::Uuid;
 
     #[test]
@@ -1491,6 +1496,35 @@ mod test {
         };
         assert!(parsed.is_some());
         assert_eq!(parsed.unwrap().to_string(), uuid_str);
+    }
+
+    #[test]
+    fn list_path_marker_round_trip_preserves_set_index() {
+        let mut opts = ListPathOptions {
+            id: Some("list-cache-id".to_string()),
+            pool_idx: Some(3),
+            set_idx: Some(7),
+            ..Default::default()
+        };
+
+        let marker = opts.encode_marker("photos/2026/image.jpg");
+        let expected_marker = format!(
+            "photos/2026/image.jpg[rustfs_cache:{},id:list-cache-id,p:3,s:7]",
+            super::MARKER_TAG_VERSION
+        );
+        assert_eq!(marker, expected_marker);
+
+        let mut parsed = ListPathOptions {
+            marker: Some(marker),
+            ..Default::default()
+        };
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert_eq!(parsed.set_idx, Some(7));
+        assert!(!parsed.create);
     }
 
     // use std::sync::Arc;

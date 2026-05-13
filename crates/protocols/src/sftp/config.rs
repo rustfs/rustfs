@@ -28,6 +28,7 @@ use super::constants::limits::{
     READ_CACHE_TOTAL_MEM_MIN, READ_CACHE_WINDOW_DEFAULT, READ_CACHE_WINDOW_MAX, READ_CACHE_WINDOW_MIN, S3_MAX_PART_SIZE,
     S3_MIN_PART_SIZE,
 };
+use russh::keys::PublicKeyBase64;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -421,15 +422,26 @@ impl SftpConfig {
             });
         }
 
-        // Sort keys by algorithm preference: Ed25519 first, then ECDSA,
-        // then RSA. russh offers keys to clients in array order during
-        // key exchange. The ordering controls which algorithm the
-        // client attempts first.
-        keys.sort_by_key(|k| match k.algorithm() {
-            russh::keys::Algorithm::Ed25519 => 0,
-            russh::keys::Algorithm::Ecdsa { .. } => 1,
-            russh::keys::Algorithm::Rsa { .. } => 2,
-            _ => 3,
+        // Sort keys by algorithm preference, then by public key bytes
+        // for deterministic ordering within the same algorithm.
+        // russh offers keys to clients in array order during key exchange.
+        keys.sort_by(|left, right| {
+            let left_rank = match left.algorithm() {
+                russh::keys::Algorithm::Ed25519 => 0,
+                russh::keys::Algorithm::Ecdsa { .. } => 1,
+                russh::keys::Algorithm::Rsa { .. } => 2,
+                _ => 3,
+            };
+            let right_rank = match right.algorithm() {
+                russh::keys::Algorithm::Ed25519 => 0,
+                russh::keys::Algorithm::Ecdsa { .. } => 1,
+                russh::keys::Algorithm::Rsa { .. } => 2,
+                _ => 3,
+            };
+
+            left_rank
+                .cmp(&right_rank)
+                .then_with(|| left.public_key_bytes().cmp(&right.public_key_bytes()))
         });
 
         tracing::info!(

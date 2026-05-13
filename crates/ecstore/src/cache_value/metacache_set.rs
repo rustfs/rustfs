@@ -45,6 +45,13 @@ async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TestReaderBehavior {
+    Eof,
+    Stall,
+}
+
 #[derive(Default)]
 pub struct ListPathRawOptions {
     pub disks: Vec<Option<DiskStore>>,
@@ -60,6 +67,10 @@ pub struct ListPathRawOptions {
     pub agreed: Option<AgreedFn>,
     pub partial: Option<PartialFn>,
     pub finished: Option<FinishedFn>,
+    #[cfg(test)]
+    pub(crate) test_reader_behaviors: Vec<TestReaderBehavior>,
+    #[cfg(test)]
+    pub(crate) peek_timeout: Option<Duration>,
     // pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
     // pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
     // pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
@@ -78,6 +89,10 @@ impl Clone for ListPathRawOptions {
             min_disks: self.min_disks,
             report_not_found: self.report_not_found,
             per_disk_limit: self.per_disk_limit,
+            #[cfg(test)]
+            test_reader_behaviors: self.test_reader_behaviors.clone(),
+            #[cfg(test)]
+            peek_timeout: self.peek_timeout,
             ..Default::default()
         }
     }
@@ -91,17 +106,33 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = opts.fallback_disks.iter().flatten().cloned().collect::<Vec<_>>();
+    let max_disk_failures = opts.disks.len().saturating_sub(opts.min_disks);
 
     let cancel_rx = CancellationToken::new();
 
-    for disk in opts.disks.iter() {
+    for (disk_idx, disk) in opts.disks.iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = disk_idx;
         let opdisk = disk.clone();
         let opts_clone = opts.clone();
         let mut fds_clone = fds.clone();
         let cancel_rx_clone = cancel_rx.clone();
-        let (rd, mut wr) = tokio::io::duplex(64);
+        let (rd, wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
         jobs.push(spawn(async move {
+            #[cfg(test)]
+            if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).copied() {
+                match behavior {
+                    TestReaderBehavior::Eof => return Ok(()),
+                    TestReaderBehavior::Stall => {
+                        let _held_writer = wr;
+                        cancel_rx_clone.cancelled().await;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let mut wr = wr;
             let wakl_opts = WalkDirOptions {
                 bucket: opts_clone.bucket.clone(),
                 base_dir: opts_clone.path.clone(),
@@ -114,15 +145,18 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             };
 
             let mut need_fallback = false;
+            let mut last_err = None;
             if let Some(disk) = opdisk {
                 match disk.walk_dir(wakl_opts, &mut wr).await {
                     Ok(_res) => {}
                     Err(err) => {
                         info!("walk dir err {:?}", &err);
+                        last_err = Some(err);
                         need_fallback = true;
                     }
                 }
             } else {
+                last_err = Some(DiskError::DiskNotFound);
                 need_fallback = true;
             }
 
@@ -165,12 +199,18 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 {
                     Ok(_r) => {
                         need_fallback = false;
+                        last_err = None;
                     }
                     Err(err) => {
                         error!("walk dir2 err {:?}", &err);
+                        last_err = Some(err);
                         break;
                     }
                 }
+            }
+
+            if need_fallback {
+                return Err(last_err.unwrap_or(DiskError::DiskNotFound));
             }
 
             // warn!("list_path_raw: while need_fallback done");
@@ -179,6 +219,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     }
 
     let revjob = spawn(async move {
+        #[cfg(test)]
+        let peek_timeout = opts.peek_timeout.unwrap_or_else(get_drive_walkdir_stall_timeout);
+        #[cfg(not(test))]
         let peek_timeout = get_drive_walkdir_stall_timeout();
         let mut errs: Vec<Option<DiskError>> = Vec::with_capacity(readers.len());
         for _ in 0..readers.len() {
@@ -358,6 +401,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 {
                     finished_fn(&errs).await;
                 }
+                if errs.iter().flatten().any(|err| *err == DiskError::Timeout) {
+                    return Err(DiskError::Timeout);
+                }
 
                 // error!("list_path_raw: at_eof + has_err == readers.len() break {:?}", &errs);
                 break;
@@ -400,10 +446,23 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     }
 
     let results = join_all(jobs).await;
+    let mut job_errs = Vec::new();
     for result in results {
-        if let Err(err) = result {
-            error!("list_path_raw err {:?}", err);
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                error!("list_path_raw err {:?}", err);
+                job_errs.push(err);
+            }
+            Err(err) => {
+                error!("list_path_raw join err {:?}", err);
+                job_errs.push(err.into());
+            }
         }
+    }
+
+    if job_errs.len() > max_disk_failures {
+        return Err(job_errs.remove(0));
     }
 
     // warn!("list_path_raw: done");
@@ -413,6 +472,8 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::endpoint::Endpoint;
+    use crate::disk::{DiskOption, new_disk};
     use rustfs_filemeta::MetacacheWriter;
 
     #[tokio::test]
@@ -422,6 +483,24 @@ mod tests {
             .expect_err("empty drive list should fail");
 
         assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_returns_timeout_when_reader_stalls_before_completion() {
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::Stall, TestReaderBehavior::Eof],
+                peek_timeout: Some(Duration::from_millis(20)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("stalled reader should make listing fail explicitly");
+
+        assert_eq!(err, DiskError::Timeout);
     }
 
     #[tokio::test]
@@ -455,5 +534,54 @@ mod tests {
             PeekOutcome::Ready(Some(entry)) => assert_eq!(entry.name, "bucket/object"),
             other => panic!("expected ready entry, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_path_raw_propagates_parent_scan_access_denied() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+        use tokio::fs;
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let parent = dir.path().join(bucket).join("shiplog");
+
+        fs::create_dir_all(parent.join("nano/a.txt"))
+            .await
+            .expect("test object directory should be created");
+        fs::write(parent.join("nano/a.txt/xl.meta"), b"meta")
+            .await
+            .expect("test metadata should be written");
+
+        std::fs::set_permissions(&parent, Permissions::from_mode(0o111)).expect("parent permissions should be changed");
+        if fs::read_dir(&parent).await.is_ok() {
+            std::fs::set_permissions(&parent, Permissions::from_mode(0o755)).expect("parent permissions should be restored");
+            return;
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp path should be valid utf-8"))
+            .expect("endpoint should be created");
+        let disk = new_disk(&endpoint, &DiskOption::default())
+            .await
+            .expect("local disk should be created");
+
+        let result = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![Some(disk)],
+                bucket: bucket.to_string(),
+                path: "shiplog/".to_string(),
+                min_disks: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        std::fs::set_permissions(&parent, Permissions::from_mode(0o755)).expect("parent permissions should be restored");
+
+        let err = result.expect_err("parent directory access failure must not be treated as an empty listing");
+        assert_eq!(err, DiskError::FileAccessDenied);
     }
 }
