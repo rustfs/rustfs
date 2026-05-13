@@ -159,9 +159,7 @@ pub(super) fn fstat_reported_size(phase: &WritePhase, part_size: u64, cached_siz
 /// Drop runs the same AbortMultipartUpload for both.
 ///
 /// attrs is required by the HandleState::Write variant layout but
-/// Drop does not read it. Callers pass a clone of the live attrs, or
-/// FileAttributes::default() at the write_dispatch_begin_streaming
-/// site where no live attrs is in scope.
+/// Drop does not read it. Callers pass a clone of the live attrs.
 pub(super) fn build_write_tombstone(
     bucket: &str,
     key: &str,
@@ -173,7 +171,7 @@ pub(super) fn build_write_tombstone(
         bucket: bucket.to_string(),
         key: key.to_string(),
         attrs: attrs.clone(),
-        open_attrs: FileAttributes::default(),
+        open_attrs: FileAttributes::empty(),
         phase: WritePhase::Failed {
             upload_id,
             abort_authorized,
@@ -952,7 +950,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // close_abort_or_skip can honour a Deny-Abort policy without a
         // second IAM probe per error path.
         let mp = self
-            .start_multipart_upload(dst_bucket, dst_key, &FileAttributes::default())
+            .start_multipart_upload(dst_bucket, dst_key, &FileAttributes::empty())
             .await?;
 
         let result: Result<Vec<CompletedPart>, SftpError> = async {
@@ -1590,7 +1588,7 @@ mod tests {
 
         with_test_auth_override(
             |_, _, _| true,
-            driver.write_dispatch_begin_streaming(&handle_id, &mut phase, "b", "k", &FileAttributes::default()),
+            driver.write_dispatch_begin_streaming(&handle_id, &mut phase, "b", "k", &FileAttributes::empty()),
         )
         .await
         .expect("begin_streaming must succeed on queued Create Ok");
@@ -1630,7 +1628,7 @@ mod tests {
         backend.queue_create_multipart_upload_ok("UP-ALLOW");
         let driver = build_driver(backend, TEST_PART_SIZE);
 
-        let mp = with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &FileAttributes::default()))
+        let mp = with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &FileAttributes::empty()))
             .await
             .expect("start_multipart_upload must succeed on Allow");
         assert_eq!(mp.upload_id, "UP-ALLOW");
@@ -1672,7 +1670,7 @@ mod tests {
         backend.queue_create_multipart_upload_ok("UP-NO-ATTRS");
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
-        with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &FileAttributes::default()))
+        with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &FileAttributes::empty()))
             .await
             .expect("start_multipart_upload must succeed");
 
@@ -1691,7 +1689,7 @@ mod tests {
         // a WORM-shaped IAM policy a principal can meet in production.
         let mp = with_test_auth_override(
             |action, _bucket, _object| !matches!(action, S3Action::AbortMultipartUpload),
-            driver.start_multipart_upload("b", "k", &FileAttributes::default()),
+            driver.start_multipart_upload("b", "k", &FileAttributes::empty()),
         )
         .await
         .expect("Create Allow must succeed even when Abort is Deny");
@@ -1713,7 +1711,7 @@ mod tests {
 
         let err = with_test_auth_override(
             |action, _, _| !matches!(action, S3Action::CreateMultipartUpload),
-            driver.start_multipart_upload("b", "k", &FileAttributes::default()),
+            driver.start_multipart_upload("b", "k", &FileAttributes::empty()),
         )
         .await
         .expect_err("Deny on CreateMultipartUpload must fail fast");
@@ -1722,6 +1720,37 @@ mod tests {
             backend.upload_part_calls().is_empty(),
             "Create authorize failure must not reach any backend call"
         );
+    }
+
+    #[tokio::test]
+    async fn multipart_copy_starts_upload_without_sftp_open_metadata() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_create_multipart_upload_ok("UP-COPY");
+        backend.queue_upload_part_copy_ok("etag-copy-1");
+        backend.queue_complete_multipart_upload_ok();
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        with_test_auth_override(
+            |_, _, _| true,
+            driver.multipart_copy("src-bucket", "src-key", "dst-bucket", "dst-key", TEST_PART_SIZE),
+        )
+        .await
+        .expect("multipart copy must complete");
+
+        let create_calls = backend.create_multipart_calls();
+        assert_eq!(create_calls.len(), 1);
+        assert_eq!(create_calls[0].bucket, "dst-bucket");
+        assert_eq!(create_calls[0].key, "dst-key");
+        assert!(
+            create_calls[0].metadata.is_none(),
+            "server-side multipart copy is not an SFTP OPEN path and must not write OPEN metadata"
+        );
+
+        let complete_calls = backend.complete_multipart_calls();
+        assert_eq!(complete_calls.len(), 1);
+        assert_eq!(complete_calls[0].upload_id, "UP-COPY");
+        assert_eq!(complete_calls[0].part_count, 1);
+        assert!(backend.abort_multipart_calls().is_empty(), "successful multipart copy must not abort");
     }
 
     // --- upload_multipart_bytes ---
@@ -1912,7 +1941,7 @@ mod tests {
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
         driver
-            .commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec())
+            .commit_write("b", "k", &FileAttributes::empty(), b"hello".to_vec())
             .await
             .expect("commit_write must succeed");
 
