@@ -35,7 +35,7 @@ impl NotifyRuntimeFacade {
         concurrency_limiter: Arc<Semaphore>,
         metrics: Arc<NotificationMetrics>,
     ) -> Self {
-        let replay_metrics = metrics.clone();
+        let replay_metrics = metrics;
         let runtime_adapter = BuiltinPluginRuntimeAdapter::new(
             Arc::new(move |event: ReplayEvent<Event>| {
                 let metrics = replay_metrics.clone();
@@ -60,7 +60,7 @@ impl NotifyRuntimeFacade {
                     info!("Target {} has no replay worker to start", target_id);
                 }
             }),
-            Some(concurrency_limiter.clone()),
+            Some(concurrency_limiter),
             Duration::from_secs(5),
             Duration::from_millis(500),
             "Stop event stream processing for target",

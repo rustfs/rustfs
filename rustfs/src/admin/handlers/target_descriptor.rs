@@ -602,14 +602,14 @@ fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, conf
     for instance in &normalized_instances {
         let key = normalized_endpoint_key(&instance.instance_id, &instance.target_type);
 
-        if instance_has_config_entry(&instance) {
+        if instance_has_config_entry(instance) {
             config_targets.insert(key.clone());
             if instance.enabled {
                 configured_keys.push((instance.instance_id.clone(), instance.target_type.clone()));
             }
         }
 
-        if instance_has_env_entry(&instance) {
+        if instance_has_env_entry(instance) {
             env_targets.insert(key);
         }
     }

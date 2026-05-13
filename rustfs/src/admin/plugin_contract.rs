@@ -149,6 +149,8 @@ pub(crate) struct PluginRevisionContract {
     pub digest_sha256: Option<String>,
     pub source: String,
     pub installed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,6 +159,8 @@ pub(crate) struct PluginInstallationContract {
     pub install_state: PluginInstallState,
     pub current_revision: Option<PluginRevisionContract>,
     pub previous_revision: Option<PluginRevisionContract>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_error: Option<String>,
 }
 
 impl From<TargetPluginInstallation> for PluginInstallationContract {
@@ -168,13 +172,16 @@ impl From<TargetPluginInstallation> for PluginInstallationContract {
                 digest_sha256: revision.digest_sha256,
                 source: revision.source,
                 installed_at: revision.installed_at,
+                artifact_id: revision.artifact_id,
             }),
             previous_revision: value.previous_revision.map(|revision| PluginRevisionContract {
                 version: revision.version,
                 digest_sha256: revision.digest_sha256,
                 source: revision.source,
                 installed_at: revision.installed_at,
+                artifact_id: revision.artifact_id,
             }),
+            validation_error: value.validation_error,
         }
     }
 }

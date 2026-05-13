@@ -15,6 +15,9 @@
 use crate::TargetDomain;
 use crate::runtime::sidecar_protocol::SidecarHandshake;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+const DEFAULT_FAILURE_THRESHOLD: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,6 +25,9 @@ pub struct SidecarPluginRuntime {
     pub endpoint: String,
     pub handshake: SidecarHandshake,
     pub healthy: bool,
+    pub failure_count: usize,
+    pub degraded_to_builtin: bool,
+    pub last_error: Option<String>,
 }
 
 impl SidecarPluginRuntime {
@@ -30,6 +36,9 @@ impl SidecarPluginRuntime {
             endpoint: endpoint.into(),
             handshake,
             healthy: false,
+            failure_count: 0,
+            degraded_to_builtin: false,
+            last_error: None,
         }
     }
 
@@ -43,11 +52,39 @@ impl SidecarPluginRuntime {
         }
 
         self.healthy = true;
+        self.degraded_to_builtin = false;
+        self.last_error = None;
+        self.failure_count = 0;
         Ok(())
     }
 
     pub fn mark_unhealthy(&mut self) {
         self.healthy = false;
+    }
+
+    pub fn record_failure(&mut self, error: impl Into<String>) {
+        self.failure_count = self.failure_count.saturating_add(1);
+        self.healthy = false;
+        self.last_error = Some(error.into());
+        if self.failure_count >= DEFAULT_FAILURE_THRESHOLD {
+            self.degraded_to_builtin = true;
+        }
+    }
+
+    pub fn send_with_timeout(&mut self, operation_timeout: Duration, simulated_latency: Duration) -> Result<(), String> {
+        if simulated_latency > operation_timeout {
+            self.record_failure(format!(
+                "sidecar send timeout after {:?} (budget {:?})",
+                simulated_latency, operation_timeout
+            ));
+            return Err(self
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "sidecar timeout without recorded error".to_string()));
+        }
+        self.healthy = true;
+        self.last_error = None;
+        Ok(())
     }
 
     pub fn shutdown(&mut self) {
@@ -60,6 +97,7 @@ mod tests {
     use super::SidecarPluginRuntime;
     use crate::TargetDomain;
     use crate::runtime::sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability};
+    use std::time::Duration;
 
     fn notify_sidecar_handshake() -> SidecarHandshake {
         SidecarHandshake {
@@ -106,5 +144,28 @@ mod tests {
         runtime.shutdown();
 
         assert!(!runtime.healthy);
+    }
+
+    #[test]
+    fn sidecar_runtime_degrades_to_builtin_after_failure_threshold() {
+        let mut runtime = SidecarPluginRuntime::new("grpc://127.0.0.1:50051", notify_sidecar_handshake());
+
+        runtime.record_failure("send failed");
+        runtime.record_failure("send failed again");
+        runtime.record_failure("send failed third time");
+
+        assert!(runtime.degraded_to_builtin);
+        assert!(!runtime.healthy);
+        assert_eq!(runtime.failure_count, 3);
+    }
+
+    #[test]
+    fn sidecar_runtime_send_timeout_records_last_error() {
+        let mut runtime = SidecarPluginRuntime::new("grpc://127.0.0.1:50051", notify_sidecar_handshake());
+
+        let result = runtime.send_with_timeout(Duration::from_millis(50), Duration::from_millis(75));
+
+        assert!(result.is_err());
+        assert_eq!(runtime.last_error.as_deref(), Some("sidecar send timeout after 75ms (budget 50ms)"));
     }
 }
