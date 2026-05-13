@@ -1291,12 +1291,31 @@ impl LocalDisk {
 
         let mut dir_objes = HashSet::new();
 
+        // need to skip multipart dirs
+        let mut multipart_dir_to_skip = HashSet::new();
+        if skip_current_dir_object
+            && let Ok(meta) = self
+                .read_metadata(bucket, format!("{}/{}", &current, STORAGE_FORMAT_FILE).as_str())
+                .await
+            && let Ok(file_meta) = FileMeta::load(&meta)
+            && let Ok(data_dirs) = file_meta.get_data_dirs()
+        {
+            for data_dir in data_dirs.iter().flatten() {
+                multipart_dir_to_skip.insert(data_dir.to_string());
+            }
+        }
+
         // First-level filtering
         for item in entries.iter_mut() {
             let entry = item.clone();
             // check limit
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
+            }
+            // check multipart dir
+            if skip_current_dir_object && multipart_dir_to_skip.contains(entry.trim_end_matches(SLASH_SEPARATOR)) {
+                *item = "".to_owned();
+                continue;
             }
             // check prefix
             if !prefix.is_empty() && !entry.starts_with(prefix.as_str()) {
