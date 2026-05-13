@@ -13,7 +13,7 @@
 //  limitations under the License.
 
 use async_trait::async_trait;
-use rustfs_audit::{AuditPipeline, AuditRegistry, AuditRuntimeFacade, AuditRuntimeView, system::AuditSystemState};
+use rustfs_audit::{AuditPipeline, AuditRegistry, AuditRuntimeFacade, AuditRuntimeView};
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::store::{Key, Store};
 use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
@@ -117,9 +117,8 @@ async fn audit_runtime_facade_activates_empty_target_list() {
     let registry = Arc::new(Mutex::new(AuditRegistry::new()));
     let replay_workers = Arc::new(RwLock::new(rustfs_targets::ReplayWorkerManager::new()));
     let facade = AuditRuntimeFacade::new(registry, replay_workers);
-    let state = Arc::new(RwLock::new(AuditSystemState::Stopped));
 
-    let activation = facade.activate_targets_with_replay(state, Vec::new()).await;
+    let activation = facade.activate_targets_with_replay(Vec::new()).await;
     assert!(activation.targets.is_empty());
     assert_eq!(activation.replay_workers.len(), 0);
 }

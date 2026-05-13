@@ -132,6 +132,10 @@ impl AuditRegistry {
         &self.targets
     }
 
+    pub fn runtime_manager_mut(&mut self) -> &mut TargetRuntimeManager<AuditEntry> {
+        &mut self.targets
+    }
+
     /// Lists all target IDs
     ///
     /// # Returns

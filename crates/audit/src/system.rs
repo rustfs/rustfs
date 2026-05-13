@@ -85,10 +85,13 @@ impl AuditSystem {
     }
 
     async fn clear_runtime_targets(&self) -> AuditResult<()> {
-        self.runtime_facade().stop_replay_workers().await;
-        let mut registry = self.registry.lock().await;
-        registry.close_all().await?;
-        drop(registry);
+        {
+            let mut registry = self.registry.lock().await;
+            let mut replay_workers = self.stream_cancellers.write().await;
+            self.runtime_facade()
+                .shutdown_runtime(&mut registry, &mut replay_workers)
+                .await?;
+        }
 
         let mut state = self.state.write().await;
         *state = AuditSystemState::Stopped;
@@ -108,10 +111,7 @@ impl AuditSystem {
 
         info!(target_count = targets.len(), "Created audit targets successfully");
 
-        let activation = self
-            .runtime_facade()
-            .activate_targets_with_replay(self.state.clone(), targets)
-            .await;
+        let activation = self.runtime_facade().activate_targets_with_replay(targets).await;
         self.runtime_facade().replace_targets(activation).await?;
 
         let mut state = self.state.write().await;
