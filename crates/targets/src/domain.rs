@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use crate::target::TargetType;
+use serde::{Deserialize, Serialize};
 
 /// Logical target domains supported by RustFS target plugins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TargetDomain {
     Notify,
     Audit,

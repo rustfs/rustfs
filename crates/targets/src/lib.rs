@@ -39,7 +39,7 @@ pub use config::{
 pub use control_plane::{
     TargetPluginEnableState, TargetPluginInstallState, TargetPluginInstallation, TargetPluginOperationalState,
     TargetPluginRevision, TargetPluginRuntimeState, builtin_target_plugin_installation, builtin_target_plugin_operational_state,
-    runtime_state_from_status_label,
+    external_target_plugin_installation, rollback_target_plugin_installation, runtime_state_from_status_label,
 };
 pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};
@@ -55,8 +55,11 @@ pub use plugin::{
 pub use runtime::{
     ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeStatusSnapshot, RuntimeTargetHealthSnapshot,
     RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager, activate_targets_with_replay,
-    init_target_and_optionally_start_replay, start_replay_worker,
     adapter::{BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter},
+    init_target_and_optionally_start_replay,
+    sidecar::SidecarPluginRuntime,
+    sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability},
+    start_replay_worker,
 };
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};

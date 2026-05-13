@@ -13,6 +13,8 @@
 // limitations under the License.
 
 pub mod adapter;
+pub mod sidecar;
+pub mod sidecar_protocol;
 
 use crate::Target;
 use crate::arn::TargetID;

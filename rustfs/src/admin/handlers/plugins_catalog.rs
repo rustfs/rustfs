@@ -27,7 +27,12 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
-use rustfs_targets::{BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest, builtin_target_plugin_installation};
+use rustfs_targets::{
+    BuiltinTargetAdminDescriptor, SidecarHandshake, SidecarPluginCapability, SidecarPluginRuntime, TargetDomain,
+    TargetPluginArtifactManifest, TargetPluginDistributionManifest, TargetPluginEntrypointKind,
+    TargetPluginExternalRuntimeContract, TargetPluginRuntimeTransport, builtin_target_marketplace_manifest,
+    builtin_target_plugin_installation, external_target_plugin_installation, installable_target_marketplace_manifest,
+};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -62,6 +67,7 @@ fn build_catalog_response() -> PluginCatalogResponse {
     }
 
     let mut plugins = plugins.into_values().collect::<Vec<_>>();
+    plugins.push(example_external_webhook_plugin_entry());
     plugins.sort_by(|a, b| a.target_type.cmp(&b.target_type));
     for plugin in &mut plugins {
         plugin.supported_domains.sort();
@@ -69,6 +75,79 @@ fn build_catalog_response() -> PluginCatalogResponse {
     }
 
     PluginCatalogResponse { plugins }
+}
+
+fn example_external_webhook_plugin_entry() -> PluginCatalogEntry {
+    let base = rustfs_targets::TargetPluginManifest {
+        plugin_id: "external:webhook-sidecar",
+        display_name: "Webhook Sidecar",
+        provider: "rustfs-labs",
+        version: "1.0.0",
+        target_type: "webhook",
+        supported_domains: &[TargetDomain::Notify],
+        secret_fields: &["auth_token"],
+    };
+    let marketplace = installable_target_marketplace_manifest(
+        base,
+        TargetPluginEntrypointKind::Sidecar,
+        TargetPluginExternalRuntimeContract {
+            protocol_version: rustfs_targets::SIDECAR_RUNTIME_PROTOCOL_VERSION,
+            transport: TargetPluginRuntimeTransport::Grpc,
+        },
+        TargetPluginDistributionManifest {
+            artifacts: &[TargetPluginArtifactManifest {
+                artifact_id: "sidecar-linux-amd64",
+                target_triple: "x86_64-unknown-linux-gnu",
+                download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
+                digest_sha256: "0123456789abcdef0123456789abcdef",
+                size_bytes: 8192,
+            }],
+        },
+    );
+    let handshake = SidecarHandshake {
+        protocol_version: rustfs_targets::SIDECAR_RUNTIME_PROTOCOL_VERSION.to_string(),
+        plugin_id: base.plugin_id.to_string(),
+        plugin_version: base.version.to_string(),
+        supported_domains: vec![TargetDomain::Notify],
+        capabilities: vec![
+            SidecarPluginCapability::HealthCheck,
+            SidecarPluginCapability::SendEvent,
+            SidecarPluginCapability::Shutdown,
+        ],
+    };
+    let mut runtime = SidecarPluginRuntime::new("grpc://127.0.0.1:50051", handshake);
+    runtime
+        .enable(base.plugin_id, TargetDomain::Notify)
+        .expect("example sidecar plugin handshake should validate");
+
+    PluginCatalogEntry {
+        plugin_id: base.plugin_id.to_string(),
+        target_type: base.target_type.to_string(),
+        display_name: base.display_name.to_string(),
+        provider: base.provider.to_string(),
+        version: base.version.to_string(),
+        packaging: PluginContractPackaging::from(marketplace.packaging),
+        entrypoint_kind: PluginContractEntrypointKind::from(marketplace.entrypoint_kind),
+        api_compatibility_version: marketplace.api_compatibility_version.to_string(),
+        runtime_contract: PluginRuntimeContract::from(marketplace.runtime_contract),
+        distribution: marketplace.distribution.map(PluginDistributionContract::from),
+        supported_domains: base.supported_domains.iter().copied().map(Into::into).collect(),
+        secret_fields: base.secret_fields.iter().map(|field| (*field).to_string()).collect(),
+        domain_configs: vec![PluginCatalogDomainEntry {
+            domain: PluginContractDomain::Notify,
+            subsystem: "notify_webhook".to_string(),
+            valid_fields: vec!["endpoint".to_string(), "auth_token".to_string()],
+        }],
+        installation: Some(
+            external_target_plugin_installation(
+                base.version,
+                "0123456789abcdef0123456789abcdef",
+                "sidecar-linux-amd64",
+                Some("2026-05-13T20:00:00Z".to_string()),
+            )
+            .into(),
+        ),
+    }
 }
 
 fn merge_catalog_descriptor(plugins: &mut HashMap<&'static str, PluginCatalogEntry>, descriptor: &BuiltinTargetAdminDescriptor) {
