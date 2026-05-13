@@ -215,8 +215,8 @@ pub async fn start_http_server(
         TcpListener::from_std(socket.into())?
     };
 
-    let tls_path = config.tls_path.as_deref().unwrap_or_default();
-    let tls_path_configured = config.tls_path.as_ref().is_some_and(|path| !path.trim().is_empty());
+    let tls_path = config.tls_path.as_deref().map(str::trim).unwrap_or_default();
+    let tls_path_configured = !tls_path.is_empty();
     // Load TLS materials and build server acceptor.
     // Note: outbound material (root CAs, mTLS identity) is already applied in main.rs.
     let tls_snapshot = TlsMaterialSnapshot::load(tls_path)

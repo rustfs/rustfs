@@ -66,8 +66,6 @@ pub struct OutboundTlsMaterial {
 pub struct TlsMaterialSnapshot {
     /// Material for outbound client connections.
     pub outbound: OutboundTlsMaterial,
-    /// Whether any server certificates were found.
-    pub has_server_certs: bool,
 }
 
 impl TlsMaterialSnapshot {
@@ -86,13 +84,7 @@ impl TlsMaterialSnapshot {
         // Load outbound material (root CAs + mTLS identity)
         let outbound = load_outbound_material(&tls_dir).await?;
 
-        // Check if server certs exist (actual loading happens in build_tls_acceptor)
-        let has_server_certs = has_server_certificates(tls_path).await;
-
-        Ok(Self {
-            outbound,
-            has_server_certs,
-        })
+        Ok(Self { outbound })
     }
 
     /// Apply outbound material to global state (root CAs, mTLS identity).
@@ -174,7 +166,6 @@ impl TlsMaterialSnapshot {
                 root_ca_pem: Vec::new(),
                 mtls_identity: None,
             },
-            has_server_certs: false,
         }
     }
 }
@@ -287,24 +278,6 @@ async fn load_outbound_material(tls_dir: &Path) -> Result<OutboundTlsMaterial, T
         root_ca_pem,
         mtls_identity,
     })
-}
-
-/// Quick check whether server certificate files exist in the TLS directory.
-async fn has_server_certificates(tls_path: &str) -> bool {
-    if tokio::fs::metadata(tls_path).await.is_err() {
-        return false;
-    }
-    // Check for multi-cert directory structure OR single cert files
-    if rustfs_utils::load_all_certs_from_directory(
-        rustfs_utils::CertDirectoryLoadOptions::builder(tls_path, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
-    )
-    .is_ok_and(|p| !p.is_empty())
-    {
-        return true;
-    }
-    let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
-    let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
-    tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok()
 }
 
 /// Load mTLS client identity from the TLS directory.
