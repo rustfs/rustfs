@@ -14,8 +14,7 @@
 
 use crate::{Event, NotificationError, integration::NotificationMetrics, notifier::SharedNotifyTargetList};
 use rustfs_targets::{
-    ReplayEvent, ReplayWorkerManager, RuntimeActivation, Target, activate_targets_with_replay,
-    init_target_and_optionally_start_replay, start_replay_worker,
+    BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter, ReplayEvent, ReplayWorkerManager, RuntimeActivation, Target,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +25,7 @@ use tracing::info;
 pub struct NotifyRuntimeFacade {
     target_list: SharedNotifyTargetList,
     replay_workers: Arc<RwLock<ReplayWorkerManager>>,
-    concurrency_limiter: Arc<Semaphore>,
-    metrics: Arc<NotificationMetrics>,
+    runtime_adapter: Arc<dyn PluginRuntimeAdapter<Event>>,
 }
 
 impl NotifyRuntimeFacade {
@@ -37,11 +35,41 @@ impl NotifyRuntimeFacade {
         concurrency_limiter: Arc<Semaphore>,
         metrics: Arc<NotificationMetrics>,
     ) -> Self {
+        let replay_metrics = metrics.clone();
+        let runtime_adapter = BuiltinPluginRuntimeAdapter::new(
+            Arc::new(move |event: ReplayEvent<Event>| {
+                let metrics = replay_metrics.clone();
+                Box::pin(async move {
+                    match event {
+                        ReplayEvent::Delivered { .. } => metrics.increment_processed(),
+                        ReplayEvent::RetryableError { .. } => {}
+                        ReplayEvent::Dropped { target, .. }
+                        | ReplayEvent::PermanentFailure { target, .. }
+                        | ReplayEvent::RetryExhausted { target, .. } => {
+                            target.record_final_failure();
+                            metrics.increment_failed();
+                        }
+                        ReplayEvent::UnreadableEntry { .. } => {}
+                    }
+                })
+            }),
+            Arc::new(|target_id, has_replay| {
+                if has_replay {
+                    info!("Event stream processing for target {} is started successfully", target_id);
+                } else {
+                    info!("Target {} has no replay worker to start", target_id);
+                }
+            }),
+            Some(concurrency_limiter.clone()),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            "Stop event stream processing for target",
+        );
+
         Self {
             target_list,
             replay_workers,
-            concurrency_limiter,
-            metrics,
+            runtime_adapter: Arc::new(runtime_adapter),
         }
     }
 
@@ -49,69 +77,22 @@ impl NotifyRuntimeFacade {
         &self,
         targets: Vec<Box<dyn Target<Event> + Send + Sync>>,
     ) -> RuntimeActivation<Event> {
-        activate_targets_with_replay(targets, |target| {
-            let metrics = self.metrics.clone();
-            let limiter = self.concurrency_limiter.clone();
-            async move {
-                let target_id = target.id();
-                info!("Initializing target: {}", target_id);
-                init_target_and_optionally_start_replay(
-                    target,
-                    |target_id, has_replay| {
-                        if has_replay {
-                            info!("Event stream processing for target {} is started successfully", target_id);
-                        } else {
-                            info!("Target {} has no replay worker to start", target_id);
-                        }
-                    },
-                    move |store, target| {
-                        start_replay_worker(
-                            store,
-                            target,
-                            Arc::new(move |event| {
-                                let metrics = metrics.clone();
-                                Box::pin(async move {
-                                    match event {
-                                        ReplayEvent::Delivered { .. } => metrics.increment_processed(),
-                                        ReplayEvent::RetryableError { .. } => {}
-                                        ReplayEvent::Dropped { target, .. }
-                                        | ReplayEvent::PermanentFailure { target, .. }
-                                        | ReplayEvent::RetryExhausted { target, .. } => {
-                                            target.record_final_failure();
-                                            metrics.increment_failed();
-                                        }
-                                        ReplayEvent::UnreadableEntry { .. } => {}
-                                    }
-                                })
-                            }),
-                            Some(limiter.clone()),
-                            Duration::from_secs(5),
-                            Duration::from_millis(500),
-                        )
-                    },
-                )
-                .await
-            }
-        })
-        .await
+        self.runtime_adapter.activate_with_replay(targets).await
     }
 
     pub async fn replace_targets(&self, activation: RuntimeActivation<Event>) -> Result<(), NotificationError> {
-        self.stop_replay_workers().await;
-        {
-            let mut target_list = self.target_list.write().await;
-            target_list.clear_targets_only().await;
-            for target in activation.targets {
-                target_list.add(target)?;
-            }
-        }
-        *self.replay_workers.write().await = activation.replay_workers;
+        let mut target_list = self.target_list.write().await;
+        let mut replay_workers = self.replay_workers.write().await;
+        self.runtime_adapter
+            .replace_runtime_targets(target_list.runtime_mut(), &mut replay_workers, activation)
+            .await
+            .map_err(NotificationError::Target)?;
         Ok(())
     }
 
     pub async fn stop_replay_workers(&self) {
         let mut replay_workers = self.replay_workers.write().await;
-        replay_workers.stop_all("Stop event stream processing for target").await;
+        self.runtime_adapter.stop_replay_workers(&mut replay_workers).await;
     }
 
     pub async fn shutdown(&self) {
@@ -120,7 +101,17 @@ impl NotifyRuntimeFacade {
         let active_targets = self.replay_workers.read().await.len();
         info!("Stops {} active event stream processing tasks", active_targets);
 
-        self.stop_replay_workers().await;
+        {
+            let mut target_list = self.target_list.write().await;
+            let mut replay_workers = self.replay_workers.write().await;
+            if let Err(err) = self
+                .runtime_adapter
+                .shutdown(target_list.runtime_mut(), &mut replay_workers)
+                .await
+            {
+                tracing::error!(error = %err, "Failed to shutdown notify runtime cleanly");
+            }
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         info!("Notify the system to be shut down completed");

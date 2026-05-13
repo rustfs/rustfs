@@ -288,6 +288,10 @@ impl TargetList {
         self.runtime.status_snapshot(replay_workers)
     }
 
+    pub fn runtime_mut(&mut self) -> &mut TargetRuntimeManager<Event> {
+        &mut self.runtime
+    }
+
     /// Returns the number of targets
     pub fn len(&self) -> usize {
         self.runtime.len()
@@ -333,23 +337,28 @@ mod tests {
         assert!(targets.contains(&target_id));
     }
 
-    #[test]
-    fn encoded_event_key_matches_raw_and_decoded_rule_targets() {
+    #[tokio::test]
+    async fn encoded_event_key_matches_raw_and_decoded_rule_targets() {
         let raw_target = TargetID::new("raw".to_string(), "webhook".to_string());
         let decoded_target = TargetID::new("decoded".to_string(), "webhook".to_string());
         let mut rules_map = RulesMap::new();
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads%2F*.csv".to_string(), raw_target.clone());
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), decoded_target.clone());
 
-        let targets = match_event_targets(&rules_map, EventName::ObjectCreatedPut, "uploads%2Freport.csv");
+        let rule_engine = NotifyRuleEngine::new();
+        rule_engine.set_bucket_rules("test-bucket", rules_map).await;
+
+        let targets = rule_engine
+            .match_targets("test-bucket", EventName::ObjectCreatedPut, "uploads%2Freport.csv")
+            .await;
 
         assert_eq!(targets.len(), 2);
         assert!(targets.contains(&raw_target));
         assert!(targets.contains(&decoded_target));
     }
 
-    #[test]
-    fn encoded_event_key_does_not_bypass_suffix_filter() {
+    #[tokio::test]
+    async fn encoded_event_key_does_not_bypass_suffix_filter() {
         let target_id = TargetID::new("primary".to_string(), "webhook".to_string());
         let mut rules_map = RulesMap::new();
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), target_id);
