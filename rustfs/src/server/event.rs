@@ -62,7 +62,11 @@ fn parse_host_and_port(host: String) -> (String, u16) {
         return (addr.ip().to_string(), addr.port());
     }
 
-    match host.rsplit_once(':') {
+    if host.chars().filter(|&c| c == ':').count() != 1 {
+        return (host, 0);
+    }
+
+    match host.split_once(':') {
         Some((base, port)) if !base.is_empty() => match port.parse::<u16>() {
             Ok(port) => (base.to_string(), port),
             Err(_) => (host, 0),
@@ -81,6 +85,39 @@ fn install_ecstore_event_dispatch_hook() {
 
     if !installed {
         warn!("ECStore event dispatch hook was already registered");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_host_and_port;
+
+    #[test]
+    fn parse_host_and_port_with_ipv4_and_port() {
+        let (host, port) = parse_host_and_port("127.0.0.1:9000".to_string());
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 9000);
+    }
+
+    #[test]
+    fn parse_host_and_port_with_bracketed_ipv6_and_port() {
+        let (host, port) = parse_host_and_port("[::1]:9000".to_string());
+        assert_eq!(host, "::1");
+        assert_eq!(port, 9000);
+    }
+
+    #[test]
+    fn parse_host_and_port_with_ipv6_without_port() {
+        let (host, port) = parse_host_and_port("::1".to_string());
+        assert_eq!(host, "::1");
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn parse_host_and_port_with_hostname_and_port() {
+        let (host, port) = parse_host_and_port("localhost:9001".to_string());
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 9001);
     }
 }
 

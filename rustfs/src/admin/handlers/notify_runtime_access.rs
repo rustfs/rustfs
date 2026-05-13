@@ -35,7 +35,7 @@ pub(crate) async fn set_notification_target_config(
     system
         .set_target_config(subsystem, target_name, kvs)
         .await
-        .map_err(|e| s3_error!(InternalError, "failed to set plugin instance config: {}", e))
+        .map_err(|e| s3_error!(InternalError, "failed to set notification target config: {}", e))
 }
 
 pub(crate) async fn remove_notification_target_config(subsystem: &str, target_name: &str) -> S3Result<()> {
@@ -43,5 +43,5 @@ pub(crate) async fn remove_notification_target_config(subsystem: &str, target_na
     system
         .remove_target_config(subsystem, target_name)
         .await
-        .map_err(|e| s3_error!(InternalError, "failed to remove plugin instance config: {}", e))
+        .map_err(|e| s3_error!(InternalError, "failed to remove notification target config: {}", e))
 }
