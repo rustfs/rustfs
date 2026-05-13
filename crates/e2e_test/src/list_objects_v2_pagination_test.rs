@@ -31,6 +31,7 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use serial_test::serial;
+    use std::collections::HashSet;
     use tracing::info;
 
     /// Helper function to create an S3 client for testing
@@ -55,6 +56,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Test for Issue #2775: continuation forwarding must not
+    /// skip a child directory when the prefix component repeats in the key.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_repeated_prefix_continuation() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 repeated-prefix continuation");
+
+        const PAGE_SIZE: i32 = 2;
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
+            .await
+            .expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-repeated-prefix-small";
+        let prefix = "engineering/";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let expected_keys = vec![
+            format!("{prefix}alpha-000/artifact.txt"),
+            format!("{prefix}engineering/engineering/project-000/artifact.txt"),
+            format!("{prefix}engineering/engineering/project-001/artifact.txt"),
+            format!("{prefix}engineering/project-000/artifact.txt"),
+            format!("{prefix}engineering/project-001/artifact.txt"),
+            format!("{prefix}engineering/project-002/artifact.txt"),
+            format!("{prefix}zulu-000/artifact.txt"),
+        ];
+        let noise_keys = [
+            "different/prefix/prefix/project-000/artifact.txt",
+            "engineering-other/project-000/artifact.txt",
+            "unrelated/engineering/project-000/artifact.txt",
+        ];
+
+        for key in &expected_keys {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .expect("Failed to put object");
+        }
+        for key in noise_keys {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .expect("Failed to put noise object");
+        }
+
+        let mut listed_keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        let mut last_key: Option<String> = None;
+        let mut page_count = 0;
+
+        loop {
+            let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix).max_keys(PAGE_SIZE);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let output = request.send().await.expect("Failed to list objects");
+
+            for obj in output.contents() {
+                if let Some(key) = obj.key() {
+                    if let Some(previous) = &last_key {
+                        assert!(
+                            key > previous.as_str(),
+                            "ListObjectsV2 did not preserve lexicographic order: {key} <= {previous}"
+                        );
+                    }
+
+                    last_key = Some(key.to_string());
+                    listed_keys.push(key.to_string());
+                }
+            }
+
+            page_count += 1;
+
+            if output.is_truncated().unwrap_or(false) {
+                continuation_token = output.next_continuation_token().map(|s| s.to_string());
+                assert!(
+                    continuation_token.is_some(),
+                    "BUG: NextContinuationToken must be present when IsTruncated is true"
+                );
+            } else {
+                break;
+            }
+
+            if page_count > 10 {
+                panic!("Too many pages, possible infinite loop due to pagination bug");
+            }
+        }
+
+        let seen: HashSet<String> = listed_keys.iter().cloned().collect();
+
+        assert_eq!(
+            listed_keys, expected_keys,
+            "Issue #2775 regression: repeated-prefix pagination must return exactly the expected keys in lexicographic order"
+        );
+        assert_eq!(
+            listed_keys.len(),
+            expected_keys.len(),
+            "Issue #2775 regression: expected all {} repeated-prefix objects under {prefix}, got {}",
+            expected_keys.len(),
+            listed_keys.len()
+        );
+        assert_eq!(seen.len(), expected_keys.len(), "Listed keys must be unique");
+
+        for key in &expected_keys {
+            assert!(seen.contains(key), "Missing expected key after repeated-prefix pagination: {key}");
+        }
+
+        env.stop_server();
     }
 
     /// Test that IsTruncated is false when all objects fit within max_keys

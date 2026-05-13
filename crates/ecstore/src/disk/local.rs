@@ -1247,29 +1247,16 @@ impl LocalDisk {
         W: AsyncWrite + Unpin + Send,
     {
         let forward = {
-            opts.forward_to.as_ref().filter(|v| v.starts_with(&*current)).map(|v| {
-                let forward = v.trim_start_matches(&*current);
-                if let Some(idx) = forward.find('/') {
-                    forward[..idx].to_owned()
-                } else {
-                    forward.to_owned()
-                }
-            })
-            // if let Some(forward_to) = &opts.forward_to {
-
-            // } else {
-            //     None
-            // }
-            // if !opts.forward_to.is_empty() && opts.forward_to.starts_with(&*current) {
-            //     let forward = opts.forward_to.trim_start_matches(&*current);
-            //     if let Some(idx) = forward.find('/') {
-            //         &forward[..idx]
-            //     } else {
-            //         forward
-            //     }
-            // } else {
-            //     ""
-            // }
+            opts.forward_to
+                .as_ref()
+                .and_then(|v| v.strip_prefix(&current))
+                .map(|forward| {
+                    if let Some(idx) = forward.find('/') {
+                        forward[..idx].to_owned()
+                    } else {
+                        forward.to_owned()
+                    }
+                })
         };
 
         if opts.limit > 0 && *objs_returned >= opts.limit {
@@ -3236,6 +3223,109 @@ mod test {
         assert_eq!(names.iter().filter(|name| *name == "marker/subdir/file.txt").count(), 1);
         assert_eq!(names.iter().filter(|name| *name == "marker/subdir/").count(), 1);
         assert_eq!(names.iter().filter(|name| *name == "marker/file.txt").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_forward_to_repeated_prefix_component() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        for name in [
+            "different/prefix/prefix/repo-0000",
+            "different/prefix/prefix/repo-0001",
+            "different/prefix/prefix/repo-0002",
+            "engineering/alpha-0000",
+            "engineering/engineering/engineering/repo-0000",
+            "engineering/engineering/engineering/repo-0001",
+            "engineering/engineering/repo-0000",
+            "engineering/engineering/repo-0001",
+            "engineering/engineering/repo-0002",
+            "engineering/zulu-0000",
+            "unrelated/engineering/repo-0000",
+        ] {
+            let object_dir = bucket_dir.join(name);
+            fs::create_dir_all(&object_dir).await.unwrap();
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta").await.unwrap();
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str) -> (Vec<String>, i32) {
+            let (reader, mut writer) = tokio::io::duplex(4096);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: base_dir.to_string(),
+                recursive: true,
+                forward_to: Some(forward_to.to_string()),
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+                .await
+                .unwrap();
+            out.close().await.unwrap();
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            let entries = reader.read_all().await.unwrap();
+            let names: Vec<String> = entries
+                .into_iter()
+                .filter(|entry| !entry.metadata.is_empty())
+                .map(|entry| entry.name)
+                .collect();
+
+            (names, objs_returned)
+        }
+
+        let (engineering_names, engineering_count) =
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001").await;
+
+        assert_eq!(
+            engineering_names,
+            vec![
+                "engineering/engineering/engineering/repo-0001".to_string(),
+                "engineering/engineering/repo-0000".to_string(),
+                "engineering/engineering/repo-0001".to_string(),
+                "engineering/engineering/repo-0002".to_string(),
+                "engineering/zulu-0000".to_string(),
+            ],
+            "forward_to must resume at the requested triply repeated prefix and preserve lexicographic order"
+        );
+        assert_eq!(engineering_count as usize, engineering_names.len());
+
+        let (different_names, different_count) =
+            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001").await;
+
+        assert_eq!(
+            different_names,
+            vec![
+                "different/prefix/prefix/repo-0001".to_string(),
+                "different/prefix/prefix/repo-0002".to_string(),
+            ],
+            "forward_to must also work for repeated components unrelated to the engineering prefix"
+        );
+        assert_eq!(different_count as usize, different_names.len());
+
+        let (double_names, double_count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001").await;
+
+        assert_eq!(
+            double_names,
+            vec![
+                "engineering/engineering/repo-0001".to_string(),
+                "engineering/engineering/repo-0002".to_string(),
+                "engineering/zulu-0000".to_string(),
+            ],
+            "forward_to must not skip a child directory whose name repeats the base prefix"
+        );
+        assert_eq!(double_count as usize, double_names.len());
     }
 
     #[tokio::test]
