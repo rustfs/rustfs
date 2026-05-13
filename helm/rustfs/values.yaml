@@ -11,7 +11,7 @@ replicaCount: 4
 # - drivesPerNode = 1: each pod gets a single volume mounted at /data
 # Upgrade note: deployments that previously used replicaCount=16 for one drive
 # per pod should now set replicaCount=16 and drivesPerNode=1 explicitly.
-drivesPerNode: 1
+drivesPerNode: 4
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:
@@ -91,11 +91,12 @@ config:
       # | replicaCount | drivesPerNode | Total drives | Valid parity | Default |
       # | ------------ | ------------- | ------------ | ------------ | ------- |
       # | 1            | 1             | 1            | 0            | 0       |
-      # | 4            | 1             | 4            | 0–2          | *2*     |
+      # | 4            | 1             | 4            | 0–2          | 2       |
       # | 4            | 2             | 8            | 0–4          | 4       |
+      # | 4            | 4             | 16           | 0–8          | *4*     |
       # | 8            | 1             | 8            | 0–4          | 4       |
       # | 16           | 1             | 16           | 0–8          | 4       |
-      storage_class_standard: "EC:2" # Storage class for standard storage class in erasure coding mode, default is "STANDARD"
+      storage_class_standard: "EC:4" # Storage class for standard storage class in erasure coding mode, default is "STANDARD"
     scanner:
       # Scanner speed preset: fastest|fast|default|slow|slowest
       speed: ""
@@ -118,7 +119,7 @@ config:
     obs_endpoint:
       enabled: false # If true, rustfs will export metrics, traces, logs and profiling data to the specified OTLP endpoints. If false, the individual settings for metrics, traces, logs and profiling endpoints will be ignored and all data will not be exported.
       base_endpoint: "" #Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318
-      use_stdout: true # If true, rustfs will also export logs to stdout in addition to the OTLP logs endpoint.
+      use_stdout: false # If true, rustfs will also export logs to stdout in addition to the OTLP logs endpoint.
       metrics:
         enabled: false
         endpoint: "" # If specified, rustfs will export metrics to this OTLP endpoint. e.g. "http://localhost:4318/v1/metrics"
