@@ -34,10 +34,10 @@ use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CopyObjectInput, CopyObjectOutput, CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-    DeleteBucketOutput, DeleteObjectOutput, ETag, GetObjectOutput, HeadBucketOutput, HeadObjectOutput, ListBucketsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, UploadPartCopyInput,
-    UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    CopyObjectInput, CopyObjectOutput, CopyPartResult, CreateBucketOutput, CreateMultipartUploadInput,
+    CreateMultipartUploadOutput, DeleteBucketOutput, DeleteObjectOutput, ETag, GetObjectOutput, HeadBucketOutput,
+    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob,
+    Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -316,6 +316,18 @@ impl DummyBackend {
     /// Queue an upload_part error.
     pub fn queue_upload_part_err(&self, err: DummyError) {
         self.inner.lock().expect("lock").upload_part.push_back(Err(err));
+    }
+
+    /// Queue an upload_part_copy Ok response carrying the given ETag.
+    pub fn queue_upload_part_copy_ok(&self, e_tag: impl Into<String>) {
+        let out = UploadPartCopyOutput {
+            copy_part_result: Some(CopyPartResult {
+                e_tag: Some(ETag::Strong(e_tag.into())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").upload_part_copy.push_back(Ok(out));
     }
 
     /// Queue a complete_multipart_upload Ok response.

@@ -863,7 +863,7 @@ impl LocalDiskWrapper {
                     timeout_ms = timeout_duration.as_millis(),
                     "Local disk operation timed out"
                 );
-                Err(DiskError::other(format!("disk operation timeout after {timeout_duration:?}")))
+                Err(DiskError::Timeout)
             }
         }
     }
