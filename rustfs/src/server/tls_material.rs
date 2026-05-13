@@ -110,7 +110,7 @@ impl TlsMaterialSnapshot {
     /// handling both multi-cert (SNI resolver) and single-cert fallback.
     /// Returns `None` if no TLS certificates are available.
     pub(crate) async fn build_tls_acceptor(&self, tls_path: &str) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
-        if tls_path.is_empty() || !self.has_server_certs {
+        if tls_path.is_empty() {
             return Ok(None);
         }
 
@@ -122,6 +122,7 @@ impl TlsMaterialSnapshot {
         .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
 
         // Try multi-cert (SNI) first
+        let mut multi_cert_error: Option<String> = None;
         match rustfs_utils::load_all_certs_from_directory(
             rustfs_utils::CertDirectoryLoadOptions::builder(tls_path, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
         ) {
@@ -132,10 +133,15 @@ impl TlsMaterialSnapshot {
                     let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
                     return Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))));
                 }
-                Err(e) => warn!("Failed to build multi-cert resolver: {}, falling back to single-cert", e),
+                Err(e) => {
+                    return Err(TlsMaterialError::Parse(format!("failed to build multi-cert resolver: {e}")));
+                }
             },
             Ok(_) => debug!("No valid multi-cert directory structure found"),
-            Err(_) => debug!("load_all_certs_from_directory failed, trying single-cert fallback"),
+            Err(e) => {
+                multi_cert_error = Some(e.to_string());
+                debug!("load_all_certs_from_directory failed, trying single-cert fallback");
+            }
         }
 
         // Fallback: single cert
@@ -149,6 +155,13 @@ impl TlsMaterialSnapshot {
             info!("Created TLS acceptor with single certificate");
             let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
             return Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))));
+        }
+
+        if let Some(err) = multi_cert_error {
+            return Err(TlsMaterialError::Parse(format!(
+                "failed to parse TLS certificates under '{}': {}",
+                tls_path, err
+            )));
         }
 
         debug!("No valid TLS certificates found, starting with HTTP");

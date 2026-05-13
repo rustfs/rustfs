@@ -216,6 +216,7 @@ pub async fn start_http_server(
     };
 
     let tls_path = config.tls_path.as_deref().unwrap_or_default();
+    let tls_path_configured = config.tls_path.as_ref().is_some_and(|path| !path.trim().is_empty());
     // Load TLS materials and build server acceptor.
     // Note: outbound material (root CAs, mTLS identity) is already applied in main.rs.
     let tls_snapshot = TlsMaterialSnapshot::load(tls_path)
@@ -226,6 +227,12 @@ pub async fn start_http_server(
         .build_tls_acceptor(tls_path)
         .await
         .map_err(|e| Error::other(e.to_string()))?;
+    if tls_path_configured && tls_acceptor.is_none() {
+        return Err(Error::other(format!(
+            "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but no valid server certificate/private key could be loaded; refusing HTTP fallback startup",
+            tls_path
+        )));
+    }
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 
