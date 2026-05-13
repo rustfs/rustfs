@@ -422,7 +422,7 @@ impl LocalDisk {
                             total: info.total,
                             free: info.free,
                             used: info.used,
-                            used_inodes: info.files - info.ffree,
+                            used_inodes: info.files.saturating_sub(info.ffree),
                             free_inodes: info.ffree,
                             major: info.major,
                             minor: info.minor,
