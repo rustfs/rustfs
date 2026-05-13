@@ -14,4 +14,4 @@
 
 pub mod builtin;
 
-pub use crate::manifest::builtin_target_manifest;
+pub use crate::manifest::{builtin_target_manifest, example_external_webhook_plugin};
