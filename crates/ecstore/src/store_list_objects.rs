@@ -67,6 +67,26 @@ fn ensure_non_empty_listing_disks(bucket: &str, path: &str, disks: &[DiskStore])
     Ok(())
 }
 
+fn walk_result_from_set_errors(errs: Vec<Option<Error>>) -> Result<()> {
+    if is_all_not_found(&errs) {
+        if is_all_volume_not_found(&errs) {
+            return Err(StorageError::VolumeNotFound);
+        }
+
+        return Ok(());
+    }
+
+    for err in errs.into_iter().flatten() {
+        if err == Error::Unexpected {
+            continue;
+        }
+
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 pub fn max_keys_plus_one(max_keys: i32, add_one: bool) -> i32 {
     let mut max_keys = max_keys;
     if !(0..=MAX_OBJECT_LIST).contains(&max_keys) {
@@ -967,19 +987,24 @@ impl ECStore {
         tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await });
 
         let walk_results = join_all(futures).await;
+        let mut errs = Vec::new();
         for (idx, walk_result) in walk_results.into_iter().enumerate() {
-            if let Err(err) = walk_result {
-                error!(
-                    bucket = %bucket,
-                    prefix = %prefix,
-                    set_task_index = idx,
-                    error = ?err,
-                    "walk_internal list_path_raw task failed"
-                );
+            match walk_result {
+                Ok(()) => errs.push(None),
+                Err(err) => {
+                    error!(
+                        bucket = %bucket,
+                        prefix = %prefix,
+                        set_task_index = idx,
+                        error = ?err,
+                        "walk_internal list_path_raw task failed"
+                    );
+                    errs.push(Some(err.into()));
+                }
             }
         }
 
-        Ok(())
+        walk_result_from_set_errors(errs)
     }
 }
 
@@ -1416,7 +1441,8 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use super::{ListPathOptions, MAX_OBJECT_LIST, max_keys_plus_one};
+    use super::{ListPathOptions, MAX_OBJECT_LIST, max_keys_plus_one, walk_result_from_set_errors};
+    use crate::error::StorageError;
     use uuid::Uuid;
 
     #[test]
@@ -1525,6 +1551,22 @@ mod test {
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
         assert!(!parsed.create);
+    }
+
+    #[test]
+    fn walk_result_from_set_errors_returns_non_eof_error() {
+        let err = walk_result_from_set_errors(vec![Some(StorageError::Unexpected), Some(StorageError::FileAccessDenied)])
+            .expect_err("walk should fail when any set reports a real listing error");
+
+        assert_eq!(err, StorageError::FileAccessDenied);
+    }
+
+    #[test]
+    fn walk_result_from_set_errors_preserves_volume_not_found() {
+        let err = walk_result_from_set_errors(vec![Some(StorageError::VolumeNotFound), Some(StorageError::VolumeNotFound)])
+            .expect_err("all volume-not-found set errors should remain visible");
+
+        assert_eq!(err, StorageError::VolumeNotFound);
     }
 
     // use std::sync::Arc;
