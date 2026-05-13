@@ -67,21 +67,21 @@ fn ensure_non_empty_listing_disks(bucket: &str, path: &str, disks: &[DiskStore])
     Ok(())
 }
 
-fn walk_result_from_set_errors(errs: Vec<Option<Error>>) -> Result<()> {
-    if is_all_not_found(&errs) {
-        if is_all_volume_not_found(&errs) {
+fn walk_result_from_set_errors(errs: &[Option<Error>]) -> Result<()> {
+    if is_all_not_found(errs) {
+        if is_all_volume_not_found(errs) {
             return Err(StorageError::VolumeNotFound);
         }
 
         return Ok(());
     }
 
-    for err in errs.into_iter().flatten() {
-        if err == Error::Unexpected {
+    for err in errs.iter().flatten() {
+        if err == &Error::Unexpected || err.is_not_found() {
             continue;
         }
 
-        return Err(err);
+        return Err(err.clone());
     }
 
     Ok(())
@@ -988,23 +988,25 @@ impl ECStore {
 
         let walk_results = join_all(futures).await;
         let mut errs = Vec::new();
-        for (idx, walk_result) in walk_results.into_iter().enumerate() {
+        for walk_result in walk_results {
             match walk_result {
                 Ok(()) => errs.push(None),
-                Err(err) => {
-                    error!(
-                        bucket = %bucket,
-                        prefix = %prefix,
-                        set_task_index = idx,
-                        error = ?err,
-                        "walk_internal list_path_raw task failed"
-                    );
-                    errs.push(Some(err.into()));
-                }
+                Err(err) => errs.push(Some(err.into())),
             }
         }
 
-        walk_result_from_set_errors(errs)
+        let result = walk_result_from_set_errors(&errs);
+        if let Err(err) = &result {
+            error!(
+                bucket = %bucket,
+                prefix = %prefix,
+                error = ?err,
+                set_errors = ?errs,
+                "walk_internal list_path_raw tasks failed"
+            );
+        }
+
+        result
     }
 }
 
@@ -1555,15 +1557,27 @@ mod test {
 
     #[test]
     fn walk_result_from_set_errors_returns_non_eof_error() {
-        let err = walk_result_from_set_errors(vec![Some(StorageError::Unexpected), Some(StorageError::FileAccessDenied)])
+        let err = walk_result_from_set_errors(&[Some(StorageError::Unexpected), Some(StorageError::FileAccessDenied)])
             .expect_err("walk should fail when any set reports a real listing error");
 
         assert_eq!(err, StorageError::FileAccessDenied);
     }
 
     #[test]
+    fn walk_result_from_set_errors_prefers_real_error_over_not_found() {
+        let err = walk_result_from_set_errors(&[
+            Some(StorageError::VolumeNotFound),
+            Some(StorageError::DiskNotFound),
+            Some(StorageError::FileAccessDenied),
+        ])
+        .expect_err("walk should report the real listing error");
+
+        assert_eq!(err, StorageError::FileAccessDenied);
+    }
+
+    #[test]
     fn walk_result_from_set_errors_preserves_volume_not_found() {
-        let err = walk_result_from_set_errors(vec![Some(StorageError::VolumeNotFound), Some(StorageError::VolumeNotFound)])
+        let err = walk_result_from_set_errors(&[Some(StorageError::VolumeNotFound), Some(StorageError::VolumeNotFound)])
             .expect_err("all volume-not-found set errors should remain visible");
 
         assert_eq!(err, StorageError::VolumeNotFound);
