@@ -493,6 +493,71 @@ mod tests {
         env.stop_server();
     }
 
+    /// Test ListObjectsV2 caps max_keys above the service limit and still paginates.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_max_keys_above_limit_returns_token() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 with max_keys above limit");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-max-keys-above-limit";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let object_count = 1002;
+        for i in 0..object_count {
+            let key = format!("object{:04}.txt", i);
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(&key)
+                .body(ByteStream::from_static(b"test content"))
+                .send()
+                .await
+                .expect("Failed to put object");
+        }
+
+        let output = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .max_keys(1001)
+            .send()
+            .await
+            .expect("Failed to list objects");
+
+        assert_eq!(output.contents().len(), 1000);
+        assert_eq!(output.key_count(), Some(1000));
+        assert_eq!(output.max_keys(), Some(1000));
+        assert!(
+            output.is_truncated().unwrap_or(false),
+            "IsTruncated should be true when more objects remain after capped max_keys"
+        );
+
+        let next_token = output
+            .next_continuation_token()
+            .expect("NextContinuationToken should be present when capped response is truncated")
+            .to_string();
+
+        let output = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .max_keys(1001)
+            .continuation_token(next_token)
+            .send()
+            .await
+            .expect("Failed to list objects with continuation token");
+
+        assert_eq!(output.contents().len(), 2);
+        assert!(!output.is_truncated().unwrap_or(false));
+        assert!(output.next_continuation_token().is_none());
+
+        env.stop_server();
+    }
+
     /// Test ListObjectsV2 with max_keys=0
     ///
     /// S3 semantics: when max_keys is 0, the response should include no objects

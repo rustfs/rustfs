@@ -50,6 +50,10 @@ const MAX_OBJECT_LIST: i32 = 1000;
 
 const METACACHE_SHARE_PREFIX: bool = false;
 
+fn normalize_max_keys(max_keys: i32) -> i32 {
+    max_keys.min(MAX_OBJECT_LIST)
+}
+
 fn ensure_non_empty_listing_disks(bucket: &str, path: &str, disks: &[DiskStore]) -> Result<()> {
     if disks.is_empty() {
         warn!(
@@ -267,6 +271,7 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<ListObjectsInfo> {
+        let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
@@ -390,6 +395,7 @@ impl ECStore {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
+        let max_keys = normalize_max_keys(max_keys);
         if marker.is_none() && version_marker.is_some() {
             return Err(StorageError::NotImplemented);
         }
@@ -1410,8 +1416,17 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use super::ListPathOptions;
+    use super::{ListPathOptions, MAX_OBJECT_LIST, max_keys_plus_one};
     use uuid::Uuid;
+
+    #[test]
+    fn test_max_keys_plus_one_caps_before_lookahead() {
+        assert_eq!(max_keys_plus_one(999, true), 1000);
+        assert_eq!(max_keys_plus_one(MAX_OBJECT_LIST, true), MAX_OBJECT_LIST + 1);
+        assert_eq!(max_keys_plus_one(MAX_OBJECT_LIST + 1, true), MAX_OBJECT_LIST + 1);
+        assert_eq!(max_keys_plus_one(i32::MAX, true), MAX_OBJECT_LIST + 1);
+        assert_eq!(max_keys_plus_one(-1, true), MAX_OBJECT_LIST + 1);
+    }
 
     /// Test that "null" version marker is handled correctly
     /// AWS S3 API uses "null" string to represent non-versioned objects
