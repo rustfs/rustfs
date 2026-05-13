@@ -5560,6 +5560,36 @@ mod tests {
     }
 
     #[test]
+    fn test_object_quorum_from_meta_returns_not_found_when_all_metadata_is_missing() {
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            Some(DiskError::VolumeNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::FileNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+            .expect_err("missing metadata should map to FileNotFound");
+
+        assert_eq!(err, DiskError::FileNotFound);
+    }
+
+    #[test]
+    fn test_object_quorum_from_meta_preserves_read_quorum_for_mixed_failures() {
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            Some(DiskError::VolumeNotFound),
+            Some(DiskError::FileCorrupt),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+            .expect_err("mixed metadata failures should keep quorum semantics");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
     fn test_shuffle_parts_metadata() {
         // Test metadata shuffling
         let metadata = vec![
