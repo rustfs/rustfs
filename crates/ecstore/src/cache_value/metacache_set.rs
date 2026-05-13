@@ -91,6 +91,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = opts.fallback_disks.iter().flatten().cloned().collect::<Vec<_>>();
+    let max_disk_failures = opts.disks.len().saturating_sub(opts.min_disks);
 
     let cancel_rx = CancellationToken::new();
 
@@ -114,15 +115,18 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             };
 
             let mut need_fallback = false;
+            let mut last_err = None;
             if let Some(disk) = opdisk {
                 match disk.walk_dir(wakl_opts, &mut wr).await {
                     Ok(_res) => {}
                     Err(err) => {
                         info!("walk dir err {:?}", &err);
+                        last_err = Some(err);
                         need_fallback = true;
                     }
                 }
             } else {
+                last_err = Some(DiskError::DiskNotFound);
                 need_fallback = true;
             }
 
@@ -165,12 +169,18 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 {
                     Ok(_r) => {
                         need_fallback = false;
+                        last_err = None;
                     }
                     Err(err) => {
                         error!("walk dir2 err {:?}", &err);
+                        last_err = Some(err);
                         break;
                     }
                 }
+            }
+
+            if need_fallback {
+                return Err(last_err.unwrap_or(DiskError::DiskNotFound));
             }
 
             // warn!("list_path_raw: while need_fallback done");
@@ -400,10 +410,23 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     }
 
     let results = join_all(jobs).await;
+    let mut job_errs = Vec::new();
     for result in results {
-        if let Err(err) = result {
-            error!("list_path_raw err {:?}", err);
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                error!("list_path_raw err {:?}", err);
+                job_errs.push(err);
+            }
+            Err(err) => {
+                error!("list_path_raw join err {:?}", err);
+                job_errs.push(err.into());
+            }
         }
+    }
+
+    if job_errs.len() > max_disk_failures {
+        return Err(job_errs.remove(0));
     }
 
     // warn!("list_path_raw: done");
@@ -413,6 +436,8 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::endpoint::Endpoint;
+    use crate::disk::{DiskOption, new_disk};
     use rustfs_filemeta::MetacacheWriter;
 
     #[tokio::test]
@@ -455,5 +480,54 @@ mod tests {
             PeekOutcome::Ready(Some(entry)) => assert_eq!(entry.name, "bucket/object"),
             other => panic!("expected ready entry, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_path_raw_propagates_parent_scan_access_denied() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+        use tokio::fs;
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let parent = dir.path().join(bucket).join("shiplog");
+
+        fs::create_dir_all(parent.join("nano/a.txt"))
+            .await
+            .expect("test object directory should be created");
+        fs::write(parent.join("nano/a.txt/xl.meta"), b"meta")
+            .await
+            .expect("test metadata should be written");
+
+        std::fs::set_permissions(&parent, Permissions::from_mode(0o111)).expect("parent permissions should be changed");
+        if fs::read_dir(&parent).await.is_ok() {
+            std::fs::set_permissions(&parent, Permissions::from_mode(0o755)).expect("parent permissions should be restored");
+            return;
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp path should be valid utf-8"))
+            .expect("endpoint should be created");
+        let disk = new_disk(&endpoint, &DiskOption::default())
+            .await
+            .expect("local disk should be created");
+
+        let result = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![Some(disk)],
+                bucket: bucket.to_string(),
+                path: "shiplog/".to_string(),
+                min_disks: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        std::fs::set_permissions(&parent, Permissions::from_mode(0o755)).expect("parent permissions should be restored");
+
+        let err = result.expect_err("parent directory access failure must not be treated as an empty listing");
+        assert_eq!(err, DiskError::FileAccessDenied);
     }
 }

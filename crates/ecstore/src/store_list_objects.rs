@@ -315,7 +315,7 @@ impl ECStore {
                 ..Default::default()
             });
 
-        if let Some(err) = list_result.err.clone()
+        if let Some(err) = list_result.err.take()
             && err != rustfs_filemeta::Error::Unexpected
         {
             return Err(to_object_err(err.into(), vec![bucket, prefix]));
@@ -427,7 +427,7 @@ impl ECStore {
                 ..Default::default()
             });
 
-        if let Some(err) = list_result.err.clone()
+        if let Some(err) = list_result.err.take()
             && err != rustfs_filemeta::Error::Unexpected
         {
             return Err(to_object_err(err.into(), vec![bucket, prefix]));
@@ -611,6 +611,11 @@ impl ECStore {
 
         // wait spawns exit
         join_all(vec![job1, job2]).await;
+
+        if let Ok(err) = err_rx.try_recv() {
+            error!("list_path err_rx.try_recv() ok {:?}", &err);
+            result.err = Some(err.as_ref().clone().into());
+        }
 
         if result.err.is_some() {
             return Ok(result);
@@ -1340,7 +1345,7 @@ impl SetDisks {
             },
         )
         .await
-        .map_err(Error::other)
+        .map_err(Error::from)
     }
 }
 
