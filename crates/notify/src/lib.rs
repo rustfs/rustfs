@@ -36,7 +36,6 @@ mod runtime_facade;
 mod runtime_view;
 mod services;
 mod status_view;
-pub mod stream;
 
 pub use bucket_config_manager::NotifyBucketConfigManager;
 pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
