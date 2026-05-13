@@ -32,19 +32,26 @@ use super::lifecycle::{SessionDiag, SessionRegistry, new_session_registry};
 use super::wedge_watchdog;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
-use russh::keys::{self, PrivateKey};
+use russh::keys::{self, PrivateKey, PublicKeyBase64};
 use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty, Sig};
+use rustfs_config::{
+    DEFAULT_SFTP_HOST_KEY_RELOAD_ENABLE, DEFAULT_SFTP_HOST_KEY_RELOAD_INTERVAL, ENV_SFTP_HOST_KEY_RELOAD_ENABLE,
+    ENV_SFTP_HOST_KEY_RELOAD_INTERVAL,
+};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::Debug;
+use std::hash::Hasher;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::sftp::constants::limits::SHUTDOWN_DRAIN_TIMEOUT_SECS;
@@ -135,10 +142,143 @@ fn build_ssh_config(host_keys: Vec<PrivateKey>, idle_timeout_secs: u64, banner: 
     })
 }
 
+#[derive(Debug)]
+struct SshConfigHolder {
+    current: RwLock<Arc<russh::server::Config>>,
+    fingerprint: RwLock<u64>,
+}
+
+impl SshConfigHolder {
+    fn new(config: Arc<russh::server::Config>) -> Self {
+        let fingerprint = fingerprint_host_keys(&config.keys);
+        Self {
+            current: RwLock::new(config),
+            fingerprint: RwLock::new(fingerprint),
+        }
+    }
+
+    fn get(&self) -> Arc<russh::server::Config> {
+        match self.current.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    async fn reload_from_config(&self, config: &SftpConfig) -> Result<Option<usize>, SftpInitError> {
+        let host_keys = SftpConfig::load_host_keys(&config.host_key_dir).await?;
+        let host_key_count = host_keys.len();
+        let fingerprint = fingerprint_host_keys(&host_keys);
+        let ssh_config = build_ssh_config(host_keys, config.idle_timeout_secs, &config.banner);
+
+        let mut fingerprint_guard = match self.fingerprint.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *fingerprint_guard == fingerprint {
+            return Ok(None);
+        }
+
+        match self.current.write() {
+            Ok(mut guard) => *guard = ssh_config,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = ssh_config;
+            }
+        }
+        *fingerprint_guard = fingerprint;
+
+        Ok(Some(host_key_count))
+    }
+}
+
+fn fingerprint_host_keys(host_keys: &[PrivateKey]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut public_keys: Vec<(u8, String)> = host_keys
+        .iter()
+        .map(|key| (host_key_algorithm_rank(key.algorithm()), key.public_key_base64()))
+        .collect();
+    public_keys.sort_unstable();
+
+    for (algorithm_rank, public_key_base64) in public_keys {
+        hasher.write_u8(algorithm_rank);
+        hasher.write_usize(public_key_base64.len());
+        hasher.write(public_key_base64.as_bytes());
+    }
+
+    hasher.finish()
+}
+
+fn host_key_algorithm_rank(algorithm: keys::Algorithm) -> u8 {
+    match algorithm {
+        keys::Algorithm::Ed25519 => 0,
+        keys::Algorithm::Ecdsa { .. } => 1,
+        keys::Algorithm::Rsa { .. } => 2,
+        _ => 3,
+    }
+}
+
+fn spawn_host_key_reload_loop(config: SftpConfig, holder: Arc<SshConfigHolder>, shutdown_token: CancellationToken) {
+    let enabled = rustfs_utils::get_env_bool(ENV_SFTP_HOST_KEY_RELOAD_ENABLE, DEFAULT_SFTP_HOST_KEY_RELOAD_ENABLE);
+    if !enabled {
+        tracing::debug!(
+            "SFTP host key hot reload is disabled (set {}=1 to enable)",
+            ENV_SFTP_HOST_KEY_RELOAD_ENABLE
+        );
+        return;
+    }
+
+    let interval_secs =
+        rustfs_utils::get_env_u64(ENV_SFTP_HOST_KEY_RELOAD_INTERVAL, DEFAULT_SFTP_HOST_KEY_RELOAD_INTERVAL).max(5);
+
+    tracing::info!(
+        host_key_dir = %config.host_key_dir.display(),
+        interval_secs,
+        "SFTP host key hot reload enabled"
+    );
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => {
+                    tracing::info!(host_key_dir = %config.host_key_dir.display(), "SFTP host key hot reload task stopped");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+
+            match holder.reload_from_config(&config).await {
+                Ok(Some(host_key_count)) => {
+                    tracing::info!(
+                        host_key_dir = %config.host_key_dir.display(),
+                        host_key_count,
+                        "SFTP host keys reloaded successfully"
+                    );
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        host_key_dir = %config.host_key_dir.display(),
+                        "SFTP host key material unchanged; skipping reload"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        host_key_dir = %config.host_key_dir.display(),
+                        err = %err,
+                        "SFTP host key reload failed; keeping previous keys"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// SSH server hosting the SFTP subsystem.
 pub struct SftpServer<S: StorageBackend> {
     config: SftpConfig,
-    ssh_config: Arc<russh::server::Config>,
+    ssh_config: Arc<SshConfigHolder>,
     storage: S,
     /// Weak refs to live per-session activity records. Walked by the
     /// per-session wedge watchdog and by external observers that
@@ -166,7 +306,11 @@ where
 {
     /// Build a new server from validated configuration and loaded host keys.
     pub fn new(config: SftpConfig, storage: S, host_keys: Vec<PrivateKey>) -> Result<Self, SftpInitError> {
-        let ssh_config = build_ssh_config(host_keys, config.idle_timeout_secs, &config.banner);
+        let ssh_config = Arc::new(SshConfigHolder::new(build_ssh_config(
+            host_keys,
+            config.idle_timeout_secs,
+            &config.banner,
+        )));
         Ok(Self {
             config,
             ssh_config,
@@ -221,6 +365,7 @@ where
         // the SHUTDOWN_DRAIN_TIMEOUT_SECS ceiling because no session
         // has to wait for the watchdog's natural tick to fire.
         let server_shutdown_token = CancellationToken::new();
+        spawn_host_key_reload_loop(self.config.clone(), Arc::clone(&self.ssh_config), server_shutdown_token.child_token());
 
         loop {
             self.drain_finished_tasks(&mut sessions);
@@ -289,7 +434,7 @@ where
             }
         };
 
-        let ssh_config = Arc::clone(&self.ssh_config);
+        let ssh_config = self.ssh_config.get();
         // Capture local_addr for the wedge watchdog's TCP-state probe.
         // Failure here only happens if the kernel can no longer name
         // the accepted socket. Fall back to an unspecified address
@@ -362,6 +507,130 @@ where
             session_shutdown_token,
             peer_addr,
         ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod hot_reload_tests {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    const PEM_BOUNDARY_DASHES: &str = "-----";
+    const PEM_OPENSSH_LABEL: &str = "OPENSSH PRIVATE KEY";
+
+    fn build_pem_block(body: &str) -> String {
+        format!("{d}BEGIN {l}{d}\n{body}\n{d}END {l}{d}\n", d = PEM_BOUNDARY_DASHES, l = PEM_OPENSSH_LABEL,)
+    }
+
+    fn test_ed25519_pem() -> String {
+        build_pem_block(
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+             QyNTUxOQAAACCkeMEUpnJEbOMBXiQfjZcHZMEbHW3DlNRL+Jbi1cIqMgAAAKDviRiQ74kY\n\
+             kAAAAAtzc2gtZWQyNTUxOQAAACCkeMEUpnJEbOMBXiQfjZcHZMEbHW3DlNRL+Jbi1cIqMg\n\
+             AAAEBb5q0DpuL1Rbx4CHUEaRQRSVn1xS2SF+A+qES7OkhrOKR4wRSmckRs4wFeJB+Nlwdk\n\
+             wRsdbcOU1Ev4luLVwioyAAAAGHNpbW9uc0B1YnVudHUtbGludXgtMjQwNAECAwQF",
+        )
+    }
+
+    fn test_ecdsa_pem() -> String {
+        build_pem_block(
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS\n\
+             1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQSBp+cYoqTsQzIF+eQS23gIOBFkIqhi\n\
+             M8u54NeDrEyxKSewEHP+5i6/+1HURUWDnW+YfS6nbfGb8GxBkJ2ghVvZAAAAqPpS97P6Uv\n\
+             ezAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBIGn5xiipOxDMgX5\n\
+             5BLbeAg4EWQiqGIzy7ng14OsTLEpJ7AQc/7mLr/7UdRFRYOdb5h9Lqdt8ZvwbEGQnaCFW9\n\
+             kAAAAgBdQn3JuP2lSrY3082L+jmYvESyPu9bSmzUe8yMuILzIAAAALdGVzdC12ZWN0b3IB\n\
+             AgMEBQ==",
+        )
+    }
+
+    fn write_file_with_mode(path: &Path, content: &str, mode: u32) {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(mode);
+        let mut file = opts.open(path).expect("open file");
+        std::io::Write::write_all(&mut file, content.as_bytes()).expect("write file");
+    }
+
+    fn test_config(host_key_dir: &Path) -> SftpConfig {
+        SftpConfig {
+            bind_addr: "0.0.0.0:2222".parse().unwrap(),
+            host_key_dir: host_key_dir.to_path_buf(),
+            idle_timeout_secs: 600,
+            part_size: 16 * 1024 * 1024,
+            handles_per_session: None,
+            backend_op_timeout_secs: None,
+            read_cache_window_bytes: None,
+            read_cache_total_mem_bytes: None,
+            read_only: false,
+            banner: "SSH-2.0-RustFS".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_config_holder_reload_replaces_host_keys_for_new_sessions() {
+        let dir = TempDir::new().expect("tempdir");
+        write_file_with_mode(&dir.path().join("ssh_host_ed25519_key"), &test_ed25519_pem(), 0o600);
+
+        let config = test_config(dir.path());
+        let initial_keys = SftpConfig::load_host_keys(dir.path()).await.expect("initial key load");
+        let holder = SshConfigHolder::new(build_ssh_config(initial_keys, config.idle_timeout_secs, &config.banner));
+        assert!(matches!(holder.get().keys[0].algorithm(), russh::keys::Algorithm::Ed25519));
+
+        std::fs::remove_file(dir.path().join("ssh_host_ed25519_key")).expect("remove old key");
+        write_file_with_mode(&dir.path().join("ssh_host_ecdsa_key"), &test_ecdsa_pem(), 0o600);
+
+        let reloaded = holder.reload_from_config(&config).await.expect("reload host keys");
+        assert_eq!(reloaded, Some(1));
+        assert!(matches!(holder.get().keys[0].algorithm(), russh::keys::Algorithm::Ecdsa { .. }));
+    }
+
+    #[tokio::test]
+    async fn ssh_config_holder_reload_skips_when_host_keys_are_unchanged() {
+        let dir = TempDir::new().expect("tempdir");
+        write_file_with_mode(&dir.path().join("ssh_host_ed25519_key"), &test_ed25519_pem(), 0o600);
+
+        let config = test_config(dir.path());
+        let initial_keys = SftpConfig::load_host_keys(dir.path()).await.expect("initial key load");
+        let holder = SshConfigHolder::new(build_ssh_config(initial_keys, config.idle_timeout_secs, &config.banner));
+
+        let reloaded = holder.reload_from_config(&config).await.expect("reload host keys");
+        assert_eq!(reloaded, None);
+    }
+
+    #[tokio::test]
+    async fn ssh_config_holder_reload_failure_keeps_current_host_keys() {
+        let dir = TempDir::new().expect("tempdir");
+        write_file_with_mode(&dir.path().join("ssh_host_ed25519_key"), &test_ed25519_pem(), 0o600);
+
+        let config = test_config(dir.path());
+        let initial_keys = SftpConfig::load_host_keys(dir.path()).await.expect("initial key load");
+        let holder = SshConfigHolder::new(build_ssh_config(initial_keys, config.idle_timeout_secs, &config.banner));
+        assert!(matches!(holder.get().keys[0].algorithm(), russh::keys::Algorithm::Ed25519));
+
+        std::fs::remove_file(dir.path().join("ssh_host_ed25519_key")).expect("remove old key");
+
+        let err = holder
+            .reload_from_config(&config)
+            .await
+            .expect_err("empty host key directory must fail reload");
+        assert!(matches!(err, SftpInitError::NoHostKeysFound { .. }));
+        assert!(matches!(holder.get().keys[0].algorithm(), russh::keys::Algorithm::Ed25519));
+    }
+
+    #[tokio::test]
+    async fn fingerprint_host_keys_is_order_independent() {
+        let dir = TempDir::new().expect("tempdir");
+        write_file_with_mode(&dir.path().join("ssh_host_ed25519_key"), &test_ed25519_pem(), 0o600);
+        write_file_with_mode(&dir.path().join("ssh_host_ecdsa_key"), &test_ecdsa_pem(), 0o600);
+
+        let keys = SftpConfig::load_host_keys(dir.path()).await.expect("load keys");
+        let forward = fingerprint_host_keys(&keys);
+        let reversed_keys: Vec<_> = keys.into_iter().rev().collect();
+        let reversed = fingerprint_host_keys(&reversed_keys);
+
+        assert_eq!(forward, reversed);
     }
 }
 

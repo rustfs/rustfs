@@ -17,13 +17,14 @@ use super::driver::FtpsDriver;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
 use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
+use crate::tls_hot_reload::{ReloadableCertResolver, spawn_cert_reload_loop};
 use libunftp::options::FtpsRequired;
-use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use unftp_core::auth::{
     AuthenticationError, Authenticator, Credentials, Principal, UserDetail, UserDetailError, UserDetailProvider,
@@ -79,6 +80,7 @@ where
     /// then spawns the server loop in a background task.
     pub async fn start(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), FtpsInitError> {
         info!("Initializing FTPS server on {}", self.config.bind_addr);
+        let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
         let storage_clone = self.storage.clone();
         let mut server_builder = libunftp::ServerBuilder::with_user_detail_provider(
@@ -112,28 +114,16 @@ where
             if let Some(cert_dir) = &self.config.cert_dir {
                 debug!("Enabling FTPS with multi-certificate support from directory: {}", cert_dir);
 
-                // Load all certificates from directory
-                let cert_key_pairs = rustfs_utils::load_all_certs_from_directory(
-                    rustfs_utils::CertDirectoryLoadOptions::builder(cert_dir, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
-                )
-                .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to load certificates: {}", e)))?;
-
-                if cert_key_pairs.is_empty() {
-                    return Err(FtpsInitError::InvalidConfig("No valid certificates found in directory".into()));
-                }
-
-                debug!("Loaded {} certificates for FTPS", cert_key_pairs.len());
-
-                // Create multi-certificate resolver with SNI support
-                let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)
+                let resolver = ReloadableCertResolver::load_from_directory(cert_dir)
                     .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to create certificate resolver: {}", e)))?;
+                let _reload_task = spawn_cert_reload_loop("ftps", cert_dir.clone(), resolver.clone(), reload_shutdown_rx.clone());
 
                 // Build ServerConfig with SNI support
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
                 let server_config = rustls::ServerConfig::builder()
                     .with_no_client_auth()
-                    .with_cert_resolver(Arc::new(resolver));
+                    .with_cert_resolver(resolver);
 
                 server_builder = server_builder.ftps_manual::<std::path::PathBuf>(Arc::new(server_config));
 
@@ -166,6 +156,7 @@ where
         // Wait for shutdown signal or server failure
         tokio::select! {
             result = server_handle => {
+                let _ = reload_shutdown_tx.send(true);
                 match result {
                     Ok(Ok(())) => {
                         info!("FTPS server stopped normally");
@@ -183,6 +174,7 @@ where
             }
             _ = shutdown_rx.recv() => {
                 info!("FTPS server received shutdown signal");
+                let _ = reload_shutdown_tx.send(true);
                 // libunftp listen() is not easily cancellable gracefully without dropping the future.
                 // The select! dropping server_handle will close the listener.
                 Ok(())

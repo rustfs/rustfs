@@ -213,7 +213,7 @@ impl ListPathOptions {
                 MARKER_TAG_VERSION,
                 id.to_owned(),
                 self.pool_idx.unwrap_or_default(),
-                self.pool_idx.unwrap_or_default(),
+                self.set_idx.unwrap_or_default(),
             )
         } else {
             format!("{marker}[rustfs_cache:{MARKER_TAG_VERSION},return:]")
@@ -1410,6 +1410,7 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
+    use super::ListPathOptions;
     use uuid::Uuid;
 
     /// Test that "null" version marker is handled correctly
@@ -1480,6 +1481,35 @@ mod test {
         };
         assert!(parsed.is_some());
         assert_eq!(parsed.unwrap().to_string(), uuid_str);
+    }
+
+    #[test]
+    fn list_path_marker_round_trip_preserves_set_index() {
+        let mut opts = ListPathOptions {
+            id: Some("list-cache-id".to_string()),
+            pool_idx: Some(3),
+            set_idx: Some(7),
+            ..Default::default()
+        };
+
+        let marker = opts.encode_marker("photos/2026/image.jpg");
+        let expected_marker = format!(
+            "photos/2026/image.jpg[rustfs_cache:{},id:list-cache-id,p:3,s:7]",
+            super::MARKER_TAG_VERSION
+        );
+        assert_eq!(marker, expected_marker);
+
+        let mut parsed = ListPathOptions {
+            marker: Some(marker),
+            ..Default::default()
+        };
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert_eq!(parsed.set_idx, Some(7));
+        assert!(!parsed.create);
     }
 
     // use std::sync::Arc;
