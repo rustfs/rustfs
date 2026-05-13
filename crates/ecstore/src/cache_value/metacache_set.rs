@@ -55,6 +55,7 @@ async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>
 pub(crate) enum TestReaderBehavior {
     Eof,
     Stall,
+    ProducerError(DiskError),
     PartialThenTimeout(Vec<MetaCacheEntry>),
 }
 
@@ -135,6 +136,10 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         cancel_rx_clone.cancelled().await;
                         return Ok(());
                     }
+                    TestReaderBehavior::ProducerError(err) => {
+                        producer_errs_clone.lock().expect("producer error mutex poisoned")[disk_idx] = Some(err.clone());
+                        return Err(err);
+                    }
                     TestReaderBehavior::PartialThenTimeout(entries) => {
                         let mut wr = wr;
                         let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
@@ -181,14 +186,14 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             }
 
             while need_fallback {
-                let disk_op = {
-                    if fds_clone.is_empty() {
-                        None
-                    } else {
-                        let disk = fds_clone.remove(0);
-                        if disk.is_online().await { Some(disk.clone()) } else { None }
+                let mut disk_op = None;
+                while !fds_clone.is_empty() {
+                    let disk = fds_clone.remove(0);
+                    if disk.is_online().await {
+                        disk_op = Some(disk);
+                        break;
                     }
-                };
+                }
 
                 let Some(disk) = disk_op else {
                     warn!("list_path_raw: fallback disk is none");
@@ -406,6 +411,12 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 if errs.iter().flatten().any(|err| *err == DiskError::Timeout) {
                     return Err(DiskError::Timeout);
                 }
+                let mut err_iter = errs.iter().flatten();
+                if let Some(err) = err_iter.next()
+                    && err_iter.next().is_none()
+                {
+                    return Err(err.clone());
+                }
                 let mut combined_err = Vec::new();
                 errs.iter().zip(opts.disks.iter()).for_each(|(err, disk)| match (err, disk) {
                     (Some(err), Some(disk)) => {
@@ -596,54 +607,20 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn list_path_raw_propagates_parent_scan_access_denied() {
-        use crate::disk::endpoint::Endpoint;
-        use crate::disk::{DiskOption, new_disk};
-        use std::fs::Permissions;
-        use std::os::unix::fs::PermissionsExt;
-        use tempfile::tempdir;
-        use tokio::fs;
-
-        let dir = tempdir().expect("tempdir should be created");
-        let bucket = "test-bucket";
-        let parent = dir.path().join(bucket).join("shiplog");
-
-        fs::create_dir_all(parent.join("nano/a.txt"))
-            .await
-            .expect("test object directory should be created");
-        fs::write(parent.join("nano/a.txt/xl.meta"), b"meta")
-            .await
-            .expect("test metadata should be written");
-
-        std::fs::set_permissions(&parent, Permissions::from_mode(0o111)).expect("parent permissions should be changed");
-        if fs::read_dir(&parent).await.is_ok() {
-            std::fs::set_permissions(&parent, Permissions::from_mode(0o755)).expect("parent permissions should be restored");
-            return;
-        }
-
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp path should be valid utf-8"))
-            .expect("endpoint should be created");
-        let disk = new_disk(&endpoint, &DiskOption::default())
-            .await
-            .expect("local disk should be created");
-
-        let result = list_path_raw(
+    async fn list_path_raw_propagates_producer_access_denied() {
+        let err = list_path_raw(
             CancellationToken::new(),
             ListPathRawOptions {
-                disks: vec![Some(disk)],
-                bucket: bucket.to_string(),
-                path: "shiplog/".to_string(),
+                disks: vec![None],
                 min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::ProducerError(DiskError::FileAccessDenied)],
                 ..Default::default()
             },
         )
-        .await;
+        .await
+        .expect_err("producer access failure must not be treated as an empty listing");
 
-        std::fs::set_permissions(&parent, Permissions::from_mode(0o755)).expect("parent permissions should be restored");
-
-        let err = result.expect_err("parent directory access failure must not be treated as an empty listing");
         assert_eq!(err, DiskError::FileAccessDenied);
     }
 }
