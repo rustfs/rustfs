@@ -50,6 +50,7 @@ pub use runtime::{
     ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeStatusSnapshot, RuntimeTargetHealthSnapshot,
     RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager, activate_targets_with_replay,
     init_target_and_optionally_start_replay, start_replay_worker,
+    adapter::{BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter},
 };
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};

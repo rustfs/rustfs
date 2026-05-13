@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod adapter;
+
 use crate::Target;
 use crate::arn::TargetID;
 use crate::store::{Key, Store, ensure_store_entry_raw_readable};
