@@ -223,16 +223,16 @@ pub async fn start_http_server(
         .await
         .map_err(|e| Error::other(e.to_string()))?;
 
-    let tls_acceptor = tls_snapshot
-        .build_tls_acceptor(tls_path)
-        .await
-        .map_err(|e| Error::other(e.to_string()))?;
-    if tls_path_configured && tls_acceptor.is_none() {
-        return Err(Error::other(format!(
-            "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but no valid server certificate/private key could be loaded; refusing HTTP fallback startup",
-            tls_path
-        )));
-    }
+    let tls_acceptor = tls_snapshot.build_tls_acceptor(tls_path).await.map_err(|e| {
+        if tls_path_configured {
+            Error::other(format!(
+                "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but TLS acceptor initialization failed: {}",
+                tls_path, e
+            ))
+        } else {
+            Error::other(e.to_string())
+        }
+    })?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 

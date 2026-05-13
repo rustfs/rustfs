@@ -114,11 +114,10 @@ impl TlsMaterialSnapshot {
         .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
 
         // Try multi-cert (SNI) first
-        let mut multi_cert_error: Option<String> = None;
-        match rustfs_utils::load_all_certs_from_directory(
+        let multi_cert_error = match rustfs_utils::load_all_certs_from_directory(
             rustfs_utils::CertDirectoryLoadOptions::builder(tls_path, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
         ) {
-            Ok(cert_key_pairs) if !cert_key_pairs.is_empty() => match rustfs_utils::create_multi_cert_resolver(cert_key_pairs) {
+            Ok(cert_key_pairs) => match rustfs_utils::create_multi_cert_resolver(cert_key_pairs) {
                 Ok(resolver) => {
                     let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
                     info!("Created TLS acceptor with SNI resolver");
@@ -129,12 +128,11 @@ impl TlsMaterialSnapshot {
                     return Err(TlsMaterialError::Parse(format!("failed to build multi-cert resolver: {e}")));
                 }
             },
-            Ok(_) => debug!("No valid multi-cert directory structure found"),
             Err(e) => {
-                multi_cert_error = Some(e.to_string());
                 debug!("load_all_certs_from_directory failed, trying single-cert fallback");
+                Some(e.to_string())
             }
-        }
+        };
 
         // Fallback: single cert
         let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
@@ -150,8 +148,8 @@ impl TlsMaterialSnapshot {
         }
 
         if let Some(err) = multi_cert_error {
-            return Err(TlsMaterialError::Parse(format!(
-                "failed to parse TLS certificates under '{}': {}",
+            return Err(TlsMaterialError::Io(format!(
+                "failed to discover TLS certificates under '{}': {}",
                 tls_path, err
             )));
         }
