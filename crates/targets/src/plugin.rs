@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    PluginRuntimeAdapter, RuntimeActivation, Target, TargetError, catalog::builtin_target_manifest,
-    config::collect_target_configs, manifest::TargetPluginManifest,
+    PluginRuntimeAdapter, RuntimeActivation, Target, TargetError, config::collect_target_configs,
+    manifest::{TargetPluginManifest, builtin_target_manifest},
 };
 use hashbrown::HashMap;
 use rustfs_ecstore::config::{Config, KVS};

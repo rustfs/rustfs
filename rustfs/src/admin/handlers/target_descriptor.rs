@@ -25,7 +25,6 @@ use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::SharedTarget;
 use rustfs_targets::{
     BuiltinTargetAdminDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator,
-    catalog::builtin_target_manifest,
     check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available_with_tls,
     check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
     check_redis_server_available,
@@ -34,6 +33,7 @@ use rustfs_targets::{
         build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, normalize_target_plugin_instances,
         validate_redis_config,
     },
+    manifest::builtin_target_manifest,
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
 use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
@@ -416,7 +416,7 @@ pub(crate) fn collect_target_instances(
             continue;
         }
 
-        let (plugin_id, subsystem) = target_spec_by_service(specs, &service)
+        let (plugin_id, subsystem): (String, String) = target_spec_by_service(specs, &service)
             .map(|spec| (builtin_target_manifest(spec.service).plugin_id.to_string(), spec.subsystem.to_string()))
             .unwrap_or_else(|| ("custom:target".to_string(), format!("{}_{}", canonical_domain_label(domain), service)));
         instances.push(TargetInstanceReadModel {
