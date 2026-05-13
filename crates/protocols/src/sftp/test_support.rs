@@ -65,13 +65,13 @@ pub(super) fn file_handle(bucket: &str, key: &str, size: u64, attrs: FileAttribu
 
 /// Build a HandleState::Write with the given bucket, key, and
 /// WritePhase, ready to be inserted directly into a driver handle
-/// table without running open_write. Default FileAttributes are used.
+/// table without running open_write. Default FSTAT attrs and empty OPEN attrs are used.
 pub(super) fn write_handle(bucket: &str, key: &str, phase: WritePhase) -> HandleState {
     HandleState::Write {
         bucket: bucket.to_string(),
         key: key.to_string(),
         attrs: FileAttributes::default(),
-        open_attrs: FileAttributes::default(),
+        open_attrs: FileAttributes::empty(),
         phase,
     }
 }
