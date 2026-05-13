@@ -59,6 +59,10 @@ pub(super) enum HandleState {
         /// The size field tracks the running total of bytes received so
         /// a client polling FSTAT during a transfer sees the progress.
         attrs: FileAttributes,
+        /// Raw attributes supplied on OPEN. Only fields explicitly set
+        /// by the client are copied into S3 user metadata at object
+        /// creation time.
+        open_attrs: FileAttributes,
         /// Multipart upload lifecycle state. See WritePhase.
         phase: WritePhase,
     },

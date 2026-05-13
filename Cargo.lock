@@ -10244,6 +10244,7 @@ dependencies = [
  "lz4",
  "md-5 0.11.0",
  "netif",
+ "rcgen",
  "regex",
  "rustix 1.1.4",
  "rustls",

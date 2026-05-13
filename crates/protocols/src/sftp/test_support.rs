@@ -71,6 +71,7 @@ pub(super) fn write_handle(bucket: &str, key: &str, phase: WritePhase) -> Handle
         bucket: bucket.to_string(),
         key: key.to_string(),
         attrs: FileAttributes::default(),
+        open_attrs: FileAttributes::default(),
         phase,
     }
 }
