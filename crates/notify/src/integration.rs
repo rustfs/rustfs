@@ -20,6 +20,7 @@ use crate::{
     rules::BucketNotificationConfig,
 };
 use hashbrown::HashMap;
+use metrics::{counter, gauge};
 use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
@@ -30,6 +31,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore, broadcast};
 use tracing::info;
+
+const METRIC_NOTIFICATION_CURRENT_SEND_IN_PROGRESS: &str = "rustfs_notification_current_send_in_progress";
+const METRIC_NOTIFICATION_EVENTS_ERRORS_TOTAL: &str = "rustfs_notification_events_errors_total";
+const METRIC_NOTIFICATION_EVENTS_SENT_TOTAL: &str = "rustfs_notification_events_sent_total";
+const METRIC_NOTIFICATION_EVENTS_SKIPPED_TOTAL: &str = "rustfs_notification_events_skipped_total";
 
 #[derive(Clone)]
 pub struct LiveEventBatch {
@@ -357,6 +363,22 @@ impl Drop for NotificationSystem {
     fn drop(&mut self) {
         // Asynchronous operation cannot be used here, but logs can be recorded.
         info!("Notify the system instance to be destroyed");
+
+        let snapshot = self.snapshot_metrics();
+        for (name, value, is_gauge) in [
+            (METRIC_NOTIFICATION_CURRENT_SEND_IN_PROGRESS, snapshot.current_send_in_progress, true),
+            (METRIC_NOTIFICATION_EVENTS_ERRORS_TOTAL, snapshot.events_errors_total, false),
+            (METRIC_NOTIFICATION_EVENTS_SENT_TOTAL, snapshot.events_sent_total, false),
+            (METRIC_NOTIFICATION_EVENTS_SKIPPED_TOTAL, snapshot.events_skipped_total, false),
+        ] {
+            if is_gauge {
+                gauge!(name).set(value as f64);
+            } else {
+                counter!(name).absolute(value);
+            }
+            info!("shutdown metric {}={}", name, value);
+        }
+
         let status = self.get_status();
         for (key, value) in status {
             info!("key:{}, value:{}", key, value);

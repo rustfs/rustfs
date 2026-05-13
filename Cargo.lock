@@ -9837,6 +9837,7 @@ dependencies = [
  "chrono",
  "form_urlencoded",
  "hashbrown 0.17.1",
+ "metrics",
  "percent-encoding",
  "quick-xml 0.39.4",
  "rayon",
