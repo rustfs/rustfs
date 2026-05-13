@@ -1270,6 +1270,7 @@ impl LocalDisk {
             Err(e) => {
                 if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
                     error!("scan list_dir {}, err {:?}", &current, &e);
+                    return Err(e);
                 }
 
                 if opts.report_notfound && e == Error::FileNotFound && current == opts.base_dir {
