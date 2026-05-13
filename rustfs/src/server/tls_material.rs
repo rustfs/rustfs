@@ -66,8 +66,6 @@ pub struct OutboundTlsMaterial {
 pub struct TlsMaterialSnapshot {
     /// Material for outbound client connections.
     pub outbound: OutboundTlsMaterial,
-    /// Whether any server certificates were found.
-    pub has_server_certs: bool,
 }
 
 impl TlsMaterialSnapshot {
@@ -86,13 +84,7 @@ impl TlsMaterialSnapshot {
         // Load outbound material (root CAs + mTLS identity)
         let outbound = load_outbound_material(&tls_dir).await?;
 
-        // Check if server certs exist (actual loading happens in build_tls_acceptor)
-        let has_server_certs = has_server_certificates(tls_path).await;
-
-        Ok(Self {
-            outbound,
-            has_server_certs,
-        })
+        Ok(Self { outbound })
     }
 
     /// Apply outbound material to global state (root CAs, mTLS identity).
@@ -110,7 +102,7 @@ impl TlsMaterialSnapshot {
     /// handling both multi-cert (SNI resolver) and single-cert fallback.
     /// Returns `None` if no TLS certificates are available.
     pub(crate) async fn build_tls_acceptor(&self, tls_path: &str) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
-        if tls_path.is_empty() || !self.has_server_certs {
+        if tls_path.is_empty() {
             return Ok(None);
         }
 
@@ -122,21 +114,25 @@ impl TlsMaterialSnapshot {
         .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
 
         // Try multi-cert (SNI) first
-        match rustfs_utils::load_all_certs_from_directory(
+        let multi_cert_error = match rustfs_utils::load_all_certs_from_directory(
             rustfs_utils::CertDirectoryLoadOptions::builder(tls_path, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
         ) {
-            Ok(cert_key_pairs) if !cert_key_pairs.is_empty() => match rustfs_utils::create_multi_cert_resolver(cert_key_pairs) {
+            Ok(cert_key_pairs) => match rustfs_utils::create_multi_cert_resolver(cert_key_pairs) {
                 Ok(resolver) => {
                     let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
                     info!("Created TLS acceptor with SNI resolver");
                     let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
                     return Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))));
                 }
-                Err(e) => warn!("Failed to build multi-cert resolver: {}, falling back to single-cert", e),
+                Err(e) => {
+                    return Err(TlsMaterialError::Parse(format!("failed to build multi-cert resolver: {e}")));
+                }
             },
-            Ok(_) => debug!("No valid multi-cert directory structure found"),
-            Err(_) => debug!("load_all_certs_from_directory failed, trying single-cert fallback"),
-        }
+            Err(e) => {
+                debug!("load_all_certs_from_directory failed, trying single-cert fallback");
+                Some(e.to_string())
+            }
+        };
 
         // Fallback: single cert
         let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
@@ -151,6 +147,13 @@ impl TlsMaterialSnapshot {
             return Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))));
         }
 
+        if let Some(err) = multi_cert_error {
+            return Err(TlsMaterialError::Io(format!(
+                "failed to discover TLS certificates under '{}': {}",
+                tls_path, err
+            )));
+        }
+
         debug!("No valid TLS certificates found, starting with HTTP");
         Ok(None)
     }
@@ -161,7 +164,6 @@ impl TlsMaterialSnapshot {
                 root_ca_pem: Vec::new(),
                 mtls_identity: None,
             },
-            has_server_certs: false,
         }
     }
 }
@@ -274,24 +276,6 @@ async fn load_outbound_material(tls_dir: &Path) -> Result<OutboundTlsMaterial, T
         root_ca_pem,
         mtls_identity,
     })
-}
-
-/// Quick check whether server certificate files exist in the TLS directory.
-async fn has_server_certificates(tls_path: &str) -> bool {
-    if tokio::fs::metadata(tls_path).await.is_err() {
-        return false;
-    }
-    // Check for multi-cert directory structure OR single cert files
-    if rustfs_utils::load_all_certs_from_directory(
-        rustfs_utils::CertDirectoryLoadOptions::builder(tls_path, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
-    )
-    .is_ok_and(|p| !p.is_empty())
-    {
-        return true;
-    }
-    let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
-    let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
-    tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok()
 }
 
 /// Load mTLS client identity from the TLS directory.

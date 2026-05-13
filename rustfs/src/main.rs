@@ -225,7 +225,7 @@ async fn async_main() -> Result<()> {
     // Initialize TLS outbound material (root CAs, mTLS identity) if configured.
     // Server-side TLS acceptor is built separately inside start_http_server()
     // using the same TlsMaterialSnapshot loading logic.
-    if let Some(tls_path) = &config.tls_path {
+    if let Some(tls_path) = config.tls_path.as_deref().map(str::trim).filter(|path| !path.is_empty()) {
         match rustfs::server::tls_material::TlsMaterialSnapshot::load(tls_path).await {
             Ok(snapshot) => {
                 snapshot.apply_outbound().await;
