@@ -14,9 +14,7 @@
 
 use crate::admin::{
     auth::validate_admin_request,
-    handlers::audit_runtime_config::{
-        load_server_config_from_store, remove_audit_target_config, set_audit_target_config,
-    },
+    handlers::audit_runtime_config::{load_server_config_from_store, remove_audit_target_config, set_audit_target_config},
     handlers::notify_runtime_access::{
         load_notification_config_snapshot, remove_notification_target_config, set_notification_target_config,
     },

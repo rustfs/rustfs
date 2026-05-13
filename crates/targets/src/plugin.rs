@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    PluginRuntimeAdapter, RuntimeActivation, Target, TargetError, config::collect_target_configs,
+    PluginRuntimeAdapter, RuntimeActivation, Target, TargetError,
+    config::collect_target_configs,
     manifest::{TargetPluginManifest, builtin_target_manifest},
 };
 use hashbrown::HashMap;

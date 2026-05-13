@@ -12,10 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{
-    AuditEntry, AuditResult, observability,
-    system::AuditTargetMetricSnapshot,
-};
+use crate::{AuditEntry, AuditResult, observability, system::AuditTargetMetricSnapshot};
 use rustfs_targets::{
     BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter, ReplayEvent, ReplayWorkerManager, RuntimeActivation, SharedTarget, Target,
     target::EntityTarget,
