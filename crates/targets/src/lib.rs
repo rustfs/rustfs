@@ -16,6 +16,7 @@ pub mod arn;
 pub mod catalog;
 mod check;
 pub mod config;
+pub mod control_plane;
 pub mod domain;
 pub mod error;
 pub mod manifest;
@@ -34,6 +35,11 @@ pub use config::{
     LegacyTargetInstanceDescriptor, TargetInstanceSourceClass, TargetInstanceSourceHints, TargetPluginInstance,
     TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, normalize_legacy_target_instances,
     normalize_legacy_target_instances_from_env, normalize_target_plugin_instances, normalize_target_plugin_instances_from_env,
+};
+pub use control_plane::{
+    TargetPluginEnableState, TargetPluginInstallState, TargetPluginInstallation, TargetPluginOperationalState,
+    TargetPluginRevision, TargetPluginRuntimeState, builtin_target_plugin_installation, builtin_target_plugin_operational_state,
+    runtime_state_from_status_label,
 };
 pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};

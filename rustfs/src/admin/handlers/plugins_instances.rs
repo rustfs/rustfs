@@ -41,6 +41,7 @@ use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
+use rustfs_targets::{builtin_target_plugin_operational_state, runtime_state_from_status_label};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -120,6 +121,8 @@ fn plugin_instance_domain_context(domain: PluginContractDomain) -> PluginInstanc
 }
 
 fn map_instance(instance: TargetInstanceReadModel) -> PluginInstanceEntry {
+    let runtime_state = runtime_state_from_status_label(&instance.status);
+
     PluginInstanceEntry {
         id: instance.canonical_id,
         plugin_id: instance.plugin_id,
@@ -131,6 +134,7 @@ fn map_instance(instance: TargetInstanceReadModel) -> PluginInstanceEntry {
         source: map_instance_source(instance.source),
         enabled: instance.enabled,
         config: kvs_to_map(instance.config),
+        operational_state: Some(builtin_target_plugin_operational_state(instance.enabled, runtime_state).into()),
         diagnostic_codes: Vec::new(),
     }
 }
@@ -1501,6 +1505,7 @@ mod tests {
             source: input.source,
             enabled: input.enabled,
             config: HashMap::new(),
+            operational_state: None,
             diagnostic_codes: Vec::new(),
         }
     }

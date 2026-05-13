@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use rustfs_targets::{
-    TargetDomain, TargetPluginArtifactManifest, TargetPluginDistributionManifest, TargetPluginEntrypointKind,
-    TargetPluginExternalRuntimeContract, TargetPluginPackaging, TargetPluginRuntimeTransport,
+    TargetDomain, TargetPluginArtifactManifest, TargetPluginDistributionManifest, TargetPluginEnableState,
+    TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract, TargetPluginInstallState, TargetPluginInstallation,
+    TargetPluginOperationalState, TargetPluginPackaging, TargetPluginRuntimeState, TargetPluginRuntimeTransport,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -83,6 +84,115 @@ impl From<TargetPluginRuntimeTransport> for PluginRuntimeTransport {
             TargetPluginRuntimeTransport::InProcess => Self::InProcess,
             TargetPluginRuntimeTransport::Grpc => Self::Grpc,
             TargetPluginRuntimeTransport::WasmHost => Self::WasmHost,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PluginInstallState {
+    NotInstalled,
+    Installed,
+    InstallFailed,
+}
+
+impl From<TargetPluginInstallState> for PluginInstallState {
+    fn from(value: TargetPluginInstallState) -> Self {
+        match value {
+            TargetPluginInstallState::NotInstalled => Self::NotInstalled,
+            TargetPluginInstallState::Installed => Self::Installed,
+            TargetPluginInstallState::InstallFailed => Self::InstallFailed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PluginEnableState {
+    Enabled,
+    Disabled,
+}
+
+impl From<TargetPluginEnableState> for PluginEnableState {
+    fn from(value: TargetPluginEnableState) -> Self {
+        match value {
+            TargetPluginEnableState::Enabled => Self::Enabled,
+            TargetPluginEnableState::Disabled => Self::Disabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PluginOperationalRuntimeState {
+    Running,
+    Offline,
+    Error,
+    Unknown,
+}
+
+impl From<TargetPluginRuntimeState> for PluginOperationalRuntimeState {
+    fn from(value: TargetPluginRuntimeState) -> Self {
+        match value {
+            TargetPluginRuntimeState::Running => Self::Running,
+            TargetPluginRuntimeState::Offline => Self::Offline,
+            TargetPluginRuntimeState::Error => Self::Error,
+            TargetPluginRuntimeState::Unknown => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct PluginRevisionContract {
+    pub version: String,
+    pub digest_sha256: Option<String>,
+    pub source: String,
+    pub installed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct PluginInstallationContract {
+    pub install_state: PluginInstallState,
+    pub current_revision: Option<PluginRevisionContract>,
+    pub previous_revision: Option<PluginRevisionContract>,
+}
+
+impl From<TargetPluginInstallation> for PluginInstallationContract {
+    fn from(value: TargetPluginInstallation) -> Self {
+        Self {
+            install_state: PluginInstallState::from(value.install_state),
+            current_revision: value.current_revision.map(|revision| PluginRevisionContract {
+                version: revision.version,
+                digest_sha256: revision.digest_sha256,
+                source: revision.source,
+                installed_at: revision.installed_at,
+            }),
+            previous_revision: value.previous_revision.map(|revision| PluginRevisionContract {
+                version: revision.version,
+                digest_sha256: revision.digest_sha256,
+                source: revision.source,
+                installed_at: revision.installed_at,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct PluginOperationalStateContract {
+    pub install_state: PluginInstallState,
+    pub enable_state: PluginEnableState,
+    pub runtime_state: PluginOperationalRuntimeState,
+}
+
+impl From<TargetPluginOperationalState> for PluginOperationalStateContract {
+    fn from(value: TargetPluginOperationalState) -> Self {
+        Self {
+            install_state: PluginInstallState::from(value.install_state),
+            enable_state: PluginEnableState::from(value.enable_state),
+            runtime_state: PluginOperationalRuntimeState::from(value.runtime_state),
         }
     }
 }
@@ -172,6 +282,8 @@ pub(crate) struct PluginCatalogEntry {
     pub supported_domains: Vec<PluginContractDomain>,
     pub secret_fields: Vec<String>,
     pub domain_configs: Vec<PluginCatalogDomainEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installation: Option<PluginInstallationContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -192,6 +304,8 @@ pub(crate) struct PluginInstanceEntry {
     pub source: PluginInstanceSource,
     pub enabled: bool,
     pub config: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operational_state: Option<PluginOperationalStateContract>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_codes: Vec<PluginInstanceDiagnosticCode>,
 }
@@ -273,6 +387,7 @@ mod tests {
                     subsystem: "notify_webhook".to_string(),
                     valid_fields: vec!["endpoint".to_string(), "auth_token".to_string()],
                 }],
+                installation: None,
             }],
         };
 
@@ -323,6 +438,7 @@ mod tests {
                     ("enable".to_string(), "on".to_string()),
                     ("endpoint".to_string(), "https://example.com/hook".to_string()),
                 ]),
+                operational_state: None,
                 diagnostic_codes: vec![PluginInstanceDiagnosticCode::NotLoadedInRuntime],
             }],
             diagnostic_counts: vec![PluginInstanceDiagnosticCount {
@@ -377,6 +493,7 @@ mod tests {
                 source: PluginInstanceSource::Config,
                 enabled: true,
                 config: HashMap::from([("endpoint".to_string(), "https://example.com/hook".to_string())]),
+                operational_state: None,
                 diagnostic_codes: vec![PluginInstanceDiagnosticCode::NotLoadedInRuntime],
             },
             diagnostics: vec![PluginInstanceDiagnostic {
@@ -437,6 +554,7 @@ mod tests {
             supported_domains: vec![PluginContractDomain::Notify],
             secret_fields: Vec::new(),
             domain_configs: Vec::new(),
+            installation: None,
         };
 
         let value = serde_json::to_value(entry).expect("catalog entry should serialize");

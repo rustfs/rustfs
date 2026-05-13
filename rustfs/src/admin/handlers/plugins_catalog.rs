@@ -27,7 +27,7 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
-use rustfs_targets::{BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest};
+use rustfs_targets::{BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest, builtin_target_plugin_installation};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -95,6 +95,7 @@ fn merge_catalog_descriptor(plugins: &mut HashMap<&'static str, PluginCatalogEnt
         supported_domains: manifest.supported_domains.iter().copied().map(Into::into).collect(),
         secret_fields: manifest.secret_fields.iter().map(|field| (*field).to_string()).collect(),
         domain_configs: Vec::new(),
+        installation: Some(builtin_target_plugin_installation(manifest).into()),
     });
 
     if !entry.domain_configs.iter().any(|existing| existing.domain == domain) {
