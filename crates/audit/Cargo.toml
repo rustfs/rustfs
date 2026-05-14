@@ -42,6 +42,7 @@ tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "
 tracing = { workspace = true, features = ["std", "attributes"] }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 temp-env = { workspace = true }
 url = { workspace = true }
 
@@ -49,5 +50,4 @@ url = { workspace = true }
 workspace = true
 
 [lib]
-test = false
 doctest = false

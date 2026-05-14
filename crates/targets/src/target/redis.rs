@@ -16,10 +16,11 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
-    store::{Key, QueueStore, Store},
+    store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, queue_store_subdir_name,
+        TargetType, build_queued_payload, invalidate_cache_on_connectivity_error, is_connectivity_error,
+        mark_target_disconnected_on_connectivity_error, open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -33,12 +34,12 @@ use rustfs_config::{REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, R
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,22 +321,14 @@ where
         let target_id = TargetID::new(id, ChannelTargetType::Redis.as_str().to_string());
         let publisher_client = build_redis_client(&args)?;
 
-        let queue_store = if !args.queue_dir.is_empty() {
-            let base_path = PathBuf::from(&args.queue_dir);
-            let specific_queue_path = base_path.join(queue_store_subdir_name(ChannelTargetType::Redis.as_str(), &target_id.id));
-            let extension = match args.target_type {
-                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
-            };
-            let store = QueueStore::<QueuedPayload>::new(specific_queue_path, args.queue_limit, extension);
-            if let Err(e) = store.open() {
-                error!(target_id = %target_id, error = %e, "Failed to open store for Redis target");
-                return Err(TargetError::Storage(format!("{e}")));
-            }
-            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
-        } else {
-            None
-        };
+        let queue_store = open_target_queue_store(
+            &args.queue_dir,
+            args.queue_limit,
+            args.target_type,
+            ChannelTargetType::Redis.as_str(),
+            &target_id,
+            "Failed to open store for Redis target",
+        )?;
 
         info!(target_id = %target_id, "Redis target created");
         Ok(Self {
@@ -391,9 +384,7 @@ where
             Ok(_) => Ok(()),
             Err(err) => {
                 let mapped = map_redis_error(err);
-                if is_retryable_target_error(&mapped) {
-                    self.invalidate_cached_publisher().await;
-                }
+                invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_publisher()).await;
                 Err(mapped)
             }
         }
@@ -437,9 +428,7 @@ where
                 }
                 Err(err) => {
                     let mapped = map_redis_error(err);
-                    if is_retryable_target_error(&mapped) {
-                        self.invalidate_cached_publisher().await;
-                    }
+                    invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_publisher()).await;
 
                     warn!(
                         target_id = %self.id,
@@ -450,7 +439,7 @@ where
                         "Redis publish attempt failed"
                     );
 
-                    if !is_retryable_target_error(&mapped) || attempt >= self.args.max_retry_attempts {
+                    if !is_connectivity_error(&mapped) || attempt >= self.args.max_retry_attempts {
                         last_error = Some(mapped);
                         break;
                     }
@@ -492,14 +481,15 @@ where
                 Ok(true)
             }
             Ok(Err(err)) => {
-                self.invalidate_cached_publisher().await;
-                self.connected.store(false, Ordering::SeqCst);
+                invalidate_cache_on_connectivity_error(&err, || self.invalidate_cached_publisher()).await;
+                mark_target_disconnected_on_connectivity_error(&self.connected, &err);
                 Err(err)
             }
             Err(_) => {
-                self.invalidate_cached_publisher().await;
-                self.connected.store(false, Ordering::SeqCst);
-                Err(TargetError::Timeout("Redis connection timed out".to_string()))
+                let timeout_err = TargetError::Timeout("Redis connection timed out".to_string());
+                invalidate_cache_on_connectivity_error(&timeout_err, || self.invalidate_cached_publisher()).await;
+                mark_target_disconnected_on_connectivity_error(&self.connected, &timeout_err);
+                Err(timeout_err)
             }
         }
     }
@@ -514,17 +504,9 @@ where
         };
 
         if let Some(store) = &self.store {
-            let encoded = match queued.encode() {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    self.delivery_counters.record_final_failure();
-                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
-                }
-            };
-
-            if let Err(e) = store.put_raw(&encoded) {
+            if let Err(e) = persist_queued_payload_to_store(store.as_ref(), &queued) {
                 self.delivery_counters.record_final_failure();
-                return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+                return Err(e);
             }
 
             debug!(target_id = %self.id, "Event saved to store for Redis target");
@@ -556,14 +538,14 @@ where
         }
 
         if let Err(err) = self.init_inner().await {
-            if matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_)) {
+            if is_connectivity_error(&err) {
                 warn!(target_id = %self.id, error = %err, "Redis target not ready; queued event remains in store");
             }
             return Err(err);
         }
 
         if let Err(err) = self.send_body(body, &meta).await {
-            if matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_)) {
+            if is_connectivity_error(&err) {
                 warn!(target_id = %self.id, error = %err, "Failed to send Redis event from store: target not connected. Event remains queued.");
             }
             return Err(err);
@@ -732,10 +714,6 @@ fn map_redis_error(err: RedisError) -> TargetError {
         _ if err.is_unrecoverable_error() => TargetError::NotConnected,
         _ => TargetError::Request(err.to_string()),
     }
-}
-
-fn is_retryable_target_error(err: &TargetError) -> bool {
-    matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_))
 }
 
 fn compute_retry_delay(attempt: usize, min_delay: Duration, max_delay: Duration) -> Duration {
