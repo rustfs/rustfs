@@ -372,7 +372,7 @@ impl ObjectInfo {
         let scheme = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         if let Some(scheme) = scheme {
-            let algorithm = CompressionAlgorithm::from_str(&scheme)?;
+            let algorithm = crate::rio::compression_scheme_to_algorithm(&scheme)?;
             Ok((algorithm, true))
         } else {
             Ok((CompressionAlgorithm::None, false))
@@ -386,19 +386,29 @@ impl ObjectInfo {
     pub fn is_encrypted(&self) -> bool {
         use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 
-        self.user_defined
-            .keys()
-            .any(|key| rustfs_utils::http::is_encryption_metadata_key(key))
-            || self.user_defined.contains_key(SSEC_ALGORITHM_HEADER)
+        self.user_defined.keys().any(|key| {
+            rustfs_utils::http::is_encryption_metadata_key(key)
+                || key
+                    .to_ascii_lowercase()
+                    .starts_with("x-minio-internal-server-side-encryption-")
+                || key.eq_ignore_ascii_case("x-minio-internal-encrypted-multipart")
+        }) || self.user_defined.contains_key(SSEC_ALGORITHM_HEADER)
             || self.user_defined.contains_key(SSEC_KEY_HEADER)
             || self.user_defined.contains_key(SSEC_KEY_MD5_HEADER)
     }
 
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
+        let actual_size = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE);
         if let Some(size_str) = self
             .user_defined
             .get("x-rustfs-encryption-original-size")
-            .or_else(|| self.user_defined.get("x-amz-server-side-encryption-customer-original-size"))
+            .map(String::as_str)
+            .or_else(|| {
+                self.user_defined
+                    .get("x-amz-server-side-encryption-customer-original-size")
+                    .map(String::as_str)
+            })
+            .or(actual_size.as_deref())
             && !size_str.is_empty()
         {
             let size = size_str

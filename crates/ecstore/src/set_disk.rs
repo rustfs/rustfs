@@ -908,7 +908,7 @@ impl ObjectIO for SetDisks {
                 insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
             }
 
-            let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+            let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
 
             //TODO: userDefined
 
@@ -2729,7 +2729,7 @@ impl MultipartOperations for SetDisks {
             )));
         }
 
-        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+        let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
 
         let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
 

@@ -42,6 +42,7 @@ artifacts/
 PR_DESCRIPTION.md
 scripts/s3-tests/selected_tests.txt
 docs
+__pycache__/
 
 # nix stuff
 result*

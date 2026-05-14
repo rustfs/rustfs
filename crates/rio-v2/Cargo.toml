@@ -29,4 +29,19 @@ documentation = "https://docs.rs/rustfs-rio-v2/latest/rustfs_rio_v2/"
 workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
+hex.workspace = true
+hmac.workspace = true
+minlz = "0.1.3"
+pin-project-lite.workspace = true
+rand.workspace = true
 rustfs-rio.workspace = true
+rustfs-utils.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rustfs-filemeta.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true

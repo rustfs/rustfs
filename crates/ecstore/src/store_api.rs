@@ -17,6 +17,7 @@ use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
 use crate::disk::DiskStore;
 use crate::error::{Error, Result};
+use crate::rio::{DecompressReader, HashReader, LimitReader};
 use crate::store_utils::clean_metadata;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent,
@@ -34,7 +35,6 @@ use rustfs_filemeta::{
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_rio::Checksum;
-use rustfs_rio::{DecompressReader, HashReader, LimitReader};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_RESTORE, AMZ_STORAGE_CLASS};
@@ -44,7 +44,6 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::pin::Pin;
-use std::str::FromStr as _;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use time::OffsetDateTime;
