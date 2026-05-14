@@ -1022,6 +1022,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketPolicyInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1036,6 +1037,8 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_POLICY_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context);
 
         let item = sr_bucket_meta_item(bucket.clone(), "policy");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1108,6 +1111,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeletePublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1122,6 +1126,8 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "delete public access block", request_context);
 
         Ok(S3Response::with_status(DeletePublicAccessBlockOutput::default(), StatusCode::NO_CONTENT))
     }
@@ -1678,6 +1684,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketPolicyInput>,
     ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketPolicyInput { bucket, policy, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1723,6 +1730,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket policy", request_context);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "policy");
         item.policy = Some(serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
@@ -1807,6 +1816,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutPublicAccessBlockInput {
             bucket,
             public_access_block_configuration,
@@ -1826,6 +1836,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put public access block", request_context);
 
         Ok(S3Response::new(PutPublicAccessBlockOutput::default()))
     }
@@ -2101,6 +2113,35 @@ mod tests {
         let mut req = build_request(input, method);
         req.extensions.insert(req_info);
         req
+    }
+
+    fn usecase_method_source<'a>(source: &'a str, method: &str) -> &'a str {
+        let start_marker = format!("pub async fn {method}");
+        let start = source.find(&start_marker).expect("method should exist");
+        let rest = &source[start + start_marker.len()..];
+        let end = rest.find("\n    pub async fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn bucket_policy_and_public_access_block_changes_notify_peer_metadata_reload() {
+        let source = include_str!("bucket_usecase.rs");
+        for (method, operation) in [
+            ("execute_delete_bucket_policy", "delete bucket policy"),
+            ("execute_put_bucket_policy", "put bucket policy"),
+            ("execute_delete_public_access_block", "delete public access block"),
+            ("execute_put_public_access_block", "put public access block"),
+        ] {
+            let body = usecase_method_source(source, method);
+            assert!(
+                body.contains("notify_bucket_metadata_reload("),
+                "{method} should notify peers to reload cached bucket metadata"
+            );
+            assert!(
+                body.contains(operation),
+                "{method} should identify the bucket metadata operation in reload logs"
+            );
+        }
     }
 
     fn replication_rule_for_target(arn: &str) -> ReplicationRule {
