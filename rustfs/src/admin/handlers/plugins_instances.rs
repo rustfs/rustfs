@@ -43,6 +43,7 @@ use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
+use rustfs_targets::manifest::builtin_target_manifest;
 use rustfs_targets::{builtin_target_plugin_operational_state, runtime_state_from_status_label};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use std::collections::{BTreeMap, HashMap};
@@ -97,6 +98,44 @@ fn audit_target_specs() -> &'static [AdminTargetSpec] {
     &AUDIT_TARGET_SPECS
 }
 
+const REDACTED_SECRET_VALUE: &str = "***redacted***";
+
+fn builtin_secret_fields_for_service(plugin_id: &str, service: &str) -> &'static [&'static str] {
+    if !plugin_id.starts_with("builtin:") {
+        return &[];
+    }
+
+    match service.to_ascii_lowercase().as_str() {
+        "webhook" => builtin_target_manifest("webhook").secret_fields,
+        "mqtt" => builtin_target_manifest("mqtt").secret_fields,
+        "kafka" => builtin_target_manifest("kafka").secret_fields,
+        "amqp" => builtin_target_manifest("amqp").secret_fields,
+        "nats" => builtin_target_manifest("nats").secret_fields,
+        "pulsar" => builtin_target_manifest("pulsar").secret_fields,
+        "mysql" => builtin_target_manifest("mysql").secret_fields,
+        "redis" => builtin_target_manifest("redis").secret_fields,
+        "postgres" => builtin_target_manifest("postgres").secret_fields,
+        _ => &[],
+    }
+}
+
+fn map_instance_config(config: KVS, plugin_id: &str, service: &str) -> HashMap<String, String> {
+    let secret_fields = builtin_secret_fields_for_service(plugin_id, service);
+    config
+        .0
+        .into_iter()
+        .map(|kv| {
+            let should_redact = secret_fields.iter().any(|field| field.eq_ignore_ascii_case(&kv.key));
+            let value = if should_redact && !kv.value.is_empty() {
+                REDACTED_SECRET_VALUE.to_string()
+            } else {
+                kv.value
+            };
+            (kv.key, value)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PluginInstanceDomainContext {
     domain: PluginContractDomain,
@@ -124,18 +163,21 @@ fn plugin_instance_domain_context(domain: PluginContractDomain) -> PluginInstanc
 
 fn map_instance(instance: TargetInstanceReadModel) -> PluginInstanceEntry {
     let runtime_state = runtime_state_from_status_label(&instance.status);
+    let plugin_id = instance.plugin_id;
+    let service = instance.service;
+    let config = map_instance_config(instance.config, &plugin_id, &service);
 
     PluginInstanceEntry {
         id: instance.canonical_id,
-        plugin_id: instance.plugin_id,
+        plugin_id,
         domain: PluginContractDomain::from(instance.domain),
         subsystem: instance.subsystem,
         account_id: instance.account_id,
-        service: instance.service,
+        service,
         status: instance.status,
         source: map_instance_source(instance.source),
         enabled: instance.enabled,
-        config: kvs_to_map(instance.config),
+        config,
         operational_state: Some(builtin_target_plugin_operational_state(instance.enabled, runtime_state).into()),
         diagnostic_codes: Vec::new(),
     }
@@ -221,10 +263,6 @@ fn map_instance_source(source: TargetEndpointSource) -> PluginInstanceSource {
         TargetEndpointSource::Mixed => PluginInstanceSource::Mixed,
         TargetEndpointSource::Runtime => PluginInstanceSource::Runtime,
     }
-}
-
-fn kvs_to_map(config: KVS) -> HashMap<String, String> {
-    config.0.into_iter().map(|kv| (kv.key, kv.value)).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -499,7 +537,7 @@ async fn authorize_plugin_instance_request(req: &S3Request<Body>) -> S3Result<()
         &cred,
         owner,
         false,
-        vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+        vec![Action::AdminAction(AdminAction::GetBucketTargetAction)],
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
     )
     .await
@@ -830,7 +868,7 @@ mod tests {
     use rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS;
     use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
-    use rustfs_config::{ENABLE_KEY, WEBHOOK_ENDPOINT};
+    use rustfs_config::{ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT};
     use rustfs_ecstore::config::{Config, KV, KVS};
     use rustfs_targets::TargetDomain;
     use s3s::{Body, S3Request};
@@ -879,6 +917,16 @@ mod tests {
         assert!(
             delete_block.contains("authorize_plugin_instance_write_request(&req).await?;"),
             "plugin instance deletion should require SetBucketTargetAction"
+        );
+
+        let read_auth_block = extract_block_between_markers(
+            src,
+            "async fn authorize_plugin_instance_request",
+            "async fn authorize_plugin_instance_write_request",
+        );
+        assert!(
+            read_auth_block.contains("AdminAction::GetBucketTargetAction"),
+            "plugin instance read routes should require GetBucketTargetAction"
         );
     }
 
@@ -980,6 +1028,44 @@ mod tests {
         assert_eq!(mapped.id, instance.canonical_id);
         assert_eq!(mapped.domain, PluginContractDomain::Audit);
         assert!(mapped.diagnostic_codes.is_empty());
+    }
+
+    #[test]
+    fn map_instance_redacts_secret_config_fields() {
+        let instance = TargetInstanceReadModel {
+            canonical_id: canonical_target_instance_id("builtin:webhook", TargetDomain::Notify, "primary"),
+            plugin_id: "builtin:webhook".to_string(),
+            domain: TargetDomain::Notify,
+            subsystem: NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            account_id: "primary".to_string(),
+            service: "webhook".to_string(),
+            status: "online".to_string(),
+            runtime_present: true,
+            source: TargetEndpointSource::Config,
+            enabled: true,
+            config: KVS(vec![
+                KV {
+                    key: WEBHOOK_ENDPOINT.to_string(),
+                    value: "https://example.com/webhook".to_string(),
+                    hidden_if_empty: false,
+                },
+                KV {
+                    key: WEBHOOK_AUTH_TOKEN.to_string(),
+                    value: "super-secret-token".to_string(),
+                    hidden_if_empty: false,
+                },
+            ]),
+        };
+
+        let mapped = map_instance(instance);
+        assert_eq!(
+            mapped.config.get(WEBHOOK_ENDPOINT).map(String::as_str),
+            Some("https://example.com/webhook")
+        );
+        assert_eq!(
+            mapped.config.get(WEBHOOK_AUTH_TOKEN).map(String::as_str),
+            Some(super::REDACTED_SECRET_VALUE)
+        );
     }
 
     #[test]
