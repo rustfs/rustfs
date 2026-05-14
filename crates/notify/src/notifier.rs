@@ -470,4 +470,39 @@ mod tests {
         assert_eq!(enabled_target.save_calls.load(Ordering::SeqCst), 1);
         assert_eq!(disabled_target.save_calls.load(Ordering::SeqCst), 0);
     }
+
+    #[tokio::test]
+    async fn send_event_respects_prefix_suffix_filters() {
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), rule_engine.clone());
+        let target = TestTarget::new("filtered-target", "webhook", true);
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), target.id.clone());
+
+        rule_engine.set_bucket_rules("bucket", rules_map).await;
+        notifier.target_list().write().await.add(Arc::new(target.clone())).unwrap();
+
+        notifier
+            .send(Arc::new(Event::new_test_event("bucket", "report.csv", EventName::ObjectCreatedPut)))
+            .await;
+        notifier
+            .send(Arc::new(Event::new_test_event(
+                "bucket",
+                "uploads/report.txt",
+                EventName::ObjectCreatedPut,
+            )))
+            .await;
+
+        assert_eq!(target.save_calls.load(Ordering::SeqCst), 0);
+
+        notifier
+            .send(Arc::new(Event::new_test_event(
+                "bucket",
+                "uploads/report.csv",
+                EventName::ObjectCreatedPut,
+            )))
+            .await;
+
+        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+    }
 }
