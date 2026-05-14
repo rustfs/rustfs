@@ -1232,6 +1232,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_object_reader_decrypts_managed_sse_range_on_plaintext_semantics() {
+        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
+            let plaintext = b"0123456789abcdefghijklmnopqrstuvwxyz".to_vec();
+            let data_key = [0x23; 32];
+            let base_nonce = [0x13; 12];
+            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+
+            let mut encrypted = Vec::new();
+            rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("encrypt managed ranged object");
+
+            let object_info = ObjectInfo {
+                size: encrypted.len() as i64,
+                user_defined: HashMap::from([
+                    ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
+                    ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
+                    ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
+                    ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
+                ]),
+                ..Default::default()
+            };
+            let range = HTTPRangeSpec {
+                is_suffix_length: false,
+                start: 5,
+                end: 11,
+            };
+
+            let (mut reader, offset, length) = GetObjectReader::new(
+                Box::new(Cursor::new(encrypted.clone())),
+                Some(range),
+                &object_info,
+                &ObjectOptions::default(),
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("managed encrypted range reads should decrypt inside ecstore");
+
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("read managed ranged plaintext");
+
+            assert_eq!(offset, 0);
+            assert_eq!(length, encrypted.len() as i64);
+            assert_eq!(reader.object_info.size, 7);
+            assert_eq!(actual, b"56789ab");
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_get_object_reader_uses_local_managed_fallback_without_env() {
         async_with_vars(
             [
