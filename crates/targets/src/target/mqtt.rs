@@ -875,7 +875,7 @@ where
                 Err(e) => {
                     error!(target_id = %self.id, error = %e, "Failed to save event to store");
                     self.delivery_counters.record_final_failure();
-                    Err(TargetError::Storage(format!("Failed to save event to store: {e}")))
+                    Err(e)
                 }
             }
         } else {
