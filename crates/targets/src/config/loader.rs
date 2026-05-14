@@ -193,7 +193,14 @@ where
         .filter(|key| key.as_str() != DEFAULT_DELIMITER)
         .cloned()
         .collect();
-    all_instance_ids.extend(env_overrides.keys().filter(|key| key.as_str() != DEFAULT_DELIMITER).cloned());
+    all_instance_ids.extend(
+        env_overrides
+            .iter()
+            .filter(|(instance_id, env_cfg)| {
+                instance_id.as_str() != DEFAULT_DELIMITER && env_cfg.lookup(rustfs_config::ENABLE_KEY).is_some()
+            })
+            .map(|(instance_id, _)| instance_id.clone()),
+    );
     all_instance_ids.sort();
     all_instance_ids.dedup();
 
@@ -305,6 +312,29 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].0, "primary");
         assert_eq!(configs[0].1.lookup(WEBHOOK_ENDPOINT).as_deref(), Some("https://example.com/from-env"));
+    }
+
+    #[test]
+    fn collect_target_configs_does_not_materialize_env_only_instance_without_enable_flag() {
+        let mut cfg = Config(HashMap::new());
+        let mut subsystem = HashMap::new();
+        let mut default_kvs = KVS::new();
+        default_kvs.insert(ENABLE_KEY.to_string(), "on".to_string());
+        subsystem.insert("_".to_string(), default_kvs);
+        cfg.0.insert("notify_webhook".to_string(), subsystem);
+
+        let configs = collect_target_configs_from_env(
+            &cfg,
+            NOTIFY_ROUTE_PREFIX,
+            "webhook",
+            &HashSet::from([ENABLE_KEY.to_string(), WEBHOOK_ENDPOINT.to_string()]),
+            vec![(
+                "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_SECONDARY".to_string(),
+                "https://example.com/secondary".to_string(),
+            )],
+        );
+
+        assert!(configs.is_empty());
     }
 
     #[test]

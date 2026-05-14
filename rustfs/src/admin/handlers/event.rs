@@ -288,7 +288,7 @@ impl Operation for RemoveNotificationTarget {
 }
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
-    extract_supported_target_params(notification_target_specs(), params, "")
+    extract_supported_target_params(notification_target_specs(), params, "notification")
 }
 
 #[cfg(test)]
