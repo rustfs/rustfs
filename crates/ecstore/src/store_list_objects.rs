@@ -1583,6 +1583,18 @@ mod test {
         assert_eq!(err, StorageError::VolumeNotFound);
     }
 
+    #[test]
+    fn walk_result_from_set_errors_allows_missing_entries() {
+        walk_result_from_set_errors(&[Some(StorageError::FileNotFound), Some(StorageError::VolumeNotFound)])
+            .expect("missing objects under an existing listing path should not fail the walk");
+    }
+
+    #[test]
+    fn walk_result_from_set_errors_ignores_only_unexpected_and_successes() {
+        walk_result_from_set_errors(&[None, Some(StorageError::Unexpected)])
+            .expect("successful sets and unexpected EOF-style markers should not fail the walk");
+    }
+
     // use std::sync::Arc;
 
     // use crate::cache_value::metacache_set::list_path_raw;
