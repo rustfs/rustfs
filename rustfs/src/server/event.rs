@@ -88,39 +88,6 @@ fn install_ecstore_event_dispatch_hook() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_host_and_port;
-
-    #[test]
-    fn parse_host_and_port_with_ipv4_and_port() {
-        let (host, port) = parse_host_and_port("127.0.0.1:9000".to_string());
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 9000);
-    }
-
-    #[test]
-    fn parse_host_and_port_with_bracketed_ipv6_and_port() {
-        let (host, port) = parse_host_and_port("[::1]:9000".to_string());
-        assert_eq!(host, "::1");
-        assert_eq!(port, 9000);
-    }
-
-    #[test]
-    fn parse_host_and_port_with_ipv6_without_port() {
-        let (host, port) = parse_host_and_port("::1".to_string());
-        assert_eq!(host, "::1");
-        assert_eq!(port, 0);
-    }
-
-    #[test]
-    fn parse_host_and_port_with_hostname_and_port() {
-        let (host, port) = parse_host_and_port("localhost:9001".to_string());
-        assert_eq!(host, "localhost");
-        assert_eq!(port, 9001);
-    }
-}
-
 fn ensure_live_events_initialized() -> bool {
     if rustfs_notify::notification_system().is_some() {
         return true;
@@ -223,5 +190,38 @@ pub async fn init_event_notifier() {
             }
             Err(e) => error!("Failed to initialize event notifier system: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_host_and_port;
+
+    #[test]
+    fn parse_host_and_port_with_ipv4_and_port() {
+        let (host, port) = parse_host_and_port("127.0.0.1:9000".to_string());
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 9000);
+    }
+
+    #[test]
+    fn parse_host_and_port_with_bracketed_ipv6_and_port() {
+        let (host, port) = parse_host_and_port("[::1]:9000".to_string());
+        assert_eq!(host, "::1");
+        assert_eq!(port, 9000);
+    }
+
+    #[test]
+    fn parse_host_and_port_with_ipv6_without_port() {
+        let (host, port) = parse_host_and_port("::1".to_string());
+        assert_eq!(host, "::1");
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn parse_host_and_port_with_hostname_and_port() {
+        let (host, port) = parse_host_and_port("localhost:9001".to_string());
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 9001);
     }
 }
