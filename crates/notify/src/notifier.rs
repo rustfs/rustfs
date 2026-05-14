@@ -12,52 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    error::NotificationError,
-    event::Event,
-    integration::NotificationMetrics,
-    rules::{RulesMap, TargetIdSet},
-};
-use hashbrown::HashMap;
-use percent_encoding::percent_decode_str;
+use crate::{error::NotificationError, event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine};
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
-use rustfs_s3_common::EventName;
-use rustfs_targets::Target;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;
-use starshard::AsyncShardedHashMap;
+use rustfs_targets::{SharedTarget, Target, TargetRuntimeManager};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, instrument, warn};
 
-fn decoded_object_key_for_matching(object_key: &str) -> Option<String> {
-    if !object_key.contains('%') {
-        return None;
-    }
-
-    let decoded = percent_decode_str(object_key).decode_utf8().ok()?;
-    (decoded != object_key).then(|| decoded.into_owned())
-}
-
-fn match_event_targets(rules: &RulesMap, event_name: EventName, object_key: &str) -> TargetIdSet {
-    let mut target_ids = rules.match_rules(event_name, object_key);
-    if let Some(decoded_key) = decoded_object_key_for_matching(object_key) {
-        target_ids.extend(rules.match_rules(event_name, &decoded_key));
-    }
-    target_ids
-}
+pub type SharedNotifyTargetList = Arc<RwLock<TargetList>>;
 
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
     metrics: Arc<NotificationMetrics>,
-    target_list: Arc<RwLock<TargetList>>,
-    bucket_rules_map: Arc<AsyncShardedHashMap<String, RulesMap, rustc_hash::FxBuildHasher>>,
+    rule_engine: NotifyRuleEngine,
+    target_list: SharedNotifyTargetList,
     send_limiter: Arc<Semaphore>,
 }
 
 impl Default for EventNotifier {
     fn default() -> Self {
-        Self::new(Arc::new(NotificationMetrics::new()))
+        Self::new(Arc::new(NotificationMetrics::new()), NotifyRuleEngine::new())
     }
 }
 
@@ -66,32 +42,14 @@ impl EventNotifier {
     ///
     /// # Returns
     /// Returns a new instance of EventNotifier.
-    pub fn new(metrics: Arc<NotificationMetrics>) -> Self {
+    pub fn new(metrics: Arc<NotificationMetrics>, rule_engine: NotifyRuleEngine) -> Self {
         let max_inflight = rustfs_utils::get_env_usize(ENV_NOTIFY_SEND_CONCURRENCY, DEFAULT_NOTIFY_SEND_CONCURRENCY);
         EventNotifier {
             metrics,
+            rule_engine,
             target_list: Arc::new(RwLock::new(TargetList::new())),
-            bucket_rules_map: Arc::new(AsyncShardedHashMap::new(0)),
             send_limiter: Arc::new(Semaphore::new(max_inflight)),
         }
-    }
-
-    /// Checks whether a TargetID is still referenced by any bucket's rules.
-    ///
-    /// # Arguments
-    /// * `target_id` - The TargetID to check.
-    ///
-    /// # Returns
-    /// Returns `true` if the TargetID is bound to any bucket, otherwise `false`.
-    pub async fn is_target_bound_to_any_bucket(&self, target_id: &TargetID) -> bool {
-        // `AsyncShardedHashMap::iter()`: Traverse (bucket_name, rules_map)
-        let items = self.bucket_rules_map.iter().await;
-        for (_bucket, rules_map) in items {
-            if rules_map.contains_target_id(target_id) {
-                return true;
-            }
-        }
-        false
     }
 
     /// Returns a reference to the target list
@@ -99,21 +57,8 @@ impl EventNotifier {
     ///
     /// # Returns
     /// Returns an `Arc<RwLock<TargetList>>` representing the target list.
-    pub fn target_list(&self) -> Arc<RwLock<TargetList>> {
+    pub fn target_list(&self) -> SharedNotifyTargetList {
         Arc::clone(&self.target_list)
-    }
-
-    /// Removes all notification rules for a bucket
-    ///
-    /// # Arguments
-    /// * `bucket` - The name of the bucket for which to remove rules
-    ///
-    /// This method removes all rules associated with the specified bucket name.
-    /// It will log a message indicating the removal of rules.
-    pub async fn remove_rules_map(&self, bucket: &str) {
-        if self.bucket_rules_map.remove(&bucket.to_string()).await.is_some() {
-            info!("Removed all notification rules for bucket: {}", bucket);
-        }
     }
 
     /// Returns a list of ARNs for the registered targets
@@ -132,40 +77,6 @@ impl EventNotifier {
             .collect()
     }
 
-    /// Adds a rules map for a bucket
-    ///
-    /// # Arguments
-    /// * `bucket` - The name of the bucket for which to add the rules map
-    /// * `rules_map` - The rules map to add for the bucket
-    pub async fn add_rules_map(&self, bucket: &str, rules_map: RulesMap) {
-        if rules_map.is_empty() {
-            self.bucket_rules_map.remove(&bucket.to_string()).await;
-        } else {
-            self.bucket_rules_map.insert(bucket.to_string(), rules_map).await;
-        }
-        info!("Added rules for bucket: {}", bucket);
-    }
-
-    /// Gets the rules map for a specific bucket.
-    ///
-    /// # Arguments
-    /// * `bucket` - The name of the bucket for which to get the rules map
-    ///
-    /// # Returns
-    /// Returns `Some(RulesMap)` if rules exist for the bucket, otherwise returns `None`.
-    pub async fn get_rules_map(&self, bucket: &str) -> Option<RulesMap> {
-        self.bucket_rules_map.get(&bucket.to_string()).await
-    }
-
-    /// Removes notification rules for a bucket
-    ///
-    /// # Arguments
-    /// * `bucket` - The name of the bucket for which to remove notification rules
-    pub async fn remove_notification(&self, bucket: &str) {
-        self.bucket_rules_map.remove(&bucket.to_string()).await;
-        info!("Removed notification rules for bucket: {}", bucket);
-    }
-
     /// Removes all targets
     pub async fn remove_all_bucket_targets(&self) {
         let mut target_list_guard = self.target_list.write().await;
@@ -173,26 +84,6 @@ impl EventNotifier {
         // TargetList::clear_targets_only already handles calling target.close().
         target_list_guard.clear_targets_only().await; // Modified clear to not re-cancel
         info!("Removed all targets and their streams");
-    }
-
-    /// Checks if there are active subscribers for the given bucket and event name.
-    ///
-    /// # Parameters
-    /// * `bucket_name` - bucket name.
-    /// * `event_name` - Event name.
-    ///
-    /// # Return value
-    /// Return `true` if at least one matching notification rule exists.
-    pub async fn has_subscriber(&self, bucket_name: &str, event_name: &EventName) -> bool {
-        // Rules to check if the bucket exists
-        if let Some(rules_map) = self.bucket_rules_map.get(&bucket_name.to_string()).await {
-            // A composite event (such as ObjectCreatedAll) is expanded to multiple single events.
-            // We need to check whether any of these single events have the rules configured.
-            rules_map.has_subscriber(event_name)
-        } else {
-            // If no bucket is found, no subscribers
-            false
-        }
     }
 
     /// Sends an event to the appropriate targets based on the bucket rules
@@ -205,13 +96,7 @@ impl EventNotifier {
         let object_key = &event.s3.object.key;
         let event_name = event.event_name;
 
-        let Some(rules) = self.bucket_rules_map.get(bucket_name).await else {
-            debug!("No rules found for bucket: {}", bucket_name);
-            self.metrics.increment_skipped();
-            return;
-        };
-
-        let target_ids = match_event_targets(&rules, event_name, object_key);
+        let target_ids = self.rule_engine.match_targets(bucket_name, event_name, object_key).await;
         if target_ids.is_empty() {
             debug!("No matching targets for event in bucket: {}", bucket_name);
             self.metrics.increment_skipped();
@@ -287,45 +172,30 @@ impl EventNotifier {
         info!("Event processing initiated for {} targets for bucket: {}", target_ids_len, bucket_name);
     }
 
-    /// Initializes the targets for buckets
-    ///
-    /// # Arguments
-    /// * `targets_to_init` - A vector of boxed targets to initialize
-    ///
-    /// # Returns
-    /// Returns `Ok(())` if initialization is successful, otherwise returns a `NotificationError`.
+    /// Initializes the targets for buckets from shared target handles.
     #[instrument(skip(self, targets_to_init))]
-    pub async fn init_bucket_targets(
-        &self,
-        targets_to_init: Vec<Box<dyn Target<Event> + Send + Sync>>,
-    ) -> Result<(), NotificationError> {
-        // Currently active, simpler logic
-        let mut target_list_guard = self.target_list.write().await; //Gets a write lock for the TargetList
-
-        // Clear existing targets first - rebuild from scratch to ensure consistency with new configuration
+    pub async fn init_bucket_targets_shared(&self, targets_to_init: Vec<SharedTarget<Event>>) -> Result<(), NotificationError> {
+        let mut target_list_guard = self.target_list.write().await;
         target_list_guard.clear();
 
-        for target_boxed in targets_to_init {
-            // Traverse the incoming Box<dyn Target >
-            debug!("init bucket target: {}", target_boxed.name());
-            // TargetList::add method expectations Arc<dyn Target + Send + Sync>
-            // Therefore, you need to convert Box<dyn Target + Send + Sync> to Arc<dyn Target + Send + Sync>
-            let target_arc: Arc<dyn Target<Event> + Send + Sync> = Arc::from(target_boxed);
-            target_list_guard.add(target_arc)?; // Add Arc<dyn Target> to the list
+        for target in targets_to_init {
+            debug!("init bucket target: {}", target.name());
+            target_list_guard.add(target)?;
         }
+
         info!(
-            "Initialized {} targets, list size: {}", // Clearer logs
+            "Initialized {} shared targets, list size: {}",
             target_list_guard.len(),
             target_list_guard.len()
         );
-        Ok(()) // Make sure to return a Result
+        Ok(())
     }
 }
 
 /// A thread-safe list of targets
 pub struct TargetList {
     /// Map of TargetID to Target
-    targets: HashMap<TargetID, Arc<dyn Target<Event> + Send + Sync>>,
+    runtime: TargetRuntimeManager<Event>,
 }
 
 impl Default for TargetList {
@@ -337,7 +207,9 @@ impl Default for TargetList {
 impl TargetList {
     /// Creates a new TargetList
     pub fn new() -> Self {
-        TargetList { targets: HashMap::new() }
+        TargetList {
+            runtime: TargetRuntimeManager::new(),
+        }
     }
 
     /// Adds a target to the list
@@ -349,17 +221,17 @@ impl TargetList {
     /// Returns `Ok(())` if the target was added successfully, or a `NotificationError` if an error occurred.
     pub fn add(&mut self, target: Arc<dyn Target<Event> + Send + Sync>) -> Result<(), NotificationError> {
         let id = target.id();
-        if self.targets.contains_key(&id) {
+        if self.runtime.get_by_target_id(&id).is_some() {
             // Potentially update or log a warning/error if replacing an existing target.
             warn!("Target with ID {} already exists in TargetList. It will be overwritten.", id);
         }
-        self.targets.insert(id, target);
+        self.runtime.add_arc(target);
         Ok(())
     }
 
     /// Clears all targets from the list
     pub fn clear(&mut self) {
-        self.targets.clear();
+        self.runtime.clear();
     }
 
     /// Removes a target by ID. Note: This does not stop its associated event stream.
@@ -370,30 +242,14 @@ impl TargetList {
     ///
     /// # Returns
     /// Returns the removed target if it existed, otherwise `None`.
-    pub async fn remove_target_only(&mut self, id: &TargetID) -> Option<Arc<dyn Target<Event> + Send + Sync>> {
-        if let Some(target_arc) = self.targets.remove(id) {
-            if let Err(e) = target_arc.close().await {
-                // Target's own close logic
-                error!("Failed to close target {} during removal: {}", id, e);
-            }
-            Some(target_arc)
-        } else {
-            None
-        }
+    pub async fn remove_target_only(&mut self, id: &TargetID) -> Option<SharedTarget<Event>> {
+        self.runtime.remove_by_target_id_and_close(id).await
     }
 
     /// Clears all targets from the list. Note: This does not stop their associated event streams.
     /// Stream cancellation should be handled by EventNotifier.
     pub async fn clear_targets_only(&mut self) {
-        let target_ids_to_clear: Vec<TargetID> = self.targets.keys().cloned().collect();
-        for id in target_ids_to_clear {
-            if let Some(target_arc) = self.targets.remove(&id)
-                && let Err(e) = target_arc.close().await
-            {
-                error!("Failed to close target {} during clear: {}", id, e);
-            }
-        }
-        self.targets.clear();
+        self.runtime.clear_and_close().await;
     }
 
     /// Returns a target by ID
@@ -403,34 +259,54 @@ impl TargetList {
     ///
     /// # Returns
     /// Returns the target if it exists, otherwise `None`.
-    pub fn get(&self, id: &TargetID) -> Option<Arc<dyn Target<Event> + Send + Sync>> {
-        self.targets.get(id).cloned()
+    pub fn get(&self, id: &TargetID) -> Option<SharedTarget<Event>> {
+        self.runtime.get_by_target_id(id)
     }
 
     /// Returns all target IDs
     pub fn keys(&self) -> Vec<TargetID> {
-        self.targets.keys().cloned().collect()
+        self.runtime.target_ids()
     }
 
     /// Returns all targets in the list
-    pub fn values(&self) -> Vec<Arc<dyn Target<Event> + Send + Sync>> {
-        self.targets.values().cloned().collect()
+    pub fn values(&self) -> Vec<SharedTarget<Event>> {
+        self.runtime.values()
+    }
+
+    pub fn runtime_snapshots(&self) -> Vec<rustfs_targets::RuntimeTargetSnapshot> {
+        self.runtime.snapshots()
+    }
+
+    pub async fn runtime_health_snapshots(&self) -> Vec<rustfs_targets::RuntimeTargetHealthSnapshot> {
+        self.runtime.health_snapshots().await
+    }
+
+    pub fn runtime_status_snapshot(
+        &self,
+        replay_workers: &rustfs_targets::ReplayWorkerManager,
+    ) -> rustfs_targets::RuntimeStatusSnapshot {
+        self.runtime.status_snapshot(replay_workers)
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut TargetRuntimeManager<Event> {
+        &mut self.runtime
     }
 
     /// Returns the number of targets
     pub fn len(&self) -> usize {
-        self.targets.len()
+        self.runtime.len()
     }
 
     /// is_empty can be derived from len()
     pub fn is_empty(&self) -> bool {
-        self.targets.is_empty()
+        self.runtime.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{rule_engine::NotifyRuleEngine, rules::RulesMap};
     use async_trait::async_trait;
     use rustfs_s3_common::EventName;
     use rustfs_targets::StoreError;
@@ -445,40 +321,57 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    #[test]
-    fn encoded_event_key_matches_raw_prefix_suffix_filter() {
+    #[tokio::test]
+    async fn encoded_event_key_matches_raw_prefix_suffix_filter() {
         let target_id = TargetID::new("primary".to_string(), "webhook".to_string());
         let mut rules_map = RulesMap::new();
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), target_id.clone());
 
-        let targets = match_event_targets(&rules_map, EventName::ObjectCreatedPut, "uploads%2Freport.csv");
+        let rule_engine = NotifyRuleEngine::new();
+        rule_engine.set_bucket_rules("test-bucket", rules_map).await;
+
+        let targets = rule_engine
+            .match_targets("test-bucket", EventName::ObjectCreatedPut, "uploads%2Freport.csv")
+            .await;
 
         assert!(targets.contains(&target_id));
     }
 
-    #[test]
-    fn encoded_event_key_matches_raw_and_decoded_rule_targets() {
+    #[tokio::test]
+    async fn encoded_event_key_matches_raw_and_decoded_rule_targets() {
         let raw_target = TargetID::new("raw".to_string(), "webhook".to_string());
         let decoded_target = TargetID::new("decoded".to_string(), "webhook".to_string());
         let mut rules_map = RulesMap::new();
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads%2F*.csv".to_string(), raw_target.clone());
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), decoded_target.clone());
 
-        let targets = match_event_targets(&rules_map, EventName::ObjectCreatedPut, "uploads%2Freport.csv");
+        let rule_engine = NotifyRuleEngine::new();
+        rule_engine.set_bucket_rules("test-bucket", rules_map).await;
+
+        let targets = rule_engine
+            .match_targets("test-bucket", EventName::ObjectCreatedPut, "uploads%2Freport.csv")
+            .await;
 
         assert_eq!(targets.len(), 2);
         assert!(targets.contains(&raw_target));
         assert!(targets.contains(&decoded_target));
     }
 
-    #[test]
-    fn encoded_event_key_does_not_bypass_suffix_filter() {
+    #[tokio::test]
+    async fn encoded_event_key_does_not_bypass_suffix_filter() {
         let target_id = TargetID::new("primary".to_string(), "webhook".to_string());
         let mut rules_map = RulesMap::new();
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), target_id);
 
-        let root_targets = match_event_targets(&rules_map, EventName::ObjectCreatedPut, "report.csv");
-        let suffix_targets = match_event_targets(&rules_map, EventName::ObjectCreatedPut, "uploads%2Freport.txt");
+        let rule_engine = NotifyRuleEngine::new();
+        rule_engine.set_bucket_rules("test-bucket", rules_map).await;
+
+        let root_targets = rule_engine
+            .match_targets("test-bucket", EventName::ObjectCreatedPut, "report.csv")
+            .await;
+        let suffix_targets = rule_engine
+            .match_targets("test-bucket", EventName::ObjectCreatedPut, "uploads%2Freport.txt")
+            .await;
 
         assert!(root_targets.is_empty());
         assert!(suffix_targets.is_empty());
@@ -547,7 +440,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_event_skips_disabled_target() {
-        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()));
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), rule_engine.clone());
 
         let enabled_target = TestTarget::new("enabled-target", "webhook", true);
         let disabled_target = TestTarget::new("disabled-target", "webhook", false);
@@ -556,7 +450,7 @@ mod tests {
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), enabled_target.id.clone());
         rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), disabled_target.id.clone());
 
-        notifier.add_rules_map("bucket", rules_map).await;
+        rule_engine.set_bucket_rules("bucket", rules_map).await;
         notifier
             .target_list()
             .write()
