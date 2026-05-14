@@ -3307,10 +3307,12 @@ pub(crate) mod cmptst_34 {
         // CompleteMultipartUpload finalises the object.
         let payload = vec![0xA5u8; 6 * 1024 * 1024];
 
-        let mut client_attrs = FileAttributes::default();
-        client_attrs.mtime = Some(REQUESTED_MTIME);
-        client_attrs.atime = Some(REQUESTED_MTIME);
-        client_attrs.permissions = Some(REQUESTED_MODE);
+        let client_attrs = FileAttributes {
+            mtime: Some(REQUESTED_MTIME),
+            atime: Some(REQUESTED_MTIME),
+            permissions: Some(REQUESTED_MODE),
+            ..FileAttributes::default()
+        };
 
         let mut writer = sftp
             .open_with_flags_and_attributes(&path, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE, client_attrs)
