@@ -51,13 +51,13 @@ Treat this file list as the default checklist for future release bumps. Only dro
 - `1.0.0-beta.4` -> `0.4.0`
 - Follow the same pattern for later beta releases unless the repository rule changes.
 - Update `rustfs.spec` release metadata and changelog entry.
-- Keep `rustfs.spec` `Release` aligned with the app version string.
+- Set `rustfs.spec` `Release` to the prerelease suffix without the base version, for example `beta.3` for `1.0.0-beta.3`.
 - Keep the release asset changes in a separate commit from the core Rust workspace version bump when the branch contains both.
 
 4. Stop and discuss before changing release policy
 - Ask before changing the established Docker tag style away from `<version>`.
 - Ask before changing the established Helm chart version mapping away from `beta.N -> 0.N.0`.
-- Ask before changing the established `rustfs.spec` `Release` rule away from the app version string.
+- Ask before changing the established `rustfs.spec` `Release` rule away from the release suffix form such as `beta.N`.
 - Ask before widening the release scope beyond the files already validated in PR `#2957`.
 
 5. Verify before shipping
@@ -99,5 +99,5 @@ When using this skill, return:
 
 - Docs use Docker tags in `<version>` form, not `v<version>`.
 - `helm/rustfs/Chart.yaml` `version` follows `beta.N -> 0.N.0` based on the current release policy.
-- `rustfs.spec` `Release` follows the app version string.
+- `rustfs.spec` `Release` follows the release suffix form, for example `beta.3`.
 - If any of these rules need to change in the future, pause and confirm before editing.
