@@ -115,7 +115,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # Using specific version
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:v1.0.0-beta.1
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.3
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
