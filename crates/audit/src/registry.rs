@@ -153,12 +153,13 @@ impl AuditRegistry {
 
         for target_id in self.targets.keys() {
             if let Some(target) = self.targets.remove(&target_id)
-                && let Err(err) = target.close().await {
-                    tracing::error!(target_id = %target_id, error = %err, "Failed to close target during shutdown");
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
+                && let Err(err) = target.close().await
+            {
+                tracing::error!(target_id = %target_id, error = %err, "Failed to close target during shutdown");
+                if first_error.is_none() {
+                    first_error = Some(err);
                 }
+            }
         }
 
         match first_error {
