@@ -90,7 +90,7 @@ impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
         let audit_enabled = is_audit_module_enabled();
-        let notify_enabled = is_notify_module_enabled();
+        let notify_enabled = should_build_notification_event(is_notify_module_enabled());
 
         let path = req.uri.path().trim_start_matches('/');
         let mut segs = path.splitn(2, '/');
@@ -332,6 +332,10 @@ impl OperationHelper {
         }
         self
     }
+}
+
+fn should_build_notification_event(notify_module_enabled: bool) -> bool {
+    notify_module_enabled || rustfs_notify::notification_system().is_some_and(|system| system.has_live_listeners())
 }
 
 impl Drop for OperationHelper {

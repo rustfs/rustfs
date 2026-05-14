@@ -473,14 +473,8 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// in-place edit cycle (download, modify, upload). Clients that need
     /// that pattern (rare for SFTP) get a clear protocol error rather
     /// than a data loss path.
-    #[tracing::instrument(level = "info", skip(self, _attrs), fields(id, path = %sanitise_control_bytes(&filename), pflags = ?pflags), err(Debug))]
-    async fn open(
-        &mut self,
-        id: u32,
-        filename: String,
-        pflags: OpenFlags,
-        _attrs: FileAttributes,
-    ) -> Result<Handle, Self::Error> {
+    #[tracing::instrument(level = "info", skip(self, attrs), fields(id, path = %sanitise_control_bytes(&filename), pflags = ?pflags), err(Debug))]
+    async fn open(&mut self, id: u32, filename: String, pflags: OpenFlags, attrs: FileAttributes) -> Result<Handle, Self::Error> {
         if pflags.contains(OpenFlags::APPEND) {
             return Err(SftpError::code(StatusCode::OpUnsupported));
         }
@@ -502,7 +496,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
             return Err(SftpError::code(StatusCode::OpUnsupported));
         }
         if is_write {
-            return self.open_write(id, &filename, pflags).await;
+            return self.open_write(id, &filename, pflags, attrs).await;
         }
         if is_read {
             return self.open_read(id, &filename).await;
@@ -564,6 +558,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
             bucket,
             key,
             attrs,
+            open_attrs,
             phase,
         }) = removed
         else {
@@ -574,7 +569,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
             WritePhase::Buffering { part_buffer } => {
                 // Small-file path. No multipart state exists so nothing
                 // to abort on failure.
-                self.commit_write(&bucket, &key, part_buffer).await?;
+                self.commit_write(&bucket, &key, &open_attrs, part_buffer).await?;
             }
             WritePhase::Streaming {
                 upload_id,
@@ -686,6 +681,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
             bucket,
             key,
             attrs,
+            open_attrs: _,
             phase:
                 WritePhase::Streaming {
                     upload_id,

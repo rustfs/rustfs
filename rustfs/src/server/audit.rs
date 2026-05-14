@@ -72,13 +72,7 @@ pub async fn start_audit_system() -> AuditResult<()> {
 
     // 1. Get the global configuration loaded by ecstore
     let server_config = match server_config_from_context() {
-        Some(config) => {
-            info!(
-                target: "rustfs::main::start_audit_system",
-                "Global server configuration loads successfully: {:?}", config
-            );
-            config
-        }
+        Some(config) => config,
         None => {
             warn!(
                 target: "rustfs::main::start_audit_system",
@@ -92,9 +86,8 @@ pub async fn start_audit_system() -> AuditResult<()> {
         target: "rustfs::main::start_audit_system",
         "The global server configuration is loaded"
     );
-    // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
-    let has_targets = has_any_audit_targets(&server_config);
-    if !has_targets {
+    // 2. Check if the audit subsystem exists in the configuration, and skip initialization if it doesn't
+    if !has_any_audit_targets(&server_config) {
         info!(
             target: "rustfs::main::start_audit_system",
             "Audit subsystem targets are not configured, and audit system initialization is skipped."
@@ -107,35 +100,16 @@ pub async fn start_audit_system() -> AuditResult<()> {
         "Audit subsystem configuration detected and started initializing the audit system."
     );
 
-    if let Some(system) = audit_system() {
-        match system.get_state().await {
-            AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {
-                // Match notify behavior: prefer reloading the existing singleton
-                // instead of constructing a second lifecycle path on re-enable.
-                match system.reload_config(server_config).await {
-                    Ok(()) => {
-                        info!(
-                            target: "rustfs::main::start_audit_system",
-                            "Audit system reloaded successfully with time: {}.",
-                            jiff::Zoned::now()
-                        );
-                        Ok(())
-                    }
-                    Err(e) => {
-                        warn!(
-                            target: "rustfs::main::start_audit_system",
-                            "Audit system reload failed: {:?}",
-                            e
-                        );
-                        Err(e)
-                    }
-                }
-            }
-            AuditSystemState::Stopped | AuditSystemState::Stopping => match system.start(server_config).await {
+    let system = audit_system().unwrap_or_else(init_audit_system);
+    match system.get_state().await {
+        AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {
+            // Match notify behavior: prefer reloading the existing singleton
+            // instead of constructing a second lifecycle path on re-enable.
+            match system.reload_config(server_config).await {
                 Ok(()) => {
                     info!(
                         target: "rustfs::main::start_audit_system",
-                        "Audit system started successfully with time: {}.",
+                        "Audit system reloaded successfully with time: {}.",
                         jiff::Zoned::now()
                     );
                     Ok(())
@@ -143,16 +117,14 @@ pub async fn start_audit_system() -> AuditResult<()> {
                 Err(e) => {
                     warn!(
                         target: "rustfs::main::start_audit_system",
-                        "Audit system startup failed: {:?}",
+                        "Audit system reload failed: {:?}",
                         e
                     );
                     Err(e)
                 }
-            },
+            }
         }
-    } else {
-        let system = init_audit_system();
-        match system.start(server_config).await {
+        AuditSystemState::Stopped | AuditSystemState::Stopping => match system.start(server_config).await {
             Ok(()) => {
                 info!(
                     target: "rustfs::main::start_audit_system",
@@ -169,7 +141,7 @@ pub async fn start_audit_system() -> AuditResult<()> {
                 );
                 Err(e)
             }
-        }
+        },
     }
 }
 

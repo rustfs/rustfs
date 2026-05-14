@@ -38,6 +38,20 @@ pub async fn initialize(config: Config) -> Result<(), NotificationError> {
     }
 }
 
+/// Initialize the global notification system only for live in-process consumers.
+///
+/// This does not load configured notification targets or bucket rules. It exists so
+/// ListenBucketNotification clients can receive live events even when external
+/// notification targets are disabled.
+pub fn initialize_live_events() -> Result<(), NotificationError> {
+    let system = NotificationSystem::new(Config::new());
+
+    match NOTIFICATION_SYSTEM.set(Arc::new(system)) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized)),
+    }
+}
+
 /// Returns a handle to the global NotificationSystem instance.
 /// Return None if the system has not been initialized.
 pub fn notification_system() -> Option<Arc<NotificationSystem>> {

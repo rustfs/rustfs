@@ -920,4 +920,18 @@ mod tests {
         assert!(msg.contains("1 failure(s)"));
         assert!(msg.contains("peer[0]"));
     }
+
+    #[tokio::test]
+    async fn load_transition_tier_config_reports_unreachable_peers() {
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+        };
+
+        let results = sys.load_transition_tier_config().await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].host.is_empty());
+        assert!(results[0].err.is_some());
+        assert!(results[0].err.as_ref().unwrap().to_string().contains("peer is not reachable"));
+    }
 }

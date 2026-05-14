@@ -18,22 +18,39 @@
 //! It supports sending events to various targets
 //! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
 
+mod bucket_config_manager;
+mod config_manager;
 mod error;
 mod event;
+mod event_bridge;
 pub mod factory;
 mod global;
 pub mod integration;
 mod notification_system_subscriber;
 pub mod notifier;
+mod pipeline;
 pub mod registry;
+mod rule_engine;
 pub mod rules;
-pub mod stream;
+mod runtime_facade;
+mod runtime_view;
+mod services;
+mod status_view;
 
+pub use bucket_config_manager::NotifyBucketConfigManager;
+pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
 pub use error::{LifecycleError, NotificationError};
 pub use event::{Event, EventArgs, EventArgsBuilder};
+pub use event_bridge::{LiveEventHistory, NotifyEventBridge};
 pub use global::{
-    initialize, is_notification_system_initialized, notification_metrics_snapshot, notification_system,
+    initialize, initialize_live_events, is_notification_system_initialized, notification_metrics_snapshot, notification_system,
     notification_target_metrics, notifier_global,
 };
 pub use integration::{NotificationMetricSnapshot, NotificationSystem, NotificationTargetMetricSnapshot};
+pub use pipeline::NotifyPipeline;
+pub use rule_engine::NotifyRuleEngine;
 pub use rules::BucketNotificationConfig;
+pub use runtime_facade::NotifyRuntimeFacade;
+pub use runtime_view::NotifyRuntimeView;
+pub use services::NotifyServices;
+pub use status_view::NotifyStatusView;

@@ -17,6 +17,7 @@ use crate::app::context::resolve_server_config;
 use rustfs_ecstore::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
 use rustfs_notify::EventArgs as NotifyEventArgs;
 use rustfs_s3_common::EventName;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::spawn;
 use tracing::{error, info, instrument, warn};
@@ -39,13 +40,7 @@ pub fn is_notify_module_enabled() -> bool {
 
 fn convert_ecstore_event_args(args: EcstoreEventArgs) -> NotifyEventArgs {
     let version_id = args.object.version_id.map(|v| v.to_string()).unwrap_or_default();
-    let (host, port) = match args.host.rsplit_once(':') {
-        Some((host, port)) => match port.parse::<u16>() {
-            Ok(port) => (host.to_string(), port),
-            Err(_) => (args.host, 0),
-        },
-        None => (args.host, 0),
-    };
+    let (host, port) = parse_host_and_port(args.host);
     let req_params = args.req_params.into_iter().collect();
     let resp_elements = args.resp_elements.into_iter().collect();
 
@@ -62,6 +57,24 @@ fn convert_ecstore_event_args(args: EcstoreEventArgs) -> NotifyEventArgs {
     }
 }
 
+fn parse_host_and_port(host: String) -> (String, u16) {
+    if let Ok(addr) = host.parse::<SocketAddr>() {
+        return (addr.ip().to_string(), addr.port());
+    }
+
+    if host.chars().filter(|&c| c == ':').count() != 1 {
+        return (host, 0);
+    }
+
+    match host.split_once(':') {
+        Some((base, port)) if !base.is_empty() => match port.parse::<u16>() {
+            Ok(port) => (base.to_string(), port),
+            Err(_) => (host, 0),
+        },
+        _ => (host, 0),
+    }
+}
+
 fn install_ecstore_event_dispatch_hook() {
     let installed = register_event_dispatch_hook(|args| {
         let notify_args = convert_ecstore_event_args(args);
@@ -72,6 +85,23 @@ fn install_ecstore_event_dispatch_hook() {
 
     if !installed {
         warn!("ECStore event dispatch hook was already registered");
+    }
+}
+
+fn ensure_live_events_initialized() -> bool {
+    if rustfs_notify::notification_system().is_some() {
+        return true;
+    }
+
+    match rustfs_notify::initialize_live_events() {
+        Ok(()) => {
+            install_ecstore_event_dispatch_hook();
+            true
+        }
+        Err(e) => {
+            error!("Failed to initialize live event stream support: {}", e);
+            false
+        }
     }
 }
 
@@ -107,9 +137,15 @@ pub async fn init_event_notifier() {
     if !enabled {
         info!(
             target: "rustfs::main::init_event_notifier",
-            "Notify module is disabled, event notifier initialization is skipped. Set {}=true to enable notify initialization.",
+            "Notify module is disabled, initializing live event stream support only. Set {}=true to enable notification targets.",
             rustfs_config::ENV_NOTIFY_ENABLE
         );
+        if ensure_live_events_initialized() {
+            info!(
+                target: "rustfs::main::init_event_notifier",
+                "Live event stream support initialized successfully."
+            );
+        }
         return;
     }
 
@@ -143,13 +179,49 @@ pub async fn init_event_notifier() {
                 "Event notifier system reloaded successfully."
             );
         }
-    } else if let Err(e) = rustfs_notify::initialize(server_config).await {
-        error!("Failed to initialize event notifier system: {}", e);
     } else {
-        install_ecstore_event_dispatch_hook();
-        info!(
-            target: "rustfs::main::init_event_notifier",
-            "Event notifier system initialized successfully."
-        );
+        match rustfs_notify::initialize(server_config).await {
+            Ok(()) => {
+                install_ecstore_event_dispatch_hook();
+                info!(
+                    target: "rustfs::main::init_event_notifier",
+                    "Event notifier system initialized successfully."
+                );
+            }
+            Err(e) => error!("Failed to initialize event notifier system: {}", e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_host_and_port;
+
+    #[test]
+    fn parse_host_and_port_with_ipv4_and_port() {
+        let (host, port) = parse_host_and_port("127.0.0.1:9000".to_string());
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 9000);
+    }
+
+    #[test]
+    fn parse_host_and_port_with_bracketed_ipv6_and_port() {
+        let (host, port) = parse_host_and_port("[::1]:9000".to_string());
+        assert_eq!(host, "::1");
+        assert_eq!(port, 9000);
+    }
+
+    #[test]
+    fn parse_host_and_port_with_ipv6_without_port() {
+        let (host, port) = parse_host_and_port("::1".to_string());
+        assert_eq!(host, "::1");
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn parse_host_and_port_with_hostname_and_port() {
+        let (host, port) = parse_host_and_port("localhost:9001".to_string());
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 9001);
     }
 }

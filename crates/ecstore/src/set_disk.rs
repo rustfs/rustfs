@@ -1937,8 +1937,11 @@ impl ObjectOperations for SetDisks {
             None
         };
 
+        // Use the same full xl.meta read path as GetObject metadata resolution.
+        // This avoids HEAD/GetObject metadata visibility skew immediately after
+        // PutObject/CompleteMultipartUpload.
         let (fi, _, _) = self
-            .get_object_fileinfo(bucket, object, opts, false)
+            .get_object_fileinfo(bucket, object, opts, true)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
@@ -5554,6 +5557,36 @@ mod tests {
         let data_dirs = vec![Some(uuid1), Some(uuid2), None];
         let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
         assert_eq!(result, None); // No UUID meets quorum of 2
+    }
+
+    #[test]
+    fn test_object_quorum_from_meta_returns_not_found_when_all_metadata_is_missing() {
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            Some(DiskError::VolumeNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::FileNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+            .expect_err("missing metadata should map to FileNotFound");
+
+        assert_eq!(err, DiskError::FileNotFound);
+    }
+
+    #[test]
+    fn test_object_quorum_from_meta_preserves_read_quorum_for_mixed_failures() {
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            Some(DiskError::VolumeNotFound),
+            Some(DiskError::FileCorrupt),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+            .expect_err("mixed metadata failures should keep quorum semantics");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
     #[test]

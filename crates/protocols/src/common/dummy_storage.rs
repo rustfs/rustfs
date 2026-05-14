@@ -34,12 +34,12 @@ use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CopyObjectInput, CopyObjectOutput, CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-    DeleteBucketOutput, DeleteObjectOutput, ETag, GetObjectOutput, HeadBucketOutput, HeadObjectOutput, ListBucketsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, UploadPartCopyInput,
-    UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    CopyObjectInput, CopyObjectOutput, CopyPartResult, CreateBucketOutput, CreateMultipartUploadInput,
+    CreateMultipartUploadOutput, DeleteBucketOutput, DeleteObjectOutput, ETag, GetObjectOutput, HeadBucketOutput,
+    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob,
+    Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -88,6 +88,22 @@ pub struct UploadPartCall {
     pub content_length: Option<i64>,
 }
 
+/// Recorded invocation of put_object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutObjectCall {
+    pub bucket: String,
+    pub key: String,
+    pub metadata: Option<HashMap<String, String>>,
+}
+
+/// Recorded invocation of create_multipart_upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateMultipartCall {
+    pub bucket: String,
+    pub key: String,
+    pub metadata: Option<HashMap<String, String>>,
+}
+
 /// Recorded invocation of complete_multipart_upload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteCall {
@@ -126,6 +142,8 @@ struct Inner {
 
     // Observation logs.
     abort_multipart_calls: Vec<AbortCall>,
+    put_object_calls: Vec<PutObjectCall>,
+    create_multipart_calls: Vec<CreateMultipartCall>,
     upload_part_calls: Vec<UploadPartCall>,
     complete_multipart_calls: Vec<CompleteCall>,
     head_object_calls: Vec<HeadObjectCall>,
@@ -173,6 +191,8 @@ impl Inner {
             abort_multipart_upload: VecDeque::new(),
             upload_part_copy: VecDeque::new(),
             abort_multipart_calls: Vec::new(),
+            put_object_calls: Vec::new(),
+            create_multipart_calls: Vec::new(),
             upload_part_calls: Vec::new(),
             complete_multipart_calls: Vec::new(),
             head_object_calls: Vec::new(),
@@ -296,6 +316,18 @@ impl DummyBackend {
     /// Queue an upload_part error.
     pub fn queue_upload_part_err(&self, err: DummyError) {
         self.inner.lock().expect("lock").upload_part.push_back(Err(err));
+    }
+
+    /// Queue an upload_part_copy Ok response carrying the given ETag.
+    pub fn queue_upload_part_copy_ok(&self, e_tag: impl Into<String>) {
+        let out = UploadPartCopyOutput {
+            copy_part_result: Some(CopyPartResult {
+                e_tag: Some(ETag::Strong(e_tag.into())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").upload_part_copy.push_back(Ok(out));
     }
 
     /// Queue a complete_multipart_upload Ok response.
@@ -422,6 +454,16 @@ impl DummyBackend {
         self.inner.lock().expect("lock").abort_multipart_calls.clone()
     }
 
+    /// Snapshot the put_object call log.
+    pub fn put_object_calls(&self) -> Vec<PutObjectCall> {
+        self.inner.lock().expect("lock").put_object_calls.clone()
+    }
+
+    /// Snapshot the create_multipart_upload call log.
+    pub fn create_multipart_calls(&self) -> Vec<CreateMultipartCall> {
+        self.inner.lock().expect("lock").create_multipart_calls.clone()
+    }
+
     /// Snapshot the upload_part call log.
     pub fn upload_part_calls(&self) -> Vec<UploadPartCall> {
         self.inner.lock().expect("lock").upload_part_calls.clone()
@@ -471,12 +513,17 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn put_object(&self, _input: PutObjectInput, _ak: &str, _sk: &str) -> Result<PutObjectOutput, Self::Error> {
+    async fn put_object(&self, input: PutObjectInput, _ak: &str, _sk: &str) -> Result<PutObjectOutput, Self::Error> {
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across
         // an await point.
         let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
+            inner.put_object_calls.push(PutObjectCall {
+                bucket: input.bucket.to_string(),
+                key: input.key.to_string(),
+                metadata: input.metadata.clone(),
+            });
             let stall = inner.stall_put_object;
             let entered = inner.put_object_entered.clone();
             let popped = if stall { None } else { inner.put_object.pop_front() };
@@ -582,10 +629,18 @@ impl StorageBackend for DummyBackend {
 
     async fn create_multipart_upload(
         &self,
-        _input: CreateMultipartUploadInput,
+        input: CreateMultipartUploadInput,
         _ak: &str,
         _sk: &str,
     ) -> Result<CreateMultipartUploadOutput, Self::Error> {
+        {
+            let mut inner = self.inner.lock().expect("lock");
+            inner.create_multipart_calls.push(CreateMultipartCall {
+                bucket: input.bucket.to_string(),
+                key: input.key.to_string(),
+                metadata: input.metadata.clone(),
+            });
+        }
         match self.inner.lock().expect("lock").create_multipart_upload.pop_front() {
             Some(r) => r,
             None => Err(DummyError::Unconfigured("create_multipart_upload")),
