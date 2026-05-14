@@ -107,9 +107,21 @@ pub async fn init_event_notifier() {
     if !enabled {
         info!(
             target: "rustfs::main::init_event_notifier",
-            "Notify module is disabled, event notifier initialization is skipped. Set {}=true to enable notify initialization.",
+            "Notify module is disabled, initializing live event stream support only. Set {}=true to enable notification targets.",
             rustfs_config::ENV_NOTIFY_ENABLE
         );
+        if rustfs_notify::notification_system().is_none() {
+            match rustfs_notify::initialize_live_events() {
+                Ok(()) => {
+                    install_ecstore_event_dispatch_hook();
+                    info!(
+                        target: "rustfs::main::init_event_notifier",
+                        "Live event stream support initialized successfully."
+                    );
+                }
+                Err(e) => error!("Failed to initialize live event stream support: {}", e),
+            }
+        }
         return;
     }
 

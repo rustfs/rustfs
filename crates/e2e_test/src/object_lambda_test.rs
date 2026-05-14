@@ -1152,6 +1152,41 @@ async fn test_listen_notification_emits_after_put_object() -> Result<(), Box<dyn
 
 #[tokio::test]
 #[serial]
+async fn test_listen_notification_emits_on_empty_bucket_when_notify_disabled() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "false")])
+        .await?;
+
+    let bucket = "listen-empty-bucket-e2e";
+    let key = "seed/object.txt";
+    let client = env.create_s3_client();
+
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let listen_url = format!("{}/{bucket}?events={}&ping=1", env.url, urlencoding::encode("s3:ObjectCreated:*"),);
+    let response = signed_request(http::Method::GET, &listen_url, &env.access_key, &env.secret_key, None, None).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let read_task = tokio::spawn(read_listen_notification_event(response, key));
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"empty bucket watch body"))
+        .send()
+        .await?;
+
+    let payload = timeout(Duration::from_secs(12), read_task).await???;
+    assert!(!payload.is_empty(), "listen_notification payload should not be empty");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_listen_notification_fans_in_remote_node_events() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
