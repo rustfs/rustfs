@@ -19,13 +19,14 @@
 //! body through `send_raw_from_store`.
 
 use crate::{
-    StoreError, Target, TargetLog,
+    StoreError, Target,
     arn::TargetID,
     error::TargetError,
-    store::{Key, QueueStore, Store},
+    store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, queue_store_subdir_name,
+        TargetType, build_queued_payload_with_records, is_connectivity_error, open_target_queue_store,
+        persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -39,11 +40,11 @@ use rustfs_config::{AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 use url::Url;
 
 #[derive(Clone)]
@@ -315,22 +316,14 @@ where
     pub fn new(id: String, args: AMQPArgs) -> Result<Self, TargetError> {
         args.validate()?;
         let target_id = TargetID::new(id, ChannelTargetType::Amqp.as_str().to_string());
-        let queue_store = if !args.queue_dir.is_empty() {
-            let base_path = PathBuf::from(&args.queue_dir);
-            let specific_queue_path = base_path.join(queue_store_subdir_name(ChannelTargetType::Amqp.as_str(), &target_id.id));
-            let extension = match args.target_type {
-                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
-            };
-            let store = QueueStore::<QueuedPayload>::new(specific_queue_path, args.queue_limit, extension);
-            if let Err(e) = store.open() {
-                error!(target_id = %target_id, error = %e, "Failed to open store for AMQP target");
-                return Err(TargetError::Storage(format!("{e}")));
-            }
-            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
-        } else {
-            None
-        };
+        let queue_store = open_target_queue_store(
+            &args.queue_dir,
+            args.queue_limit,
+            args.target_type,
+            ChannelTargetType::Amqp.as_str(),
+            &target_id,
+            "Failed to open store for AMQP target",
+        )?;
 
         Ok(Self {
             id: target_id,
@@ -344,22 +337,7 @@ where
     }
 
     fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
-        let object_name = crate::target::decode_object_name(&event.object_name)?;
-        let key = format!("{}/{}", event.bucket_name, object_name);
-        let log = TargetLog {
-            event_name: event.event_name,
-            key,
-            records: vec![event.clone()],
-        };
-        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
-        let meta = QueuedPayloadMeta::new(
-            event.event_name,
-            event.bucket_name.clone(),
-            event.object_name.clone(),
-            "application/json",
-            body.len(),
-        );
-        Ok(QueuedPayload::new(meta, body))
+        build_queued_payload_with_records(event, vec![event.clone()])
     }
 
     async fn get_or_connect(&self) -> Result<Arc<AMQPConnection>, TargetError> {
@@ -453,16 +431,9 @@ where
         };
 
         if let Some(store) = &self.store {
-            let encoded = match queued.encode() {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    self.delivery_counters.record_final_failure();
-                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
-                }
-            };
-            if let Err(e) = store.put_raw(&encoded) {
+            if let Err(e) = persist_queued_payload_to_store(store.as_ref(), &queued) {
                 self.delivery_counters.record_final_failure();
-                return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+                return Err(e);
             }
             Ok(())
         } else {
@@ -505,10 +476,7 @@ where
         }
         match self.get_or_connect().await {
             Ok(_) => Ok(()),
-            Err(err)
-                if self.store.is_some()
-                    && matches!(err, TargetError::Network(_) | TargetError::Timeout(_) | TargetError::NotConnected) =>
-            {
+            Err(err) if self.store.is_some() && is_connectivity_error(&err) => {
                 warn!(target_id = %self.id, error = %err, "AMQP init failed; events will buffer in store");
                 Ok(())
             }
@@ -535,6 +503,7 @@ mod tests {
     use super::*;
     use rustfs_s3_common::EventName;
     use serde_json::json;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use uuid::Uuid;
 
