@@ -47,6 +47,10 @@ use crate::{
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
+fn sha256_hex(data: &[u8]) -> String {
+    rustfs_utils::hex(HashAlgorithm::SHA256.hash_encode(data))
+}
+
 pub struct RemoveBucketOptions {
     _forced_delete: bool,
 }
@@ -340,7 +344,7 @@ impl TransitionClient {
                         content_body: ReaderImpl::Body(Bytes::from(remove_bytes.clone())),
                         content_length: remove_bytes.len() as i64,
                         content_md5_base64: base64_encode(&HashAlgorithm::Md5.hash_encode(&remove_bytes).as_ref()),
-                        content_sha256_hex: base64_encode(&HashAlgorithm::SHA256.hash_encode(&remove_bytes).as_ref()),
+                        content_sha256_hex: sha256_hex(&remove_bytes),
                         custom_header: headers,
                         object_name: "".to_string(),
                         stream_sha256: false,
@@ -741,4 +745,29 @@ pub async fn process_remove_multi_objects_response(
 
 fn has_invalid_xml_char(str: &str) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_object_delete_sha256_is_lowercase_hex() {
+        let objects = vec![ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object.txt".to_string(),
+            ..Default::default()
+        }];
+        let body = generate_remove_multi_objects_request(&objects);
+
+        let encoded = sha256_hex(&body);
+
+        assert_eq!(encoded.len(), 64);
+        assert!(
+            encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(encoded, base64_encode(&HashAlgorithm::SHA256.hash_encode(&body).as_ref()));
+    }
 }
