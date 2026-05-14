@@ -104,6 +104,11 @@
 //!   byte-exact with the production cache window.
 //! - CMPTST-33: read-cache disabled regression, 8 MiB download
 //!   byte-exact with RUSTFS_SFTP_READ_CACHE_WINDOW_BYTES=0.
+//! - CMPTST-34: OPEN with non-default FileAttributes followed by a
+//!   payload that crosses the 5 MiB multipart boundary preserves the
+//!   client-supplied mtime and permissions through the streaming
+//!   CreateMultipartUpload path. HeadObject through aws-sdk-s3
+//!   confirms the metadata reached the finalised S3 object.
 
 use crate::common::rustfs_binary_path_with_features;
 use crate::protocols::sftp_helpers::{
@@ -3273,6 +3278,78 @@ pub(crate) mod cmptst_33 {
         run_read_cache_disabled_round_trip()
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
+    }
+}
+
+// CMPTST-34: OPEN-time client attrs preservation across the streaming
+// multipart write path. The payload crosses the 5 MiB part-size
+// boundary so the driver transitions Buffering -> Streaming and
+// finalises via CompleteMultipartUpload. The OPEN-supplied mtime and
+// permissions must reach the resulting object as x-amz-meta-mtime and
+// x-amz-meta-mode. The S3 client connects to the same rustfs process
+// the shared-server suite already drives.
+pub(crate) mod cmptst_34 {
+    use super::*;
+
+    const COMPLIANCE_TEST_OUTPUT_ID: &str = "CMPTST-34";
+    const REQUESTED_MTIME: u32 = 1_715_000_010;
+    const REQUESTED_MODE: u32 = 0o600;
+
+    pub(crate) async fn run_open_attrs_round_trip_multipart(sftp: &SftpSession, s3: &S3Client) -> Result<()> {
+        info!("{COMPLIANCE_TEST_OUTPUT_ID}: OPEN with mtime + mode, multi-part payload, streaming path");
+        let bucket = "complopenattrsmpbucket";
+        let bucket_path = format!("/{bucket}");
+        sftp.create_dir(&bucket_path).await?;
+
+        let path = format!("/{bucket}/attr-mp.bin");
+        // 6 MiB exceeds the 5 MiB part-size boundary so the streaming
+        // path runs at least one full UploadPart before the CLOSE-time
+        // CompleteMultipartUpload finalises the object.
+        let payload = vec![0xA5u8; 6 * 1024 * 1024];
+
+        let mut client_attrs = FileAttributes::default();
+        client_attrs.mtime = Some(REQUESTED_MTIME);
+        client_attrs.atime = Some(REQUESTED_MTIME);
+        client_attrs.permissions = Some(REQUESTED_MODE);
+
+        let mut writer = sftp
+            .open_with_flags_and_attributes(&path, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE, client_attrs)
+            .await?;
+        writer.write_all(&payload).await?;
+        writer.flush().await?;
+        writer.shutdown().await?;
+
+        let head = s3
+            .head_object()
+            .bucket(bucket)
+            .key("attr-mp.bin")
+            .send()
+            .await
+            .map_err(|e| anyhow!("S3 HeadObject failed: {e:?}"))?;
+        let content_length = head.content_length().unwrap_or(0);
+        if content_length != payload.len() as i64 {
+            return Err(anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} unexpected size: got {content_length} bytes"));
+        }
+        let metadata = head
+            .metadata()
+            .ok_or_else(|| anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} HeadObject returned no metadata map"))?;
+        let mtime_value = metadata
+            .get("mtime")
+            .ok_or_else(|| anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} mtime key missing on the object"))?;
+        if mtime_value != &REQUESTED_MTIME.to_string() {
+            return Err(anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} mtime mismatch: got {mtime_value}"));
+        }
+        let mode_value = metadata
+            .get("mode")
+            .ok_or_else(|| anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} mode key missing on the object"))?;
+        if mode_value != &REQUESTED_MODE.to_string() {
+            return Err(anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} mode mismatch: got {mode_value}"));
+        }
+
+        sftp.remove_file(&path).await?;
+        sftp.remove_dir(&bucket_path).await?;
+        info!("PASS {COMPLIANCE_TEST_OUTPUT_ID}: multipart upload preserved mtime + mode end to end");
+        Ok(())
     }
 }
 
