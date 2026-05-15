@@ -21,7 +21,7 @@ use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
-    copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
+    copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
 use crate::storage::s3_api::multipart::{
@@ -496,6 +496,7 @@ impl DefaultMultipartUsecase {
             object_lock_legal_hold_status,
             object_lock_mode,
             object_lock_retain_until_date,
+            metadata: input_metadata,
             ..
         } = req.input.clone();
 
@@ -524,7 +525,8 @@ impl DefaultMultipartUsecase {
             req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         )?;
 
-        let mut metadata = extract_metadata(&req.headers);
+        let mut metadata = input_metadata.unwrap_or_default();
+        extract_metadata_from_mime(&req.headers, &mut metadata);
 
         if let Some(tags) = tagging {
             metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);

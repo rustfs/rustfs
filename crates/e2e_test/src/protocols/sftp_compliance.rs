@@ -39,7 +39,7 @@
 use crate::protocols::sftp_compliance_tests::{
     cmptst_01, cmptst_02, cmptst_03, cmptst_04, cmptst_05, cmptst_06, cmptst_07, cmptst_08, cmptst_09, cmptst_10, cmptst_11,
     cmptst_12, cmptst_13, cmptst_14, cmptst_15, cmptst_16, cmptst_17, cmptst_18, cmptst_19, cmptst_20, cmptst_21, cmptst_22,
-    cmptst_23, cmptst_27, cmptst_28, cmptst_29, cmptst_32, cmptst_33, spawn_compliance_rustfs,
+    cmptst_23, cmptst_27, cmptst_28, cmptst_29, cmptst_32, cmptst_33, cmptst_34, spawn_compliance_rustfs,
 };
 #[cfg(target_os = "linux")]
 use crate::protocols::sftp_compliance_tests::{cmptst_24, cmptst_25, cmptst_26};
@@ -95,6 +95,15 @@ pub async fn test_sftp_compliance_suite() -> Result<()> {
         cmptst_12::run_rename_same_path_keeps_file(&sftp).await?;
         cmptst_13::run_implicit_dir_round_trip(&sftp).await?;
         cmptst_14::run_winscp_setstat_shape_on_handle(&sftp).await?;
+
+        // CMPTST-34 cross-checks the SFTP streaming-multipart write
+        // path against the S3 layer. The OPEN-time FileAttributes must
+        // reach the finalised object as x-amz-meta-* user metadata
+        // through the CreateMultipartUpload input field. The S3 client
+        // connects to the same rustfs process this suite already drives.
+        let s3 = build_test_s3_client(&format!("http://{COMPLIANCE_RW_S3_ADDRESS}"));
+        wait_for_s3_ready(&s3, 30).await?;
+        cmptst_34::run_open_attrs_round_trip_multipart(&sftp, &s3).await?;
 
         drop(sftp);
         session.disconnect(russh::Disconnect::ByApplication, "", "en").await?;
