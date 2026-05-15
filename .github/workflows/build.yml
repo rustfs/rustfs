@@ -169,7 +169,7 @@ jobs:
             {"target_id":"linux-x86_64-gnu","os":"ubicloud-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
             {"target_id":"linux-aarch64-gnu","os":"ubicloud-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
             {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
-            {"target_id":"macos-x86_64","os":"macos-latest","target":"x86_64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
+            {"target_id":"macos-x86_64","os":"macos-15-intel","target":"x86_64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
             {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":""}
           ]}'
 
