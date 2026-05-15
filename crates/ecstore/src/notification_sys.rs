@@ -872,10 +872,7 @@ mod tests {
         let result = call_peer_with_timeout(
             Duration::from_millis(5),
             "peer-3",
-            || async {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                Ok::<_, Error>(build_props("slow"))
-            },
+            std::future::pending::<Result<ServerProperties>>,
             || build_props("fallback"),
         )
         .await;

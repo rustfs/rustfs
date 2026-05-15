@@ -2153,9 +2153,6 @@ impl DiskAPI for LocalDisk {
     #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
-        use std::time::Instant;
-
-        let start = Instant::now();
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
@@ -2188,6 +2185,9 @@ impl DiskAPI for LocalDisk {
         #[cfg(unix)]
         {
             use memmap2::MmapOptions;
+            use std::time::Instant;
+
+            let start = Instant::now();
             let file_path_clone = file_path.clone();
 
             let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
@@ -2272,8 +2272,7 @@ impl DiskAPI for LocalDisk {
                 f.seek(SeekFrom::Start(offset as u64)).await?;
             }
 
-            let mut buffer = Vec::with_capacity(length);
-            buffer.resize(length, 0);
+            let mut buffer = vec![0; length];
             f.read_exact(&mut buffer).await?;
 
             Ok(Bytes::from(buffer))
@@ -3497,10 +3496,10 @@ mod test {
         let disk_info = disk.disk_info(&disk_info_opts).await.unwrap();
 
         // Basic checks on disk info
-        // Note: On macOS and some other Unix systems, fs_type may be empty
+        // Note: On macOS, Windows, and some other systems, fs_type may be empty
         // because statvfs does not provide filesystem type information.
         // This is a platform limitation, not a bug.
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         assert!(!disk_info.fs_type.is_empty(), "fs_type should not be empty on this platform");
         assert!(disk_info.total > 0);
         assert!(disk_info.free <= disk_info.total);

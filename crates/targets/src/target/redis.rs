@@ -730,6 +730,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    fn absolute_test_path(path: &str) -> String {
+        std::env::temp_dir().join(path).to_string_lossy().into_owned()
+    }
+
     fn base_args() -> RedisArgs {
         RedisArgs {
             enable: true,
@@ -782,7 +786,7 @@ mod tests {
             url: Url::parse("rediss://127.0.0.1:6379").unwrap(),
             tls: RedisTlsConfig {
                 policy: Some(RedisTlsPolicy::CustomCa),
-                ca_path: "/tmp/ca.pem".to_string(),
+                ca_path: absolute_test_path("redis-ca.pem"),
                 ..RedisTlsConfig::default()
             },
             ..base_args()

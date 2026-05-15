@@ -605,6 +605,10 @@ mod tests {
     };
     use rustfs_ecstore::config::KVS;
 
+    fn absolute_test_path(path: &str) -> String {
+        std::env::temp_dir().join(path).to_string_lossy().into_owned()
+    }
+
     fn amqp_base_config() -> KVS {
         let mut config = KVS::new();
         config.insert(AMQP_URL.to_string(), "amqp://127.0.0.1:5672/%2f".to_string());
@@ -787,8 +791,9 @@ mod tests {
 
     #[test]
     fn build_mysql_args_applies_defaults() {
-        let args = build_mysql_args(&mysql_base_config(), "/custom/queue", TargetType::NotifyEvent).expect("valid mysql args");
-        assert_eq!(args.queue_dir, "/custom/queue");
+        let queue_dir = absolute_test_path("custom-queue");
+        let args = build_mysql_args(&mysql_base_config(), &queue_dir, TargetType::NotifyEvent).expect("valid mysql args");
+        assert_eq!(args.queue_dir, queue_dir);
         assert_eq!(args.queue_limit, 100000);
         assert_eq!(args.max_open_connections, 2);
     }
@@ -846,7 +851,7 @@ mod tests {
         let err = validate_mysql_config(&config, "").expect_err("relative tls_ca should fail");
         assert!(err.to_string().contains("tls_ca must be an absolute path"));
 
-        config.insert(MYSQL_TLS_CA.to_string(), "/etc/ssl/mysql/ca.pem".to_string());
+        config.insert(MYSQL_TLS_CA.to_string(), absolute_test_path("mysql-ca.pem"));
         config.insert(MYSQL_TLS_CLIENT_CERT.to_string(), "client.pem".to_string());
         config.insert(MYSQL_TLS_CLIENT_KEY.to_string(), "client.key".to_string());
 
@@ -857,14 +862,17 @@ mod tests {
     #[test]
     fn build_mysql_args_accepts_absolute_tls_paths() {
         let mut config = mysql_base_config();
-        config.insert(MYSQL_TLS_CA.to_string(), "/etc/ssl/mysql/ca.pem".to_string());
-        config.insert(MYSQL_TLS_CLIENT_CERT.to_string(), "/etc/ssl/mysql/client.pem".to_string());
-        config.insert(MYSQL_TLS_CLIENT_KEY.to_string(), "/etc/ssl/mysql/client.key".to_string());
+        let tls_ca = absolute_test_path("mysql-ca.pem");
+        let tls_client_cert = absolute_test_path("mysql-client.pem");
+        let tls_client_key = absolute_test_path("mysql-client.key");
+        config.insert(MYSQL_TLS_CA.to_string(), tls_ca.clone());
+        config.insert(MYSQL_TLS_CLIENT_CERT.to_string(), tls_client_cert.clone());
+        config.insert(MYSQL_TLS_CLIENT_KEY.to_string(), tls_client_key.clone());
 
         let args = build_mysql_args(&config, "", TargetType::NotifyEvent).expect("absolute mysql TLS paths should pass");
-        assert_eq!(args.tls_ca, "/etc/ssl/mysql/ca.pem");
-        assert_eq!(args.tls_client_cert, "/etc/ssl/mysql/client.pem");
-        assert_eq!(args.tls_client_key, "/etc/ssl/mysql/client.key");
+        assert_eq!(args.tls_ca, tls_ca);
+        assert_eq!(args.tls_client_cert, tls_client_cert);
+        assert_eq!(args.tls_client_key, tls_client_key);
     }
 
     fn redis_base_config() -> KVS {

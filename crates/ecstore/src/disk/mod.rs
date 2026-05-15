@@ -789,7 +789,6 @@ mod tests {
     use super::*;
     use endpoint::Endpoint;
     use local::LocalDisk;
-    use std::path::PathBuf;
     use tokio::fs;
     use uuid::Uuid;
 
@@ -1094,7 +1093,7 @@ mod tests {
         assert!(disk.is_ok());
 
         let disk = disk.unwrap();
-        assert_eq!(disk.path(), PathBuf::from(test_dir).canonicalize().unwrap());
+        assert_eq!(disk.path(), rustfs_utils::canonicalize(test_dir).unwrap());
         assert!(disk.is_local());
         // Note: is_online() might return false for local disks without proper initialization
         // This is expected behavior for test environments

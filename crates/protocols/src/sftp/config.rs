@@ -28,6 +28,7 @@ use super::constants::limits::{
     READ_CACHE_TOTAL_MEM_MIN, READ_CACHE_WINDOW_DEFAULT, READ_CACHE_WINDOW_MAX, READ_CACHE_WINDOW_MIN, S3_MAX_PART_SIZE,
     S3_MIN_PART_SIZE,
 };
+#[cfg(unix)]
 use russh::keys::PublicKeyBase64;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -38,6 +39,7 @@ use thiserror::Error;
 /// Upper bound on file size accepted as a candidate host key (1 MiB).
 /// Guards against accidentally reading huge non-key files in the host
 /// key directory. Real keys are well under 10 KiB.
+#[cfg(unix)]
 const MAX_HOST_KEY_FILE_SIZE: u64 = 1024 * 1024;
 
 /// PEM pre-encapsulation boundary marker prefix per RFC 7468 section 3.
@@ -45,6 +47,7 @@ const MAX_HOST_KEY_FILE_SIZE: u64 = 1024 * 1024;
 /// space, the label, and five more hyphens. Used to distinguish a file
 /// that looks like a private key but failed to decode (passphrase, corrupt)
 /// from a file that is genuinely something else (a .pub key, a README).
+#[cfg(unix)]
 const PEM_BEGIN_MARKER: &str = "-----BEGIN";
 
 /// Errors that can occur during SFTP server initialization.
@@ -457,6 +460,7 @@ impl SftpConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     use tempfile::TempDir;
 
@@ -464,17 +468,21 @@ mod tests {
     // label / five-hyphen) are composed at runtime by build_pem_block
     // so the source file emits no contiguous private-key marker that
     // secret scanners would flag. Throwaway test-vector keys.
+    #[cfg(unix)]
     const PEM_BOUNDARY_DASHES: &str = "-----";
+    #[cfg(unix)]
     const PEM_OPENSSH_LABEL: &str = "OPENSSH PRIVATE KEY";
 
     /// Wrap a base64 body in the OpenSSH-format PEM boundary markers.
     /// The boundary string is composed at runtime from PEM_BOUNDARY_DASHES
     /// and PEM_OPENSSH_LABEL so the source file does not contain the full
     /// marker as a contiguous literal.
+    #[cfg(unix)]
     fn build_pem_block(body: &str) -> String {
         format!("{d}BEGIN {l}{d}\n{body}\n{d}END {l}{d}\n", d = PEM_BOUNDARY_DASHES, l = PEM_OPENSSH_LABEL,)
     }
 
+    #[cfg(unix)]
     fn test_ed25519_pem() -> String {
         // Throwaway Ed25519 private key, no passphrase.
         build_pem_block(
@@ -486,6 +494,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn test_ecdsa_pem() -> String {
         // ECDSA P-256 fixture key for the algorithm-preference sort
         // test. Not passphrase-protected.
@@ -516,6 +525,7 @@ mod tests {
     }
 
     /// Write a file at the given path with the given content and mode.
+    #[cfg(unix)]
     fn write_file_with_mode(path: &Path, content: &str, mode: u32) {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true).mode(mode);
@@ -599,6 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn load_host_keys_fails_when_dir_missing() {
         let path = PathBuf::from("/this/path/does/not/exist/sftp-host-keys");
         let err = SftpConfig::load_host_keys(&path).await.expect_err("missing dir must error");
@@ -606,6 +617,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn load_host_keys_fails_when_dir_empty() {
         let dir = TempDir::new().expect("tempdir");
         let err = SftpConfig::load_host_keys(dir.path())
@@ -615,6 +627,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(unix))]
+    async fn load_host_keys_rejects_non_unix_platform() {
+        let dir = TempDir::new().expect("tempdir");
+        let err = SftpConfig::load_host_keys(dir.path())
+            .await
+            .expect_err("non-Unix platforms must be rejected");
+        assert!(matches!(err, SftpInitError::UnsupportedPlatform { .. }));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn load_host_keys_rejects_insecure_permissions() {
         let dir = TempDir::new().expect("tempdir");
         let key_path = dir.path().join("ssh_host_ed25519_key");
@@ -632,6 +655,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn load_host_keys_loads_one_valid_ed25519_key() {
         let dir = TempDir::new().expect("tempdir");
         let key_path = dir.path().join("ssh_host_ed25519_key");
@@ -642,6 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn load_host_keys_skips_non_key_files() {
         let dir = TempDir::new().expect("tempdir");
         // Real key plus an unrelated file.
@@ -654,6 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn load_host_keys_handles_empty_file() {
         let dir = TempDir::new().expect("tempdir");
         write_file_with_mode(&dir.path().join("empty"), "", 0o600);
@@ -665,6 +691,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn load_host_keys_skips_passphrase_protected_key_with_warn() {
         // Build content that looks like a private key but cannot be decoded
         // (we pass None as the passphrase). Exercises the load_host_keys
@@ -682,6 +709,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn load_host_keys_sorts_ed25519_before_ecdsa() {
         let dir = TempDir::new().expect("tempdir");
         // Write ECDSA first to confirm sort ordering rather than insertion order.
