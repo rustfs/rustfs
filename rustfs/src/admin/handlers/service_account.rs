@@ -124,7 +124,8 @@ fn parse_service_account_policy(policy: &serde_json::Value) -> S3Result<Policy> 
     let policy_bytes = serde_json::to_vec(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
     Policy::parse_config(&policy_bytes).map_err(|e| {
         debug!("parse service account policy failed, e: {:?}", e);
-        s3_error!(InvalidArgument, "invalid service account policy: {}", e)
+        let message = e.to_string().replace('\'', "");
+        s3_error!(InvalidArgument, "invalid service account policy: {}", message)
     })
 }
 
@@ -1547,7 +1548,7 @@ mod tests {
         .expect_err("policy without Resource should be rejected");
 
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
-        assert_eq!(err.message(), Some("invalid service account policy: 'Resource' is empty"));
+        assert_eq!(err.message(), Some("invalid service account policy: Resource is empty"));
     }
 
     #[test]
