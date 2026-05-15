@@ -292,7 +292,7 @@ zip = "8.6.0"
 zstd = "0.13.3"
 
 # Observability and Metrics
-metrics = "0.24.5"
+metrics = "0.24.6"
 dial9-tokio-telemetry = "0.3"
 opentelemetry = { version = "0.32.0" }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["experimental_span_attributes", "experimental_metadata_attributes"] }
@@ -324,7 +324,7 @@ jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 # pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 # Pyroscope uses a patched pprof, until they merge back upstream, replace all references. Otherwise, two pprof libs with symbol collision.
-pprof = { package = "pprof-pyroscope-fork", version = "0.1500.3", features = ["flamegraph", "protobuf-codec"] }
+pprof = { package = "pprof-pyroscope-fork", version = "0.1500.4", features = ["flamegraph", "protobuf-codec"] }
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs"]
