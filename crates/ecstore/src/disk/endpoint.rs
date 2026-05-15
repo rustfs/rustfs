@@ -82,13 +82,16 @@ impl TryFrom<&str> for Endpoint {
                 #[cfg(not(windows))]
                 let path = Path::new(&path).absolutize()?;
 
-                // On windows having a preceding SlashSeparator will cause problems, if the
-                // command line already has C:/<export-folder/ in it. Final resulting
-                // path on windows might become C:/C:/ this will cause problems
-                // of starting rustfs server properly in distributed mode on windows.
-                // As a special case make sure to trim the separator.
                 #[cfg(windows)]
-                let path = Path::new(&path[1..]).absolutize()?;
+                let path = if has_leading_slash_windows_drive(&path) {
+                    // Url::path() exposes absolute Windows drive paths as `/C:/...`.
+                    // Trim only this synthetic leading slash.
+                    Path::new(&path[1..]).absolutize()?.to_string_lossy().into_owned()
+                } else {
+                    path
+                };
+                #[cfg(windows)]
+                let path = Path::new(&path);
 
                 debug!("endpoint try_from: path={}", path.display());
 
@@ -217,6 +220,12 @@ impl Endpoint {
     }
 }
 
+#[cfg(windows)]
+fn has_leading_slash_windows_drive(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'/'
+}
+
 /// parse a file path into a URL.
 fn url_parse_from_file_path(value: &str) -> Result<Url> {
     // Only check if the arg is an ip address and ask for scheme since its absent.
@@ -241,6 +250,24 @@ fn url_parse_from_file_path(value: &str) -> Result<Url> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn test_has_leading_slash_windows_drive() {
+        assert!(has_leading_slash_windows_drive("/C:/data"));
+        assert!(!has_leading_slash_windows_drive("/C:foo"));
+        assert!(!has_leading_slash_windows_drive("/export1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_drive_rewrite_keeps_url_path_semantics() {
+        let drive_path = Endpoint::try_from("http://example.com/C:/data").unwrap();
+        assert_eq!(drive_path.url.path(), "C:/data");
+
+        let url_path = Endpoint::try_from("http://example.com/C:foo").unwrap();
+        assert_eq!(url_path.url.path(), "/C:foo");
+    }
 
     #[test]
     fn test_new_endpoint() {
