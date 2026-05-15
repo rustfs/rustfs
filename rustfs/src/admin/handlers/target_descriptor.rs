@@ -12,22 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::StreamExt;
+use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use rustfs_config::{
-    AMQP_QUEUE_DIR, ENABLE_KEY, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_TLS_CA,
-    MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
-    MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
+    AMQP_QUEUE_DIR, ENABLE_KEY, EnableState, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS,
+    MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC,
+    MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
-use rustfs_ecstore::config::Config;
+use rustfs_ecstore::config::{Config, KVS};
+use rustfs_targets::SharedTarget;
 use rustfs_targets::{
-    BuiltinTargetDescriptor, TargetError, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
-    check_mqtt_broker_available_with_tls, check_mysql_server_available, check_nats_server_available,
-    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
+    BuiltinTargetAdminDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator,
+    check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available_with_tls,
+    check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
+    check_redis_server_available,
     config::{
-        build_amqp_args, build_kafka_args, build_mysql_args, build_nats_args, build_postgres_args, build_pulsar_args,
-        build_redis_args, collect_env_target_instance_ids, validate_redis_config,
+        TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, build_amqp_args, build_kafka_args, build_mysql_args,
+        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, normalize_target_plugin_instances,
+        validate_redis_config,
     },
+    manifest::builtin_target_manifest,
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
 use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
@@ -36,12 +42,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep};
+use tokio::sync::Semaphore;
+use tokio::time::{Duration, sleep, timeout};
 use url::Url;
 
 pub(crate) type EndpointKey = (String, String);
 type AdminRequestValidatorFn =
-    Arc<dyn Fn(&HashMap<String, String>, &str) -> futures::future::BoxFuture<'static, S3Result<()>> + Send + Sync>;
+    Arc<dyn for<'a> Fn(&'a HashMap<String, String>, &'a str) -> BoxFuture<'a, S3Result<()>> + Send + Sync>;
+type DomainScopedValidatorFn = for<'a> fn(&'a HashMap<String, String>, &'a str, TargetDomain) -> BoxFuture<'a, S3Result<()>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -59,28 +67,26 @@ pub(crate) struct MergedTargetEndpoint {
     pub source: TargetEndpointSource,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum TargetDomain {
-    Notify,
-    Audit,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetInstanceReadModel {
+    pub canonical_id: String,
+    pub plugin_id: String,
+    pub domain: TargetDomain,
+    pub subsystem: String,
+    pub account_id: String,
+    pub service: String,
+    pub status: String,
+    pub runtime_present: bool,
+    pub source: TargetEndpointSource,
+    pub enabled: bool,
+    pub config: KVS,
 }
 
-impl TargetDomain {
-    pub(crate) fn runtime_target_type(self) -> TargetType {
-        match self {
-            TargetDomain::Notify => TargetType::NotifyEvent,
-            TargetDomain::Audit => TargetType::AuditLog,
-        }
-    }
-}
-
-impl From<TargetType> for TargetDomain {
-    fn from(value: TargetType) -> Self {
-        match value {
-            TargetType::NotifyEvent => TargetDomain::Notify,
-            TargetType::AuditLog => TargetDomain::Audit,
-        }
-    }
+struct TargetEndpointSnapshot {
+    normalized_instances: Vec<TargetPluginInstanceRecord>,
+    configured_keys: Vec<EndpointKey>,
+    config_targets: HbHashSet<EndpointKey>,
+    env_targets: HbHashSet<EndpointKey>,
 }
 
 #[derive(Clone)]
@@ -91,67 +97,53 @@ pub(crate) struct AdminTargetSpec {
     validator: AdminRequestValidatorFn,
 }
 
-pub(crate) fn admin_target_spec_from_builtin<E>(descriptor: &BuiltinTargetDescriptor<E>) -> AdminTargetSpec
-where
-    E: Send + Sync + 'static + Clone + serde::Serialize + serde::de::DeserializeOwned,
-{
+pub(crate) fn admin_target_spec_from_builtin(descriptor: &BuiltinTargetAdminDescriptor) -> AdminTargetSpec {
+    let admin = descriptor.admin_metadata();
     AdminTargetSpec {
-        subsystem: descriptor.subsystem(),
-        service: descriptor.plugin().target_type(),
-        valid_keys: descriptor.plugin().valid_fields(),
-        validator: match descriptor.request_validator() {
-            TargetRequestValidator::Webhook => Arc::new(validate_webhook_request_entry),
-            TargetRequestValidator::Mqtt => Arc::new(validate_mqtt_request_entry),
-            TargetRequestValidator::Amqp(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_amqp_request_entry)
-                } else {
-                    Arc::new(validate_notify_amqp_request_entry)
-                }
-            }
-            TargetRequestValidator::Kafka(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_kafka_request_entry)
-                } else {
-                    Arc::new(validate_notify_kafka_request_entry)
-                }
-            }
-            TargetRequestValidator::MySql(target_type) => {
-                Arc::new(move |kv_map, default_queue_dir| validate_mysql_request_entry(kv_map, default_queue_dir, target_type))
-            }
-            TargetRequestValidator::Nats(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_nats_request_entry)
-                } else {
-                    Arc::new(validate_notify_nats_request_entry)
-                }
-            }
-            TargetRequestValidator::Postgres(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_postgres_request_entry)
-                } else {
-                    Arc::new(validate_notify_postgres_request_entry)
-                }
-            }
-            TargetRequestValidator::Pulsar(target_type) => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    Arc::new(validate_audit_pulsar_request_entry)
-                } else {
-                    Arc::new(validate_notify_pulsar_request_entry)
-                }
-            }
-            TargetRequestValidator::Redis {
-                default_channel,
-                target_type,
-            } => {
-                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
-                    validate_audit_redis_request_entry(default_channel)
-                } else {
-                    validate_notify_redis_request_entry(default_channel)
-                }
-            }
-        },
+        subsystem: admin.subsystem(),
+        service: descriptor.manifest().target_type,
+        valid_keys: descriptor.valid_fields(),
+        validator: validator_from_metadata(admin),
     }
+}
+
+fn validator_from_metadata(metadata: TargetAdminMetadata) -> AdminRequestValidatorFn {
+    match metadata.request_validator() {
+        TargetRequestValidator::Webhook => Arc::new(validate_webhook_request_entry),
+        TargetRequestValidator::Mqtt => Arc::new(validate_mqtt_request_entry),
+        TargetRequestValidator::Amqp(target_type) => {
+            domain_request_validator(TargetDomain::from(target_type), validate_amqp_request)
+        }
+        TargetRequestValidator::Kafka(target_type) => {
+            domain_request_validator(TargetDomain::from(target_type), validate_kafka_request)
+        }
+        TargetRequestValidator::MySql(target_type) => {
+            Arc::new(move |kv_map, default_queue_dir| validate_mysql_request_entry(kv_map, default_queue_dir, target_type))
+        }
+        TargetRequestValidator::Nats(target_type) => {
+            domain_request_validator(TargetDomain::from(target_type), validate_nats_request)
+        }
+        TargetRequestValidator::Postgres(target_type) => {
+            domain_request_validator(TargetDomain::from(target_type), validate_postgres_request)
+        }
+        TargetRequestValidator::Pulsar(target_type) => {
+            domain_request_validator(TargetDomain::from(target_type), validate_pulsar_request)
+        }
+        TargetRequestValidator::Redis {
+            default_channel,
+            target_type,
+        } => redis_request_validator(TargetDomain::from(target_type), default_channel),
+    }
+}
+
+fn domain_request_validator(domain: TargetDomain, validator: DomainScopedValidatorFn) -> AdminRequestValidatorFn {
+    Arc::new(move |kv_map, default_queue_dir| validator(kv_map, default_queue_dir, domain))
+}
+
+fn redis_request_validator(domain: TargetDomain, default_channel: &'static str) -> AdminRequestValidatorFn {
+    Arc::new(move |kv_map, default_queue_dir| {
+        Box::pin(validate_redis_request(kv_map, default_queue_dir, domain, default_channel))
+    })
 }
 
 impl std::fmt::Debug for AdminTargetSpec {
@@ -182,54 +174,26 @@ pub(crate) fn target_service_name(specs: &[AdminTargetSpec], target_type: &str) 
     target_spec(specs, target_type).map(|spec| spec.service)
 }
 
-pub(crate) fn collect_configured_endpoint_keys(specs: &[AdminTargetSpec], config: &Config) -> Vec<EndpointKey> {
-    let mut endpoints = Vec::new();
-    for spec in specs {
-        let Some(targets) = config.0.get(spec.subsystem) else {
-            continue;
-        };
-
-        for (target_name, kvs) in targets {
-            if target_name == rustfs_config::DEFAULT_DELIMITER {
-                continue;
-            }
-            let enabled = kvs.lookup(ENABLE_KEY).as_deref().map(config_enable_is_on).unwrap_or(false);
-            if enabled {
-                endpoints.push((target_name.clone(), spec.service.to_string()));
-            }
-        }
+pub(crate) fn extract_supported_target_params<'a>(
+    specs: &[AdminTargetSpec],
+    params: &'a matchit::Params<'_, '_>,
+    unsupported_target_label: &str,
+) -> S3Result<(&'a str, &'a str)> {
+    let target_type = params
+        .get("target_type")
+        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'target_type'"))?;
+    if target_service_name(specs, target_type).is_none() {
+        return Err(s3_error!(
+            InvalidArgument,
+            "unsupported {} target type: '{}'",
+            unsupported_target_label,
+            target_type
+        ));
     }
-    endpoints
-}
-
-pub(crate) fn collect_config_entry_keys(specs: &[AdminTargetSpec], config: &Config) -> HbHashSet<EndpointKey> {
-    let mut endpoints = HbHashSet::new();
-    for spec in specs {
-        let Some(targets) = config.0.get(spec.subsystem) else {
-            continue;
-        };
-
-        for target_name in targets.keys() {
-            if target_name == rustfs_config::DEFAULT_DELIMITER {
-                continue;
-            }
-            endpoints.insert(normalized_endpoint_key(target_name, spec.service));
-        }
-    }
-    endpoints
-}
-
-pub(crate) fn collect_env_endpoint_keys(specs: &[AdminTargetSpec], route_prefix: &str) -> HbHashSet<EndpointKey> {
-    let mut endpoints = HbHashSet::new();
-    for spec in specs {
-        let valid_keys = spec.valid_keys.iter().map(|key| (*key).to_string()).collect::<HashSet<_>>();
-        for instance_id in collect_env_target_instance_ids(route_prefix, spec.service, &valid_keys) {
-            if instance_id != rustfs_config::DEFAULT_DELIMITER && !instance_id.is_empty() {
-                endpoints.insert(normalized_endpoint_key(&instance_id, spec.service));
-            }
-        }
-    }
-    endpoints
+    let target_name = params
+        .get("target_name")
+        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'target_name'"))?;
+    Ok((target_type, target_name))
 }
 
 pub(crate) fn classify_endpoint_source(
@@ -237,7 +201,11 @@ pub(crate) fn classify_endpoint_source(
     env_targets: &HbHashSet<EndpointKey>,
     key: &EndpointKey,
 ) -> TargetEndpointSource {
-    match (config_targets.contains(key), env_targets.contains(key)) {
+    classify_endpoint_source_flags(config_targets.contains(key), env_targets.contains(key))
+}
+
+fn classify_endpoint_source_flags(has_config_source: bool, has_env_source: bool) -> TargetEndpointSource {
+    match (has_config_source, has_env_source) {
         (true, true) => TargetEndpointSource::Mixed,
         (true, false) => TargetEndpointSource::Config,
         (false, true) => TargetEndpointSource::Env,
@@ -252,11 +220,10 @@ pub(crate) fn endpoint_source(
     target_type: &str,
     target_name: &str,
 ) -> TargetEndpointSource {
-    let config_targets = collect_config_entry_keys(specs, config);
-    let env_targets = collect_env_endpoint_keys(specs, route_prefix);
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
     let service = target_service_name(specs, target_type).unwrap_or_default();
     let key = normalized_endpoint_key(target_name, service);
-    classify_endpoint_source(&config_targets, &env_targets, &key)
+    classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &key)
 }
 
 pub(crate) fn target_mutation_block_reason(
@@ -301,6 +268,33 @@ pub(crate) fn build_json_response(
     S3Response::with_headers((status, body), header)
 }
 
+pub(crate) async fn collect_runtime_statuses<E>(targets: Vec<SharedTarget<E>>) -> HashMap<EndpointKey, String>
+where
+    E: Send + Sync + 'static + Clone + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let semaphore = Arc::new(Semaphore::new(10));
+    let mut futures = futures::stream::FuturesUnordered::new();
+
+    for target in targets {
+        let sem = Arc::clone(&semaphore);
+        futures.push(async move {
+            let _permit = sem.acquire().await;
+            let status = match tokio::time::timeout(Duration::from_secs(3), target.is_active()).await {
+                Ok(Ok(true)) => "online",
+                _ => "offline",
+            };
+            ((target.id().id, target.id().name), status.to_string())
+        });
+    }
+
+    let mut runtime_statuses = HashMap::new();
+    while let Some((key, status)) = futures.next().await {
+        runtime_statuses.insert(key, status);
+    }
+
+    runtime_statuses
+}
+
 pub(crate) fn merge_target_endpoints(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
@@ -309,9 +303,7 @@ pub(crate) fn merge_target_endpoints(
 ) -> Vec<MergedTargetEndpoint> {
     let mut endpoints = Vec::new();
     let mut seen = HashSet::new();
-    let configured_keys = collect_configured_endpoint_keys(specs, config);
-    let config_targets = collect_config_entry_keys(specs, config);
-    let env_targets = collect_env_endpoint_keys(specs, route_prefix);
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
     let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
 
     for ((account_id, service), status) in runtime_statuses {
@@ -321,7 +313,7 @@ pub(crate) fn merge_target_endpoints(
             .or_insert((account_id, service, status));
     }
 
-    for key in configured_keys {
+    for key in snapshot.configured_keys {
         let normalized = normalized_endpoint_key(&key.0, &key.1);
         if !seen.insert(normalized.clone()) {
             continue;
@@ -336,7 +328,7 @@ pub(crate) fn merge_target_endpoints(
             account_id: key.0,
             service: key.1,
             status,
-            source: classify_endpoint_source(&config_targets, &env_targets, &normalized),
+            source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &normalized),
         });
     }
 
@@ -346,12 +338,12 @@ pub(crate) fn merge_target_endpoints(
                 account_id,
                 service,
                 status,
-                source: classify_endpoint_source(&config_targets, &env_targets, &normalized),
+                source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &normalized),
             });
         }
     }
 
-    for key in &env_targets {
+    for key in &snapshot.env_targets {
         if !seen.insert(key.clone()) {
             continue;
         }
@@ -360,12 +352,102 @@ pub(crate) fn merge_target_endpoints(
             account_id: key.0.clone(),
             service: key.1.clone(),
             status: "offline".to_string(),
-            source: classify_endpoint_source(&config_targets, &env_targets, key),
+            source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, key),
         });
     }
 
     endpoints.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
     endpoints
+}
+
+pub(crate) fn canonical_target_instance_id(plugin_id: &str, domain: TargetDomain, instance_id: &str) -> String {
+    format!("{plugin_id}:{}:{}", canonical_domain_label(domain), instance_id.to_lowercase())
+}
+
+pub(crate) fn collect_target_instances(
+    specs: &[AdminTargetSpec],
+    route_prefix: &str,
+    config: &Config,
+    runtime_statuses: HashMap<EndpointKey, String>,
+) -> Vec<TargetInstanceReadModel> {
+    let mut instances = Vec::new();
+    let mut seen = HashSet::new();
+    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
+    let domain = inferred_target_domain(route_prefix);
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
+
+    for ((account_id, service), status) in runtime_statuses {
+        let normalized = normalized_endpoint_key(&account_id, &service);
+        normalized_runtime_statuses
+            .entry(normalized)
+            .or_insert((account_id, service, status));
+    }
+
+    for instance in snapshot.normalized_instances {
+        let key = normalized_endpoint_key(&instance.instance_id, &instance.target_type);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+
+        let runtime_present = normalized_runtime_statuses.contains_key(&key);
+        let status = normalized_runtime_statuses
+            .remove(&key)
+            .map(|(_, _, status)| status)
+            .unwrap_or_else(|| "offline".to_string());
+        let source = classify_endpoint_source_flags(instance_has_config_entry(&instance), instance_has_env_entry(&instance));
+
+        instances.push(TargetInstanceReadModel {
+            canonical_id: canonical_target_instance_id(&instance.plugin_id, domain, &instance.instance_id),
+            plugin_id: instance.plugin_id,
+            domain,
+            subsystem: instance.subsystem,
+            account_id: instance.instance_id,
+            service: instance.target_type,
+            status,
+            runtime_present,
+            source,
+            enabled: instance.enabled,
+            config: instance.effective_config,
+        });
+    }
+
+    for (normalized, (account_id, service, status)) in normalized_runtime_statuses {
+        if !seen.insert(normalized) {
+            continue;
+        }
+
+        let (plugin_id, subsystem): (String, String) = target_spec_by_service(specs, &service)
+            .map(|spec| (builtin_target_manifest(spec.service).plugin_id.to_string(), spec.subsystem.to_string()))
+            .unwrap_or_else(|| ("custom:target".to_string(), format!("{}_{}", canonical_domain_label(domain), service)));
+        instances.push(TargetInstanceReadModel {
+            canonical_id: canonical_target_instance_id(&plugin_id, domain, &account_id),
+            plugin_id,
+            domain,
+            subsystem,
+            account_id,
+            service,
+            status,
+            runtime_present: true,
+            source: TargetEndpointSource::Runtime,
+            enabled: true,
+            config: KVS::new(),
+        });
+    }
+
+    instances.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
+    instances
+}
+
+pub(crate) fn find_target_instance(
+    specs: &[AdminTargetSpec],
+    route_prefix: &str,
+    config: &Config,
+    runtime_statuses: HashMap<EndpointKey, String>,
+    canonical_id: &str,
+) -> Option<TargetInstanceReadModel> {
+    collect_target_instances(specs, route_prefix, config, runtime_statuses)
+        .into_iter()
+        .find(|instance| instance.canonical_id == canonical_id)
 }
 
 pub(crate) fn allowed_target_keys(specs: &[AdminTargetSpec], target_type: &str) -> HashSet<&'static str> {
@@ -435,8 +517,109 @@ pub(crate) async fn validate_target_request(
     spec.validate_request(kv_map, default_queue_dir).await
 }
 
-fn config_enable_is_on(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1")
+pub(crate) async fn build_enabled_target_kvs<'a, I>(
+    specs: &[AdminTargetSpec],
+    key_values: I,
+    target_type: &str,
+    default_queue_dir: &str,
+    target_label: &str,
+) -> S3Result<KVS>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let allowed_keys = allowed_target_keys(specs, target_type);
+    let kv_map = collect_validated_key_values(key_values, &allowed_keys, target_type, target_label)?;
+    let spec = target_spec(specs, target_type)
+        .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
+    timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, default_queue_dir))
+        .await
+        .map_err(|_| s3_error!(InvalidArgument, "target validation timed out"))??;
+
+    let mut kvs = KVS::new();
+    for (key, value) in kv_map {
+        kvs.insert(key, value);
+    }
+    kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+    Ok(kvs)
+}
+
+fn instance_has_config_entry(instance: &TargetPluginInstanceRecord) -> bool {
+    instance.source_hints.has_file_instance
+}
+
+fn instance_has_env_entry(instance: &TargetPluginInstanceRecord) -> bool {
+    instance.source_hints.has_env_instance
+}
+
+fn normalized_target_instances(
+    specs: &[AdminTargetSpec],
+    route_prefix: &str,
+    config: &Config,
+) -> Vec<TargetPluginInstanceRecord> {
+    specs
+        .iter()
+        .flat_map(|spec| {
+            normalize_target_plugin_instances(
+                config,
+                &TargetPluginInstanceCompatDescriptor {
+                    domain: inferred_target_domain(route_prefix),
+                    plugin_id: builtin_target_manifest(spec.service).plugin_id,
+                    target_type: spec.service,
+                    subsystem: spec.subsystem,
+                    route_prefix,
+                    valid_fields: spec.valid_keys,
+                },
+            )
+        })
+        .collect()
+}
+
+fn inferred_target_domain(route_prefix: &str) -> TargetDomain {
+    match route_prefix {
+        rustfs_config::notify::NOTIFY_ROUTE_PREFIX => TargetDomain::Notify,
+        rustfs_config::audit::AUDIT_ROUTE_PREFIX => TargetDomain::Audit,
+        _ => TargetDomain::Notify,
+    }
+}
+
+fn canonical_domain_label(domain: TargetDomain) -> &'static str {
+    match domain {
+        TargetDomain::Notify => "notify",
+        TargetDomain::Audit => "audit",
+    }
+}
+
+fn target_spec_by_service<'a>(specs: &'a [AdminTargetSpec], service: &str) -> Option<&'a AdminTargetSpec> {
+    specs.iter().find(|spec| spec.service == service)
+}
+
+fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> TargetEndpointSnapshot {
+    let normalized_instances = normalized_target_instances(specs, route_prefix, config);
+    let mut configured_keys = Vec::new();
+    let mut config_targets = HbHashSet::new();
+    let mut env_targets = HbHashSet::new();
+
+    for instance in &normalized_instances {
+        let key = normalized_endpoint_key(&instance.instance_id, &instance.target_type);
+
+        if instance_has_config_entry(instance) {
+            config_targets.insert(key.clone());
+            if instance.enabled {
+                configured_keys.push((instance.instance_id.clone(), instance.target_type.clone()));
+            }
+        }
+
+        if instance_has_env_entry(instance) {
+            env_targets.insert(key);
+        }
+    }
+
+    TargetEndpointSnapshot {
+        normalized_instances,
+        configured_keys,
+        config_targets,
+        env_targets,
+    }
 }
 
 async fn retry_with_backoff<F, Fut, T>(mut operation: F, max_attempts: usize, base_delay: Duration) -> Result<T, Error>
@@ -489,12 +672,11 @@ async fn validate_webhook_request(kv_map: &HashMap<String, String>) -> S3Result<
     Ok(())
 }
 
-fn validate_webhook_request_entry(
-    kv_map: &HashMap<String, String>,
-    _default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    Box::pin(async move { validate_webhook_request(&kv_map).await })
+fn validate_webhook_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    _default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_webhook_request(kv_map))
 }
 
 async fn validate_mqtt_request(kv_map: &HashMap<String, String>) -> S3Result<()> {
@@ -541,131 +723,34 @@ async fn validate_mqtt_request(kv_map: &HashMap<String, String>) -> S3Result<()>
     Ok(())
 }
 
-fn validate_mqtt_request_entry(
-    kv_map: &HashMap<String, String>,
-    _default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    Box::pin(async move { validate_mqtt_request(&kv_map).await })
+fn validate_mqtt_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    _default_queue_dir: &'a str,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_mqtt_request(kv_map))
 }
 
-fn validate_notify_nats_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_nats_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
-}
-
-fn validate_audit_nats_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_nats_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
-}
-
-fn validate_notify_kafka_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_kafka_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
-}
-
-fn validate_audit_kafka_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_kafka_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
-}
-
-fn validate_notify_amqp_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_amqp_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
-}
-
-fn validate_audit_amqp_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_amqp_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
-}
-
-fn validate_notify_pulsar_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_pulsar_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
-}
-
-fn validate_audit_pulsar_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_pulsar_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
-}
-
-fn validate_mysql_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
+fn validate_mysql_request_entry<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
     target_type: TargetType,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_mysql_request(&kv_map, &default_queue_dir, target_type).await })
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(validate_mysql_request(kv_map, default_queue_dir, target_type))
 }
 
-fn validate_notify_postgres_request_entry(
+fn validate_nats_request<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+    domain: TargetDomain,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(async move { validate_nats_request_impl(kv_map, default_queue_dir, domain).await })
+}
+
+async fn validate_nats_request_impl(
     kv_map: &HashMap<String, String>,
     default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_postgres_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
-}
-
-fn validate_audit_postgres_request_entry(
-    kv_map: &HashMap<String, String>,
-    default_queue_dir: &str,
-) -> futures::future::BoxFuture<'static, S3Result<()>> {
-    let kv_map = kv_map.clone();
-    let default_queue_dir = default_queue_dir.to_string();
-    Box::pin(async move { validate_postgres_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
-}
-
-fn validate_notify_redis_request_entry(default_channel: &'static str) -> AdminRequestValidatorFn {
-    Arc::new(move |kv_map: &HashMap<String, String>, default_queue_dir: &str| {
-        let kv_map = kv_map.clone();
-        let default_queue_dir = default_queue_dir.to_string();
-        Box::pin(async move { validate_redis_request(&kv_map, &default_queue_dir, TargetDomain::Notify, default_channel).await })
-    })
-}
-
-fn validate_audit_redis_request_entry(default_channel: &'static str) -> AdminRequestValidatorFn {
-    Arc::new(move |kv_map: &HashMap<String, String>, default_queue_dir: &str| {
-        let kv_map = kv_map.clone();
-        let default_queue_dir = default_queue_dir.to_string();
-        Box::pin(async move { validate_redis_request(&kv_map, &default_queue_dir, TargetDomain::Audit, default_channel).await })
-    })
-}
-
-async fn validate_nats_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
+    domain: TargetDomain,
+) -> S3Result<()> {
     if let Some(queue_dir) = kv_map.get("queue_dir") {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
@@ -677,7 +762,19 @@ async fn validate_nats_request(kv_map: &HashMap<String, String>, default_queue_d
     })
 }
 
-async fn validate_kafka_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
+fn validate_kafka_request<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+    domain: TargetDomain,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(async move { validate_kafka_request_impl(kv_map, default_queue_dir, domain).await })
+}
+
+async fn validate_kafka_request_impl(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+) -> S3Result<()> {
     if let Some(queue_dir) = kv_map.get(KAFKA_QUEUE_DIR) {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
@@ -697,7 +794,19 @@ async fn validate_kafka_request(kv_map: &HashMap<String, String>, default_queue_
     })
 }
 
-async fn validate_amqp_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
+fn validate_amqp_request<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+    domain: TargetDomain,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(async move { validate_amqp_request_impl(kv_map, default_queue_dir, domain).await })
+}
+
+async fn validate_amqp_request_impl(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+) -> S3Result<()> {
     if let Some(queue_dir) = kv_map.get(AMQP_QUEUE_DIR) {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
@@ -709,7 +818,15 @@ async fn validate_amqp_request(kv_map: &HashMap<String, String>, default_queue_d
     })
 }
 
-async fn validate_pulsar_request(
+fn validate_pulsar_request<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+    domain: TargetDomain,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(async move { validate_pulsar_request_impl(kv_map, default_queue_dir, domain).await })
+}
+
+async fn validate_pulsar_request_impl(
     kv_map: &HashMap<String, String>,
     default_queue_dir: &str,
     domain: TargetDomain,
@@ -742,7 +859,15 @@ async fn validate_mysql_request(
     })
 }
 
-async fn validate_postgres_request(
+fn validate_postgres_request<'a>(
+    kv_map: &'a HashMap<String, String>,
+    default_queue_dir: &'a str,
+    domain: TargetDomain,
+) -> BoxFuture<'a, S3Result<()>> {
+    Box::pin(async move { validate_postgres_request_impl(kv_map, default_queue_dir, domain).await })
+}
+
+async fn validate_postgres_request_impl(
     kv_map: &HashMap<String, String>,
     default_queue_dir: &str,
     domain: TargetDomain,

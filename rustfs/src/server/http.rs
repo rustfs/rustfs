@@ -215,17 +215,24 @@ pub async fn start_http_server(
         TcpListener::from_std(socket.into())?
     };
 
-    let tls_path = config.tls_path.as_deref().unwrap_or_default();
+    let tls_path = config.tls_path.as_deref().map(str::trim).unwrap_or_default();
+    let tls_path_configured = !tls_path.is_empty();
     // Load TLS materials and build server acceptor.
     // Note: outbound material (root CAs, mTLS identity) is already applied in main.rs.
     let tls_snapshot = TlsMaterialSnapshot::load(tls_path)
         .await
         .map_err(|e| Error::other(e.to_string()))?;
 
-    let tls_acceptor = tls_snapshot
-        .build_tls_acceptor(tls_path)
-        .await
-        .map_err(|e| Error::other(e.to_string()))?;
+    let tls_acceptor = tls_snapshot.build_tls_acceptor(tls_path).await.map_err(|e| {
+        if tls_path_configured {
+            Error::other(format!(
+                "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but TLS acceptor initialization failed: {}",
+                tls_path, e
+            ))
+        } else {
+            Error::other(e.to_string())
+        }
+    })?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 

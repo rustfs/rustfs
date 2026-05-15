@@ -36,6 +36,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 form_urlencoded = { workspace = true }
 hashbrown = { workspace = true }
+percent-encoding = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
@@ -45,6 +46,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
 url = { workspace = true }
 wildmatch = { workspace = true, features = ["serde"] }
+metrics = { workspace = true }
 
 # quick-xml dependencies for custom S3KeyFilter XML deserialization
 # Custom deserializer implemented for S3KeyFilter to handle both XML structures:

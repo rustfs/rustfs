@@ -13,15 +13,17 @@
 // limitations under the License.
 
 use crate::arn::TargetID;
-use crate::store::{Key, Store};
+use crate::store::{Key, QueueStore, Store};
 use crate::{StoreError, TargetError, TargetLog};
 use async_trait::async_trait;
 use rustfs_s3_common::EventName;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -49,6 +51,8 @@ pub struct TargetDeliveryCounters {
     failed_messages: AtomicU64,
     total_messages: AtomicU64,
 }
+
+pub(crate) type BoxedQueuedStore = Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>;
 
 impl TargetDeliveryCounters {
     #[inline]
@@ -409,13 +413,24 @@ pub(crate) fn build_queued_payload<E>(event: &EntityTarget<E>) -> Result<QueuedP
 where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
+    build_queued_payload_with_records(event, vec![event.data.clone()])
+}
+
+pub(crate) fn build_queued_payload_with_records<E, R>(
+    event: &EntityTarget<E>,
+    records: Vec<R>,
+) -> Result<QueuedPayload, TargetError>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    R: Serialize,
+{
     let object_name = decode_object_name(&event.object_name)?;
     let key = format!("{}/{}", event.bucket_name, object_name);
 
     let log = TargetLog {
         event_name: event.event_name,
         key,
-        records: vec![event.data.clone()],
+        records,
     };
 
     let body = serde_json::to_vec(&log).map_err(|err| TargetError::Serialization(format!("Failed to serialize event: {err}")))?;
@@ -428,6 +443,68 @@ where
     );
 
     Ok(QueuedPayload::new(meta, body))
+}
+
+pub(crate) fn open_target_queue_store(
+    queue_dir: &str,
+    queue_limit: u64,
+    target_type: TargetType,
+    target_type_label: &str,
+    target_id: &TargetID,
+    open_context: &str,
+) -> Result<Option<BoxedQueuedStore>, TargetError> {
+    fn boxed_queue_store(store: QueueStore<QueuedPayload>) -> BoxedQueuedStore {
+        Box::new(store)
+    }
+
+    if queue_dir.is_empty() {
+        return Ok(None);
+    }
+
+    let queue_dir = PathBuf::from(queue_dir).join(queue_store_subdir_name(target_type_label, &target_id.id));
+    let extension = match target_type {
+        TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
+        TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
+    };
+    let store = QueueStore::<QueuedPayload>::new(queue_dir, queue_limit, extension);
+    store
+        .open()
+        .map_err(|err| TargetError::Storage(format!("{open_context}: {err}")))?;
+
+    Ok(Some(boxed_queue_store(store)))
+}
+
+pub(crate) fn persist_queued_payload_to_store(
+    store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync),
+    queued: &QueuedPayload,
+) -> Result<(), TargetError> {
+    let encoded = queued
+        .encode()
+        .map_err(|err| TargetError::Storage(format!("Failed to encode queued payload: {err}")))?;
+    store
+        .put_raw(&encoded)
+        .map(|_| ())
+        .map_err(|err| TargetError::Storage(format!("Failed to save event to store: {err}")))
+}
+
+pub(crate) fn is_connectivity_error(err: &TargetError) -> bool {
+    matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_))
+}
+
+pub(crate) async fn invalidate_cache_on_connectivity_error<F, Fut>(err: &TargetError, invalidate: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    if is_connectivity_error(err) {
+        invalidate().await;
+    }
+}
+
+pub(crate) fn mark_target_disconnected_on_connectivity_error(connected: &AtomicBool, err: &TargetError) {
+    if is_connectivity_error(err) {
+        connected.store(false, Ordering::SeqCst);
+    }
 }
 
 pub(crate) fn delete_stored_payload(
@@ -457,6 +534,90 @@ pub(crate) fn ensure_rustls_provider_installed() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    #[derive(Clone)]
+    struct MockQueuedStore {
+        fail_put_raw: bool,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl MockQueuedStore {
+        fn new(fail_put_raw: bool) -> Self {
+            Self {
+                fail_put_raw,
+                writes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Store<QueuedPayload> for MockQueuedStore {
+        type Error = StoreError;
+        type Key = Key;
+
+        fn open(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn put(&self, _item: Arc<QueuedPayload>) -> Result<Self::Key, Self::Error> {
+            Err(StoreError::Internal("not implemented in mock".to_string()))
+        }
+
+        fn put_multiple(&self, _items: Vec<QueuedPayload>) -> Result<Self::Key, Self::Error> {
+            Err(StoreError::Internal("not implemented in mock".to_string()))
+        }
+
+        fn put_raw(&self, data: &[u8]) -> Result<Self::Key, Self::Error> {
+            if self.fail_put_raw {
+                return Err(StoreError::Internal("mock put_raw failed".to_string()));
+            }
+            self.writes.lock().expect("mock writes lock poisoned").push(data.to_vec());
+            Ok(Key {
+                name: "mock".to_string(),
+                extension: ".json".to_string(),
+                item_count: 1,
+                compress: false,
+            })
+        }
+
+        fn get(&self, _key: &Self::Key) -> Result<QueuedPayload, Self::Error> {
+            Err(StoreError::Internal("not implemented in mock".to_string()))
+        }
+
+        fn get_multiple(&self, _key: &Self::Key) -> Result<Vec<QueuedPayload>, Self::Error> {
+            Err(StoreError::Internal("not implemented in mock".to_string()))
+        }
+
+        fn get_raw(&self, _key: &Self::Key) -> Result<Vec<u8>, Self::Error> {
+            Err(StoreError::Internal("not implemented in mock".to_string()))
+        }
+
+        fn del(&self, _key: &Self::Key) -> Result<(), Self::Error> {
+            Err(StoreError::Internal("not implemented in mock".to_string()))
+        }
+
+        fn delete(&self) -> Result<(), Self::Error> {
+            Err(StoreError::Internal("not implemented in mock".to_string()))
+        }
+
+        fn list(&self) -> Vec<Self::Key> {
+            Vec::new()
+        }
+
+        fn len(&self) -> usize {
+            0
+        }
+
+        fn is_empty(&self) -> bool {
+            true
+        }
+
+        fn boxed_clone(&self) -> Box<dyn Store<QueuedPayload, Error = Self::Error, Key = Self::Key> + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
 
     #[test]
     fn channel_target_type_amqp_uses_runtime_name() {
@@ -499,6 +660,139 @@ mod tests {
 
         assert_eq!(value["Key"], "bucket-a/greeting file (2).csv");
         assert_eq!(value["Records"][0], "payload-data");
+    }
+
+    #[test]
+    fn build_queued_payload_with_records_preserves_custom_record_shape() {
+        let event = EntityTarget {
+            object_name: "object.txt".to_string(),
+            bucket_name: "bucket-a".to_string(),
+            event_name: EventName::ObjectCreatedPut,
+            data: "ignored".to_string(),
+        };
+
+        let payload = build_queued_payload_with_records(&event, vec![event.clone()]).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&payload.body).unwrap();
+
+        assert_eq!(value["Records"][0]["bucket_name"], "bucket-a");
+        assert_eq!(value["Records"][0]["object_name"], "object.txt");
+        assert_eq!(value["Records"][0]["data"], "ignored");
+    }
+
+    #[test]
+    fn open_target_queue_store_returns_none_when_queue_dir_empty() {
+        let target_id = TargetID::new("target-a".to_string(), ChannelTargetType::Webhook.as_str().to_string());
+        let store = open_target_queue_store(
+            "",
+            100,
+            TargetType::NotifyEvent,
+            ChannelTargetType::Webhook.as_str(),
+            &target_id,
+            "open failed",
+        )
+        .unwrap();
+        assert!(store.is_none());
+    }
+
+    #[test]
+    fn open_target_queue_store_adds_context_on_open_error() {
+        let base = std::env::temp_dir().join(format!("rustfs-target-store-file-{}", Uuid::new_v4()));
+        fs::write(&base, b"not-a-directory").expect("failed to create file base");
+        let target_id = TargetID::new("target-a".to_string(), ChannelTargetType::Kafka.as_str().to_string());
+
+        let result = open_target_queue_store(
+            base.to_str().unwrap(),
+            100,
+            TargetType::NotifyEvent,
+            ChannelTargetType::Kafka.as_str(),
+            &target_id,
+            "custom open context",
+        );
+
+        match result {
+            Ok(_) => panic!("expected open_target_queue_store to fail on file base path"),
+            Err(err) => assert!(err.to_string().contains("custom open context")),
+        }
+        let _ = fs::remove_file(base);
+    }
+
+    #[test]
+    fn persist_queued_payload_to_store_writes_encoded_payload() {
+        let store = MockQueuedStore::new(false);
+        let meta = QueuedPayloadMeta::new(
+            EventName::ObjectCreatedPut,
+            "bucket-a".to_string(),
+            "obj.txt".to_string(),
+            "application/json",
+            7,
+        );
+        let queued = QueuedPayload::new(meta, br#"{"x":1}"#.to_vec());
+
+        persist_queued_payload_to_store(&store, &queued).unwrap();
+
+        let writes = store.writes.lock().expect("mock writes lock poisoned");
+        assert_eq!(writes.len(), 1);
+        let decoded = QueuedPayload::decode(&writes[0]).unwrap();
+        assert_eq!(decoded.body, br#"{"x":1}"#);
+    }
+
+    #[test]
+    fn persist_queued_payload_to_store_maps_store_error() {
+        let store = MockQueuedStore::new(true);
+        let meta = QueuedPayloadMeta::new(
+            EventName::ObjectCreatedPut,
+            "bucket-a".to_string(),
+            "obj.txt".to_string(),
+            "application/json",
+            7,
+        );
+        let queued = QueuedPayload::new(meta, br#"{"x":1}"#.to_vec());
+
+        let err = persist_queued_payload_to_store(&store, &queued).expect_err("expected put_raw failure");
+        assert!(err.to_string().contains("Failed to save event to store"));
+    }
+
+    #[test]
+    fn is_connectivity_error_classifies_target_errors() {
+        assert!(is_connectivity_error(&TargetError::NotConnected));
+        assert!(is_connectivity_error(&TargetError::Timeout("timeout".to_string())));
+        assert!(is_connectivity_error(&TargetError::Network("network".to_string())));
+        assert!(!is_connectivity_error(&TargetError::Storage("storage".to_string())));
+        assert!(!is_connectivity_error(&TargetError::Serialization("serialization".to_string())));
+    }
+
+    #[tokio::test]
+    async fn invalidate_cache_on_connectivity_error_only_runs_for_connectivity_failures() {
+        let marker = Arc::new(AtomicBool::new(false));
+        invalidate_cache_on_connectivity_error(&TargetError::NotConnected, {
+            let marker = Arc::clone(&marker);
+            move || async move {
+                marker.store(true, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert!(marker.load(Ordering::SeqCst));
+
+        marker.store(false, Ordering::SeqCst);
+        invalidate_cache_on_connectivity_error(&TargetError::Request("request failed".to_string()), {
+            let marker = Arc::clone(&marker);
+            move || async move {
+                marker.store(true, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert!(!marker.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mark_target_disconnected_on_connectivity_error_only_marks_connectivity_failures() {
+        let connected = AtomicBool::new(true);
+        mark_target_disconnected_on_connectivity_error(&connected, &TargetError::Timeout("timeout".to_string()));
+        assert!(!connected.load(Ordering::SeqCst));
+
+        connected.store(true, Ordering::SeqCst);
+        mark_target_disconnected_on_connectivity_error(&connected, &TargetError::Request("request failed".to_string()));
+        assert!(connected.load(Ordering::SeqCst));
     }
 
     #[test]
