@@ -31,13 +31,18 @@ jobs:
   update-flake:
     name: Update flake.lock
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Cache Nix
+        uses: DeterminateSystems/flakehub-cache-action@v3.20.0
 
       - name: Check Nix flake inputs
         uses: DeterminateSystems/flake-checker-action@v12
