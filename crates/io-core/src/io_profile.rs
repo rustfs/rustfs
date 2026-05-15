@@ -219,6 +219,15 @@ pub fn detect_storage_media(storage_detection_enabled: bool, storage_media_overr
         }
     }
 
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        if let Ok(media) = detect_platform_storage_media()
+            && media != StorageMedia::Unknown
+        {
+            return media;
+        }
+    }
+
     StorageMedia::Unknown
 }
 

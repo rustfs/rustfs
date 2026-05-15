@@ -749,6 +749,7 @@ fn validate_local_cross_device_mounts(local_paths: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod test {
+    use path_absolutize::Absolutize;
     use rustfs_utils::must_get_local_ips;
 
     use super::*;
@@ -1452,9 +1453,10 @@ mod test {
     }
 
     fn must_file_path(s: impl AsRef<Path>) -> url::Url {
-        let url = url::Url::from_file_path(s.as_ref());
+        let path = s.as_ref().absolutize().expect("absolute test path");
+        let url = url::Url::from_file_path(&path);
 
-        assert!(url.is_ok(), "failed to convert path to URL: {}", s.as_ref().display());
+        assert!(url.is_ok(), "failed to convert path to URL: {}", path.display());
 
         url.unwrap()
     }

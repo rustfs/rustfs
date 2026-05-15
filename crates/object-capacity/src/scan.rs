@@ -648,6 +648,7 @@ mod tests {
     use super::*;
     use crate::capacity_manager::{DataSource, HybridStrategyConfig, create_isolated_manager};
     use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk};
+    #[cfg(unix)]
     use rustfs_config::ENV_CAPACITY_FOLLOW_SYMLINKS;
     use serial_test::serial;
 
@@ -671,6 +672,7 @@ mod tests {
         let file_path = temp_dir.path().join("test.txt");
         let mut file = File::create(&file_path).unwrap();
         file.write_all(b"Hello, World!").unwrap();
+        drop(file);
 
         let size = get_dir_size_async(temp_dir.path()).await.unwrap();
         assert_eq!(size.used_bytes, 13);
@@ -709,10 +711,12 @@ mod tests {
         let file1 = temp_dir.path().join("file1.txt");
         let mut f1 = File::create(&file1).unwrap();
         f1.write_all(b"content1").unwrap();
+        drop(f1);
 
         let file2 = subdir.join("file2.txt");
         let mut f2 = File::create(&file2).unwrap();
         f2.write_all(b"content2").unwrap();
+        drop(f2);
 
         let size = get_dir_size_async(temp_dir.path()).await.unwrap();
         assert_eq!(size.used_bytes, 16);
@@ -736,6 +740,7 @@ mod tests {
         let file_path = temp_dir.path().join("test.txt");
         let mut file = File::create(&file_path).unwrap();
         file.write_all(b"Hello, World!").unwrap();
+        drop(file);
 
         let disks = vec![
             CapacityDiskRef {

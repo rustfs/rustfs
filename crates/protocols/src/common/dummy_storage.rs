@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #![cfg(test)]
+#![allow(dead_code)]
 
 //! Storage-backend double for protocol driver unit tests.
 //!
