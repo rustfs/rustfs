@@ -225,7 +225,7 @@ impl Endpoint {
 #[cfg(windows)]
 fn has_leading_slash_windows_drive(path: &str) -> bool {
     let bytes = path.as_bytes();
-    bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':'
+    bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'/'
 }
 
 /// parse a file path into a URL.
@@ -502,6 +502,19 @@ mod test {
 
         let url_endpoint = Endpoint::try_from("http://example.com:9000/path/to/data").unwrap();
         assert_eq!(url_endpoint.get_file_path(), "/path/to/data");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_url_drive_path_requires_separator_after_colon() {
+        let drive_path_endpoint = Endpoint::try_from("http://host/C:/data").unwrap();
+        assert_eq!(drive_path_endpoint.get_type(), EndpointType::Url);
+        assert!(has_leading_slash_windows_drive(Url::parse("http://host/C:/data").unwrap().path()));
+
+        let url_path_endpoint = Endpoint::try_from("http://host/C:foo").unwrap();
+        assert_eq!(url_path_endpoint.get_type(), EndpointType::Url);
+        assert!(!has_leading_slash_windows_drive(Url::parse("http://host/C:foo").unwrap().path()));
+        assert_eq!(url_path_endpoint.get_file_path(), "/C:foo");
     }
 
     #[test]
