@@ -16,7 +16,7 @@ use crate::rules::{RulesMap, TargetIdSet};
 use percent_encoding::percent_decode_str;
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
-use starshard::{AsyncShardedHashMap, SnapshotMode, DEFAULT_SHARDS};
+use starshard::{AsyncShardedHashMap, DEFAULT_SHARDS, SnapshotMode};
 use std::sync::Arc;
 use tracing::info;
 
