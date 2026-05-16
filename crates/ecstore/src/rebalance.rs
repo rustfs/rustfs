@@ -1169,6 +1169,37 @@ fn resolve_rebalance_worker_result(
     }
 }
 
+type RebalanceEntryTask = tokio::task::JoinHandle<Result<()>>;
+
+async fn wait_rebalance_entry_tasks(set_idx: usize, tasks: Arc<tokio::sync::Mutex<Vec<RebalanceEntryTask>>>) -> Result<()> {
+    let tasks = {
+        let mut tasks = tasks.lock().await;
+        std::mem::take(&mut *tasks)
+    };
+
+    let mut first_error = None;
+    for task in tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                error!("rebalance entry task failed for set {}: {}", set_idx, err);
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+            Err(err) => {
+                let err = Error::other(format!("rebalance entry task join error for set {set_idx}: {err}"));
+                error!("{}", err);
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_error { Err(err) } else { Ok(()) }
+}
+
 fn resolve_rebalance_save_task_result(
     pool_idx: usize,
     save_task_result: std::result::Result<Result<()>, tokio::task::JoinError>,
@@ -1691,26 +1722,28 @@ impl ECStore {
 
         let mut jobs = Vec::new();
         let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
+        let entry_workers = Arc::new(tokio::sync::Semaphore::new(pool.disk_set.len().max(1)));
 
-        // let wk = Workers::new(pool.disk_set.len() * 2).map_err(Error::other)?;
-        // wk.clone().take().await;
         for (set_idx, set) in pool.disk_set.iter().enumerate() {
+            let entry_tasks = Arc::new(tokio::sync::Mutex::new(Vec::<RebalanceEntryTask>::new()));
             let rebalance_entry: ListCallback = Arc::new({
                 let this = Arc::clone(self);
                 let bucket = bucket.clone();
                 let entry_error = entry_error.clone();
                 let callback_rx = rx.clone();
-                // let wk = wk.clone();
                 let set = set.clone();
                 let bucket_configs = bucket_configs.clone();
+                let entry_tasks = entry_tasks.clone();
+                let entry_workers = entry_workers.clone();
                 move |entry: MetaCacheEntry| {
                     let this = this.clone();
                     let bucket = bucket.clone();
                     let entry_error = entry_error.clone();
                     let callback_rx = callback_rx.clone();
-                    // let wk = wk.clone();
                     let set = set.clone();
                     let bucket_configs = bucket_configs.clone();
+                    let entry_tasks = entry_tasks.clone();
+                    let entry_workers = entry_workers.clone();
                     Box::pin(async move {
                         if callback_rx.is_cancelled() {
                             return;
@@ -1719,20 +1752,38 @@ impl ECStore {
                             return;
                         }
 
-                        info!("rebalance_entry: rebalance_entry spawn start");
-                        // wk.take().await;
-                        // tokio::spawn(async move {
-                        info!("rebalance_entry: rebalance_entry spawn start2");
-                        if let Err(err) = this.rebalance_entry(bucket, pool_index, entry, set, bucket_configs).await {
-                            error!("rebalance_entry: rebalance entry failed: {err}");
-                            let mut first_err = entry_error.lock().await;
-                            if first_err.is_none() {
-                                *first_err = Some(err);
-                                callback_rx.cancel();
-                            }
+                        let permit = tokio::select! {
+                            _ = callback_rx.cancelled() => return,
+                            permit = entry_workers.clone().acquire_owned() => match permit {
+                                Ok(permit) => permit,
+                                Err(err) => {
+                                    error!("rebalance_entry: worker semaphore closed: {err}");
+                                    return;
+                                }
+                            },
+                        };
+
+                        if entry_error.lock().await.is_some() {
+                            return;
                         }
-                        info!("rebalance_entry: rebalance_entry spawn done");
-                        // });
+
+                        let task = tokio::spawn(async move {
+                            let _permit = permit;
+                            info!("rebalance_entry: rebalance entry task start");
+                            let result = this.rebalance_entry(bucket, pool_index, entry, set, bucket_configs).await;
+                            if let Err(err) = &result {
+                                error!("rebalance_entry: rebalance entry failed: {err}");
+                                let mut first_err = entry_error.lock().await;
+                                if first_err.is_none() {
+                                    *first_err = Some(err.clone());
+                                    callback_rx.cancel();
+                                }
+                            }
+                            info!("rebalance_entry: rebalance entry task done");
+                            result
+                        });
+
+                        entry_tasks.lock().await.push(task);
                     })
                 }
             });
@@ -1740,23 +1791,23 @@ impl ECStore {
             let set = set.clone();
             let rx = rx.clone();
             let bucket = bucket.clone();
-            // let wk = wk.clone();
+            let entry_tasks = entry_tasks.clone();
 
             let job = tokio::spawn(async move {
-                let result = set.list_objects_to_rebalance(rx, bucket, rebalance_entry).await;
+                let list_result = set.list_objects_to_rebalance(rx, bucket, rebalance_entry).await;
+                let entry_result = wait_rebalance_entry_tasks(set_idx, entry_tasks).await;
+                let result = list_result.and(entry_result);
                 if let Err(err) = &result {
                     error!("Rebalance worker {} error: {}", set_idx, err);
                 } else {
                     info!("Rebalance worker {} done", set_idx);
                 }
-                // wk.clone().give().await;
                 result
             });
 
             jobs.push((set_idx, job));
         }
 
-        // wk.wait().await;
         let mut worker_error: Option<Error> = None;
         for (set_idx, job) in jobs {
             if let Err(err) = resolve_rebalance_worker_result(set_idx, job.await)
@@ -2678,6 +2729,29 @@ mod rebalance_unit_tests {
 
         let err = resolve_rebalance_worker_result(7, Err(join_error)).unwrap_err();
         assert!(err.to_string().contains("rebalance worker 7 task join error"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_rebalance_entry_tasks_returns_ok_for_successful_tasks() {
+        let tasks = Arc::new(tokio::sync::Mutex::new(vec![tokio::spawn(async { Ok(()) })]));
+
+        super::wait_rebalance_entry_tasks(1, tasks)
+            .await
+            .expect("successful entry tasks should pass");
+    }
+
+    #[tokio::test]
+    async fn test_wait_rebalance_entry_tasks_returns_first_task_error() {
+        let tasks = Arc::new(tokio::sync::Mutex::new(vec![
+            tokio::spawn(async { Ok(()) }),
+            tokio::spawn(async { Err(Error::other("entry failed")) }),
+        ]));
+
+        let err = super::wait_rebalance_entry_tasks(1, tasks)
+            .await
+            .expect_err("entry task failure should be returned");
+
+        assert!(err.to_string().contains("entry failed"));
     }
 
     #[test]

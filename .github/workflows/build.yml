@@ -234,8 +234,7 @@ jobs:
         run: |
           mkdir -p ./rustfs/static
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            curl.exe -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300
-            if [[ $? -eq 0 ]]; then
+            if curl.exe --fail -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300; then
               unzip -o console.zip -d ./rustfs/static
               rm console.zip
             else
@@ -244,9 +243,8 @@ jobs:
             fi
           else
             chmod +w ./rustfs/static/LICENSE || true
-            curl -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
-              -o console.zip --retry 3 --retry-delay 5 --max-time 300
-            if [[ $? -eq 0 ]]; then
+            if curl --fail -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
+              -o console.zip --retry 3 --retry-delay 5 --max-time 300; then
               unzip -o console.zip -d ./rustfs/static
               rm console.zip
             else

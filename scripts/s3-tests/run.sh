@@ -25,8 +25,8 @@ PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.v
 export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
 
 # Configuration
-S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
-S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfs-ci-admin}"
+S3_SECRET_KEY="${S3_SECRET_KEY:-rustfs-ci-secret}"
 S3_ALT_ACCESS_KEY="${S3_ALT_ACCESS_KEY:-rustfsalt}"
 S3_ALT_SECRET_KEY="${S3_ALT_SECRET_KEY:-rustfsalt}"
 S3_REGION="${S3_REGION:-us-east-1}"
@@ -218,8 +218,8 @@ Environment Variables:
   RUSTFS_BINARY          - Path to RustFS binary (for binary mode, default: ./target/release/rustfs)
   S3_HOST                - S3 service host (default: 127.0.0.1)
   S3_PORT                - S3 service port (default: 9000)
-  S3_ACCESS_KEY          - Main user access key (default: rustfsadmin)
-  S3_SECRET_KEY          - Main user secret key (default: rustfsadmin)
+  S3_ACCESS_KEY          - Main user access key (default: rustfs-ci-admin)
+  S3_SECRET_KEY          - Main user secret key (default: rustfs-ci-secret)
   S3_ALT_ACCESS_KEY      - Alt user access key (default: rustfsalt)
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
   MAXFAIL                - Stop after N failures (default: 1)
@@ -690,7 +690,7 @@ envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
 }
 
 # Step 7: Provision s3-tests alt user
-# Note: Main user (rustfsadmin) is a system user and doesn't need to be created via API
+# Note: The configured main user is a system user and doesn't need to be created via API
 log_info "Provisioning s3-tests alt user..."
 
 # Helper function to install Python packages with fallback for externally-managed environments
