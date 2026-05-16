@@ -141,8 +141,7 @@ fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
     config.is_using_default_credentials()
 }
 
-const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str =
-    "Detected default root credentials; use them only for loopback or explicitly opted-in local development";
+const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values, or use RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true only for local development";
 const DEFAULT_CREDENTIALS_ERROR_MESSAGE: &str = "Default root credentials are not allowed on non-loopback listeners; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values, bind to loopback, or set RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true for local development only";
 
 fn allow_insecure_default_credentials() -> bool {
@@ -842,13 +841,13 @@ mod tests {
     }
 
     #[test]
-    fn default_credentials_warning_message_does_not_expose_values() {
-        let message = DEFAULT_CREDENTIALS_ERROR_MESSAGE;
-
-        assert!(message.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
-        assert!(message.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
-        assert!(message.contains(rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS));
-        assert!(!message.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
-        assert!(!message.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
+    fn default_credentials_messages_are_actionable_without_exposing_values() {
+        for message in [DEFAULT_CREDENTIALS_WARNING_MESSAGE, DEFAULT_CREDENTIALS_ERROR_MESSAGE] {
+            assert!(message.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
+            assert!(message.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
+            assert!(message.contains(rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS));
+            assert!(!message.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
+            assert!(!message.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
+        }
     }
 }

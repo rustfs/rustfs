@@ -39,6 +39,7 @@ const HEADER_FORWARDED: &str = "forwarded";
 const HEADER_X_FORWARDED_FOR: &str = "x-forwarded-for";
 const HEADER_X_FORWARDED_HOST: &str = "x-forwarded-host";
 const HEADER_X_FORWARDED_PROTO: &str = "x-forwarded-proto";
+const HEADER_X_FORWARDED_SCHEME: &str = "x-forwarded-scheme";
 const HEADER_X_REAL_IP: &str = "x-real-ip";
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -279,11 +280,16 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
 }
 
 fn forwarded_host(headers: &HeaderMap) -> Option<String> {
-    parse_single_value_header(headers, HEADER_X_FORWARDED_HOST).or_else(|| parse_forwarded_header_value(headers, "host"))
+    parse_single_value_header(headers, HEADER_X_FORWARDED_HOST)
+        .and_then(sanitize_forwarded_host)
+        .or_else(|| parse_forwarded_header_value(headers, "host").and_then(sanitize_forwarded_host))
 }
 
 fn forwarded_proto(headers: &HeaderMap) -> Option<String> {
-    parse_single_value_header(headers, HEADER_X_FORWARDED_PROTO).or_else(|| parse_forwarded_header_value(headers, "proto"))
+    parse_single_value_header(headers, HEADER_X_FORWARDED_PROTO)
+        .and_then(sanitize_forwarded_proto)
+        .or_else(|| parse_single_value_header(headers, HEADER_X_FORWARDED_SCHEME).and_then(sanitize_forwarded_proto))
+        .or_else(|| parse_forwarded_header_value(headers, "proto").and_then(sanitize_forwarded_proto))
 }
 
 fn parse_single_value_header(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -315,6 +321,28 @@ fn parse_forwarded_header_value(headers: &HeaderMap, name: &str) -> Option<Strin
     }
 
     None
+}
+
+fn sanitize_forwarded_host(value: String) -> Option<String> {
+    sanitize_forwarded_value(&value).filter(|value| !value.chars().any(char::is_whitespace))
+}
+
+fn sanitize_forwarded_proto(value: String) -> Option<String> {
+    let value = sanitize_forwarded_value(&value)?;
+    if value.eq_ignore_ascii_case("http") || value.eq_ignore_ascii_case("https") {
+        return Some(value.to_ascii_lowercase());
+    }
+
+    None
+}
+
+fn sanitize_forwarded_value(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('"');
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return None;
+    }
+
+    Some(value.to_string())
 }
 
 fn parse_x_forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
@@ -393,8 +421,9 @@ fn parse_implementation(value: Option<&str>) -> TrustedProxyImplementation {
 mod tests {
     use super::{
         ENV_TRUSTED_PROXY_IMPLEMENTATION, HEADER_FORWARDED, HEADER_X_FORWARDED_FOR, HEADER_X_FORWARDED_HOST,
-        HEADER_X_FORWARDED_PROTO, HEADER_X_REAL_IP, TrustedProxyImplementation, TrustedProxyLayer, forwarded_client_ip,
-        is_internal_ip, parse_implementation, parse_ip_token, resolve_client_info,
+        HEADER_X_FORWARDED_PROTO, HEADER_X_FORWARDED_SCHEME, HEADER_X_REAL_IP, TrustedProxyImplementation, TrustedProxyLayer,
+        forwarded_client_ip, forwarded_host, forwarded_proto, is_internal_ip, parse_implementation, parse_ip_token,
+        resolve_client_info,
     };
     use crate::ClientInfo;
     use axum::http::{HeaderMap, HeaderValue};
@@ -465,6 +494,17 @@ mod tests {
     }
 
     #[test]
+    fn test_internal_peer_preserves_forwarded_scheme_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.10"));
+        headers.insert(HEADER_X_FORWARDED_SCHEME, HeaderValue::from_static("https"));
+
+        let client_info = resolve_client_info(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers);
+
+        assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
+    }
+
+    #[test]
     fn test_forwarded_header_preserves_proto_and_host() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -477,6 +517,16 @@ mod tests {
         assert_eq!(client_info.real_ip, IpAddr::from([203, 0, 113, 10]));
         assert_eq!(client_info.forwarded_host.as_deref(), Some("s3.example.test"));
         assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
+    }
+
+    #[test]
+    fn test_invalid_forwarded_host_and_proto_are_ignored() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_X_FORWARDED_HOST, HeaderValue::from_static("bad host"));
+        headers.insert(HEADER_X_FORWARDED_PROTO, HeaderValue::from_static("ftp"));
+
+        assert_eq!(forwarded_host(&headers), None);
+        assert_eq!(forwarded_proto(&headers), None);
     }
 
     #[test]
