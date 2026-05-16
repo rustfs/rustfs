@@ -16,7 +16,7 @@ use crate::rules::{RulesMap, TargetIdSet};
 use percent_encoding::percent_decode_str;
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
-use starshard::AsyncShardedHashMap;
+use starshard::{AsyncShardedHashMap, SnapshotMode, DEFAULT_SHARDS};
 use std::sync::Arc;
 use tracing::info;
 
@@ -37,7 +37,7 @@ pub struct NotifyRuleEngine {
 impl NotifyRuleEngine {
     pub fn new() -> Self {
         Self {
-            bucket_rules_map: Arc::new(AsyncShardedHashMap::new(0)),
+            bucket_rules_map: Arc::new(AsyncShardedHashMap::with_snapshot_mode(DEFAULT_SHARDS, SnapshotMode::Cached)),
         }
     }
 

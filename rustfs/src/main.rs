@@ -76,15 +76,7 @@ const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(all(
-    not(target_os = "windows"),
-    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
-))]
-#[global_allocator]
-static GLOBAL: rustfs::profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
-    rustfs::profiling::allocator::TracingAllocator::new(mimalloc::MiMalloc);
-
-#[cfg(target_os = "windows")]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

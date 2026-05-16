@@ -15,7 +15,7 @@
 use crate::rules::{BucketRulesSnapshot, BucketSnapshotRef, DynRulesContainer};
 use arc_swap::ArcSwap;
 use rustfs_s3_common::EventName;
-use starshard::ShardedHashMap;
+use starshard::{ShardedHashMap, DEFAULT_SHARDS};
 use std::fmt;
 use std::sync::Arc;
 
@@ -46,7 +46,7 @@ impl SubscriberIndex {
     /// Returns a new instance of SubscriberIndex.
     pub fn new(empty_rules: Arc<DynRulesContainer>) -> Self {
         Self {
-            inner: ShardedHashMap::new(64),
+            inner: ShardedHashMap::new(DEFAULT_SHARDS),
             empty_rules,
         }
     }
@@ -121,7 +121,7 @@ impl Default for SubscriberIndex {
         struct EmptyRules;
         impl crate::rules::subscriber_snapshot::RulesContainer for EmptyRules {
             type Rule = dyn crate::rules::subscriber_snapshot::RuleEvents;
-            fn iter_rules<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Self::Rule> + 'a> {
+            fn iter_rules<'a>(&'a self) -> Box<dyn Iterator<Item=&'a Self::Rule> + 'a> {
                 Box::new(std::iter::empty())
             }
         }
