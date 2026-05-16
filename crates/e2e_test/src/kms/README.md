@@ -244,9 +244,9 @@ Designed to run inside CI/CD pipelines:
 
 ## 📚 References
 
-- [KMS configuration guide](../../../../docs/kms/README.md)
-- [Dynamic configuration API](../../../../docs/kms/http-api.md)
-- [Troubleshooting](../../../../docs/kms/troubleshooting.md)
+- [KMS configuration types](../../../kms/src/config.rs)
+- [Dynamic configuration API handlers](../../../../rustfs/src/admin/handlers/kms_dynamic.rs)
+- [KMS management API handlers](../../../../rustfs/src/admin/handlers/kms_management.rs)
 
 ---
 

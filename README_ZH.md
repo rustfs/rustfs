@@ -1,4 +1,4 @@
-[![RustFS](https://github.com/user-attachments/assets/1b5afcd6-a2c3-47ff-8bc3-ce882b0ddca7)](https://rustfs.com.cn)
+[![RustFS](https://repository-images.githubusercontent.com/722597620/0fa936a2-8164-4f53-867f-def4beb64b21)](https://rustfs.com.cn)
 
 <p align="center">RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。</p>
 

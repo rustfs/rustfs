@@ -832,6 +832,10 @@ where
 mod tests {
     use super::*;
 
+    fn absolute_test_path(path: &str) -> String {
+        std::env::temp_dir().join(path).to_string_lossy().into_owned()
+    }
+
     #[test]
     fn parse_dsn_format() {
         let dsn = MySqlDsn::parse("rustfs:secret123@tcp(mysql.example.com:3306)/rustfs_events").expect("valid DSN");
@@ -1189,10 +1193,10 @@ mod tests {
             dsn_string: "rustfs:password@tcp(127.0.0.1:3306)/db".to_string(),
             table: "events".to_string(),
             format: "access".to_string(),
-            tls_ca: "/etc/ssl/mysql/ca.pem".to_string(),
-            tls_client_cert: "/etc/ssl/mysql/client.pem".to_string(),
-            tls_client_key: "/etc/ssl/mysql/client.key".to_string(),
-            queue_dir: "/tmp".to_string(),
+            tls_ca: absolute_test_path("mysql-ca.pem"),
+            tls_client_cert: absolute_test_path("mysql-client.pem"),
+            tls_client_key: absolute_test_path("mysql-client.key"),
+            queue_dir: absolute_test_path("mysql-queue"),
             queue_limit: 100,
             max_open_connections: 2,
             target_type: TargetType::NotifyEvent,
