@@ -177,12 +177,6 @@ libmimalloc-sys = { version = "0.1.47", features = ["extended"] }
 
 
 # Only enable pprof-based profiling on non-Windows targets.
-[target.'cfg(all(not(target_os = "windows"), not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))'.dependencies]
-starshard = { workspace = true }
-backtrace = { workspace = true }
-rand = { workspace = true }
-pprof = { workspace = true }
-
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }

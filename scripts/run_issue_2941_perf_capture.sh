@@ -125,7 +125,11 @@ snapshot_proc() {
   fi
 
   if command_exists top; then
-    top -H -b -n 1 -p "${pid}" >"${OUT_DIR}/${prefix}.top.txt" 2>&1 || true
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      top -H -b -n 1 -p "${pid}" >"${OUT_DIR}/${prefix}.top.txt" 2>&1 || true
+    else
+      top -l 1 -pid "${pid}" >"${OUT_DIR}/${prefix}.top.txt" 2>&1 || true
+    fi
   fi
 }
 
@@ -169,7 +173,10 @@ sample_container_stats_loop() {
 sample_pidstat() {
   local pid="$1"
   [[ -n "${pid}" ]] || return 0
-  command_exists pidstat || return 0
+  command_exists pidstat || {
+    echo "pidstat unavailable" >"${OUT_DIR}/pidstat.txt"
+    return 0
+  }
 
   pidstat -durwh -p "${pid}" 1 "${DURATION_SECS}" >"${OUT_DIR}/pidstat.txt" 2>&1 || true
 }
@@ -179,6 +186,7 @@ sample_perf() {
   [[ -n "${pid}" ]] || return 0
   [[ "${PERF_MODE}" == "off" ]] && return 0
   command_exists perf || {
+    echo "perf unavailable" >"${OUT_DIR}/perf-record.log"
     [[ "${PERF_MODE}" == "on" ]] && warn "perf requested but not installed"
     return 0
   }
