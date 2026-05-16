@@ -78,6 +78,15 @@ fn build_resource(action: &Action, bucket: &str, object: &str, bucket_resource_o
     resource
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionFamily {
+    S3,
+    Admin,
+    Sts,
+    Kms,
+    Mixed,
+}
+
 impl Statement {
     fn is_kms(&self) -> bool {
         for act in self.actions.iter() {
@@ -107,6 +116,48 @@ impl Statement {
         }
 
         false
+    }
+
+    fn action_family(&self) -> Option<ActionFamily> {
+        if self.actions.is_empty() {
+            return None;
+        }
+
+        let mut saw_s3 = false;
+        let mut saw_admin = false;
+        let mut saw_sts = false;
+        let mut saw_kms = false;
+
+        for action in self.actions.iter() {
+            match action {
+                Action::S3Action(_) => saw_s3 = true,
+                Action::AdminAction(_) => saw_admin = true,
+                Action::StsAction(_) => saw_sts = true,
+                Action::KmsAction(_) => saw_kms = true,
+                Action::None => {}
+            }
+        }
+
+        let family_count = saw_s3 as u8 + saw_admin as u8 + saw_sts as u8 + saw_kms as u8;
+
+        if family_count != 1 {
+            return Some(ActionFamily::Mixed);
+        }
+
+        if saw_s3 {
+            return Some(ActionFamily::S3);
+        }
+        if saw_admin {
+            return Some(ActionFamily::Admin);
+        }
+        if saw_sts {
+            return Some(ActionFamily::Sts);
+        }
+        if saw_kms {
+            return Some(ActionFamily::Kms);
+        }
+
+        Some(ActionFamily::Mixed)
     }
 
     /// Returns true when this statement would reach `conditions.evaluate_with_resolver` in
@@ -186,9 +237,25 @@ impl Validator for Statement {
             return Err(IamError::BothActionAndNotAction.into());
         }
 
-        // policy must contain either Resource or NotResource (but not both), and cannot have both empty.
+        let action_family = if self.not_actions.is_empty() {
+            match self.action_family() {
+                Some(ActionFamily::Mixed) => return Err(IamError::MixedActionFamilies.into()),
+                family => family,
+            }
+        } else {
+            None
+        };
+
+        // Policy must contain either Resource or NotResource (but not both), unless
+        // the statement is Action-mode Admin/STS/KMS.
         if self.resources.is_empty() && self.not_resources.is_empty() {
-            return Err(IamError::NonResource.into());
+            let allow_empty_resource = matches!(
+                action_family,
+                Some(ActionFamily::Admin) | Some(ActionFamily::Sts) | Some(ActionFamily::Kms)
+            );
+            if !allow_empty_resource {
+                return Err(IamError::NonResource.into());
+            }
         }
 
         if !self.resources.is_empty() && !self.not_resources.is_empty() {

@@ -67,6 +67,9 @@ pub enum Error {
     #[error("invalid action: '{0}'")]
     InvalidAction(String),
 
+    #[error("'Action' contains mixed action families in the same statement")]
+    MixedActionFamilies,
+
     #[error("invalid resource, type: '{0}', pattern: '{1}'")]
     InvalidResource(String, String),
 }
