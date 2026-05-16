@@ -453,6 +453,6 @@ The script follows the same steps:
 
 ## See Also
 
-- [GitHub Actions Workflow](../.github/workflows/e2e-s3tests.yml)
-- [S3 Tests Configuration](../.github/s3tests/s3tests.conf)
+- [GitHub Actions Workflow](../../.github/workflows/e2e-s3tests.yml)
+- [S3 Tests Configuration](../../.github/s3tests/s3tests.conf)
 - [Ceph S3 Tests Repository](https://github.com/ceph/s3-tests)
