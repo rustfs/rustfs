@@ -40,8 +40,8 @@ on:
 
 env:
   # main user
-  S3_ACCESS_KEY: rustfsadmin
-  S3_SECRET_KEY: rustfsadmin
+  S3_ACCESS_KEY: rustfs-ci-admin
+  S3_SECRET_KEY: rustfs-ci-secret
   # alt user (must be different from main for many s3-tests)
   S3_ALT_ACCESS_KEY: rustfsalt
   S3_ALT_SECRET_KEY: rustfsalt

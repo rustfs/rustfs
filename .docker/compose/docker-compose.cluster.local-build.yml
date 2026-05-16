@@ -23,8 +23,8 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}
       - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
@@ -50,8 +50,8 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}
       - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
@@ -77,8 +77,8 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}
       - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
@@ -104,8 +104,8 @@ services:
       - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}
       - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
       - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}

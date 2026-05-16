@@ -20,9 +20,8 @@ use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
-use rustfs_utils::http::{
-    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, ip::get_source_ip_raw,
-};
+use rustfs_trusted_proxies::ClientInfo;
+use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
@@ -32,6 +31,7 @@ use s3s::auth::SimpleAuth;
 use s3s::s3_error;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -436,6 +436,20 @@ pub(crate) fn extract_string_list_claim(claims: &HashMap<String, Value>, claim_n
     }
 }
 
+fn policy_source_ip(remote_addr: Option<SocketAddr>, client_info: Option<&ClientInfo>) -> String {
+    client_info
+        .map(|info| info.real_ip.to_string())
+        .or_else(|| remote_addr.map(|addr| addr.ip().to_string()))
+        .unwrap_or_default()
+}
+
+fn policy_secure_transport(client_info: Option<&ClientInfo>) -> bool {
+    client_info
+        .and_then(|info| info.forwarded_proto.as_deref())
+        .map(|proto| proto.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+}
+
 /// Get condition values for policy evaluation
 ///
 /// # Arguments
@@ -453,9 +467,21 @@ pub fn get_condition_values(
     cred: &Credentials,
     version_id: Option<&str>,
     region: Option<s3s::region::Region>,
-    remote_addr: Option<std::net::SocketAddr>,
+    remote_addr: Option<SocketAddr>,
 ) -> HashMap<String, Vec<String>> {
-    get_condition_values_with_query(header, cred, version_id, region, remote_addr, None)
+    get_condition_values_with_client_info(header, cred, version_id, region, remote_addr, None)
+}
+
+/// Get condition values for policy evaluation with verified client information.
+pub fn get_condition_values_with_client_info(
+    header: &HeaderMap,
+    cred: &Credentials,
+    version_id: Option<&str>,
+    region: Option<s3s::region::Region>,
+    remote_addr: Option<SocketAddr>,
+    client_info: Option<&ClientInfo>,
+) -> HashMap<String, Vec<String>> {
+    get_condition_values_with_query_and_client_info(header, cred, version_id, region, remote_addr, None, client_info)
 }
 
 /// Get condition values for policy evaluation with optional query-string values.
@@ -475,8 +501,22 @@ pub fn get_condition_values_with_query(
     cred: &Credentials,
     version_id: Option<&str>,
     region: Option<s3s::region::Region>,
-    remote_addr: Option<std::net::SocketAddr>,
+    remote_addr: Option<SocketAddr>,
     query: Option<&str>,
+) -> HashMap<String, Vec<String>> {
+    get_condition_values_with_query_and_client_info(header, cred, version_id, region, remote_addr, query, None)
+}
+
+/// Get condition values for policy evaluation with optional query-string values
+/// and verified client information from trusted proxy middleware.
+pub fn get_condition_values_with_query_and_client_info(
+    header: &HeaderMap,
+    cred: &Credentials,
+    version_id: Option<&str>,
+    region: Option<s3s::region::Region>,
+    remote_addr: Option<SocketAddr>,
+    query: Option<&str>,
+    client_info: Option<&ClientInfo>,
 ) -> HashMap<String, Vec<String>> {
     let username = if cred.is_temp() || cred.is_service_account() {
         cred.parent_user.clone()
@@ -510,21 +550,8 @@ pub fn get_condition_values_with_query(
     // Determine auth type and signature version from headers and query
     let (auth_type, signature_version) = determine_auth_type_and_version_with_query(header, query);
 
-    // Get TLS status from header
-    let is_tls = header
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s == "https")
-        .or_else(|| {
-            header
-                .get("x-forwarded-scheme")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s == "https")
-        })
-        .unwrap_or(false);
-
-    // Get remote address from header or use default
-    let remote_addr_s = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    let is_tls = policy_secure_transport(client_info);
+    let source_ip = policy_source_ip(remote_addr, client_info);
 
     let mut args = HashMap::new();
 
@@ -532,7 +559,7 @@ pub fn get_condition_values_with_query(
     args.insert("CurrentTime".to_owned(), vec![curr_time.format(&Rfc3339).unwrap_or_default()]);
     args.insert("EpochTime".to_owned(), vec![epoch_time.to_string()]);
     args.insert("SecureTransport".to_owned(), vec![is_tls.to_string()]);
-    args.insert("SourceIp".to_owned(), vec![get_source_ip_raw(header, &remote_addr_s)]);
+    args.insert("SourceIp".to_owned(), vec![source_ip]);
 
     // Add user agent and referer
     if let Some(user_agent) = header.get("user-agent") {
@@ -888,6 +915,7 @@ mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_credentials::Credentials;
+    use rustfs_trusted_proxies::ValidationMode;
     use s3s::auth::SecretKey;
     use serde_json::json;
     use std::collections::HashMap;
@@ -1600,38 +1628,73 @@ mod tests {
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
         assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 3: X-Forwarded-For present -> XFF (takes precedence over remote_addr)
+        // Case 3: X-Forwarded-For is ignored without verified proxy context
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.1");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 4: X-Forwarded-For with multiple IPs -> First IP
+        // Case 4: X-Forwarded-For with multiple IPs is ignored without verified proxy context
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.3, 10.0.0.4"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.3");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 5: X-Real-IP present (XFF removed) -> X-Real-IP
+        // Case 5: X-Real-IP is ignored without verified proxy context
         headers.remove("x-forwarded-for");
         headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.2"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.2");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 6: Forwarded header present (X-Real-IP removed) -> Forwarded
+        // Case 6: Forwarded is ignored without verified proxy context
         headers.remove("x-real-ip");
         headers.insert("forwarded", HeaderValue::from_static("for=10.0.0.5;proto=http"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.5");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 7: Forwarded header with quotes and multiple values
+        // Case 7: Forwarded with quotes and multiple values is ignored without verified proxy context
         headers.insert("forwarded", HeaderValue::from_static("for=\"10.0.0.6\", for=10.0.0.7"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.6");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
         // Case 8: IPv6 Remote Addr
         let remote_addr_v6: std::net::SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
         headers.clear();
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr_v6));
         assert_eq!(conditions.get("SourceIp").unwrap()[0], "2001:db8::1");
+    }
+
+    #[test]
+    fn test_get_condition_values_uses_verified_client_info() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let cred = Credentials::default();
+        let remote_addr: std::net::SocketAddr = "192.168.0.10:12345".parse().unwrap();
+        let client_info = ClientInfo::from_trusted_proxy(
+            "10.0.0.1".parse().unwrap(),
+            None,
+            Some("https".to_string()),
+            "192.168.0.10".parse().unwrap(),
+            1,
+            ValidationMode::Lenient,
+            Vec::new(),
+        );
+
+        let conditions =
+            get_condition_values_with_client_info(&headers, &cred, None, None, Some(remote_addr), Some(&client_info));
+
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.1");
+        assert_eq!(conditions.get("SecureTransport").unwrap()[0], "true");
+    }
+
+    #[test]
+    fn test_get_condition_values_ignores_unverified_secure_transport_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let cred = Credentials::default();
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("SecureTransport").unwrap()[0], "false");
     }
 
     // ========== KEYSTONE AUTHENTICATION TESTS ==========

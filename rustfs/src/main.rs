@@ -59,7 +59,7 @@ use rustfs_iam::{init_iam_sys, init_oidc_sys};
 use rustfs_obs::{init_metrics_runtime, init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
 use rustfs_utils::{
-    ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
+    ExternalEnvCompatReport, apply_external_env_compat, get_env_bool, get_env_bool_with_aliases, net::parse_and_resolve_address,
 };
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::io::{Error, Result};
@@ -130,11 +130,15 @@ fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
 }
 
 fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
-    rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key) && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
+    config.is_using_default_credentials()
 }
 
-const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str =
-    "Detected default root credentials; change them with the RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY environment variables";
+const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values, or use RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true only for local development";
+const DEFAULT_CREDENTIALS_ERROR_MESSAGE: &str = "Default root credentials are not allowed on non-loopback listeners; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values, bind to loopback, or set RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true for local development only";
+
+fn allow_insecure_default_credentials() -> bool {
+    get_env_bool(rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS, false)
+}
 
 async fn async_main() -> Result<()> {
     // Parse command line arguments
@@ -257,6 +261,15 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
+    if !config.default_credentials_allowed_for_addr(server_addr, allow_insecure_default_credentials()) {
+        error!("{DEFAULT_CREDENTIALS_ERROR_MESSAGE}");
+        return Err(Error::other(DEFAULT_CREDENTIALS_ERROR_MESSAGE));
+    }
+
+    if is_using_default_credentials(&config) {
+        warn!("{}", DEFAULT_CREDENTIALS_WARNING_MESSAGE);
+    }
+
     info!(
         target: "rustfs::main::run",
         server_address = %server_address,
@@ -351,10 +364,6 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     } else {
         None
     };
-
-    if is_using_default_credentials(&config) {
-        warn!("{}", DEFAULT_CREDENTIALS_WARNING_MESSAGE);
-    }
 
     let ctx = CancellationToken::new();
 
@@ -824,12 +833,13 @@ mod tests {
     }
 
     #[test]
-    fn default_credentials_warning_message_does_not_expose_values() {
-        let message = DEFAULT_CREDENTIALS_WARNING_MESSAGE;
-
-        assert!(message.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
-        assert!(message.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
-        assert!(!message.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
-        assert!(!message.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
+    fn default_credentials_messages_are_actionable_without_exposing_values() {
+        for message in [DEFAULT_CREDENTIALS_WARNING_MESSAGE, DEFAULT_CREDENTIALS_ERROR_MESSAGE] {
+            assert!(message.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
+            assert!(message.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
+            assert!(message.contains(rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS));
+            assert!(!message.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
+            assert!(!message.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
+        }
     }
 }
