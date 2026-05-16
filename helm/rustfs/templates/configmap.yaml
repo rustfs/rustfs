@@ -19,6 +19,9 @@ data:
   {{- if .domains }}
   RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" $ | quote }}
   {{- end }}
+  {{- if .ec.storage_class_standard }}
+  RUSTFS_STORAGE_CLASS_STANDARD: {{ .ec.storage_class_standard | quote }}
+  {{- end }}
   {{- with .log_rotation }}
     {{- if .size }}
   RUSTFS_OBS_LOG_ROTATION_SIZE_MB: {{ .size | quote }}
