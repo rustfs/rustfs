@@ -72,7 +72,7 @@ use rustfs_ecstore::{
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
-use rustfs_utils::net::parse_and_resolve_address;
+use rustfs_utils::{get_env_bool, net::parse_and_resolve_address};
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -303,19 +303,8 @@ impl RustFSServerBuilder {
         // Trusted proxies.
         rustfs_trusted_proxies::init();
 
-        // Credentials.
-        init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone()))
-            .map_err(|e| ServerError::Init(format!("credentials: {e:?}")))?;
-
-        // Region.
-        if let Some(region_str) = &config.region {
-            let region = region_str
-                .parse()
-                .map_err(|e| ServerError::Init(format!("invalid region '{region_str}': {e}")))?;
-            rustfs_ecstore::global::set_global_region(region);
-        }
-
-        // Resolve listen address.
+        // Resolve listen address before credential initialization so unsafe
+        // default credentials can fail before the server binds a listener.
         let server_addr =
             parse_and_resolve_address(config.address.as_str()).map_err(|e| ServerError::Init(format!("address: {e}")))?;
 
@@ -326,6 +315,26 @@ impl RustFSServerBuilder {
                  Use `find_available_port()` to obtain a free port."
                     .to_string(),
             ));
+        }
+
+        let allow_insecure_defaults = get_env_bool(rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS, false);
+        if !config.default_credentials_allowed_for_addr(server_addr, allow_insecure_defaults) {
+            return Err(ServerError::Init(
+                "default root credentials are not allowed on non-loopback listeners; set access_key and secret_key to non-default values, bind to loopback, or set RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true for local development only"
+                    .to_string(),
+            ));
+        }
+
+        // Credentials.
+        init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone()))
+            .map_err(|e| ServerError::Init(format!("credentials: {e:?}")))?;
+
+        // Region.
+        if let Some(region_str) = &config.region {
+            let region = region_str
+                .parse()
+                .map_err(|e| ServerError::Init(format!("invalid region '{region_str}': {e}")))?;
+            rustfs_ecstore::global::set_global_region(region);
         }
 
         let server_port = server_addr.port();

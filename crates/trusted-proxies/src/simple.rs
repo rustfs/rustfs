@@ -37,6 +37,8 @@ pub const SIMPLE_INTERNAL_ONLY_DEFAULT: bool = true;
 
 const HEADER_FORWARDED: &str = "forwarded";
 const HEADER_X_FORWARDED_FOR: &str = "x-forwarded-for";
+const HEADER_X_FORWARDED_HOST: &str = "x-forwarded-host";
+const HEADER_X_FORWARDED_PROTO: &str = "x-forwarded-proto";
 const HEADER_X_REAL_IP: &str = "x-real-ip";
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -257,9 +259,15 @@ fn resolve_client_info(peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Cl
     }
 
     match forwarded_client_ip(headers) {
-        Some(real_ip) if is_usable_ip(real_ip) && real_ip != peer_addr.ip() => {
-            ClientInfo::from_trusted_proxy(real_ip, None, None, peer_addr.ip(), 1, ValidationMode::Lenient, Vec::new())
-        }
+        Some(real_ip) if is_usable_ip(real_ip) && real_ip != peer_addr.ip() => ClientInfo::from_trusted_proxy(
+            real_ip,
+            forwarded_host(headers),
+            forwarded_proto(headers),
+            peer_addr.ip(),
+            1,
+            ValidationMode::Lenient,
+            Vec::new(),
+        ),
         _ => ClientInfo::direct(peer_addr),
     }
 }
@@ -268,6 +276,45 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     parse_x_forwarded_for(headers)
         .or_else(|| parse_single_ip_header(headers, HEADER_X_REAL_IP))
         .or_else(|| parse_forwarded_header(headers))
+}
+
+fn forwarded_host(headers: &HeaderMap) -> Option<String> {
+    parse_single_value_header(headers, HEADER_X_FORWARDED_HOST).or_else(|| parse_forwarded_header_value(headers, "host"))
+}
+
+fn forwarded_proto(headers: &HeaderMap) -> Option<String> {
+    parse_single_value_header(headers, HEADER_X_FORWARDED_PROTO).or_else(|| parse_forwarded_header_value(headers, "proto"))
+}
+
+fn parse_single_value_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn parse_forwarded_header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let value = headers.get(HEADER_FORWARDED)?.to_str().ok()?;
+    let first = value.split(',').next()?.trim();
+
+    for part in first.split(';') {
+        let Some((key, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            let value = value.trim().trim_matches('"');
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 fn parse_x_forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
@@ -345,8 +392,9 @@ fn parse_implementation(value: Option<&str>) -> TrustedProxyImplementation {
 #[cfg(test)]
 mod tests {
     use super::{
-        ENV_TRUSTED_PROXY_IMPLEMENTATION, HEADER_FORWARDED, HEADER_X_FORWARDED_FOR, HEADER_X_REAL_IP, TrustedProxyImplementation,
-        TrustedProxyLayer, forwarded_client_ip, is_internal_ip, parse_implementation, parse_ip_token, resolve_client_info,
+        ENV_TRUSTED_PROXY_IMPLEMENTATION, HEADER_FORWARDED, HEADER_X_FORWARDED_FOR, HEADER_X_FORWARDED_HOST,
+        HEADER_X_FORWARDED_PROTO, HEADER_X_REAL_IP, TrustedProxyImplementation, TrustedProxyLayer, forwarded_client_ip,
+        is_internal_ip, parse_implementation, parse_ip_token, resolve_client_info,
     };
     use crate::ClientInfo;
     use axum::http::{HeaderMap, HeaderValue};
@@ -401,6 +449,34 @@ mod tests {
         assert_eq!(client_info.real_ip, IpAddr::from([203, 0, 113, 10]));
         assert!(client_info.is_from_trusted_proxy);
         assert_eq!(client_info.proxy_ip, Some(IpAddr::from([10, 0, 0, 5])));
+    }
+
+    #[test]
+    fn test_internal_peer_preserves_forwarded_proto_and_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.10"));
+        headers.insert(HEADER_X_FORWARDED_HOST, HeaderValue::from_static("s3.example.test"));
+        headers.insert(HEADER_X_FORWARDED_PROTO, HeaderValue::from_static("https"));
+
+        let client_info = resolve_client_info(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers);
+
+        assert_eq!(client_info.forwarded_host.as_deref(), Some("s3.example.test"));
+        assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
+    }
+
+    #[test]
+    fn test_forwarded_header_preserves_proto_and_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_FORWARDED,
+            HeaderValue::from_static("for=203.0.113.10;proto=https;host=s3.example.test"),
+        );
+
+        let client_info = resolve_client_info(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers);
+
+        assert_eq!(client_info.real_ip, IpAddr::from([203, 0, 113, 10]));
+        assert_eq!(client_info.forwarded_host.as_deref(), Some("s3.example.test"));
+        assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
     }
 
     #[test]

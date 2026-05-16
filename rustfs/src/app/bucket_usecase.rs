@@ -18,7 +18,7 @@ use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
-use crate::auth::get_condition_values;
+use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
@@ -69,6 +69,7 @@ use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},
 };
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use rustfs_utils::string::parse_bool;
@@ -1308,7 +1309,15 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
+        let client_info = req.extensions.get::<ClientInfo>();
+        let conditions = get_condition_values_with_client_info(
+            &req.headers,
+            &rustfs_credentials::Credentials::default(),
+            None,
+            None,
+            remote_addr,
+            client_info,
+        );
 
         let read_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
