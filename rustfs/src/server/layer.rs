@@ -262,6 +262,7 @@ where
         if should_force_zero_content_length_for_empty_body_route(&req) {
             req.headers_mut()
                 .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+            req.headers_mut().remove(http::header::TRANSFER_ENCODING);
         }
 
         let mut inner = self.inner.clone();
@@ -274,12 +275,12 @@ fn should_force_zero_content_length_for_empty_body_route<B>(req: &HttpRequest<B>
         return false;
     }
 
-    if req.headers().contains_key(http::header::TRANSFER_ENCODING) {
-        return false;
-    }
-
     if is_empty_body_admin_path(req.method(), req.uri().path()) {
         return true;
+    }
+
+    if req.headers().contains_key(http::header::TRANSFER_ENCODING) {
+        return false;
     }
 
     is_empty_body_s3_path(req.method(), req.uri())
@@ -1301,13 +1302,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_body_layer_preserves_admin_transfer_encoding_without_content_length() {
+    async fn empty_body_layer_normalizes_admin_chunked_request_without_content_length() {
         let capture = HeaderCaptureService::default();
         let headers = capture.headers();
         let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
         let request = Request::builder()
-            .method(Method::PUT)
-            .uri("/rustfs/admin/v3/set-group-status?group=test&status=enabled")
+            .method(Method::POST)
+            .uri(format!("{MINIO_ADMIN_V3_PREFIX}/rebalance/start"))
             .header(http::header::TRANSFER_ENCODING, "chunked")
             .body(())
             .expect("request");
@@ -1315,8 +1316,8 @@ mod tests {
         let _ = service.call(request).await.expect("service call");
 
         let headers = headers.lock().expect("captured headers").take().expect("captured headers");
-        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
-        assert_eq!(headers.get(http::header::TRANSFER_ENCODING).unwrap(), "chunked");
+        assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
+        assert!(headers.get(http::header::TRANSFER_ENCODING).is_none());
     }
 
     #[test]
