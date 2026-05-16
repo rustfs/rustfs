@@ -5,7 +5,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="${LABEL:-issue-2941}"
 DURATION_SECS="${DURATION_SECS:-60}"
 PERF_FREQ="${PERF_FREQ:-99}"
-OUT_DIR="${OUT_DIR:-${PROJECT_ROOT}/target/perf/${LABEL}-$(date +%Y%m%d-%H%M%S)}"
+OUT_DIR="${OUT_DIR:-}"
 RUSTFS_PID="${RUSTFS_PID:-}"
 CONTAINER_NAME="${CONTAINER_NAME:-}"
 ENDPOINT="${ENDPOINT:-http://127.0.0.1:9000}"
@@ -54,18 +54,28 @@ warn() {
   printf '[WARN] %s\n' "$*" >&2
 }
 
+require_arg() {
+  local option="$1"
+  local value="${2-}"
+  if [[ $# -lt 2 || -z "${value}" || "${value}" == --* ]]; then
+    warn "missing value for ${option}"
+    usage
+    exit 1
+  fi
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --label) LABEL="$2"; shift 2 ;;
-      --duration) DURATION_SECS="$2"; shift 2 ;;
-      --out-dir) OUT_DIR="$2"; shift 2 ;;
-      --pid) RUSTFS_PID="$2"; shift 2 ;;
-      --container) CONTAINER_NAME="$2"; shift 2 ;;
-      --endpoint) ENDPOINT="$2"; shift 2 ;;
-      --perf) PERF_MODE="$2"; shift 2 ;;
-      --perf-freq) PERF_FREQ="$2"; shift 2 ;;
-      --sudo-cmd) SUDO_CMD="$2"; shift 2 ;;
+      --label) require_arg "$1" "${2-}"; LABEL="$2"; shift 2 ;;
+      --duration) require_arg "$1" "${2-}"; DURATION_SECS="$2"; shift 2 ;;
+      --out-dir) require_arg "$1" "${2-}"; OUT_DIR="$2"; shift 2 ;;
+      --pid) require_arg "$1" "${2-}"; RUSTFS_PID="$2"; shift 2 ;;
+      --container) require_arg "$1" "${2-}"; CONTAINER_NAME="$2"; shift 2 ;;
+      --endpoint) require_arg "$1" "${2-}"; ENDPOINT="$2"; shift 2 ;;
+      --perf) require_arg "$1" "${2-}"; PERF_MODE="$2"; shift 2 ;;
+      --perf-freq) require_arg "$1" "${2-}"; PERF_FREQ="$2"; shift 2 ;;
+      --sudo-cmd) require_arg "$1" "${2-}"; SUDO_CMD="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *)
         warn "unknown argument: $1"
@@ -74,6 +84,12 @@ parse_args() {
         ;;
     esac
   done
+}
+
+finalize_defaults() {
+  if [[ -z "${OUT_DIR}" ]]; then
+    OUT_DIR="${PROJECT_ROOT}/target/perf/${LABEL}-$(date +%Y%m%d-%H%M%S)}"
+  fi
 }
 
 command_exists() {
@@ -220,6 +236,7 @@ capture_version_info() {
 
 main() {
   parse_args "$@"
+  finalize_defaults
   mkdir -p "${OUT_DIR}"
 
   local pid

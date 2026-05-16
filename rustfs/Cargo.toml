@@ -176,7 +176,7 @@ libmimalloc-sys = { version = "0.1.47", features = ["extended"] }
 
 
 
-# Only enable pprof-based profiling on non-Windows targets.
+# Only enable pprof-based profiling on linux + gnu + x86_64.
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
