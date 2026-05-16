@@ -141,6 +141,9 @@ spec:
               mountPath: /opt/tls/ca.crt
               subPath: ca.crt
             {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
@@ -153,8 +156,9 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
-      {{- if .Values.mtls.enabled }}
+      {{- if or .Values.mtls.enabled .Values.extraVolumes }}
       volumes:
+        {{- if .Values.mtls.enabled }}
         - name: server-cert
           secret:
             secretName: rustfs-server-tls
@@ -175,6 +179,10 @@ spec:
                 path: client_key.pem
               - key: ca.crt
                 path: client_ca.crt
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
   volumeClaimTemplates:
     - metadata:
