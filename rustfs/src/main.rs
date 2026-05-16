@@ -34,6 +34,7 @@ use rustfs::server::{
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
+use rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS;
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
@@ -76,15 +77,7 @@ const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(all(
-    not(target_os = "windows"),
-    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
-))]
-#[global_allocator]
-static GLOBAL: rustfs::profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
-    rustfs::profiling::allocator::TracingAllocator::new(mimalloc::MiMalloc);
-
-#[cfg(target_os = "windows")]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -145,7 +138,7 @@ const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credent
 const DEFAULT_CREDENTIALS_ERROR_MESSAGE: &str = "Default root credentials are not allowed on non-loopback listeners; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values, bind to loopback, or set RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true for local development only";
 
 fn allow_insecure_default_credentials() -> bool {
-    get_env_bool(rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS, false)
+    get_env_bool(ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS, false)
 }
 
 async fn async_main() -> Result<()> {
@@ -845,7 +838,7 @@ mod tests {
         for message in [DEFAULT_CREDENTIALS_WARNING_MESSAGE, DEFAULT_CREDENTIALS_ERROR_MESSAGE] {
             assert!(message.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
             assert!(message.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
-            assert!(message.contains(rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS));
+            assert!(message.contains(ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS));
             assert!(!message.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
             assert!(!message.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
         }

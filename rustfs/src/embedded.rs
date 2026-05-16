@@ -51,6 +51,7 @@ use crate::config::Config;
 use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
 use crate::server::{init_event_notifier, shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
+use rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS;
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
@@ -317,7 +318,7 @@ impl RustFSServerBuilder {
             ));
         }
 
-        let allow_insecure_defaults = get_env_bool(rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS, false);
+        let allow_insecure_defaults = get_env_bool(ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS, false);
         if !config.default_credentials_allowed_for_addr(server_addr, allow_insecure_defaults) {
             return Err(ServerError::Init(
                 "default root credentials are not allowed on non-loopback listeners; set access_key and secret_key to non-default values, bind to loopback, or set RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true for local development only"
