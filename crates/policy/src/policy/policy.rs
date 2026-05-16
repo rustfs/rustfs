@@ -1588,6 +1588,53 @@ mod test {
     }
 
     #[test]
+    fn test_mixed_action_families_are_invalid_even_without_resource() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*", "s3:GetObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families should be rejected even when Resource is missing");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_mixed_action_families_with_wildcard_variants_are_invalid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:*", "admin:*", "sts:AssumeRole"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families with wildcard variants should be rejected");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
     fn test_notaction_without_resource_remains_invalid() {
         let data = r#"
 {
