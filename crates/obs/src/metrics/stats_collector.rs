@@ -842,6 +842,8 @@ pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
     let transition_missed_immediate_tasks = GLOBAL_TransitionState.missed_immediate_tasks().max(0) as u64;
     let transition_queue_full_tasks = GLOBAL_TransitionState.queue_full_tasks().max(0) as u64;
     let transition_queue_send_timeout_tasks = GLOBAL_TransitionState.queue_send_timeout_tasks().max(0) as u64;
+    let transition_compensation_scheduled_tasks = GLOBAL_TransitionState.compensation_scheduled_tasks().max(0) as u64;
+    let transition_compensation_running_tasks = GLOBAL_TransitionState.compensation_running_tasks().max(0) as u64;
     let metrics = global_metrics().report().await;
     let versions_scanned = metrics.life_time_ilm.values().copied().sum();
 
@@ -852,6 +854,8 @@ pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
         transition_missed_immediate_tasks,
         transition_queue_full_tasks,
         transition_queue_send_timeout_tasks,
+        transition_compensation_scheduled_tasks,
+        transition_compensation_running_tasks,
         versions_scanned,
     })
 }

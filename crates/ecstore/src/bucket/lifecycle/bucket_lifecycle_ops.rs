@@ -60,7 +60,7 @@ use s3s::dto::{
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION};
 use sha2::{Digest, Sha256};
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -575,6 +575,9 @@ pub struct TransitionState {
     missed_immediate_tasks: AtomicI64,
     queue_full_tasks: AtomicI64,
     queue_send_timeout_tasks: AtomicI64,
+    compensation_scheduled_tasks: AtomicI64,
+    compensation_running_tasks: AtomicI64,
+    compensation_buckets: Arc<Mutex<HashSet<String>>>,
     last_day_stats: Arc<Mutex<HashMap<String, LastDayTierStats>>>,
 }
 
@@ -597,8 +600,40 @@ impl TransitionState {
             missed_immediate_tasks: AtomicI64::new(0),
             queue_full_tasks: AtomicI64::new(0),
             queue_send_timeout_tasks: AtomicI64::new(0),
+            compensation_scheduled_tasks: AtomicI64::new(0),
+            compensation_running_tasks: AtomicI64::new(0),
+            compensation_buckets: Arc::new(Mutex::new(HashSet::new())),
             last_day_stats: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    fn schedule_bucket_compensation(&self, bucket: &str) {
+        let mut scheduled = self.compensation_buckets.lock().unwrap();
+        if !scheduled.insert(bucket.to_string()) {
+            return;
+        }
+        self.compensation_scheduled_tasks.fetch_add(1, Ordering::SeqCst);
+        let bucket = bucket.to_string();
+        let scheduled = Arc::clone(&self.compensation_buckets);
+        let state = Arc::clone(&GLOBAL_TransitionState);
+        tokio::spawn(async move {
+            state.compensation_running_tasks.fetch_add(1, Ordering::SeqCst);
+            let Some(api) = crate::new_object_layer_fn() else {
+                scheduled.lock().unwrap().remove(&bucket);
+                state.compensation_running_tasks.fetch_add(-1, Ordering::SeqCst);
+                warn!(bucket = %bucket, "transition compensation skipped because object layer is unavailable");
+                return;
+            };
+
+            if let Err(err) = enqueue_transition_for_existing_objects(api, &bucket).await {
+                warn!(bucket = %bucket, error = ?err, "transition compensation backfill failed");
+            } else {
+                info!(bucket = %bucket, "transition compensation backfill completed");
+            }
+
+            scheduled.lock().unwrap().remove(&bucket);
+            state.compensation_running_tasks.fetch_add(-1, Ordering::SeqCst);
+        });
     }
 
     pub async fn queue_transition_task(&self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
@@ -614,6 +649,7 @@ impl TransitionState {
                 Ok(Err(_)) => {
                     self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
                     self.queue_full_tasks.fetch_add(1, Ordering::SeqCst);
+                    self.schedule_bucket_compensation(&oi.bucket);
                     warn!(
                         bucket = %oi.bucket,
                         object = %oi.name,
@@ -625,6 +661,7 @@ impl TransitionState {
                 Err(_) => {
                     self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
                     self.queue_send_timeout_tasks.fetch_add(1, Ordering::SeqCst);
+                    self.schedule_bucket_compensation(&oi.bucket);
                     warn!(
                         bucket = %oi.bucket,
                         object = %oi.name,
@@ -697,6 +734,14 @@ impl TransitionState {
 
     pub fn queue_send_timeout_tasks(&self) -> i64 {
         self.queue_send_timeout_tasks.load(Ordering::SeqCst)
+    }
+
+    pub fn compensation_scheduled_tasks(&self) -> i64 {
+        self.compensation_scheduled_tasks.load(Ordering::SeqCst)
+    }
+
+    pub fn compensation_running_tasks(&self) -> i64 {
+        self.compensation_running_tasks.load(Ordering::SeqCst)
     }
 
     pub async fn worker(api: Arc<ECStore>) {
@@ -2447,6 +2492,17 @@ mod tests {
         with_transition_queue_env(None, Some("250"), || {
             assert_eq!(resolve_transition_queue_send_timeout(), StdDuration::from_millis(250));
         });
+    }
+
+    #[tokio::test]
+    async fn schedule_bucket_compensation_deduplicates_same_bucket() {
+        let state = TransitionState::new_with_capacity(1);
+
+        state.schedule_bucket_compensation("bucket-a");
+        state.schedule_bucket_compensation("bucket-a");
+
+        assert_eq!(state.compensation_scheduled_tasks(), 1);
+        assert!(state.compensation_buckets.lock().unwrap().contains("bucket-a"));
     }
 
     #[tokio::test]

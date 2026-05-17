@@ -250,6 +250,8 @@ pub enum MetricName {
     IlmTransitionMissedImmediateTasks,
     IlmTransitionQueueFullTasks,
     IlmTransitionQueueSendTimeoutTasks,
+    IlmTransitionCompensationScheduledTasks,
+    IlmTransitionCompensationRunningTasks,
     IlmVersionsScanned,
 
     // Copy the relevant metrics
@@ -588,6 +590,8 @@ impl MetricName {
             Self::IlmTransitionMissedImmediateTasks => "transition_missed_immediate_tasks".to_string(),
             Self::IlmTransitionQueueFullTasks => "transition_queue_full_tasks".to_string(),
             Self::IlmTransitionQueueSendTimeoutTasks => "transition_queue_send_timeout_tasks".to_string(),
+            Self::IlmTransitionCompensationScheduledTasks => "transition_compensation_scheduled_tasks".to_string(),
+            Self::IlmTransitionCompensationRunningTasks => "transition_compensation_running_tasks".to_string(),
             Self::IlmVersionsScanned => "versions_scanned".to_string(),
 
             // Copy the relevant metrics
