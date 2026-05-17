@@ -93,10 +93,25 @@ const ENV_STALE_UPLOADS_CLEANUP_INTERVAL: &str = "RUSTFS_API_STALE_UPLOADS_CLEAN
 const DEFAULT_STALE_UPLOADS_EXPIRY: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
+const DEFAULT_TRANSITION_WORKERS_CAP: i64 = 16;
+const DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX: i64 = 32;
 
 lazy_static! {
     pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
     pub static ref GLOBAL_TransitionState: Arc<TransitionState> = TransitionState::new();
+}
+
+fn resolve_transition_worker_count() -> (i64, i64, i64) {
+    let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
+    let configured = env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback);
+    let mut effective = configured;
+    let absolute_max = get_env_i64("RUSTFS_ABSOLUTE_MAX_WORKERS", DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+    effective = std::cmp::min(effective, absolute_max);
+    (configured, absolute_max, effective)
 }
 
 pub struct LifecycleSys;
@@ -580,12 +595,13 @@ impl TransitionState {
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let max_workers = get_env_i64("RUSTFS_MAX_TRANSITION_WORKERS", std::cmp::min(num_cpus::get() as i64, 16));
-        let mut n = max_workers;
-        let tw = 8; //globalILMConfig.getTransitionWorkers();
-        if tw > 0 {
-            n = tw;
-        }
+        let (configured, absolute_max, n) = resolve_transition_worker_count();
+        info!(
+            configured_transition_workers = configured,
+            absolute_max_workers = absolute_max,
+            effective_transition_workers = n,
+            "transition worker count resolved"
+        );
 
         //let mut transition_state = GLOBAL_TransitionState.write().await;
         //self.objAPI = objAPI
@@ -702,15 +718,17 @@ impl TransitionState {
 
     pub async fn update_workers_inner(api: Arc<ECStore>, n: i64) {
         let mut n = n;
+        let requested = n;
         if n == 0 {
-            let max_workers = get_env_i64("RUSTFS_MAX_TRANSITION_WORKERS", std::cmp::min(num_cpus::get() as i64, 16));
-            n = max_workers;
+            let (_, _, effective) = resolve_transition_worker_count();
+            n = effective;
         }
         // Allow environment override of maximum workers
-        let absolute_max = get_env_i64("RUSTFS_ABSOLUTE_MAX_WORKERS", 32);
+        let absolute_max = get_env_i64("RUSTFS_ABSOLUTE_MAX_WORKERS", DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
         n = std::cmp::min(n, absolute_max);
 
-        let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
+        let previous_num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
+        let mut num_workers = previous_num_workers;
         while num_workers < n {
             let clone_api = api.clone();
             tokio::spawn(async move {
@@ -727,6 +745,15 @@ impl TransitionState {
             num_workers -= 1;
             GLOBAL_TransitionState.num_workers.fetch_add(-1, Ordering::SeqCst);
         }
+
+        info!(
+            requested_transition_workers = requested,
+            effective_transition_workers = n,
+            absolute_max_workers = absolute_max,
+            previous_transition_workers = previous_num_workers,
+            current_transition_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst),
+            "transition workers updated"
+        );
     }
 }
 
@@ -2004,11 +2031,12 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 #[cfg(test)]
 mod tests {
     use super::{
-        DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, StaleMultipartUploadCandidate, cleanup_empty_multipart_sha_dirs_on_local_disks,
+        DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX, DEFAULT_TRANSITION_WORKERS_CAP,
+        GLOBAL_TransitionState, StaleMultipartUploadCandidate, TransitionState, cleanup_empty_multipart_sha_dirs_on_local_disks,
         cleanup_stale_multipart_uploads_once_at, lifecycle_deleted_object, lifecycle_rule_has_date_expiration,
         lifecycle_version_purge_state_from_completed_targets, mark_delete_opts_skip_decommissioned_on_remote_success,
-        merge_stale_multipart_candidate, replication_state_for_delete, should_defer_date_expiry_for_recent_config_update,
-        should_reuse_lifecycle_delete_replication_state,
+        merge_stale_multipart_candidate, replication_state_for_delete, resolve_transition_worker_count,
+        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
     };
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -2021,12 +2049,15 @@ mod tests {
     use crate::store_api::{
         BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader,
     };
+    use futures::FutureExt;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
+    use std::env;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, OnceLock};
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
@@ -2041,6 +2072,105 @@ mod tests {
         mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, true);
 
         assert!(opts.skip_decommissioned);
+    }
+
+    #[allow(unsafe_code)]
+    fn with_transition_worker_env<F>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
+    where
+        F: FnOnce(),
+    {
+        let original_transition = env::var_os("RUSTFS_MAX_TRANSITION_WORKERS");
+        let original_absolute = env::var_os("RUSTFS_ABSOLUTE_MAX_WORKERS");
+
+        match transition {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_MAX_TRANSITION_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_MAX_TRANSITION_WORKERS");
+            },
+        }
+        match absolute {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_ABSOLUTE_MAX_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_ABSOLUTE_MAX_WORKERS");
+            },
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test_fn));
+
+        match original_transition {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_MAX_TRANSITION_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_MAX_TRANSITION_WORKERS");
+            },
+        }
+        match original_absolute {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_ABSOLUTE_MAX_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_ABSOLUTE_MAX_WORKERS");
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[allow(unsafe_code)]
+    async fn with_transition_worker_env_async<F, Fut>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let original_transition = env::var_os("RUSTFS_MAX_TRANSITION_WORKERS");
+        let original_absolute = env::var_os("RUSTFS_ABSOLUTE_MAX_WORKERS");
+
+        match transition {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_MAX_TRANSITION_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_MAX_TRANSITION_WORKERS");
+            },
+        }
+        match absolute {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_ABSOLUTE_MAX_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_ABSOLUTE_MAX_WORKERS");
+            },
+        }
+
+        let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+
+        match original_transition {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_MAX_TRANSITION_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_MAX_TRANSITION_WORKERS");
+            },
+        }
+        match original_absolute {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_ABSOLUTE_MAX_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_ABSOLUTE_MAX_WORKERS");
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     #[test]
@@ -2066,6 +2196,70 @@ mod tests {
 
         assert!(lifecycle_rule_has_date_expiration(&lc, "rule-date"));
         assert!(!lifecycle_rule_has_date_expiration(&lc, "missing-rule"));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_uses_fallback_when_env_missing() {
+        with_transition_worker_env(None, None, || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
+            assert_eq!(configured, fallback);
+            assert_eq!(absolute_max, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            assert_eq!(effective, fallback);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_honors_positive_env_value() {
+        with_transition_worker_env(Some("4"), Some("32"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            assert_eq!(configured, 4);
+            assert_eq!(absolute_max, 32);
+            assert_eq!(effective, 4);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_clamps_to_absolute_max() {
+        with_transition_worker_env(Some("64"), Some("16"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            assert_eq!(configured, 64);
+            assert_eq!(absolute_max, 16);
+            assert_eq!(effective, 16);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_falls_back_for_zero_value() {
+        with_transition_worker_env(Some("0"), Some("32"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
+            assert_eq!(configured, fallback);
+            assert_eq!(absolute_max, 32);
+            assert_eq!(effective, fallback);
+        });
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transition_state_init_honors_runtime_configured_worker_count() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let original_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
+        with_transition_worker_env_async(Some("3"), Some("8"), || async {
+            TransitionState::update_workers(ecstore.clone(), 0).await;
+            assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 3);
+        })
+        .await;
+
+        TransitionState::update_workers(ecstore, original_workers).await;
     }
 
     #[test]
