@@ -607,10 +607,10 @@ impl TransitionState {
         })
     }
 
-    fn schedule_bucket_compensation(&self, bucket: &str) {
+    fn schedule_bucket_compensation(&self, bucket: &str) -> bool {
         let mut scheduled = self.compensation_buckets.lock().unwrap();
         if !scheduled.insert(bucket.to_string()) {
-            return;
+            return false;
         }
         self.compensation_scheduled_tasks.fetch_add(1, Ordering::SeqCst);
         let bucket = bucket.to_string();
@@ -634,6 +634,7 @@ impl TransitionState {
             scheduled.lock().unwrap().remove(&bucket);
             state.compensation_running_tasks.fetch_add(-1, Ordering::SeqCst);
         });
+        true
     }
 
     pub async fn queue_transition_task(&self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
@@ -649,24 +650,26 @@ impl TransitionState {
                 Ok(Err(_)) => {
                     self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
                     self.queue_full_tasks.fetch_add(1, Ordering::SeqCst);
-                    self.schedule_bucket_compensation(&oi.bucket);
+                    let scheduled = self.schedule_bucket_compensation(&oi.bucket);
                     warn!(
                         bucket = %oi.bucket,
                         object = %oi.name,
                         source = ?src,
                         timeout_ms = send_timeout.as_millis() as u64,
+                        compensation_scheduled = scheduled,
                         "transition enqueue failed because the queue is closed"
                     );
                 }
                 Err(_) => {
                     self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
                     self.queue_send_timeout_tasks.fetch_add(1, Ordering::SeqCst);
-                    self.schedule_bucket_compensation(&oi.bucket);
+                    let scheduled = self.schedule_bucket_compensation(&oi.bucket);
                     warn!(
                         bucket = %oi.bucket,
                         object = %oi.name,
                         source = ?src,
                         timeout_ms = send_timeout.as_millis() as u64,
+                        compensation_scheduled = scheduled,
                         "transition enqueue timed out under backpressure"
                     );
                 }
