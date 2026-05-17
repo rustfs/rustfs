@@ -86,7 +86,7 @@ jobs:
 
       - name: Build with profiling optimizations
         run: |
-          RUSTFLAGS="-C force-frame-pointers=yes -C debug-assertions=off" \
+          RUSTFLAGS="-C force-frame-pointers=yes -C debug-assertions=off --cfg tokio_unstable" \
           cargo +nightly build --profile profiling -p rustfs --bins
 
       - name: Run performance profiling
