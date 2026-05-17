@@ -860,7 +860,7 @@ impl HealOperations for Sets {
 #[async_trait::async_trait]
 impl StorageAPI for Sets {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        self.disk_set[0].new_ns_lock(bucket, object).await
+        self.get_disks_by_key(object).new_ns_lock(bucket, object).await
     }
     #[tracing::instrument(skip(self))]
     async fn backend_info(&self) -> rustfs_madmin::BackendInfo {

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use rustfs_utils::{sip_hash, DEFAULT_SIP_HASH_KEY};
 
 struct LatestObjectInfoCandidate {
     info: Option<ObjectInfo>,
@@ -599,7 +600,20 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        self.pools[0].new_ns_lock(bucket, object).await
+        if self.pools.len() == 1 {
+            return self.pools[0].new_ns_lock(bucket, object).await;
+        }
+
+        let pool_idx = match self.get_pool_idx_existing_no_lock(bucket, object).await {
+            Ok(idx) => idx,
+            Err(err) if is_err_object_not_found(&err) => {
+                let key = format!("{}/{}", bucket, object);
+                sip_hash(&key, self.pools.len(), &DEFAULT_SIP_HASH_KEY)
+            }
+            Err(err) => return Err(err),
+        };
+
+        self.pools[pool_idx].new_ns_lock(bucket, object).await
     }
 
     #[instrument(skip(self))]
