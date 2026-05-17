@@ -929,7 +929,7 @@ impl ReplicationResyncer {
 }
 
 fn heal_should_use_check_replicate_delete(oi: &ObjectInfo) -> bool {
-    oi.delete_marker || (!oi.replication_status.is_empty() && oi.replication_status != ReplicationStatusType::Failed)
+    oi.delete_marker || !oi.version_purge_status.is_empty()
 }
 
 pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationConfig) -> ReplicateObjectInfo {
@@ -3742,7 +3742,7 @@ mod tests {
     }
 
     #[test]
-    fn test_heal_should_use_check_replicate_delete_pending_uses_delete_path() {
+    fn test_heal_should_use_check_replicate_delete_pending_non_delete_marker_uses_must_replicate_path() {
         let oi = ObjectInfo {
             bucket: "b".to_string(),
             name: "obj".to_string(),
@@ -3751,8 +3751,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            heal_should_use_check_replicate_delete(&oi),
-            "Pending (non-Failed) status with non-empty replication uses check_replicate_delete path"
+            !heal_should_use_check_replicate_delete(&oi),
+            "Pending non-delete-marker object must use must_replicate path to evaluate current target set"
         );
     }
 
@@ -3768,6 +3768,36 @@ mod tests {
         assert!(
             heal_should_use_check_replicate_delete(&oi),
             "Delete marker always uses check_replicate_delete path"
+        );
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_version_purge_status_uses_delete_path() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: false,
+            version_purge_status: VersionPurgeStatusType::Pending,
+            ..Default::default()
+        };
+        assert!(
+            heal_should_use_check_replicate_delete(&oi),
+            "Version purge entries must use check_replicate_delete path"
+        );
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_completed_non_delete_marker_uses_must_replicate_path() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+        assert!(
+            !heal_should_use_check_replicate_delete(&oi),
+            "Completed non-delete-marker object must use must_replicate path so new targets can be evaluated"
         );
     }
 
