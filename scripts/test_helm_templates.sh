@@ -23,6 +23,19 @@ render_standalone_deployment() {
     '
 }
 
+render_distributed_statefulset() {
+  helm template rustfs "$CHART_DIR" \
+    --namespace rustfs \
+    --set secret.rustfs.access_key=test-access-key \
+    --set secret.rustfs.secret_key=test-secret-key \
+    "$@" |
+    awk '
+      /^# Source: rustfs\/templates\/statefulset.yaml$/ { in_statefulset = 1 }
+      in_statefulset && /^---$/ { exit }
+      in_statefulset { print }
+    '
+}
+
 recreate_output=$(render_standalone_deployment --set mode.standalone.strategy.type=Recreate)
 grep -q "type: Recreate" <<<"$recreate_output"
 if grep -q "rollingUpdate:" <<<"$recreate_output"; then
@@ -116,5 +129,37 @@ helm template rustfs "$CHART_DIR" \
   >/dev/null 2>&1 || partial_empty_status=$?
 if [[ $partial_empty_status -eq 0 ]]; then
   echo "Partial-empty credentials (only access_key set) must fail rendering" >&2
+  exit 1
+fi
+
+# extraVolumes and extraVolumeMounts must appear in standalone Deployment.
+standalone_extra_output=$(render_standalone_deployment \
+  --set 'extraVolumes[0].name=ca-bundle' \
+  --set 'extraVolumes[0].configMap.name=ca-bundle' \
+  --set 'extraVolumeMounts[0].name=ca-bundle' \
+  --set 'extraVolumeMounts[0].mountPath=/etc/ssl/certs/ca.crt' \
+  --set 'extraVolumeMounts[0].subPath=ca.crt')
+if ! grep -q "ca-bundle" <<<"$standalone_extra_output"; then
+  echo "extraVolumes must render in standalone Deployment" >&2
+  exit 1
+fi
+if ! grep -q "/etc/ssl/certs/ca.crt" <<<"$standalone_extra_output"; then
+  echo "extraVolumeMounts must render in standalone Deployment" >&2
+  exit 1
+fi
+
+# extraVolumes and extraVolumeMounts must appear in distributed StatefulSet.
+distributed_extra_output=$(render_distributed_statefulset \
+  --set 'extraVolumes[0].name=ca-bundle' \
+  --set 'extraVolumes[0].configMap.name=ca-bundle' \
+  --set 'extraVolumeMounts[0].name=ca-bundle' \
+  --set 'extraVolumeMounts[0].mountPath=/etc/ssl/certs/ca.crt' \
+  --set 'extraVolumeMounts[0].subPath=ca.crt')
+if ! grep -q "ca-bundle" <<<"$distributed_extra_output"; then
+  echo "extraVolumes must render in distributed StatefulSet" >&2
+  exit 1
+fi
+if ! grep -q "/etc/ssl/certs/ca.crt" <<<"$distributed_extra_output"; then
+  echo "extraVolumeMounts must render in distributed StatefulSet" >&2
   exit 1
 fi
