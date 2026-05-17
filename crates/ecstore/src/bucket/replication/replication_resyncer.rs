@@ -943,10 +943,6 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
             oi.replication_status_internal = Some(format!("{}={};", rc.role, oi.replication_status.as_str()));
         }
 
-        if !oi.replication_status.is_empty() {
-            oi.replication_status_internal = Some(format!("{}={};", rc.role, oi.replication_status.as_str()));
-        }
-
         let keys_to_update: Vec<_> = user_defined
             .iter()
             .filter(|(k, _)| has_internal_suffix(k, SUFFIX_REPLICATION_RESET))
