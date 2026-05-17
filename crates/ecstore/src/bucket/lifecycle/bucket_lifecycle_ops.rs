@@ -97,6 +97,7 @@ const DEFAULT_TRANSITION_WORKERS_CAP: i64 = 16;
 const DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX: i64 = 32;
 const DEFAULT_TRANSITION_QUEUE_CAPACITY: usize = 1000;
 const DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS: usize = 100;
+const ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT: &str = "RUSTFS_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT";
 
 lazy_static! {
     pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
@@ -131,6 +132,12 @@ fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
         src,
         LcEventSrc::S3PutObject | LcEventSrc::S3CopyObject | LcEventSrc::S3CompleteMultipartUpload
     )
+}
+
+fn should_force_immediate_transition_enqueue_timeout() -> bool {
+    env::var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT)
+        .ok()
+        .is_some_and(|value| value == "1")
 }
 
 pub struct LifecycleSys;
@@ -644,6 +651,19 @@ impl TransitionState {
             event: event.clone(),
         };
         if is_immediate_transition_source(src) {
+            if should_force_immediate_transition_enqueue_timeout() {
+                self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
+                self.queue_send_timeout_tasks.fetch_add(1, Ordering::SeqCst);
+                let scheduled = self.schedule_bucket_compensation(&oi.bucket);
+                warn!(
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    source = ?src,
+                    compensation_scheduled = scheduled,
+                    "transition enqueue forced into timeout path for test fault injection"
+                );
+                return;
+            }
             let send_timeout = resolve_transition_queue_send_timeout();
             match tokio::time::timeout(send_timeout, self.transition_tx.send(Some(task))).await {
                 Ok(Ok(())) => {}

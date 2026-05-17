@@ -16,6 +16,7 @@ use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultO
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::storage::ecfs::FS;
 use bytes::Bytes;
+use futures::FutureExt;
 use futures::stream;
 use http::{Extensions, HeaderMap, Method, Uri};
 use rustfs_ecstore::{
@@ -43,7 +44,7 @@ use serial_test::serial;
 use std::{
     collections::HashMap,
     convert::Infallible,
-    fs as stdfs,
+    env, fs as stdfs,
     io::Cursor,
     path::PathBuf,
     sync::{Arc, Once, OnceLock},
@@ -58,6 +59,7 @@ use uuid::Uuid;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV: &str = "RUSTFS_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT";
 
 fn init_tracing() {
     INIT.call_once(|| {});
@@ -322,6 +324,30 @@ async fn wait_for_transition(
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[allow(unsafe_code)]
+async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let original = env::var_os(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV);
+    unsafe {
+        env::set_var(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV, "1");
+    }
+    let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+    match original {
+        Some(value) => unsafe {
+            env::set_var(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV, value);
+        },
+        None => unsafe {
+            env::remove_var(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV);
+        },
+    }
+    if let Err(err) = result {
+        std::panic::resume_unwind(err);
     }
 }
 
@@ -635,6 +661,37 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .map(|path| stdfs::canonicalize(path).unwrap().to_string_lossy().into_owned())
         .collect();
     assert_eq!(actual_paths, expected_paths);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn immediate_transition_timeout_eventually_completes_via_compensation() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let payload = b"transition compensation should eventually complete";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+    })
+    .await;
+
+    let info = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should eventually transition after compensation backfill");
+
+    assert_eq!(info.transitioned_object.status, "complete");
+    assert_eq!(info.transitioned_object.tier, tier_name);
+    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
