@@ -697,6 +697,116 @@ async fn immediate_transition_timeout_eventually_completes_via_compensation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "requires isolated global object layer state"]
+async fn compensation_driven_copy_still_completes_transition() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let src_bucket = format!("test-comp-copy-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let dst_bucket = format!("test-comp-copy-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let src_object = "test/source.txt";
+    let dst_object = "test/copied.txt";
+    let payload = b"copy object should still transition after compensation";
+
+    create_test_bucket(&ecstore, src_bucket.as_str()).await;
+    create_test_bucket(&ecstore, dst_bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(dst_bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set destination lifecycle configuration");
+    let _ = upload_test_object(&ecstore, src_bucket.as_str(), src_object, payload).await;
+
+    let copy_input = CopyObjectInput::builder()
+        .copy_source(CopySource::Bucket {
+            bucket: src_bucket.clone().into(),
+            key: src_object.to_string().into(),
+            version_id: None,
+        })
+        .bucket(dst_bucket.clone())
+        .key(dst_object.to_string())
+        .build()
+        .unwrap();
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
+            .await
+            .expect("Failed to copy object through usecase");
+    })
+    .await;
+
+    let info = wait_for_transition(&ecstore, dst_bucket.as_str(), dst_object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("copied object should eventually transition after compensation backfill");
+
+    assert_eq!(info.transitioned_object.status, "complete");
+    assert_eq!(info.transitioned_object.tier, tier_name);
+    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn compensation_driven_complete_multipart_upload_still_transitions() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultMultipartUsecase::without_context();
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-comp-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/multipart.txt";
+    let payload = b"multipart should still transition after compensation";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+
+    let upload = ecstore
+        .new_multipart_upload(bucket.as_str(), object, &ObjectOptions::default())
+        .await
+        .expect("Failed to create multipart upload");
+
+    let mut reader = PutObjReader::from_vec(payload.to_vec());
+    let uploaded_part = ecstore
+        .put_object_part(bucket.as_str(), object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+        .await
+        .expect("Failed to upload multipart part");
+
+    let complete_input = CompleteMultipartUploadInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .upload_id(upload.upload_id.clone())
+        .multipart_upload(Some(CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                part_number: Some(1),
+                e_tag: uploaded_part.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                ..Default::default()
+            }]),
+        }))
+        .build()
+        .unwrap();
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
+            .await
+            .expect("Failed to complete multipart upload through usecase");
+    })
+    .await;
+
+    let info = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("multipart object should eventually transition after compensation backfill");
+
+    assert_eq!(info.transitioned_object.status, "complete");
+    assert_eq!(info.transitioned_object.tier, tier_name);
+    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
 async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::without_context();
