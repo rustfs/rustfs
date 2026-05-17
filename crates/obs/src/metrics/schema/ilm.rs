@@ -53,6 +53,24 @@ pub static ILM_TRANSITION_MISSED_IMMEDIATE_TASKS_MD: LazyLock<MetricDescriptor> 
     )
 });
 
+pub static ILM_TRANSITION_QUEUE_FULL_TASKS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::IlmTransitionQueueFullTasks,
+        "Number of ILM transition tasks that could not enqueue because the queue was full or closed",
+        &[],
+        subsystems::ILM,
+    )
+});
+
+pub static ILM_TRANSITION_QUEUE_SEND_TIMEOUT_TASKS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::IlmTransitionQueueSendTimeoutTasks,
+        "Number of ILM transition tasks that timed out waiting for queue capacity",
+        &[],
+        subsystems::ILM,
+    )
+});
+
 pub static ILM_VERSIONS_SCANNED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::IlmVersionsScanned,

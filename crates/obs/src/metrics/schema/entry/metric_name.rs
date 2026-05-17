@@ -248,6 +248,8 @@ pub enum MetricName {
     IlmTransitionActiveTasks,
     IlmTransitionPendingTasks,
     IlmTransitionMissedImmediateTasks,
+    IlmTransitionQueueFullTasks,
+    IlmTransitionQueueSendTimeoutTasks,
     IlmVersionsScanned,
 
     // Copy the relevant metrics
@@ -584,6 +586,8 @@ impl MetricName {
             Self::IlmTransitionActiveTasks => "transition_active_tasks".to_string(),
             Self::IlmTransitionPendingTasks => "transition_pending_tasks".to_string(),
             Self::IlmTransitionMissedImmediateTasks => "transition_missed_immediate_tasks".to_string(),
+            Self::IlmTransitionQueueFullTasks => "transition_queue_full_tasks".to_string(),
+            Self::IlmTransitionQueueSendTimeoutTasks => "transition_queue_send_timeout_tasks".to_string(),
             Self::IlmVersionsScanned => "versions_scanned".to_string(),
 
             // Copy the relevant metrics

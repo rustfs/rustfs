@@ -95,6 +95,8 @@ const DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL: StdDuration = StdDuration::from_se
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const DEFAULT_TRANSITION_WORKERS_CAP: i64 = 16;
 const DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX: i64 = 32;
+const DEFAULT_TRANSITION_QUEUE_CAPACITY: usize = 1000;
+const DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS: usize = 100;
 
 lazy_static! {
     pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
@@ -112,6 +114,23 @@ fn resolve_transition_worker_count() -> (i64, i64, i64) {
     let absolute_max = get_env_i64("RUSTFS_ABSOLUTE_MAX_WORKERS", DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
     effective = std::cmp::min(effective, absolute_max);
     (configured, absolute_max, effective)
+}
+
+fn resolve_transition_queue_capacity() -> usize {
+    get_env_usize("RUSTFS_TRANSITION_QUEUE_CAPACITY", DEFAULT_TRANSITION_QUEUE_CAPACITY).max(1)
+}
+
+fn resolve_transition_queue_send_timeout() -> StdDuration {
+    StdDuration::from_millis(
+        get_env_usize("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS).max(1) as u64,
+    )
+}
+
+fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
+    matches!(
+        src,
+        LcEventSrc::S3PutObject | LcEventSrc::S3CopyObject | LcEventSrc::S3CompleteMultipartUpload
+    )
 }
 
 pub struct LifecycleSys;
@@ -554,13 +573,19 @@ pub struct TransitionState {
     kill_rx: A_Receiver<()>,
     active_tasks: AtomicI64,
     missed_immediate_tasks: AtomicI64,
+    queue_full_tasks: AtomicI64,
+    queue_send_timeout_tasks: AtomicI64,
     last_day_stats: Arc<Mutex<HashMap<String, LastDayTierStats>>>,
 }
 
 impl TransitionState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<Self> {
-        let (tx1, rx1) = bounded(1000);
+        Self::new_with_capacity(resolve_transition_queue_capacity())
+    }
+
+    fn new_with_capacity(capacity: usize) -> Arc<Self> {
+        let (tx1, rx1) = bounded(capacity);
         let (tx2, rx2) = bounded(1);
         Arc::new(Self {
             transition_tx: tx1,
@@ -570,6 +595,8 @@ impl TransitionState {
             kill_rx: rx2,
             active_tasks: AtomicI64::new(0),
             missed_immediate_tasks: AtomicI64::new(0),
+            queue_full_tasks: AtomicI64::new(0),
+            queue_send_timeout_tasks: AtomicI64::new(0),
             last_day_stats: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -580,26 +607,68 @@ impl TransitionState {
             src: src.clone(),
             event: event.clone(),
         };
-        select! {
-            //_ -> t.ctx.Done() => (),
-            _ = self.transition_tx.send(Some(task)) => (),
-            else => {
-                match src {
-                    LcEventSrc::S3PutObject | LcEventSrc::S3CopyObject | LcEventSrc::S3CompleteMultipartUpload => {
-                        self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
-                    }
-                    _ => ()
+        if is_immediate_transition_source(src) {
+            let send_timeout = resolve_transition_queue_send_timeout();
+            match tokio::time::timeout(send_timeout, self.transition_tx.send(Some(task))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
+                    self.queue_full_tasks.fetch_add(1, Ordering::SeqCst);
+                    warn!(
+                        bucket = %oi.bucket,
+                        object = %oi.name,
+                        source = ?src,
+                        timeout_ms = send_timeout.as_millis() as u64,
+                        "transition enqueue failed because the queue is closed"
+                    );
                 }
-            },
+                Err(_) => {
+                    self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
+                    self.queue_send_timeout_tasks.fetch_add(1, Ordering::SeqCst);
+                    warn!(
+                        bucket = %oi.bucket,
+                        object = %oi.name,
+                        source = ?src,
+                        timeout_ms = send_timeout.as_millis() as u64,
+                        "transition enqueue timed out under backpressure"
+                    );
+                }
+            }
+            return;
+        }
+
+        if let Err(err) = self.transition_tx.try_send(Some(task)) {
+            match err {
+                async_channel::TrySendError::Full(_) => {
+                    debug!(
+                        bucket = %oi.bucket,
+                        object = %oi.name,
+                        source = ?src,
+                        "transition queue is full; deferring to scanner/backfill"
+                    );
+                }
+                async_channel::TrySendError::Closed(_) => {
+                    warn!(
+                        bucket = %oi.bucket,
+                        object = %oi.name,
+                        source = ?src,
+                        "transition enqueue failed because the queue is closed"
+                    );
+                }
+            }
         }
     }
 
     pub async fn init(api: Arc<ECStore>) {
         let (configured, absolute_max, n) = resolve_transition_worker_count();
+        let queue_capacity = resolve_transition_queue_capacity();
+        let queue_send_timeout = resolve_transition_queue_send_timeout();
         info!(
             configured_transition_workers = configured,
             absolute_max_workers = absolute_max,
             effective_transition_workers = n,
+            transition_queue_capacity = queue_capacity,
+            transition_queue_send_timeout_ms = queue_send_timeout.as_millis() as u64,
             "transition worker count resolved"
         );
 
@@ -620,6 +689,14 @@ impl TransitionState {
 
     pub fn missed_immediate_tasks(&self) -> i64 {
         self.missed_immediate_tasks.load(Ordering::SeqCst)
+    }
+
+    pub fn queue_full_tasks(&self) -> i64 {
+        self.queue_full_tasks.load(Ordering::SeqCst)
+    }
+
+    pub fn queue_send_timeout_tasks(&self) -> i64 {
+        self.queue_send_timeout_tasks.load(Ordering::SeqCst)
     }
 
     pub async fn worker(api: Arc<ECStore>) {
@@ -2031,11 +2108,12 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 #[cfg(test)]
 mod tests {
     use super::{
-        DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX, DEFAULT_TRANSITION_WORKERS_CAP,
-        GLOBAL_TransitionState, StaleMultipartUploadCandidate, TransitionState, cleanup_empty_multipart_sha_dirs_on_local_disks,
-        cleanup_stale_multipart_uploads_once_at, lifecycle_deleted_object, lifecycle_rule_has_date_expiration,
-        lifecycle_version_purge_state_from_completed_targets, mark_delete_opts_skip_decommissioned_on_remote_success,
-        merge_stale_multipart_candidate, replication_state_for_delete, resolve_transition_worker_count,
+        DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
+        DEFAULT_TRANSITION_WORKERS_CAP, GLOBAL_TransitionState, StaleMultipartUploadCandidate, TransitionState,
+        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at, lifecycle_deleted_object,
+        lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
+        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
         should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
     };
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
@@ -2173,6 +2251,105 @@ mod tests {
         }
     }
 
+    #[allow(unsafe_code)]
+    fn with_transition_queue_env<F>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
+    where
+        F: FnOnce(),
+    {
+        let original_capacity = env::var_os("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+        let original_timeout = env::var_os("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+
+        match capacity {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_CAPACITY", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+            },
+        }
+        match timeout_ms {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+            },
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test_fn));
+
+        match original_capacity {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_CAPACITY", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+            },
+        }
+        match original_timeout {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[allow(unsafe_code)]
+    async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let original_capacity = env::var_os("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+        let original_timeout = env::var_os("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+
+        match capacity {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_CAPACITY", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+            },
+        }
+        match timeout_ms {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+            },
+        }
+
+        let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+
+        match original_capacity {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_CAPACITY", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+            },
+        }
+        match original_timeout {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
     #[test]
     fn lifecycle_rule_has_date_expiration_detects_enabled_date_rule() {
         let lc = BucketLifecycleConfiguration {
@@ -2248,6 +2425,30 @@ mod tests {
         });
     }
 
+    #[test]
+    #[serial]
+    fn resolve_transition_queue_capacity_uses_default_when_env_missing() {
+        with_transition_queue_env(None, None, || {
+            assert_eq!(resolve_transition_queue_capacity(), DEFAULT_TRANSITION_QUEUE_CAPACITY);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_queue_capacity_honors_positive_env_value() {
+        with_transition_queue_env(Some("128"), None, || {
+            assert_eq!(resolve_transition_queue_capacity(), 128);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_queue_send_timeout_honors_positive_env_value() {
+        with_transition_queue_env(None, Some("250"), || {
+            assert_eq!(resolve_transition_queue_send_timeout(), StdDuration::from_millis(250));
+        });
+    }
+
     #[tokio::test]
     #[serial]
     async fn transition_state_init_honors_runtime_configured_worker_count() {
@@ -2259,7 +2460,15 @@ mod tests {
         })
         .await;
 
-        TransitionState::update_workers(ecstore, original_workers).await;
+        let current_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
+        if original_workers > 0 {
+            TransitionState::update_workers(ecstore, original_workers).await;
+        } else {
+            for _ in 0..current_workers {
+                let _ = GLOBAL_TransitionState.kill_tx.send(()).await;
+                GLOBAL_TransitionState.num_workers.fetch_add(-1, Ordering::SeqCst);
+            }
+        }
     }
 
     #[test]

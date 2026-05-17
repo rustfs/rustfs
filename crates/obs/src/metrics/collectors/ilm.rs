@@ -36,6 +36,10 @@ pub struct IlmStats {
     pub transition_pending_tasks: u64,
     /// Number of missed immediate ILM transition tasks
     pub transition_missed_immediate_tasks: u64,
+    /// Number of ILM transition tasks rejected because the queue was full/closed
+    pub transition_queue_full_tasks: u64,
+    /// Number of ILM transition tasks that timed out waiting for queue capacity
+    pub transition_queue_send_timeout_tasks: u64,
     /// Total number of object versions scanned for ILM
     pub versions_scanned: u64,
 }
@@ -53,6 +57,11 @@ pub fn collect_ilm_metrics(stats: &IlmStats) -> Vec<PrometheusMetric> {
             &ILM_TRANSITION_MISSED_IMMEDIATE_TASKS_MD,
             stats.transition_missed_immediate_tasks as f64,
         ),
+        PrometheusMetric::from_descriptor(&ILM_TRANSITION_QUEUE_FULL_TASKS_MD, stats.transition_queue_full_tasks as f64),
+        PrometheusMetric::from_descriptor(
+            &ILM_TRANSITION_QUEUE_SEND_TIMEOUT_TASKS_MD,
+            stats.transition_queue_send_timeout_tasks as f64,
+        ),
         PrometheusMetric::from_descriptor(&ILM_VERSIONS_SCANNED_MD, stats.versions_scanned as f64),
     ]
 }
@@ -68,12 +77,14 @@ mod tests {
             transition_active_tasks: 5,
             transition_pending_tasks: 50,
             transition_missed_immediate_tasks: 10,
+            transition_queue_full_tasks: 2,
+            transition_queue_send_timeout_tasks: 3,
             versions_scanned: 1000000,
         };
 
         let metrics = collect_ilm_metrics(&stats);
 
-        assert_eq!(metrics.len(), 5);
+        assert_eq!(metrics.len(), 7);
 
         let pending = metrics.iter().find(|m| m.value == 100.0);
         assert!(pending.is_some());
@@ -87,7 +98,7 @@ mod tests {
         let stats = IlmStats::default();
         let metrics = collect_ilm_metrics(&stats);
 
-        assert_eq!(metrics.len(), 5);
+        assert_eq!(metrics.len(), 7);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());
