@@ -54,17 +54,29 @@ lazy_static::lazy_static! {
 }
 
 pub fn get_max_timeout_duration() -> Duration {
-    Duration::from_secs(rustfs_utils::get_env_u64(
-        rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION,
-        rustfs_config::DEFAULT_DRIVE_MAX_TIMEOUT_DURATION_SECS,
-    ))
+    let explicit = rustfs_utils::get_env_opt_u64(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION);
+    if let Some(v) = explicit {
+        return Duration::from_secs(v);
+    }
+    if network_mount_mode() {
+        return Duration::from_secs(rustfs_config::NETWORK_MOUNT_DRIVE_TIMEOUT_SECS);
+    }
+    Duration::from_secs(rustfs_config::DEFAULT_DRIVE_MAX_TIMEOUT_DURATION_SECS)
 }
 
 fn get_drive_timeout_duration(env_key: &str, default_secs: u64) -> Duration {
-    Duration::from_secs(
-        rustfs_utils::get_env_opt_u64_with_aliases(env_key, &[rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION])
-            .unwrap_or(default_secs),
-    )
+    let explicit = rustfs_utils::get_env_opt_u64_with_aliases(env_key, &[rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION]);
+    if let Some(v) = explicit {
+        return Duration::from_secs(v);
+    }
+    if network_mount_mode() {
+        return Duration::from_secs(rustfs_config::NETWORK_MOUNT_DRIVE_TIMEOUT_SECS);
+    }
+    Duration::from_secs(default_secs)
+}
+
+fn network_mount_mode() -> bool {
+    rustfs_utils::get_env_bool(rustfs_config::ENV_NETWORK_MOUNT_MODE, rustfs_config::DEFAULT_NETWORK_MOUNT_MODE)
 }
 
 pub fn get_drive_metadata_timeout() -> Duration {
@@ -596,6 +608,7 @@ impl LocalDiskWrapper {
                     )
                     .await
                     .is_err()
+                        && !network_mount_mode()
                         && health.mark_failure(&disk.endpoint(), "active_health_check_failed")
                     {
                         // Health check failed, disk is considered faulty
@@ -723,7 +736,9 @@ impl LocalDiskWrapper {
                             return;
                         }
                         Err(e) => {
-                            health.mark_failure(&disk.endpoint(), "recovery_probe_failed");
+                            if !network_mount_mode() {
+                                health.mark_failure(&disk.endpoint(), "recovery_probe_failed");
+                            }
                             warn!("Disk {} still faulty: {:?}", disk.to_string(), e);
                         }
                     }
@@ -846,9 +861,8 @@ impl LocalDiskWrapper {
                 operation_result
             }
             Err(_) => {
-                // Timeout occurred, mark disk as potentially faulty and decrement waiting counter
                 self.health.decrement_waiting();
-                if self.health.mark_failure(&self.endpoint(), "operation_timeout") {
+                if !network_mount_mode() && self.health.mark_failure(&self.endpoint(), "operation_timeout") {
                     self.spawn_recovery_monitor_if_needed();
                 }
                 counter!(
@@ -1338,5 +1352,73 @@ mod tests {
 
         assert!(health.mark_offline(&endpoint, "again"));
         assert!(health.is_faulty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn network_mount_mode_defaults_to_false() {
+        temp_env::with_var_unset(rustfs_config::ENV_NETWORK_MOUNT_MODE, || {
+            assert!(!network_mount_mode());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn network_mount_mode_respects_env_true() {
+        temp_env::with_var(rustfs_config::ENV_NETWORK_MOUNT_MODE, Some("true"), || {
+            assert!(network_mount_mode());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn network_mount_mode_overrides_drive_timeouts() {
+        temp_env::with_var(rustfs_config::ENV_NETWORK_MOUNT_MODE, Some("true"), || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                    assert_eq!(
+                        get_drive_metadata_timeout(),
+                        Duration::from_secs(rustfs_config::NETWORK_MOUNT_DRIVE_TIMEOUT_SECS)
+                    );
+                    assert_eq!(
+                        get_drive_walkdir_timeout(),
+                        Duration::from_secs(rustfs_config::NETWORK_MOUNT_DRIVE_TIMEOUT_SECS)
+                    );
+                    assert_eq!(
+                        get_drive_list_dir_timeout(),
+                        Duration::from_secs(rustfs_config::NETWORK_MOUNT_DRIVE_TIMEOUT_SECS)
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn network_mount_mode_explicit_override_takes_precedence() {
+        temp_env::with_var(rustfs_config::ENV_NETWORK_MOUNT_MODE, Some("true"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, Some("120"), || {
+                assert_eq!(get_drive_metadata_timeout(), Duration::from_secs(120));
+            });
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn network_mount_mode_skips_state_transition() {
+        temp_env::with_var(rustfs_config::ENV_NETWORK_MOUNT_MODE, Some("true"), || {
+            let endpoint = Endpoint::try_from("/tmp/runtime-state-no-transition").expect("endpoint should parse");
+            let health = DiskHealthTracker::new();
+
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!health.is_faulty());
+
+            if !network_mount_mode() {
+                health.mark_failure(&endpoint, "operation_timeout");
+            }
+
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!health.is_faulty());
+        });
     }
 }
