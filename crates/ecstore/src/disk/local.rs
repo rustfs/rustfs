@@ -3356,8 +3356,10 @@ mod test {
         const UUID_OBJ: &str = "db8b9b74-9016-4f9e-83e9-82a772947d28";
         const VER_ID_1: &str = "c683f9f8-c0a1-4bc5-8a67-0faafa839a1a";
         const VER_ID_2: &str = "a4b84f6e-c8ba-461b-8f9d-43feb0893efb";
+        const VER_ID_3: &str = "892c9ae7-2bb3-44ee-9a71-bc7ddf08d765";
         const BASE_DIR: &str = "dir1/obj/";
         const MULTIPART_DIR: &str = "multipart-file";
+        const DIR_IN_MULTIPART_DIR: &str = "dir-in-multipart";
         const EMPTY_STR: &str = "";
 
         let parse_uuid = |s: &str| Uuid::parse_str(s).unwrap();
@@ -3371,6 +3373,7 @@ mod test {
         let dir = tempdir().unwrap();
         let obj_base = dir.path().join("test-bucket").join(BASE_DIR);
         let multipart_base = obj_base.join(MULTIPART_DIR);
+        let dir_in_multipart_base = multipart_base.join(DIR_IN_MULTIPART_DIR);
 
         fs::create_dir_all(&multipart_base).await.unwrap();
         for uuid in &[UUID_MULTIPART_1, UUID_MULTIPART_2] {
@@ -3380,6 +3383,11 @@ mod test {
         fs::create_dir_all(obj_base.join(UUID_OBJ)).await.unwrap();
         fs::write(obj_base.join(UUID_OBJ).join("part.1"), b"part").await.unwrap();
 
+        fs::create_dir_all(&dir_in_multipart_base).await.unwrap();
+        fs::write(dir_in_multipart_base.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .unwrap();
+
         let mut fm = FileMeta::default();
         fm.add_version(create_file_info(VER_ID_1, UUID_MULTIPART_1)).unwrap();
         fm.add_version(create_file_info(VER_ID_2, UUID_MULTIPART_2)).unwrap();
@@ -3388,7 +3396,7 @@ mod test {
             .unwrap();
 
         let mut fm = FileMeta::default();
-        fm.add_version(create_file_info(VER_ID_1, UUID_OBJ)).unwrap();
+        fm.add_version(create_file_info(VER_ID_3, UUID_OBJ)).unwrap();
         fs::write(obj_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().unwrap())
             .await
             .unwrap();
@@ -3421,7 +3429,6 @@ mod test {
         let mut reader = MetacacheReader::new(reader);
         let entries = reader.read_all().await.unwrap();
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
-
         assert_eq!(
             names
                 .iter()
@@ -3433,6 +3440,20 @@ mod test {
             names
                 .iter()
                 .filter(|name| *name == &format!("{}{}/", BASE_DIR, MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}", BASE_DIR, MULTIPART_DIR, DIR_IN_MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}/", BASE_DIR, MULTIPART_DIR, DIR_IN_MULTIPART_DIR))
                 .count(),
             1
         );
@@ -3454,6 +3475,27 @@ mod test {
             names
                 .iter()
                 .filter(|name| *name == &format!("{}{}", BASE_DIR, UUID_OBJ))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}/", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_1))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}/", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_2))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/", BASE_DIR, UUID_OBJ))
                 .count(),
             0
         );
