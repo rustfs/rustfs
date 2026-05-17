@@ -145,22 +145,18 @@ fn validate_notification_filter_rules(
             return Err(s3_error!(InvalidArgument, "{}", invalid_filter_value_message(&cfg_scope, value)));
         }
 
-        match name.as_str() {
-            "prefix" => {
-                if has_prefix {
-                    return Err(s3_error!(InvalidArgument, "duplicate notification filter name 'prefix' ({cfg_scope})"));
-                }
-                has_prefix = true;
+        if name.as_str().eq_ignore_ascii_case("prefix") {
+            if has_prefix {
+                return Err(s3_error!(InvalidArgument, "duplicate notification filter name 'prefix' ({cfg_scope})"));
             }
-            "suffix" => {
-                if has_suffix {
-                    return Err(s3_error!(InvalidArgument, "duplicate notification filter name 'suffix' ({cfg_scope})"));
-                }
-                has_suffix = true;
+            has_prefix = true;
+        } else if name.as_str().eq_ignore_ascii_case("suffix") {
+            if has_suffix {
+                return Err(s3_error!(InvalidArgument, "duplicate notification filter name 'suffix' ({cfg_scope})"));
             }
-            other => {
-                return Err(s3_error!(InvalidArgument, "{}", invalid_filter_name_message(&cfg_scope, other)));
-            }
+            has_suffix = true;
+        } else {
+            return Err(s3_error!(InvalidArgument, "{}", invalid_filter_name_message(&cfg_scope, name.as_str())));
         }
     }
 
@@ -3047,7 +3043,7 @@ mod tests {
 
     #[test]
     fn validate_notification_configuration_filters_rejects_invalid_filter_name() {
-        let raw_name = "Prefix".repeat(100);
+        let raw_name = "unsupported".repeat(100);
         let cfg = NotificationConfiguration {
             queue_configurations: Some(vec![QueueConfiguration {
                 id: Some("q1".to_string()),
@@ -3070,6 +3066,34 @@ mod tests {
         let msg = err.message().unwrap_or_default();
         assert!(msg.contains("len="), "error message should include summarized length");
         assert!(!msg.contains(&raw_name), "error message should not echo full raw filter name");
+    }
+
+    #[test]
+    fn validate_notification_configuration_filters_accepts_case_insensitive_filter_names() {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(vec![QueueConfiguration {
+                id: Some("q1".to_string()),
+                queue_arn: "arn:rustfs:sqs:us-east-1:1:webhook".to_string(),
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                filter: Some(NotificationConfigurationFilter {
+                    key: Some(S3KeyFilter {
+                        filter_rules: Some(vec![
+                            FilterRule {
+                                name: Some(FilterRuleName::from("Prefix".to_string())),
+                                value: Some("uploads/".to_string()),
+                            },
+                            FilterRule {
+                                name: Some(FilterRuleName::from("Suffix".to_string())),
+                                value: Some(".csv".to_string()),
+                            },
+                        ]),
+                    }),
+                }),
+            }]),
+            ..Default::default()
+        };
+
+        validate_notification_configuration_filters(&cfg).expect("capitalized filter names should be accepted");
     }
 
     #[test]
@@ -3229,7 +3253,7 @@ mod tests {
                     filter: Some(NotificationConfigurationFilter {
                         key: Some(S3KeyFilter {
                             filter_rules: Some(vec![FilterRule {
-                                name: Some(FilterRuleName::from("Prefix".to_string())),
+                                name: Some(FilterRuleName::from("unsupported".to_string())),
                                 value: Some("uploads/".to_string()),
                             }]),
                         }),
