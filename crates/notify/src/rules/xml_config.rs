@@ -66,7 +66,7 @@ pub struct FilterRule {
 
 impl FilterRule {
     fn validate(&self) -> Result<(), ParseConfigError> {
-        if self.name != "prefix" && self.name != "suffix" {
+        if !self.name.eq_ignore_ascii_case("prefix") && !self.name.eq_ignore_ascii_case("suffix") {
             return Err(ParseConfigError::InvalidFilterName(self.name.clone()));
         }
         // ValidateFilterRuleValue from Go:
@@ -98,12 +98,12 @@ impl S3KeyFilter {
         let mut has_suffix = false;
         for rule in &self.filter_rule_list {
             rule.validate()?;
-            if rule.name == "prefix" {
+            if rule.name.eq_ignore_ascii_case("prefix") {
                 if has_prefix {
                     return Err(ParseConfigError::DuplicatePrefixFilter);
                 }
                 has_prefix = true;
-            } else if rule.name == "suffix" {
+            } else if rule.name.eq_ignore_ascii_case("suffix") {
                 if has_suffix {
                     return Err(ParseConfigError::DuplicateSuffixFilter);
                 }
@@ -126,9 +126,9 @@ impl S3KeyFilter {
         let mut suffix_val: Option<&str> = None;
 
         for rule in &self.filter_rule_list {
-            if rule.name == "prefix" {
+            if rule.name.eq_ignore_ascii_case("prefix") {
                 prefix_val = Some(&rule.value);
-            } else if rule.name == "suffix" {
+            } else if rule.name.eq_ignore_ascii_case("suffix") {
                 suffix_val = Some(&rule.value);
             }
         }
