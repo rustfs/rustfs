@@ -762,6 +762,15 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_default_policies_validate() {
+        for (name, policy) in default::DEFAULT_POLICIES.iter() {
+            policy
+                .validate()
+                .unwrap_or_else(|err| panic!("default policy {name} should validate: {err}"));
+        }
+    }
+
     #[tokio::test]
     async fn test_deny_only_checks_only_deny_statements() -> Result<()> {
         let data = r#"
