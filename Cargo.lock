@@ -5827,9 +5827,9 @@ dependencies = [
 
 [[package]]
 name = "libbz2-rs-sys"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8fc329e1457d97a9d58a4e2ca49e3be572431a7e096008efc2e3a3c19d428f4"
+checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"
@@ -6371,13 +6371,14 @@ dependencies = [
 
 [[package]]
 name = "ml-kem"
-version = "0.3.0-rc.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8198b5db27ac9773534c371751a59dc18aec8b80aa141e69abfdd1dec2e3f78c"
+checksum = "5e15f3e5b957493873e396a66914e83e616b6afe335cdef7efe5c6e1216aba66"
 dependencies = [
  "hybrid-array",
  "kem",
  "module-lattice",
+ "pkcs8 0.11.0",
  "rand_core 0.10.1",
  "sha3",
 ]
@@ -6415,9 +6416,9 @@ dependencies = [
 
 [[package]]
 name = "mqttbytes-core-next"
-version = "0.33.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2558e8a9dd1e9ad2e771384ed983216741f60e21e5974b43b41f9980bff3e3d7"
+checksum = "199b7cddf2d1bba6248d9dbaf1e58c91cd3ab05f52559b566c9d75ff303f887b"
 dependencies = [
  "bytes",
  "thiserror 2.0.18",
@@ -7331,7 +7332,7 @@ dependencies = [
 [[package]]
 name = "pageant"
 version = "0.2.0"
-source = "git+https://github.com/simon-escapecode/russh?rev=5cac2ed84945f9b80a52b673e058f2032bbe98ec#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
+source = "git+https://github.com/Eugeny/russh?rev=32fd46f100e011acf4cde467aea147fec5f2a107#32fd46f100e011acf4cde467aea147fec5f2a107"
 dependencies = [
  "byteorder",
  "bytes",
@@ -8401,9 +8402,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.40.0"
+version = "0.40.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b7315c86b26aaef0321fba33c9dcc160da659c6a9d278f0f6a5656d6561c03b"
+checksum = "2474bd2e5029e7ccb6abb2ba48cf2383a333851dedf495901544281590c7da7f"
 dependencies = [
  "encoding_rs",
  "memchr",
@@ -9017,9 +9018,9 @@ dependencies = [
 
 [[package]]
 name = "rumqttc-core-next"
-version = "0.33.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8a93655cd2d9d3faf7e039caa4eb39d9f4b49c336ade913c92655031c9fca71"
+checksum = "660f3b3e2dc9e138e53c4db7f0ec42fe3386c751ccdff2fbd1d075a4149254cd"
 dependencies = [
  "async-tungstenite",
  "futures-io",
@@ -9035,18 +9036,18 @@ dependencies = [
 
 [[package]]
 name = "rumqttc-next"
-version = "0.33.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b6cd37028e449ffb206a1ddc60086a1a5bac578b45be91b487dccb47a930334"
+checksum = "e101c834b5ad0c5c82c5bcc7ac0b0dca70baba92fe7b903f441b87bef1f45387"
 dependencies = [
  "rumqttc-v5-next",
 ]
 
 [[package]]
 name = "rumqttc-v5-next"
-version = "0.33.0"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "796245ad9ebd2b301ed20263ccf0ee430b6bc511b3ece7f815288a72d393e763"
+checksum = "d965c65b95e12ed1cb564c2fa5fd70e3f3885b812f7429de6e5ff22f090e27f1"
 dependencies = [
  "async-tungstenite",
  "bytes",
@@ -9069,8 +9070,8 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.60.2"
-source = "git+https://github.com/simon-escapecode/russh?rev=5cac2ed84945f9b80a52b673e058f2032bbe98ec#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
+version = "0.60.3"
+source = "git+https://github.com/Eugeny/russh?rev=32fd46f100e011acf4cde467aea147fec5f2a107#32fd46f100e011acf4cde467aea147fec5f2a107"
 dependencies = [
  "aead 0.6.0-rc.10",
  "aes 0.8.4",
@@ -9150,8 +9151,8 @@ dependencies = [
 
 [[package]]
 name = "russh-cryptovec"
-version = "0.59.0"
-source = "git+https://github.com/simon-escapecode/russh?rev=5cac2ed84945f9b80a52b673e058f2032bbe98ec#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
+version = "0.60.3"
+source = "git+https://github.com/Eugeny/russh?rev=32fd46f100e011acf4cde467aea147fec5f2a107#32fd46f100e011acf4cde467aea147fec5f2a107"
 dependencies = [
  "log",
  "nix 0.31.3",
@@ -9180,7 +9181,7 @@ dependencies = [
 [[package]]
 name = "russh-util"
 version = "0.52.0"
-source = "git+https://github.com/simon-escapecode/russh?rev=5cac2ed84945f9b80a52b673e058f2032bbe98ec#5cac2ed84945f9b80a52b673e058f2032bbe98ec"
+source = "git+https://github.com/Eugeny/russh?rev=32fd46f100e011acf4cde467aea147fec5f2a107#32fd46f100e011acf4cde467aea147fec5f2a107"
 dependencies = [
  "chrono",
  "tokio",
@@ -9543,7 +9544,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "path-absolutize",
  "pin-project-lite",
- "quick-xml 0.40.0",
+ "quick-xml 0.40.1",
  "rand 0.10.1",
  "ratelimit",
  "reed-solomon-erasure",
@@ -9856,7 +9857,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "metrics",
  "percent-encoding",
- "quick-xml 0.40.0",
+ "quick-xml 0.40.1",
  "rayon",
  "rustc-hash",
  "rustfs-config",
@@ -9992,7 +9993,7 @@ dependencies = [
  "md5 0.8.0",
  "percent-encoding",
  "proptest",
- "quick-xml 0.40.0",
+ "quick-xml 0.40.1",
  "rcgen",
  "regex",
  "russh",
@@ -11550,9 +11551,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.39.1"
+version = "0.39.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4deba334e1190ba7cb498327affa11e5ece10d26a30ab2f27fcf09504b8d8b6"
+checksum = "14311e7e9a03114cd4b65eedd54e8fed2945e17f08586ae97ef53bc0669f9581"
 dependencies = [
  "libc",
  "memchr",

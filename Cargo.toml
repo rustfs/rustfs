@@ -154,7 +154,7 @@ byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.3"
-quick-xml = "0.40.0"
+quick-xml = "0.40.1"
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -254,7 +254,7 @@ rayon = "1.12.0"
 reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.3" }
-rumqttc = { package = "rumqttc-next", version = "0.33.0", features = ["websocket"] }
+rumqttc = { package = "rumqttc-next", version = "0.33.1", features = ["websocket"] }
 redis = { version = "1.2.1", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
@@ -269,7 +269,7 @@ snafu = "0.9.0"
 snap = "1.1.1"
 starshard = { version = "2.2.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }
-sysinfo = "0.39.1"
+sysinfo = "0.39.2"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.3.1"
@@ -307,7 +307,7 @@ libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
-russh = "0.60.2"
+russh = { version = "0.60.3",git = "https://github.com/Eugeny/russh",rev = "32fd46f100e011acf4cde467aea147fec5f2a107" }
 russh-sftp = "2.1.2"
 
 # WebDAV
@@ -329,11 +329,11 @@ pprof = { package = "pprof-pyroscope-fork", version = "0.1500.4", features = ["f
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs"]
 
-[patch.crates-io]
-# Pinned to the simon-escapecode/russh fork carrying the upstream fix at
-# https://github.com/Eugeny/russh/pull/702. Drops out when a russh release
-# containing the fix is published.
-russh = { git = "https://github.com/simon-escapecode/russh", rev = "5cac2ed84945f9b80a52b673e058f2032bbe98ec" }
+#[patch.crates-io]
+## Pinned to the simon-escapecode/russh fork carrying the upstream fix at
+## https://github.com/Eugeny/russh/pull/702. Drops out when a russh release
+## containing the fix is published.
+#russh = { git = "https://github.com/simon-escapecode/russh", rev = "5cac2ed84945f9b80a52b673e058f2032bbe98ec" }
 
 [profile.release]
 opt-level = 3
