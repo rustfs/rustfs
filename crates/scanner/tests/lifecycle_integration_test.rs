@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::FutureExt;
 use rustfs_ecstore::{
     bucket::lifecycle::lifecycle::TransitionOptions,
     bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
@@ -41,6 +42,7 @@ use s3s::dto::RestoreRequest;
 use serial_test::serial;
 use std::{
     collections::HashMap,
+    env,
     io::Cursor,
     path::{Path, PathBuf},
     sync::{Arc, Once, OnceLock},
@@ -56,6 +58,7 @@ use uuid::Uuid;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV: &str = "RUSTFS_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT";
 
 fn init_tracing() {
     INIT.call_once(|| {
@@ -754,6 +757,30 @@ async fn wait_for_transition(
     }
 }
 
+#[allow(unsafe_code)]
+async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let original = env::var_os(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV);
+    unsafe {
+        env::set_var(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV, "1");
+    }
+    let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+    match original {
+        Some(value) => unsafe {
+            env::set_var(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV, value);
+        },
+        None => unsafe {
+            env::remove_var(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV);
+        },
+    }
+    if let Err(err) = result {
+        std::panic::resume_unwind(err);
+    }
+}
+
 mod serial_tests {
     use super::*;
 
@@ -1214,6 +1241,63 @@ mod serial_tests {
         assert!(
             wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(1)).await,
             "deleted object should remain absent after scanner cleanup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_scanner_cleanup_still_works_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-scanner-after-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"scanner cleanup should still work after immediate compensation";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition after compensation backfill");
+        let stale_remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.objects.lock().await.contains_key(&stale_remote_object));
+
+        ecstore
+            .delete_object(bucket_name.as_str(), object_name, ObjectOptions::default())
+            .await
+            .expect("Failed to delete transitioned object after compensation-driven transition");
+
+        assert!(
+            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await > 0,
+            "deleting a compensation-transitioned null version should leave a free version for async cleanup"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&stale_remote_object),
+            "stale transitioned remote object should still exist before scanner cleanup runs"
+        );
+
+        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_remote_absence(&backend, &stale_remote_object, TRANSITION_WAIT_TIMEOUT).await,
+            "scanner should clean stale remote object even after immediate compensation transitioned it"
+        );
+        assert_eq!(
+            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await,
+            0,
+            "free-version metadata should be removed after scanner cleanup"
         );
     }
 
