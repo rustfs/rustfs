@@ -16,15 +16,15 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
-    store::{Key, QueueStore, Store},
+    store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, delete_stored_payload, queue_store_subdir_name,
+        TargetType, build_queued_payload, delete_stored_payload, is_connectivity_error, open_target_queue_store,
+        persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, prelude::Queryable};
-use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use rustfs_config::{MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -494,25 +494,14 @@ where
 
         let target_id = TargetID::new(id, ChannelTargetType::MySql.as_str().to_string());
 
-        // If `queue_dir` is non-empty, a `QueueStore` is created for persistent at-least-once delivery.
-        let queue_store = if !args.queue_dir.is_empty() {
-            let queue_dir =
-                PathBuf::from(&args.queue_dir).join(queue_store_subdir_name(ChannelTargetType::MySql.as_str(), &target_id.id));
-
-            let extension = match args.target_type {
-                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => NOTIFY_STORE_EXTENSION,
-            };
-
-            let store = QueueStore::<QueuedPayload>::new(queue_dir, args.queue_limit, extension);
-            if let Err(e) = store.open() {
-                return Err(TargetError::Storage(format!("Failed to open MySQL queue store: {e}")));
-            }
-
-            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
-        } else {
-            None
-        };
+        let queue_store = open_target_queue_store(
+            &args.queue_dir,
+            args.queue_limit,
+            args.target_type,
+            ChannelTargetType::MySql.as_str(),
+            &target_id,
+            "Failed to open MySQL queue store",
+        )?;
 
         info!(target_id = %target_id.id, table = %args.table, "MySQL target created");
 
@@ -733,18 +722,9 @@ where
         };
 
         if let Some(store) = &self.store {
-            // persist the event to a local queue before attempting to insert into MySQL. This will allow us to guarantee at-least-once delivery even if the database is temporarily unreachable or if the process crashes after acknowledging receipt but before writing to the database.
-            let encoded = match queued.encode() {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    self.delivery_counters.record_final_failure();
-                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
-                }
-            };
-
-            if let Err(e) = store.put_raw(&encoded) {
+            if let Err(e) = persist_queued_payload_to_store(store.as_ref(), &queued) {
                 self.delivery_counters.record_final_failure();
-                return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+                return Err(e);
             }
 
             debug!("Event saved to queue store for MySQL target: {}", self.id);
@@ -789,12 +769,8 @@ where
         }
 
         if let Err(e) = self.insert_event(&body, &meta).await {
-            if matches!(e, TargetError::NotConnected) {
+            if is_connectivity_error(&e) {
                 warn!(target_id = %self.id, "MySQL not reachable, event remains in queue store");
-                return Err(TargetError::NotConnected);
-            }
-            if matches!(e, TargetError::Timeout(_)) {
-                warn!(target_id = %self.id, "MySQL timeout, event remains in queue store");
                 return Err(e);
             }
             error!(target_id = %self.id, error = %e, "Failed to send event from store");
@@ -855,6 +831,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn absolute_test_path(path: &str) -> String {
+        std::env::temp_dir().join(path).to_string_lossy().into_owned()
+    }
 
     #[test]
     fn parse_dsn_format() {
@@ -1213,10 +1193,10 @@ mod tests {
             dsn_string: "rustfs:password@tcp(127.0.0.1:3306)/db".to_string(),
             table: "events".to_string(),
             format: "access".to_string(),
-            tls_ca: "/etc/ssl/mysql/ca.pem".to_string(),
-            tls_client_cert: "/etc/ssl/mysql/client.pem".to_string(),
-            tls_client_key: "/etc/ssl/mysql/client.key".to_string(),
-            queue_dir: "/tmp".to_string(),
+            tls_ca: absolute_test_path("mysql-ca.pem"),
+            tls_client_cert: absolute_test_path("mysql-client.pem"),
+            tls_client_key: absolute_test_path("mysql-client.key"),
+            queue_dir: absolute_test_path("mysql-queue"),
             queue_limit: 100,
             max_open_connections: 2,
             target_type: TargetType::NotifyEvent,

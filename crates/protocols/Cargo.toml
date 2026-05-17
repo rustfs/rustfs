@@ -128,6 +128,7 @@ socket2 = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = "1"
+rcgen = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [package.metadata.docs.rs]

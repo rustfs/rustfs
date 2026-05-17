@@ -1,4 +1,4 @@
-[![RustFS](https://github.com/user-attachments/assets/1b5afcd6-a2c3-47ff-8bc3-ce882b0ddca7)](https://rustfs.com.cn)
+[![RustFS](https://repository-images.githubusercontent.com/722597620/0fa936a2-8164-4f53-867f-def4beb64b21)](https://rustfs.com.cn)
 
 <p align="center">RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。</p>
 
@@ -113,7 +113,7 @@ RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 
  docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
  # 使用指定版本运行
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:v1.0.0-beta.1
+ docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.3
 ```
 
 您也可以使用 Docker Compose。使用根目录下的 `docker-compose.yml` 文件：

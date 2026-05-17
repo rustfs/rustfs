@@ -60,7 +60,7 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
 rust-version = "1.95.0"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
 keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
@@ -77,43 +77,42 @@ redundant_clone = "warn"
 
 [workspace.dependencies]
 # RustFS Internal Crates
-rustfs = { path = "./rustfs", version = "1.0.0-beta.2" }
-rustfs-heal = { path = "crates/heal", version = "1.0.0-beta.2" }
-rustfs-appauth = { path = "crates/appauth", version = "1.0.0-beta.2" }
-rustfs-audit = { path = "crates/audit", version = "1.0.0-beta.2" }
-rustfs-checksums = { path = "crates/checksums", version = "1.0.0-beta.2" }
-rustfs-common = { path = "crates/common", version = "1.0.0-beta.2" }
-rustfs-config = { path = "./crates/config", version = "1.0.0-beta.2" }
-rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.0-beta.2" }
-rustfs-credentials = { path = "crates/credentials", version = "1.0.0-beta.2" }
-rustfs-crypto = { path = "crates/crypto", version = "1.0.0-beta.2" }
-rustfs-ecstore = { path = "crates/ecstore", version = "1.0.0-beta.2" }
-rustfs-filemeta = { path = "crates/filemeta", version = "1.0.0-beta.2" }
-rustfs-iam = { path = "crates/iam", version = "1.0.0-beta.2" }
-rustfs-keystone = { path = "crates/keystone", version = "1.0.0-beta.2" }
-rustfs-kms = { path = "crates/kms", version = "1.0.0-beta.2" }
-rustfs-lock = { path = "crates/lock", version = "1.0.0-beta.2" }
-rustfs-madmin = { path = "crates/madmin", version = "1.0.0-beta.2" }
-rustfs-notify = { path = "crates/notify", version = "1.0.0-beta.2" }
-rustfs-io-metrics = { path = "crates/io-metrics", version = "1.0.0-beta.2" }
-rustfs-io-core = { path = "crates/io-core", version = "1.0.0-beta.2" }
-rustfs-object-capacity = { path = "crates/object-capacity", version = "1.0.0-beta.2" }
-rustfs-obs = { path = "crates/obs", version = "1.0.0-beta.2" }
-rustfs-policy = { path = "crates/policy", version = "1.0.0-beta.2" }
-rustfs-protos = { path = "crates/protos", version = "1.0.0-beta.2" }
-rustfs-protocols = { path = "crates/protocols", version = "1.0.0-beta.2" }
-rustfs-rio = { path = "crates/rio", version = "1.0.0-beta.2" }
-rustfs-rio-v2 = { path = "crates/rio-v2", version = "1.0.0-beta.2" }
-rustfs-s3-common = { path = "crates/s3-common", version = "1.0.0-beta.2" }
-rustfs-s3select-api = { path = "crates/s3select-api", version = "1.0.0-beta.2" }
-rustfs-s3select-query = { path = "crates/s3select-query", version = "1.0.0-beta.2" }
-rustfs-scanner = { path = "crates/scanner", version = "1.0.0-beta.2" }
-rustfs-signer = { path = "crates/signer", version = "1.0.0-beta.2" }
-rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-beta.2" }
-rustfs-targets = { path = "crates/targets", version = "1.0.0-beta.2" }
-rustfs-utils = { path = "crates/utils", version = "1.0.0-beta.2" }
-rustfs-workers = { path = "crates/workers", version = "1.0.0-beta.2" }
-rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.2" }
+rustfs = { path = "./rustfs", version = "1.0.0-beta.3" }
+rustfs-heal = { path = "crates/heal", version = "1.0.0-beta.3" }
+rustfs-appauth = { path = "crates/appauth", version = "1.0.0-beta.3" }
+rustfs-audit = { path = "crates/audit", version = "1.0.0-beta.3" }
+rustfs-checksums = { path = "crates/checksums", version = "1.0.0-beta.3" }
+rustfs-common = { path = "crates/common", version = "1.0.0-beta.3" }
+rustfs-config = { path = "./crates/config", version = "1.0.0-beta.3" }
+rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.0-beta.3" }
+rustfs-credentials = { path = "crates/credentials", version = "1.0.0-beta.3" }
+rustfs-crypto = { path = "crates/crypto", version = "1.0.0-beta.3" }
+rustfs-ecstore = { path = "crates/ecstore", version = "1.0.0-beta.3" }
+rustfs-filemeta = { path = "crates/filemeta", version = "1.0.0-beta.3" }
+rustfs-iam = { path = "crates/iam", version = "1.0.0-beta.3" }
+rustfs-keystone = { path = "crates/keystone", version = "1.0.0-beta.3" }
+rustfs-kms = { path = "crates/kms", version = "1.0.0-beta.3" }
+rustfs-lock = { path = "crates/lock", version = "1.0.0-beta.3" }
+rustfs-madmin = { path = "crates/madmin", version = "1.0.0-beta.3" }
+rustfs-notify = { path = "crates/notify", version = "1.0.0-beta.3" }
+rustfs-io-metrics = { path = "crates/io-metrics", version = "1.0.0-beta.3" }
+rustfs-io-core = { path = "crates/io-core", version = "1.0.0-beta.3" }
+rustfs-object-capacity = { path = "crates/object-capacity", version = "1.0.0-beta.3" }
+rustfs-obs = { path = "crates/obs", version = "1.0.0-beta.3" }
+rustfs-policy = { path = "crates/policy", version = "1.0.0-beta.3" }
+rustfs-protos = { path = "crates/protos", version = "1.0.0-beta.3" }
+rustfs-protocols = { path = "crates/protocols", version = "1.0.0-beta.3" }
+rustfs-rio = { path = "crates/rio", version = "1.0.0-beta.3" }
+rustfs-s3-common = { path = "crates/s3-common", version = "1.0.0-beta.3" }
+rustfs-s3select-api = { path = "crates/s3select-api", version = "1.0.0-beta.3" }
+rustfs-s3select-query = { path = "crates/s3select-query", version = "1.0.0-beta.3" }
+rustfs-scanner = { path = "crates/scanner", version = "1.0.0-beta.3" }
+rustfs-signer = { path = "crates/signer", version = "1.0.0-beta.3" }
+rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-beta.3" }
+rustfs-targets = { path = "crates/targets", version = "1.0.0-beta.3" }
+rustfs-utils = { path = "crates/utils", version = "1.0.0-beta.3" }
+rustfs-workers = { path = "crates/workers", version = "1.0.0-beta.3" }
+rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.3" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
@@ -128,7 +127,7 @@ futures-core = "0.3.32"
 futures-util = "0.3.32"
 pollster = "0.4.0"
 pulsar = { version = "6.7.2", default-features = false, features = ["tokio-rustls-runtime"] }
-lapin = { version = "4.7.2", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
+lapin = { version = "4.7.4", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 hyper = { version = "1.9.0", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "server-graceful", "tracing"] }
@@ -156,7 +155,7 @@ byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.3"
-quick-xml = "0.39.4"
+quick-xml = "0.40.0"
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -170,7 +169,7 @@ blake2 = "0.11.0-rc.6"
 chacha20poly1305 = { version = "0.11.0-rc.3" }
 crc-fast = "1.9.0"
 hmac = { version = "0.13.0" }
-jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
 openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0"
 rsa = { version = "0.10.0-rc.18" }
@@ -269,9 +268,9 @@ smallvec = { version = "1.15.1", features = ["serde"] }
 smartstring = "1.0.1"
 snafu = "0.9.0"
 snap = "1.1.1"
-starshard = { version = "1.1.0", features = ["rayon", "async", "serde"] }
+starshard = { version = "2.2.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }
-sysinfo = "0.39.0"
+sysinfo = "0.39.1"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.3.1"
@@ -294,7 +293,7 @@ zip = "8.6.0"
 zstd = "0.13.3"
 
 # Observability and Metrics
-metrics = "0.24.5"
+metrics = "0.24.6"
 dial9-tokio-telemetry = "0.3"
 opentelemetry = { version = "0.31.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
@@ -308,7 +307,7 @@ pyroscope = { version = "2.0.3", features = ["backend-pprof-rs"] }
 libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
-rcgen = "0.14.7"
+rcgen = "0.14.8"
 russh = "0.60.2"
 russh-sftp = "2.1.2"
 
@@ -326,7 +325,7 @@ jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 # pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 # Pyroscope uses a patched pprof, until they merge back upstream, replace all references. Otherwise, two pprof libs with symbol collision.
-pprof = { package = "pprof-pyroscope-fork", version = "0.1500.3", features = ["flamegraph", "protobuf-codec"] }
+pprof = { package = "pprof-pyroscope-fork", version = "0.1500.4", features = ["flamegraph", "protobuf-codec"] }
 
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs"]

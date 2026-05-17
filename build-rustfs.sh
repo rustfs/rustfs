@@ -217,7 +217,7 @@ setup_rust_environment() {
     # Set up environment variables for musl targets
     if [[ "$PLATFORM" == *"musl"* ]]; then
         print_message $YELLOW "Setting up environment for musl target..."
-        export RUSTFLAGS="'--cfg tokio_unstable -C target-feature=-crt-static'"
+        export RUSTFLAGS="--cfg tokio_unstable -C target-feature=-crt-static"
 
         # For cargo-zigbuild, set up additional environment variables
         if command -v cargo-zigbuild &> /dev/null; then

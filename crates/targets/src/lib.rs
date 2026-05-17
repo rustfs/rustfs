@@ -13,10 +13,15 @@
 // limitations under the License.
 
 pub mod arn;
+pub mod catalog;
 mod check;
 pub mod config;
+pub mod control_plane;
+pub mod domain;
 pub mod error;
+pub mod manifest;
 pub mod plugin;
+pub mod runtime;
 pub mod store;
 pub mod sys;
 pub mod target;
@@ -26,8 +31,36 @@ pub use check::{
     check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
     check_redis_server_available,
 };
+pub use config::{
+    LegacyTargetInstanceDescriptor, TargetInstanceSourceClass, TargetInstanceSourceHints, TargetPluginInstance,
+    TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, normalize_legacy_target_instances,
+    normalize_legacy_target_instances_from_env, normalize_target_plugin_instances, normalize_target_plugin_instances_from_env,
+};
+pub use control_plane::{
+    TargetPluginEnableState, TargetPluginInstallState, TargetPluginInstallation, TargetPluginOperationalState,
+    TargetPluginRevision, TargetPluginRuntimeState, builtin_target_plugin_installation, builtin_target_plugin_operational_state,
+    external_target_plugin_installation, rollback_target_plugin_installation, runtime_state_from_status_label,
+};
+pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};
-pub use plugin::{BuiltinTargetDescriptor, TargetPluginDescriptor, TargetPluginRegistry, TargetRequestValidator, boxed_target};
+pub use manifest::{
+    TargetPluginArtifactManifest, TargetPluginDistributionManifest, TargetPluginEntrypointKind,
+    TargetPluginExternalRuntimeContract, TargetPluginManifest, TargetPluginMarketplaceManifest, TargetPluginPackaging,
+    TargetPluginRuntimeTransport, builtin_target_marketplace_manifest, installable_target_marketplace_manifest,
+};
+pub use plugin::{
+    BuiltinTargetAdminDescriptor, BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetPluginRegistry,
+    TargetRequestValidator, boxed_target,
+};
+pub use runtime::{
+    ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeStatusSnapshot, RuntimeTargetHealthSnapshot,
+    RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager, activate_targets_with_replay,
+    adapter::{BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter},
+    init_target_and_optionally_start_replay,
+    sidecar::SidecarPluginRuntime,
+    sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability},
+    start_replay_worker,
+};
 pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};
 pub use sys::user_agent::*;

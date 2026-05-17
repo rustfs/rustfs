@@ -113,8 +113,8 @@ process_data_volumes
 process_log_directory
 
 # 4) Default credentials warning
-if [ "${RUSTFS_ACCESS_KEY}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY}" = "rustfsadmin" ]; then
-  echo "!!!WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY. Override them in production!"
+if [ "${RUSTFS_ACCESS_KEY:-}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY:-}" = "rustfsadmin" ]; then
+  echo "!!!WARNING: Default credentials are only allowed on loopback or with explicit insecure local-dev opt-in."
 fi
 
 # 5) Append DATA_VOLUMES only if no data paths in arguments

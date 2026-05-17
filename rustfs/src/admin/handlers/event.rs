@@ -14,12 +14,12 @@
 
 use crate::admin::{
     auth::validate_admin_request,
+    handlers::notify_runtime_access::{get_notification_system, load_notification_config_snapshot},
     handlers::target_descriptor::{
-        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, allowed_target_keys,
-        build_json_response, collect_validated_key_values as shared_collect_validated_key_values,
+        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
+        build_json_response, collect_runtime_statuses, extract_supported_target_params,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
-        target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
-        validate_target_request,
+        target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     router::{AdminOperation, Operation, S3Router},
 };
@@ -28,22 +28,18 @@ use crate::server::{
     ADMIN_PREFIX, RemoteAddr, is_notify_module_enabled, refresh_notify_module_enabled,
     refresh_persisted_module_switches_from_store,
 };
-use futures::stream::{FuturesUnordered, StreamExt};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
-use rustfs_config::{ENABLE_KEY, EVENT_DEFAULT_DIR, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::{EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::Config;
-use rustfs_notify::factory::builtin_target_descriptors as builtin_notification_target_descriptors;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_targets::catalog::builtin::builtin_notify_target_admin_descriptors;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::LazyLock;
-use tokio::sync::Semaphore;
-use tokio::time::{Duration, timeout};
 use tracing::{Span, info, warn};
 
 pub fn register_notification_target_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -99,7 +95,7 @@ struct NotificationEndpointsResponse {
 }
 
 static NOTIFICATION_TARGET_SPECS: LazyLock<Vec<AdminTargetSpec>> = LazyLock::new(|| {
-    builtin_notification_target_descriptors()
+    builtin_notify_target_admin_descriptors()
         .into_iter()
         .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
         .collect()
@@ -119,10 +115,6 @@ async fn authorize_notification_admin_request(req: &S3Request<Body>, action: Adm
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
-}
-
-fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {
-    rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))
 }
 
 fn target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
@@ -180,8 +172,7 @@ impl Operation for NotificationTarget {
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
-        let ns = get_notification_system()?;
-        let config_snapshot = ns.config.read().await.clone();
+        let (ns, config_snapshot) = load_notification_config_snapshot().await?;
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
@@ -196,28 +187,17 @@ impl Operation for NotificationTarget {
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for target config: {}", e))?;
 
         let specs = notification_target_specs();
-        let allowed_keys: HashSet<&str> = allowed_target_keys(specs, target_type);
-
-        let kv_map = shared_collect_validated_key_values(
+        let kvs = build_enabled_target_kvs(
+            specs,
             notification_body
                 .key_values
                 .iter()
                 .map(|kv| (kv.key.as_str(), kv.value.as_str())),
-            &allowed_keys,
             target_type,
+            EVENT_DEFAULT_DIR,
             "target",
-        )?;
-        let spec = target_spec(specs, target_type)
-            .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
-        timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, EVENT_DEFAULT_DIR))
-            .await
-            .map_err(|_| s3_error!(InvalidArgument, "target validation timed out"))??;
-
-        let mut kvs = rustfs_ecstore::config::KVS::new();
-        for (key, value) in kv_map {
-            kvs.insert(key, value);
-        }
-        kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        )
+        .await?;
 
         info!("Setting target config for type '{}', name '{}'", target_type, target_name);
         ns.set_target_config(target_type, target_name, kvs)
@@ -235,29 +215,8 @@ impl Operation for ListNotificationTargets {
         let span = Span::current();
         let _enter = span.enter();
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
-        let ns = get_notification_system()?;
-
-        let targets = ns.get_target_values().await;
-        let semaphore = Arc::new(Semaphore::new(10));
-        let mut futures = FuturesUnordered::new();
-
-        for target in targets {
-            let sem = Arc::clone(&semaphore);
-            futures.push(async move {
-                let _permit = sem.acquire().await;
-                let status = match timeout(Duration::from_secs(3), target.is_active()).await {
-                    Ok(Ok(true)) => "online",
-                    _ => "offline",
-                };
-                ((target.id().id, target.id().name), status.to_string())
-            });
-        }
-
-        let mut runtime_statuses = HashMap::new();
-        while let Some((key, status)) = futures.next().await {
-            runtime_statuses.insert(key, status);
-        }
-        let config = ns.config.read().await.clone();
+        let (ns, config) = load_notification_config_snapshot().await?;
+        let runtime_statuses = collect_runtime_statuses(ns.get_target_values().await).await;
         let notification_endpoints = merge_notification_endpoints(&config, runtime_statuses);
 
         let data = serde_json::to_vec(&NotificationEndpointsResponse { notification_endpoints })
@@ -283,30 +242,15 @@ impl Operation for ListTargetsArns {
         }
         let ns = get_notification_system()?;
 
-        let targets = ns.get_target_values().await;
         let region = req
             .region
             .clone()
             .ok_or_else(|| s3_error!(InvalidRequest, "region not found"))?;
-        let semaphore = Arc::new(Semaphore::new(10));
-        let mut futures = FuturesUnordered::new();
-
-        for target in targets {
-            let sem = Arc::clone(&semaphore);
-            futures.push(async move {
-                let _permit = sem.acquire().await;
-                let status = match timeout(Duration::from_secs(3), target.is_active()).await {
-                    Ok(Ok(true)) => "online",
-                    _ => "offline",
-                };
-                (target.id(), status.to_string())
-            });
-        }
-
-        let mut target_statuses = Vec::new();
-        while let Some(target_status) = futures.next().await {
-            target_statuses.push(target_status);
-        }
+        let target_statuses = collect_runtime_statuses(ns.get_target_values().await)
+            .await
+            .into_iter()
+            .map(|((account_id, service), status)| (rustfs_targets::arn::TargetID::new(account_id, service), status))
+            .collect();
 
         let data_target_arn_list = collect_online_target_arns(region.as_str(), target_statuses);
 
@@ -329,8 +273,7 @@ impl Operation for RemoveNotificationTarget {
         if let Some(reason) = notification_target_operation_block_reason("managing notification targets from the console").await {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
-        let ns = get_notification_system()?;
-        let config_snapshot = ns.config.read().await.clone();
+        let (ns, config_snapshot) = load_notification_config_snapshot().await?;
         if let Some(reason) = target_mutation_block_reason(&config_snapshot, target_type, target_name) {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
@@ -344,27 +287,19 @@ impl Operation for RemoveNotificationTarget {
     }
 }
 
-fn extract_param<'a>(params: &'a Params<'_, '_>, key: &str) -> S3Result<&'a str> {
-    params
-        .get(key)
-        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: '{}'", key))
-}
-
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
-    let target_type = extract_param(params, "target_type")?;
-    if target_service_name(notification_target_specs(), target_type).is_none() {
-        return Err(s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type));
-    }
-    let target_name = extract_param(params, "target_name")?;
-    Ok((target_type, target_name))
+    extract_supported_target_params(notification_target_specs(), params, "notification")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::handlers::target_descriptor::{
+        allowed_target_keys, collect_validated_key_values as shared_collect_validated_key_values,
+    };
     use matchit::Router;
-    use rustfs_config::DEFAULT_DELIMITER;
     use rustfs_config::notify::{NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+    use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY};
     use rustfs_ecstore::config::{KV, KVS};
     use rustfs_targets::arn::TargetID;
     use serial_test::serial;

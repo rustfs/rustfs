@@ -510,7 +510,7 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         })
         .transpose()?;
     let version_id = query_value_exact(&filtered_uri, "versionId").filter(|value| !value.is_empty());
-    let range = parse_optional_header(&req.headers, http::header::RANGE)?
+    let range = parse_optional_header(&req.headers, header::RANGE)?
         .map(|value| Range::parse(&value).map_err(|_| s3_error!(InvalidArgument, "Range header is invalid")))
         .transpose()?;
 
@@ -520,13 +520,10 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         .part_number(part_number)
         .version_id(version_id)
         .range(range)
-        .if_match(parse_optional_etag_condition_header::<IfMatch>(&req.headers, http::header::IF_MATCH)?)
-        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(
-            &req.headers,
-            http::header::IF_NONE_MATCH,
-        )?)
-        .if_modified_since(parse_optional_timestamp_header(&req.headers, http::header::IF_MODIFIED_SINCE)?)
-        .if_unmodified_since(parse_optional_timestamp_header(&req.headers, http::header::IF_UNMODIFIED_SINCE)?);
+        .if_match(parse_optional_etag_condition_header::<IfMatch>(&req.headers, header::IF_MATCH)?)
+        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(&req.headers, header::IF_NONE_MATCH)?)
+        .if_modified_since(parse_optional_timestamp_header(&req.headers, header::IF_MODIFIED_SINCE)?)
+        .if_unmodified_since(parse_optional_timestamp_header(&req.headers, header::IF_UNMODIFIED_SINCE)?);
 
     builder = builder.sse_customer_algorithm(parse_optional_header(
         &req.headers,

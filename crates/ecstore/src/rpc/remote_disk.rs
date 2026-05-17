@@ -385,7 +385,7 @@ impl RemoteDisk {
                     timeout_ms = timeout_duration.as_millis(),
                     "Remote disk operation timed out"
                 );
-                Err(Error::other(format!("Remote disk operation timeout after {timeout_duration:?}")))
+                Err(DiskError::Timeout)
             }
         }
     }

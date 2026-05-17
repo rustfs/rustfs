@@ -24,6 +24,12 @@ use crate::common::client::s3::StorageBackend;
 use crate::common::gateway::S3Action;
 use russh_sftp::protocol::{File, FileAttributes, StatusCode};
 use s3s::dto::ListObjectsV2Input;
+use std::collections::HashMap;
+
+const SFTP_META_MTIME: &str = "mtime";
+const SFTP_META_MODE: &str = "mode";
+const SFTP_META_UID: &str = "uid";
+const SFTP_META_GID: &str = "gid";
 
 /// Build the SFTP FileAttributes struct returned by STAT, LSTAT, and
 /// FSTAT. Callers are responsible for any clamping or conversion of the
@@ -40,6 +46,44 @@ pub(super) fn s3_attrs_to_sftp(size: u64, mtime: Option<u32>, is_dir: bool) -> F
         permissions: Some(permissions),
         atime: mtime,
         mtime,
+    }
+}
+
+fn parse_u32_metadata(metadata: &HashMap<String, String>, key: &str) -> Option<u32> {
+    metadata.get(key).and_then(|value| value.parse::<u32>().ok())
+}
+
+pub(super) fn sftp_attrs_to_user_metadata(attrs: &FileAttributes) -> Option<HashMap<String, String>> {
+    let mut metadata = HashMap::new();
+    if let Some(mtime) = attrs.mtime {
+        metadata.insert(SFTP_META_MTIME.to_string(), mtime.to_string());
+    }
+    if let Some(mode) = attrs.permissions {
+        metadata.insert(SFTP_META_MODE.to_string(), mode.to_string());
+    }
+    if let Some(uid) = attrs.uid {
+        metadata.insert(SFTP_META_UID.to_string(), uid.to_string());
+    }
+    if let Some(gid) = attrs.gid {
+        metadata.insert(SFTP_META_GID.to_string(), gid.to_string());
+    }
+
+    if metadata.is_empty() { None } else { Some(metadata) }
+}
+
+pub(super) fn apply_user_metadata_to_sftp_attrs(attrs: &mut FileAttributes, metadata: &HashMap<String, String>) {
+    if let Some(mtime) = parse_u32_metadata(metadata, SFTP_META_MTIME) {
+        attrs.mtime = Some(mtime);
+        attrs.atime = Some(mtime);
+    }
+    if let Some(mode) = parse_u32_metadata(metadata, SFTP_META_MODE) {
+        attrs.permissions = Some(mode);
+    }
+    if let Some(uid) = parse_u32_metadata(metadata, SFTP_META_UID) {
+        attrs.uid = Some(uid);
+    }
+    if let Some(gid) = parse_u32_metadata(metadata, SFTP_META_GID) {
+        attrs.gid = Some(gid);
     }
 }
 
@@ -120,7 +164,11 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     Ok(out) => {
                         let size = out.content_length.unwrap_or(0).max(0) as u64;
                         let mtime = timestamp_to_mtime(out.last_modified);
-                        Ok(s3_attrs_to_sftp(size, mtime, false))
+                        let mut attrs = s3_attrs_to_sftp(size, mtime, false);
+                        if let Some(metadata) = out.metadata {
+                            apply_user_metadata_to_sftp_attrs(&mut attrs, &metadata);
+                        }
+                        Ok(attrs)
                     }
                     Err(e) if is_not_found_error(&e) => {
                         // No object at this key. Check whether it is a
@@ -186,6 +234,45 @@ mod tests {
         assert_eq!(attrs.size, Some(42));
         assert_eq!(attrs.mtime, Some(1_700_000_000));
         assert!(attrs.is_regular());
+    }
+
+    #[test]
+    fn sftp_attrs_to_user_metadata_maps_only_present_open_attrs() {
+        let attrs = FileAttributes {
+            size: None,
+            uid: Some(1000),
+            gid: Some(1001),
+            user: None,
+            group: None,
+            permissions: Some(0o100640),
+            atime: None,
+            mtime: Some(1_777_992_333),
+        };
+
+        let metadata = sftp_attrs_to_user_metadata(&attrs).expect("present attrs produce metadata");
+        assert_eq!(metadata.get("mtime").map(String::as_str), Some("1777992333"));
+        assert_eq!(metadata.get("mode").map(String::as_str), Some("33184"));
+        assert_eq!(metadata.get("uid").map(String::as_str), Some("1000"));
+        assert_eq!(metadata.get("gid").map(String::as_str), Some("1001"));
+        assert!(!metadata.contains_key("size"), "object size is data-path state, not OPEN metadata");
+    }
+
+    #[test]
+    fn apply_user_metadata_to_sftp_attrs_overrides_defaults() {
+        let mut attrs = s3_attrs_to_sftp(42, Some(10), false);
+        let metadata = HashMap::from([
+            ("mtime".to_string(), "1777992348".to_string()),
+            ("mode".to_string(), "33152".to_string()),
+            ("uid".to_string(), "501".to_string()),
+            ("gid".to_string(), "20".to_string()),
+        ]);
+
+        apply_user_metadata_to_sftp_attrs(&mut attrs, &metadata);
+        assert_eq!(attrs.mtime, Some(1_777_992_348));
+        assert_eq!(attrs.atime, Some(1_777_992_348));
+        assert_eq!(attrs.permissions, Some(0o100600));
+        assert_eq!(attrs.uid, Some(501));
+        assert_eq!(attrs.gid, Some(20));
     }
 
     #[test]

@@ -134,7 +134,7 @@ start_rustfs() {
     
     # Start RustFS in background with environment variables
     cd "$TARGET_DIR"
-    RUSTFS_ACCESS_KEY=rustfsadmin RUSTFS_SECRET_KEY=rustfsadmin \
+    RUSTFS_ACCESS_KEY=rustfs-e2e-admin RUSTFS_SECRET_KEY=rustfs-e2e-secret \
     RUSTFS_OBS_LOG_DIRECTORY="$TARGET_DIR/logs" \
     ./rustfs --address :9000 "$DATA_DIR" > rustfs.log 2>&1 &
     RUSTFS_PID=$!
