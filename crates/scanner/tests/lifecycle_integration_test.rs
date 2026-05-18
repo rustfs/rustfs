@@ -12,10 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::FutureExt;
+use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
 use rustfs_ecstore::{
     bucket::lifecycle::lifecycle::TransitionOptions,
     bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
-    bucket::{lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects, metadata_sys},
+    bucket::{
+        lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects, metadata_sys,
+        versioning_sys::BucketVersioningSys,
+    },
     client::transition_api::{ReadCloser, ReaderImpl},
     disk::endpoint::Endpoint,
     disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, new_disk},
@@ -41,6 +46,7 @@ use s3s::dto::RestoreRequest;
 use serial_test::serial;
 use std::{
     collections::HashMap,
+    env,
     io::Cursor,
     path::{Path, PathBuf},
     sync::{Arc, Once, OnceLock},
@@ -245,6 +251,14 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
     info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
 }
 
+async fn modeled_versioned_delete_opts(bucket: &str, object: &str) -> ObjectOptions {
+    ObjectOptions {
+        versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
+        version_suspended: BucketVersioningSys::prefix_suspended(bucket, object).await,
+        ..Default::default()
+    }
+}
+
 /// Test helper: Set bucket lifecycle configuration
 #[allow(dead_code)]
 async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -271,7 +285,8 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
 /// Test helper: Set bucket lifecycle configuration
 #[allow(dead_code)]
 async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
+    // Create lifecycle rule that targets delete-marker cleanup only.
+    // Keep Expiration.Days unset to avoid expiring live transitioned object versions.
     let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <LifecycleConfiguration>
     <Rule>
@@ -281,13 +296,35 @@ async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<
             <Prefix>test/</Prefix>
         </Filter>
         <Expiration>
-            <Days>0</Days>
             <ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>
         </Expiration>
     </Rule>
 </LifecycleConfiguration>"#;
 
     metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64) -> Result<(), Box<dyn std::error::Error>> {
+    let lifecycle_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <DelMarkerExpiration>
+            <Days>{days}</Days>
+        </DelMarkerExpiration>
+    </Rule>
+</LifecycleConfiguration>"#
+    );
+
+    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
 
     Ok(())
 }
@@ -529,6 +566,22 @@ async fn wait_for_version_count(ecstore: &Arc<ECStore>, bucket: &str, object: &s
     }
 }
 
+async fn wait_for_remote_object_count(backend: &MockWarmBackend, expected: usize, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if backend.objects.lock().await.len() == expected {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn scan_object_with_lifecycle(disk_path: &Path, bucket: &str, object: &str) {
     let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
     endpoint.set_pool_index(0);
@@ -751,6 +804,30 @@ async fn wait_for_transition(
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[allow(unsafe_code)]
+async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let original = env::var_os(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
+    unsafe {
+        env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, "1");
+    }
+    let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+    match original {
+        Some(value) => unsafe {
+            env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, value);
+        },
+        None => unsafe {
+            env::remove_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
+        },
+    }
+    if let Err(err) = result {
+        std::panic::resume_unwind(err);
     }
 }
 
@@ -1214,6 +1291,398 @@ mod serial_tests {
         assert!(
             wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(1)).await,
             "deleted object should remain absent after scanner cleanup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_scanner_cleanup_still_works_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-scanner-after-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"scanner cleanup should still work after immediate compensation";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition after compensation backfill");
+        let stale_remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.objects.lock().await.contains_key(&stale_remote_object));
+
+        ecstore
+            .delete_object(bucket_name.as_str(), object_name, ObjectOptions::default())
+            .await
+            .expect("Failed to delete transitioned object after compensation-driven transition");
+
+        assert!(
+            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await > 0,
+            "deleting a compensation-transitioned null version should leave a free version for async cleanup"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&stale_remote_object),
+            "stale transitioned remote object should still exist before scanner cleanup runs"
+        );
+
+        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_remote_absence(&backend, &stale_remote_object, TRANSITION_WAIT_TIMEOUT).await,
+            "scanner should clean stale remote object even after immediate compensation transitioned it"
+        );
+        assert_eq!(
+            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await,
+            0,
+            "free-version metadata should be removed after scanner cleanup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_existing_object_backfill_is_idempotent_after_immediate_compensation_transition() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-backfill-after-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"existing-object backfill should be idempotent after compensation transition";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition after immediate compensation backfill");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("existing-object backfill should succeed after compensation transition");
+
+        let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should remain transitioned after existing-object backfill rerun");
+
+        assert_eq!(info.transitioned_object.status, "complete");
+        assert_eq!(info.transitioned_object.tier, tier_name);
+        assert_eq!(info.transitioned_object.name, remote_object);
+        assert!(backend.objects.lock().await.contains_key(&remote_object));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_noncurrent_expiry_still_works_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-versioned-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <Transition>
+          <Days>0</Days>
+          <StorageClass>{tier_name}</StorageClass>
+        </Transition>
+        <NoncurrentVersionExpiration>
+            <NoncurrentDays>0</NoncurrentDays>
+        </NoncurrentVersionExpiration>
+    </Rule>
+</LifecycleConfiguration>"#
+        );
+        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        let mut reader = PutObjReader::from_vec(b"v1".to_vec());
+        ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to upload v1");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            let mut reader = PutObjReader::from_vec(b"v2".to_vec());
+            ecstore
+                .put_object(
+                    bucket_name.as_str(),
+                    object_name,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("failed to upload v2");
+        })
+        .await;
+
+        let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+
+        assert_eq!(info.transitioned_object.status, "complete");
+        assert_eq!(info.transitioned_object.tier, tier_name);
+        assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_version_count(&ecstore, bucket_name.as_str(), object_name, 1, Duration::from_secs(3)).await,
+            "noncurrent expiry should still remove the previous version after compensation transition"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_noncurrent_transition_still_works_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-noncurrent-transition-comp-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <Transition>
+          <Days>0</Days>
+          <StorageClass>{tier_name}</StorageClass>
+        </Transition>
+        <NoncurrentVersionTransition>
+            <NoncurrentDays>0</NoncurrentDays>
+            <StorageClass>{tier_name}</StorageClass>
+        </NoncurrentVersionTransition>
+    </Rule>
+</LifecycleConfiguration>"#
+        );
+        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        let mut reader = PutObjReader::from_vec(b"v1".to_vec());
+        ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to upload v1");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            let mut reader = PutObjReader::from_vec(b"v2".to_vec());
+            ecstore
+                .put_object(
+                    bucket_name.as_str(),
+                    object_name,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("failed to upload v2");
+        })
+        .await;
+
+        let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+        assert_eq!(info.transitioned_object.status, "complete");
+        assert_eq!(info.transitioned_object.tier, tier_name);
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_remote_object_count(&backend, 2, TRANSITION_WAIT_TIMEOUT).await,
+            "noncurrent transition should still move the previous version into the remote tier"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_modeled_versioned_delete_creates_delete_marker_after_immediate_compensation_transition() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-modeled-versioned-delete-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"modeled versioned delete should create delete marker after compensation";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set transition lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+        ecstore
+            .delete_object(
+                bucket_name.as_str(),
+                object_name,
+                modeled_versioned_delete_opts(bucket_name.as_str(), object_name).await,
+            )
+            .await
+            .expect("modeled versioned delete should succeed");
+
+        assert!(
+            object_is_delete_marker(&ecstore, bucket_name.as_str(), object_name).await,
+            "versioned delete modeled with versioned flags should create a delete marker"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&remote_object),
+            "creating a delete marker should not remove the transitioned remote object version"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_modeled_delete_marker_cleanup_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-modeled-del-marker-cleanup-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"modeled delete-marker cleanup should converge after compensation transition";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set transition lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+        ecstore
+            .delete_object(
+                bucket_name.as_str(),
+                object_name,
+                modeled_versioned_delete_opts(bucket_name.as_str(), object_name).await,
+            )
+            .await
+            .expect("modeled versioned delete should succeed");
+
+        assert!(
+            object_is_delete_marker(&ecstore, bucket_name.as_str(), object_name).await,
+            "modeled versioned delete should create delete marker before cleanup"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&remote_object),
+            "delete marker creation should not remove transitioned remote object"
+        );
+
+        set_bucket_lifecycle_delmarker_expiration(bucket_name.as_str(), 1)
+            .await
+            .expect("Failed to set delete marker expiration lifecycle configuration");
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            object_is_delete_marker(&ecstore, bucket_name.as_str(), object_name).await,
+            "delete marker should remain before DelMarkerExpiration due time"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&remote_object),
+            "pre-due delete marker lifecycle scan should not remove transitioned remote object"
+        );
+
+        set_bucket_lifecycle_deletemarker(bucket_name.as_str())
+            .await
+            .expect("Failed to set expired object delete marker lifecycle configuration");
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(5)).await,
+            "expired object delete marker lifecycle should eventually clean up the delete marker"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&remote_object),
+            "delete marker lifecycle cleanup should not remove transitioned remote object"
         );
     }
 
