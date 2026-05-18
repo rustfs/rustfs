@@ -19,6 +19,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
 use http::{Extensions, HeaderMap, Method, Uri};
+use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
 use rustfs_ecstore::{
     bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
     bucket::metadata_sys,
@@ -59,7 +60,6 @@ use uuid::Uuid;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-const FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV: &str = "RUSTFS_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT";
 
 fn init_tracing() {
     INIT.call_once(|| {});
@@ -333,17 +333,17 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let original = env::var_os(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV);
+    let original = env::var_os(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
     unsafe {
-        env::set_var(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV, "1");
+        env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, "1");
     }
     let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
     match original {
         Some(value) => unsafe {
-            env::set_var(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV, value);
+            env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, value);
         },
         None => unsafe {
-            env::remove_var(FORCE_IMMEDIATE_ENQUEUE_TIMEOUT_ENV);
+            env::remove_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
         },
     }
     if let Err(err) = result {

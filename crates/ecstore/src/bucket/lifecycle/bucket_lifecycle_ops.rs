@@ -679,12 +679,12 @@ impl TransitionState {
             match self.transition_tx.try_send(Some(task)) {
                 Ok(()) => {}
                 Err(async_channel::TrySendError::Full(task)) => {
+                    self.queue_full_tasks.fetch_add(1, Ordering::SeqCst);
                     let send_timeout = self.transition_queue_send_timeout;
                     match tokio::time::timeout(send_timeout, self.transition_tx.send(task)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(_)) => {
                             self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
-                            self.queue_full_tasks.fetch_add(1, Ordering::SeqCst);
                             let scheduled = self.schedule_bucket_compensation(&oi.bucket);
                             warn!(
                                 bucket = %oi.bucket,
@@ -712,7 +712,6 @@ impl TransitionState {
                 }
                 Err(async_channel::TrySendError::Closed(_task)) => {
                     self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
-                    self.queue_full_tasks.fetch_add(1, Ordering::SeqCst);
                     let scheduled = self.schedule_bucket_compensation(&oi.bucket);
                     warn!(
                         bucket = %oi.bucket,
@@ -2544,7 +2543,7 @@ mod tests {
         });
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn schedule_bucket_compensation_deduplicates_same_bucket() {
         let state = TransitionState::new_with_capacity(1);
 
