@@ -1411,9 +1411,10 @@ impl LocalDisk {
 
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
-            while let Some((pop, skip_object, dir_to_skip)) = dir_stack.last().cloned()
-                && pop < name
+            while let Some((last_name, _, _)) = dir_stack.last()
+                && *last_name < name
             {
+                let (pop, skip_object, dir_to_skip) = dir_stack.pop().unwrap();
                 out.write_obj(&MetaCacheEntry {
                     name: pop.clone(),
                     ..Default::default()
@@ -1426,7 +1427,6 @@ impl LocalDisk {
                 {
                     error!("scan_dir err {:?}", er);
                 }
-                dir_stack.pop();
             }
 
             let mut meta = MetaCacheEntry {
@@ -2418,7 +2418,7 @@ impl DiskAPI for LocalDisk {
             if multipart_dir_to_skip.is_empty() {
                 None
             } else {
-                Some(multipart_dir_to_skip.clone())
+                Some(multipart_dir_to_skip)
             },
         )
         .await?;
