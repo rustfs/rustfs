@@ -47,6 +47,11 @@ use lazy_static::lazy_static;
 use rustfs_common::data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
+use rustfs_config::{
+    DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
+    DEFAULT_TRANSITION_WORKERS_CAP, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, ENV_TRANSITION_QUEUE_CAPACITY,
+    ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
+};
 use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, RestoreStatusOps,
     VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
@@ -93,11 +98,6 @@ const ENV_STALE_UPLOADS_CLEANUP_INTERVAL: &str = "RUSTFS_API_STALE_UPLOADS_CLEAN
 const DEFAULT_STALE_UPLOADS_EXPIRY: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
-const DEFAULT_TRANSITION_WORKERS_CAP: i64 = 16;
-const DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX: i64 = 32;
-const DEFAULT_TRANSITION_QUEUE_CAPACITY: usize = 1000;
-const DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS: usize = 100;
-const ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT: &str = "RUSTFS_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT";
 
 lazy_static! {
     pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
@@ -106,25 +106,23 @@ lazy_static! {
 
 fn resolve_transition_worker_count() -> (i64, i64, i64) {
     let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
-    let configured = env::var("RUSTFS_MAX_TRANSITION_WORKERS")
+    let configured = env::var(ENV_TRANSITION_WORKERS)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(fallback);
     let mut effective = configured;
-    let absolute_max = get_env_i64("RUSTFS_ABSOLUTE_MAX_WORKERS", DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+    let absolute_max = get_env_i64(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
     effective = std::cmp::min(effective, absolute_max);
     (configured, absolute_max, effective)
 }
 
 fn resolve_transition_queue_capacity() -> usize {
-    get_env_usize("RUSTFS_TRANSITION_QUEUE_CAPACITY", DEFAULT_TRANSITION_QUEUE_CAPACITY).max(1)
+    get_env_usize(ENV_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_CAPACITY).max(1)
 }
 
 fn resolve_transition_queue_send_timeout() -> StdDuration {
-    StdDuration::from_millis(
-        get_env_usize("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS).max(1) as u64,
-    )
+    StdDuration::from_millis(get_env_usize(ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS).max(1) as u64)
 }
 
 fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
@@ -134,10 +132,16 @@ fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
     )
 }
 
+#[cfg(any(test, debug_assertions))]
 fn should_force_immediate_transition_enqueue_timeout() -> bool {
     env::var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT)
         .ok()
         .is_some_and(|value| value == "1")
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn should_force_immediate_transition_enqueue_timeout() -> bool {
+    false
 }
 
 pub struct LifecycleSys;
@@ -620,7 +624,7 @@ impl TransitionState {
         })
     }
 
-    fn schedule_bucket_compensation(&self, bucket: &str) -> bool {
+    fn schedule_bucket_compensation(self: &Arc<Self>, bucket: &str) -> bool {
         let mut scheduled = self.compensation_buckets.lock().unwrap();
         if !scheduled.insert(bucket.to_string()) {
             return false;
@@ -628,7 +632,7 @@ impl TransitionState {
         self.compensation_scheduled_tasks.fetch_add(1, Ordering::SeqCst);
         let bucket = bucket.to_string();
         let scheduled = Arc::clone(&self.compensation_buckets);
-        let state = Arc::clone(&GLOBAL_TransitionState);
+        let state = Arc::clone(self);
         tokio::spawn(async move {
             state.compensation_running_tasks.fetch_add(1, Ordering::SeqCst);
             let Some(api) = crate::new_object_layer_fn() else {
@@ -650,7 +654,7 @@ impl TransitionState {
         true
     }
 
-    pub async fn queue_transition_task(&self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
+    pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
         let task = TransitionTask {
             obj_info: oi.clone(),
             src: src.clone(),
@@ -2542,11 +2546,12 @@ mod tests {
     async fn schedule_bucket_compensation_deduplicates_same_bucket() {
         let state = TransitionState::new_with_capacity(1);
 
-        state.schedule_bucket_compensation("bucket-a");
-        state.schedule_bucket_compensation("bucket-a");
+        let first = state.schedule_bucket_compensation("bucket-a");
+        let second = state.schedule_bucket_compensation("bucket-a");
 
+        assert!(first);
+        assert!(!second);
         assert_eq!(state.compensation_scheduled_tasks(), 1);
-        assert!(state.compensation_buckets.lock().unwrap().contains("bucket-a"));
     }
 
     #[tokio::test]
