@@ -624,10 +624,10 @@ pub(crate) fn extract_prefix_suffix(filter: Option<&NotificationConfigurationFil
         if let Some(rules) = &filter_rules.filter_rules {
             for rule in rules {
                 if let (Some(name), Some(value)) = (rule.name.as_ref(), rule.value.as_ref()) {
-                    match name.as_str() {
-                        "prefix" => prefix = value.clone(),
-                        "suffix" => suffix = value.clone(),
-                        _ => {}
+                    if name.as_str().eq_ignore_ascii_case("prefix") {
+                        prefix = value.clone();
+                    } else if name.as_str().eq_ignore_ascii_case("suffix") {
+                        suffix = value.clone();
                     }
                 }
             }
