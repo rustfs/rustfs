@@ -16,7 +16,10 @@ use futures::FutureExt;
 use rustfs_ecstore::{
     bucket::lifecycle::lifecycle::TransitionOptions,
     bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
-    bucket::{lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects, metadata_sys},
+    bucket::{
+        lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects, metadata_sys,
+        versioning_sys::BucketVersioningSys,
+    },
     client::transition_api::{ReadCloser, ReaderImpl},
     disk::endpoint::Endpoint,
     disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, new_disk},
@@ -246,6 +249,14 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
         .expect("Failed to upload test object");
 
     info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
+}
+
+async fn versioned_delete_opts(bucket: &str, object: &str) -> ObjectOptions {
+    ObjectOptions {
+        versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
+        version_suspended: BucketVersioningSys::prefix_suspended(bucket, object).await,
+        ..Default::default()
+    }
 }
 
 /// Test helper: Set bucket lifecycle configuration
@@ -1524,6 +1535,54 @@ mod serial_tests {
         assert!(
             wait_for_remote_object_count(&backend, 2, TRANSITION_WAIT_TIMEOUT).await,
             "noncurrent transition should still move the previous version into the remote tier"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_modeled_versioned_delete_creates_delete_marker_after_immediate_compensation_transition() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-modeled-versioned-delete-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"modeled versioned delete should create delete marker after compensation";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set transition lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+        ecstore
+            .delete_object(
+                bucket_name.as_str(),
+                object_name,
+                versioned_delete_opts(bucket_name.as_str(), object_name).await,
+            )
+            .await
+            .expect("modeled versioned delete should succeed");
+
+        assert!(
+            object_is_delete_marker(&ecstore, bucket_name.as_str(), object_name).await,
+            "versioned delete modeled with versioned flags should create a delete marker"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&remote_object),
+            "creating a delete marker should not remove the transitioned remote object version"
         );
     }
 
