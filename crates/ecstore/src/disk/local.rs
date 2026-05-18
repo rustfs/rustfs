@@ -1179,14 +1179,7 @@ impl LocalDisk {
                 f.write_all(buf).await.map_err(to_file_error)?;
             }
             InternalBuf::Owned(buf) => {
-                // Reduce one copy by using the owned buffer directly.
-                // It may be more efficient for larger writes.
-                let mut f = f.into_std().await;
-                let task = tokio::task::spawn_blocking(move || {
-                    use std::io::Write as _;
-                    f.write_all(buf.as_ref()).map_err(to_file_error)
-                });
-                task.await??;
+                f.write_all(buf.as_ref()).await.map_err(to_file_error)?;
             }
         }
 
