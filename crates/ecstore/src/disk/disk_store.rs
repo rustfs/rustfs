@@ -1231,6 +1231,28 @@ mod tests {
     use super::*;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::health_state::RuntimeDriveHealthState;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::AsyncWrite;
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn drive_metadata_timeout_uses_default_when_unset() {
@@ -1374,6 +1396,49 @@ mod tests {
         assert_eq!(result.expect_err("operation should time out"), DiskError::Timeout);
         assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
         assert!(!wrapper.health.is_faulty());
+    }
+
+    #[tokio::test]
+    async fn walk_dir_writer_backpressure_timeout_does_not_mark_drive_failure() {
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+            let wrapper = LocalDiskWrapper::new(disk, false);
+            let bucket = "test-bucket";
+            let object = "test-object";
+
+            wrapper.make_volume(bucket).await.expect("bucket should be created");
+
+            let mut file_info = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+            file_info.volume = bucket.to_string();
+            file_info.name = object.to_string();
+            file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+            file_info.erasure.index = 1;
+
+            wrapper
+                .write_metadata("", bucket, object, file_info)
+                .await
+                .expect("object metadata should be written");
+
+            let mut writer = PendingWriter;
+            let result = wrapper
+                .walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        ..Default::default()
+                    },
+                    &mut writer,
+                )
+                .await;
+
+            assert_eq!(result.expect_err("walk_dir should time out"), DiskError::Timeout);
+            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!wrapper.health.is_faulty());
+        })
+        .await;
     }
 
     #[tokio::test]
