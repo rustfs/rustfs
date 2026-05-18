@@ -16,8 +16,10 @@ use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultO
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::storage::ecfs::FS;
 use bytes::Bytes;
+use futures::FutureExt;
 use futures::stream;
 use http::{Extensions, HeaderMap, Method, Uri};
+use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
 use rustfs_ecstore::{
     bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
     bucket::metadata_sys,
@@ -43,7 +45,7 @@ use serial_test::serial;
 use std::{
     collections::HashMap,
     convert::Infallible,
-    fs as stdfs,
+    env, fs as stdfs,
     io::Cursor,
     path::PathBuf,
     sync::{Arc, Once, OnceLock},
@@ -322,6 +324,30 @@ async fn wait_for_transition(
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[allow(unsafe_code)]
+async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let original = env::var_os(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
+    unsafe {
+        env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, "1");
+    }
+    let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+    match original {
+        Some(value) => unsafe {
+            env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, value);
+        },
+        None => unsafe {
+            env::remove_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
+        },
+    }
+    if let Err(err) = result {
+        std::panic::resume_unwind(err);
     }
 }
 
@@ -635,6 +661,334 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .map(|path| stdfs::canonicalize(path).unwrap().to_string_lossy().into_owned())
         .collect();
     assert_eq!(actual_paths, expected_paths);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn immediate_transition_timeout_eventually_completes_via_compensation() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let payload = b"transition compensation should eventually complete";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+    })
+    .await;
+
+    let info = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should eventually transition after compensation backfill");
+
+    assert_eq!(info.transitioned_object.status, "complete");
+    assert_eq!(info.transitioned_object.tier, tier_name);
+    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn compensation_driven_copy_still_completes_transition() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let src_bucket = format!("test-comp-copy-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let dst_bucket = format!("test-comp-copy-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let src_object = "test/source.txt";
+    let dst_object = "test/copied.txt";
+    let payload = b"copy object should still transition after compensation";
+
+    create_test_bucket(&ecstore, src_bucket.as_str()).await;
+    create_test_bucket(&ecstore, dst_bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(dst_bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set destination lifecycle configuration");
+    let _ = upload_test_object(&ecstore, src_bucket.as_str(), src_object, payload).await;
+
+    let copy_input = CopyObjectInput::builder()
+        .copy_source(CopySource::Bucket {
+            bucket: src_bucket.clone().into(),
+            key: src_object.to_string().into(),
+            version_id: None,
+        })
+        .bucket(dst_bucket.clone())
+        .key(dst_object.to_string())
+        .build()
+        .unwrap();
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
+            .await
+            .expect("Failed to copy object through usecase");
+    })
+    .await;
+
+    let info = wait_for_transition(&ecstore, dst_bucket.as_str(), dst_object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("copied object should eventually transition after compensation backfill");
+
+    assert_eq!(info.transitioned_object.status, "complete");
+    assert_eq!(info.transitioned_object.tier, tier_name);
+    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn compensation_driven_complete_multipart_upload_still_transitions() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultMultipartUsecase::without_context();
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-comp-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/multipart.txt";
+    let payload = b"multipart should still transition after compensation";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+
+    let upload = ecstore
+        .new_multipart_upload(bucket.as_str(), object, &ObjectOptions::default())
+        .await
+        .expect("Failed to create multipart upload");
+
+    let mut reader = PutObjReader::from_vec(payload.to_vec());
+    let uploaded_part = ecstore
+        .put_object_part(bucket.as_str(), object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+        .await
+        .expect("Failed to upload multipart part");
+
+    let complete_input = CompleteMultipartUploadInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .upload_id(upload.upload_id.clone())
+        .multipart_upload(Some(CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                part_number: Some(1),
+                e_tag: uploaded_part.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                ..Default::default()
+            }]),
+        }))
+        .build()
+        .unwrap();
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
+            .await
+            .expect("Failed to complete multipart upload through usecase");
+    })
+    .await;
+
+    let info = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("multipart object should eventually transition after compensation backfill");
+
+    assert_eq!(info.transitioned_object.status, "complete");
+    assert_eq!(info.transitioned_object.tier, tier_name);
+    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-compensation-delete-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let payload = b"compensation should still preserve delete cleanup";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+    })
+    .await;
+
+    let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should eventually transition after compensation backfill");
+    let remote_object = transitioned.transitioned_object.name.clone();
+
+    assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+    let mut req = build_request(
+        DeleteObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .unwrap(),
+        Method::DELETE,
+    );
+    insert_header(&mut req.headers, SUFFIX_FORCE_DELETE, "true");
+
+    Box::pin(usecase.execute_delete_object(req))
+        .await
+        .expect("Failed to delete object through usecase after compensation-driven transition");
+
+    assert!(
+        wait_for_object_absence(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
+        "object should be removed from hot tier after delete usecase"
+    );
+
+    assert!(
+        wait_for_remote_absence(&backend, &remote_object, TRANSITION_WAIT_TIMEOUT).await,
+        "transitioned object should be removed from remote tier after delete usecase"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-comp-versioned-delete-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let payload = b"versioned delete should preserve transitioned remote version behind delete marker";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+    })
+    .await;
+
+    let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should eventually transition after compensation backfill");
+    let remote_object = transitioned.transitioned_object.name.clone();
+
+    assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+    let req = build_request(
+        DeleteObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .unwrap(),
+        Method::DELETE,
+    );
+
+    Box::pin(usecase.execute_delete_object(req))
+        .await
+        .expect("Failed to issue versioned delete after compensation-driven transition");
+
+    assert!(
+        wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
+        "versioned delete should create a delete marker after compensation-driven transition"
+    );
+    assert!(
+        backend.objects.lock().await.contains_key(&remote_object),
+        "creating a delete marker should not remove the transitioned remote object version"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::without_context();
+    let bucket_usecase = DefaultBucketUsecase::without_context();
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-comp-del-marker-cleanup-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let payload = b"delete marker lifecycle should still clean up after compensation-driven transition";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set transition lifecycle configuration");
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+    })
+    .await;
+
+    let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should eventually transition after compensation backfill");
+    let remote_object = transitioned.transitioned_object.name.clone();
+
+    assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+    let req = build_request(
+        DeleteObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .unwrap(),
+        Method::DELETE,
+    );
+
+    Box::pin(usecase.execute_delete_object(req))
+        .await
+        .expect("Failed to issue versioned delete after compensation-driven transition");
+
+    assert!(
+        wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
+        "versioned delete should create a delete marker before lifecycle cleanup"
+    );
+    assert!(
+        backend.objects.lock().await.contains_key(&remote_object),
+        "delete marker creation should keep the transitioned remote object version"
+    );
+
+    let req = build_request(
+        PutBucketLifecycleConfigurationInput::builder()
+            .bucket(bucket.clone())
+            .lifecycle_configuration(Some(expiration_lifecycle_configuration("test/")))
+            .build()
+            .unwrap(),
+        Method::PUT,
+    );
+    bucket_usecase
+        .execute_put_bucket_lifecycle_configuration(req)
+        .await
+        .expect("Failed to update lifecycle configuration for delete marker cleanup");
+
+    assert!(
+        wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
+        "delete marker should remain visible after lifecycle update until cleanup completes"
+    );
+    assert!(
+        backend.objects.lock().await.contains_key(&remote_object),
+        "delete marker lifecycle cleanup should not remove the transitioned remote object version"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

@@ -59,6 +59,25 @@ pub const DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT: usize = 10;
 pub const DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE: f64 = 1.0; // 100% sampling
 // Note: S3 bucket/prefix have no default; absence means upload is disabled (modeled as Option<String>)
 
+/// Maximum transition workers used as a local fallback when runtime env is unset.
+pub const DEFAULT_TRANSITION_WORKERS_CAP: i64 = 16;
+/// Absolute upper bound for transition workers accepted from runtime env.
+pub const DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX: i64 = 32;
+/// Default capacity for the transition queue.
+pub const DEFAULT_TRANSITION_QUEUE_CAPACITY: usize = 1000;
+/// Default send timeout for transition queue enqueue attempts, in milliseconds.
+pub const DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS: usize = 100;
+/// Test-only fault injection env var that forces the immediate transition enqueue timeout path.
+pub const ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT: &str = "RUSTFS_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT";
+/// Runtime env var controlling the transition worker count.
+pub const ENV_TRANSITION_WORKERS: &str = "RUSTFS_MAX_TRANSITION_WORKERS";
+/// Runtime env var controlling the absolute maximum transition workers.
+pub const ENV_TRANSITION_WORKERS_ABSOLUTE_MAX: &str = "RUSTFS_ABSOLUTE_MAX_WORKERS";
+/// Runtime env var controlling the transition queue capacity.
+pub const ENV_TRANSITION_QUEUE_CAPACITY: &str = "RUSTFS_TRANSITION_QUEUE_CAPACITY";
+/// Runtime env var controlling the transition queue send timeout in milliseconds.
+pub const ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS: &str = "RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS";
+
 // Allocator reclaim configuration
 pub const ENV_ALLOCATOR_RECLAIM_ENABLED: &str = "RUSTFS_ALLOCATOR_RECLAIM_ENABLED";
 pub const ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS: &str = "RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS";
