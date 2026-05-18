@@ -36,7 +36,7 @@ pub struct IlmStats {
     pub transition_pending_tasks: u64,
     /// Number of missed immediate ILM transition tasks
     pub transition_missed_immediate_tasks: u64,
-    /// Number of ILM transition tasks rejected because the queue was full/closed
+    /// Number of ILM transition tasks that initially hit full queue backpressure
     pub transition_queue_full_tasks: u64,
     /// Number of ILM transition tasks that timed out waiting for queue capacity
     pub transition_queue_send_timeout_tasks: u64,

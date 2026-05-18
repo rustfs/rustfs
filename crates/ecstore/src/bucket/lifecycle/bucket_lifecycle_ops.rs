@@ -596,6 +596,12 @@ pub struct TransitionState {
     last_day_stats: Arc<Mutex<HashMap<String, LastDayTierStats>>>,
 }
 
+enum ImmediateEnqueueFailure {
+    ForcedTimeout,
+    QueueClosed { timeout_ms: Option<u64> },
+    QueueSendTimedOut { timeout_ms: u64 },
+}
+
 impl TransitionState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<Self> {
@@ -631,15 +637,15 @@ impl TransitionState {
         if !scheduled.insert(bucket.to_string()) {
             return false;
         }
-        self.compensation_scheduled_tasks.fetch_add(1, Ordering::SeqCst);
+        Self::inc_counter(&self.compensation_scheduled_tasks);
         let bucket = bucket.to_string();
         let scheduled = Arc::clone(&self.compensation_buckets);
         let state = Arc::clone(self);
         tokio::spawn(async move {
-            state.compensation_running_tasks.fetch_add(1, Ordering::SeqCst);
+            Self::inc_counter(&state.compensation_running_tasks);
             let Some(api) = crate::new_object_layer_fn() else {
                 scheduled.lock().unwrap().remove(&bucket);
-                state.compensation_running_tasks.fetch_add(-1, Ordering::SeqCst);
+                Self::add_counter(&state.compensation_running_tasks, -1);
                 warn!(bucket = %bucket, "transition compensation skipped because object layer is unavailable");
                 return;
             };
@@ -651,22 +657,32 @@ impl TransitionState {
             }
 
             scheduled.lock().unwrap().remove(&bucket);
-            state.compensation_running_tasks.fetch_add(-1, Ordering::SeqCst);
+            Self::add_counter(&state.compensation_running_tasks, -1);
         });
         true
     }
 
-    pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
-        let task = TransitionTask {
-            obj_info: oi.clone(),
-            src: src.clone(),
-            event: event.clone(),
-        };
-        if is_immediate_transition_source(src) {
-            if should_force_immediate_transition_enqueue_timeout() {
-                self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
-                self.queue_send_timeout_tasks.fetch_add(1, Ordering::SeqCst);
-                let scheduled = self.schedule_bucket_compensation(&oi.bucket);
+    #[inline]
+    fn inc_counter(counter: &AtomicI64) {
+        Self::add_counter(counter, 1);
+    }
+
+    #[inline]
+    fn add_counter(counter: &AtomicI64, delta: i64) {
+        counter.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn counter_value(counter: &AtomicI64) -> i64 {
+        counter.load(Ordering::Relaxed)
+    }
+
+    fn handle_immediate_enqueue_failure(self: &Arc<Self>, oi: &ObjectInfo, src: &LcEventSrc, failure: ImmediateEnqueueFailure) {
+        Self::inc_counter(&self.missed_immediate_tasks);
+        let scheduled = self.schedule_bucket_compensation(&oi.bucket);
+        match failure {
+            ImmediateEnqueueFailure::ForcedTimeout => {
+                Self::inc_counter(&self.queue_send_timeout_tasks);
                 warn!(
                     bucket = %oi.bucket,
                     object = %oi.name,
@@ -674,45 +690,19 @@ impl TransitionState {
                     compensation_scheduled = scheduled,
                     "transition enqueue forced into timeout path for test fault injection"
                 );
-                return;
             }
-            match self.transition_tx.try_send(Some(task)) {
-                Ok(()) => {}
-                Err(async_channel::TrySendError::Full(task)) => {
-                    self.queue_full_tasks.fetch_add(1, Ordering::SeqCst);
-                    let send_timeout = self.transition_queue_send_timeout;
-                    match tokio::time::timeout(send_timeout, self.transition_tx.send(task)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => {
-                            self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
-                            let scheduled = self.schedule_bucket_compensation(&oi.bucket);
-                            warn!(
-                                bucket = %oi.bucket,
-                                object = %oi.name,
-                                source = ?src,
-                                timeout_ms = send_timeout.as_millis() as u64,
-                                compensation_scheduled = scheduled,
-                                "transition enqueue failed because the queue is closed"
-                            );
-                        }
-                        Err(_) => {
-                            self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
-                            self.queue_send_timeout_tasks.fetch_add(1, Ordering::SeqCst);
-                            let scheduled = self.schedule_bucket_compensation(&oi.bucket);
-                            warn!(
-                                bucket = %oi.bucket,
-                                object = %oi.name,
-                                source = ?src,
-                                timeout_ms = send_timeout.as_millis() as u64,
-                                compensation_scheduled = scheduled,
-                                "transition enqueue timed out under backpressure"
-                            );
-                        }
-                    }
+            ImmediateEnqueueFailure::QueueClosed { timeout_ms } => match timeout_ms {
+                Some(timeout_ms) => {
+                    warn!(
+                        bucket = %oi.bucket,
+                        object = %oi.name,
+                        source = ?src,
+                        timeout_ms,
+                        compensation_scheduled = scheduled,
+                        "transition enqueue failed because the queue is closed"
+                    );
                 }
-                Err(async_channel::TrySendError::Closed(_task)) => {
-                    self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
-                    let scheduled = self.schedule_bucket_compensation(&oi.bucket);
+                None => {
                     warn!(
                         bucket = %oi.bucket,
                         object = %oi.name,
@@ -720,6 +710,63 @@ impl TransitionState {
                         compensation_scheduled = scheduled,
                         "transition enqueue failed because the queue is closed"
                     );
+                }
+            },
+            ImmediateEnqueueFailure::QueueSendTimedOut { timeout_ms } => {
+                Self::inc_counter(&self.queue_send_timeout_tasks);
+                warn!(
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    source = ?src,
+                    timeout_ms,
+                    compensation_scheduled = scheduled,
+                    "transition enqueue timed out under backpressure"
+                );
+            }
+        }
+    }
+
+    pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
+        if is_immediate_transition_source(src) && should_force_immediate_transition_enqueue_timeout() {
+            self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::ForcedTimeout);
+            return;
+        }
+
+        let task = TransitionTask {
+            obj_info: oi.clone(),
+            src: src.clone(),
+            event: event.clone(),
+        };
+        if is_immediate_transition_source(src) {
+            match self.transition_tx.try_send(Some(task)) {
+                Ok(()) => {}
+                Err(async_channel::TrySendError::Full(task)) => {
+                    Self::inc_counter(&self.queue_full_tasks);
+                    let send_timeout = self.transition_queue_send_timeout;
+                    match tokio::time::timeout(send_timeout, self.transition_tx.send(task)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            self.handle_immediate_enqueue_failure(
+                                oi,
+                                src,
+                                ImmediateEnqueueFailure::QueueClosed {
+                                    timeout_ms: Some(send_timeout.as_millis() as u64),
+                                },
+                            );
+                        }
+                        Err(_) => {
+                            self.handle_immediate_enqueue_failure(
+                                oi,
+                                src,
+                                ImmediateEnqueueFailure::QueueSendTimedOut {
+                                    timeout_ms: send_timeout.as_millis() as u64,
+                                },
+                            );
+                        }
+                    }
+                }
+                Err(async_channel::TrySendError::Closed(_task)) => {
+                    self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::QueueClosed { timeout_ms: None });
                 }
             }
             return;
@@ -770,27 +817,27 @@ impl TransitionState {
     }
 
     pub fn active_tasks(&self) -> i64 {
-        self.active_tasks.load(Ordering::SeqCst)
+        Self::counter_value(&self.active_tasks)
     }
 
     pub fn missed_immediate_tasks(&self) -> i64 {
-        self.missed_immediate_tasks.load(Ordering::SeqCst)
+        Self::counter_value(&self.missed_immediate_tasks)
     }
 
     pub fn queue_full_tasks(&self) -> i64 {
-        self.queue_full_tasks.load(Ordering::SeqCst)
+        Self::counter_value(&self.queue_full_tasks)
     }
 
     pub fn queue_send_timeout_tasks(&self) -> i64 {
-        self.queue_send_timeout_tasks.load(Ordering::SeqCst)
+        Self::counter_value(&self.queue_send_timeout_tasks)
     }
 
     pub fn compensation_scheduled_tasks(&self) -> i64 {
-        self.compensation_scheduled_tasks.load(Ordering::SeqCst)
+        Self::counter_value(&self.compensation_scheduled_tasks)
     }
 
     pub fn compensation_running_tasks(&self) -> i64 {
-        self.compensation_running_tasks.load(Ordering::SeqCst)
+        Self::counter_value(&self.compensation_running_tasks)
     }
 
     pub async fn worker(api: Arc<ECStore>) {
@@ -813,7 +860,7 @@ impl TransitionState {
                     if task.as_any().is::<TransitionTask>() {
                         let task = task.as_any().downcast_ref::<TransitionTask>().expect("TransitionTask downcast failed");
 
-                        GLOBAL_TransitionState.active_tasks.fetch_add(1, Ordering::SeqCst);
+                        TransitionState::inc_counter(&GLOBAL_TransitionState.active_tasks);
 
                         let obj_info_for_event = ObjectInfo {
                             bucket: task.obj_info.bucket.clone(),
@@ -858,7 +905,7 @@ impl TransitionState {
                                 ..Default::default()
                             });
                         }
-                        GLOBAL_TransitionState.active_tasks.fetch_add(-1, Ordering::SeqCst);
+                        TransitionState::add_counter(&GLOBAL_TransitionState.active_tasks, -1);
                     }
                 }
                 else => ()
