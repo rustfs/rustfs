@@ -1016,10 +1016,6 @@ async fn gather_results(
     recv: Receiver<MetaCacheEntry>,
     results_tx: Sender<MetaCacheEntriesSortedResult>,
 ) -> Result<()> {
-    let mut returned = false;
-
-    let mut sender = Some(results_tx);
-
     let mut recv = recv;
     let mut entries = Vec::new();
     while let Some(mut entry) = recv.recv().await {
@@ -1027,10 +1023,6 @@ async fn gather_results(
         {
             // normalize windows path separator
             entry.name = entry.name.replace("\\", "/");
-        }
-
-        if returned {
-            continue;
         }
 
         // TODO: rx.recv()
@@ -1066,8 +1058,8 @@ async fn gather_results(
         // TODO: Lifecycle
 
         if opts.limit > 0 && entries.len() >= opts.limit as usize {
-            if let Some(tx) = sender {
-                tx.send(MetaCacheEntriesSortedResult {
+            results_tx
+                .send(MetaCacheEntriesSortedResult {
                     entries: Some(MetaCacheEntriesSorted {
                         o: MetaCacheEntries(entries.clone()),
                         ..Default::default()
@@ -1076,11 +1068,7 @@ async fn gather_results(
                 })
                 .await
                 .map_err(Error::other)?;
-
-                returned = true;
-                sender = None;
-            }
-            continue;
+            return Ok(());
         }
 
         entries.push(Some(entry));
@@ -1088,8 +1076,8 @@ async fn gather_results(
     }
 
     // finish not full, return eof
-    if let Some(tx) = sender {
-        tx.send(MetaCacheEntriesSortedResult {
+    results_tx
+        .send(MetaCacheEntriesSortedResult {
             entries: Some(MetaCacheEntriesSorted {
                 o: MetaCacheEntries(entries.clone()),
                 ..Default::default()
@@ -1098,7 +1086,6 @@ async fn gather_results(
         })
         .await
         .map_err(Error::other)?;
-    }
 
     Ok(())
 }
@@ -1443,9 +1430,54 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use super::{ListPathOptions, MAX_OBJECT_LIST, max_keys_plus_one, walk_result_from_set_errors};
+    use super::{ListPathOptions, MAX_OBJECT_LIST, gather_results, max_keys_plus_one, walk_result_from_set_errors};
     use crate::error::StorageError;
+    use rustfs_filemeta::MetaCacheEntry;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    fn test_meta_entry(name: &str) -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn gather_results_returns_after_limit_without_waiting_for_input_close() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+
+        entry_tx.send(test_meta_entry("obj-a")).await.unwrap();
+        entry_tx.send(test_meta_entry("obj-b")).await.unwrap();
+
+        let handle = tokio::spawn(gather_results(
+            CancellationToken::new(),
+            ListPathOptions {
+                bucket: "bucket".to_owned(),
+                limit: 1,
+                incl_deleted: true,
+                ..Default::default()
+            },
+            entry_rx,
+            result_tx,
+        ));
+
+        let result = timeout(Duration::from_secs(1), result_rx.recv())
+            .await
+            .expect("limited result should be sent promptly")
+            .expect("limited result should be present");
+        assert_eq!(result.entries.unwrap().entries().len(), 1);
+
+        timeout(Duration::from_millis(50), handle)
+            .await
+            .expect("gather_results should finish after sending a limited result")
+            .expect("gather_results task should not panic")
+            .expect("gather_results should succeed");
+    }
 
     #[test]
     fn test_max_keys_plus_one_caps_before_lookahead() {
