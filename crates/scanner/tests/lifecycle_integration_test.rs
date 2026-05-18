@@ -251,7 +251,7 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
     info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
 }
 
-async fn versioned_delete_opts(bucket: &str, object: &str) -> ObjectOptions {
+async fn modeled_versioned_delete_opts(bucket: &str, object: &str) -> ObjectOptions {
     ObjectOptions {
         versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
         version_suspended: BucketVersioningSys::prefix_suspended(bucket, object).await,
@@ -1571,7 +1571,7 @@ mod serial_tests {
             .delete_object(
                 bucket_name.as_str(),
                 object_name,
-                versioned_delete_opts(bucket_name.as_str(), object_name).await,
+                modeled_versioned_delete_opts(bucket_name.as_str(), object_name).await,
             )
             .await
             .expect("modeled versioned delete should succeed");
