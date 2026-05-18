@@ -285,7 +285,8 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
 /// Test helper: Set bucket lifecycle configuration
 #[allow(dead_code)]
 async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
+    // Create lifecycle rule that targets delete-marker cleanup only.
+    // Keep Expiration.Days unset to avoid expiring live transitioned object versions.
     let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <LifecycleConfiguration>
     <Rule>
@@ -295,13 +296,35 @@ async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<
             <Prefix>test/</Prefix>
         </Filter>
         <Expiration>
-            <Days>0</Days>
             <ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>
         </Expiration>
     </Rule>
 </LifecycleConfiguration>"#;
 
     metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64) -> Result<(), Box<dyn std::error::Error>> {
+    let lifecycle_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <DelMarkerExpiration>
+            <Days>{days}</Days>
+        </DelMarkerExpiration>
+    </Rule>
+</LifecycleConfiguration>"#
+    );
+
+    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
 
     Ok(())
 }
@@ -1583,6 +1606,83 @@ mod serial_tests {
         assert!(
             backend.objects.lock().await.contains_key(&remote_object),
             "creating a delete marker should not remove the transitioned remote object version"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_modeled_delete_marker_cleanup_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-modeled-del-marker-cleanup-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"modeled delete-marker cleanup should converge after compensation transition";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set transition lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+        ecstore
+            .delete_object(
+                bucket_name.as_str(),
+                object_name,
+                modeled_versioned_delete_opts(bucket_name.as_str(), object_name).await,
+            )
+            .await
+            .expect("modeled versioned delete should succeed");
+
+        assert!(
+            object_is_delete_marker(&ecstore, bucket_name.as_str(), object_name).await,
+            "modeled versioned delete should create delete marker before cleanup"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&remote_object),
+            "delete marker creation should not remove transitioned remote object"
+        );
+
+        set_bucket_lifecycle_delmarker_expiration(bucket_name.as_str(), 1)
+            .await
+            .expect("Failed to set delete marker expiration lifecycle configuration");
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            object_is_delete_marker(&ecstore, bucket_name.as_str(), object_name).await,
+            "delete marker should remain before DelMarkerExpiration due time"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&remote_object),
+            "pre-due delete marker lifecycle scan should not remove transitioned remote object"
+        );
+
+        set_bucket_lifecycle_deletemarker(bucket_name.as_str())
+            .await
+            .expect("Failed to set expired object delete marker lifecycle configuration");
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(5)).await,
+            "expired object delete marker lifecycle should eventually clean up the delete marker"
+        );
+        assert!(
+            backend.objects.lock().await.contains_key(&remote_object),
+            "delete marker lifecycle cleanup should not remove transitioned remote object"
         );
     }
 
