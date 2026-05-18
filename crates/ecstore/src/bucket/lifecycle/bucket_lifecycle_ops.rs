@@ -942,7 +942,7 @@ impl TransitionState {
             n = effective;
         }
         // Allow environment override of maximum workers
-        let absolute_max = get_env_i64("RUSTFS_ABSOLUTE_MAX_WORKERS", DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+        let absolute_max = get_env_i64(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
         n = std::cmp::min(n, absolute_max);
 
         let previous_num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
@@ -2269,6 +2269,7 @@ mod tests {
         BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader,
     };
     use futures::FutureExt;
+    use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;
@@ -2299,7 +2300,7 @@ mod tests {
         F: FnOnce(),
     {
         let original_transition = env::var_os("RUSTFS_MAX_TRANSITION_WORKERS");
-        let original_absolute = env::var_os("RUSTFS_ABSOLUTE_MAX_WORKERS");
+        let original_absolute = env::var_os(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
 
         match transition {
             Some(value) => unsafe {
@@ -2311,10 +2312,10 @@ mod tests {
         }
         match absolute {
             Some(value) => unsafe {
-                env::set_var("RUSTFS_ABSOLUTE_MAX_WORKERS", value);
+                env::set_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, value);
             },
             None => unsafe {
-                env::remove_var("RUSTFS_ABSOLUTE_MAX_WORKERS");
+                env::remove_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
             },
         }
 
@@ -2330,10 +2331,10 @@ mod tests {
         }
         match original_absolute {
             Some(value) => unsafe {
-                env::set_var("RUSTFS_ABSOLUTE_MAX_WORKERS", value);
+                env::set_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, value);
             },
             None => unsafe {
-                env::remove_var("RUSTFS_ABSOLUTE_MAX_WORKERS");
+                env::remove_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
             },
         }
 
@@ -2349,7 +2350,7 @@ mod tests {
         Fut: std::future::Future<Output = ()>,
     {
         let original_transition = env::var_os("RUSTFS_MAX_TRANSITION_WORKERS");
-        let original_absolute = env::var_os("RUSTFS_ABSOLUTE_MAX_WORKERS");
+        let original_absolute = env::var_os(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
 
         match transition {
             Some(value) => unsafe {
@@ -2361,10 +2362,10 @@ mod tests {
         }
         match absolute {
             Some(value) => unsafe {
-                env::set_var("RUSTFS_ABSOLUTE_MAX_WORKERS", value);
+                env::set_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, value);
             },
             None => unsafe {
-                env::remove_var("RUSTFS_ABSOLUTE_MAX_WORKERS");
+                env::remove_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
             },
         }
 
@@ -2380,10 +2381,10 @@ mod tests {
         }
         match original_absolute {
             Some(value) => unsafe {
-                env::set_var("RUSTFS_ABSOLUTE_MAX_WORKERS", value);
+                env::set_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, value);
             },
             None => unsafe {
-                env::remove_var("RUSTFS_ABSOLUTE_MAX_WORKERS");
+                env::remove_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
             },
         }
 
