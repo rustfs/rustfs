@@ -587,13 +587,16 @@ impl ECStore {
         let store = self.clone();
         let opts = o.clone();
         let cancel_rx1 = cancel.clone();
+        let cancel_rx1_for_err = cancel_rx1.clone();
         let err_tx1 = err_tx.clone();
         let job1 = tokio::spawn(async move {
             let mut opts = opts;
             opts.stop_disk_at_limit = true;
             if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await {
-                error!("list_merged err {:?}", err);
-                let _ = err_tx1.send(Arc::new(err));
+                if !cancel_rx1_for_err.is_cancelled() {
+                    error!("list_merged err {:?}", err);
+                    let _ = err_tx1.send(Arc::new(err));
+                }
             }
         });
 
