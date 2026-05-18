@@ -91,7 +91,7 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 - Do not reflect arbitrary `Origin` while also allowing credentials. Default CORS should be no CORS unless explicitly configured.
 - Do not render user-controlled object content in a same-origin iframe with console credentials available to JavaScript.
 - Prefer origin separation for object preview/download, `nosniff`, CSP, strict content-type handling, and avoiding durable credentials in `localStorage`.
-- License/version-like metadata endpoints should expose only coarse public data unless authenticated.
+- Console license/version-like metadata endpoints should expose only coarse public data unless authenticated, especially subject names and expiration timestamps.
 
 ### Profiling, debug, and health endpoints
 - Profiling and debug endpoints are not health checks. They require admin auth, opt-in enablement, rate limiting, and safe responses.

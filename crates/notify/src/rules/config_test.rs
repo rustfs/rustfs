@@ -161,6 +161,39 @@ mod integration_tests {
         assert!(targets.is_empty(), "Files not in images/ should not match");
     }
 
+    #[test]
+    fn test_capitalized_filter_names_xml() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<NotificationConfiguration>
+    <QueueConfiguration>
+        <Id>test-queue</Id>
+        <Queue>arn:rustfs:sqs:ap-northeast-1:primary:webhook</Queue>
+        <Event>s3:ObjectCreated:*</Event>
+        <Filter>
+            <S3Key>
+                <FilterRule>
+                    <Name>Prefix</Name>
+                    <Value>uploads/</Value>
+                </FilterRule>
+                <FilterRule>
+                    <Name>Suffix</Name>
+                    <Value>.csv</Value>
+                </FilterRule>
+            </S3Key>
+        </Filter>
+    </QueueConfiguration>
+</NotificationConfiguration>"#;
+
+        let current_region = "ap-northeast-1";
+        let arn_list = vec!["arn:rustfs:sqs:ap-northeast-1:primary:webhook".to_string()];
+
+        let config = BucketNotificationConfig::from_xml(Cursor::new(xml.as_bytes()), current_region, &arn_list).unwrap();
+        let rules_map = config.get_rules_map();
+
+        let targets = rules_map.match_rules(EventName::ObjectCreatedPut, "uploads/report.csv");
+        assert!(!targets.is_empty(), "capitalized filter names should still build prefix/suffix rules");
+    }
+
     /// Test suffix only filter
     #[test]
     fn test_suffix_only_filter_xml() {
