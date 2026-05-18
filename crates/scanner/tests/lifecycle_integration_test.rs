@@ -532,6 +532,22 @@ async fn wait_for_version_count(ecstore: &Arc<ECStore>, bucket: &str, object: &s
     }
 }
 
+async fn wait_for_remote_object_count(backend: &MockWarmBackend, expected: usize, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if backend.objects.lock().await.len() == expected {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn scan_object_with_lifecycle(disk_path: &Path, bucket: &str, object: &str) {
     let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
     endpoint.set_pool_index(0);
@@ -1425,6 +1441,89 @@ mod serial_tests {
         assert!(
             wait_for_version_count(&ecstore, bucket_name.as_str(), object_name, 1, Duration::from_secs(3)).await,
             "noncurrent expiry should still remove the previous version after compensation transition"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_noncurrent_transition_still_works_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-noncurrent-transition-comp-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <Transition>
+          <Days>0</Days>
+          <StorageClass>{tier_name}</StorageClass>
+        </Transition>
+        <NoncurrentVersionTransition>
+            <NoncurrentDays>0</NoncurrentDays>
+            <StorageClass>{tier_name}</StorageClass>
+        </NoncurrentVersionTransition>
+    </Rule>
+</LifecycleConfiguration>"#
+        );
+        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        let mut reader = PutObjReader::from_vec(b"v1".to_vec());
+        ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to upload v1");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            let mut reader = PutObjReader::from_vec(b"v2".to_vec());
+            ecstore
+                .put_object(
+                    bucket_name.as_str(),
+                    object_name,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("failed to upload v2");
+        })
+        .await;
+
+        let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+        assert_eq!(info.transitioned_object.status, "complete");
+        assert_eq!(info.transitioned_object.tier, tier_name);
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_remote_object_count(&backend, 2, TRANSITION_WAIT_TIMEOUT).await,
+            "noncurrent transition should still move the previous version into the remote tier"
         );
     }
 
