@@ -62,10 +62,7 @@ fn map_cpu_profile_collect_error_message(err: &str) -> (StatusCode, String) {
             "CPU profiler is already running. Disable RUSTFS_OBS_PROFILING_EXPORT_ENABLED or retry later.".to_string(),
         );
     }
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Failed to collect CPU profile: {err}"),
-    )
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to collect CPU profile: {err}"))
 }
 
 #[async_trait::async_trait]
@@ -229,9 +226,9 @@ impl Operation for ProfileStatusHandler {
 mod tests {
     use super::{ProfileHandler, ProfileStatusHandler, extract_query_params};
     use crate::admin::router::Operation;
-    use hyper::StatusCode;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
+    use hyper::StatusCode;
     use matchit::Params;
     use s3s::{Body, S3ErrorCode, S3Request};
 
@@ -290,7 +287,8 @@ mod tests {
 
     #[test]
     fn cpu_profile_collect_error_maps_profiler_conflict_to_409() {
-        let (status, message) = super::map_cpu_profile_collect_error_message("create profiler failed: start running cpu profiler error");
+        let (status, message) =
+            super::map_cpu_profile_collect_error_message("create profiler failed: start running cpu profiler error");
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(message.contains("CPU profiler is already running"));
     }
