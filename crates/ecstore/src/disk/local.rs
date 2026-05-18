@@ -1234,6 +1234,7 @@ impl LocalDisk {
     }
 
     #[async_recursion::async_recursion]
+    #[allow(clippy::too_many_arguments)]
     async fn scan_dir<W>(
         &self,
         mut current: String,
@@ -1242,6 +1243,7 @@ impl LocalDisk {
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
         skip_current_dir_object: bool,
+        multipart_dir_to_skip: Option<HashSet<String>>,
     ) -> Result<()>
     where
         W: AsyncWrite + Unpin + Send,
@@ -1291,20 +1293,6 @@ impl LocalDisk {
 
         let mut dir_objes = HashSet::new();
 
-        // need to skip multipart dirs
-        let mut multipart_dir_to_skip = HashSet::new();
-        if skip_current_dir_object
-            && let Ok(meta) = self
-                .read_metadata(bucket, format!("{}/{}", &current, STORAGE_FORMAT_FILE).as_str())
-                .await
-            && let Ok(file_meta) = FileMeta::load(&meta)
-            && let Ok(data_dirs) = file_meta.get_data_dirs()
-        {
-            for data_dir in data_dirs.iter().flatten() {
-                multipart_dir_to_skip.insert(data_dir.to_string());
-            }
-        }
-
         // First-level filtering
         for item in entries.iter_mut() {
             let entry = item.clone();
@@ -1313,7 +1301,10 @@ impl LocalDisk {
                 return Ok(());
             }
             // check multipart dir
-            if skip_current_dir_object && multipart_dir_to_skip.contains(entry.trim_end_matches(SLASH_SEPARATOR)) {
+            if skip_current_dir_object
+                && let Some(ref dir_to_skip) = multipart_dir_to_skip
+                && dir_to_skip.contains(entry.trim_end_matches(SLASH_SEPARATOR))
+            {
                 *item = "".to_owned();
                 continue;
             }
@@ -1386,15 +1377,25 @@ impl LocalDisk {
             }
         }
 
-        let mut dir_stack: Vec<(String, bool)> = Vec::with_capacity(5);
+        let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>)> = Vec::with_capacity(5);
         // Explicit directory markers and real directories can resolve to the same logical path.
-        let schedule_dir = |dir_stack: &mut Vec<(String, bool)>, dir_name: String, skip_object: bool| {
-            if let Some((last_dir_name, existing_skip_object)) = dir_stack.last_mut()
+        let schedule_dir = |dir_stack: &mut Vec<(String, bool, Option<HashSet<String>>)>,
+                            dir_name: String,
+                            skip_object: bool,
+                            dir_to_skip: Option<HashSet<String>>| {
+            if let Some((last_dir_name, existing_skip_object, existing_dir_to_skip)) = dir_stack.last_mut()
                 && *last_dir_name == dir_name
             {
                 *existing_skip_object |= skip_object;
+                if let Some(existing_dir_to_skip) = existing_dir_to_skip {
+                    if let Some(new_dir_to_skip) = &dir_to_skip {
+                        existing_dir_to_skip.extend(new_dir_to_skip.iter().cloned());
+                    }
+                } else {
+                    *existing_dir_to_skip = dir_to_skip;
+                }
             } else {
-                dir_stack.push((dir_name, skip_object));
+                dir_stack.push((dir_name, skip_object, dir_to_skip));
             }
         };
         prefix = "".to_owned();
@@ -1410,7 +1411,7 @@ impl LocalDisk {
 
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
-            while let Some((pop, skip_object)) = dir_stack.last().cloned()
+            while let Some((pop, skip_object, dir_to_skip)) = dir_stack.last().cloned()
                 && pop < name
             {
                 out.write_obj(&MetaCacheEntry {
@@ -1420,7 +1421,8 @@ impl LocalDisk {
                 .await?;
 
                 if opts.recursive
-                    && let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object)).await
+                    && let Err(er) =
+                        Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
                 {
                     error!("scan_dir err {:?}", er);
                 }
@@ -1461,11 +1463,24 @@ impl LocalDisk {
                     // }
 
                     if opts.recursive {
+                        let mut dir_to_skip = HashSet::new();
+                        if let Ok(file_meta) = FileMeta::load(&res)
+                            && let Ok(data_dirs) = file_meta.get_data_dirs()
+                        {
+                            for data_dir in data_dirs.iter().flatten() {
+                                dir_to_skip.insert(data_dir.to_string());
+                            }
+                        }
                         let mut dir_name = meta.name.clone();
                         if !dir_name.ends_with(SLASH_SEPARATOR) {
                             dir_name.push_str(SLASH_SEPARATOR);
                         }
-                        schedule_dir(&mut dir_stack, dir_name, true);
+                        schedule_dir(
+                            &mut dir_stack,
+                            dir_name,
+                            true,
+                            if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
+                        );
                     }
                 }
                 Err(err) => {
@@ -1474,7 +1489,7 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            schedule_dir(&mut dir_stack, meta.name, false);
+                            schedule_dir(&mut dir_stack, meta.name, false, None);
                         }
                     }
 
@@ -1483,7 +1498,7 @@ impl LocalDisk {
             };
         }
 
-        while let Some((dir, skip_object)) = dir_stack.pop() {
+        while let Some((dir, skip_object, dir_to_skip)) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
             }
@@ -1495,7 +1510,8 @@ impl LocalDisk {
             .await?;
 
             if opts.recursive
-                && let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object)).await
+                && let Err(er) =
+                    Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
             {
                 warn!("scan_dir err {:?}", &er);
             }
@@ -2347,6 +2363,7 @@ impl DiskAPI for LocalDisk {
         let mut objs_returned = 0;
 
         let mut skip_current_dir_object = false;
+        let mut multipart_dir_to_skip: HashSet<String> = HashSet::new();
         if opts.base_dir.ends_with(SLASH_SEPARATOR) {
             if let Ok(data) = self
                 .read_metadata(
@@ -2370,10 +2387,23 @@ impl DiskAPI for LocalDisk {
                 let fpath =
                     self.get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
 
-                if let Ok(meta) = tokio::fs::metadata(fpath).await
+                if let Ok(meta) = tokio::fs::metadata(&fpath).await
                     && meta.is_file()
                 {
                     skip_current_dir_object = true;
+                    if let Ok(meta_bytes) = self
+                        .read_metadata(
+                            opts.bucket.as_str(),
+                            path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str(),
+                        )
+                        .await
+                        && let Ok(file_meta) = FileMeta::load(&meta_bytes)
+                        && let Ok(data_dirs) = file_meta.get_data_dirs()
+                    {
+                        for data_dir in data_dirs.iter().flatten() {
+                            multipart_dir_to_skip.insert(data_dir.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -2385,6 +2415,11 @@ impl DiskAPI for LocalDisk {
             &mut out,
             &mut objs_returned,
             skip_current_dir_object,
+            if multipart_dir_to_skip.is_empty() {
+                None
+            } else {
+                Some(multipart_dir_to_skip.clone())
+            },
         )
         .await?;
 
@@ -3170,7 +3205,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
             .unwrap();
         out.close().await.unwrap();
@@ -3225,7 +3260,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
             .unwrap();
         out.close().await.unwrap();
@@ -3285,7 +3320,7 @@ mod test {
             };
             let mut objs_returned = 0;
 
-            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
                 .await
                 .unwrap();
             out.close().await.unwrap();
@@ -3408,6 +3443,7 @@ mod test {
         let mut out = MetacacheWriter::new(&mut writer);
         let mut objs_returned = 0;
 
+        let multipart_dir_to_skip = HashSet::from([UUID_OBJ.to_string()]);
         disk.scan_dir(
             BASE_DIR.to_string(),
             EMPTY_STR.to_string(),
@@ -3421,6 +3457,7 @@ mod test {
             &mut out,
             &mut objs_returned,
             true,
+            Some(multipart_dir_to_skip),
         )
         .await
         .unwrap();
@@ -3429,6 +3466,7 @@ mod test {
         let mut reader = MetacacheReader::new(reader);
         let entries = reader.read_all().await.unwrap();
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
+
         assert_eq!(
             names
                 .iter()
