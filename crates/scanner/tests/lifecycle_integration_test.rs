@@ -1304,6 +1304,49 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     #[ignore = "requires isolated global object layer state"]
+    async fn test_existing_object_backfill_is_idempotent_after_immediate_compensation_transition() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-backfill-after-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"existing-object backfill should be idempotent after compensation transition";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition after immediate compensation backfill");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("existing-object backfill should succeed after compensation transition");
+
+        let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should remain transitioned after existing-object backfill rerun");
+
+        assert_eq!(info.transitioned_object.status, "complete");
+        assert_eq!(info.transitioned_object.tier, tier_name);
+        assert_eq!(info.transitioned_object.name, remote_object);
+        assert!(backend.objects.lock().await.contains_key(&remote_object));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_scanner_expires_zero_day_current_version() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
