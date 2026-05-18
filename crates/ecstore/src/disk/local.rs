@@ -3382,7 +3382,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_scan_dir_ignore_multipart_dirs() {
+    async fn test_walk_dir_ignore_multipart_dirs() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
 
@@ -3440,28 +3440,19 @@ mod test {
         let disk = LocalDisk::new(&endpoint, false).await.unwrap();
 
         let (reader, mut writer) = tokio::io::duplex(4096);
-        let mut out = MetacacheWriter::new(&mut writer);
-        let mut objs_returned = 0;
-
-        let multipart_dir_to_skip = HashSet::from([UUID_OBJ.to_string()]);
-        disk.scan_dir(
-            BASE_DIR.to_string(),
-            EMPTY_STR.to_string(),
-            &WalkDirOptions {
+        disk.walk_dir(
+            WalkDirOptions {
                 bucket: "test-bucket".to_string(),
                 base_dir: BASE_DIR.to_string(),
                 recursive: true,
                 filter_prefix: Some(EMPTY_STR.to_string()),
                 ..Default::default()
             },
-            &mut out,
-            &mut objs_returned,
-            true,
-            Some(multipart_dir_to_skip),
+            &mut writer,
         )
         .await
         .unwrap();
-        out.close().await.unwrap();
+        MetacacheWriter::new(&mut writer).close().await.unwrap();
 
         let mut reader = MetacacheReader::new(reader);
         let entries = reader.read_all().await.unwrap();
