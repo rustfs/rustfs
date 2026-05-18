@@ -863,6 +863,60 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "requires isolated global object layer state"]
+async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-comp-versioned-delete-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let payload = b"versioned delete should preserve transitioned remote version behind delete marker";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+        .await
+        .expect("Failed to set lifecycle configuration");
+
+    with_forced_immediate_enqueue_timeout(|| async {
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+    })
+    .await;
+
+    let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object should eventually transition after compensation backfill");
+    let remote_object = transitioned.transitioned_object.name.clone();
+
+    assert!(backend.objects.lock().await.contains_key(&remote_object));
+
+    let req = build_request(
+        DeleteObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .unwrap(),
+        Method::DELETE,
+    );
+
+    Box::pin(usecase.execute_delete_object(req))
+        .await
+        .expect("Failed to issue versioned delete after compensation-driven transition");
+
+    assert!(
+        wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
+        "versioned delete should create a delete marker after compensation-driven transition"
+    );
+    assert!(
+        backend.objects.lock().await.contains_key(&remote_object),
+        "creating a delete marker should not remove the transitioned remote object version"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
 async fn put_bucket_lifecycle_configuration_expires_existing_objects() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultBucketUsecase::without_context();
