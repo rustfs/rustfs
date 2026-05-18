@@ -122,7 +122,9 @@ fn resolve_transition_queue_capacity() -> usize {
 }
 
 fn resolve_transition_queue_send_timeout() -> StdDuration {
-    StdDuration::from_millis(get_env_usize(ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS).max(1) as u64)
+    StdDuration::from_millis(
+        get_env_usize(ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS).max(1) as u64,
+    )
 }
 
 fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
