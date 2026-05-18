@@ -73,6 +73,11 @@ pub fn set_enabled(enabled: bool) {
     let _ = &*STACK_CACHE;
 
     ENABLED.store(enabled, Ordering::Relaxed);
+
+    if !enabled {
+        LIVE_ALLOCATIONS.clear();
+        STACK_CACHE.clear();
+    }
 }
 
 fn should_sample(size: usize) -> bool {
@@ -321,20 +326,26 @@ fn dump_profile_inner(path: &Path) -> Result<(), String> {
 // Helper to handle sampling logic
 #[inline(always)]
 fn handle_alloc_sampling(ptr: *mut u8, size: usize) {
-    if !ptr.is_null() {
-        // Check reentrancy guard BEFORE calling should_sample
-        if !REENTRANCY_GUARD.replace(true) {
-            if should_sample(size) {
-                record_alloc(ptr, size);
-            }
-            REENTRANCY_GUARD.set(false);
+    if ptr.is_null() || !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    // Check reentrancy guard BEFORE calling should_sample
+    if !REENTRANCY_GUARD.replace(true) {
+        if should_sample(size) {
+            record_alloc(ptr, size);
         }
+        REENTRANCY_GUARD.set(false);
     }
 }
 
 // Helper to handle dealloc logic
 #[inline(always)]
 fn handle_dealloc_sampling(ptr: *mut u8) {
+    if ptr.is_null() || !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
     if !REENTRANCY_GUARD.replace(true) {
         record_dealloc(ptr);
         REENTRANCY_GUARD.set(false);
@@ -439,6 +450,36 @@ mod tests {
 
         REENTRANCY_GUARD.set(false);
         set_enabled(false);
+    }
+
+    #[test]
+    #[serial]
+    fn test_disabled_dealloc_skips_tracking_map() {
+        set_enabled(false);
+
+        let key = usize::MAX - 1;
+        LIVE_ALLOCATIONS.insert(key, (1, Arc::new(vec![key])));
+
+        handle_dealloc_sampling(key as *mut u8);
+
+        assert!(LIVE_ALLOCATIONS.get(&key).is_some());
+        LIVE_ALLOCATIONS.remove(&key);
+    }
+
+    #[test]
+    #[serial]
+    fn test_disabling_clears_tracking_maps() {
+        set_enabled(true);
+
+        let key = usize::MAX - 2;
+        let stack_key = u64::MAX - 2;
+        LIVE_ALLOCATIONS.insert(key, (1, Arc::new(vec![key])));
+        STACK_CACHE.insert(stack_key, Weak::new());
+
+        set_enabled(false);
+
+        assert!(LIVE_ALLOCATIONS.get(&key).is_none());
+        assert!(STACK_CACHE.get(&stack_key).is_none());
     }
 
     #[test]
