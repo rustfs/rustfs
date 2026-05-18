@@ -1,0 +1,219 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Profiling-first 4-node local-build compose.
+#
+# Goals:
+# - force linux/amd64 runtime/build on Apple Silicon hosts;
+# - enable RustFS built-in CPU profiling;
+# - keep all tuning knobs host-overridable via env.
+
+services:
+  node1:
+    platform: ${RUSTFS_DOCKER_PLATFORM:-linux/amd64}
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:local-4node}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.source
+    hostname: node1
+    environment:
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
+      - RUSTFS_OBS_PROFILING_ENDPOINT=${RUSTFS_OBS_PROFILING_ENDPOINT:-http://host.docker.internal:4040}
+      - RUSTFS_OBS_PROFILING_EXPORT_ENABLED=${RUSTFS_OBS_PROFILING_EXPORT_ENABLED:-true}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      - RUSTFS_ENABLE_PROFILING=${RUSTFS_ENABLE_PROFILING:-true}
+      - RUSTFS_PROF_CPU_MODE=${RUSTFS_PROF_CPU_MODE:-continuous}
+      - RUSTFS_PROF_CPU_FREQ=${RUSTFS_PROF_CPU_FREQ:-99}
+      - RUSTFS_PROF_OUTPUT_DIR=${RUSTFS_PROF_OUTPUT_DIR:-/tmp/rustfs-profiles}
+      - RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=${RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS:-48}
+      - RUSTFS_OBJECT_IO_BUFFER_SIZE=${RUSTFS_OBJECT_IO_BUFFER_SIZE:-262144}
+      - RUSTFS_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD=${RUSTFS_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD:-6}
+      - RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=${RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD:-12}
+      - RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY=${RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY:-8}
+      - RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=${RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE:-8388608}
+      - RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES=${RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES:-25165824}
+      - RUSTFS_RUNTIME_WORKER_THREADS=${RUSTFS_RUNTIME_WORKER_THREADS:-12}
+      - RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=${RUSTFS_RUNTIME_MAX_BLOCKING_THREADS:-512}
+      - RUSTFS_ALLOCATOR_RECLAIM_ENABLED=${RUSTFS_ALLOCATOR_RECLAIM_ENABLED:-false}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - node1_data_0:/data/rustfs0
+      - node1_data_1:/data/rustfs1
+      - node1_data_2:/data/rustfs2
+      - node1_data_3:/data/rustfs3
+    ports:
+      - "9000:9000"
+    networks:
+      - rustfs-cluster-net
+
+  node2:
+    platform: ${RUSTFS_DOCKER_PLATFORM:-linux/amd64}
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:local-4node}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.source
+    hostname: node2
+    environment:
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
+      - RUSTFS_OBS_PROFILING_ENDPOINT=${RUSTFS_OBS_PROFILING_ENDPOINT:-http://host.docker.internal:4040}
+      - RUSTFS_OBS_PROFILING_EXPORT_ENABLED=${RUSTFS_OBS_PROFILING_EXPORT_ENABLED:-true}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      - RUSTFS_ENABLE_PROFILING=${RUSTFS_ENABLE_PROFILING:-true}
+      - RUSTFS_PROF_CPU_MODE=${RUSTFS_PROF_CPU_MODE:-continuous}
+      - RUSTFS_PROF_CPU_FREQ=${RUSTFS_PROF_CPU_FREQ:-99}
+      - RUSTFS_PROF_OUTPUT_DIR=${RUSTFS_PROF_OUTPUT_DIR:-/tmp/rustfs-profiles}
+      - RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=${RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS:-48}
+      - RUSTFS_OBJECT_IO_BUFFER_SIZE=${RUSTFS_OBJECT_IO_BUFFER_SIZE:-262144}
+      - RUSTFS_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD=${RUSTFS_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD:-6}
+      - RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=${RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD:-12}
+      - RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY=${RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY:-8}
+      - RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=${RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE:-8388608}
+      - RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES=${RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES:-25165824}
+      - RUSTFS_RUNTIME_WORKER_THREADS=${RUSTFS_RUNTIME_WORKER_THREADS:-12}
+      - RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=${RUSTFS_RUNTIME_MAX_BLOCKING_THREADS:-512}
+      - RUSTFS_ALLOCATOR_RECLAIM_ENABLED=${RUSTFS_ALLOCATOR_RECLAIM_ENABLED:-false}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - node2_data_0:/data/rustfs0
+      - node2_data_1:/data/rustfs1
+      - node2_data_2:/data/rustfs2
+      - node2_data_3:/data/rustfs3
+    ports:
+      - "9001:9000"
+    networks:
+      - rustfs-cluster-net
+
+  node3:
+    platform: ${RUSTFS_DOCKER_PLATFORM:-linux/amd64}
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:local-4node}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.source
+    hostname: node3
+    environment:
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
+      - RUSTFS_OBS_PROFILING_ENDPOINT=${RUSTFS_OBS_PROFILING_ENDPOINT:-http://host.docker.internal:4040}
+      - RUSTFS_OBS_PROFILING_EXPORT_ENABLED=${RUSTFS_OBS_PROFILING_EXPORT_ENABLED:-true}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      - RUSTFS_ENABLE_PROFILING=${RUSTFS_ENABLE_PROFILING:-true}
+      - RUSTFS_PROF_CPU_MODE=${RUSTFS_PROF_CPU_MODE:-continuous}
+      - RUSTFS_PROF_CPU_FREQ=${RUSTFS_PROF_CPU_FREQ:-99}
+      - RUSTFS_PROF_OUTPUT_DIR=${RUSTFS_PROF_OUTPUT_DIR:-/tmp/rustfs-profiles}
+      - RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=${RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS:-48}
+      - RUSTFS_OBJECT_IO_BUFFER_SIZE=${RUSTFS_OBJECT_IO_BUFFER_SIZE:-262144}
+      - RUSTFS_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD=${RUSTFS_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD:-6}
+      - RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=${RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD:-12}
+      - RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY=${RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY:-8}
+      - RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=${RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE:-8388608}
+      - RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES=${RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES:-25165824}
+      - RUSTFS_RUNTIME_WORKER_THREADS=${RUSTFS_RUNTIME_WORKER_THREADS:-12}
+      - RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=${RUSTFS_RUNTIME_MAX_BLOCKING_THREADS:-512}
+      - RUSTFS_ALLOCATOR_RECLAIM_ENABLED=${RUSTFS_ALLOCATOR_RECLAIM_ENABLED:-false}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - node3_data_0:/data/rustfs0
+      - node3_data_1:/data/rustfs1
+      - node3_data_2:/data/rustfs2
+      - node3_data_3:/data/rustfs3
+    ports:
+      - "9002:9000"
+    networks:
+      - rustfs-cluster-net
+
+  node4:
+    platform: ${RUSTFS_DOCKER_PLATFORM:-linux/amd64}
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs:local-4node}
+    build:
+      context: ../..
+      dockerfile: Dockerfile.source
+    hostname: node4
+    environment:
+      - RUSTFS_VOLUMES=http://node{1...4}:9000/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}
+      - RUSTFS_OBS_ENDPOINT=${RUSTFS_OBS_ENDPOINT:-http://host.docker.internal:4318}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_OBS_LOGGER_LEVEL:-info}
+      - RUSTFS_OBS_PROFILING_ENDPOINT=${RUSTFS_OBS_PROFILING_ENDPOINT:-http://host.docker.internal:4040}
+      - RUSTFS_OBS_PROFILING_EXPORT_ENABLED=${RUSTFS_OBS_PROFILING_EXPORT_ENABLED:-true}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+      - RUSTFS_ENABLE_PROFILING=${RUSTFS_ENABLE_PROFILING:-true}
+      - RUSTFS_PROF_CPU_MODE=${RUSTFS_PROF_CPU_MODE:-continuous}
+      - RUSTFS_PROF_CPU_FREQ=${RUSTFS_PROF_CPU_FREQ:-99}
+      - RUSTFS_PROF_OUTPUT_DIR=${RUSTFS_PROF_OUTPUT_DIR:-/tmp/rustfs-profiles}
+      - RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=${RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS:-48}
+      - RUSTFS_OBJECT_IO_BUFFER_SIZE=${RUSTFS_OBJECT_IO_BUFFER_SIZE:-262144}
+      - RUSTFS_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD=${RUSTFS_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD:-6}
+      - RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD=${RUSTFS_OBJECT_HIGH_CONCURRENCY_THRESHOLD:-12}
+      - RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY=${RUSTFS_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY:-8}
+      - RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=${RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE:-8388608}
+      - RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES=${RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES:-25165824}
+      - RUSTFS_RUNTIME_WORKER_THREADS=${RUSTFS_RUNTIME_WORKER_THREADS:-12}
+      - RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=${RUSTFS_RUNTIME_MAX_BLOCKING_THREADS:-512}
+      - RUSTFS_ALLOCATOR_RECLAIM_ENABLED=${RUSTFS_ALLOCATOR_RECLAIM_ENABLED:-false}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - node4_data_0:/data/rustfs0
+      - node4_data_1:/data/rustfs1
+      - node4_data_2:/data/rustfs2
+      - node4_data_3:/data/rustfs3
+    ports:
+      - "9003:9000"
+    networks:
+      - rustfs-cluster-net
+
+volumes:
+  node1_data_0:
+  node1_data_1:
+  node1_data_2:
+  node1_data_3:
+  node2_data_0:
+  node2_data_1:
+  node2_data_2:
+  node2_data_3:
+  node3_data_0:
+  node3_data_1:
+  node3_data_2:
+  node3_data_3:
+  node4_data_0:
+  node4_data_1:
+  node4_data_2:
+  node4_data_3:
+
+networks:
+  rustfs-cluster-net:
+    driver: bridge

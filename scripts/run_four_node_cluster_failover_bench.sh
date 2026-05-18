@@ -13,9 +13,11 @@ RUN_BENCHMARK="${RUN_BENCHMARK:-true}"
 KEEP_UP="${KEEP_UP:-false}"
 PRECHECK_AUTO_CLEANUP="${PRECHECK_AUTO_CLEANUP:-true}"
 WAIT_PROBE_MODE="${WAIT_PROBE_MODE:-service}"
+COMPOSE_UP_NO_BUILD="${COMPOSE_UP_NO_BUILD:-false}"
 
 RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}"
 RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}"
+RUSTFS_DOCKER_PLATFORM="${RUSTFS_DOCKER_PLATFORM:-}"
 RUSTFS_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK="${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
 
@@ -65,6 +67,7 @@ Options:
 Environment:
   CLUSTER_COMPOSE OBS_COMPOSE PROJECT_NAME IMAGE_TAG
   WITH_OBSERVABILITY BUILD_LOCAL_IMAGE RUN_FAILOVER RUN_BENCHMARK KEEP_UP
+  COMPOSE_UP_NO_BUILD (true|false, default: false)
   RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY RUSTFS_OBS_ENDPOINT
   PRECHECK_AUTO_CLEANUP (true|false, default: true)
   WAIT_PROBE_MODE (service|ready, default: service)
@@ -690,6 +693,7 @@ main() {
   resolve_bool "RUN_FAILOVER" "${RUN_FAILOVER}"
   resolve_bool "RUN_BENCHMARK" "${RUN_BENCHMARK}"
   resolve_bool "KEEP_UP" "${KEEP_UP}"
+  resolve_bool "COMPOSE_UP_NO_BUILD" "${COMPOSE_UP_NO_BUILD}"
   resolve_bool "PRECHECK_AUTO_CLEANUP" "${PRECHECK_AUTO_CLEANUP}"
   resolve_probe_mode
   resolve_bench_wait_mode
@@ -731,7 +735,12 @@ main() {
 
   if [[ "${BUILD_LOCAL_IMAGE}" == "true" ]]; then
     log_info "Building local image from Dockerfile.source: ${IMAGE_TAG}"
-    docker build -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+    if [[ -n "${RUSTFS_DOCKER_PLATFORM}" ]]; then
+      log_info "Using docker build platform: ${RUSTFS_DOCKER_PLATFORM}"
+      docker build --platform "${RUSTFS_DOCKER_PLATFORM}" -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+    else
+      docker build -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+    fi
   else
     log_info "Skipping image build"
   fi
@@ -739,7 +748,11 @@ main() {
   run_precheck_after_build
 
   log_info "Starting compose stack"
-  compose up -d
+  if [[ "${COMPOSE_UP_NO_BUILD}" == "true" ]]; then
+    compose up -d --no-build
+  else
+    compose up -d
+  fi
 
   log_info "Waiting for 4-node cluster readiness (mode=${WAIT_PROBE_MODE})"
   wait_cluster_ready

@@ -238,6 +238,14 @@ run_one() {
     fi
   fi
 
+  if [[ "$TOOL" == "warp" ]]; then
+    # Warp may still exit with code 0 even when it prints runtime failures.
+    # Treat explicit error lines as failed runs to keep summary.csv reliable.
+    if rg -q 'warp: <ERROR>' "$log_file"; then
+      status="failed"
+    fi
+  fi
+
   local metrics throughput reqps latency
   metrics="$(collect_metrics "$log_file")"
   throughput="$(echo "$metrics" | cut -d',' -f1)"
