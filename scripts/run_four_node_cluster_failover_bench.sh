@@ -31,6 +31,8 @@ BENCH_WAIT_MODE="${BENCH_WAIT_MODE:-ready}"
 
 BENCH_ENDPOINT="${BENCH_ENDPOINT:-http://127.0.0.1:9000}"
 BENCH_BUCKET="${BENCH_BUCKET:-rustfs-four-node-bench}"
+BENCH_AUTO_NEW_BUCKET="${BENCH_AUTO_NEW_BUCKET:-true}"
+BENCH_BUCKET_PREFIX="${BENCH_BUCKET_PREFIX:-rustfs-four-node-bench}"
 BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-}"
 BENCH_CONCURRENCIES="${BENCH_CONCURRENCIES:-}"
 BENCH_DURATION="${BENCH_DURATION:-60s}"
@@ -76,6 +78,8 @@ Environment:
   BENCH_CONCURRENCIES BENCH_DURATION BENCH_SIZES OUT_DIR
   BENCH_WAIT_MODE (ready|service, default: ready)
   BENCH_READY_TIMEOUT_SECS (default: 180)
+  BENCH_AUTO_NEW_BUCKET (true|false, default: true)
+  BENCH_BUCKET_PREFIX (default: rustfs-four-node-bench)
 USAGE
 }
 
@@ -546,12 +550,19 @@ run_benchmark() {
   local bench_out_dir
   local conc
   local conc_dir
+  local bench_bucket
+  local -a bench_extra_args=()
   bench_out_dir="${OUT_DIR}/benchmark"
   mkdir -p "${bench_out_dir}"
 
   if ! command -v warp >/dev/null 2>&1; then
     log_error "warp is required for benchmark phase. Please install warp or run with --skip-bench."
     exit 1
+  fi
+
+  bench_bucket="${BENCH_BUCKET}"
+  if [[ "${BENCH_AUTO_NEW_BUCKET}" == "true" ]]; then
+    bench_extra_args+=(--auto-new-bucket)
   fi
 
   log_info "Waiting for benchmark endpoint readiness (mode=${BENCH_WAIT_MODE})"
@@ -577,7 +588,9 @@ run_benchmark() {
         --endpoint "${BENCH_ENDPOINT}" \
         --access-key "${RUSTFS_ACCESS_KEY}" \
         --secret-key "${RUSTFS_SECRET_KEY}" \
-        --bucket "${BENCH_BUCKET}" \
+        --bucket "${bench_bucket}" \
+        --bucket-prefix "${BENCH_BUCKET_PREFIX}" \
+        "${bench_extra_args[@]}" \
         --concurrency "${conc}" \
         --duration "${BENCH_DURATION}" \
         --sizes "${BENCH_SIZES}" \
@@ -694,6 +707,7 @@ main() {
   resolve_bool "RUN_BENCHMARK" "${RUN_BENCHMARK}"
   resolve_bool "KEEP_UP" "${KEEP_UP}"
   resolve_bool "COMPOSE_UP_NO_BUILD" "${COMPOSE_UP_NO_BUILD}"
+  resolve_bool "BENCH_AUTO_NEW_BUCKET" "${BENCH_AUTO_NEW_BUCKET}"
   resolve_bool "PRECHECK_AUTO_CLEANUP" "${PRECHECK_AUTO_CLEANUP}"
   resolve_probe_mode
   resolve_bench_wait_mode
