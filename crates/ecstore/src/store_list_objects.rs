@@ -340,6 +340,9 @@ impl ECStore {
                 ..Default::default()
             });
 
+        // err=None means gather_results filled its limit → disk has more data
+        let disk_has_more = list_result.err.is_none();
+
         if let Some(err) = list_result.err.take()
             && err != rustfs_filemeta::Error::Unexpected
         {
@@ -369,6 +372,11 @@ impl ECStore {
             is_truncated = true;
             // Truncate to max_keys if we have more results
             get_objects.truncate(max_keys as usize);
+        } else if disk_has_more && !get_objects.is_empty() {
+            // Disk indicated more data available, but processing pipeline reduced
+            // the count below max_keys (e.g. to_fileinfo failures, forward_past filtering).
+            // There is still more data to fetch.
+            is_truncated = true;
         }
 
         let next_marker = {
