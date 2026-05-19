@@ -300,10 +300,10 @@ impl InlineData {
             return Ok(false);
         }
 
-        let first = first.to_string();
-        let second = second.to_string();
-        let first_key = first.as_bytes();
-        let second_key = second.as_bytes();
+        let mut first_buf = Uuid::encode_buffer();
+        let mut second_buf = Uuid::encode_buffer();
+        let first_key = first.hyphenated().encode_lower(&mut first_buf).as_bytes();
+        let second_key = second.hyphenated().encode_lower(&mut second_buf).as_bytes();
         let same = first_key == second_key;
 
         let mut cur = Cursor::new(buf);
