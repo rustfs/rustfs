@@ -322,15 +322,16 @@ impl FileMeta {
         }
 
         let vid = version.get_version_id();
-
-        // Match existing version for replace; null version: None and Some(nil) are equivalent
-        let matches = |h: &Option<Uuid>| {
-            let v_null = vid.is_none() || vid == Some(Uuid::nil());
-            let h_null = h.is_none() || *h == Some(Uuid::nil());
-            (v_null && h_null) || (vid == *h)
+        let vid_is_null = vid.is_none() || vid == Some(Uuid::nil());
+        let existing_idx = if vid_is_null {
+            self.versions
+                .iter()
+                .position(|v| v.header.version_id.is_none() || v.header.version_id == Some(Uuid::nil()))
+        } else {
+            self.versions.iter().position(|v| v.header.version_id == vid)
         };
 
-        if let Some(fidx) = self.versions.iter().position(|v| matches(&v.header.version_id)) {
+        if let Some(fidx) = existing_idx {
             return self.set_idx(fidx, version);
         }
 
