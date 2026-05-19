@@ -302,7 +302,9 @@ impl InlineData {
 
         let first = first.to_string();
         let second = second.to_string();
-        let same = first == second;
+        let first_key = first.as_bytes();
+        let second_key = second.as_bytes();
+        let same = first_key == second_key;
 
         let mut cur = Cursor::new(buf);
         let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
@@ -316,17 +318,15 @@ impl InlineData {
             let str_len = rmp::decode::read_str_len(&mut cur)?;
             let mut field_buff = vec![0u8; str_len as usize];
             cur.read_exact(&mut field_buff)?;
-            let find_key = String::from_utf8(field_buff)?;
-
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
             cur.set_position(end as u64);
 
             let should_remove = if same {
-                find_key == first
+                field_buff.as_slice() == first_key
             } else {
-                find_key == first || find_key == second
+                field_buff.as_slice() == first_key || field_buff.as_slice() == second_key
             };
 
             if should_remove {
@@ -334,6 +334,7 @@ impl InlineData {
                 continue;
             }
 
+            let find_key = String::from_utf8(field_buff)?;
             let find_value = &buf[start..end];
             values.push(find_value.to_vec());
             keys.push(find_key);
