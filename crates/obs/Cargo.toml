@@ -51,11 +51,11 @@ crossbeam-deque = { workspace = true }
 crossbeam-utils = { workspace = true }
 num_cpus = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry-appender-tracing = { workspace = true}
-opentelemetry_sdk = { workspace = true}
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true }
-opentelemetry-semantic-conventions = { workspace = true}
+opentelemetry-semantic-conventions = { workspace = true }
 percent-encoding = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }

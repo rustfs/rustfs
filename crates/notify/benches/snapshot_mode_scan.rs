@@ -46,9 +46,10 @@ fn bench_snapshot_mode_scan(c: &mut Criterion) {
             group.throughput(Throughput::Elements(bucket_count as u64));
             group.bench_with_input(BenchmarkId::new(mode_name, bucket_count), &bucket_count, |b, _| {
                 b.iter(|| {
-                    rt.block_on(async {
-                        let _ = scan_target_bound(&map, &miss_target).await;
+                    let found = rt.block_on(async {
+                        scan_target_bound(std::hint::black_box(&map), std::hint::black_box(&miss_target)).await
                     });
+                    std::hint::black_box(found);
                 });
             });
         }
