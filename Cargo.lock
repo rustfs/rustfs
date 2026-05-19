@@ -9340,7 +9340,8 @@ dependencies = [
  "rustfs-protocols",
  "rustfs-protos",
  "rustfs-rio",
- "rustfs-s3-common",
+ "rustfs-s3-ops",
+ "rustfs-s3-types",
  "rustfs-s3select-api",
  "rustfs-s3select-query",
  "rustfs-scanner",
@@ -9394,7 +9395,8 @@ dependencies = [
  "metrics",
  "rustfs-config",
  "rustfs-ecstore",
- "rustfs-s3-common",
+ "rustfs-s3-ops",
+ "rustfs-s3-types",
  "rustfs-targets",
  "serde",
  "serde_json",
@@ -9566,7 +9568,8 @@ dependencies = [
  "rustfs-policy",
  "rustfs-protos",
  "rustfs-rio",
- "rustfs-s3-common",
+ "rustfs-s3-ops",
+ "rustfs-s3-types",
  "rustfs-signer",
  "rustfs-utils",
  "rustix 1.1.4",
@@ -9702,6 +9705,7 @@ dependencies = [
  "criterion",
  "metrics",
  "num_cpus",
+ "rustfs-s3-ops",
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",
@@ -9862,7 +9866,8 @@ dependencies = [
  "rustc-hash",
  "rustfs-config",
  "rustfs-ecstore",
- "rustfs-s3-common",
+ "rustfs-s3-ops",
+ "rustfs-s3-types",
  "rustfs-targets",
  "rustfs-utils",
  "serde",
@@ -10078,10 +10083,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustfs-s3-common"
+name = "rustfs-s3-ops"
 version = "1.0.0-beta.3"
 dependencies = [
- "metrics",
+ "rustfs-s3-types",
+]
+
+[[package]]
+name = "rustfs-s3-types"
+version = "1.0.0-beta.3"
+dependencies = [
  "serde",
  "serde_json",
 ]
@@ -10198,7 +10209,8 @@ dependencies = [
  "rustfs-config",
  "rustfs-ecstore",
  "rustfs-kafka-async",
- "rustfs-s3-common",
+ "rustfs-s3-ops",
+ "rustfs-s3-types",
  "rustfs-utils",
  "rustls",
  "rustls-native-certs",

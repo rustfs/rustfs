@@ -65,6 +65,7 @@ pub mod io_metrics;
 pub mod lock_metrics;
 pub mod performance;
 pub mod process_lock_metrics;
+pub mod s3_api_metrics;
 pub mod sampler;
 pub mod system_path_metrics;
 pub mod timeout_metrics;
@@ -119,6 +120,7 @@ pub use process_lock_metrics::{
     record_write_lock_held_acquire, record_write_lock_held_release, snapshot_process_lock_counts,
     snapshot_process_platform_stats,
 };
+pub use s3_api_metrics::{init_s3_metrics, record_s3_op};
 pub use sampler::{
     ProcessResourceSnapshot, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_platform, snapshot_process_resource,
     snapshot_process_resource_and_system, snapshot_process_system,

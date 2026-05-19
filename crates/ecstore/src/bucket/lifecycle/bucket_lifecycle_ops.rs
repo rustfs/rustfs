@@ -56,7 +56,7 @@ use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, RestoreStatusOps,
     VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
 };
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,

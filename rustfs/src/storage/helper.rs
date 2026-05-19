@@ -23,9 +23,10 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_ecstore::store_api::ObjectInfo;
+use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
-use rustfs_s3_common::record_s3_op;
-use rustfs_s3_common::{EventName, S3Operation};
+use rustfs_s3_ops::S3Operation;
+use rustfs_s3_types::EventName;
 use rustfs_utils::{
     extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
     http::headers::AMZ_REQUEST_ID,

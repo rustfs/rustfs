@@ -14,7 +14,7 @@
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use hashbrown::HashMap;
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
 
@@ -542,7 +542,7 @@ mod event_args_tests {
     use super::EventArgs;
     use hashbrown::HashMap;
     use rustfs_ecstore::store_api::ObjectInfo;
-    use rustfs_s3_common::EventName;
+    use rustfs_s3_types::EventName;
 
     fn args_with_headers(pairs: &[(&str, &str)]) -> EventArgs {
         let mut req_params = HashMap::new();

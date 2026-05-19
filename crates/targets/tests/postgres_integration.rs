@@ -38,7 +38,7 @@
 //! podman rm -f rustfs-pg-test
 //! ```
 
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_targets::Target;
 use rustfs_targets::check_postgres_server_available;
 use rustfs_targets::target::EntityTarget;

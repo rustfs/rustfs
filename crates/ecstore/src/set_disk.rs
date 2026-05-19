@@ -83,7 +83,7 @@ use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
 };
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{

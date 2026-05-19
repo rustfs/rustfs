@@ -969,7 +969,7 @@ mod tests {
         let payload = build_queued_payload(&EntityTarget {
             object_name: "greeting+file+%282%29.csv".to_string(),
             bucket_name: "bucket".to_string(),
-            event_name: rustfs_s3_common::EventName::ObjectCreatedPut,
+            event_name: rustfs_s3_types::EventName::ObjectCreatedPut,
             data: "payload-data".to_string(),
         })
         .expect("payload should build");
@@ -1071,7 +1071,7 @@ mod tests {
 
         let target = RedisTarget::<String>::new("redis:test".to_string(), args).expect("target should build");
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket".to_string(),
             "object".to_string(),
             "application/json",
@@ -1110,7 +1110,7 @@ mod tests {
 
         let target = RedisTarget::<String>::new("redis:test".to_string(), args).expect("target should build");
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket".to_string(),
             "object".to_string(),
             "application/json",
@@ -1149,7 +1149,7 @@ mod tests {
 
         let target = RedisTarget::<String>::new("redis:test".to_string(), args).expect("target should build");
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket".to_string(),
             "object".to_string(),
             "application/json",

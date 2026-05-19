@@ -13,33 +13,23 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-io-metrics"
+name = "rustfs-s3-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Metrics collection and reporting for RustFS (using metrics crate + OTEL)"
-keywords = ["metrics", "zero-copy", "rustfs", "otel", "performance"]
-categories = ["development-tools", "filesystem"]
-
-[[bench]]
-name = "metrics_pipeline"
-harness = false
-
-[dependencies]
-metrics = { workspace = true }
-rustfs-s3-ops = { workspace = true }
-num_cpus = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync","rt"] }
-tracing = { workspace = true }
-sysinfo = { workspace = true }
-
-[dev-dependencies]
-criterion = { workspace = true }
-tokio = { workspace = true, features = ["test-util","rt","macros"] }
+description = "S3 event type definitions for RustFS."
+keywords = ["s3", "event", "types", "rustfs"]
+categories = ["data-structures"]
 
 [lints]
 workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lib]
+doctest = false

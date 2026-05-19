@@ -61,7 +61,7 @@ pub use runtime::{
     sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability},
     start_replay_worker,
 };
-pub use rustfs_s3_common::EventName;
+pub use rustfs_s3_types::EventName;
 use serde::{Deserialize, Serialize};
 pub use sys::user_agent::*;
 pub use target::{Target, TargetDeliverySnapshot};

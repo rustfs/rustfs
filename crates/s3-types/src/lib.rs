@@ -13,7 +13,5 @@
 // limitations under the License.
 
 mod event_name;
-mod s3_metrics;
 
-pub use event_name::{EventName, ParseEventNameError, S3Operation};
-pub use s3_metrics::{init_s3_metrics, record_s3_op};
+pub use event_name::{EventName, ParseEventNameError};

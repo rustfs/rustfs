@@ -65,7 +65,7 @@ use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,

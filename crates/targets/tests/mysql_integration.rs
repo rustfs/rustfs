@@ -70,7 +70,7 @@ fn make_args(dsn: &str, table: &str, queue_dir: &str) -> MySqlArgs {
     }
 }
 
-fn make_entity(bucket: &str, object: &str, event_name: rustfs_s3_common::EventName) -> EntityTarget<serde_json::Value> {
+fn make_entity(bucket: &str, object: &str, event_name: rustfs_s3_types::EventName) -> EntityTarget<serde_json::Value> {
     EntityTarget {
         object_name: object.to_string(),
         bucket_name: bucket.to_string(),
@@ -117,7 +117,7 @@ async fn direct_write_and_read() {
 
     target.init().await.expect("init");
 
-    let entity = make_entity("mybucket", "obj.txt", rustfs_s3_common::EventName::ObjectCreatedPut);
+    let entity = make_entity("mybucket", "obj.txt", rustfs_s3_types::EventName::ObjectCreatedPut);
     target.save(Arc::new(entity)).await.expect("save");
 
     let pool = build_test_pool(&dsn);
@@ -141,10 +141,10 @@ async fn delete_appends_row_does_not_remove_old() {
 
     target.init().await.expect("init");
 
-    let put = make_entity("mybucket", "obj.txt", rustfs_s3_common::EventName::ObjectCreatedPut);
+    let put = make_entity("mybucket", "obj.txt", rustfs_s3_types::EventName::ObjectCreatedPut);
     target.save(Arc::new(put)).await.expect("save put");
 
-    let delete = make_entity("mybucket", "obj.txt", rustfs_s3_common::EventName::ObjectRemovedDelete);
+    let delete = make_entity("mybucket", "obj.txt", rustfs_s3_types::EventName::ObjectRemovedDelete);
     target.save(Arc::new(delete)).await.expect("save delete");
 
     let pool = build_test_pool(&dsn);
@@ -166,7 +166,7 @@ async fn queue_store_saves_entry_and_replays() {
     let target: MySqlTarget<serde_json::Value> =
         MySqlTarget::new("queue".to_string(), make_args(&dsn, &table, queue_dir)).expect("create target");
 
-    let entity = make_entity("mybucket", "obj.txt", rustfs_s3_common::EventName::ObjectCreatedPut);
+    let entity = make_entity("mybucket", "obj.txt", rustfs_s3_types::EventName::ObjectCreatedPut);
     target.save(Arc::new(entity)).await.expect("save to queue");
 
     let store = target.store().expect("store should exist");
@@ -206,7 +206,7 @@ async fn duplicate_replay_produces_duplicate_rows() {
     let target: MySqlTarget<serde_json::Value> =
         MySqlTarget::new("dupe".to_string(), make_args(&dsn, &table, queue_dir)).expect("create target");
 
-    let entity = make_entity("mybucket", "obj.txt", rustfs_s3_common::EventName::ObjectCreatedPut);
+    let entity = make_entity("mybucket", "obj.txt", rustfs_s3_types::EventName::ObjectCreatedPut);
     target.save(Arc::new(entity)).await.expect("save to queue");
 
     target.init().await.expect("init");

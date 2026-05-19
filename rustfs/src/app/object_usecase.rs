@@ -86,7 +86,7 @@ use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
-use rustfs_s3_common::S3Operation;
+use rustfs_s3_ops::S3Operation;
 use rustfs_s3select_api::{
     object_store::bytes_stream,
     query::{Context, Query},

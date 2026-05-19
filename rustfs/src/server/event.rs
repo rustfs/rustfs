@@ -16,7 +16,7 @@ use super::{module_switch::resolve_notify_module_state, refresh_persisted_module
 use crate::app::context::resolve_server_config;
 use rustfs_ecstore::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
 use rustfs_notify::EventArgs as NotifyEventArgs;
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::spawn;

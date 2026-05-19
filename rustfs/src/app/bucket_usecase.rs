@@ -64,7 +64,7 @@ use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
 };
-use rustfs_s3_common::S3Operation;
+use rustfs_s3_ops::S3Operation;
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},
