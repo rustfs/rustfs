@@ -41,7 +41,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{DuplexStream, duplex};
 use tracing::{debug, warn};
 
@@ -176,6 +176,8 @@ pub struct BackpressurePipeMeta {
     pub buffer_capacity: usize,
     /// Current backpressure state.
     pub state: BackpressureState,
+    /// Age of the pipe since creation.
+    pub age: Duration,
 }
 
 /// Compact metadata snapshot for the lightweight backpressure monitor.
@@ -239,6 +241,8 @@ pub struct BackpressurePipe {
     total_written: Arc<AtomicUsize>,
     /// Total bytes read.
     total_read: Arc<AtomicUsize>,
+    /// Pipe creation timestamp.
+    created_at: Instant,
 }
 
 impl BackpressurePipe {
@@ -268,6 +272,7 @@ impl BackpressurePipe {
             state: Arc::new(AtomicBool::new(false)),
             total_written: Arc::new(AtomicUsize::new(0)),
             total_read: Arc::new(AtomicUsize::new(0)),
+            created_at: Instant::now(),
         }
     }
 
@@ -313,7 +318,13 @@ impl BackpressurePipe {
         BackpressurePipeMeta {
             buffer_capacity: self.config.buffer_size,
             state: self.state(),
+            age: self.age(),
         }
+    }
+
+    /// Get the age of this pipe.
+    pub fn age(&self) -> Duration {
+        self.created_at.elapsed()
     }
 
     /// Record bytes written (call after successful write).
@@ -553,6 +564,7 @@ mod tests {
         assert_eq!(pipe.capacity(), 4 * 1024 * 1024);
         assert_eq!(pipe.state(), BackpressureState::Normal);
         assert_eq!(pipe.meta().buffer_capacity, 4 * 1024 * 1024);
+        assert!(pipe.age() >= pipe.meta().age);
     }
 
     #[test]
