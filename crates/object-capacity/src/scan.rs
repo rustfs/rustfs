@@ -18,8 +18,8 @@ use super::capacity_manager::{
     get_stat_timeout,
 };
 use super::types::{CapacityDiskRef, CapacityScanResult, CapacityScanSummary};
-use futures::{StreamExt, stream};
 use crate::capacity_scope::CapacityScopeDisk;
+use futures::{StreamExt, stream};
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_dynamic_timeout, record_capacity_scan_disk, record_capacity_scan_mode, record_capacity_scan_sampling,
     record_capacity_stall_detected, record_capacity_symlink, record_capacity_timeout_fallback,

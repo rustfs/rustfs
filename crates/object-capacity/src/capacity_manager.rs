@@ -16,8 +16,8 @@
 
 use super::scan::refresh_capacity_with_scope;
 use super::types::CapacityDiskRef;
-use futures::FutureExt;
 use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
+use futures::FutureExt;
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH,
     DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS,

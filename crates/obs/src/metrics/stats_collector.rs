@@ -28,7 +28,6 @@ use crate::metrics::collectors::{
 };
 use chrono::Utc;
 use rustfs_common::metrics::global_metrics;
-use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState};
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
@@ -38,6 +37,7 @@ use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
+use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
 use std::collections::HashMap;
 use std::time::Duration;
