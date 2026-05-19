@@ -61,7 +61,6 @@ workspace = true
 [dependencies]
 # RustFS Internal Crates
 rustfs-heal = { workspace = true }
-rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants", "notify"] }
