@@ -20,6 +20,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 const VERSION_COUNT_CASES: &[usize] = &[1, 8, 32, 64];
+const BENCH_BASE_TIME_UNIX_SECS: i64 = 1_700_000_000;
 
 fn make_file_info(version_id: Uuid, data_dir: Uuid, size: i64, mod_time: OffsetDateTime) -> FileInfo {
     FileInfo {
@@ -43,7 +44,7 @@ fn make_file_info(version_id: Uuid, data_dir: Uuid, size: i64, mod_time: OffsetD
 
 fn build_meta_with_versions(version_count: usize) -> FileMeta {
     let mut meta = FileMeta::new();
-    let base_time = OffsetDateTime::now_utc();
+    let base_time = OffsetDateTime::from_unix_timestamp(BENCH_BASE_TIME_UNIX_SECS).expect("valid bench base timestamp");
     for i in 0..version_count {
         let fi = make_file_info(Uuid::new_v4(), Uuid::new_v4(), 64 * 1024, base_time - Duration::from_secs(i as u64));
         meta.add_version(fi).expect("seed add_version should succeed");
@@ -59,6 +60,7 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
     for &version_count in VERSION_COUNT_CASES {
         let seeded = build_meta_with_versions(version_count);
         let dst_buf = seeded.marshal_msg().expect("marshal seeded meta");
+        let base_time = OffsetDateTime::from_unix_timestamp(BENCH_BASE_TIME_UNIX_SECS).expect("valid bench base timestamp");
         let replace_version_id = seeded
             .versions
             .first()
@@ -73,12 +75,7 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
                 if let Some(old_data_dir) = has_old_data_dir {
                     let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), old_data_dir]);
                 }
-                let fi = make_file_info(
-                    replace_version_id,
-                    Uuid::new_v4(),
-                    64 * 1024,
-                    OffsetDateTime::now_utc() + Duration::from_millis(1),
-                );
+                let fi = make_file_info(replace_version_id, Uuid::new_v4(), 64 * 1024, base_time + Duration::from_millis(1));
                 xlmeta.add_version(fi).expect("add new version");
                 let out = xlmeta.marshal_msg().expect("marshal updated meta");
                 black_box(out);
