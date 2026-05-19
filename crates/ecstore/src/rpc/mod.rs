@@ -15,6 +15,7 @@
 mod client;
 mod context_propagation;
 mod http_auth;
+mod internode_data_transport;
 mod peer_rest_client;
 mod peer_s3_client;
 mod remote_disk;
