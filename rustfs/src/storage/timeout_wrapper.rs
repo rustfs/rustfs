@@ -248,6 +248,8 @@ pub struct RequestTimeoutWrapper {
     config: GetObjectTimeoutPolicy,
     /// Shared core timing primitive.
     core_wrapper: CoreRequestTimeoutWrapper,
+    /// Optional operation size hint for dynamic timeout decisions.
+    operation_size: Option<u64>,
     /// Cancellation token for propagating cancellation to sub-tasks.
     cancel_token: CancellationToken,
     /// Request ID for logging/metrics.
@@ -270,18 +272,12 @@ impl RequestTimeoutWrapper {
     /// Note: This uses a sentinel request_id. Prefer `with_request_id()` to pass
     /// the canonical request-id from `RequestContext`.
     pub fn new(config: GetObjectTimeoutPolicy) -> Self {
-        let core_wrapper = CoreRequestTimeoutWrapper::new(config.to_core_config());
-        Self {
-            config,
-            core_wrapper,
-            cancel_token: CancellationToken::new(),
-            request_id: "no-request-id".to_string(),
-        }
+        Self::new_with_parts(config, None, CancellationToken::new(), "no-request-id".to_string())
     }
 
     /// Create a new timeout wrapper with a specific request ID.
     pub fn with_request_id(config: GetObjectTimeoutPolicy, request_id: impl Into<String>) -> Self {
-        Self::new_with_parts(config, CancellationToken::new(), request_id.into())
+        Self::new_with_parts(config, None, CancellationToken::new(), request_id.into())
     }
 
     /// Create a new timeout wrapper with operation size for dynamic timeout calculation.
@@ -289,23 +285,32 @@ impl RequestTimeoutWrapper {
     /// Note: This uses a sentinel request_id. Prefer `with_request_id()` to pass
     /// the canonical request-id from `RequestContext`.
     pub fn with_operation_size(config: GetObjectTimeoutPolicy, operation_size: Option<u64>) -> Self {
-        let _ = operation_size;
-        Self::new(config)
+        Self::new_with_parts(config, operation_size, CancellationToken::new(), "no-request-id".to_string())
     }
 
     /// Get the configured timeout for this operation
-    pub fn get_timeout(&self, operation_size: Option<u64>) -> Duration {
-        self.config.get_timeout_for_operation(operation_size)
+    pub fn get_timeout(&self, operation_size_hint: Option<u64>) -> Duration {
+        self.config.get_timeout_for_operation(self.effective_operation_size(operation_size_hint))
     }
 
-    fn new_with_parts(config: GetObjectTimeoutPolicy, cancel_token: CancellationToken, request_id: String) -> Self {
+    fn new_with_parts(
+        config: GetObjectTimeoutPolicy,
+        operation_size: Option<u64>,
+        cancel_token: CancellationToken,
+        request_id: String,
+    ) -> Self {
         let core_wrapper = CoreRequestTimeoutWrapper::new(config.to_core_config());
         Self {
             config,
             core_wrapper,
+            operation_size,
             cancel_token,
             request_id,
         }
+    }
+
+    fn effective_operation_size(&self, operation_size_hint: Option<u64>) -> Option<u64> {
+        operation_size_hint.or(self.operation_size)
     }
 
     fn context_fields(&self, context: Option<(&str, &str)>) -> (String, String) {
@@ -333,7 +338,7 @@ impl RequestTimeoutWrapper {
 
     /// Check if the timeout has been exceeded.
     pub fn is_timeout(&self) -> bool {
-        self.config.is_timeout_enabled() && self.core_wrapper.elapsed() >= self.config.get_object_timeout
+        self.config.is_timeout_enabled() && self.core_wrapper.elapsed() >= self.get_timeout(None)
     }
 
     /// Get elapsed time since the request started.
@@ -352,7 +357,7 @@ impl RequestTimeoutWrapper {
         if !self.config.is_timeout_enabled() {
             return None;
         }
-        let timeout = self.config.get_timeout_for_operation(operation_size);
+        let timeout = self.config.get_timeout_for_operation(self.effective_operation_size(operation_size));
         self.core_wrapper.remaining(timeout)
     }
 
@@ -361,7 +366,7 @@ impl RequestTimeoutWrapper {
         if !self.config.is_timeout_enabled() {
             return false;
         }
-        let timeout = self.config.get_timeout_for_operation(operation_size);
+        let timeout = self.config.get_timeout_for_operation(self.effective_operation_size(operation_size));
         self.core_wrapper.elapsed() >= timeout
     }
 
@@ -539,7 +544,7 @@ impl RequestTimeoutWrapper {
                     lock_hold_time: None,
                     disk_reads_completed: 0,
                     disk_reads_pending: 0,
-                    object_size: None,
+                    object_size: self.operation_size,
                     progress_percent: None,
                 })
             }
@@ -811,5 +816,25 @@ mod tests {
 
         // Large size should calculate longer timeout
         assert!(!wrapper.should_timeout(Some(10 * 1024 * 1024)));
+    }
+
+    #[test]
+    fn test_wrapper_operation_size_hint_is_applied() {
+        let config = GetObjectTimeoutPolicy {
+            get_object_timeout: Duration::from_secs(300),
+            enable_dynamic_timeout: true,
+            bytes_per_second: 1024 * 1024,
+            min_timeout: Duration::from_secs(1),
+            max_timeout: Duration::from_secs(300),
+            ..Default::default()
+        };
+        let size = 100 * 1024 * 1024;
+        let wrapper = RequestTimeoutWrapper::with_operation_size(config.clone(), Some(size));
+
+        let expected_dynamic = config.get_timeout_for_operation(Some(size));
+        let baseline_no_size = config.get_timeout_for_operation(None);
+
+        assert_ne!(expected_dynamic, baseline_no_size);
+        assert_eq!(wrapper.get_timeout(None), expected_dynamic);
     }
 }
