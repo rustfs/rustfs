@@ -587,11 +587,14 @@ impl ECStore {
         let store = self.clone();
         let opts = o.clone();
         let cancel_rx1 = cancel.clone();
+        let cancel_rx1_for_err = cancel_rx1.clone();
         let err_tx1 = err_tx.clone();
         let job1 = tokio::spawn(async move {
             let mut opts = opts;
             opts.stop_disk_at_limit = true;
-            if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await {
+            if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await
+                && !cancel_rx1_for_err.is_cancelled()
+            {
                 error!("list_merged err {:?}", err);
                 let _ = err_tx1.send(Arc::new(err));
             }
@@ -1011,15 +1014,11 @@ impl ECStore {
 }
 
 async fn gather_results(
-    _rx: CancellationToken,
+    rx: CancellationToken,
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
     results_tx: Sender<MetaCacheEntriesSortedResult>,
 ) -> Result<()> {
-    let mut returned = false;
-
-    let mut sender = Some(results_tx);
-
     let mut recv = recv;
     let mut entries = Vec::new();
     while let Some(mut entry) = recv.recv().await {
@@ -1027,10 +1026,6 @@ async fn gather_results(
         {
             // normalize windows path separator
             entry.name = entry.name.replace("\\", "/");
-        }
-
-        if returned {
-            continue;
         }
 
         // TODO: rx.recv()
@@ -1065,9 +1060,13 @@ async fn gather_results(
 
         // TODO: Lifecycle
 
+        entries.push(Some(entry));
+
         if opts.limit > 0 && entries.len() >= opts.limit as usize {
-            if let Some(tx) = sender {
-                tx.send(MetaCacheEntriesSortedResult {
+            rx.cancel();
+
+            results_tx
+                .send(MetaCacheEntriesSortedResult {
                     entries: Some(MetaCacheEntriesSorted {
                         o: MetaCacheEntries(entries.clone()),
                         ..Default::default()
@@ -1076,20 +1075,13 @@ async fn gather_results(
                 })
                 .await
                 .map_err(Error::other)?;
-
-                returned = true;
-                sender = None;
-            }
-            continue;
+            return Ok(());
         }
-
-        entries.push(Some(entry));
-        // entries.push(entry);
     }
 
     // finish not full, return eof
-    if let Some(tx) = sender {
-        tx.send(MetaCacheEntriesSortedResult {
+    results_tx
+        .send(MetaCacheEntriesSortedResult {
             entries: Some(MetaCacheEntriesSorted {
                 o: MetaCacheEntries(entries.clone()),
                 ..Default::default()
@@ -1098,7 +1090,6 @@ async fn gather_results(
         })
         .await
         .map_err(Error::other)?;
-    }
 
     Ok(())
 }
@@ -1337,6 +1328,8 @@ impl SetDisks {
 
         let tx1 = sender.clone();
         let tx2 = sender.clone();
+        let cancel_for_send1 = rx.clone();
+        let cancel_for_send2 = rx.clone();
 
         list_path_raw(
             rx,
@@ -1353,8 +1346,11 @@ impl SetDisks {
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                     Box::pin({
                         let value = tx1.clone();
+                        let cancel_token = cancel_for_send1.clone();
                         async move {
-                            if let Err(err) = value.send(entry).await {
+                            if let Err(err) = value.send(entry).await
+                                && !cancel_token.is_cancelled()
+                            {
                                 error!("list_path send fail {:?}", err);
                             }
                         }
@@ -1364,9 +1360,11 @@ impl SetDisks {
                     Box::pin({
                         let value = tx2.clone();
                         let resolver = resolver.clone();
+                        let cancel_token = cancel_for_send2.clone();
                         async move {
                             if let Some(entry) = entries.resolve(resolver)
                                 && let Err(err) = value.send(entry).await
+                                && !cancel_token.is_cancelled()
                             {
                                 error!("list_path send fail {:?}", err);
                             }
@@ -1443,9 +1441,53 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use super::{ListPathOptions, MAX_OBJECT_LIST, max_keys_plus_one, walk_result_from_set_errors};
+    use super::{ListPathOptions, MAX_OBJECT_LIST, gather_results, max_keys_plus_one, walk_result_from_set_errors};
     use crate::error::StorageError;
+    use rustfs_filemeta::MetaCacheEntry;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    fn test_meta_entry(name: &str) -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn gather_results_returns_after_limit_without_waiting_for_input_close() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+
+        entry_tx.send(test_meta_entry("obj-a")).await.unwrap();
+
+        let handle = tokio::spawn(gather_results(
+            CancellationToken::new(),
+            ListPathOptions {
+                bucket: "bucket".to_owned(),
+                limit: 1,
+                incl_deleted: true,
+                ..Default::default()
+            },
+            entry_rx,
+            result_tx,
+        ));
+
+        let result = timeout(Duration::from_secs(1), result_rx.recv())
+            .await
+            .expect("limited result should be sent promptly")
+            .expect("limited result should be present");
+        assert_eq!(result.entries.unwrap().entries().len(), 1);
+
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("gather_results should finish after sending a limited result")
+            .expect("gather_results task should not panic")
+            .expect("gather_results should succeed");
+    }
 
     #[test]
     fn test_max_keys_plus_one_caps_before_lookahead() {

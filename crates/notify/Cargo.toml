@@ -62,9 +62,14 @@ axum = { workspace = true }
 rustfs-utils = { workspace = true, features = ["path"] }
 serde_json = { workspace = true }
 time = { workspace = true }
+criterion = { workspace = true }
 
 [lints]
 workspace = true
 
 [lib]
 doctest = false
+
+[[bench]]
+name = "snapshot_mode_scan"
+harness = false
