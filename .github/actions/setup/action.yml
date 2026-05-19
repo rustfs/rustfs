@@ -58,13 +58,13 @@ runs:
     - name: Install protoc
       uses: arduino/setup-protoc@v3
       with:
-        version: "33.1"
+        version: "34.1"
         repo-token: ${{ inputs.github-token }}
 
     - name: Install flatc
-      uses: Nugine/setup-flatc@v1.2.4
+      uses: Nugine/setup-flatc@v1
       with:
-        version: "25.9.23"
+        version: "25.12.19"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
