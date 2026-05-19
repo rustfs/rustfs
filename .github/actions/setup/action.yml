@@ -56,7 +56,7 @@ runs:
           libssl-dev
 
     - name: Install protoc
-      uses: arduino/setup-protoc@v3
+      uses: rustfs/setup-protoc@v3
       with:
         version: "34.1"
         repo-token: ${{ inputs.github-token || github.token }}
