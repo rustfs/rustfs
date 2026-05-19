@@ -36,6 +36,9 @@ use bytes::Bytes;
 use futures::lock::Mutex;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use metrics::counter;
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, global_internode_metrics,
+};
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
@@ -1576,11 +1579,12 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
+                let data_len = data.len();
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await.map_err(|err| {
+                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                    Error::other(format!("can not get client, err: {err}"))
+                })?;
                 let request = Request::new(WriteAllRequest {
                     disk,
                     volume: volume.to_string(),
@@ -1588,9 +1592,19 @@ impl DiskAPI for RemoteDisk {
                     data,
                 });
 
-                let response = client.write_all(request).await?.into_inner();
+                global_internode_metrics().record_outgoing_request_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                let response = match client.write_all(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                        return Err(err.into());
+                    }
+                };
+
+                global_internode_metrics().record_sent_bytes_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL, data_len);
 
                 if !response.success {
+                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
                     return Err(response.error.unwrap_or_default().into());
                 }
 
@@ -1608,22 +1622,32 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await.map_err(|err| {
+                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                    Error::other(format!("can not get client, err: {err}"))
+                })?;
                 let request = Request::new(ReadAllRequest {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                 });
 
-                let response = client.read_all(request).await?.into_inner();
+                global_internode_metrics().record_outgoing_request_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                let response = match client.read_all(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                        return Err(err.into());
+                    }
+                };
 
                 if !response.success {
+                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
                     return Err(response.error.unwrap_or_default().into());
                 }
 
+                global_internode_metrics()
+                    .record_recv_bytes_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL, response.data.len());
                 Ok(response.data)
             },
             get_max_timeout_duration(),
