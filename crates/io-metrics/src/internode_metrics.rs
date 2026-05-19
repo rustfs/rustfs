@@ -19,6 +19,19 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub const INTERNODE_OPERATION_READ_FILE_STREAM: &str = "read_file_stream";
+pub const INTERNODE_OPERATION_PUT_FILE_STREAM: &str = "put_file_stream";
+pub const INTERNODE_OPERATION_WALK_DIR: &str = "walk_dir";
+pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
+pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
+
+const OPERATION_LABEL: &str = "operation";
+const INTERNODE_OPERATION_SENT_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_sent_bytes_total";
+const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_recv_bytes_total";
+const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
+const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_incoming_total";
+const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InternodeMetricsSnapshot {
     pub sent_bytes_total: u64,
@@ -54,6 +67,16 @@ impl InternodeMetrics {
         counter!("rustfs_system_network_internode_sent_bytes_total").increment(bytes);
     }
 
+    pub fn record_sent_bytes_for_operation(&self, operation: &'static str, bytes: usize) {
+        self.record_sent_bytes(bytes);
+
+        let bytes = bytes as u64;
+        if bytes == 0 {
+            return;
+        }
+        counter!(INTERNODE_OPERATION_SENT_BYTES_TOTAL, OPERATION_LABEL => operation).increment(bytes);
+    }
+
     pub fn record_recv_bytes(&self, bytes: usize) {
         let bytes = bytes as u64;
         if bytes == 0 {
@@ -63,9 +86,24 @@ impl InternodeMetrics {
         counter!("rustfs_system_network_internode_recv_bytes_total").increment(bytes);
     }
 
+    pub fn record_recv_bytes_for_operation(&self, operation: &'static str, bytes: usize) {
+        self.record_recv_bytes(bytes);
+
+        let bytes = bytes as u64;
+        if bytes == 0 {
+            return;
+        }
+        counter!(INTERNODE_OPERATION_RECV_BYTES_TOTAL, OPERATION_LABEL => operation).increment(bytes);
+    }
+
     pub fn record_outgoing_request(&self) {
         self.outgoing_requests_total.fetch_add(1, Ordering::Relaxed);
         counter!("rustfs_system_network_internode_requests_outgoing_total").increment(1);
+    }
+
+    pub fn record_outgoing_request_for_operation(&self, operation: &'static str) {
+        self.record_outgoing_request();
+        counter!(INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL, OPERATION_LABEL => operation).increment(1);
     }
 
     pub fn record_incoming_request(&self) {
@@ -73,9 +111,19 @@ impl InternodeMetrics {
         counter!("rustfs_system_network_internode_requests_incoming_total").increment(1);
     }
 
+    pub fn record_incoming_request_for_operation(&self, operation: &'static str) {
+        self.record_incoming_request();
+        counter!(INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL, OPERATION_LABEL => operation).increment(1);
+    }
+
     pub fn record_error(&self) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
         counter!("rustfs_system_network_internode_errors_total").increment(1);
+    }
+
+    pub fn record_error_for_operation(&self, operation: &'static str) {
+        self.record_error();
+        counter!(INTERNODE_OPERATION_ERRORS_TOTAL, OPERATION_LABEL => operation).increment(1);
     }
 
     pub fn record_dial_result(&self, duration: Duration, success: bool) {
@@ -162,5 +210,23 @@ mod tests {
         assert!(snapshot.last_dial_unix_millis > 0);
 
         metrics.reset_for_test();
+    }
+
+    #[test]
+    fn operation_metrics_also_update_aggregate_snapshot() {
+        let metrics = InternodeMetrics::default();
+
+        metrics.record_sent_bytes_for_operation(INTERNODE_OPERATION_READ_FILE_STREAM, 128);
+        metrics.record_recv_bytes_for_operation(INTERNODE_OPERATION_PUT_FILE_STREAM, 256);
+        metrics.record_outgoing_request_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+        metrics.record_incoming_request_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+        metrics.record_error_for_operation(INTERNODE_OPERATION_WALK_DIR);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.sent_bytes_total, 128);
+        assert_eq!(snapshot.recv_bytes_total, 256);
+        assert_eq!(snapshot.outgoing_requests_total, 1);
+        assert_eq!(snapshot.incoming_requests_total, 1);
+        assert_eq!(snapshot.errors_total, 1);
     }
 }

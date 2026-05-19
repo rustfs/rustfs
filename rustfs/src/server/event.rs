@@ -16,7 +16,7 @@ use super::{module_switch::resolve_notify_module_state, refresh_persisted_module
 use crate::app::context::resolve_server_config;
 use rustfs_ecstore::event_notification::{EventArgs as EcstoreEventArgs, register_event_dispatch_hook};
 use rustfs_notify::EventArgs as NotifyEventArgs;
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::spawn;
@@ -38,14 +38,26 @@ pub fn is_notify_module_enabled() -> bool {
     NOTIFY_MODULE_ENABLED.load(Ordering::Relaxed)
 }
 
-fn convert_ecstore_event_args(args: EcstoreEventArgs) -> NotifyEventArgs {
+fn convert_ecstore_event_args(args: EcstoreEventArgs) -> Option<NotifyEventArgs> {
     let version_id = args.object.version_id.map(|v| v.to_string()).unwrap_or_default();
     let (host, port) = parse_host_and_port(args.host);
     let req_params = args.req_params.into_iter().collect();
     let resp_elements = args.resp_elements.into_iter().collect();
+    let event_name = match EventName::try_from_event_str(args.event_name.as_str()) {
+        Ok(event_name) => event_name,
+        Err(err) => {
+            warn!(
+                event_name = args.event_name,
+                bucket = args.bucket_name,
+                error = %err,
+                "dropping ecstore event with invalid event name"
+            );
+            return None;
+        }
+    };
 
-    NotifyEventArgs {
-        event_name: EventName::from(args.event_name.as_str()),
+    Some(NotifyEventArgs {
+        event_name,
         bucket_name: args.bucket_name,
         object: args.object,
         req_params,
@@ -54,7 +66,7 @@ fn convert_ecstore_event_args(args: EcstoreEventArgs) -> NotifyEventArgs {
         host,
         port,
         user_agent: args.user_agent,
-    }
+    })
 }
 
 fn parse_host_and_port(host: String) -> (String, u16) {
@@ -77,7 +89,9 @@ fn parse_host_and_port(host: String) -> (String, u16) {
 
 fn install_ecstore_event_dispatch_hook() {
     let installed = register_event_dispatch_hook(|args| {
-        let notify_args = convert_ecstore_event_args(args);
+        let Some(notify_args) = convert_ecstore_event_args(args) else {
+            return;
+        };
         spawn(async move {
             rustfs_notify::notifier_global::notify(notify_args).await;
         });

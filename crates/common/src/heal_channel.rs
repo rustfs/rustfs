@@ -379,7 +379,9 @@ fn heal_response_sender() -> &'static HealResponseSender {
 
 /// Publish a heal response to subscribers.
 pub fn publish_heal_response(response: HealChannelResponse) -> Result<(), broadcast::error::SendError<HealChannelResponse>> {
-    heal_response_sender().send(response).map(|_| ())
+    let sender = heal_response_sender();
+    let _ = sender.send(response);
+    Ok(())
 }
 
 /// Subscribe to heal responses.
@@ -626,5 +628,10 @@ mod tests {
         let received = receiver.recv().await.expect("should receive heal response");
         assert_eq!(received.request_id, response.request_id);
         assert!(received.success);
+
+        drop(receiver);
+        let response = create_heal_response("req-no-subscriber".to_string(), true, None, None);
+
+        publish_heal_response(response).expect("publish without subscribers should be ignored");
     }
 }

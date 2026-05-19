@@ -18,7 +18,7 @@
 //! to event matching, including filter rules with prefix and suffix.
 
 use super::*;
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_targets::arn::{ARN, TargetID};
 use std::io::Cursor;
 
