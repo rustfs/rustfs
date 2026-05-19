@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{DuplexStream, duplex};
 
-/// Backpressure configuration
+/// Facade policy for duplex-pipe watermark backpressure.
 #[derive(Debug, Clone)]
-pub struct BackpressureConfig {
+pub struct PipeBackpressurePolicy {
     /// Buffer size in bytes
     pub buffer_size: usize,
     /// High watermark percentage
@@ -31,7 +31,7 @@ pub struct BackpressureConfig {
     pub low_watermark: u32,
 }
 
-impl Default for BackpressureConfig {
+impl Default for PipeBackpressurePolicy {
     fn default() -> Self {
         Self {
             buffer_size: 4 * 1024 * 1024, // 4MB
@@ -41,7 +41,7 @@ impl Default for BackpressureConfig {
     }
 }
 
-impl BackpressureConfig {
+impl PipeBackpressurePolicy {
     /// Calculate high watermark threshold in bytes
     pub fn high_watermark_bytes(&self) -> usize {
         (self.buffer_size as u64 * self.high_watermark as u64 / 100) as usize
@@ -53,16 +53,19 @@ impl BackpressureConfig {
     }
 }
 
+/// Backward-compatible alias for the old backpressure facade name.
+pub type BackpressureConfig = PipeBackpressurePolicy;
+
 /// Backpressure manager
 pub struct BackpressureManager {
-    config: BackpressureConfig,
+    config: PipeBackpressurePolicy,
     monitor: Arc<CoreBackpressureMonitor>,
 }
 
 impl BackpressureManager {
     /// Create a new backpressure manager
     pub fn new(buffer_size: usize, high_watermark: u32, low_watermark: u32) -> Self {
-        let config = BackpressureConfig {
+        let config = PipeBackpressurePolicy {
             buffer_size,
             high_watermark,
             low_watermark,
@@ -83,7 +86,7 @@ impl BackpressureManager {
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &BackpressureConfig {
+    pub fn config(&self) -> &PipeBackpressurePolicy {
         &self.config
     }
 
@@ -112,13 +115,13 @@ impl BackpressureManager {
 pub struct BackpressurePipe {
     reader: DuplexStream,
     writer: DuplexStream,
-    config: BackpressureConfig,
+    config: PipeBackpressurePolicy,
     monitor: Arc<CoreBackpressureMonitor>,
     created_at: Instant,
 }
 
 impl BackpressurePipe {
-    fn new(config: BackpressureConfig, monitor: Arc<CoreBackpressureMonitor>) -> Self {
+    fn new(config: PipeBackpressurePolicy, monitor: Arc<CoreBackpressureMonitor>) -> Self {
         let (reader, writer) = duplex(config.buffer_size);
 
         Self {
@@ -146,7 +149,7 @@ impl BackpressurePipe {
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &BackpressureConfig {
+    pub fn config(&self) -> &PipeBackpressurePolicy {
         &self.config
     }
 
@@ -204,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_config() {
-        let config = BackpressureConfig::default();
+        let config = PipeBackpressurePolicy::default();
         assert_eq!(config.buffer_size, 4 * 1024 * 1024);
         assert!(config.high_watermark > config.low_watermark);
     }

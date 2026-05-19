@@ -47,9 +47,9 @@
 //! # Usage
 //!
 //! ```ignore
-//! use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
+//! use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 //!
-//! let config = TimeoutConfig::from_env();
+//! let config = GetObjectTimeoutPolicy::from_env();
 //! let wrapper = RequestTimeoutWrapper::new(config);
 //!
 //! match wrapper.execute_with_timeout(|cancel_token| async move {
@@ -66,11 +66,11 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-// Re-export types from rustfs_io_core for convenience
+use rustfs_io_core::calculate_adaptive_timeout;
 
-/// Timeout configuration for GetObject requests.
+/// Request-level timeout policy for GetObject.
 #[derive(Debug, Clone)]
-pub struct TimeoutConfig {
+pub struct GetObjectTimeoutPolicy {
     /// GetObject request overall timeout (default 30s).
     /// After this duration, the request is cancelled and returns 504.
     pub get_object_timeout: Duration,
@@ -96,7 +96,7 @@ pub struct TimeoutConfig {
     pub max_timeout: Duration,
 }
 
-impl Default for TimeoutConfig {
+impl Default for GetObjectTimeoutPolicy {
     fn default() -> Self {
         Self {
             get_object_timeout: Duration::from_secs(rustfs_config::DEFAULT_OBJECT_GET_TIMEOUT),
@@ -110,7 +110,7 @@ impl Default for TimeoutConfig {
     }
 }
 
-impl TimeoutConfig {
+impl GetObjectTimeoutPolicy {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let get_object_timeout =
@@ -158,12 +158,13 @@ impl TimeoutConfig {
             return self.get_object_timeout;
         }
 
-        // Calculate timeout based on expected transfer speed
-        // Add 50% buffer for network overhead and system load
-        let estimated_seconds = (object_size / self.bytes_per_second) * 3 / 2;
-
-        // Ensure at least 1 second
-        let estimated_duration = Duration::from_secs(estimated_seconds.max(1));
+        // Reuse the core adaptive-timeout estimator while preserving the current
+        // storage-layer 50% safety buffer semantics. The core helper uses a 20%
+        // overhead factor, so we feed it an 80% effective rate to reach the same
+        // 1.5x envelope this request policy historically used.
+        let effective_rate_bps = self.bytes_per_second.saturating_mul(4).saturating_div(5).max(1);
+        let estimated_duration =
+            calculate_adaptive_timeout(Duration::from_secs(1), Some(effective_rate_bps), 0, object_size);
 
         // Clamp to min/max bounds
         estimated_duration
@@ -180,6 +181,9 @@ impl TimeoutConfig {
         }
     }
 }
+
+/// Backward-compatible alias for the old request timeout name.
+pub type TimeoutConfig = GetObjectTimeoutPolicy;
 
 /// Information about a timeout event.
 #[derive(Debug, Clone)]
@@ -223,7 +227,7 @@ pub enum TimedGetObjectResult<T, E> {
 #[derive(Debug)]
 pub struct RequestTimeoutWrapper {
     /// Configuration.
-    config: TimeoutConfig,
+    config: GetObjectTimeoutPolicy,
     /// Request start time.
     start_time: Instant,
     /// Cancellation token for propagating cancellation to sub-tasks.
@@ -237,7 +241,7 @@ impl RequestTimeoutWrapper {
     ///
     /// Note: This uses a sentinel request_id. Prefer `with_request_id()` to pass
     /// the canonical request-id from `RequestContext`.
-    pub fn new(config: TimeoutConfig) -> Self {
+    pub fn new(config: GetObjectTimeoutPolicy) -> Self {
         Self {
             config,
             start_time: Instant::now(),
@@ -247,7 +251,7 @@ impl RequestTimeoutWrapper {
     }
 
     /// Create a new timeout wrapper with a specific request ID.
-    pub fn with_request_id(config: TimeoutConfig, request_id: impl Into<String>) -> Self {
+    pub fn with_request_id(config: GetObjectTimeoutPolicy, request_id: impl Into<String>) -> Self {
         Self {
             config,
             start_time: Instant::now(),
@@ -260,7 +264,7 @@ impl RequestTimeoutWrapper {
     ///
     /// Note: This uses a sentinel request_id. Prefer `with_request_id()` to pass
     /// the canonical request-id from `RequestContext`.
-    pub fn with_operation_size(config: TimeoutConfig, operation_size: Option<u64>) -> Self {
+    pub fn with_operation_size(config: GetObjectTimeoutPolicy, operation_size: Option<u64>) -> Self {
         let _ = operation_size;
         Self {
             config,

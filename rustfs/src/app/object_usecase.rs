@@ -32,7 +32,7 @@ use crate::storage::options::{
 use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_to_metadata, map_get_object_reader_error};
-use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
+use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use crate::storage::*;
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -159,7 +159,7 @@ impl Drop for DeadlockRequestGuard {
 }
 
 struct GetObjectBootstrap {
-    timeout_config: TimeoutConfig,
+    timeout_config: GetObjectTimeoutPolicy,
     wrapper: RequestTimeoutWrapper,
     request_start: std::time::Instant,
     request_guard: GetObjectGuard,
@@ -443,14 +443,14 @@ fn should_buffer_get_object_in_memory_with_threshold(
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
-    use crate::storage::deadlock_detector::{DeadlockDetector, DeadlockDetectorConfig};
+    use crate::storage::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
     use std::sync::Arc;
 
     #[test]
     fn deadlock_request_guard_unregisters_on_drop() {
-        let detector = Arc::new(DeadlockDetector::new(DeadlockDetectorConfig {
+        let detector = Arc::new(DeadlockDetector::new(RequestHangDetectionPolicy {
             enabled: true,
-            ..DeadlockDetectorConfig::default()
+            ..RequestHangDetectionPolicy::default()
         }));
         let request_id = "test-request-id".to_string();
 
@@ -1112,7 +1112,7 @@ impl DefaultObjectUsecase {
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
-        let timeout_config = TimeoutConfig::from_env();
+        let timeout_config = GetObjectTimeoutPolicy::from_env();
         let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
         let request_start = std::time::Instant::now();
         let request_guard = ConcurrencyManager::track_request();
@@ -1154,7 +1154,7 @@ impl DefaultObjectUsecase {
     async fn acquire_get_object_io_planning<'a>(
         manager: &'a ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
-        timeout_config: &TimeoutConfig,
+        timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
         key: &str,
     ) -> S3Result<GetObjectIoPlanning<'a>> {
@@ -1274,7 +1274,7 @@ impl DefaultObjectUsecase {
         req: &S3Request<GetObjectInput>,
         manager: &'a ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
-        timeout_config: &TimeoutConfig,
+        timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
         key: &str,
         rs: Option<HTTPRangeSpec>,
@@ -2024,7 +2024,7 @@ impl DefaultObjectUsecase {
 
     fn finalize_get_object_completion(
         wrapper: &RequestTimeoutWrapper,
-        timeout_config: &TimeoutConfig,
+        timeout_config: &GetObjectTimeoutPolicy,
         total_duration: Duration,
         response_content_length: i64,
         optimal_buffer_size: usize,

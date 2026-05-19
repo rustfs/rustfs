@@ -22,9 +22,9 @@ use rustfs_io_metrics::io_metrics;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Scheduler configuration
+/// Facade policy for the concurrency-layer scheduler manager.
 #[derive(Debug, Clone)]
-pub struct SchedulerConfig {
+pub struct SchedulerPolicy {
     /// Base buffer size
     pub base_buffer_size: usize,
     /// Maximum buffer size
@@ -35,7 +35,7 @@ pub struct SchedulerConfig {
     pub low_priority_threshold: usize,
 }
 
-impl Default for SchedulerConfig {
+impl Default for SchedulerPolicy {
     fn default() -> Self {
         Self {
             base_buffer_size: 64 * 1024,              // 64KB
@@ -46,9 +46,12 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// Backward-compatible alias for the old scheduler facade name.
+pub type SchedulerConfig = SchedulerPolicy;
+
 /// Scheduler manager
 pub struct SchedulerManager {
-    config: SchedulerConfig,
+    config: SchedulerPolicy,
     scheduler: Arc<CoreIoScheduler>,
 }
 
@@ -60,7 +63,7 @@ impl SchedulerManager {
         high_priority_threshold: usize,
         low_priority_threshold: usize,
     ) -> Self {
-        let config = SchedulerConfig {
+        let config = SchedulerPolicy {
             base_buffer_size,
             max_buffer_size,
             high_priority_threshold,
@@ -76,7 +79,7 @@ impl SchedulerManager {
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &SchedulerConfig {
+    pub fn config(&self) -> &SchedulerPolicy {
         &self.config
     }
 
@@ -111,12 +114,12 @@ impl SchedulerManager {
 
 /// I/O strategy
 pub struct IoStrategy {
-    config: SchedulerConfig,
+    config: SchedulerPolicy,
     scheduler: Arc<CoreIoScheduler>,
 }
 
 impl IoStrategy {
-    fn new(config: SchedulerConfig, scheduler: Arc<CoreIoScheduler>) -> Self {
+    fn new(config: SchedulerPolicy, scheduler: Arc<CoreIoScheduler>) -> Self {
         Self { config, scheduler }
     }
 
@@ -191,7 +194,7 @@ impl IoStrategy {
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &SchedulerConfig {
+    pub fn config(&self) -> &SchedulerPolicy {
         &self.config
     }
 }
@@ -202,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_scheduler_config() {
-        let config = SchedulerConfig::default();
+        let config = SchedulerPolicy::default();
         assert!(config.base_buffer_size < config.max_buffer_size);
     }
 

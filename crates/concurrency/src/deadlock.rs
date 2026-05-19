@@ -20,9 +20,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Deadlock configuration
+/// Facade policy for the concurrency-layer deadlock monitor.
 #[derive(Debug, Clone)]
-pub struct DeadlockConfig {
+pub struct DeadlockMonitorPolicy {
     /// Enable deadlock detection
     pub enabled: bool,
     /// Check interval
@@ -31,7 +31,7 @@ pub struct DeadlockConfig {
     pub hang_threshold: Duration,
 }
 
-impl Default for DeadlockConfig {
+impl Default for DeadlockMonitorPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -41,9 +41,12 @@ impl Default for DeadlockConfig {
     }
 }
 
+/// Backward-compatible alias for the old deadlock facade name.
+pub type DeadlockConfig = DeadlockMonitorPolicy;
+
 /// Deadlock manager
 pub struct DeadlockManager {
-    config: DeadlockConfig,
+    config: DeadlockMonitorPolicy,
     detector: Arc<CoreDeadlockDetector>,
     running: Arc<tokio::sync::Mutex<bool>>,
 }
@@ -51,7 +54,7 @@ pub struct DeadlockManager {
 impl DeadlockManager {
     /// Create a new deadlock manager
     pub fn new(enabled: bool, check_interval: Duration, hang_threshold: Duration) -> Self {
-        let config = DeadlockConfig {
+        let config = DeadlockMonitorPolicy {
             enabled,
             check_interval,
             hang_threshold,
@@ -71,7 +74,7 @@ impl DeadlockManager {
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &DeadlockConfig {
+    pub fn config(&self) -> &DeadlockMonitorPolicy {
         &self.config
     }
 

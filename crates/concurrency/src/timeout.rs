@@ -18,9 +18,9 @@ use rustfs_io_core::{TimeoutError, calculate_adaptive_timeout};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Timeout configuration
+/// Facade policy for the concurrency-layer timeout manager.
 #[derive(Debug, Clone)]
-pub struct TimeoutConfig {
+pub struct TimeoutManagerPolicy {
     /// Default timeout duration
     pub default_timeout: Duration,
     /// Maximum timeout duration
@@ -29,7 +29,7 @@ pub struct TimeoutConfig {
     pub enable_dynamic: bool,
 }
 
-impl Default for TimeoutConfig {
+impl Default for TimeoutManagerPolicy {
     fn default() -> Self {
         Self {
             default_timeout: Duration::from_secs(30),
@@ -39,16 +39,19 @@ impl Default for TimeoutConfig {
     }
 }
 
+/// Backward-compatible alias for the old timeout facade name.
+pub type TimeoutConfig = TimeoutManagerPolicy;
+
 /// Timeout manager
 pub struct TimeoutManager {
-    config: TimeoutConfig,
+    config: TimeoutManagerPolicy,
 }
 
 impl TimeoutManager {
     /// Create a new timeout manager
     pub fn new(default_timeout: Duration, max_timeout: Duration, enable_dynamic: bool) -> Self {
         Self {
-            config: TimeoutConfig {
+            config: TimeoutManagerPolicy {
                 default_timeout,
                 max_timeout,
                 enable_dynamic,
@@ -57,7 +60,7 @@ impl TimeoutManager {
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &TimeoutConfig {
+    pub fn config(&self) -> &TimeoutManagerPolicy {
         &self.config
     }
 
@@ -134,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_timeout_config() {
-        let config = TimeoutConfig::default();
+        let config = TimeoutManagerPolicy::default();
         assert!(config.default_timeout < config.max_timeout);
     }
 

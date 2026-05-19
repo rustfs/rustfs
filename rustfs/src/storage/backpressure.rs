@@ -47,9 +47,9 @@ use tracing::{debug, warn};
 
 use metrics::counter;
 
-/// Backpressure pipe configuration.
+/// Object-transfer duplex pipe backpressure policy.
 #[derive(Debug, Clone)]
-pub struct BackpressureConfig {
+pub struct ObjectPipeBackpressurePolicy {
     /// Buffer size in bytes (default 4MB).
     pub buffer_size: usize,
     /// High watermark percentage (default 80%).
@@ -60,7 +60,7 @@ pub struct BackpressureConfig {
     pub low_watermark: u32,
 }
 
-impl Default for BackpressureConfig {
+impl Default for ObjectPipeBackpressurePolicy {
     fn default() -> Self {
         Self {
             buffer_size: rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
@@ -70,7 +70,7 @@ impl Default for BackpressureConfig {
     }
 }
 
-impl BackpressureConfig {
+impl ObjectPipeBackpressurePolicy {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let buffer_size = rustfs_utils::get_env_usize(
@@ -103,6 +103,9 @@ impl BackpressureConfig {
         (self.buffer_size as u64 * self.low_watermark as u64 / 100) as usize
     }
 }
+
+/// Backward-compatible alias for the old object pipe config name.
+pub type BackpressureConfig = ObjectPipeBackpressurePolicy;
 
 /// Backpressure state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +179,7 @@ pub struct BackpressurePipe {
     /// Writer end of the duplex pipe.
     writer: DuplexStream,
     /// Configuration.
-    config: BackpressureConfig,
+    config: ObjectPipeBackpressurePolicy,
     /// Current buffer usage (approximate, updated on write).
     buffer_usage: Arc<AtomicUsize>,
     /// Current backpressure state.
@@ -194,7 +197,7 @@ impl BackpressurePipe {
     }
 
     /// Create a new backpressure-aware pipe with custom configuration.
-    pub fn with_config(config: BackpressureConfig) -> Self {
+    pub fn with_config(config: ObjectPipeBackpressurePolicy) -> Self {
         let (reader, writer) = duplex(config.buffer_size);
 
         debug!(

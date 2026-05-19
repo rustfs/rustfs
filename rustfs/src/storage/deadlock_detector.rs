@@ -40,9 +40,9 @@
 //! # Usage
 //!
 //! ```ignore
-//! use crate::storage::deadlock_detector::{DeadlockDetector, DeadlockDetectorConfig};
+//! use crate::storage::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
 //!
-//! let config = DeadlockDetectorConfig::from_env();
+//! let config = RequestHangDetectionPolicy::from_env();
 //! let detector = DeadlockDetector::new(config);
 //! detector.start();
 //!
@@ -73,9 +73,9 @@ pub type RequestId = String;
 /// Lock identifier type.
 pub type LockId = String;
 
-/// Deadlock detector configuration.
+/// Request-level hang and deadlock diagnosis policy.
 #[derive(Debug, Clone)]
-pub struct DeadlockDetectorConfig {
+pub struct RequestHangDetectionPolicy {
     /// Whether deadlock detection is enabled.
     pub enabled: bool,
     /// Detection check interval.
@@ -86,7 +86,7 @@ pub struct DeadlockDetectorConfig {
     pub capture_backtrace: bool,
 }
 
-impl Default for DeadlockDetectorConfig {
+impl Default for RequestHangDetectionPolicy {
     fn default() -> Self {
         Self {
             enabled: rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
@@ -97,7 +97,7 @@ impl Default for DeadlockDetectorConfig {
     }
 }
 
-impl DeadlockDetectorConfig {
+impl RequestHangDetectionPolicy {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let enabled = rustfs_utils::get_env_bool(
@@ -121,6 +121,9 @@ impl DeadlockDetectorConfig {
         }
     }
 }
+
+/// Backward-compatible alias for the old request diagnosis config name.
+pub type DeadlockDetectorConfig = RequestHangDetectionPolicy;
 
 /// Lock information for tracking.
 #[derive(Debug, Clone)]
@@ -247,7 +250,7 @@ pub struct ResourceUsage {
 /// Deadlock detector.
 pub struct DeadlockDetector {
     /// Configuration.
-    config: DeadlockDetectorConfig,
+    config: RequestHangDetectionPolicy,
     /// Active request trackers.
     requests: Arc<RwLock<HashMap<RequestId, RequestResourceTracker>>>,
     /// Detection task handle.
@@ -262,7 +265,7 @@ pub struct DeadlockDetector {
 
 impl DeadlockDetector {
     /// Create a new deadlock detector.
-    pub fn new(config: DeadlockDetectorConfig) -> Self {
+    pub fn new(config: RequestHangDetectionPolicy) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Self {
@@ -426,7 +429,7 @@ impl DeadlockDetector {
     /// Detect deadlock cycles in the lock wait graph.
     fn detect_cycle(
         requests: &Arc<RwLock<HashMap<RequestId, RequestResourceTracker>>>,
-        config: &DeadlockDetectorConfig,
+        config: &RequestHangDetectionPolicy,
         deadlocks_detected: &Arc<AtomicU64>,
     ) {
         let requests_guard = requests.read().unwrap();
