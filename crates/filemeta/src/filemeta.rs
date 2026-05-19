@@ -282,6 +282,11 @@ impl FileMeta {
             fi.version_id = Some(Uuid::nil());
         }
 
+        if fi.data.is_none() && self.data.after_version().is_empty() {
+            let version = FileMetaVersion::from(fi);
+            return self.add_version_filemata(version);
+        }
+
         let version_key = data_key_for_version(fi.version_id);
         let mut next_data = self.data.clone();
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use rustfs_filemeta::{ErasureAlgo, FileInfo, FileMeta};
 use std::hint::black_box;
 use std::time::Duration;
@@ -80,6 +80,28 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
                 let out = xlmeta.marshal_msg().expect("marshal updated meta");
                 black_box(out);
             });
+        });
+
+        let mut prepared = FileMeta::load(&dst_buf).expect("load prepared meta");
+        if let Some(old_data_dir) = prepared.find_unshared_data_dir_for_version(Some(replace_version_id)) {
+            let _ = prepared.data.remove_two(replace_version_id, old_data_dir);
+        }
+        group.bench_with_input(BenchmarkId::new("add_version_marshal_only", version_count), &version_count, |b, _| {
+            b.iter_batched(
+                || prepared.clone(),
+                |mut xlmeta| {
+                    let fi = make_file_info(
+                        replace_version_id,
+                        Uuid::new_v4(),
+                        64 * 1024,
+                        base_time + Duration::from_millis(1),
+                    );
+                    xlmeta.add_version(fi).expect("add new version");
+                    let out = xlmeta.marshal_msg().expect("marshal updated meta");
+                    black_box(out);
+                },
+                BatchSize::SmallInput,
+            );
         });
 
         group.bench_with_input(BenchmarkId::new("remove_two_only", version_count), &version_count, |b, _| {

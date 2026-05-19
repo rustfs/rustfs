@@ -188,6 +188,7 @@ impl InlineData {
             return Ok(false);
         }
 
+        let key_bytes = key.as_bytes();
         let mut cur = Cursor::new(buf);
 
         let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
@@ -204,18 +205,17 @@ impl InlineData {
 
             cur.read_exact(&mut field_buff)?;
 
-            let find_key = String::from_utf8(field_buff)?;
-
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
             cur.set_position(end as u64);
 
-            if find_key == key {
+            if field_buff.as_slice() == key_bytes {
                 found = true;
                 continue;
             }
 
+            let find_key = String::from_utf8(field_buff)?;
             keys.push(find_key);
             values.push(buf[start..end].to_vec());
         }
