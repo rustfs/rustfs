@@ -181,10 +181,12 @@ pub struct BackpressurePipeMeta {
 }
 
 /// Compact metadata snapshot for the lightweight backpressure monitor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackpressureMonitorMeta {
     /// Buffer capacity in bytes.
     pub buffer_capacity: usize,
+    /// Current buffer usage percentage.
+    pub usage_percent: f32,
     /// Current backpressure state.
     pub state: BackpressureState,
 }
@@ -467,6 +469,7 @@ impl BackpressureMonitor {
     pub fn meta(&self) -> BackpressureMonitorMeta {
         BackpressureMonitorMeta {
             buffer_capacity: self.config.buffer_size,
+            usage_percent: self.usage_percent(),
             state: self.state(),
         }
     }
@@ -548,14 +551,17 @@ mod tests {
         // Initially normal
         assert_eq!(monitor.state(), BackpressureState::Normal);
         assert_eq!(monitor.meta().buffer_capacity, 1000);
+        assert_eq!(monitor.meta().usage_percent, 0.0);
 
         // Write to reach high watermark
         let state = monitor.on_write(850);
         assert_eq!(state, BackpressureState::HighWatermark);
+        assert_eq!(monitor.meta().usage_percent, 85.0);
 
         // Read to go below low watermark
         let state = monitor.on_read(400);
         assert_eq!(state, BackpressureState::Normal);
+        assert_eq!(monitor.meta().usage_percent, 45.0);
     }
 
     #[tokio::test]
