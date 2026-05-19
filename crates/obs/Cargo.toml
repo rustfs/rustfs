@@ -51,11 +51,11 @@ crossbeam-deque = { workspace = true }
 crossbeam-utils = { workspace = true }
 num_cpus = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-appender-tracing = { workspace = true}
+opentelemetry_sdk = { workspace = true}
 opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true }
-opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
+opentelemetry-semantic-conventions = { workspace = true}
 percent-encoding = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }
