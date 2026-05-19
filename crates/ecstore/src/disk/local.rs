@@ -2518,14 +2518,15 @@ impl DiskAPI for LocalDisk {
 
         // TODO: Healing
 
-        let search_version_id = fi.version_id.or(Some(Uuid::nil()));
+        let version_id = fi.version_id.unwrap_or_default();
+        let search_version_id = Some(version_id);
         let no_inline = fi.data.is_none() && fi.size > 0;
 
         // Check if there's an existing version with the same version_id that has a data_dir to clean up
         // Reuse one metadata scan to find the version data_dir and determine whether it is shared.
         let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(search_version_id);
         if let Some(old_data_dir) = has_old_data_dir.as_ref() {
-            let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), *old_data_dir]);
+            let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
         }
 
         xlmeta.add_version(fi)?;

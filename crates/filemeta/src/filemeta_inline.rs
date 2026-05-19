@@ -293,6 +293,64 @@ impl InlineData {
         self.serialize(keys, values)?;
         Ok(true)
     }
+
+    pub fn remove_two(&mut self, first: Uuid, second: Uuid) -> Result<bool> {
+        let buf = self.after_version();
+        if buf.is_empty() {
+            return Ok(false);
+        }
+
+        let first = first.to_string();
+        let second = second.to_string();
+        let same = first == second;
+
+        let mut cur = Cursor::new(buf);
+        let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
+        let mut keys = Vec::with_capacity(fields_len + 1);
+        let mut values = Vec::with_capacity(fields_len + 1);
+        let mut found = false;
+
+        while fields_len > 0 {
+            fields_len -= 1;
+
+            let str_len = rmp::decode::read_str_len(&mut cur)?;
+            let mut field_buff = vec![0u8; str_len as usize];
+            cur.read_exact(&mut field_buff)?;
+            let find_key = String::from_utf8(field_buff)?;
+
+            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
+            let start = cur.position() as usize;
+            let end = start + bin_len;
+            cur.set_position(end as u64);
+
+            let should_remove = if same {
+                find_key == first
+            } else {
+                find_key == first || find_key == second
+            };
+
+            if should_remove {
+                found = true;
+                continue;
+            }
+
+            let find_value = &buf[start..end];
+            values.push(find_value.to_vec());
+            keys.push(find_key);
+        }
+
+        if !found {
+            return Ok(false);
+        }
+
+        if keys.is_empty() {
+            self.0 = Vec::new();
+            return Ok(true);
+        }
+
+        self.serialize(keys, values)?;
+        Ok(true)
+    }
     fn serialize(&mut self, keys: Vec<String>, values: Vec<Vec<u8>>) -> Result<()> {
         assert_eq!(keys.len(), values.len(), "InlineData serialize: keys/values not match");
 
