@@ -53,16 +53,8 @@ runs:
           musl-tools \
           build-essential \
           pkg-config \
-          libssl-dev
-
-    - name: Install protoc
-      uses: arduino/setup-protoc@v3
-      with:
-        # Keep this on a known-good protobuf release line for setup-protoc v3.
-        # Some newer tags may trigger fallback resolution and fail with
-        # "unable to get latest version" in CI.
-        version: "29.3"
-        repo-token: ${{ github.token }}
+          libssl-dev \
+          protobuf-compiler
 
     - name: Install flatc
       uses: Nugine/setup-flatc@v1
