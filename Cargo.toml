@@ -145,7 +145,7 @@ tonic = { version = "0.14.6", features = ["gzip"] }
 tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3", features = ["timeout"] }
-tower-http = { version = "0.6.10", features = ["cors"] }
+tower-http = { version = "0.6.11", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.1", features = ["serde"] }
@@ -194,7 +194,7 @@ tokio-postgres-rustls = "0.13"
 # Utilities and Tools
 anyhow = "1.0.102"
 arc-swap = "1.9.1"
-astral-tokio-tar = "0.6.1"
+astral-tokio-tar = "0.6.2"
 atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.16" }
@@ -216,7 +216,7 @@ crossbeam-deque = "0.8.6"
 crossbeam-utils = "0.8.21"
 datafusion = "53.1.0"
 derive_builder = "0.20.2"
-enumset = "1.1.12"
+enumset = "1.1.13"
 faster-hex = "0.10.0"
 flate2 = "1.1.9"
 glob = "0.3.3"
@@ -269,7 +269,7 @@ snafu = "0.9.0"
 snap = "1.1.1"
 starshard = { version = "2.2.0", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }
-sysinfo = "0.39.1"
+sysinfo = "0.39.2"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.3.1"
@@ -277,7 +277,7 @@ thiserror = "2.0.18"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.5"
 tracing-error = "0.2.1"
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"
@@ -294,12 +294,12 @@ zstd = "0.13.3"
 # Observability and Metrics
 metrics = "0.24.6"
 dial9-tokio-telemetry = "0.3"
-opentelemetry = { version = "0.31.0" }
+opentelemetry = { version = "0.32.0" }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes", "spec_unstable_logs_enabled"] }
-opentelemetry-otlp = { version = "0.31.1", features = ["gzip-http", "reqwest-rustls"] }
-opentelemetry_sdk = { version = "0.31.0" }
-opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
-opentelemetry-stdout = { version = "0.31.0" }
+opentelemetry-otlp = { version = "0.32.0", features = ["gzip-http", "reqwest-rustls"] }
+opentelemetry_sdk = { version = "0.32.0" }
+opentelemetry-semantic-conventions = { version = "0.32.0", features = ["semconv_experimental"] }
+opentelemetry-stdout = { version = "0.32.0" }
 pyroscope = { version = "2.0.3", features = ["backend-pprof-rs"] }
 
 # FTP and SFTP
