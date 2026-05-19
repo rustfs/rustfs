@@ -200,6 +200,7 @@ impl GetObjectTimeoutPolicy {
 }
 
 /// Backward-compatible alias for the old request timeout name.
+#[deprecated(note = "use GetObjectTimeoutPolicy instead")]
 pub type TimeoutConfig = GetObjectTimeoutPolicy;
 
 /// Information about a timeout event.
@@ -565,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_timeout_config_default() {
-        let config = TimeoutConfig::default();
+        let config = GetObjectTimeoutPolicy::default();
         assert_eq!(config.get_object_timeout, Duration::from_secs(30));
         assert_eq!(config.lock_acquire_timeout, Duration::from_secs(5));
         assert_eq!(config.disk_read_timeout, Duration::from_secs(10));
@@ -573,10 +574,10 @@ mod tests {
 
     #[test]
     fn test_timeout_config_is_enabled() {
-        let config = TimeoutConfig::default();
+        let config = GetObjectTimeoutPolicy::default();
         assert!(config.is_timeout_enabled());
 
-        let disabled_config = TimeoutConfig {
+        let disabled_config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::ZERO,
             ..Default::default()
         };
@@ -585,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_wrapper_success() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::from_secs(5),
             ..Default::default()
         };
@@ -603,7 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_wrapper_timeout() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::from_millis(100),
             ..Default::default()
         };
@@ -626,7 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_wrapper_error() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::from_secs(5),
             ..Default::default()
         };
@@ -644,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_wrapper_disabled() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::ZERO,
             ..Default::default()
         };
@@ -680,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_timeout_config_default_with_dynamic() {
-        let config = TimeoutConfig::default();
+        let config = GetObjectTimeoutPolicy::default();
         assert!(config.enable_dynamic_timeout);
         assert_eq!(config.bytes_per_second, rustfs_config::DEFAULT_OBJECT_BYTES_PER_SECOND);
         assert_eq!(config.min_timeout, Duration::from_secs(rustfs_config::DEFAULT_OBJECT_MIN_TIMEOUT));
@@ -689,7 +690,7 @@ mod tests {
 
     #[test]
     fn test_calculate_timeout_for_size() {
-        let config = TimeoutConfig::default();
+        let config = GetObjectTimeoutPolicy::default();
 
         // Test with small object (should use min timeout)
         let small_timeout = config.calculate_timeout_for_size(1024); // 1KB
@@ -708,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_timeout_with_dynamic_disabled() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             enable_dynamic_timeout: false,
             ..Default::default()
         };
@@ -777,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_should_timeout() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::from_millis(100),
             ..Default::default()
         };
@@ -794,7 +795,7 @@ mod tests {
 
     #[test]
     fn test_should_timeout_with_size() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             enable_dynamic_timeout: true,
             bytes_per_second: 1024, // 1KB/s
             min_timeout: Duration::from_secs(rustfs_config::DEFAULT_OBJECT_MIN_TIMEOUT),

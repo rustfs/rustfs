@@ -105,6 +105,7 @@ impl ObjectPipeBackpressurePolicy {
 }
 
 /// Backward-compatible alias for the old object pipe config name.
+#[deprecated(note = "use ObjectPipeBackpressurePolicy instead")]
 pub type BackpressureConfig = ObjectPipeBackpressurePolicy;
 
 /// Backpressure state.
@@ -258,7 +259,7 @@ pub struct BackpressurePipe {
 impl BackpressurePipe {
     /// Create a new backpressure-aware pipe with default configuration.
     pub fn new() -> Self {
-        Self::with_config(BackpressureConfig::from_env())
+        Self::with_config(ObjectPipeBackpressurePolicy::from_env())
     }
 
     /// Create a new backpressure-aware pipe with custom configuration.
@@ -423,7 +424,7 @@ impl Default for BackpressurePipe {
 /// wrap the streams but provides monitoring capabilities.
 pub struct BackpressureMonitor {
     /// Configuration.
-    config: BackpressureConfig,
+    config: ObjectPipeBackpressurePolicy,
     /// Current buffer usage.
     buffer_usage: Arc<AtomicUsize>,
     /// In high watermark state.
@@ -433,11 +434,11 @@ pub struct BackpressureMonitor {
 impl BackpressureMonitor {
     /// Create a new monitor with default configuration.
     pub fn new() -> Self {
-        Self::with_config(BackpressureConfig::from_env())
+        Self::with_config(ObjectPipeBackpressurePolicy::from_env())
     }
 
     /// Create a new monitor with custom configuration.
-    pub fn with_config(config: BackpressureConfig) -> Self {
+    pub fn with_config(config: ObjectPipeBackpressurePolicy) -> Self {
         Self {
             config,
             buffer_usage: Arc::new(AtomicUsize::new(0)),
@@ -527,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_config_default() {
-        let config = BackpressureConfig::default();
+        let config = ObjectPipeBackpressurePolicy::default();
         assert_eq!(config.buffer_size, 4 * 1024 * 1024);
         assert_eq!(config.high_watermark, 80);
         assert_eq!(config.low_watermark, 50);
@@ -535,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_config_watermarks() {
-        let config = BackpressureConfig {
+        let config = ObjectPipeBackpressurePolicy {
             buffer_size: 1000,
             high_watermark: 80,
             low_watermark: 50,
@@ -553,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_monitor() {
-        let config = BackpressureConfig {
+        let config = ObjectPipeBackpressurePolicy {
             buffer_size: 1000,
             high_watermark: 80,
             low_watermark: 50,
@@ -587,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_pipe_state_transitions() {
-        let config = BackpressureConfig {
+        let config = ObjectPipeBackpressurePolicy {
             buffer_size: 1000,
             high_watermark: 80,
             low_watermark: 50,

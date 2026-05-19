@@ -133,6 +133,7 @@ impl RequestHangDetectionPolicy {
 }
 
 /// Backward-compatible alias for the old request diagnosis config name.
+#[deprecated(note = "use RequestHangDetectionPolicy instead")]
 pub type DeadlockDetectorConfig = RequestHangDetectionPolicy;
 
 /// Lock information for tracking.
@@ -567,7 +568,7 @@ static DEADLOCK_DETECTOR: std::sync::OnceLock<Arc<DeadlockDetector>> = std::sync
 pub fn get_deadlock_detector() -> Arc<DeadlockDetector> {
     DEADLOCK_DETECTOR
         .get_or_init(|| {
-            let config = DeadlockDetectorConfig::from_env();
+            let config = RequestHangDetectionPolicy::from_env();
             Arc::new(DeadlockDetector::new(config))
         })
         .clone()
@@ -593,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_deadlock_detector_config_default() {
-        let config = DeadlockDetectorConfig::default();
+        let config = RequestHangDetectionPolicy::default();
         assert!(!config.enabled);
         assert_eq!(config.check_interval, Duration::from_secs(5));
         assert_eq!(config.hang_threshold, Duration::from_secs(10));
@@ -619,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_deadlock_detector_registration() {
-        let config = DeadlockDetectorConfig {
+        let config = RequestHangDetectionPolicy {
             enabled: true,
             ..Default::default()
         };
