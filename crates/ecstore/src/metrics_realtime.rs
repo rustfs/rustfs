@@ -16,7 +16,10 @@ use crate::{admin_server_info::get_local_server_property, new_object_layer_fn, s
 use chrono::Utc;
 use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics};
+use rustfs_madmin::metrics::{
+    DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
+    ScannerMetrics as MadminScannerMetrics, TimedAction as MadminTimedAction,
+};
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -51,6 +54,51 @@ impl MetricType {
 
     pub fn new(t: u32) -> Self {
         Self(t)
+    }
+}
+
+fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsReport) -> MadminScannerMetrics {
+    MadminScannerMetrics {
+        collected_at: metrics.collected_at,
+        current_cycle: metrics.current_cycle,
+        current_started: metrics.current_started,
+        cycles_completed_at: metrics.cycles_completed_at,
+        ongoing_buckets: metrics.ongoing_buckets,
+        life_time_ops: metrics.life_time_ops,
+        life_time_ilm: metrics.life_time_ilm,
+        last_minute: MadminLastMinute {
+            actions: metrics
+                .last_minute
+                .actions
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        MadminTimedAction {
+                            count: value.count,
+                            acc_time: value.acc_time,
+                            bytes: value.bytes,
+                        },
+                    )
+                })
+                .collect(),
+            ilm: metrics
+                .last_minute
+                .ilm
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key,
+                        MadminTimedAction {
+                            count: value.count,
+                            acc_time: value.acc_time,
+                            bytes: value.bytes,
+                        },
+                    )
+                })
+                .collect(),
+        },
+        active_paths: metrics.active_paths,
     }
 }
 
@@ -112,7 +160,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
         if let Some(init_time) = rustfs_common::get_global_init_time().await {
             metrics.current_started = init_time;
         }
-        real_time_metrics.aggregated.scanner = Some(metrics);
+        real_time_metrics.aggregated.scanner = Some(to_madmin_scanner_metrics(metrics));
     }
 
     // if types.contains(&MetricType::OS) {}

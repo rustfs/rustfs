@@ -9426,7 +9426,6 @@ dependencies = [
  "chrono",
  "metrics",
  "rmp-serde",
- "rustfs-madmin",
  "s3s",
  "serde",
  "tokio",
