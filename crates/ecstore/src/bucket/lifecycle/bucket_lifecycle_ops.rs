@@ -44,7 +44,7 @@ use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use rustfs_common::data_usage::TierStats;
+use rustfs_data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
 use rustfs_config::{

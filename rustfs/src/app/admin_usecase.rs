@@ -17,7 +17,7 @@
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::capacity::resolve_admin_used_capacity;
 use crate::error::ApiError;
-use rustfs_common::data_usage::DataUsageInfo;
+use rustfs_data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::data_usage::load_data_usage_from_backend;
 use rustfs_ecstore::endpoints::EndpointServerPools;

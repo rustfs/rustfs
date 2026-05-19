@@ -46,6 +46,7 @@ rustfs-policy.workspace = true
 rustfs-protos.workspace = true
 rustfs-kms.workspace = true
 rustfs-s3-common = { workspace = true }
+rustfs-data-usage.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }
