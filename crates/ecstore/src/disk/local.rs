@@ -1203,6 +1203,11 @@ impl LocalDisk {
         Ok(f)
     }
 
+    async fn open_file_read_only(&self, path: impl AsRef<Path>) -> Result<File> {
+        let f = super::fs::open_file(path.as_ref(), O_RDONLY).await.map_err(to_file_error)?;
+        Ok(f)
+    }
+
     #[allow(dead_code)]
     fn get_metrics(&self) -> DiskMetrics {
         DiskMetrics::default()
@@ -2137,7 +2142,7 @@ impl DiskAPI for LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+        let f = self.open_file_read_only(file_path).await?;
 
         Ok(Box::new(f))
     }
@@ -2154,7 +2159,7 @@ impl DiskAPI for LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+        let mut f = self.open_file_read_only(file_path).await?;
 
         let meta = f.metadata().await?;
         let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
