@@ -96,6 +96,7 @@ impl Default for LockManagerPolicy {
 
 /// Main configuration for concurrency management
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct ConcurrencyConfig {
     /// Feature flags
     pub features: ConcurrencyFeatures,
@@ -111,18 +112,6 @@ pub struct ConcurrencyConfig {
     pub scheduler_policy: SchedulerPolicy,
 }
 
-impl Default for ConcurrencyConfig {
-    fn default() -> Self {
-        Self {
-            features: ConcurrencyFeatures::default(),
-            timeout_policy: TimeoutManagerPolicy::default(),
-            lock_policy: LockManagerPolicy::default(),
-            deadlock_policy: DeadlockMonitorPolicy::default(),
-            backpressure_policy: PipeBackpressurePolicy::default(),
-            scheduler_policy: SchedulerPolicy::default(),
-        }
-    }
-}
 
 impl ConcurrencyConfig {
     /// Create configuration from environment variables

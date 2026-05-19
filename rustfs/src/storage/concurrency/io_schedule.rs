@@ -31,11 +31,10 @@
 //! runtime monitoring features (`IoPriorityMetrics`, `IoStrategyDebugInfo`).
 
 use rustfs_config::{KI_B, MI_B};
-use rustfs_io_core::{
-    IoPriority as CoreIoPriority, IoPriorityQueueConfig as CoreIoPriorityQueueConfig,
-    IoSchedulerConfig as CoreIoSchedulerConfig,
-};
 use rustfs_io_core::io_profile::{AccessPattern, StorageMedia, StorageProfile};
+use rustfs_io_core::{
+    IoPriority as CoreIoPriority, IoPriorityQueueConfig as CoreIoPriorityQueueConfig, IoSchedulerConfig as CoreIoSchedulerConfig,
+};
 use rustfs_io_metrics::bandwidth::{BandwidthSnapshot, BandwidthTier};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -2075,14 +2074,8 @@ mod tests {
         assert_eq!(core.high_capacity, config.queue_high_capacity);
         assert_eq!(core.normal_capacity, config.queue_normal_capacity);
         assert_eq!(core.low_capacity, config.queue_low_capacity);
-        assert_eq!(
-            core.starvation_interval,
-            Duration::from_millis(config.starvation_prevention_interval_ms)
-        );
-        assert_eq!(
-            core.starvation_threshold,
-            Duration::from_secs(config.starvation_threshold_secs)
-        );
+        assert_eq!(core.starvation_interval, Duration::from_millis(config.starvation_prevention_interval_ms));
+        assert_eq!(core.starvation_threshold, Duration::from_secs(config.starvation_threshold_secs));
     }
 
     #[test]
@@ -2093,10 +2086,7 @@ mod tests {
         assert_eq!(config.queue_high_capacity, core.high_capacity);
         assert_eq!(config.queue_normal_capacity, core.normal_capacity);
         assert_eq!(config.queue_low_capacity, core.low_capacity);
-        assert_eq!(
-            config.starvation_prevention_interval_ms,
-            core.starvation_interval.as_millis() as u64
-        );
+        assert_eq!(config.starvation_prevention_interval_ms, core.starvation_interval.as_millis() as u64);
         assert_eq!(config.starvation_threshold_secs, core.starvation_threshold.as_secs());
     }
 

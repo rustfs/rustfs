@@ -324,10 +324,7 @@ impl BackpressurePipe {
     pub fn meta(&self) -> BackpressurePipeMeta {
         BackpressurePipeMeta {
             buffer_capacity: self.config.buffer_size,
-            state: state_from_high_watermark(
-                self.state.load(Ordering::Relaxed),
-                BackpressureState::BackpressureApplied,
-            ),
+            state: state_from_high_watermark(self.state.load(Ordering::Relaxed), BackpressureState::BackpressureApplied),
             age: self.age(),
         }
     }
@@ -360,12 +357,8 @@ impl BackpressurePipe {
     fn update_watermark_state(&self) {
         let usage = self.buffer_usage.load(Ordering::Relaxed);
         let usage_percent = calculate_usage_percent(usage, self.config.buffer_size) as u32;
-        let (next_state, changed) = apply_watermark_transition(
-            &self.state,
-            usage,
-            self.config.high_watermark_bytes(),
-            self.config.low_watermark_bytes(),
-        );
+        let (next_state, changed) =
+            apply_watermark_transition(&self.state, usage, self.config.high_watermark_bytes(), self.config.low_watermark_bytes());
 
         if changed {
             match next_state {
@@ -480,10 +473,7 @@ impl BackpressureMonitor {
         BackpressureMonitorMeta {
             buffer_capacity: self.config.buffer_size,
             usage_percent: calculate_usage_percent(usage, self.config.buffer_size),
-            state: state_from_high_watermark(
-                self.in_high_watermark.load(Ordering::Relaxed),
-                BackpressureState::HighWatermark,
-            ),
+            state: state_from_high_watermark(self.in_high_watermark.load(Ordering::Relaxed), BackpressureState::HighWatermark),
         }
     }
 

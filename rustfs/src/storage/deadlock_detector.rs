@@ -66,7 +66,9 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use metrics::counter;
-use rustfs_io_core::{DeadlockDetector as CoreDeadlockDetector, DeadlockDetectorConfig as CoreDeadlockConfig, LockType as CoreLockType};
+use rustfs_io_core::{
+    DeadlockDetector as CoreDeadlockDetector, DeadlockDetectorConfig as CoreDeadlockConfig, LockType as CoreLockType,
+};
 
 /// Request identifier type.
 pub type RequestId = String;

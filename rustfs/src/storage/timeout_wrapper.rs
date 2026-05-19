@@ -66,7 +66,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use rustfs_io_core::{RequestTimeoutWrapper as CoreRequestTimeoutWrapper, TimeoutConfig as CoreTimeoutConfig, calculate_adaptive_timeout};
+use rustfs_io_core::{
+    RequestTimeoutWrapper as CoreRequestTimeoutWrapper, TimeoutConfig as CoreTimeoutConfig, calculate_adaptive_timeout,
+};
 
 /// Request-level timeout policy for GetObject.
 #[derive(Debug, Clone)]
@@ -163,8 +165,7 @@ impl GetObjectTimeoutPolicy {
         // overhead factor, so we feed it an 80% effective rate to reach the same
         // 1.5x envelope this request policy historically used.
         let effective_rate_bps = self.bytes_per_second.saturating_mul(4).saturating_div(5).max(1);
-        let estimated_duration =
-            calculate_adaptive_timeout(Duration::from_secs(1), Some(effective_rate_bps), 0, object_size);
+        let estimated_duration = calculate_adaptive_timeout(Duration::from_secs(1), Some(effective_rate_bps), 0, object_size);
 
         // Clamp to min/max bounds
         estimated_duration

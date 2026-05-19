@@ -14,7 +14,9 @@
 
 //! Backpressure management
 
-use rustfs_io_core::{BackpressureConfig as CoreBackpressureConfig, BackpressureMonitor as CoreBackpressureMonitor, BackpressureState};
+use rustfs_io_core::{
+    BackpressureConfig as CoreBackpressureConfig, BackpressureMonitor as CoreBackpressureMonitor, BackpressureState,
+};
 use rustfs_io_metrics::backpressure_metrics;
 use std::sync::Arc;
 use std::time::Instant;

@@ -1123,12 +1123,7 @@ impl DefaultObjectUsecase {
         deadlock_detector.register_request(&request_id, format!("GetObject {bucket}/{key}"));
         let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
 
-        Self::ensure_get_object_not_timed_out_before_processing(
-            &wrapper,
-            &timeout_config,
-            bucket,
-            key,
-        )?;
+        Self::ensure_get_object_not_timed_out_before_processing(&wrapper, &timeout_config, bucket, key)?;
 
         rustfs_io_metrics::record_get_object_request_start(concurrent_requests);
 
@@ -1189,12 +1184,7 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::record_io_queue_congestion();
         }
 
-        Self::ensure_get_object_not_timed_out_before_read(
-            wrapper,
-            timeout_config,
-            bucket,
-            key,
-        )?;
+        Self::ensure_get_object_not_timed_out_before_read(wrapper, timeout_config, bucket, key)?;
 
         Ok(GetObjectIoPlanning {
             _disk_permit: disk_permit,
