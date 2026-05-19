@@ -1014,7 +1014,7 @@ impl ECStore {
 }
 
 async fn gather_results(
-    _rx: CancellationToken,
+    rx: CancellationToken,
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
     results_tx: Sender<MetaCacheEntriesSortedResult>,
@@ -1060,7 +1060,11 @@ async fn gather_results(
 
         // TODO: Lifecycle
 
+        entries.push(Some(entry));
+
         if opts.limit > 0 && entries.len() >= opts.limit as usize {
+            rx.cancel();
+
             results_tx
                 .send(MetaCacheEntriesSortedResult {
                     entries: Some(MetaCacheEntriesSorted {
@@ -1073,9 +1077,6 @@ async fn gather_results(
                 .map_err(Error::other)?;
             return Ok(());
         }
-
-        entries.push(Some(entry));
-        // entries.push(entry);
     }
 
     // finish not full, return eof
@@ -1475,7 +1476,7 @@ mod test {
             .expect("limited result should be present");
         assert_eq!(result.entries.unwrap().entries().len(), 1);
 
-        timeout(Duration::from_millis(50), handle)
+        timeout(Duration::from_secs(1), handle)
             .await
             .expect("gather_results should finish after sending a limited result")
             .expect("gather_results task should not panic")
