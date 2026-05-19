@@ -1601,12 +1601,13 @@ impl DiskAPI for RemoteDisk {
                     }
                 };
 
+                global_internode_metrics().record_sent_bytes_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL, data_len);
+
                 if !response.success {
                     global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                global_internode_metrics().record_sent_bytes_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL, data_len);
                 Ok(())
             },
             get_max_timeout_duration(),

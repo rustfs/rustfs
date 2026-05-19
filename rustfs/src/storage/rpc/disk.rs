@@ -933,16 +933,14 @@ impl NodeService {
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
         let request = request.into_inner();
         let data_len = request.data.len();
+        global_internode_metrics().record_incoming_request_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+        global_internode_metrics().record_recv_bytes_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL, data_len);
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.write_all(&request.volume, &request.path, request.data).await {
-                Ok(_) => {
-                    global_internode_metrics().record_incoming_request_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
-                    global_internode_metrics().record_recv_bytes_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL, data_len);
-                    Ok(Response::new(WriteAllResponse {
-                        success: true,
-                        error: None,
-                    }))
-                }
+                Ok(_) => Ok(Response::new(WriteAllResponse {
+                    success: true,
+                    error: None,
+                })),
                 Err(err) => {
                     global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
                     Ok(Response::new(WriteAllResponse {
@@ -964,10 +962,10 @@ impl NodeService {
         debug!("read all");
 
         let request = request.into_inner();
+        global_internode_metrics().record_incoming_request_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.read_all(&request.volume, &request.path).await {
                 Ok(data) => {
-                    global_internode_metrics().record_incoming_request_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
                     global_internode_metrics().record_sent_bytes_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL, data.len());
                     Ok(Response::new(ReadAllResponse {
                         success: true,
