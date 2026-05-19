@@ -29,8 +29,8 @@ use crate::storage::s3_api::multipart::{
     parse_list_multipart_uploads_params, parse_list_parts_params,
 };
 use crate::storage::sse::{
-    build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers, map_get_object_reader_error,
-    mark_encrypted_multipart_metadata,
+    build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
+    extract_ssekms_context_from_headers, map_get_object_reader_error, mark_encrypted_multipart_metadata,
 };
 use crate::storage::*;
 use bytes::Bytes;
@@ -547,6 +547,7 @@ impl DefaultMultipartUsecase {
             metadata.extend(object_lock_metadata);
         }
         apply_bucket_default_lock_retention(&bucket, &mut metadata, has_explicit_object_lock_retention).await?;
+        let (_, sse_customer_key, _) = extract_ssec_params_from_headers(&req.headers)?;
 
         let encryption_request = PrepareEncryptionRequest {
             bucket: &bucket,
@@ -555,6 +556,7 @@ impl DefaultMultipartUsecase {
             ssekms_key_id,
             ssekms_context: extract_ssekms_context_from_headers(&req.headers)?,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
+            sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
         };
 
@@ -778,27 +780,25 @@ impl DefaultMultipartUsecase {
         }
         .check_upload_part_customer_key_md5(&fi.user_defined, sse_customer_key_md5.clone())?;
         let (requested_sse, requested_kms_key_id) = if has_ssec {
-            let encryption_request = EncryptionRequest {
+            let ssec_material = sse_decryption(DecryptionRequest {
                 bucket: &bucket,
                 key: &key,
-                server_side_encryption,
-                ssekms_key_id,
-                ssekms_context: None,
-                sse_customer_algorithm: sse_customer_algorithm.clone(),
-                sse_customer_key,
-                sse_customer_key_md5: sse_customer_key_md5.clone(),
-                content_size: actual_size,
-            };
-
-            match sse_encryption(encryption_request).await? {
-                Some(material) => {
-                    let requested_sse = Some(material.server_side_encryption.clone());
-                    let requested_kms_key_id = material.kms_key_id.clone();
-                    write_plan = write_plan.with_encryption(material.write_encryption(Some(part_id)));
-                    (requested_sse, requested_kms_key_id)
+                metadata: &fi.user_defined,
+                sse_customer_key: sse_customer_key.as_ref(),
+                sse_customer_key_md5: sse_customer_key_md5.as_ref(),
+            })
+            .await?
+            .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
+            let ssec_write = match ssec_material.key_kind {
+                crate::storage::sse::EncryptionKeyKind::Object => {
+                    rustfs_ecstore::rio::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
                 }
-                None => (None, None),
-            }
+                crate::storage::sse::EncryptionKeyKind::Direct => {
+                    rustfs_ecstore::rio::WriteEncryption::multipart(ssec_material.key_bytes, ssec_material.base_nonce, part_id)
+                }
+            };
+            write_plan = write_plan.with_encryption(ssec_write);
+            (Some(ssec_material.server_side_encryption), ssec_material.kms_key_id)
         } else if let Some(server_side_encryption) = server_side_encryption {
             let managed_material = sse_decryption(DecryptionRequest {
                 bucket: &bucket,
@@ -1118,27 +1118,29 @@ impl DefaultMultipartUsecase {
         .check_upload_part_customer_key_md5(&mp_info.user_defined, sse_customer_key_md5.clone())?;
 
         let (requested_sse, requested_kms_key_id, dst_user_defined) = if has_ssec {
-            let encryption_request = EncryptionRequest {
+            let ssec_material = sse_decryption(DecryptionRequest {
                 bucket: &bucket,
                 key: &key,
-                server_side_encryption,
-                ssekms_key_id,
-                ssekms_context: None,
-                sse_customer_algorithm: sse_customer_algorithm.clone(),
-                sse_customer_key,
-                sse_customer_key_md5: sse_customer_key_md5.clone(),
-                content_size: actual_size,
-            };
-
-            match sse_encryption(encryption_request).await? {
-                Some(material) => {
-                    let requested_sse = Some(material.server_side_encryption.clone());
-                    let requested_kms_key_id = material.kms_key_id.clone();
-                    write_plan = write_plan.with_encryption(material.write_encryption(Some(part_id)));
-                    (requested_sse, requested_kms_key_id, mp_info.user_defined.clone())
+                metadata: &mp_info.user_defined,
+                sse_customer_key: sse_customer_key.as_ref(),
+                sse_customer_key_md5: sse_customer_key_md5.as_ref(),
+            })
+            .await?
+            .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
+            let ssec_write = match ssec_material.key_kind {
+                crate::storage::sse::EncryptionKeyKind::Object => {
+                    rustfs_ecstore::rio::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
                 }
-                None => (None, None, mp_info.user_defined.clone()),
-            }
+                crate::storage::sse::EncryptionKeyKind::Direct => {
+                    rustfs_ecstore::rio::WriteEncryption::multipart(ssec_material.key_bytes, ssec_material.base_nonce, part_id)
+                }
+            };
+            write_plan = write_plan.with_encryption(ssec_write);
+            (
+                Some(ssec_material.server_side_encryption),
+                ssec_material.kms_key_id,
+                mp_info.user_defined.clone(),
+            )
         } else if let Some(server_side_encryption) = server_side_encryption {
             let managed_material = sse_decryption(DecryptionRequest {
                 bucket: &bucket,
@@ -1319,6 +1321,7 @@ mod tests {
             ssekms_key_id: None,
             ssekms_context: None,
             sse_customer_algorithm: None,
+            sse_customer_key: None,
             sse_customer_key_md5: None,
         };
         let session_material = sse_prepare_encryption(prepare_request)

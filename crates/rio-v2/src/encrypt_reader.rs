@@ -122,7 +122,7 @@ where
         }
 
         loop {
-            if this.temp_buffer.len() >= DARE_PAYLOAD_SIZE + 1 {
+            if this.temp_buffer.len() > DARE_PAYLOAD_SIZE {
                 let package = build_dare_package(
                     this.cipher,
                     *this.sequence_number,
@@ -141,7 +141,7 @@ where
             let mut read_buf = ReadBuf::new(&mut this.read_buffer[..remaining]);
             match this.inner.as_mut().poll_read(cx, &mut read_buf) {
                 Poll::Pending => {
-                    if this.temp_buffer.len() >= DARE_PAYLOAD_SIZE + 1 {
+                    if this.temp_buffer.len() > DARE_PAYLOAD_SIZE {
                         continue;
                     }
                     return Poll::Pending;

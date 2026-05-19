@@ -10093,7 +10093,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio-v2"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "aes-gcm 0.11.0-rc.3",
  "hex",

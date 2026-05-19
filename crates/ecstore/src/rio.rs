@@ -72,9 +72,9 @@ pub fn compression_index_storage_bytes(index: &Index) -> Bytes {
     #[cfg(feature = "rio-v2")]
     {
         let encoded = index.clone().into_vec();
-        return strip_index_headers(encoded.as_ref())
+        strip_index_headers(encoded.as_ref())
             .map(Bytes::copy_from_slice)
-            .unwrap_or(encoded);
+            .unwrap_or(encoded)
     }
 
     #[cfg(not(feature = "rio-v2"))]

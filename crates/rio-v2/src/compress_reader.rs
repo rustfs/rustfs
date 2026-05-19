@@ -138,23 +138,23 @@ where
         }
 
         if this.temp_buffer.is_empty() {
-            if let Some(padding_multiple) = *this.padding_multiple {
-                if let Some(padding_chunk) = build_padding_chunk(*this.written, padding_multiple)? {
-                    *this.written += padding_chunk.len();
-                    this.index.total_compressed = *this.written as i64;
-                    *this.buffer = padding_chunk;
-                    *this.pos = 0;
-                    *this.done = true;
+            if let Some(padding_multiple) = *this.padding_multiple
+                && let Some(padding_chunk) = build_padding_chunk(*this.written, padding_multiple)?
+            {
+                *this.written += padding_chunk.len();
+                this.index.total_compressed = *this.written as i64;
+                *this.buffer = padding_chunk;
+                *this.pos = 0;
+                *this.done = true;
 
-                    let to_copy = min(buf.remaining(), this.buffer.len());
-                    buf.put_slice(&this.buffer[..to_copy]);
-                    *this.pos += to_copy;
-                    if *this.pos == this.buffer.len() {
-                        this.buffer.clear();
-                        *this.pos = 0;
-                    }
-                    return Poll::Ready(Ok(()));
+                let to_copy = min(buf.remaining(), this.buffer.len());
+                buf.put_slice(&this.buffer[..to_copy]);
+                *this.pos += to_copy;
+                if *this.pos == this.buffer.len() {
+                    this.buffer.clear();
+                    *this.pos = 0;
                 }
+                return Poll::Ready(Ok(()));
             }
 
             *this.done = true;
@@ -427,7 +427,7 @@ fn build_s2_chunk(uncompressed: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 fn build_padding_chunk(current_size: usize, padding_multiple: usize) -> io::Result<Option<Vec<u8>>> {
-    if padding_multiple == 0 || current_size % padding_multiple == 0 {
+    if padding_multiple == 0 || current_size.is_multiple_of(padding_multiple) {
         return Ok(None);
     }
 

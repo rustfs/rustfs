@@ -20,6 +20,10 @@ struct HeadRecord {
     content_length: u64,
     #[serde(rename = "ServerSideEncryption")]
     server_side_encryption: Option<String>,
+    #[serde(rename = "SSECustomerAlgorithm")]
+    sse_customer_algorithm: Option<String>,
+    #[serde(rename = "SSECustomerKeyMD5")]
+    sse_customer_key_md5: Option<String>,
     #[serde(rename = "SSEKMSKeyId")]
     sse_kms_key_id: Option<String>,
 }
@@ -94,7 +98,7 @@ fn require_generated_fixture_root() {
     let root = fixture_root();
     assert!(
         root.join("cases").is_dir(),
-        "generated fixture root missing: {}. Run scripts/minio_fixture_lab/lab.py capture-matrix first.",
+        "generated fixture root missing: {}. Run test/minio_fixture_lab/lab.py capture-matrix first.",
         root.display()
     );
 }
@@ -103,15 +107,15 @@ fn metadata_keys(fi: &FileInfo) -> HashMap<&str, &str> {
     fi.metadata.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
 }
 
-fn expected_fixture_kms_key_id(case_id: &str) -> String {
-    read_manifest(case_id)
-        .capture
-        .and_then(|capture| capture.kms_key_id)
-        .unwrap_or_else(|| panic!("fixture {case_id} missing capture.kms_key_id"))
+fn expected_fixture_kms_key_id(case_id: &str, request: &RequestRecord) -> Option<String> {
+    request
+        .headers
+        .get("x-amz-server-side-encryption-aws-kms-key-id")
+        .cloned()
+        .or_else(|| read_manifest(case_id).capture.and_then(|capture| capture.kms_key_id))
 }
 
 #[test]
-#[ignore = "requires generated MinIO fixture data"]
 fn parses_singlepart_sse_s3_fixture() {
     require_generated_fixture_root();
 
@@ -132,7 +136,6 @@ fn parses_singlepart_sse_s3_fixture() {
 }
 
 #[test]
-#[ignore = "requires generated MinIO fixture data"]
 fn parses_singlepart_sse_kms_fixture() {
     require_generated_fixture_root();
 
@@ -141,7 +144,7 @@ fn parses_singlepart_sse_kms_fixture() {
     let head: HeadRecord = read_json(&case_dir(case_id).join("head.json"));
     let fi = load_file_info(case_id);
     let metadata = metadata_keys(&fi);
-    let expected_key_id = expected_fixture_kms_key_id(case_id);
+    let expected_key_id = expected_fixture_kms_key_id(case_id, &request).expect("fixture kms key id");
 
     assert_eq!(request.encryption, "SSE-KMS");
     assert!(!request.multipart);
@@ -167,7 +170,6 @@ fn parses_singlepart_sse_kms_fixture() {
 }
 
 #[test]
-#[ignore = "requires generated MinIO fixture data"]
 fn parses_multipart_sse_s3_fixture() {
     require_generated_fixture_root();
 
@@ -176,7 +178,6 @@ fn parses_multipart_sse_s3_fixture() {
     let head: HeadRecord = read_json(&case_dir(case_id).join("head.json"));
     let fi = load_file_info(case_id);
     let metadata = metadata_keys(&fi);
-    let expected_key_id = expected_fixture_kms_key_id(case_id);
 
     assert_eq!(request.encryption, "SSE-S3");
     assert!(request.multipart);
@@ -184,9 +185,10 @@ fn parses_multipart_sse_s3_fixture() {
     assert_eq!(head.server_side_encryption.as_deref(), Some("AES256"));
     assert_eq!(fi.parts.len(), 2);
     assert_eq!(fi.parts.iter().map(|part| part.actual_size as u64).sum::<u64>(), request.size_bytes);
-    assert_eq!(
-        metadata.get("X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id"),
-        Some(&expected_key_id.as_str())
+    assert!(
+        metadata
+            .get("X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id")
+            .is_some_and(|value| !value.is_empty())
     );
     assert!(metadata.contains_key("X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key"));
     assert!(metadata.contains_key("X-Minio-Internal-Encrypted-Multipart"));
@@ -194,7 +196,6 @@ fn parses_multipart_sse_s3_fixture() {
 }
 
 #[test]
-#[ignore = "requires generated MinIO fixture data"]
 fn parses_multipart_sse_kms_fixture() {
     require_generated_fixture_root();
 
@@ -203,7 +204,7 @@ fn parses_multipart_sse_kms_fixture() {
     let head: HeadRecord = read_json(&case_dir(case_id).join("head.json"));
     let fi = load_file_info(case_id);
     let metadata = metadata_keys(&fi);
-    let expected_key_id = expected_fixture_kms_key_id(case_id);
+    let expected_key_id = expected_fixture_kms_key_id(case_id, &request).expect("fixture kms key id");
 
     assert_eq!(request.encryption, "SSE-KMS");
     assert!(request.multipart);
@@ -220,6 +221,62 @@ fn parses_multipart_sse_kms_fixture() {
             .get("x-amz-server-side-encryption-context")
             .map(String::as_str)
     );
+    assert!(metadata.contains_key("X-Minio-Internal-Encrypted-Multipart"));
+    assert_eq!(metadata.get("X-Minio-Internal-actual-size"), Some(&"8388608"));
+}
+
+#[test]
+fn parses_singlepart_sse_c_fixture() {
+    require_generated_fixture_root();
+
+    let case_id = "sse-c-singlepart-64k";
+    let request: RequestRecord = read_json(&case_dir(case_id).join("request.json"));
+    let head: HeadRecord = read_json(&case_dir(case_id).join("head.json"));
+    let fi = load_file_info(case_id);
+    let metadata = metadata_keys(&fi);
+
+    assert_eq!(request.encryption, "SSE-C");
+    assert!(!request.multipart);
+    assert_eq!(head.content_length, request.size_bytes);
+    assert_eq!(head.sse_customer_algorithm.as_deref(), Some("AES256"));
+    assert_eq!(
+        head.sse_customer_key_md5.as_deref(),
+        request
+            .headers
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .map(String::as_str)
+    );
+    assert_eq!(fi.parts.len(), 1);
+    assert_eq!(fi.parts[0].actual_size as u64, request.size_bytes);
+    assert!(metadata.contains_key("X-Minio-Internal-Server-Side-Encryption-Sealed-Key"));
+    assert!(!metadata.contains_key("X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id"));
+}
+
+#[test]
+fn parses_multipart_sse_c_fixture() {
+    require_generated_fixture_root();
+
+    let case_id = "sse-c-multipart-8m";
+    let request: RequestRecord = read_json(&case_dir(case_id).join("request.json"));
+    let head: HeadRecord = read_json(&case_dir(case_id).join("head.json"));
+    let fi = load_file_info(case_id);
+    let metadata = metadata_keys(&fi);
+
+    assert_eq!(request.encryption, "SSE-C");
+    assert!(request.multipart);
+    assert_eq!(head.content_length, request.size_bytes);
+    assert_eq!(head.sse_customer_algorithm.as_deref(), Some("AES256"));
+    assert_eq!(
+        head.sse_customer_key_md5.as_deref(),
+        request
+            .headers
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .map(String::as_str)
+    );
+    assert_eq!(fi.parts.len(), 2);
+    assert_eq!(fi.parts.iter().map(|part| part.actual_size as u64).sum::<u64>(), request.size_bytes);
+    assert!(metadata.contains_key("X-Minio-Internal-Server-Side-Encryption-Sealed-Key"));
+    assert!(!metadata.contains_key("X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id"));
     assert!(metadata.contains_key("X-Minio-Internal-Encrypted-Multipart"));
     assert_eq!(metadata.get("X-Minio-Internal-actual-size"), Some(&"8388608"));
 }

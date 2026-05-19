@@ -1053,9 +1053,9 @@ fn contains_managed_encryption_metadata(metadata: &HashMap<String, String>) -> b
 
     #[cfg(feature = "rio-v2")]
     {
-        return metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
+        metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
             || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
-            || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER);
+            || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
     }
 
     #[cfg(not(feature = "rio-v2"))]
@@ -1306,14 +1306,13 @@ fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<Str
     #[cfg(feature = "rio-v2")]
     {
         let mut normalized = metadata.clone();
-        if !normalized.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER) {
-            if let Some(value) = metadata
+        if !normalized.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
+            && let Some(value) = metadata
                 .get(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
                 .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER))
                 .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
-            {
-                normalized.insert(INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), value.clone());
-            }
+        {
+            normalized.insert(INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), value.clone());
         }
 
         if !normalized.contains_key(INTERNAL_ENCRYPTION_IV_HEADER)
@@ -1337,7 +1336,7 @@ fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<Str
             normalized.insert("x-rustfs-encryption-context".to_string(), encoded);
         }
 
-        return normalized;
+        normalized
     }
 
     #[cfg(not(feature = "rio-v2"))]
@@ -1353,7 +1352,7 @@ fn decrypt_local_sse_dek(encrypted_dek: &[u8], _kms_key_id: &str, object_context
 
     #[cfg(feature = "rio-v2")]
     {
-        return decrypt_minio_secret_key_dek(encrypted_dek, object_context);
+        decrypt_minio_secret_key_dek(encrypted_dek, object_context)
     }
 
     #[cfg(not(feature = "rio-v2"))]
@@ -1476,7 +1475,7 @@ fn parse_minio_secret_key_ciphertext(
 #[cfg(feature = "rio-v2")]
 fn marshal_minio_kms_context(context: &HashMap<String, String>) -> Vec<u8> {
     let mut entries: Vec<_> = context.iter().collect();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(left, _)| *left);
 
     let mut json = String::from("{");
     for (index, (key, value)) in entries.into_iter().enumerate() {

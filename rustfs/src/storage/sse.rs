@@ -989,6 +989,19 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap
             if let Some(original_size) = material.original_size {
                 metadata.insert(SSEC_ORIGINAL_SIZE_HEADER.to_string(), original_size.to_string());
             }
+
+            #[cfg(feature = "rio-v2")]
+            if let Some(sealed) = &material.managed_sealed_key {
+                metadata.insert(MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealed.iv));
+                metadata.insert(
+                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+                );
+                metadata.insert(
+                    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
+                    BASE64_STANDARD.encode(sealed.sealed_key),
+                );
+            }
         }
         SSEType::SseS3 | SSEType::SseKms => {
             let encrypted_data_key = material
@@ -1188,6 +1201,8 @@ pub struct PrepareEncryptionRequest<'a> {
     pub ssekms_context: Option<HashMap<String, String>>,
     /// SSE-C algorithm (customer-provided key)
     pub sse_customer_algorithm: Option<SSECustomerAlgorithm>,
+    /// SSE-C key (Base64-encoded)
+    pub sse_customer_key: Option<SSECustomerKey>,
     /// SSE-C key MD5 (Base64-encoded)
     pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
 }
@@ -1198,7 +1213,7 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
         request.ssekms_key_id.as_ref(),
         request.ssekms_context.as_ref(),
         request.sse_customer_algorithm.as_ref(),
-        None,
+        request.sse_customer_key.as_ref(),
         request.sse_customer_key_md5.as_ref(),
         false,
     )?;
@@ -1207,7 +1222,7 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
         request.bucket,
         request.server_side_encryption,
         request.sse_customer_algorithm,
-        None,
+        request.sse_customer_key.clone(),
         request.sse_customer_key_md5,
         request.ssekms_key_id,
     )
@@ -1221,7 +1236,10 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
         Some(SseTypeV2::SseKms(sse, kms_key_id)) => {
             apply_managed_encryption_material(request.bucket, request.key, sse, kms_key_id, request.ssekms_context, 0).await?
         }
-        Some(SseTypeV2::SseC(algorithm, _, key_md5)) => apply_ssec_prepare_encryption_material(algorithm, key_md5).await?,
+        Some(SseTypeV2::SseC(algorithm, _, key_md5)) => {
+            apply_ssec_prepare_encryption_material(request.bucket, request.key, algorithm, request.sse_customer_key, key_md5)
+                .await?
+        }
         None => return Ok(None),
     };
 
@@ -1296,22 +1314,45 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
 // ============================================================================
 
 async fn apply_ssec_prepare_encryption_material(
+    bucket: &str,
+    key: &str,
     algorithm: SSECustomerAlgorithm,
+    sse_key: Option<SSECustomerKey>,
     sse_key_md5: SSECustomerKeyMD5,
 ) -> Result<EncryptionMaterial, ApiError> {
+    #[cfg(feature = "rio-v2")]
+    let (key_bytes, base_nonce, key_kind, managed_sealed_key) = if let Some(sse_key) = sse_key {
+        let validated = validate_ssec_params(SsecParams {
+            algorithm: algorithm.clone(),
+            key: sse_key,
+            key_md5: sse_key_md5.clone(),
+        })?;
+        let object_key = derive_object_key(validated.key_bytes);
+        let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
+        (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
+    } else {
+        ([0; 32], [0; 12], EncryptionKeyKind::Direct, None)
+    };
+
+    #[cfg(not(feature = "rio-v2"))]
+    let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
+        let _ = (bucket, key, sse_key);
+        ([0; 32], [0; 12], EncryptionKeyKind::Direct, None)
+    };
+
     Ok(EncryptionMaterial {
         sse_type: SSEType::SseC,
         server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
         kms_key_id: None,
         algorithm,
-        key_bytes: [0; 32],
-        base_nonce: [0; 12],
+        key_bytes,
+        base_nonce,
         encrypted_data_key: None,
         customer_key_md5: Some(sse_key_md5),
         original_size: None,
-        key_kind: EncryptionKeyKind::Direct,
+        key_kind,
         managed_kms_context: None,
-        managed_sealed_key: None,
+        managed_sealed_key,
     })
 }
 
@@ -1331,8 +1372,18 @@ async fn apply_ssec_encryption_material(
 
     let validated = validate_ssec_params(params)?;
 
-    // Generate nonce (deterministic for SSE-C)
-    let base_nonce = generate_ssec_nonce(bucket, key);
+    #[cfg(feature = "rio-v2")]
+    let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
+        let object_key = derive_object_key(validated.key_bytes);
+        let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
+        (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
+    };
+
+    #[cfg(not(feature = "rio-v2"))]
+    let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
+        let base_nonce = generate_ssec_nonce(bucket, key);
+        (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct, None)
+    };
 
     // Build metadata
     Ok(EncryptionMaterial {
@@ -1340,14 +1391,14 @@ async fn apply_ssec_encryption_material(
         server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
         kms_key_id: None,
         algorithm: validated.algorithm,
-        key_bytes: validated.key_bytes,
+        key_bytes,
         base_nonce,
         encrypted_data_key: None,
         customer_key_md5: Some(validated.key_md5),
         original_size: Some(content_size),
-        key_kind: EncryptionKeyKind::Direct,
+        key_kind,
         managed_kms_context: None,
-        managed_sealed_key: None,
+        managed_sealed_key,
     })
 }
 
@@ -1372,8 +1423,23 @@ async fn apply_ssec_decryption_material(
 
     let validated = validate_ssec_params(params)?;
 
-    // Generate nonce (same as encryption)
-    let base_nonce = generate_ssec_nonce(bucket, key);
+    #[cfg(feature = "rio-v2")]
+    let (key_bytes, base_nonce, key_kind) = if let Some(sealed_key) = parse_minio_managed_sealed_key(metadata, SSEType::SseC)? {
+        (
+            unseal_object_key(&sealed_key, validated.key_bytes, SSEType::SseC, bucket, key)?,
+            [0; 12],
+            EncryptionKeyKind::Object,
+        )
+    } else {
+        let base_nonce = generate_ssec_nonce(bucket, key);
+        (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct)
+    };
+
+    #[cfg(not(feature = "rio-v2"))]
+    let (key_bytes, base_nonce, key_kind) = {
+        let base_nonce = generate_ssec_nonce(bucket, key);
+        (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct)
+    };
 
     Ok(DecryptionMaterial {
         sse_type: SSEType::SseC,
@@ -1382,9 +1448,9 @@ async fn apply_ssec_decryption_material(
         algorithm: SSECustomerAlgorithm::from(algorithm),
 
         customer_key_md5: None,
-        key_bytes: validated.key_bytes,
+        key_bytes,
         base_nonce,
-        key_kind: EncryptionKeyKind::Direct,
+        key_kind,
     })
 }
 
@@ -2064,15 +2130,14 @@ fn parse_minio_managed_sealed_key(
 fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<String, String> {
     let mut normalized = metadata.clone();
 
-    if !normalized.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER) {
-        if let Some(value) = metadata
+    if !normalized.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
+        && let Some(value) = metadata
             .get(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
             .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER))
             .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
             .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER))
-        {
-            normalized.insert(INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), value.clone());
-        }
+    {
+        normalized.insert(INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), value.clone());
     }
 
     if !normalized.contains_key(INTERNAL_ENCRYPTION_IV_HEADER)
@@ -2531,6 +2596,7 @@ mod tests {
             ssekms_key_id: None,
             ssekms_context: None,
             sse_customer_algorithm: None,
+            sse_customer_key: None,
             sse_customer_key_md5: Some(sse_key_md5),
         };
 
@@ -2560,6 +2626,7 @@ mod tests {
             ssekms_key_id: None,
             ssekms_context: None,
             sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: None,
             sse_customer_key_md5: Some(sse_key_md5),
         };
 
@@ -2570,6 +2637,37 @@ mod tests {
         let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"));
         assert_eq!(metadata.get("x-amz-server-side-encryption").unwrap(), "AES256");
         assert_eq!(metadata.get("x-amz-server-side-encryption-customer-algorithm").unwrap(), "AES256");
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn test_sse_prepare_encryption_ssec_with_customer_key_stores_sealed_key_metadata() {
+        let bucket = "test-bucket";
+        let key = "test-key";
+        let customer_key_bytes = [0x24u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let sse_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+
+        let request = PrepareEncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(customer_key),
+            sse_customer_key_md5: Some(sse_key_md5),
+        };
+
+        let material = sse_prepare_encryption(request)
+            .await
+            .expect("prepare should accept full ssec headers")
+            .expect("ssec metadata should be generated");
+        assert_eq!(material.key_kind, EncryptionKeyKind::Object);
+
+        let metadata = encryption_material_to_metadata(&material);
+        assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER));
     }
 
     #[test]
@@ -2956,6 +3054,53 @@ mod tests {
         .await
         .expect("managed sse decryption")
         .expect("managed decryption material");
+
+        assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
+        assert_eq!(decrypted.key_bytes, material.key_bytes);
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn test_ssec_rio_v2_uses_sealed_object_key_metadata_roundtrip() {
+        let customer_key_bytes = [0x42u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+
+        let material = sse_encryption(EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(customer_key.clone()),
+            sse_customer_key_md5: Some(customer_key_md5.clone()),
+            content_size: 4096,
+        })
+        .await
+        .expect("sse-c encryption")
+        .expect("sse-c material");
+
+        assert_eq!(material.key_kind, EncryptionKeyKind::Object);
+
+        let metadata = encryption_material_to_metadata(&material);
+        assert_eq!(
+            metadata.get(MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER).map(String::as_str),
+            Some(MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM)
+        );
+        assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER));
+
+        let decrypted = sse_decryption(DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &metadata,
+            sse_customer_key: Some(&customer_key),
+            sse_customer_key_md5: Some(&customer_key_md5),
+        })
+        .await
+        .expect("sse-c decryption")
+        .expect("sse-c decryption material");
 
         assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
         assert_eq!(decrypted.key_bytes, material.key_bytes);
@@ -3638,6 +3783,7 @@ mod tests {
             ssekms_key_id: None,
             ssekms_context: None,
             sse_customer_algorithm: None,
+            sse_customer_key: None,
             sse_customer_key_md5: None,
         };
         let result = sse_prepare_encryption(request).await;
