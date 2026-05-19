@@ -25,7 +25,7 @@ use rustfs_audit::{
 use rustfs_ecstore::store_api::ObjectInfo;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
-use rustfs_s3_ops::S3Operation;
+use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
 use rustfs_utils::{
     extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
@@ -90,6 +90,13 @@ pub struct EnabledOperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
+        debug_assert!(
+            operation_matches_event_name(op, event),
+            "operation/event mismatch: op={} event={}",
+            op.as_str(),
+            event.as_str()
+        );
+
         let audit_enabled = is_audit_module_enabled();
         let notify_enabled = should_build_notification_event(is_notify_module_enabled());
 

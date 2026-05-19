@@ -213,6 +213,31 @@ pub fn event_name_to_s3_operation(event_name: EventName) -> Option<S3Operation> 
     }
 }
 
+/// Returns whether an S3 operation is semantically compatible with an event name.
+///
+/// Some S3 operations intentionally map to multiple event variants:
+/// - `PutObject` can emit both `ObjectCreatedPut` and `ObjectCreatedPost`.
+/// - `DeleteObject` can emit delete/delete-marker/all-versions variants.
+/// - `DeleteObjects` can emit per-object delete events in addition to the
+///   internal batch-delete event.
+pub fn operation_matches_event_name(op: S3Operation, event_name: EventName) -> bool {
+    match op {
+        S3Operation::PutObject => {
+            matches!(event_name, EventName::ObjectCreatedPut | EventName::ObjectCreatedPost)
+        }
+        S3Operation::DeleteObject => matches!(
+            event_name,
+            EventName::ObjectRemovedDelete
+                | EventName::ObjectRemovedDeleteMarkerCreated
+                | EventName::ObjectRemovedDeleteAllVersions
+        ),
+        S3Operation::DeleteObjects => {
+            matches!(event_name, EventName::ObjectRemovedDeleteObjects | EventName::ObjectRemovedDelete)
+        }
+        _ => op.to_event_name() == Some(event_name),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +279,18 @@ mod tests {
             event_name_to_s3_operation(EventName::ObjectRemovedAbortMultipartUpload),
             Some(S3Operation::AbortMultipartUpload)
         );
+    }
+
+    #[test]
+    fn test_operation_matches_event_name() {
+        assert!(operation_matches_event_name(S3Operation::PutObject, EventName::ObjectCreatedPut));
+        assert!(operation_matches_event_name(S3Operation::PutObject, EventName::ObjectCreatedPost));
+        assert!(operation_matches_event_name(
+            S3Operation::DeleteObject,
+            EventName::ObjectRemovedDeleteMarkerCreated
+        ));
+        assert!(operation_matches_event_name(S3Operation::DeleteObjects, EventName::ObjectRemovedDelete));
+
+        assert!(!operation_matches_event_name(S3Operation::GetObject, EventName::ObjectCreatedPut));
     }
 }
