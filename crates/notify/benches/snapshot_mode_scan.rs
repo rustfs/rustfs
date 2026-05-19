@@ -40,7 +40,6 @@ fn bench_snapshot_mode_scan(c: &mut Criterion) {
 
     for bucket_count in bucket_sizes {
         for (mode, mode_name) in [(SnapshotMode::Clone, "clone"), (SnapshotMode::Cached, "cached")] {
-
             let map = rt.block_on(build_map(mode, bucket_count));
             let miss_target = TargetID::new("missing-target".to_string(), "webhook".to_string());
 
