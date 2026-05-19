@@ -1194,12 +1194,19 @@ impl LocalDisk {
             skip_parent = self.root.as_path();
         }
 
-        if let Some(parent) = path.as_ref().parent() {
+        if let Some(parent) = path.as_ref().parent()
+            && parent != skip_parent
+        {
             os::make_dir_all(parent, skip_parent).await?;
         }
 
         let f = super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?;
 
+        Ok(f)
+    }
+
+    async fn open_file_read_only(&self, path: impl AsRef<Path>) -> Result<File> {
+        let f = super::fs::open_file(path.as_ref(), O_RDONLY).await.map_err(to_file_error)?;
         Ok(f)
     }
 
@@ -2137,7 +2144,7 @@ impl DiskAPI for LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+        let f = self.open_file_read_only(file_path).await?;
 
         Ok(Box::new(f))
     }
@@ -2154,7 +2161,7 @@ impl DiskAPI for LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+        let mut f = self.open_file_read_only(file_path).await?;
 
         let meta = f.metadata().await?;
         let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
@@ -2513,32 +2520,41 @@ impl DiskAPI for LocalDisk {
 
         // TODO: Healing
 
-        let search_version_id = fi.version_id.or(Some(Uuid::nil()));
+        let version_id = fi.version_id.unwrap_or_default();
+        let search_version_id = Some(version_id);
+        let no_inline = fi.data.is_none() && fi.size > 0;
 
         // Check if there's an existing version with the same version_id that has a data_dir to clean up
-        let has_old_data_dir = {
-            xlmeta.find_version(search_version_id).ok().and_then(|(_, ver)| {
-                // shard_count == 0 means no other version shares this data_dir
-                ver.get_data_dir()
-                    .filter(|&data_dir| xlmeta.shard_data_dir_count(&search_version_id, &Some(data_dir)) == 0)
-            })
-        };
+        // Reuse one metadata scan to find the version data_dir and determine whether it is shared.
+        let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(search_version_id);
         if let Some(old_data_dir) = has_old_data_dir.as_ref() {
-            let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), *old_data_dir]);
+            let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
         }
 
-        xlmeta.add_version(fi.clone())?;
+        xlmeta.add_version(fi)?;
 
         if xlmeta.versions.len() <= 10 {
             // TODO: Sign
         }
 
-        let new_dst_buf = xlmeta.marshal_msg()?;
-
-        self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
-            .await?;
         if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
-            let no_inline = fi.data.is_none() && fi.size > 0;
+            let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
+            let meta_skip_parent = if no_inline {
+                src_file_parent
+            } else {
+                src_volume_dir.as_path()
+            };
+            let new_dst_buf = xlmeta.marshal_msg()?;
+
+            self.write_all_private(
+                src_volume,
+                format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(),
+                new_dst_buf.into(),
+                true,
+                meta_skip_parent,
+            )
+            .await?;
+
             if no_inline && let Err(err) = rename_all(&src_data_path, &dst_data_path, &skip_parent).await {
                 let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 info!(
@@ -2547,6 +2563,10 @@ impl DiskAPI for LocalDisk {
                 );
                 return Err(err);
             }
+        } else {
+            let new_dst_buf = xlmeta.marshal_msg()?;
+            self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
+                .await?;
         }
 
         if let Some(old_data_dir) = has_old_data_dir {
