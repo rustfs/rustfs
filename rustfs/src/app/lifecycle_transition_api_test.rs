@@ -327,6 +327,7 @@ async fn wait_for_transition(
     }
 }
 
+// SAFETY: these serial tests restore the process environment variable before returning.
 #[allow(unsafe_code)]
 async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
 where

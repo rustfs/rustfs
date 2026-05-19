@@ -112,9 +112,18 @@ fn resolve_transition_worker_count() -> (i64, i64, i64) {
         .filter(|value| *value > 0)
         .unwrap_or(fallback);
     let mut effective = configured;
-    let absolute_max = get_env_i64(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+    let absolute_max = resolve_transition_workers_absolute_max();
     effective = std::cmp::min(effective, absolute_max);
     (configured, absolute_max, effective)
+}
+
+fn resolve_transition_workers_absolute_max() -> i64 {
+    let absolute_max = get_env_i64(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+    if absolute_max > 0 {
+        absolute_max
+    } else {
+        DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX
+    }
 }
 
 fn resolve_transition_queue_capacity() -> usize {
@@ -942,7 +951,7 @@ impl TransitionState {
             n = effective;
         }
         // Allow environment override of maximum workers
-        let absolute_max = get_env_i64(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+        let absolute_max = resolve_transition_workers_absolute_max();
         n = std::cmp::min(n, absolute_max);
 
         let previous_num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
@@ -2294,6 +2303,7 @@ mod tests {
         assert!(opts.skip_decommissioned);
     }
 
+    // SAFETY: these serial tests restore process environment variables before returning.
     #[allow(unsafe_code)]
     fn with_transition_worker_env<F>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
     where
@@ -2343,6 +2353,7 @@ mod tests {
         }
     }
 
+    // SAFETY: these serial tests restore process environment variables before returning.
     #[allow(unsafe_code)]
     async fn with_transition_worker_env_async<F, Fut>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
     where
@@ -2393,6 +2404,7 @@ mod tests {
         }
     }
 
+    // SAFETY: these serial tests restore process environment variables before returning.
     #[allow(unsafe_code)]
     fn with_transition_queue_env<F>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where
@@ -2442,6 +2454,7 @@ mod tests {
         }
     }
 
+    // SAFETY: these serial tests restore process environment variables before returning.
     #[allow(unsafe_code)]
     async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where
@@ -2551,6 +2564,26 @@ mod tests {
             assert_eq!(configured, 64);
             assert_eq!(absolute_max, 16);
             assert_eq!(effective, 16);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_ignores_non_positive_absolute_max() {
+        with_transition_worker_env(Some("4"), Some("0"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            assert_eq!(configured, 4);
+            assert_eq!(absolute_max, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            assert_eq!(effective, 4);
+        });
+
+        with_transition_worker_env(Some("4"), Some("-1"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            assert_eq!(configured, 4);
+            assert_eq!(absolute_max, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            assert_eq!(effective, 4);
         });
     }
 
