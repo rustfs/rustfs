@@ -282,6 +282,11 @@ impl FileMeta {
             fi.version_id = Some(Uuid::nil());
         }
 
+        if fi.data.is_none() && self.data.after_version().is_empty() {
+            let version = FileMetaVersion::from(fi);
+            return self.add_version_filemata(version);
+        }
+
         let version_key = data_key_for_version(fi.version_id);
         let mut next_data = self.data.clone();
 
@@ -317,46 +322,30 @@ impl FileMeta {
         }
 
         let vid = version.get_version_id();
-
-        // Match existing version for replace; null version: None and Some(nil) are equivalent
-        let matches = |h: &Option<Uuid>| {
-            let v_null = vid.is_none() || vid == Some(Uuid::nil());
-            let h_null = h.is_none() || *h == Some(Uuid::nil());
-            (v_null && h_null) || (vid == *h)
+        let vid_is_null = vid.is_none() || vid == Some(Uuid::nil());
+        let existing_idx = if vid_is_null {
+            self.versions
+                .iter()
+                .position(|v| v.header.version_id.is_none() || v.header.version_id == Some(Uuid::nil()))
+        } else {
+            self.versions.iter().position(|v| v.header.version_id == vid)
         };
 
-        if let Some(fidx) = self.versions.iter().position(|v| matches(&v.header.version_id)) {
+        if let Some(fidx) = existing_idx {
             return self.set_idx(fidx, version);
         }
 
-        // append placeholder to find insert position
-        let placeholder = FileMetaShallowVersion {
-            header: FileMetaVersionHeader {
-                mod_time: None, // None sorts before any real mod_time
-                ..Default::default()
-            },
-            meta: Vec::new(),
-        };
-        self.versions.push(placeholder);
-
         let mod_time = version.get_mod_time();
         let new_shallow = FileMetaShallowVersion::try_from(version)?;
-
-        for (idx, exist) in self.versions.iter().enumerate() {
-            let ex_mt = exist.header.mod_time;
-            let insert_here = match (ex_mt, mod_time) {
-                (None, _) => true, // placeholder: always insert before
-                (Some(em), Some(nm)) => em <= nm,
-                (Some(_), None) => false,
-            };
-            if insert_here {
-                self.versions.insert(idx, new_shallow);
-                self.versions.pop(); // remove placeholder
-                return Ok(());
-            }
-        }
-        self.versions.pop(); // remove placeholder on fallback
-        Err(Error::other("add_version failed"))
+        let insert_pos = match mod_time {
+            Some(nm) => self.versions.partition_point(|exist| match exist.header.mod_time {
+                Some(em) => em > nm,
+                None => false,
+            }),
+            None => self.versions.partition_point(|exist| exist.header.mod_time.is_some()),
+        };
+        self.versions.insert(insert_pos, new_shallow);
+        Ok(())
 
         // if !ver.valid() {
         //     return Err(Error::other("attempted to add invalid version"));
