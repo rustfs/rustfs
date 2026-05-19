@@ -13,26 +13,22 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-appauth"
+name = "rustfs-s3-ops"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
 homepage.workspace = true
-description = "Application authentication and authorization for RustFS, providing secure access control and user management."
-keywords = ["authentication", "authorization", "security", "rustfs", "Minio"]
-categories = ["web-programming", "development-tools", "authentication"]
-
-[dependencies]
-base64-simd = { workspace = true }
-rsa = { workspace = true, features = ["sha2"] }
-serde.workspace = true
-serde_json.workspace = true
-rand.workspace = true
+description = "S3 operation enum and event mapping for RustFS."
+keywords = ["s3", "operations", "rustfs"]
+categories = ["data-structures"]
 
 [lints]
 workspace = true
+
+[dependencies]
+rustfs-s3-types = { workspace = true }
 
 [lib]
 doctest = false

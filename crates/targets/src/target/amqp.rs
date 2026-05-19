@@ -501,7 +501,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_s3_common::EventName;
+    use rustfs_s3_types::EventName;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;

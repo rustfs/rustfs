@@ -32,6 +32,7 @@ sftp = []
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-ecstore.workspace = true
 rustfs-common.workspace = true
+rustfs-data-usage.workspace = true
 rustfs-rio.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true

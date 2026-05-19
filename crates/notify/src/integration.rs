@@ -23,7 +23,7 @@ use hashbrown::HashMap;
 use metrics::{counter, gauge};
 use rustfs_config::notify::{DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY};
 use rustfs_ecstore::config::{Config, KVS};
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::{ReplayWorkerManager, RuntimeTargetHealthSnapshot, SharedTarget};
 use std::sync::Arc;
@@ -402,7 +402,7 @@ pub async fn load_config_from_file(path: &str, system: &NotificationSystem) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_s3_common::EventName;
+    use rustfs_s3_types::EventName;
 
     #[test]
     fn live_event_history_snapshots_from_sequence() {

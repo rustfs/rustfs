@@ -115,12 +115,20 @@ mod tests {
         let private_key = RsaPrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
         let public_key = RsaPublicKey::from(&private_key);
 
-        let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF).unwrap();
-        let public_key_pem = public_key.to_public_key_pem(LineEnding::LF).unwrap();
+        let private_key_pem = private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("failed to encode private key pem");
+        let public_key_pem = public_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("failed to encode public key pem");
 
         let token = Token {
             name: "test_app".to_string(),
-            expired: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600, // 1 hour from now
+            expired: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_secs()
+                + 3600, // 1 hour from now
         };
 
         let encoded = sign_license_token(&token, &private_key_pem).expect("Failed to encode token");
@@ -139,12 +147,20 @@ mod tests {
         let private_key = RsaPrivateKey::new(&mut rng, bits).expect("Failed to generate private key");
         let public_key = RsaPublicKey::from(&private_key);
 
-        let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF).unwrap();
-        let public_key_pem = public_key.to_public_key_pem(LineEnding::LF).unwrap();
+        let private_key_pem = private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("failed to encode private key pem");
+        let public_key_pem = public_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("failed to encode public key pem");
 
         let token = Token {
             name: "test_app".to_string(),
-            expired: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600,
+            expired: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_secs()
+                + 3600,
         };
 
         let encoded = gencode(&token, &public_key_pem).expect("Failed to encode token");
@@ -159,11 +175,19 @@ mod tests {
         let mut rng = rand::rng();
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("Failed to generate private key");
         let public_key = RsaPublicKey::from(&private_key);
-        let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF).unwrap();
-        let public_key_pem = public_key.to_public_key_pem(LineEnding::LF).unwrap();
+        let private_key_pem = private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("failed to encode private key pem");
+        let public_key_pem = public_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("failed to encode public key pem");
         let token = Token {
             name: "test_app".to_string(),
-            expired: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600,
+            expired: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_secs()
+                + 3600,
         };
 
         let encoded = sign_license_token(&token, &private_key_pem).expect("Failed to encode token");
@@ -181,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_source_does_not_embed_private_key() {
-        let source = include_str!("token.rs");
+        let source = include_str!("license_token.rs");
         let forbidden = ["BEGIN", "PRIVATE KEY"].join(" ");
 
         assert!(!source.contains(&forbidden));
@@ -192,7 +216,9 @@ mod tests {
         let mut rng = rand::rng();
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("Failed to generate private key");
         let public_key = RsaPublicKey::from(&private_key);
-        let public_key_pem = public_key.to_public_key_pem(LineEnding::LF).unwrap();
+        let public_key_pem = public_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("failed to encode public key pem");
 
         let invalid_token = "invalid_base64_token";
         let result = parse_signed_license_token(invalid_token, &public_key_pem);
@@ -204,7 +230,11 @@ mod tests {
     fn test_sign_license_token_with_invalid_signing_key() {
         let token = Token {
             name: "test_app".to_string(),
-            expired: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600, // 1 hour from now
+            expired: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_secs()
+                + 3600, // 1 hour from now
         };
 
         let invalid_key = "invalid_private_key";
