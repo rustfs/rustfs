@@ -103,7 +103,7 @@ memmap2 = { workspace = true }
 libc.workspace = true
 rustix = { workspace = true }
 rustfs-madmin.workspace = true
-rustfs-workers.workspace = true
+rustfs-concurrency.workspace = true
 reqwest = { workspace = true }
 aes-gcm.workspace = true
 aws-sdk-s3 = { workspace = true }

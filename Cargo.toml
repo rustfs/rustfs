@@ -15,7 +15,6 @@
 [workspace]
 members = [
     "rustfs", # Core file system implementation
-    "crates/appauth", # Application authentication and authorization
     "crates/audit", # Audit target management system with multi-target fan-out
     "crates/checksums", # client checksums
     "crates/common", # Shared utilities and data structures
@@ -78,7 +77,6 @@ redundant_clone = "warn"
 # RustFS Internal Crates
 rustfs = { path = "./rustfs", version = "1.0.0-beta.3" }
 rustfs-heal = { path = "crates/heal", version = "1.0.0-beta.3" }
-rustfs-appauth = { path = "crates/appauth", version = "1.0.0-beta.3" }
 rustfs-audit = { path = "crates/audit", version = "1.0.0-beta.3" }
 rustfs-checksums = { path = "crates/checksums", version = "1.0.0-beta.3" }
 rustfs-common = { path = "crates/common", version = "1.0.0-beta.3" }
