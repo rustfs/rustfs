@@ -84,6 +84,46 @@ pub enum S3Operation {
     UploadPartCopy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventMapping {
+    None,
+    Single(EventName),
+    PutObject,
+    DeleteObject,
+    DeleteObjects,
+}
+
+impl EventMapping {
+    #[inline]
+    fn primary_event(self) -> Option<EventName> {
+        match self {
+            Self::None => None,
+            Self::Single(event_name) => Some(event_name),
+            Self::PutObject => Some(EventName::ObjectCreatedPut),
+            Self::DeleteObject => Some(EventName::ObjectRemovedDelete),
+            Self::DeleteObjects => Some(EventName::ObjectRemovedDeleteObjects),
+        }
+    }
+
+    #[inline]
+    fn matches_event(self, event_name: EventName) -> bool {
+        match self {
+            Self::None => false,
+            Self::Single(mapped_event_name) => mapped_event_name == event_name,
+            Self::PutObject => matches!(event_name, EventName::ObjectCreatedPut | EventName::ObjectCreatedPost),
+            Self::DeleteObject => matches!(
+                event_name,
+                EventName::ObjectRemovedDelete
+                    | EventName::ObjectRemovedDeleteMarkerCreated
+                    | EventName::ObjectRemovedDeleteAllVersions
+            ),
+            Self::DeleteObjects => {
+                matches!(event_name, EventName::ObjectRemovedDeleteObjects | EventName::ObjectRemovedDelete)
+            }
+        }
+    }
+}
+
 impl S3Operation {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -156,75 +196,80 @@ impl S3Operation {
         }
     }
 
-    pub fn to_event_name(self) -> Option<EventName> {
+    #[inline]
+    fn event_mapping(self) -> EventMapping {
         match self {
-            Self::CompleteMultipartUpload => Some(EventName::ObjectCreatedCompleteMultipartUpload),
-            Self::CopyObject => Some(EventName::ObjectCreatedCopy),
-            Self::CreateBucket => Some(EventName::BucketCreated),
-            Self::DeleteBucket => Some(EventName::BucketRemoved),
-            Self::DeleteObject => Some(EventName::ObjectRemovedDelete),
-            Self::DeleteObjects => Some(EventName::ObjectRemovedDeleteObjects),
-            Self::DeleteObjectTagging => Some(EventName::ObjectTaggingDelete),
-            Self::GetObject => Some(EventName::ObjectAccessedGet),
-            Self::GetObjectAttributes => Some(EventName::ObjectAccessedAttributes),
-            Self::GetObjectLegalHold => Some(EventName::ObjectAccessedGetLegalHold),
-            Self::GetObjectRetention => Some(EventName::ObjectAccessedGetRetention),
-            Self::HeadObject => Some(EventName::ObjectAccessedHead),
-            Self::PutObject => Some(EventName::ObjectCreatedPut),
-            Self::PutObjectAcl => Some(EventName::ObjectAclPut),
-            Self::PutObjectLegalHold => Some(EventName::ObjectCreatedPutLegalHold),
-            Self::PutObjectRetention => Some(EventName::ObjectCreatedPutRetention),
-            Self::PutObjectTagging => Some(EventName::ObjectTaggingPut),
-            Self::RestoreObject => Some(EventName::ObjectRestorePost),
-            Self::SelectObjectContent => Some(EventName::ObjectAccessedGet),
-            Self::AbortMultipartUpload => Some(EventName::ObjectRemovedAbortMultipartUpload),
-            Self::CreateMultipartUpload => Some(EventName::ObjectCreatedCreateMultipartUpload),
-            Self::DeleteBucketCors => None,
-            Self::DeleteBucketEncryption => None,
-            Self::DeleteBucketLifecycle => None,
-            Self::DeleteBucketPolicy => None,
-            Self::DeleteBucketReplication => None,
-            Self::DeleteBucketTagging => None,
-            Self::DeletePublicAccessBlock => None,
-            Self::GetBucketAcl => None,
-            Self::GetBucketCors => None,
-            Self::GetBucketEncryption => None,
-            Self::GetBucketLifecycleConfiguration => None,
-            Self::GetBucketLocation => None,
-            Self::GetBucketLogging => None,
-            Self::GetBucketNotificationConfiguration => None,
-            Self::GetBucketPolicy => None,
-            Self::GetBucketPolicyStatus => None,
-            Self::GetBucketReplication => None,
-            Self::GetBucketTagging => None,
-            Self::GetBucketVersioning => None,
-            Self::GetObjectAcl => None,
-            Self::GetObjectLockConfiguration => None,
-            Self::GetObjectTagging => None,
-            Self::GetObjectTorrent => None,
-            Self::GetPublicAccessBlock => None,
-            Self::HeadBucket => None,
-            Self::ListBuckets => None,
-            Self::ListMultipartUploads => None,
-            Self::ListObjectVersions => None,
-            Self::ListObjects => None,
-            Self::ListObjectsV2 => None,
-            Self::ListParts => None,
-            Self::PutBucketAcl => None,
-            Self::PutBucketCors => None,
-            Self::PutBucketEncryption => None,
-            Self::PutBucketLifecycleConfiguration => None,
-            Self::PutBucketLogging => None,
-            Self::PutBucketNotificationConfiguration => None,
-            Self::PutBucketPolicy => None,
-            Self::PutBucketReplication => None,
-            Self::PutBucketTagging => None,
-            Self::PutBucketVersioning => None,
-            Self::PutObjectLockConfiguration => None,
-            Self::PutPublicAccessBlock => None,
-            Self::UploadPart => None,
-            Self::UploadPartCopy => None,
+            Self::AbortMultipartUpload => EventMapping::Single(EventName::ObjectRemovedAbortMultipartUpload),
+            Self::CompleteMultipartUpload => EventMapping::Single(EventName::ObjectCreatedCompleteMultipartUpload),
+            Self::CopyObject => EventMapping::Single(EventName::ObjectCreatedCopy),
+            Self::CreateBucket => EventMapping::Single(EventName::BucketCreated),
+            Self::CreateMultipartUpload => EventMapping::Single(EventName::ObjectCreatedCreateMultipartUpload),
+            Self::DeleteBucket => EventMapping::Single(EventName::BucketRemoved),
+            Self::DeleteObjectTagging => EventMapping::Single(EventName::ObjectTaggingDelete),
+            Self::DeleteObject => EventMapping::DeleteObject,
+            Self::DeleteObjects => EventMapping::DeleteObjects,
+            Self::GetObject => EventMapping::Single(EventName::ObjectAccessedGet),
+            Self::GetObjectAttributes => EventMapping::Single(EventName::ObjectAccessedAttributes),
+            Self::GetObjectLegalHold => EventMapping::Single(EventName::ObjectAccessedGetLegalHold),
+            Self::GetObjectRetention => EventMapping::Single(EventName::ObjectAccessedGetRetention),
+            Self::HeadObject => EventMapping::Single(EventName::ObjectAccessedHead),
+            Self::PutObject => EventMapping::PutObject,
+            Self::PutObjectAcl => EventMapping::Single(EventName::ObjectAclPut),
+            Self::PutObjectLegalHold => EventMapping::Single(EventName::ObjectCreatedPutLegalHold),
+            Self::PutObjectRetention => EventMapping::Single(EventName::ObjectCreatedPutRetention),
+            Self::PutObjectTagging => EventMapping::Single(EventName::ObjectTaggingPut),
+            Self::RestoreObject => EventMapping::Single(EventName::ObjectRestorePost),
+            Self::SelectObjectContent => EventMapping::Single(EventName::ObjectAccessedGet),
+            Self::DeleteBucketCors
+            | Self::DeleteBucketEncryption
+            | Self::DeleteBucketLifecycle
+            | Self::DeleteBucketPolicy
+            | Self::DeleteBucketReplication
+            | Self::DeleteBucketTagging
+            | Self::DeletePublicAccessBlock
+            | Self::GetBucketAcl
+            | Self::GetBucketCors
+            | Self::GetBucketEncryption
+            | Self::GetBucketLifecycleConfiguration
+            | Self::GetBucketLocation
+            | Self::GetBucketLogging
+            | Self::GetBucketNotificationConfiguration
+            | Self::GetBucketPolicy
+            | Self::GetBucketPolicyStatus
+            | Self::GetBucketReplication
+            | Self::GetBucketTagging
+            | Self::GetBucketVersioning
+            | Self::GetObjectAcl
+            | Self::GetObjectLockConfiguration
+            | Self::GetObjectTagging
+            | Self::GetObjectTorrent
+            | Self::GetPublicAccessBlock
+            | Self::HeadBucket
+            | Self::ListBuckets
+            | Self::ListMultipartUploads
+            | Self::ListObjectVersions
+            | Self::ListObjects
+            | Self::ListObjectsV2
+            | Self::ListParts
+            | Self::PutBucketAcl
+            | Self::PutBucketCors
+            | Self::PutBucketEncryption
+            | Self::PutBucketLifecycleConfiguration
+            | Self::PutBucketLogging
+            | Self::PutBucketNotificationConfiguration
+            | Self::PutBucketPolicy
+            | Self::PutBucketReplication
+            | Self::PutBucketTagging
+            | Self::PutBucketVersioning
+            | Self::PutObjectLockConfiguration
+            | Self::PutPublicAccessBlock
+            | Self::UploadPart
+            | Self::UploadPartCopy => EventMapping::None,
         }
+    }
+
+    pub fn to_event_name(self) -> Option<EventName> {
+        self.event_mapping().primary_event()
     }
 }
 
@@ -265,83 +310,7 @@ pub fn event_name_to_s3_operation(event_name: EventName) -> Option<S3Operation> 
 /// - `DeleteObjects` can emit per-object delete events in addition to the
 ///   internal batch-delete event.
 pub fn operation_matches_event_name(op: S3Operation, event_name: EventName) -> bool {
-    match op {
-        S3Operation::PutObject => {
-            matches!(event_name, EventName::ObjectCreatedPut | EventName::ObjectCreatedPost)
-        }
-        S3Operation::DeleteObject => matches!(
-            event_name,
-            EventName::ObjectRemovedDelete
-                | EventName::ObjectRemovedDeleteMarkerCreated
-                | EventName::ObjectRemovedDeleteAllVersions
-        ),
-        S3Operation::DeleteObjects => {
-            matches!(event_name, EventName::ObjectRemovedDeleteObjects | EventName::ObjectRemovedDelete)
-        }
-        S3Operation::AbortMultipartUpload
-        | S3Operation::CompleteMultipartUpload
-        | S3Operation::CopyObject
-        | S3Operation::CreateBucket
-        | S3Operation::CreateMultipartUpload
-        | S3Operation::DeleteBucket
-        | S3Operation::DeleteObjectTagging
-        | S3Operation::GetObject
-        | S3Operation::GetObjectAttributes
-        | S3Operation::GetObjectLegalHold
-        | S3Operation::GetObjectRetention
-        | S3Operation::HeadObject
-        | S3Operation::PutObjectAcl
-        | S3Operation::PutObjectLegalHold
-        | S3Operation::PutObjectRetention
-        | S3Operation::PutObjectTagging
-        | S3Operation::RestoreObject
-        | S3Operation::SelectObjectContent => op.to_event_name() == Some(event_name),
-        S3Operation::DeleteBucketCors
-        | S3Operation::DeleteBucketEncryption
-        | S3Operation::DeleteBucketLifecycle
-        | S3Operation::DeleteBucketPolicy
-        | S3Operation::DeleteBucketReplication
-        | S3Operation::DeleteBucketTagging
-        | S3Operation::DeletePublicAccessBlock
-        | S3Operation::GetBucketAcl
-        | S3Operation::GetBucketCors
-        | S3Operation::GetBucketEncryption
-        | S3Operation::GetBucketLifecycleConfiguration
-        | S3Operation::GetBucketLocation
-        | S3Operation::GetBucketLogging
-        | S3Operation::GetBucketNotificationConfiguration
-        | S3Operation::GetBucketPolicy
-        | S3Operation::GetBucketPolicyStatus
-        | S3Operation::GetBucketReplication
-        | S3Operation::GetBucketTagging
-        | S3Operation::GetBucketVersioning
-        | S3Operation::GetObjectAcl
-        | S3Operation::GetObjectLockConfiguration
-        | S3Operation::GetObjectTagging
-        | S3Operation::GetObjectTorrent
-        | S3Operation::GetPublicAccessBlock
-        | S3Operation::HeadBucket
-        | S3Operation::ListBuckets
-        | S3Operation::ListMultipartUploads
-        | S3Operation::ListObjectVersions
-        | S3Operation::ListObjects
-        | S3Operation::ListObjectsV2
-        | S3Operation::ListParts
-        | S3Operation::PutBucketAcl
-        | S3Operation::PutBucketCors
-        | S3Operation::PutBucketEncryption
-        | S3Operation::PutBucketLifecycleConfiguration
-        | S3Operation::PutBucketLogging
-        | S3Operation::PutBucketNotificationConfiguration
-        | S3Operation::PutBucketPolicy
-        | S3Operation::PutBucketReplication
-        | S3Operation::PutBucketTagging
-        | S3Operation::PutBucketVersioning
-        | S3Operation::PutObjectLockConfiguration
-        | S3Operation::PutPublicAccessBlock
-        | S3Operation::UploadPart
-        | S3Operation::UploadPartCopy => false,
-    }
+    op.event_mapping().matches_event(event_name)
 }
 
 /// Resolves the object-delete notification event name from delete-marker state.
