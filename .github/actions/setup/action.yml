@@ -59,7 +59,7 @@ runs:
       uses: arduino/setup-protoc@v3
       with:
         version: "34.1"
-        repo-token: ${{ inputs.github-token }}
+        repo-token: ${{ inputs.github-token || github.token }}
 
     - name: Install flatc
       uses: Nugine/setup-flatc@v1
