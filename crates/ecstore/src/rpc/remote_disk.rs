@@ -36,6 +36,9 @@ use bytes::Bytes;
 use futures::lock::Mutex;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use metrics::counter;
+use rustfs_common::internode_metrics::{
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, global_internode_metrics,
+};
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
@@ -67,6 +70,12 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureHealthAction {
+    MarkFailure,
+    IgnoreFailure,
+}
 
 async fn copy_stream_with_buffer<R, W>(reader: &mut R, writer: &mut W, buffer_size: usize) -> io::Result<u64>
 where
@@ -324,6 +333,21 @@ impl RemoteDisk {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.execute_with_timeout_for_op_and_health_action(op, operation, timeout_duration, FailureHealthAction::MarkFailure)
+            .await
+    }
+
+    async fn execute_with_timeout_for_op_and_health_action<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+        failure_health_action: FailureHealthAction,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         // Check if disk is faulty
         if self.health.is_faulty() {
             warn!("remote disk {} health is faulty, returning error", self.to_string());
@@ -338,6 +362,17 @@ impl RemoteDisk {
         self.health.last_started.store(now, std::sync::atomic::Ordering::Relaxed);
         self.health.increment_waiting();
 
+        if timeout_duration == Duration::ZERO {
+            let operation_result = operation().await;
+            if operation_result.is_ok() {
+                self.health.log_success();
+            }
+            self.health.decrement_waiting();
+            self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
+                .await;
+            return operation_result;
+        }
+
         // Execute operation with timeout
         let result = time::timeout(timeout_duration, operation()).await;
 
@@ -348,24 +383,8 @@ impl RemoteDisk {
                     self.health.log_success();
                 }
                 self.health.decrement_waiting();
-                if let Err(err) = &operation_result
-                    && is_network_like_disk_error(err)
-                {
-                    counter!(
-                        "rustfs_drive_op_network_error_total",
-                        "endpoint" => self.endpoint.to_string(),
-                        "op" => op.to_string()
-                    )
-                    .increment(1);
-                    warn!(
-                        endpoint = %self.endpoint,
-                        addr = %self.addr,
-                        op,
-                        timeout_ms = timeout_duration.as_millis(),
-                        "Remote disk operation returned a network-like error"
-                    );
-                    self.mark_faulty_and_evict("operation_network_error").await;
-                }
+                self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
+                    .await;
                 operation_result
             }
             Err(_) => {
@@ -377,7 +396,9 @@ impl RemoteDisk {
                     "op" => op.to_string()
                 )
                 .increment(1);
-                self.mark_faulty_and_evict("operation_timeout").await;
+                if failure_health_action == FailureHealthAction::MarkFailure {
+                    self.mark_faulty_and_evict("operation_timeout").await;
+                }
                 warn!(
                     endpoint = %self.endpoint,
                     addr = %self.addr,
@@ -386,6 +407,35 @@ impl RemoteDisk {
                     "Remote disk operation timed out"
                 );
                 Err(DiskError::Timeout)
+            }
+        }
+    }
+
+    async fn handle_network_like_error<T>(
+        &self,
+        op: &'static str,
+        timeout_duration: Duration,
+        operation_result: &Result<T>,
+        failure_health_action: FailureHealthAction,
+    ) {
+        if let Err(err) = operation_result
+            && is_network_like_disk_error(err)
+        {
+            counter!(
+                "rustfs_drive_op_network_error_total",
+                "endpoint" => self.endpoint.to_string(),
+                "op" => op.to_string()
+            )
+            .increment(1);
+            warn!(
+                endpoint = %self.endpoint,
+                addr = %self.addr,
+                op,
+                timeout_ms = timeout_duration.as_millis(),
+                "Remote disk operation returned a network-like error"
+            );
+            if failure_health_action == FailureHealthAction::MarkFailure {
+                self.mark_faulty_and_evict("operation_network_error").await;
             }
         }
     }
@@ -1146,7 +1196,8 @@ impl DiskAPI for RemoteDisk {
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         info!("walk_dir {}", self.endpoint.to_string());
 
-        self.execute_with_timeout(
+        self.execute_with_timeout_for_op_and_health_action(
+            "walk_dir",
             || async {
                 let disk = self.disk_ref().await;
 
@@ -1172,6 +1223,7 @@ impl DiskAPI for RemoteDisk {
                 Ok(())
             },
             get_drive_walkdir_timeout(),
+            FailureHealthAction::IgnoreFailure,
         )
         .await
     }
@@ -1527,11 +1579,12 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
+                let data_len = data.len();
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await.map_err(|err| {
+                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                    Error::other(format!("can not get client, err: {err}"))
+                })?;
                 let request = Request::new(WriteAllRequest {
                     disk,
                     volume: volume.to_string(),
@@ -1539,9 +1592,19 @@ impl DiskAPI for RemoteDisk {
                     data,
                 });
 
-                let response = client.write_all(request).await?.into_inner();
+                global_internode_metrics().record_outgoing_request_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                let response = match client.write_all(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                        return Err(err.into());
+                    }
+                };
+
+                global_internode_metrics().record_sent_bytes_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL, data_len);
 
                 if !response.success {
+                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
                     return Err(response.error.unwrap_or_default().into());
                 }
 
@@ -1559,22 +1622,32 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await.map_err(|err| {
+                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                    Error::other(format!("can not get client, err: {err}"))
+                })?;
                 let request = Request::new(ReadAllRequest {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                 });
 
-                let response = client.read_all(request).await?.into_inner();
+                global_internode_metrics().record_outgoing_request_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                let response = match client.read_all(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                        return Err(err.into());
+                    }
+                };
 
                 if !response.success {
+                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
                     return Err(response.error.unwrap_or_default().into());
                 }
 
+                global_internode_metrics()
+                    .record_recv_bytes_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL, response.data.len());
                 Ok(response.data)
             },
             get_max_timeout_duration(),
@@ -1995,6 +2068,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_with_timeout_can_ignore_remote_timeout_failure() {
+        let url = url::Url::parse("http://remote-timeout-ignored:9000").unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = remote_disk
+            .execute_with_timeout_for_op_and_health_action(
+                "walk_dir",
+                || async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok::<(), Error>(())
+                },
+                Duration::from_millis(10),
+                FailureHealthAction::IgnoreFailure,
+            )
+            .await
+            .expect_err("timeout should fail");
+
+        assert!(err.to_string().contains("timeout"));
+        assert!(remote_disk.is_online().await, "ignored timeout should not mark remote disk faulty");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_zero_duration_waits_for_operation() {
+        let url = url::Url::parse("http://remote-no-timeout:9000").unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        remote_disk
+            .execute_with_timeout(
+                || async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok::<(), Error>(())
+                },
+                Duration::ZERO,
+            )
+            .await
+            .expect("zero duration should disable the operation timeout");
+
+        assert!(
+            remote_disk.is_online().await,
+            "successful no-timeout operation should keep remote disk online"
+        );
+    }
+
+    #[tokio::test]
     async fn test_execute_with_timeout_evicts_cached_connection() {
         let addr = "http://127.0.0.1:59991".to_string();
         let url = url::Url::parse(&format!("{addr}/data")).unwrap();
@@ -2133,6 +2282,58 @@ mod tests {
         assert!(
             !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
             "network-like errors should evict cached connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_timeout_can_ignore_network_like_error() {
+        let addr = "http://127.0.0.1:59995".to_string();
+        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+
+        let err = remote_disk
+            .execute_with_timeout_for_op_and_health_action(
+                "walk_dir",
+                || async { Err::<(), Error>(DiskError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "stall timeout"))) },
+                Duration::from_secs(1),
+                FailureHealthAction::IgnoreFailure,
+            )
+            .await
+            .expect_err("timeout-like operation error should fail");
+
+        assert_eq!(
+            match &err {
+                DiskError::Io(io_err) => io_err.kind(),
+                other => panic!("expected io timeout error, got {other:?}"),
+            },
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(
+            remote_disk.is_online().await,
+            "ignored network-like error should not mark remote disk faulty"
+        );
+        assert!(
+            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "ignored network-like error should not evict cached connection"
         );
     }
 

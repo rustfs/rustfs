@@ -20,7 +20,7 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 - `GHSA-mm2q-qcmx-gw4w`: `ListServiceAccount` used `UpdateServiceAccountAdminAction`, while update lacked target ownership checks. Lesson: exact action constants and ownership checks are both required; information disclosure can chain into secret rotation and takeover.
 - `GHSA-vcwh-pff9-64cc`: `ImportIam` checked `ExportIAMAction` for an import/write operation. Lesson: every admin handler must authorize the action it actually performs.
 - `GHSA-jqmc-mg33-v45g` and `GHSA-8784-9m7f-c6p6`: `/profile/cpu` and `/profile/memory` were whitelisted from auth and allowed expensive diagnostics plus path disclosure. Lesson: profiling/debug endpoints need admin auth, opt-in, rate limits, and non-sensitive responses.
-- `GHSA-x5xv-223c-8vm7`: console license metadata endpoint was public. Lesson: public metadata endpoints should be coarse or authenticated.
+- `GHSA-xp32-gxq2-3v52`: console license metadata endpoint was public and exposed subject and expiration fields. Lesson: management metadata endpoints should require admin auth or return only coarse public status.
 
 ### IAM import, service accounts, and privilege boundaries
 
