@@ -1348,10 +1348,10 @@ impl SetDisks {
                         let value = tx1.clone();
                         let cancel_token = cancel_for_send1.clone();
                         async move {
-                            if let Err(err) = value.send(entry).await {
-                                if !cancel_token.is_cancelled() {
-                                    error!("list_path send fail {:?}", err);
-                                }
+                            if let Err(err) = value.send(entry).await
+                                && !cancel_token.is_cancelled()
+                            {
+                                error!("list_path send fail {:?}", err);
                             }
                         }
                     })
@@ -1364,10 +1364,9 @@ impl SetDisks {
                         async move {
                             if let Some(entry) = entries.resolve(resolver)
                                 && let Err(err) = value.send(entry).await
+                                && !cancel_token.is_cancelled()
                             {
-                                if !cancel_token.is_cancelled() {
-                                    error!("list_path send fail {:?}", err);
-                                }
+                                error!("list_path send fail {:?}", err);
                             }
                         }
                     })
