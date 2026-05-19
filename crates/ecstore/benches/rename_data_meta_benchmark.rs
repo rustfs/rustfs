@@ -69,10 +69,7 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
             b.iter(|| {
                 let mut xlmeta = FileMeta::load(black_box(&dst_buf)).expect("load dst meta");
                 let search_version_id = Some(replace_version_id);
-                let has_old_data_dir = xlmeta.find_version(search_version_id).ok().and_then(|(_, ver)| {
-                    ver.get_data_dir()
-                        .filter(|&data_dir| xlmeta.shard_data_dir_count(&search_version_id, &Some(data_dir)) == 0)
-                });
+                let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(search_version_id);
                 if let Some(old_data_dir) = has_old_data_dir {
                     let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), old_data_dir]);
                 }

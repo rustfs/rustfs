@@ -17,30 +17,34 @@ use super::*;
 impl FileMeta {
     pub fn find_unshared_data_dir_for_version(&self, version_id: Option<Uuid>) -> Option<Uuid> {
         let vid = version_id.unwrap_or_default();
-        let mut decoded_dirs = Vec::with_capacity(self.versions.len());
+        let mut target_data_dir = None;
 
         for version in self
             .versions
             .iter()
             .filter(|v| v.header.version_type == VersionType::Object && v.header.uses_data_dir())
         {
-            decoded_dirs.push((
-                version.header.version_id.unwrap_or_default(),
-                FileMetaVersion::decode_data_dir_from_meta(&version.meta).unwrap_or_default(),
-            ));
+            if version.header.version_id.unwrap_or_default() != vid {
+                continue;
+            }
+            target_data_dir = FileMetaVersion::decode_data_dir_from_meta(&version.meta).unwrap_or_default();
+            break;
         }
 
-        let target_data_dir = decoded_dirs
-            .iter()
-            .find(|(id, _)| *id == vid)
-            .and_then(|(_, data_dir)| *data_dir);
         let target_data_dir = target_data_dir?;
 
-        if decoded_dirs
+        for version in self
+            .versions
             .iter()
-            .any(|(id, data_dir)| *id != vid && *data_dir == Some(target_data_dir))
+            .filter(|v| v.header.version_type == VersionType::Object && v.header.uses_data_dir())
         {
-            return None;
+            if version.header.version_id.unwrap_or_default() == vid {
+                continue;
+            }
+            let dir = FileMetaVersion::decode_data_dir_from_meta(&version.meta).unwrap_or_default();
+            if dir == Some(target_data_dir) {
+                return None;
+            }
         }
 
         Some(target_data_dir)
