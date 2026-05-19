@@ -31,6 +31,10 @@
 //! runtime monitoring features (`IoPriorityMetrics`, `IoStrategyDebugInfo`).
 
 use rustfs_config::{KI_B, MI_B};
+use rustfs_io_core::{
+    IoPriority as CoreIoPriority, IoPriorityQueueConfig as CoreIoPriorityQueueConfig,
+    IoSchedulerConfig as CoreIoSchedulerConfig,
+};
 use rustfs_io_core::io_profile::{AccessPattern, StorageMedia, StorageProfile};
 use rustfs_io_metrics::bandwidth::{BandwidthSnapshot, BandwidthTier};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -146,6 +150,15 @@ impl IoPriority {
             IoPriority::Low
         } else {
             IoPriority::Normal
+        }
+    }
+
+    /// Convert from io-core priority to storage-layer compatibility priority.
+    pub fn from_core(priority: CoreIoPriority) -> Self {
+        match priority {
+            CoreIoPriority::High => IoPriority::High,
+            CoreIoPriority::Normal => IoPriority::Normal,
+            CoreIoPriority::Low => IoPriority::Low,
         }
     }
 
@@ -378,6 +391,34 @@ impl IoSchedulerConfig {
                 rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
                 rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
             ),
+        }
+    }
+
+    /// Convert storage-layer scheduler config to io-core scheduler config.
+    ///
+    /// This keeps storage-specific policy loading in place while allowing
+    /// core scheduling components to consume a normalized shared config shape.
+    pub fn to_core_config(&self) -> CoreIoSchedulerConfig {
+        CoreIoSchedulerConfig {
+            max_concurrent_reads: self.max_concurrent_reads,
+            high_priority_size_threshold: self.high_priority_size_threshold,
+            low_priority_size_threshold: self.low_priority_size_threshold,
+            queue_high_capacity: self.queue_high_capacity,
+            queue_normal_capacity: self.queue_normal_capacity,
+            queue_low_capacity: self.queue_low_capacity,
+            starvation_prevention_interval_ms: self.starvation_prevention_interval_ms,
+            starvation_threshold_secs: self.starvation_threshold_secs,
+            load_sample_window: self.load_sample_window,
+            load_high_threshold_ms: self.load_high_threshold_ms,
+            load_low_threshold_ms: self.load_low_threshold_ms,
+            enable_priority: self.enable_priority,
+            storage_detection_enabled: self.storage_detection_enabled,
+            sequential_detection_enabled: true,
+            bandwidth_monitoring_enabled: true,
+            adaptive_buffer_enabled: true,
+            base_buffer_size: rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE,
+            max_buffer_size: MI_B,
+            min_buffer_size: 32 * KI_B,
         }
     }
 }
@@ -997,11 +1038,12 @@ impl IoStrategy {
 
         // Calculate priority based on request size
         let priority = if context.file_size > 0 {
-            IoPriority::from_size_with_thresholds(
+            let core_config = config.to_core_config();
+            IoPriority::from_core(CoreIoPriority::from_size(
                 context.file_size,
-                config.high_priority_size_threshold,
-                config.low_priority_size_threshold,
-            )
+                core_config.high_priority_size_threshold,
+                core_config.low_priority_size_threshold,
+            ))
         } else {
             IoPriority::Normal
         };
@@ -1523,6 +1565,28 @@ impl IoPriorityQueueConfig {
             ),
         }
     }
+
+    /// Convert storage-layer queue config to io-core queue config.
+    pub fn to_core_config(&self) -> CoreIoPriorityQueueConfig {
+        CoreIoPriorityQueueConfig {
+            high_capacity: self.queue_high_capacity,
+            normal_capacity: self.queue_normal_capacity,
+            low_capacity: self.queue_low_capacity,
+            starvation_interval: Duration::from_millis(self.starvation_prevention_interval_ms),
+            starvation_threshold: Duration::from_secs(self.starvation_threshold_secs),
+        }
+    }
+
+    /// Build storage-layer queue config from io-core queue config.
+    pub fn from_core_config(config: &CoreIoPriorityQueueConfig) -> Self {
+        Self {
+            queue_high_capacity: config.high_capacity,
+            queue_normal_capacity: config.normal_capacity,
+            queue_low_capacity: config.low_capacity,
+            starvation_prevention_interval_ms: config.starvation_interval.as_millis() as u64,
+            starvation_threshold_secs: config.starvation_threshold.as_secs(),
+        }
+    }
 }
 
 impl<T> IoPriorityQueue<T> {
@@ -1985,6 +2049,55 @@ mod tests {
         assert_eq!(config.queue_normal_capacity, 64);
         assert_eq!(config.queue_low_capacity, 16);
         assert_eq!(config.starvation_threshold_secs, 5);
+    }
+
+    #[test]
+    #[serial]
+    async fn test_io_scheduler_config_to_core_config() {
+        let config = IoSchedulerConfig::default();
+        let core = config.to_core_config();
+        assert_eq!(core.max_concurrent_reads, config.max_concurrent_reads);
+        assert_eq!(core.high_priority_size_threshold, config.high_priority_size_threshold);
+        assert_eq!(core.low_priority_size_threshold, config.low_priority_size_threshold);
+        assert_eq!(core.queue_high_capacity, config.queue_high_capacity);
+        assert_eq!(core.queue_normal_capacity, config.queue_normal_capacity);
+        assert_eq!(core.queue_low_capacity, config.queue_low_capacity);
+        assert_eq!(core.load_high_threshold_ms, config.load_high_threshold_ms);
+        assert_eq!(core.load_low_threshold_ms, config.load_low_threshold_ms);
+        assert_eq!(core.enable_priority, config.enable_priority);
+    }
+
+    #[test]
+    #[serial]
+    async fn test_io_priority_queue_config_to_core_config() {
+        let config = IoPriorityQueueConfig::default();
+        let core = config.to_core_config();
+        assert_eq!(core.high_capacity, config.queue_high_capacity);
+        assert_eq!(core.normal_capacity, config.queue_normal_capacity);
+        assert_eq!(core.low_capacity, config.queue_low_capacity);
+        assert_eq!(
+            core.starvation_interval,
+            Duration::from_millis(config.starvation_prevention_interval_ms)
+        );
+        assert_eq!(
+            core.starvation_threshold,
+            Duration::from_secs(config.starvation_threshold_secs)
+        );
+    }
+
+    #[test]
+    #[serial]
+    async fn test_io_priority_queue_config_from_core_config() {
+        let core = rustfs_io_core::IoPriorityQueueConfig::default();
+        let config = IoPriorityQueueConfig::from_core_config(&core);
+        assert_eq!(config.queue_high_capacity, core.high_capacity);
+        assert_eq!(config.queue_normal_capacity, core.normal_capacity);
+        assert_eq!(config.queue_low_capacity, core.low_capacity);
+        assert_eq!(
+            config.starvation_prevention_interval_ms,
+            core.starvation_interval.as_millis() as u64
+        );
+        assert_eq!(config.starvation_threshold_secs, core.starvation_threshold.as_secs());
     }
 
     #[test]

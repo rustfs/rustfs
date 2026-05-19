@@ -100,12 +100,7 @@ impl ConcurrencyManager {
             backpressure: Arc::new(crate::backpressure::BackpressureManager::from_policy(config.backpressure_policy())),
 
             #[cfg(feature = "scheduler")]
-            scheduler: Arc::new(crate::scheduler::SchedulerManager::new(
-                config.io_buffer_size,
-                config.max_buffer_size,
-                config.high_priority_threshold,
-                config.low_priority_threshold,
-            )),
+            scheduler: Arc::new(crate::scheduler::SchedulerManager::from_policy(config.scheduler_policy())),
 
             config,
         }

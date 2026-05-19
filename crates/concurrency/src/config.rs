@@ -14,7 +14,10 @@
 
 //! Configuration for concurrency management
 
-use crate::{backpressure::PipeBackpressurePolicy, deadlock::DeadlockMonitorPolicy, timeout::TimeoutManagerPolicy};
+use crate::{
+    backpressure::PipeBackpressurePolicy, deadlock::DeadlockMonitorPolicy, scheduler::SchedulerPolicy,
+    timeout::TimeoutManagerPolicy,
+};
 use std::time::Duration;
 
 /// Feature flags for concurrency modules
@@ -231,6 +234,16 @@ impl ConcurrencyConfig {
             low_watermark: self.low_watermark,
         }
     }
+
+    /// Build the scheduler facade policy from the aggregate concurrency config.
+    pub fn scheduler_policy(&self) -> SchedulerPolicy {
+        SchedulerPolicy {
+            base_buffer_size: self.io_buffer_size,
+            max_buffer_size: self.max_buffer_size,
+            high_priority_threshold: self.high_priority_threshold,
+            low_priority_threshold: self.low_priority_threshold,
+        }
+    }
 }
 
 /// Configuration error
@@ -307,5 +320,15 @@ mod tests {
         assert_eq!(policy.buffer_size, config.backpressure_buffer_size);
         assert_eq!(policy.high_watermark, config.high_watermark);
         assert_eq!(policy.low_watermark, config.low_watermark);
+    }
+
+    #[test]
+    fn test_scheduler_policy_mapping() {
+        let config = ConcurrencyConfig::default();
+        let policy = config.scheduler_policy();
+        assert_eq!(policy.base_buffer_size, config.io_buffer_size);
+        assert_eq!(policy.max_buffer_size, config.max_buffer_size);
+        assert_eq!(policy.high_priority_threshold, config.high_priority_threshold);
+        assert_eq!(policy.low_priority_threshold, config.low_priority_threshold);
     }
 }

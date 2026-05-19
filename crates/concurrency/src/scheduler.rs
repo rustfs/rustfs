@@ -46,12 +46,26 @@ impl Default for SchedulerPolicy {
     }
 }
 
+impl SchedulerPolicy {
+    /// Convert facade policy to io-core scheduler config.
+    pub fn to_core_config(&self) -> rustfs_io_core::IoSchedulerConfig {
+        rustfs_io_core::IoSchedulerConfig {
+            base_buffer_size: self.base_buffer_size,
+            max_buffer_size: self.max_buffer_size,
+            high_priority_size_threshold: self.high_priority_threshold,
+            low_priority_size_threshold: self.low_priority_threshold,
+            ..rustfs_io_core::IoSchedulerConfig::default()
+        }
+    }
+}
+
 /// Backward-compatible alias for the old scheduler facade name.
 pub type SchedulerConfig = SchedulerPolicy;
 
 /// Scheduler manager
 pub struct SchedulerManager {
     config: SchedulerPolicy,
+    core_config: rustfs_io_core::IoSchedulerConfig,
     scheduler: Arc<CoreIoScheduler>,
 }
 
@@ -63,17 +77,21 @@ impl SchedulerManager {
         high_priority_threshold: usize,
         low_priority_threshold: usize,
     ) -> Self {
-        let config = SchedulerPolicy {
+        Self::from_policy(SchedulerPolicy {
             base_buffer_size,
             max_buffer_size,
             high_priority_threshold,
             low_priority_threshold,
-        };
+        })
+    }
 
-        let core_config = rustfs_io_core::IoSchedulerConfig::default();
+    /// Create a scheduler manager from facade policy.
+    pub fn from_policy(config: SchedulerPolicy) -> Self {
+        let core_config = config.to_core_config();
 
         Self {
             config,
+            core_config: core_config.clone(),
             scheduler: Arc::new(CoreIoScheduler::new(core_config)),
         }
     }
@@ -81,6 +99,11 @@ impl SchedulerManager {
     /// Get the configuration
     pub fn config(&self) -> &SchedulerPolicy {
         &self.config
+    }
+
+    /// Get the derived io-core scheduler config.
+    pub fn core_config(&self) -> &rustfs_io_core::IoSchedulerConfig {
+        &self.core_config
     }
 
     /// Get the scheduler
@@ -207,6 +230,16 @@ mod tests {
     fn test_scheduler_config() {
         let config = SchedulerPolicy::default();
         assert!(config.base_buffer_size < config.max_buffer_size);
+    }
+
+    #[test]
+    fn test_scheduler_policy_to_core_config() {
+        let policy = SchedulerPolicy::default();
+        let core = policy.to_core_config();
+        assert_eq!(core.base_buffer_size, policy.base_buffer_size);
+        assert_eq!(core.max_buffer_size, policy.max_buffer_size);
+        assert_eq!(core.high_priority_size_threshold, policy.high_priority_threshold);
+        assert_eq!(core.low_priority_size_threshold, policy.low_priority_threshold);
     }
 
     #[test]
