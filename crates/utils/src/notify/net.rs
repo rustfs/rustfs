@@ -98,16 +98,46 @@ pub fn parse_host(s: &str) -> Result<Host, NetError> {
         true
     };
 
-    // Split host and port, similar to net.SplitHostPort.
-    let (host_str, port_str) = s.rsplit_once(':').map_or((s, ""), |(h, p)| (h, p));
-    let port = if !port_str.is_empty() {
-        Some(port_str.parse().map_err(|_| NetError::ParseError(port_str.to_string()))?)
-    } else {
-        None
-    };
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return Err(NetError::MissingBracket);
+        };
+        let host = rest[..end].to_string();
+        let port_str = &rest[end + 1..];
+        let port = if let Some(port_str) = port_str.strip_prefix(':') {
+            if port_str.is_empty() {
+                None
+            } else {
+                Some(port_str.parse().map_err(|_| NetError::ParseError(port_str.to_string()))?)
+            }
+        } else if port_str.is_empty() {
+            None
+        } else {
+            return Err(NetError::InvalidHost);
+        };
 
-    // Trim IPv6 brackets if present.
-    let host = trim_ipv6(host_str)?;
+        (host, port)
+    } else {
+        if s.contains(']') {
+            return Err(NetError::MissingBracket);
+        }
+
+        // A host with multiple colons is an IPv6 literal, optionally with a
+        // zone identifier. Unbracketed IPv6 with port is ambiguous, so callers
+        // must use the standard bracketed form when they need a port.
+        let (host_str, port_str) = if s.matches(':').count() > 1 {
+            (s, "")
+        } else {
+            s.rsplit_once(':').map_or((s, ""), |(h, p)| (h, p))
+        };
+        let port = if !port_str.is_empty() {
+            Some(port_str.parse().map_err(|_| NetError::ParseError(port_str.to_string()))?)
+        } else {
+            None
+        };
+
+        (trim_ipv6(host_str)?, port)
+    };
 
     // Handle IPv6 zone identifier.
     let trimmed_host = host.split('%').next().unwrap_or(&host);
@@ -407,6 +437,33 @@ mod tests {
         let host = result.unwrap();
         assert_eq!(host.name, "::1");
         assert_eq!(host.port, Some(8080));
+    }
+
+    #[test]
+    fn parse_host_with_bare_ipv6_without_port() {
+        let result = parse_host("::1");
+        assert!(result.is_ok());
+        let host = result.unwrap();
+        assert_eq!(host.name, "::1");
+        assert_eq!(host.port, None);
+    }
+
+    #[test]
+    fn parse_host_with_ipv6_zone_without_port() {
+        let result = parse_host("fe80::1%eth0");
+        assert!(result.is_ok());
+        let host = result.unwrap();
+        assert_eq!(host.name, "fe80::1%eth0");
+        assert_eq!(host.port, None);
+    }
+
+    #[test]
+    fn parse_host_with_bracketed_ipv6_without_port() {
+        let result = parse_host("[::1]");
+        assert!(result.is_ok());
+        let host = result.unwrap();
+        assert_eq!(host.name, "::1");
+        assert_eq!(host.port, None);
     }
 
     #[test]

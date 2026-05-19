@@ -1180,6 +1180,8 @@ impl LocalDisk {
             }
             InternalBuf::Owned(buf) => {
                 f.write_all(buf.as_ref()).await.map_err(to_file_error)?;
+                // Ensure write errors are observed before returning for owned buffers.
+                f.sync_all().await.map_err(to_file_error)?;
             }
         }
 
