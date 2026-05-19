@@ -61,6 +61,7 @@ pub mod collector;
 pub mod config;
 pub mod deadlock_metrics;
 pub mod io_metrics;
+pub mod internode_metrics;
 pub mod lock_metrics;
 pub mod performance;
 pub mod process_lock_metrics;

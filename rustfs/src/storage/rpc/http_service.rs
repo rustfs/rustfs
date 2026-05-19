@@ -18,7 +18,7 @@ use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
-use rustfs_common::internode_metrics::global_internode_metrics;
+use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::disk::{DiskAPI, WalkDirOptions};
 use rustfs_ecstore::rpc::verify_rpc_signature;

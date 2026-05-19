@@ -18,9 +18,8 @@
 mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{
-    GLOBAL_CONN_MAP, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection, internode_metrics::global_internode_metrics,
-};
+use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection};
+use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use std::{
     error::Error,
     time::{Duration, Instant},

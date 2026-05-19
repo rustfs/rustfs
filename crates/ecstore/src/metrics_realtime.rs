@@ -14,10 +14,8 @@
 
 use crate::{admin_server_info::get_local_server_property, new_object_layer_fn, store_api::StorageAPI};
 use chrono::Utc;
-use rustfs_common::{
-    GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, internode_metrics::global_internode_metrics,
-    metrics::global_metrics,
-};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
+use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{DiskIOStats, DiskMetric, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics};
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
@@ -252,7 +250,7 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
 #[cfg(test)]
 mod test {
     use super::*;
-    use rustfs_common::internode_metrics::global_internode_metrics;
+    use rustfs_io_metrics::internode_metrics::global_internode_metrics;
     use std::time::Duration;
 
     #[test]

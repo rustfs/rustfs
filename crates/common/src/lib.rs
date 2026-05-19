@@ -16,7 +16,6 @@ pub mod bucket_stats;
 // pub mod error;
 pub mod globals;
 pub mod heal_channel;
-pub mod internode_metrics;
 pub mod last_minute;
 pub mod metrics;
 mod readiness;

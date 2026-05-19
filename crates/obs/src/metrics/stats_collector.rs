@@ -27,7 +27,8 @@ use crate::metrics::collectors::{
     ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
 use chrono::Utc;
-use rustfs_common::{internode_metrics::global_internode_metrics, metrics::global_metrics};
+use rustfs_common::metrics::global_metrics;
+use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState};
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;

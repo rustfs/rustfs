@@ -18,7 +18,7 @@ use futures::{Stream, TryStreamExt as _};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
-use rustfs_common::internode_metrics::global_internode_metrics;
+use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_utils::get_env_opt_str;
 use std::io::IoSlice;
 use std::io::{self, Error};
