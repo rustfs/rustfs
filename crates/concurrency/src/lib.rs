@@ -124,6 +124,8 @@ mod backpressure;
 #[cfg(feature = "scheduler")]
 mod scheduler;
 
+pub mod workers;
+
 // Public module exports with feature gates
 #[cfg(feature = "timeout")]
 pub use timeout::{TimeoutConfig, TimeoutGuard, TimeoutManager};
