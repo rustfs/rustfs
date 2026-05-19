@@ -1064,7 +1064,6 @@ async fn gather_results(
 
         if opts.limit > 0 && entries.len() >= opts.limit as usize {
             rx.cancel();
-
             results_tx
                 .send(MetaCacheEntriesSortedResult {
                     entries: Some(MetaCacheEntriesSorted {
@@ -1076,6 +1075,7 @@ async fn gather_results(
                 .await
                 .map_err(Error::other)?;
             return Ok(());
+        // entries.push(entry);
         }
     }
 
