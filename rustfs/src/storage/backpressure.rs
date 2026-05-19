@@ -554,4 +554,25 @@ mod tests {
         assert_eq!(pipe.state(), BackpressureState::Normal);
         assert_eq!(pipe.meta().buffer_capacity, 4 * 1024 * 1024);
     }
+
+    #[test]
+    fn test_backpressure_pipe_state_transitions() {
+        let config = BackpressureConfig {
+            buffer_size: 1000,
+            high_watermark: 80,
+            low_watermark: 50,
+        };
+        let pipe = BackpressurePipe::with_config(config);
+
+        assert_eq!(pipe.state(), BackpressureState::Normal);
+        assert_eq!(pipe.meta().state, BackpressureState::Normal);
+
+        pipe.record_write(850);
+        assert_eq!(pipe.state(), BackpressureState::BackpressureApplied);
+        assert_eq!(pipe.meta().state, BackpressureState::BackpressureApplied);
+
+        pipe.record_read(400);
+        assert_eq!(pipe.state(), BackpressureState::Normal);
+        assert_eq!(pipe.meta().state, BackpressureState::Normal);
+    }
 }
