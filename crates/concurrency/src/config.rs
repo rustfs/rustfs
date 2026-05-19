@@ -76,82 +76,50 @@ impl ConcurrencyFeatures {
     }
 }
 
+/// Facade policy for lock manager behavior.
+#[derive(Debug, Clone)]
+pub struct LockManagerPolicy {
+    /// Enable lock optimization.
+    pub enabled: bool,
+    /// Lock acquisition timeout.
+    pub acquire_timeout: Duration,
+}
+
+impl Default for LockManagerPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            acquire_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
 /// Main configuration for concurrency management
 #[derive(Debug, Clone)]
 pub struct ConcurrencyConfig {
     /// Feature flags
     pub features: ConcurrencyFeatures,
-
-    // Timeout configuration
-    /// Default timeout duration
-    pub default_timeout: Duration,
-    /// Maximum timeout duration
-    pub max_timeout: Duration,
-    /// Enable dynamic timeout
-    pub enable_dynamic_timeout: bool,
-
-    // Lock configuration
-    /// Enable lock optimization
-    pub enable_lock_optimization: bool,
-    /// Lock acquisition timeout
-    pub lock_acquire_timeout: Duration,
-
-    // Deadlock configuration
-    /// Enable deadlock detection
-    pub enable_deadlock_detection: bool,
-    /// Deadlock check interval
-    pub deadlock_check_interval: Duration,
-    /// Hang threshold
-    pub hang_threshold: Duration,
-
-    // Backpressure configuration
-    /// Buffer size for backpressure
-    pub backpressure_buffer_size: usize,
-    /// High watermark percentage
-    pub high_watermark: u32,
-    /// Low watermark percentage
-    pub low_watermark: u32,
-
-    // Scheduler configuration
-    /// Base buffer size for I/O
-    pub io_buffer_size: usize,
-    /// Maximum buffer size
-    pub max_buffer_size: usize,
-    /// High priority size threshold
-    pub high_priority_threshold: usize,
-    /// Low priority size threshold
-    pub low_priority_threshold: usize,
+    /// Timeout facade policy.
+    pub timeout_policy: TimeoutManagerPolicy,
+    /// Lock facade policy.
+    pub lock_policy: LockManagerPolicy,
+    /// Deadlock facade policy.
+    pub deadlock_policy: DeadlockMonitorPolicy,
+    /// Backpressure facade policy.
+    pub backpressure_policy: PipeBackpressurePolicy,
+    /// Scheduler facade policy.
+    pub scheduler_policy: SchedulerPolicy,
 }
 
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
             features: ConcurrencyFeatures::default(),
-
-            // Timeout defaults
-            default_timeout: Duration::from_secs(30),
-            max_timeout: Duration::from_secs(300),
-            enable_dynamic_timeout: true,
-
-            // Lock defaults
-            enable_lock_optimization: true,
-            lock_acquire_timeout: Duration::from_secs(5),
-
-            // Deadlock defaults
-            enable_deadlock_detection: false,
-            deadlock_check_interval: Duration::from_secs(10),
-            hang_threshold: Duration::from_secs(60),
-
-            // Backpressure defaults
-            backpressure_buffer_size: 4 * 1024 * 1024, // 4MB
-            high_watermark: 80,
-            low_watermark: 50,
-
-            // Scheduler defaults
-            io_buffer_size: 64 * 1024,                // 64KB
-            max_buffer_size: 4 * 1024 * 1024,         // 4MB
-            high_priority_threshold: 1024 * 1024,     // 1MB
-            low_priority_threshold: 10 * 1024 * 1024, // 10MB
+            timeout_policy: TimeoutManagerPolicy::default(),
+            lock_policy: LockManagerPolicy::default(),
+            deadlock_policy: DeadlockMonitorPolicy::default(),
+            backpressure_policy: PipeBackpressurePolicy::default(),
+            scheduler_policy: SchedulerPolicy::default(),
         }
     }
 }
@@ -165,25 +133,25 @@ impl ConcurrencyConfig {
         if let Ok(val) = std::env::var("RUSTFS_TIMEOUT_DEFAULT")
             && let Ok(secs) = val.parse::<u64>()
         {
-            config.default_timeout = Duration::from_secs(secs);
+            config.timeout_policy.default_timeout = Duration::from_secs(secs);
         }
 
         if let Ok(val) = std::env::var("RUSTFS_TIMEOUT_MAX")
             && let Ok(secs) = val.parse::<u64>()
         {
-            config.max_timeout = Duration::from_secs(secs);
+            config.timeout_policy.max_timeout = Duration::from_secs(secs);
         }
 
         if let Ok(val) = std::env::var("RUSTFS_BACKPRESSURE_BUFFER_SIZE")
             && let Ok(size) = val.parse::<usize>()
         {
-            config.backpressure_buffer_size = size;
+            config.backpressure_policy.buffer_size = size;
         }
 
         if let Ok(val) = std::env::var("RUSTFS_IO_BUFFER_SIZE")
             && let Ok(size) = val.parse::<usize>()
         {
-            config.io_buffer_size = size;
+            config.scheduler_policy.base_buffer_size = size;
         }
 
         config
@@ -191,17 +159,19 @@ impl ConcurrencyConfig {
 
     /// Validate configuration
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.default_timeout > self.max_timeout {
+        if self.timeout_policy.default_timeout > self.timeout_policy.max_timeout {
             return Err(ConfigError::InvalidTimeout("default_timeout cannot exceed max_timeout".to_string()));
         }
 
-        if self.high_watermark <= self.low_watermark || self.high_watermark > 100 {
+        if self.backpressure_policy.high_watermark <= self.backpressure_policy.low_watermark
+            || self.backpressure_policy.high_watermark > 100
+        {
             return Err(ConfigError::InvalidBackpressure(
                 "high_watermark must be > low_watermark and <= 100".to_string(),
             ));
         }
 
-        if self.io_buffer_size > self.max_buffer_size {
+        if self.scheduler_policy.base_buffer_size > self.scheduler_policy.max_buffer_size {
             return Err(ConfigError::InvalidScheduler("io_buffer_size cannot exceed max_buffer_size".to_string()));
         }
 
@@ -210,39 +180,27 @@ impl ConcurrencyConfig {
 
     /// Build the timeout facade policy from the aggregate concurrency config.
     pub fn timeout_policy(&self) -> TimeoutManagerPolicy {
-        TimeoutManagerPolicy {
-            default_timeout: self.default_timeout,
-            max_timeout: self.max_timeout,
-            enable_dynamic: self.enable_dynamic_timeout,
-        }
+        self.timeout_policy.clone()
+    }
+
+    /// Build the lock facade policy from the aggregate concurrency config.
+    pub fn lock_policy(&self) -> LockManagerPolicy {
+        self.lock_policy.clone()
     }
 
     /// Build the deadlock facade policy from the aggregate concurrency config.
     pub fn deadlock_policy(&self) -> DeadlockMonitorPolicy {
-        DeadlockMonitorPolicy {
-            enabled: self.enable_deadlock_detection,
-            check_interval: self.deadlock_check_interval,
-            hang_threshold: self.hang_threshold,
-        }
+        self.deadlock_policy.clone()
     }
 
     /// Build the backpressure facade policy from the aggregate concurrency config.
     pub fn backpressure_policy(&self) -> PipeBackpressurePolicy {
-        PipeBackpressurePolicy {
-            buffer_size: self.backpressure_buffer_size,
-            high_watermark: self.high_watermark,
-            low_watermark: self.low_watermark,
-        }
+        self.backpressure_policy.clone()
     }
 
     /// Build the scheduler facade policy from the aggregate concurrency config.
     pub fn scheduler_policy(&self) -> SchedulerPolicy {
-        SchedulerPolicy {
-            base_buffer_size: self.io_buffer_size,
-            max_buffer_size: self.max_buffer_size,
-            high_priority_threshold: self.high_priority_threshold,
-            low_priority_threshold: self.low_priority_threshold,
-        }
+        self.scheduler_policy.clone()
     }
 }
 
@@ -276,8 +234,11 @@ mod tests {
     #[test]
     fn test_invalid_timeout() {
         let config = ConcurrencyConfig {
-            default_timeout: Duration::from_secs(100),
-            max_timeout: Duration::from_secs(50),
+            timeout_policy: TimeoutManagerPolicy {
+                default_timeout: Duration::from_secs(100),
+                max_timeout: Duration::from_secs(50),
+                enable_dynamic: true,
+            },
             ..Default::default()
         };
         assert!(
@@ -299,36 +260,44 @@ mod tests {
     fn test_timeout_policy_mapping() {
         let config = ConcurrencyConfig::default();
         let policy = config.timeout_policy();
-        assert_eq!(policy.default_timeout, config.default_timeout);
-        assert_eq!(policy.max_timeout, config.max_timeout);
-        assert_eq!(policy.enable_dynamic, config.enable_dynamic_timeout);
+        assert_eq!(policy.default_timeout, config.timeout_policy.default_timeout);
+        assert_eq!(policy.max_timeout, config.timeout_policy.max_timeout);
+        assert_eq!(policy.enable_dynamic, config.timeout_policy.enable_dynamic);
+    }
+
+    #[test]
+    fn test_lock_policy_mapping() {
+        let config = ConcurrencyConfig::default();
+        let policy = config.lock_policy();
+        assert_eq!(policy.enabled, config.lock_policy.enabled);
+        assert_eq!(policy.acquire_timeout, config.lock_policy.acquire_timeout);
     }
 
     #[test]
     fn test_deadlock_policy_mapping() {
         let config = ConcurrencyConfig::default();
         let policy = config.deadlock_policy();
-        assert_eq!(policy.enabled, config.enable_deadlock_detection);
-        assert_eq!(policy.check_interval, config.deadlock_check_interval);
-        assert_eq!(policy.hang_threshold, config.hang_threshold);
+        assert_eq!(policy.enabled, config.deadlock_policy.enabled);
+        assert_eq!(policy.check_interval, config.deadlock_policy.check_interval);
+        assert_eq!(policy.hang_threshold, config.deadlock_policy.hang_threshold);
     }
 
     #[test]
     fn test_backpressure_policy_mapping() {
         let config = ConcurrencyConfig::default();
         let policy = config.backpressure_policy();
-        assert_eq!(policy.buffer_size, config.backpressure_buffer_size);
-        assert_eq!(policy.high_watermark, config.high_watermark);
-        assert_eq!(policy.low_watermark, config.low_watermark);
+        assert_eq!(policy.buffer_size, config.backpressure_policy.buffer_size);
+        assert_eq!(policy.high_watermark, config.backpressure_policy.high_watermark);
+        assert_eq!(policy.low_watermark, config.backpressure_policy.low_watermark);
     }
 
     #[test]
     fn test_scheduler_policy_mapping() {
         let config = ConcurrencyConfig::default();
         let policy = config.scheduler_policy();
-        assert_eq!(policy.base_buffer_size, config.io_buffer_size);
-        assert_eq!(policy.max_buffer_size, config.max_buffer_size);
-        assert_eq!(policy.high_priority_threshold, config.high_priority_threshold);
-        assert_eq!(policy.low_priority_threshold, config.low_priority_threshold);
+        assert_eq!(policy.base_buffer_size, config.scheduler_policy.base_buffer_size);
+        assert_eq!(policy.max_buffer_size, config.scheduler_policy.max_buffer_size);
+        assert_eq!(policy.high_priority_threshold, config.scheduler_policy.high_priority_threshold);
+        assert_eq!(policy.low_priority_threshold, config.scheduler_policy.low_priority_threshold);
     }
 }

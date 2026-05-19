@@ -88,10 +88,10 @@ impl ConcurrencyManager {
             timeout: Arc::new(crate::timeout::TimeoutManager::from_policy(config.timeout_policy())),
 
             #[cfg(feature = "lock")]
-            lock: Arc::new(crate::lock::LockManager::new(
-                config.enable_lock_optimization,
-                config.lock_acquire_timeout,
-            )),
+            lock: Arc::new({
+                let lock_policy = config.lock_policy();
+                crate::lock::LockManager::new(lock_policy.enabled, lock_policy.acquire_timeout)
+            }),
 
             #[cfg(feature = "deadlock")]
             deadlock: Arc::new(crate::deadlock::DeadlockManager::from_policy(config.deadlock_policy())),
@@ -227,7 +227,7 @@ impl ConcurrencyManager {
     pub async fn start(&self) {
         #[cfg(feature = "deadlock")]
         {
-            if self.config.enable_deadlock_detection {
+            if self.config.deadlock_policy.enabled {
                 self.deadlock.start().await;
             }
         }
