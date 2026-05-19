@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Facade policy for the concurrency-layer scheduler manager.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SchedulerPolicy {
     /// Base buffer size
     pub base_buffer_size: usize,

@@ -23,7 +23,7 @@ use std::time::Instant;
 use tokio::io::{DuplexStream, duplex};
 
 /// Facade policy for duplex-pipe watermark backpressure.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PipeBackpressurePolicy {
     /// Buffer size in bytes
     pub buffer_size: usize,

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Facade policy for the concurrency-layer timeout manager.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TimeoutManagerPolicy {
     /// Default timeout duration
     pub default_timeout: Duration,

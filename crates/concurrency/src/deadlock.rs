@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Facade policy for the concurrency-layer deadlock monitor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct DeadlockMonitorPolicy {
     /// Enable deadlock detection
     pub enabled: bool,

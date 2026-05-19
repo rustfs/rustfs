@@ -77,7 +77,7 @@ impl ConcurrencyFeatures {
 }
 
 /// Facade policy for lock manager behavior.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct LockManagerPolicy {
     /// Enable lock optimization.
     pub enabled: bool,
@@ -169,27 +169,27 @@ impl ConcurrencyConfig {
 
     /// Build the timeout facade policy from the aggregate concurrency config.
     pub fn timeout_policy(&self) -> TimeoutManagerPolicy {
-        self.timeout_policy.clone()
+        self.timeout_policy
     }
 
     /// Build the lock facade policy from the aggregate concurrency config.
     pub fn lock_policy(&self) -> LockManagerPolicy {
-        self.lock_policy.clone()
+        self.lock_policy
     }
 
     /// Build the deadlock facade policy from the aggregate concurrency config.
     pub fn deadlock_policy(&self) -> DeadlockMonitorPolicy {
-        self.deadlock_policy.clone()
+        self.deadlock_policy
     }
 
     /// Build the backpressure facade policy from the aggregate concurrency config.
     pub fn backpressure_policy(&self) -> PipeBackpressurePolicy {
-        self.backpressure_policy.clone()
+        self.backpressure_policy
     }
 
     /// Build the scheduler facade policy from the aggregate concurrency config.
     pub fn scheduler_policy(&self) -> SchedulerPolicy {
-        self.scheduler_policy.clone()
+        self.scheduler_policy
     }
 }
 
