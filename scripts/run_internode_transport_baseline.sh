@@ -124,7 +124,9 @@ setup_output() {
   fi
   mkdir -p "${OUT_DIR}"
   echo "scenario,endpoint,workload,concurrency,size,status,throughput,requests_per_sec,avg_latency,log_file,run_dir" > "${OUT_DIR}/summary.csv"
-  echo "scenario,workload,concurrency,size,metric,operation,before,after,delta" > "${OUT_DIR}/internode_metric_deltas.csv"
+  if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
+    echo "scenario,workload,concurrency,size,metric,operation,before,after,delta" > "${OUT_DIR}/internode_metric_deltas.csv"
+  fi
 }
 
 collect_internode_snapshot() {
@@ -231,7 +233,9 @@ run_workload() {
   local after_metrics="${run_dir}/metrics_after.prom"
 
   mkdir -p "${run_dir}"
-  collect_internode_snapshot "${before_metrics}"
+  if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
+    collect_internode_snapshot "${before_metrics}"
+  fi
 
   local cmd=(
     "${OBJECT_BENCH_SCRIPT}"
@@ -263,9 +267,11 @@ run_workload() {
   printf '==> scenario=%s workload=%s concurrency=%s endpoint=%s\n' "${scenario}" "${workload}" "${conc}" "${endpoint}"
   "${cmd[@]}"
 
-  collect_internode_snapshot "${after_metrics}"
   append_object_summary "${scenario}" "${endpoint}" "${workload}" "${conc}" "${run_dir}"
-  append_metric_deltas "${scenario}" "${workload}" "${conc}" "all_sizes" "${before_metrics}" "${after_metrics}"
+  if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
+    collect_internode_snapshot "${after_metrics}"
+    append_metric_deltas "${scenario}" "${workload}" "${conc}" "all_sizes" "${before_metrics}" "${after_metrics}"
+  fi
 }
 
 run_all() {
@@ -300,8 +306,9 @@ main() {
   parse_args "$@"
   validate_args
   require_cmd awk
-  require_cmd curl
-  require_cmd rg
+  if [[ -n "${INTERNODE_METRICS_URL}" && "${DRY_RUN}" != "true" ]]; then
+    require_cmd curl
+  fi
   if [[ ! -x "${OBJECT_BENCH_SCRIPT}" ]]; then
     echo "ERROR: benchmark script not executable: ${OBJECT_BENCH_SCRIPT}" >&2
     exit 1
@@ -312,7 +319,9 @@ main() {
 
   echo "Artifacts:"
   echo "  ${OUT_DIR}/summary.csv"
-  echo "  ${OUT_DIR}/internode_metric_deltas.csv"
+  if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
+    echo "  ${OUT_DIR}/internode_metric_deltas.csv"
+  fi
 }
 
 main "$@"

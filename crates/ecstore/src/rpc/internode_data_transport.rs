@@ -17,13 +17,13 @@ use crate::disk::{FileReader, FileWriter};
 use crate::rpc::build_auth_headers;
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
+use rustfs_config::{DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT};
 use rustfs_rio::{HttpReader, HttpWriter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::warn;
 
-pub const ENV_RUSTFS_INTERNODE_DATA_TRANSPORT: &str = "RUSTFS_INTERNODE_DATA_TRANSPORT";
-pub const INTERNODE_DATA_TRANSPORT_TCP_HTTP: &str = "tcp-http";
+static INTERNODE_DATA_TRANSPORT: OnceLock<Arc<dyn InternodeDataTransport>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct ReadStreamRequest {
@@ -109,25 +109,57 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     fn name(&self) -> &'static str {
-        INTERNODE_DATA_TRANSPORT_TCP_HTTP
+        DEFAULT_INTERNODE_DATA_TRANSPORT
+    }
+}
+
+fn build_internode_data_transport(configured_transport: Option<&str>) -> Arc<dyn InternodeDataTransport> {
+    match configured_transport.map(str::trim).filter(|transport| !transport.is_empty()) {
+        Some(transport) if transport.eq_ignore_ascii_case(DEFAULT_INTERNODE_DATA_TRANSPORT) => {
+            Arc::new(TcpHttpInternodeDataTransport)
+        }
+        Some(transport) => {
+            warn!(
+                env = ENV_RUSTFS_INTERNODE_DATA_TRANSPORT,
+                requested = %transport,
+                fallback = DEFAULT_INTERNODE_DATA_TRANSPORT,
+                "unknown internode data transport, using default backend"
+            );
+            Arc::new(TcpHttpInternodeDataTransport)
+        }
+        None => Arc::new(TcpHttpInternodeDataTransport),
     }
 }
 
 pub fn build_internode_data_transport_from_env() -> Arc<dyn InternodeDataTransport> {
-    match std::env::var(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT) {
-        Ok(transport) => {
-            if transport.eq_ignore_ascii_case(INTERNODE_DATA_TRANSPORT_TCP_HTTP) {
-                Arc::new(TcpHttpInternodeDataTransport)
-            } else {
-                warn!(
-                    env = ENV_RUSTFS_INTERNODE_DATA_TRANSPORT,
-                    requested = %transport,
-                    fallback = INTERNODE_DATA_TRANSPORT_TCP_HTTP,
-                    "unknown internode data transport, using default backend"
-                );
-                Arc::new(TcpHttpInternodeDataTransport)
-            }
-        }
-        Err(_) => Arc::new(TcpHttpInternodeDataTransport),
+    Arc::clone(
+        INTERNODE_DATA_TRANSPORT
+            .get_or_init(|| build_internode_data_transport(std::env::var(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT).ok().as_deref())),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_config_defaults_to_tcp_http() {
+        let transport = build_internode_data_transport(None);
+
+        assert_eq!(transport.name(), DEFAULT_INTERNODE_DATA_TRANSPORT);
+    }
+
+    #[test]
+    fn transport_config_accepts_tcp_http() {
+        let transport = build_internode_data_transport(Some("TCP-HTTP"));
+
+        assert_eq!(transport.name(), DEFAULT_INTERNODE_DATA_TRANSPORT);
+    }
+
+    #[test]
+    fn transport_config_falls_back_to_tcp_http_for_unknown_backend() {
+        let transport = build_internode_data_transport(Some("rdma"));
+
+        assert_eq!(transport.name(), DEFAULT_INTERNODE_DATA_TRANSPORT);
     }
 }
