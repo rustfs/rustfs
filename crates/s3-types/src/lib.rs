@@ -14,4 +14,4 @@
 
 mod event_name;
 
-pub use event_name::{EventName, ParseEventNameError};
+pub use event_name::{EventName, ParseEventNameError, event_schema_version};

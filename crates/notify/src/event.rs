@@ -14,7 +14,7 @@
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use hashbrown::HashMap;
-use rustfs_s3_types::EventName;
+use rustfs_s3_types::{EventName, event_schema_version};
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
 
@@ -135,25 +135,6 @@ pub struct Event {
 }
 
 impl Event {
-    fn event_version_for(event_name: EventName) -> &'static str {
-        match event_name {
-            EventName::ObjectReplicationFailed
-            | EventName::ObjectReplicationComplete
-            | EventName::ObjectReplicationMissedThreshold
-            | EventName::ObjectReplicationReplicatedAfterThreshold
-            | EventName::ObjectReplicationNotTracked => "2.2",
-            EventName::ObjectRestoreCompleted
-            | EventName::ObjectAclPut
-            | EventName::ObjectTaggingPut
-            | EventName::ObjectTaggingDelete
-            | EventName::LifecycleExpirationDelete
-            | EventName::LifecycleExpirationDeleteMarkerCreated
-            | EventName::LifecycleTransition
-            | EventName::IntelligentTiering => "2.3",
-            _ => "2.1",
-        }
-    }
-
     /// Creates a test event for a given bucket and object
     pub fn new_test_event(bucket: &str, key: &str, event_name: EventName) -> Self {
         let mut user_metadata = HashMap::new();
@@ -176,7 +157,7 @@ impl Event {
         user_metadata.insert("x-request-time".to_string(), Utc::now().to_rfc3339());
 
         Event {
-            event_version: Self::event_version_for(event_name).to_string(),
+            event_version: event_schema_version(event_name).to_string(),
             event_source: "rustfs:s3".to_string(),
             aws_region: "us-east-1".to_string(),
             event_time: Utc::now(),
@@ -293,7 +274,7 @@ impl Event {
         };
 
         Self {
-            event_version: Self::event_version_for(args.event_name).to_string(),
+            event_version: event_schema_version(args.event_name).to_string(),
             event_source: "rustfs:s3".to_string(),
             aws_region: args.req_params.get("region").cloned().unwrap_or_default(),
             event_time: event_time.and_utc(),

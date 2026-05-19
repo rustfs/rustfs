@@ -190,6 +190,12 @@ impl EventName {
         }
     }
 
+    /// Parses an event string into an EventName with explicit error handling.
+    #[inline]
+    pub fn try_from_event_str(s: &str) -> Result<Self, ParseEventNameError> {
+        Self::parse(s)
+    }
+
     /// Returns a string representation of the event type.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -317,6 +323,27 @@ impl EventName {
     }
 }
 
+/// Returns the S3 notification event schema version for a given event.
+#[inline]
+pub fn event_schema_version(event_name: EventName) -> &'static str {
+    match event_name {
+        EventName::ObjectReplicationFailed
+        | EventName::ObjectReplicationComplete
+        | EventName::ObjectReplicationMissedThreshold
+        | EventName::ObjectReplicationReplicatedAfterThreshold
+        | EventName::ObjectReplicationNotTracked => "2.2",
+        EventName::ObjectRestoreCompleted
+        | EventName::ObjectAclPut
+        | EventName::ObjectTaggingPut
+        | EventName::ObjectTaggingDelete
+        | EventName::LifecycleExpirationDelete
+        | EventName::LifecycleExpirationDeleteMarkerCreated
+        | EventName::LifecycleTransition
+        | EventName::IntelligentTiering => "2.3",
+        _ => "2.1",
+    }
+}
+
 impl fmt::Display for EventName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
@@ -438,5 +465,19 @@ mod tests {
                 EventName::ObjectCreatedPut,
             ]
         );
+    }
+
+    #[test]
+    fn test_event_schema_version_mapping() {
+        assert_eq!(event_schema_version(EventName::ObjectCreatedPut), "2.1");
+        assert_eq!(event_schema_version(EventName::ObjectReplicationFailed), "2.2");
+        assert_eq!(event_schema_version(EventName::LifecycleTransition), "2.3");
+    }
+
+    #[test]
+    fn test_try_from_event_str_matches_parse() {
+        let parsed = EventName::try_from_event_str("s3:ObjectCreated:Put").unwrap();
+        assert_eq!(parsed, EventName::ObjectCreatedPut);
+        assert!(EventName::try_from_event_str("s3:Invalid").is_err());
     }
 }
