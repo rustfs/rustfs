@@ -11,6 +11,8 @@ ENDPOINT=""
 ACCESS_KEY=""
 SECRET_KEY=""
 BUCKET="rustfs-bench"
+AUTO_NEW_BUCKET=false
+BUCKET_PREFIX="rustfs-bench"
 REGION="us-east-1"
 CONCURRENCY=128
 DURATION="60s"
@@ -38,6 +40,8 @@ Required:
 
 Optional:
   --bucket              Bucket name (default: rustfs-bench)
+  --auto-new-bucket     Auto-generate a unique bucket for this run
+  --bucket-prefix       Prefix used with --auto-new-bucket (default: rustfs-bench)
   --region              Region (default: us-east-1)
   --concurrency         Concurrency for all sizes (default: 128)
   --duration            warp duration, e.g. 60s/2m (default: 60s)
@@ -92,6 +96,8 @@ parse_args() {
       --access-key) ACCESS_KEY="$2"; shift 2 ;;
       --secret-key) SECRET_KEY="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
+      --auto-new-bucket) AUTO_NEW_BUCKET=true; shift ;;
+      --bucket-prefix) BUCKET_PREFIX="$2"; shift 2 ;;
       --region) REGION="$2"; shift 2 ;;
       --concurrency) CONCURRENCY="$2"; shift 2 ;;
       --duration) DURATION="$2"; shift 2 ;;
@@ -154,6 +160,15 @@ setup_output() {
   mkdir -p "$OUT_DIR"
   SUMMARY_CSV="$OUT_DIR/summary.csv"
   echo "size,tool,concurrency,status,throughput,requests_per_sec,avg_latency,log_file" > "$SUMMARY_CSV"
+}
+
+resolve_bucket() {
+  if [[ "$AUTO_NEW_BUCKET" != "true" ]]; then
+    return
+  fi
+  local suffix
+  suffix="$(date +%Y%m%d%H%M%S)-$RANDOM"
+  BUCKET="${BUCKET_PREFIX}-${suffix}"
 }
 
 extract_value() {
@@ -238,6 +253,14 @@ run_one() {
     fi
   fi
 
+  if [[ "$TOOL" == "warp" ]]; then
+    # Warp may still exit with code 0 even when it prints runtime failures.
+    # Treat explicit error lines as failed runs to keep summary.csv reliable.
+    if rg -q 'warp: <ERROR>' "$log_file"; then
+      status="failed"
+    fi
+  fi
+
   local metrics throughput reqps latency
   metrics="$(collect_metrics "$log_file")"
   throughput="$(echo "$metrics" | cut -d',' -f1)"
@@ -250,6 +273,7 @@ run_one() {
 main() {
   parse_args "$@"
   validate_args
+  resolve_bucket
   require_cmd rg
   if [[ "$TOOL" == "warp" ]]; then
     require_cmd "$WARP_BIN"
@@ -261,8 +285,10 @@ main() {
 
   echo "Output dir: $OUT_DIR"
   echo "Tool: $TOOL"
+  echo "Bucket: $BUCKET"
   echo "Sizes: $SIZES"
   echo "Concurrency: $CONCURRENCY"
+  echo "$BUCKET" > "$OUT_DIR/bucket.txt"
 
   IFS=',' read -r -a size_arr <<< "$SIZES"
   for raw_size in "${size_arr[@]}"; do

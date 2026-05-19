@@ -215,24 +215,29 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
         return Ok(());
     }
 
-    if let Some(parent) = dir_path.as_ref().parent() {
-        // Without recursion support, fall back to create_dir_all
-        if let Err(e) = super::fs::make_dir_all(&parent).await {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                return Ok(());
-            }
-
-            return Err(e);
-        }
-        // Box::pin(os_mkdir_all(&parent, &base_dir)).await?;
-    }
-
     if let Err(e) = super::fs::mkdir(dir_path.as_ref()).await {
         if e.kind() == io::ErrorKind::AlreadyExists {
             return Ok(());
         }
 
-        return Err(e);
+        if e.kind() != io::ErrorKind::NotFound {
+            return Err(e);
+        }
+
+        if let Some(parent) = dir_path.as_ref().parent() {
+            // Fall back to creating the missing parent chain only when the direct mkdir proves it is required.
+            if let Err(parent_err) = super::fs::make_dir_all(parent).await
+                && parent_err.kind() != io::ErrorKind::AlreadyExists
+            {
+                return Err(parent_err);
+            }
+        }
+
+        if let Err(retry_err) = super::fs::mkdir(dir_path.as_ref()).await
+            && retry_err.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(retry_err);
+        }
     }
 
     Ok(())
