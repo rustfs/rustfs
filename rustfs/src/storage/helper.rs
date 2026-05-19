@@ -35,7 +35,7 @@ use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
 use std::future::Future;
 use tokio::runtime::{Builder, Handle};
-use tracing::{Instrument, info_span};
+use tracing::{Instrument, info_span, warn};
 
 /// Schedules an asynchronous task on the current runtime;
 /// if there is no runtime, creates a minimal runtime execution on a new thread.
@@ -90,12 +90,21 @@ pub struct EnabledOperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
-        debug_assert!(
-            operation_matches_event_name(op, event),
-            "operation/event mismatch: op={} event={}",
-            op.as_str(),
-            event.as_str()
-        );
+        let op_event_matches = operation_matches_event_name(op, event);
+        debug_assert!(op_event_matches, "operation/event mismatch: op={} event={}", op.as_str(), event.as_str());
+        if !op_event_matches {
+            counter!(
+                "rustfs_log_chain_op_event_mismatch_total",
+                "op" => op.as_str(),
+                "event" => event.as_str().to_string()
+            )
+            .increment(1);
+            warn!(
+                op = op.as_str(),
+                event = event.as_str(),
+                "operation/event mismatch detected; check S3 semantic mapping"
+            );
+        }
 
         let audit_enabled = is_audit_module_enabled();
         let notify_enabled = should_build_notification_event(is_notify_module_enabled());
