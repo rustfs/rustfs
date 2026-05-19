@@ -2303,7 +2303,9 @@ mod tests {
         assert!(opts.skip_decommissioned);
     }
 
-    // SAFETY: only `#[serial]` tests call this helper, so env mutations are serialized here.
+    // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
+    // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
+    // process environment while `env::set_var`/`env::remove_var` is active.
     #[allow(unsafe_code)]
     fn with_transition_worker_env<F>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
     where
@@ -2353,7 +2355,9 @@ mod tests {
         }
     }
 
-    // SAFETY: only `#[serial]` tests call this helper, so env mutations are serialized here.
+    // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
+    // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
+    // process environment while `env::set_var`/`env::remove_var` is active.
     #[allow(unsafe_code)]
     async fn with_transition_worker_env_async<F, Fut>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
     where
@@ -2404,7 +2408,9 @@ mod tests {
         }
     }
 
-    // SAFETY: only `#[serial]` tests call this helper, so env mutations are serialized here.
+    // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
+    // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
+    // process environment while `env::set_var`/`env::remove_var` is active.
     #[allow(unsafe_code)]
     fn with_transition_queue_env<F>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where
@@ -2454,7 +2460,9 @@ mod tests {
         }
     }
 
-    // SAFETY: only `#[serial]` tests call this helper, so env mutations are serialized here.
+    // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
+    // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
+    // process environment while `env::set_var`/`env::remove_var` is active.
     #[allow(unsafe_code)]
     async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where
