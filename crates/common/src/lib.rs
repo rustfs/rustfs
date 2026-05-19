@@ -15,13 +15,15 @@
 pub mod bucket_stats;
 pub mod capacity_scope;
 // pub mod error;
-pub mod data_usage;
 pub mod globals;
 pub mod heal_channel;
 pub mod internode_metrics;
 pub mod last_minute;
 pub mod metrics;
 mod readiness;
+pub mod data_usage {
+    pub use rustfs_data_usage::*;
+}
 
 pub use globals::*;
 pub use readiness::{GlobalReadiness, SystemStage};

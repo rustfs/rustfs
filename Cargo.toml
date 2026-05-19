@@ -19,6 +19,7 @@ members = [
     "crates/audit", # Audit target management system with multi-target fan-out
     "crates/checksums", # client checksums
     "crates/common", # Shared utilities and data structures
+    "crates/data-usage", # Shared data usage models and algorithms
     "crates/config", # Configuration management
     "crates/credentials", # Credential management system
     "crates/crypto", # Cryptography and security features
@@ -47,7 +48,6 @@ members = [
     "crates/targets", # Target-specific configurations and utilities
     "crates/trusted-proxies", # Trusted proxies management
     "crates/utils", # Utility functions and helpers
-    "crates/workers", # Worker thread pools and task scheduling
     "crates/io-metrics", # Zero-copy metrics collection for performance analysis
     "crates/io-core", # Zero-copy core reader and writer implementations
     "crates/zip", # ZIP file handling and compression
@@ -82,6 +82,7 @@ rustfs-appauth = { path = "crates/appauth", version = "1.0.0-beta.3" }
 rustfs-audit = { path = "crates/audit", version = "1.0.0-beta.3" }
 rustfs-checksums = { path = "crates/checksums", version = "1.0.0-beta.3" }
 rustfs-common = { path = "crates/common", version = "1.0.0-beta.3" }
+rustfs-data-usage = { path = "crates/data-usage", version = "1.0.0-beta.3" }
 rustfs-config = { path = "./crates/config", version = "1.0.0-beta.3" }
 rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.0-beta.3" }
 rustfs-credentials = { path = "crates/credentials", version = "1.0.0-beta.3" }
@@ -110,7 +111,6 @@ rustfs-signer = { path = "crates/signer", version = "1.0.0-beta.3" }
 rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-beta.3" }
 rustfs-targets = { path = "crates/targets", version = "1.0.0-beta.3" }
 rustfs-utils = { path = "crates/utils", version = "1.0.0-beta.3" }
-rustfs-workers = { path = "crates/workers", version = "1.0.0-beta.3" }
 rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.3" }
 
 # Async Runtime and Networking

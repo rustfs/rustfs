@@ -1,0 +1,24 @@
+[package]
+name = "rustfs-data-usage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "Shared data usage models and algorithms for RustFS"
+keywords = ["rustfs", "data-usage", "cache", "histogram"]
+categories = ["data-structures", "filesystem"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+path-clean = { workspace = true }
+rmp-serde = { workspace = true }
+async-trait = { workspace = true }
+rustfs-filemeta = { workspace = true }
+
+[lib]
+doctest = false
