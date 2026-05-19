@@ -110,9 +110,32 @@ pub fn reset_dns_resolver() {
 
 /// helper for validating if the provided arg is an ip address.
 pub fn is_socket_addr(addr: &str) -> bool {
-    // TODO IPv6 zone information?
+    addr.parse::<SocketAddr>().is_ok() || addr.parse::<IpAddr>().is_ok() || is_ipv6_addr_with_zone(addr)
+}
 
-    addr.parse::<SocketAddr>().is_ok() || addr.parse::<IpAddr>().is_ok()
+fn is_ipv6_addr_with_zone(addr: &str) -> bool {
+    let Some(zone_start) = addr.find('%') else {
+        return false;
+    };
+
+    if addr.starts_with('[') {
+        let Some(end_bracket) = addr[zone_start..].find(']').map(|pos| zone_start + pos) else {
+            return false;
+        };
+        let zone = &addr[zone_start + 1..end_bracket];
+        return zone_start > 1
+            && is_valid_ipv6_zone(zone)
+            && addr[end_bracket..].starts_with("]:")
+            && addr[1..zone_start].parse::<Ipv6Addr>().is_ok()
+            && addr[end_bracket + 2..].parse::<u16>().is_ok();
+    }
+
+    let zone = &addr[zone_start + 1..];
+    zone_start > 0 && is_valid_ipv6_zone(zone) && addr[..zone_start].parse::<Ipv6Addr>().is_ok()
+}
+
+fn is_valid_ipv6_zone(zone: &str) -> bool {
+    !zone.is_empty() && !zone.bytes().any(|ch| matches!(ch, b':' | b'/' | b'%' | b'[' | b']'))
 }
 
 /// checks if server_addr is valid and local host.
@@ -707,5 +730,12 @@ mod test {
             is_port_set: true,
         };
         assert_eq!(host_zero_port.to_string(), "example.com:0");
+    }
+
+    #[test]
+    fn test_is_socket_addr_accepts_ipv6_zone_identifier() {
+        assert!(is_socket_addr("fe80::1%en0"));
+        assert!(is_socket_addr("[fe80::1%en0]:9000"));
+        assert!(!is_socket_addr("fe80::1%en0:9000"));
     }
 }
