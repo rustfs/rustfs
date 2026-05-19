@@ -248,6 +248,16 @@ pub fn delete_event_name_for_marker(delete_marker: bool) -> EventName {
     }
 }
 
+/// Resolves the object-create notification event name from POST-object mode.
+#[inline]
+pub fn put_event_name_for_post_object(is_post_object: bool) -> EventName {
+    if is_post_object {
+        EventName::ObjectCreatedPost
+    } else {
+        EventName::ObjectCreatedPut
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +318,11 @@ mod tests {
     fn test_delete_event_name_for_marker() {
         assert_eq!(delete_event_name_for_marker(true), EventName::ObjectRemovedDeleteMarkerCreated);
         assert_eq!(delete_event_name_for_marker(false), EventName::ObjectRemovedDelete);
+    }
+
+    #[test]
+    fn test_put_event_name_for_post_object() {
+        assert_eq!(put_event_name_for_post_object(true), EventName::ObjectCreatedPost);
+        assert_eq!(put_event_name_for_post_object(false), EventName::ObjectCreatedPut);
     }
 }

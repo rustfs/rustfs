@@ -86,7 +86,7 @@ use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
-use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker};
+use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::{
     object_store::bytes_stream,
     query::{Context, Query},
@@ -1625,9 +1625,9 @@ impl DefaultObjectUsecase {
 
     fn put_object_execution_context(req: &S3Request<PutObjectInput>) -> (EventName, QuotaOperation, &'static str) {
         if req.extensions.get::<PostObjectRequestMarker>().is_some() {
-            (EventName::ObjectCreatedPost, QuotaOperation::PostObject, "POST")
+            (put_event_name_for_post_object(true), QuotaOperation::PostObject, "POST")
         } else {
-            (EventName::ObjectCreatedPut, QuotaOperation::PutObject, "PUT")
+            (put_event_name_for_post_object(false), QuotaOperation::PutObject, "PUT")
         }
     }
 
