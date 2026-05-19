@@ -210,7 +210,6 @@ fn classify_watermark_state(usage: usize, high: usize, low: usize, currently_hig
 fn apply_watermark_transition(
     in_high_watermark: &AtomicBool,
     usage: usize,
-    _buffer_capacity: usize,
     high: usize,
     low: usize,
 ) -> (BackpressureState, bool) {
@@ -338,7 +337,6 @@ impl BackpressurePipe {
         let (next_state, changed) = apply_watermark_transition(
             &self.state,
             usage,
-            self.config.buffer_size,
             self.config.high_watermark_bytes(),
             self.config.low_watermark_bytes(),
         );
@@ -469,7 +467,6 @@ impl BackpressureMonitor {
         let (next_state, changed) = apply_watermark_transition(
             &self.in_high_watermark,
             usage,
-            self.config.buffer_size,
             self.config.high_watermark_bytes(),
             self.config.low_watermark_bytes(),
         );
