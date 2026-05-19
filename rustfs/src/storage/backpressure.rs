@@ -321,19 +321,20 @@ impl BackpressurePipe {
     pub fn record_write(&self, bytes: usize) {
         self.total_written.fetch_add(bytes, Ordering::Relaxed);
         self.buffer_usage.fetch_add(bytes, Ordering::Relaxed);
-        self.check_high_watermark();
+        self.update_watermark_state();
     }
 
     /// Record bytes read (call after successful read).
     pub fn record_read(&self, bytes: usize) {
         self.total_read.fetch_add(bytes, Ordering::Relaxed);
         self.buffer_usage.fetch_sub(bytes, Ordering::Relaxed);
-        self.check_low_watermark();
+        self.update_watermark_state();
     }
 
-    /// Check if high watermark is reached.
-    fn check_high_watermark(&self) {
+    /// Update watermark state and emit transition signals.
+    fn update_watermark_state(&self) {
         let usage = self.buffer_usage.load(Ordering::Relaxed);
+        let usage_percent = calculate_usage_percent(usage, self.config.buffer_size) as u32;
         let (next_state, changed) = apply_watermark_transition(
             &self.state,
             usage,
@@ -342,40 +343,32 @@ impl BackpressurePipe {
             self.config.low_watermark_bytes(),
         );
 
-        if changed && matches!(next_state, BackpressureState::HighWatermark) {
-            counter!("rustfs_backpressure_events_total", "state" => "high_watermark").increment(1);
+        if changed {
+            match next_state {
+                BackpressureState::HighWatermark => {
+                    counter!("rustfs_backpressure_events_total", "state" => "high_watermark").increment(1);
 
-            warn!(
-                buffer_usage = usage,
-                buffer_capacity = self.config.buffer_size,
-                usage_percent = calculate_usage_percent(usage, self.config.buffer_size) as u32,
-                high_watermark = self.config.high_watermark,
-                "Backpressure: high watermark reached"
-            );
-        }
-    }
+                    warn!(
+                        buffer_usage = usage,
+                        buffer_capacity = self.config.buffer_size,
+                        usage_percent,
+                        high_watermark = self.config.high_watermark,
+                        "Backpressure: high watermark reached"
+                    );
+                }
+                BackpressureState::Normal => {
+                    counter!("rustfs_backpressure_events_total", "state" => "normal").increment(1);
 
-    /// Check if low watermark is reached (backpressure can be released).
-    fn check_low_watermark(&self) {
-        let usage = self.buffer_usage.load(Ordering::Relaxed);
-        let (next_state, changed) = apply_watermark_transition(
-            &self.state,
-            usage,
-            self.config.buffer_size,
-            self.config.high_watermark_bytes(),
-            self.config.low_watermark_bytes(),
-        );
-
-        if changed && matches!(next_state, BackpressureState::Normal) {
-            counter!("rustfs_backpressure_events_total", "state" => "normal").increment(1);
-
-            debug!(
-                buffer_usage = usage,
-                buffer_capacity = self.config.buffer_size,
-                usage_percent = calculate_usage_percent(usage, self.config.buffer_size) as u32,
-                low_watermark = self.config.low_watermark,
-                "Backpressure: returned to normal"
-            );
+                    debug!(
+                        buffer_usage = usage,
+                        buffer_capacity = self.config.buffer_size,
+                        usage_percent,
+                        low_watermark = self.config.low_watermark,
+                        "Backpressure: returned to normal"
+                    );
+                }
+                BackpressureState::BackpressureApplied => {}
+            }
         }
     }
 
@@ -472,6 +465,7 @@ impl BackpressureMonitor {
     /// Update state based on current usage.
     fn update_state(&self) -> BackpressureState {
         let usage = self.buffer_usage.load(Ordering::Relaxed);
+        let usage_percent = calculate_usage_percent(usage, self.config.buffer_size) as u32;
         let (next_state, changed) = apply_watermark_transition(
             &self.in_high_watermark,
             usage,
@@ -484,14 +478,14 @@ impl BackpressureMonitor {
             if changed {
                 counter!("rustfs_backpressure_events_total", "state" => "high_watermark").increment(1);
 
-                debug!(usage_percent = self.usage_percent() as u32, "Backpressure: entered high watermark");
+                debug!(usage_percent, "Backpressure: entered high watermark");
             }
             BackpressureState::HighWatermark
         } else {
             if changed {
                 counter!("rustfs_backpressure_events_total", "state" => "normal").increment(1);
 
-                debug!(usage_percent = self.usage_percent() as u32, "Backpressure: returned to normal");
+                debug!(usage_percent, "Backpressure: returned to normal");
             }
             BackpressureState::Normal
         }
