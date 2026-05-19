@@ -115,6 +115,32 @@ fn warn_inline_heal_compat_requested() {
     });
 }
 
+fn non_negative_i64_to_u64(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
+fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) {
+    into.size += summary.total_size;
+    into.versions += summary.versions;
+    into.delete_markers += summary.delete_markers;
+    into.obj_sizes.add(summary.total_size as u64);
+    into.obj_versions.add(summary.versions as u64);
+
+    let replication_stats = into.replication_stats.get_or_insert_with(Default::default);
+    replication_stats.replica_size += non_negative_i64_to_u64(summary.replica_size);
+    replication_stats.replica_count += summary.replica_count as u64;
+
+    for (arn, st) in &summary.repl_target_stats {
+        let tgt_stat = replication_stats.targets.entry(arn.clone()).or_default();
+        tgt_stat.pending_size += non_negative_i64_to_u64(st.pending_size);
+        tgt_stat.failed_size += non_negative_i64_to_u64(st.failed_size);
+        tgt_stat.replicated_size += non_negative_i64_to_u64(st.replicated_size);
+        tgt_stat.replicated_count += st.replicated_count as u64;
+        tgt_stat.failed_count += st.failed_count as u64;
+        tgt_stat.pending_count += st.pending_count as u64;
+    }
+}
+
 /// Cached folder information for scanning
 #[derive(Clone, Debug)]
 pub struct CachedFolder {
@@ -963,7 +989,7 @@ impl FolderScanner {
 
                 abandoned_children.remove(&path_join_buf(&[&item.bucket, &item.object_path()]));
 
-                into.add_sizes(&sz);
+                apply_scanner_size_summary(into, &sz);
                 into.objects += 1;
                 object_count += 1;
 

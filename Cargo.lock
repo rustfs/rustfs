@@ -10155,6 +10155,7 @@ dependencies = [
  "rmp-serde",
  "rustfs-common",
  "rustfs-config",
+ "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-filemeta",
  "rustfs-utils",
