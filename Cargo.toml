@@ -145,7 +145,7 @@ tonic = { version = "0.14.6", features = ["gzip"] }
 tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3", features = ["timeout"] }
-tower-http = { version = "0.6.10", features = ["cors"] }
+tower-http = { version = "0.6.11", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.1", features = ["serde"] }
@@ -194,7 +194,7 @@ tokio-postgres-rustls = "0.13"
 # Utilities and Tools
 anyhow = "1.0.102"
 arc-swap = "1.9.1"
-astral-tokio-tar = "0.6.1"
+astral-tokio-tar = "0.6.2"
 atoi = "2.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.16" }
@@ -216,7 +216,7 @@ crossbeam-deque = "0.8.6"
 crossbeam-utils = "0.8.21"
 datafusion = "53.1.0"
 derive_builder = "0.20.2"
-enumset = "1.1.12"
+enumset = "1.1.13"
 faster-hex = "0.10.0"
 flate2 = "1.1.9"
 glob = "0.3.3"
@@ -277,7 +277,7 @@ thiserror = "2.0.18"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.5"
 tracing-error = "0.2.1"
-tracing-opentelemetry = { version = "0.32.1", git = "https://github.com/tokio-rs/tracing-opentelemetry", rev = "44521fa43c79989cdfb5b7244d5f1afadef6dd7e" }
+tracing-opentelemetry = { version = "0.33" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"
@@ -307,7 +307,7 @@ libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
-russh = { version = "0.60.3",git = "https://github.com/Eugeny/russh",rev = "32fd46f100e011acf4cde467aea147fec5f2a107" }
+russh = { version = "0.60.3", git = "https://github.com/Eugeny/russh", rev = "fc6e3ab4cd4338e94ae64e17aeed2acee9335e6b" }
 russh-sftp = "2.1.2"
 
 # WebDAV
