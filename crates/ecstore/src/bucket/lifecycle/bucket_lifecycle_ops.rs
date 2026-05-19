@@ -2303,7 +2303,7 @@ mod tests {
         assert!(opts.skip_decommissioned);
     }
 
-    // SAFETY: these serial tests restore process environment variables before returning.
+    // SAFETY: only `#[serial]` tests call this helper, so env mutations are serialized here.
     #[allow(unsafe_code)]
     fn with_transition_worker_env<F>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
     where
@@ -2353,7 +2353,7 @@ mod tests {
         }
     }
 
-    // SAFETY: these serial tests restore process environment variables before returning.
+    // SAFETY: only `#[serial]` tests call this helper, so env mutations are serialized here.
     #[allow(unsafe_code)]
     async fn with_transition_worker_env_async<F, Fut>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
     where
@@ -2404,7 +2404,7 @@ mod tests {
         }
     }
 
-    // SAFETY: these serial tests restore process environment variables before returning.
+    // SAFETY: only `#[serial]` tests call this helper, so env mutations are serialized here.
     #[allow(unsafe_code)]
     fn with_transition_queue_env<F>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where
@@ -2454,7 +2454,7 @@ mod tests {
         }
     }
 
-    // SAFETY: these serial tests restore process environment variables before returning.
+    // SAFETY: only `#[serial]` tests call this helper, so env mutations are serialized here.
     #[allow(unsafe_code)]
     async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where

@@ -807,7 +807,9 @@ async fn wait_for_transition(
     }
 }
 
-// SAFETY: these serial tests restore the process environment variable before returning.
+// SAFETY: this helper is used only by `#[serial]` tests and runs under the single-threaded Tokio
+// runtime (`worker_threads = 1`), so no concurrent test can mutate process environment during the
+// `env::set_var` / `env::remove_var` window.
 #[allow(unsafe_code)]
 async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
 where
