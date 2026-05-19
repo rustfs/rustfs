@@ -2517,13 +2517,8 @@ impl DiskAPI for LocalDisk {
         let no_inline = fi.data.is_none() && fi.size > 0;
 
         // Check if there's an existing version with the same version_id that has a data_dir to clean up
-        let has_old_data_dir = {
-            xlmeta.find_version(search_version_id).ok().and_then(|(_, ver)| {
-                // shard_count == 0 means no other version shares this data_dir
-                ver.get_data_dir()
-                    .filter(|&data_dir| xlmeta.shard_data_dir_count(&search_version_id, &Some(data_dir)) == 0)
-            })
-        };
+        // Reuse one metadata scan to find the version data_dir and determine whether it is shared.
+        let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(search_version_id);
         if let Some(old_data_dir) = has_old_data_dir.as_ref() {
             let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), *old_data_dir]);
         }
