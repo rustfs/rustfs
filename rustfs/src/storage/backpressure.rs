@@ -178,6 +178,15 @@ pub struct BackpressurePipeMeta {
     pub state: BackpressureState,
 }
 
+/// Compact metadata snapshot for the lightweight backpressure monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackpressureMonitorMeta {
+    /// Buffer capacity in bytes.
+    pub buffer_capacity: usize,
+    /// Current backpressure state.
+    pub state: BackpressureState,
+}
+
 fn calculate_usage_percent(usage: usize, capacity: usize) -> f32 {
     if capacity > 0 {
         (usage as f32 / capacity as f32) * 100.0
@@ -452,6 +461,14 @@ impl BackpressureMonitor {
         calculate_usage_percent(usage, self.config.buffer_size)
     }
 
+    /// Get a compact metadata snapshot for the monitor.
+    pub fn meta(&self) -> BackpressureMonitorMeta {
+        BackpressureMonitorMeta {
+            buffer_capacity: self.config.buffer_size,
+            state: self.state(),
+        }
+    }
+
     /// Update state based on current usage.
     fn update_state(&self) -> BackpressureState {
         let usage = self.buffer_usage.load(Ordering::Relaxed);
@@ -528,6 +545,7 @@ mod tests {
 
         // Initially normal
         assert_eq!(monitor.state(), BackpressureState::Normal);
+        assert_eq!(monitor.meta().buffer_capacity, 1000);
 
         // Write to reach high watermark
         let state = monitor.on_write(850);
