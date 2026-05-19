@@ -84,6 +84,19 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
                 black_box(out);
             });
         });
+
+        group.bench_with_input(BenchmarkId::new("remove_two_only", version_count), &version_count, |b, _| {
+            b.iter(|| {
+                let mut xlmeta = FileMeta::load(black_box(&dst_buf)).expect("load dst meta");
+                let removed = if let Some(old_data_dir) = xlmeta.find_unshared_data_dir_for_version(Some(replace_version_id)) {
+                    xlmeta.data.remove_two(replace_version_id, old_data_dir).expect("remove two")
+                } else {
+                    false
+                };
+                black_box(removed);
+                black_box(xlmeta);
+            });
+        });
     }
 }
 
