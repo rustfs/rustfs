@@ -9037,13 +9037,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "{__name__=~\"rustfs_(notification|audit)_.*\",job=~\"$job\"}",
+          "expr": "{__name__=~\"rustfs_(notification|audit|log_chain)_.*\",job=~\"$job\"}",
           "legendFormat": "{{__name__}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Notification / Audit (All)",
+      "title": "Notification / Audit / LogChain (All)",
       "type": "timeseries"
     },
     {

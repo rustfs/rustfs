@@ -179,7 +179,51 @@ impl S3Operation {
             Self::SelectObjectContent => Some(EventName::ObjectAccessedGet),
             Self::AbortMultipartUpload => Some(EventName::ObjectRemovedAbortMultipartUpload),
             Self::CreateMultipartUpload => Some(EventName::ObjectCreatedCreateMultipartUpload),
-            _ => None,
+            Self::DeleteBucketCors => None,
+            Self::DeleteBucketEncryption => None,
+            Self::DeleteBucketLifecycle => None,
+            Self::DeleteBucketPolicy => None,
+            Self::DeleteBucketReplication => None,
+            Self::DeleteBucketTagging => None,
+            Self::DeletePublicAccessBlock => None,
+            Self::GetBucketAcl => None,
+            Self::GetBucketCors => None,
+            Self::GetBucketEncryption => None,
+            Self::GetBucketLifecycleConfiguration => None,
+            Self::GetBucketLocation => None,
+            Self::GetBucketLogging => None,
+            Self::GetBucketNotificationConfiguration => None,
+            Self::GetBucketPolicy => None,
+            Self::GetBucketPolicyStatus => None,
+            Self::GetBucketReplication => None,
+            Self::GetBucketTagging => None,
+            Self::GetBucketVersioning => None,
+            Self::GetObjectAcl => None,
+            Self::GetObjectLockConfiguration => None,
+            Self::GetObjectTagging => None,
+            Self::GetObjectTorrent => None,
+            Self::GetPublicAccessBlock => None,
+            Self::HeadBucket => None,
+            Self::ListBuckets => None,
+            Self::ListMultipartUploads => None,
+            Self::ListObjectVersions => None,
+            Self::ListObjects => None,
+            Self::ListObjectsV2 => None,
+            Self::ListParts => None,
+            Self::PutBucketAcl => None,
+            Self::PutBucketCors => None,
+            Self::PutBucketEncryption => None,
+            Self::PutBucketLifecycleConfiguration => None,
+            Self::PutBucketLogging => None,
+            Self::PutBucketNotificationConfiguration => None,
+            Self::PutBucketPolicy => None,
+            Self::PutBucketReplication => None,
+            Self::PutBucketTagging => None,
+            Self::PutBucketVersioning => None,
+            Self::PutObjectLockConfiguration => None,
+            Self::PutPublicAccessBlock => None,
+            Self::UploadPart => None,
+            Self::UploadPartCopy => None,
         }
     }
 }
@@ -234,7 +278,69 @@ pub fn operation_matches_event_name(op: S3Operation, event_name: EventName) -> b
         S3Operation::DeleteObjects => {
             matches!(event_name, EventName::ObjectRemovedDeleteObjects | EventName::ObjectRemovedDelete)
         }
-        _ => op.to_event_name() == Some(event_name),
+        S3Operation::AbortMultipartUpload
+        | S3Operation::CompleteMultipartUpload
+        | S3Operation::CopyObject
+        | S3Operation::CreateBucket
+        | S3Operation::CreateMultipartUpload
+        | S3Operation::DeleteBucket
+        | S3Operation::DeleteObjectTagging
+        | S3Operation::GetObject
+        | S3Operation::GetObjectAttributes
+        | S3Operation::GetObjectLegalHold
+        | S3Operation::GetObjectRetention
+        | S3Operation::HeadObject
+        | S3Operation::PutObjectAcl
+        | S3Operation::PutObjectLegalHold
+        | S3Operation::PutObjectRetention
+        | S3Operation::PutObjectTagging
+        | S3Operation::RestoreObject
+        | S3Operation::SelectObjectContent => op.to_event_name() == Some(event_name),
+        S3Operation::DeleteBucketCors
+        | S3Operation::DeleteBucketEncryption
+        | S3Operation::DeleteBucketLifecycle
+        | S3Operation::DeleteBucketPolicy
+        | S3Operation::DeleteBucketReplication
+        | S3Operation::DeleteBucketTagging
+        | S3Operation::DeletePublicAccessBlock
+        | S3Operation::GetBucketAcl
+        | S3Operation::GetBucketCors
+        | S3Operation::GetBucketEncryption
+        | S3Operation::GetBucketLifecycleConfiguration
+        | S3Operation::GetBucketLocation
+        | S3Operation::GetBucketLogging
+        | S3Operation::GetBucketNotificationConfiguration
+        | S3Operation::GetBucketPolicy
+        | S3Operation::GetBucketPolicyStatus
+        | S3Operation::GetBucketReplication
+        | S3Operation::GetBucketTagging
+        | S3Operation::GetBucketVersioning
+        | S3Operation::GetObjectAcl
+        | S3Operation::GetObjectLockConfiguration
+        | S3Operation::GetObjectTagging
+        | S3Operation::GetObjectTorrent
+        | S3Operation::GetPublicAccessBlock
+        | S3Operation::HeadBucket
+        | S3Operation::ListBuckets
+        | S3Operation::ListMultipartUploads
+        | S3Operation::ListObjectVersions
+        | S3Operation::ListObjects
+        | S3Operation::ListObjectsV2
+        | S3Operation::ListParts
+        | S3Operation::PutBucketAcl
+        | S3Operation::PutBucketCors
+        | S3Operation::PutBucketEncryption
+        | S3Operation::PutBucketLifecycleConfiguration
+        | S3Operation::PutBucketLogging
+        | S3Operation::PutBucketNotificationConfiguration
+        | S3Operation::PutBucketPolicy
+        | S3Operation::PutBucketReplication
+        | S3Operation::PutBucketTagging
+        | S3Operation::PutBucketVersioning
+        | S3Operation::PutObjectLockConfiguration
+        | S3Operation::PutPublicAccessBlock
+        | S3Operation::UploadPart
+        | S3Operation::UploadPartCopy => false,
     }
 }
 
@@ -352,5 +458,19 @@ mod tests {
         assert_ne!(mask & EventName::ObjectCreatedPut.mask(), 0);
         assert_ne!(mask & EventName::ObjectCreatedPost.mask(), 0);
         assert_eq!(mask & EventName::ObjectRemovedDelete.mask(), 0);
+    }
+
+    #[test]
+    fn test_operations_without_event_mapping_remain_unmapped() {
+        let unmapped = [
+            S3Operation::GetBucketAcl,
+            S3Operation::ListObjectsV2,
+            S3Operation::PutBucketNotificationConfiguration,
+            S3Operation::UploadPart,
+        ];
+        for op in unmapped {
+            assert_eq!(op.to_event_name(), None);
+            assert!(!operation_matches_event_name(op, EventName::ObjectCreatedPut));
+        }
     }
 }
