@@ -62,11 +62,11 @@
 //! }
 //! ```
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use rustfs_io_core::calculate_adaptive_timeout;
+use rustfs_io_core::{RequestTimeoutWrapper as CoreRequestTimeoutWrapper, TimeoutConfig as CoreTimeoutConfig, calculate_adaptive_timeout};
 
 /// Request-level timeout policy for GetObject.
 #[derive(Debug, Clone)]
@@ -180,6 +180,23 @@ impl GetObjectTimeoutPolicy {
             _ => self.get_object_timeout,
         }
     }
+
+    /// Convert the request-level policy into a core timeout configuration.
+    ///
+    /// This is intentionally lossy: request-specific diagnostics remain in the
+    /// storage layer, while the shared timing primitive lives in `io-core`.
+    pub fn to_core_config(&self) -> CoreTimeoutConfig {
+        CoreTimeoutConfig {
+            base_timeout: self.get_object_timeout,
+            timeout_per_mb: Duration::ZERO,
+            max_timeout: self.max_timeout,
+            min_timeout: self.min_timeout,
+            get_object_timeout: self.get_object_timeout,
+            put_object_timeout: self.get_object_timeout,
+            list_objects_timeout: self.get_object_timeout,
+            enable_dynamic_timeout: false,
+        }
+    }
 }
 
 /// Backward-compatible alias for the old request timeout name.
@@ -224,16 +241,25 @@ pub enum TimedGetObjectResult<T, E> {
 }
 
 /// Request timeout wrapper for async operations.
-#[derive(Debug)]
 pub struct RequestTimeoutWrapper {
     /// Configuration.
     config: GetObjectTimeoutPolicy,
-    /// Request start time.
-    start_time: Instant,
+    /// Shared core timing primitive.
+    core_wrapper: CoreRequestTimeoutWrapper,
     /// Cancellation token for propagating cancellation to sub-tasks.
     cancel_token: CancellationToken,
     /// Request ID for logging/metrics.
     request_id: String,
+}
+
+impl std::fmt::Debug for RequestTimeoutWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestTimeoutWrapper")
+            .field("config", &self.config)
+            .field("elapsed", &self.elapsed())
+            .field("request_id", &self.request_id)
+            .finish()
+    }
 }
 
 impl RequestTimeoutWrapper {
@@ -242,9 +268,10 @@ impl RequestTimeoutWrapper {
     /// Note: This uses a sentinel request_id. Prefer `with_request_id()` to pass
     /// the canonical request-id from `RequestContext`.
     pub fn new(config: GetObjectTimeoutPolicy) -> Self {
+        let core_wrapper = CoreRequestTimeoutWrapper::new(config.to_core_config());
         Self {
             config,
-            start_time: Instant::now(),
+            core_wrapper,
             cancel_token: CancellationToken::new(),
             request_id: "no-request-id".to_string(),
         }
@@ -252,12 +279,7 @@ impl RequestTimeoutWrapper {
 
     /// Create a new timeout wrapper with a specific request ID.
     pub fn with_request_id(config: GetObjectTimeoutPolicy, request_id: impl Into<String>) -> Self {
-        Self {
-            config,
-            start_time: Instant::now(),
-            cancel_token: CancellationToken::new(),
-            request_id: request_id.into(),
-        }
+        Self::new_with_parts(config, CancellationToken::new(), request_id.into())
     }
 
     /// Create a new timeout wrapper with operation size for dynamic timeout calculation.
@@ -266,17 +288,29 @@ impl RequestTimeoutWrapper {
     /// the canonical request-id from `RequestContext`.
     pub fn with_operation_size(config: GetObjectTimeoutPolicy, operation_size: Option<u64>) -> Self {
         let _ = operation_size;
-        Self {
-            config,
-            start_time: Instant::now(),
-            cancel_token: CancellationToken::new(),
-            request_id: "no-request-id".to_string(),
-        }
+        Self::new(config)
     }
 
     /// Get the configured timeout for this operation
     pub fn get_timeout(&self, operation_size: Option<u64>) -> Duration {
         self.config.get_timeout_for_operation(operation_size)
+    }
+
+    fn new_with_parts(config: GetObjectTimeoutPolicy, cancel_token: CancellationToken, request_id: String) -> Self {
+        let core_wrapper = CoreRequestTimeoutWrapper::new(config.to_core_config());
+        Self {
+            config,
+            core_wrapper,
+            cancel_token,
+            request_id,
+        }
+    }
+
+    fn context_fields(&self, context: Option<(&str, &str)>) -> (String, String) {
+        match context {
+            Some((bucket, key)) => (bucket.to_string(), key.to_string()),
+            None => (String::new(), String::new()),
+        }
     }
 
     /// Get the request ID.
@@ -297,12 +331,12 @@ impl RequestTimeoutWrapper {
 
     /// Check if the timeout has been exceeded.
     pub fn is_timeout(&self) -> bool {
-        self.config.is_timeout_enabled() && self.elapsed() >= self.config.get_object_timeout
+        self.config.is_timeout_enabled() && self.core_wrapper.elapsed() >= self.config.get_object_timeout
     }
 
     /// Get elapsed time since the request started.
     pub fn elapsed(&self) -> Duration {
-        self.start_time.elapsed()
+        self.core_wrapper.elapsed()
     }
 
     /// Get remaining time before timeout.
@@ -317,8 +351,7 @@ impl RequestTimeoutWrapper {
             return None;
         }
         let timeout = self.config.get_timeout_for_operation(operation_size);
-        let remaining = timeout.saturating_sub(self.elapsed());
-        if remaining == Duration::ZERO { None } else { Some(remaining) }
+        self.core_wrapper.remaining(timeout)
     }
 
     /// Check if the wrapper should timeout based on elapsed time and optional operation size
@@ -327,7 +360,7 @@ impl RequestTimeoutWrapper {
             return false;
         }
         let timeout = self.config.get_timeout_for_operation(operation_size);
-        self.elapsed() >= timeout
+        self.core_wrapper.elapsed() >= timeout
     }
 
     /// Execute an async operation with timeout protection.
@@ -347,95 +380,7 @@ impl RequestTimeoutWrapper {
         F: FnOnce(CancellationToken) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        if !self.config.is_timeout_enabled() {
-            // Timeout disabled, run without timeout
-            debug!(
-                request_id = %self.request_id,
-                "Timeout disabled, executing operation without timeout"
-            );
-            return match operation(self.cancel_token).await {
-                Ok(result) => TimedGetObjectResult::Success(result),
-                Err(e) => TimedGetObjectResult::Error(e),
-            };
-        }
-
-        let timeout_duration = self.config.get_object_timeout;
-        let request_id = self.request_id.clone();
-        let start_time = self.start_time;
-
-        debug!(
-            request_id = %request_id,
-            timeout_secs = timeout_duration.as_secs(),
-            "Starting timed operation"
-        );
-
-        // Record start time for metrics
-        rustfs_io_metrics::record_get_object_request_started();
-
-        // Clone cancel_token for the operation, keep original for potential cancellation
-        let cancel_token_for_op = self.cancel_token.clone();
-
-        match tokio::time::timeout(timeout_duration, operation(cancel_token_for_op)).await {
-            Ok(Ok(result)) => {
-                // Operation completed successfully
-                let elapsed = start_time.elapsed();
-
-                rustfs_io_metrics::record_get_object_request_result("success", elapsed.as_secs_f64());
-
-                debug!(
-                    request_id = %request_id,
-                    elapsed_ms = elapsed.as_millis(),
-                    "Operation completed successfully"
-                );
-
-                TimedGetObjectResult::Success(result)
-            }
-            Ok(Err(e)) => {
-                // Operation failed before timeout
-                let elapsed = start_time.elapsed();
-
-                rustfs_io_metrics::record_get_object_request_result("error", elapsed.as_secs_f64());
-
-                debug!(
-                    request_id = %request_id,
-                    elapsed_ms = elapsed.as_millis(),
-                    "Operation failed with error"
-                );
-
-                TimedGetObjectResult::Error(e)
-            }
-            Err(_) => {
-                // Timeout occurred
-                let elapsed = start_time.elapsed();
-
-                // Cancel the operation
-                self.cancel_token.cancel();
-
-                rustfs_io_metrics::record_get_object_timeout(None, Some(elapsed.as_secs_f64()));
-                rustfs_io_metrics::record_get_object_request_result("timeout", elapsed.as_secs_f64());
-
-                warn!(
-                    request_id = %request_id,
-                    timeout_secs = timeout_duration.as_secs(),
-                    elapsed_ms = elapsed.as_millis(),
-                    "Operation timed out, cancellation signal sent"
-                );
-
-                TimedGetObjectResult::Timeout(TimeoutInfo {
-                    request_id,
-                    bucket: String::new(),
-                    key: String::new(),
-                    timeout_duration,
-                    elapsed,
-                    bytes_transferred: 0,
-                    lock_hold_time: None,
-                    disk_reads_completed: 0,
-                    disk_reads_pending: 0,
-                    object_size: None,
-                    progress_percent: None,
-                })
-            }
-        }
+        self.execute_with_timeout_internal(None, operation).await
     }
 
     /// Execute an async operation with timeout and context information.
@@ -454,84 +399,134 @@ impl RequestTimeoutWrapper {
     {
         let bucket = bucket.into();
         let key = key.into();
+        self.execute_with_timeout_internal(Some((bucket, key)), operation).await
+    }
+
+    async fn execute_with_timeout_internal<F, Fut, T, E>(
+        self,
+        context: Option<(String, String)>,
+        operation: F,
+    ) -> TimedGetObjectResult<T, E>
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let request_id = self.request_id.clone();
+        let timeout_duration = self.get_timeout(None);
+        let context_refs = context.as_ref().map(|(bucket, key)| (bucket.as_str(), key.as_str()));
 
         if !self.config.is_timeout_enabled() {
-            debug!(
-                request_id = %self.request_id,
-                bucket = %bucket,
-                key = %key,
-                "Timeout disabled, executing operation without timeout"
-            );
+            if let Some((bucket, key)) = context_refs {
+                debug!(
+                    request_id = %self.request_id,
+                    bucket = %bucket,
+                    key = %key,
+                    "Timeout disabled, executing operation without timeout"
+                );
+            } else {
+                debug!(
+                    request_id = %self.request_id,
+                    "Timeout disabled, executing operation without timeout"
+                );
+            }
+
             return match operation(self.cancel_token).await {
                 Ok(result) => TimedGetObjectResult::Success(result),
                 Err(e) => TimedGetObjectResult::Error(e),
             };
         }
 
-        let timeout_duration = self.config.get_object_timeout;
-        let request_id = self.request_id.clone();
-        let start_time = self.start_time;
-
-        debug!(
-            request_id = %request_id,
-            bucket = %bucket,
-            key = %key,
-            timeout_secs = timeout_duration.as_secs(),
-            "Starting timed operation"
-        );
+        if let Some((bucket, key)) = context_refs {
+            debug!(
+                request_id = %request_id,
+                bucket = %bucket,
+                key = %key,
+                timeout_secs = timeout_duration.as_secs(),
+                "Starting timed operation"
+            );
+        } else {
+            debug!(
+                request_id = %request_id,
+                timeout_secs = timeout_duration.as_secs(),
+                "Starting timed operation"
+            );
+        }
 
         rustfs_io_metrics::record_get_object_request_started();
 
-        // Clone cancel_token for the operation, keep original for potential cancellation
         let cancel_token_for_op = self.cancel_token.clone();
 
         match tokio::time::timeout(timeout_duration, operation(cancel_token_for_op)).await {
             Ok(Ok(result)) => {
-                let elapsed = start_time.elapsed();
-
+                let elapsed = self.elapsed();
                 rustfs_io_metrics::record_get_object_request_result("success", elapsed.as_secs_f64());
 
-                debug!(
-                    request_id = %request_id,
-                    bucket = %bucket,
-                    key = %key,
-                    elapsed_ms = elapsed.as_millis(),
-                    "Operation completed successfully"
-                );
+                if let Some((bucket, key)) = context_refs {
+                    debug!(
+                        request_id = %request_id,
+                        bucket = %bucket,
+                        key = %key,
+                        elapsed_ms = elapsed.as_millis(),
+                        "Operation completed successfully"
+                    );
+                } else {
+                    debug!(
+                        request_id = %request_id,
+                        elapsed_ms = elapsed.as_millis(),
+                        "Operation completed successfully"
+                    );
+                }
 
                 TimedGetObjectResult::Success(result)
             }
             Ok(Err(e)) => {
-                let elapsed = start_time.elapsed();
-
+                let elapsed = self.elapsed();
                 rustfs_io_metrics::record_get_object_request_result("error", elapsed.as_secs_f64());
 
-                debug!(
-                    request_id = %request_id,
-                    bucket = %bucket,
-                    key = %key,
-                    elapsed_ms = elapsed.as_millis(),
-                    "Operation failed with error"
-                );
+                if let Some((bucket, key)) = context_refs {
+                    debug!(
+                        request_id = %request_id,
+                        bucket = %bucket,
+                        key = %key,
+                        elapsed_ms = elapsed.as_millis(),
+                        "Operation failed with error"
+                    );
+                } else {
+                    debug!(
+                        request_id = %request_id,
+                        elapsed_ms = elapsed.as_millis(),
+                        "Operation failed with error"
+                    );
+                }
 
                 TimedGetObjectResult::Error(e)
             }
             Err(_) => {
-                let elapsed = start_time.elapsed();
+                let elapsed = self.elapsed();
                 self.cancel_token.cancel();
 
                 rustfs_io_metrics::record_get_object_timeout(None, Some(elapsed.as_secs_f64()));
                 rustfs_io_metrics::record_get_object_request_result("timeout", elapsed.as_secs_f64());
 
-                warn!(
-                    request_id = %request_id,
-                    bucket = %bucket,
-                    key = %key,
-                    timeout_secs = timeout_duration.as_secs(),
-                    elapsed_ms = elapsed.as_millis(),
-                    "Operation timed out, cancellation signal sent"
-                );
+                if let Some((bucket, key)) = context_refs {
+                    warn!(
+                        request_id = %request_id,
+                        bucket = %bucket,
+                        key = %key,
+                        timeout_secs = timeout_duration.as_secs(),
+                        elapsed_ms = elapsed.as_millis(),
+                        "Operation timed out, cancellation signal sent"
+                    );
+                } else {
+                    warn!(
+                        request_id = %request_id,
+                        timeout_secs = timeout_duration.as_secs(),
+                        elapsed_ms = elapsed.as_millis(),
+                        "Operation timed out, cancellation signal sent"
+                    );
+                }
 
+                let (bucket, key) = self.context_fields(context_refs);
                 TimedGetObjectResult::Timeout(TimeoutInfo {
                     request_id,
                     bucket,

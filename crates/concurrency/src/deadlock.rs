@@ -14,7 +14,7 @@
 
 //! Deadlock detection management
 
-use rustfs_io_core::{DeadlockDetector as CoreDeadlockDetector, LockType};
+use rustfs_io_core::{DeadlockDetector as CoreDeadlockDetector, DeadlockDetectorConfig as CoreDeadlockConfig, LockType};
 use rustfs_io_metrics::deadlock_metrics;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +41,17 @@ impl Default for DeadlockMonitorPolicy {
     }
 }
 
+impl DeadlockMonitorPolicy {
+    /// Convert the facade policy into the reusable io-core deadlock config.
+    pub fn to_core_config(&self) -> CoreDeadlockConfig {
+        CoreDeadlockConfig {
+            enabled: self.enabled,
+            detection_interval: self.check_interval,
+            max_hold_time: self.hang_threshold,
+        }
+    }
+}
+
 /// Backward-compatible alias for the old deadlock facade name.
 pub type DeadlockConfig = DeadlockMonitorPolicy;
 
@@ -54,18 +65,16 @@ pub struct DeadlockManager {
 impl DeadlockManager {
     /// Create a new deadlock manager
     pub fn new(enabled: bool, check_interval: Duration, hang_threshold: Duration) -> Self {
-        let config = DeadlockMonitorPolicy {
+        Self::from_policy(DeadlockMonitorPolicy {
             enabled,
             check_interval,
             hang_threshold,
-        };
+        })
+    }
 
-        let core_config = rustfs_io_core::DeadlockDetectorConfig {
-            enabled,
-            detection_interval: check_interval,
-            max_hold_time: hang_threshold,
-        };
-
+    /// Create a new deadlock manager from the facade policy type.
+    pub fn from_policy(config: DeadlockMonitorPolicy) -> Self {
+        let core_config = config.to_core_config();
         Self {
             config,
             detector: Arc::new(CoreDeadlockDetector::new(core_config)),
@@ -132,7 +141,11 @@ impl DeadlockManager {
     }
 }
 
-/// Request tracker for tracking resources
+/// Lightweight compatibility wrapper for request-scoped deadlock bookkeeping.
+///
+/// This type intentionally stays minimal in the concurrency layer. Rich
+/// request-level lock/resource diagnostics belong to
+/// `rustfs::storage::deadlock_detector::RequestResourceTracker`.
 pub struct RequestTracker {
     request_id: String,
     description: String,
@@ -177,6 +190,11 @@ impl RequestTracker {
         deadlock_metrics::record_lock_acquisition("read");
     }
 
+    /// Return a read-only view of tracked resource names.
+    pub fn resources(&self) -> &HashMap<String, Vec<String>> {
+        &self.resources
+    }
+
     /// Record a lock release
     pub fn record_lock_release(&mut self, lock_id: u64) {
         self.detector.record_release(lock_id);
@@ -199,12 +217,24 @@ mod tests {
         assert!(!manager.config().enabled);
     }
 
+    #[test]
+    fn test_deadlock_policy_to_core_config() {
+        let policy = DeadlockMonitorPolicy::default();
+        let core = policy.to_core_config();
+        assert_eq!(core.enabled, policy.enabled);
+        assert_eq!(core.detection_interval, policy.check_interval);
+        assert_eq!(core.max_hold_time, policy.hang_threshold);
+    }
+
     #[tokio::test]
     async fn test_request_tracker() {
         let manager = DeadlockManager::new(true, Duration::from_secs(10), Duration::from_secs(60));
-        let tracker = manager.track_request("req-1".to_string(), "test request".to_string());
+        let mut tracker = manager.track_request("req-1".to_string(), "test request".to_string());
+        let lock_id = manager.register_lock(LockType::Mutex);
+        tracker.record_lock_acquire(lock_id, "bucket/key".to_string());
 
         assert_eq!(tracker.request_id(), "req-1");
         assert_eq!(tracker.description(), "test request");
+        assert_eq!(tracker.resources().get("locks").map(Vec::len), Some(1));
     }
 }

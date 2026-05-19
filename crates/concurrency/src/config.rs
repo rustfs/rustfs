@@ -14,6 +14,7 @@
 
 //! Configuration for concurrency management
 
+use crate::{backpressure::PipeBackpressurePolicy, deadlock::DeadlockMonitorPolicy, timeout::TimeoutManagerPolicy};
 use std::time::Duration;
 
 /// Feature flags for concurrency modules
@@ -203,6 +204,33 @@ impl ConcurrencyConfig {
 
         Ok(())
     }
+
+    /// Build the timeout facade policy from the aggregate concurrency config.
+    pub fn timeout_policy(&self) -> TimeoutManagerPolicy {
+        TimeoutManagerPolicy {
+            default_timeout: self.default_timeout,
+            max_timeout: self.max_timeout,
+            enable_dynamic: self.enable_dynamic_timeout,
+        }
+    }
+
+    /// Build the deadlock facade policy from the aggregate concurrency config.
+    pub fn deadlock_policy(&self) -> DeadlockMonitorPolicy {
+        DeadlockMonitorPolicy {
+            enabled: self.enable_deadlock_detection,
+            check_interval: self.deadlock_check_interval,
+            hang_threshold: self.hang_threshold,
+        }
+    }
+
+    /// Build the backpressure facade policy from the aggregate concurrency config.
+    pub fn backpressure_policy(&self) -> PipeBackpressurePolicy {
+        PipeBackpressurePolicy {
+            buffer_size: self.backpressure_buffer_size,
+            high_watermark: self.high_watermark,
+            low_watermark: self.low_watermark,
+        }
+    }
 }
 
 /// Configuration error
@@ -252,5 +280,32 @@ mod tests {
 
         let features = ConcurrencyFeatures::none();
         assert!(!features.any_enabled());
+    }
+
+    #[test]
+    fn test_timeout_policy_mapping() {
+        let config = ConcurrencyConfig::default();
+        let policy = config.timeout_policy();
+        assert_eq!(policy.default_timeout, config.default_timeout);
+        assert_eq!(policy.max_timeout, config.max_timeout);
+        assert_eq!(policy.enable_dynamic, config.enable_dynamic_timeout);
+    }
+
+    #[test]
+    fn test_deadlock_policy_mapping() {
+        let config = ConcurrencyConfig::default();
+        let policy = config.deadlock_policy();
+        assert_eq!(policy.enabled, config.enable_deadlock_detection);
+        assert_eq!(policy.check_interval, config.deadlock_check_interval);
+        assert_eq!(policy.hang_threshold, config.hang_threshold);
+    }
+
+    #[test]
+    fn test_backpressure_policy_mapping() {
+        let config = ConcurrencyConfig::default();
+        let policy = config.backpressure_policy();
+        assert_eq!(policy.buffer_size, config.backpressure_buffer_size);
+        assert_eq!(policy.high_watermark, config.high_watermark);
+        assert_eq!(policy.low_watermark, config.low_watermark);
     }
 }

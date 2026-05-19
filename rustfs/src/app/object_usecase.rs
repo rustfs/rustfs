@@ -1123,16 +1123,12 @@ impl DefaultObjectUsecase {
         deadlock_detector.register_request(&request_id, format!("GetObject {bucket}/{key}"));
         let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
 
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out before processing"
-            );
-            return Err(s3_error!(InternalError, "Request timeout before processing"));
-        }
+        Self::ensure_get_object_not_timed_out_before_processing(
+            &wrapper,
+            &timeout_config,
+            bucket,
+            key,
+        )?;
 
         rustfs_io_metrics::record_get_object_request_start(concurrent_requests);
 
@@ -1165,19 +1161,13 @@ impl DefaultObjectUsecase {
             .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?;
         let permit_wait_duration = permit_wait_start.elapsed();
 
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                wait_ms = permit_wait_duration.as_millis(),
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out while waiting for disk permit"
-            );
-
-            rustfs_io_metrics::record_get_object_timeout(Some("disk_permit"), Some(wrapper.elapsed().as_secs_f64()));
-            return Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"));
-        }
+        Self::ensure_get_object_not_timed_out_while_waiting_for_disk_permit(
+            wrapper,
+            timeout_config,
+            bucket,
+            key,
+            permit_wait_duration,
+        )?;
 
         let queue_status = manager.io_queue_status();
         let queue_snapshot = GetObjectQueueSnapshot::from_available_permits(
@@ -1199,17 +1189,12 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::record_io_queue_congestion();
         }
 
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out before reading object"
-            );
-            rustfs_io_metrics::record_get_object_timeout(Some("before_read"), Some(wrapper.elapsed().as_secs_f64()));
-            return Err(s3_error!(InternalError, "Request timeout before reading object"));
-        }
+        Self::ensure_get_object_not_timed_out_before_read(
+            wrapper,
+            timeout_config,
+            bucket,
+            key,
+        )?;
 
         Ok(GetObjectIoPlanning {
             _disk_permit: disk_permit,
@@ -2050,6 +2035,73 @@ impl DefaultObjectUsecase {
             "GetObject completed: size={} duration={:?} buffer={}",
             response_content_length, total_duration, optimal_buffer_size
         );
+    }
+
+    fn ensure_get_object_not_timed_out_before_processing(
+        wrapper: &RequestTimeoutWrapper,
+        timeout_config: &GetObjectTimeoutPolicy,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<()> {
+        if !wrapper.is_timeout() {
+            return Ok(());
+        }
+
+        warn!(
+            bucket = %bucket,
+            key = %key,
+            timeout_secs = timeout_config.get_object_timeout.as_secs(),
+            elapsed_ms = wrapper.elapsed().as_millis(),
+            "GetObject request timed out before processing"
+        );
+
+        Err(s3_error!(InternalError, "Request timeout before processing"))
+    }
+
+    fn ensure_get_object_not_timed_out_while_waiting_for_disk_permit(
+        wrapper: &RequestTimeoutWrapper,
+        timeout_config: &GetObjectTimeoutPolicy,
+        bucket: &str,
+        key: &str,
+        permit_wait_duration: Duration,
+    ) -> S3Result<()> {
+        if !wrapper.is_timeout() {
+            return Ok(());
+        }
+
+        warn!(
+            bucket = %bucket,
+            key = %key,
+            wait_ms = permit_wait_duration.as_millis(),
+            timeout_secs = timeout_config.get_object_timeout.as_secs(),
+            elapsed_ms = wrapper.elapsed().as_millis(),
+            "GetObject request timed out while waiting for disk permit"
+        );
+
+        rustfs_io_metrics::record_get_object_timeout(Some("disk_permit"), Some(wrapper.elapsed().as_secs_f64()));
+        Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"))
+    }
+
+    fn ensure_get_object_not_timed_out_before_read(
+        wrapper: &RequestTimeoutWrapper,
+        timeout_config: &GetObjectTimeoutPolicy,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<()> {
+        if !wrapper.is_timeout() {
+            return Ok(());
+        }
+
+        warn!(
+            bucket = %bucket,
+            key = %key,
+            timeout_secs = timeout_config.get_object_timeout.as_secs(),
+            elapsed_ms = wrapper.elapsed().as_millis(),
+            "GetObject request timed out before reading object"
+        );
+
+        rustfs_io_metrics::record_get_object_timeout(Some("before_read"), Some(wrapper.elapsed().as_secs_f64()));
+        Err(s3_error!(InternalError, "Request timeout before reading object"))
     }
 
     async fn finalize_get_object_response(

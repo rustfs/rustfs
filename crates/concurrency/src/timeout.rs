@@ -14,7 +14,7 @@
 
 //! Timeout management for operations
 
-use rustfs_io_core::{TimeoutError, calculate_adaptive_timeout};
+use rustfs_io_core::{TimeoutConfig as CoreTimeoutConfig, TimeoutError, calculate_adaptive_timeout};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -39,29 +39,58 @@ impl Default for TimeoutManagerPolicy {
     }
 }
 
+impl TimeoutManagerPolicy {
+    /// Convert the facade policy into the reusable io-core timeout configuration.
+    ///
+    /// This keeps the concurrency layer explicitly wired to the shared core
+    /// timeout primitives without changing the facade's public behavior.
+    pub fn to_core_config(&self) -> CoreTimeoutConfig {
+        CoreTimeoutConfig {
+            base_timeout: self.default_timeout,
+            timeout_per_mb: Duration::ZERO,
+            max_timeout: self.max_timeout,
+            min_timeout: Duration::from_secs(1),
+            get_object_timeout: self.default_timeout,
+            put_object_timeout: self.max_timeout,
+            list_objects_timeout: self.default_timeout,
+            enable_dynamic_timeout: self.enable_dynamic,
+        }
+    }
+}
+
 /// Backward-compatible alias for the old timeout facade name.
 pub type TimeoutConfig = TimeoutManagerPolicy;
 
 /// Timeout manager
 pub struct TimeoutManager {
     config: TimeoutManagerPolicy,
+    core_config: CoreTimeoutConfig,
 }
 
 impl TimeoutManager {
     /// Create a new timeout manager
     pub fn new(default_timeout: Duration, max_timeout: Duration, enable_dynamic: bool) -> Self {
-        Self {
-            config: TimeoutManagerPolicy {
-                default_timeout,
-                max_timeout,
-                enable_dynamic,
-            },
-        }
+        Self::from_policy(TimeoutManagerPolicy {
+            default_timeout,
+            max_timeout,
+            enable_dynamic,
+        })
+    }
+
+    /// Create a new timeout manager from the facade policy type.
+    pub fn from_policy(config: TimeoutManagerPolicy) -> Self {
+        let core_config = config.to_core_config();
+        Self { config, core_config }
     }
 
     /// Get the configuration
     pub fn config(&self) -> &TimeoutManagerPolicy {
         &self.config
+    }
+
+    /// Get the derived io-core timeout configuration.
+    pub fn core_config(&self) -> &CoreTimeoutConfig {
+        &self.core_config
     }
 
     /// Calculate timeout for a given size
@@ -70,7 +99,8 @@ impl TimeoutManager {
             return self.config.default_timeout;
         }
 
-        calculate_adaptive_timeout(self.config.default_timeout, None, 0, size).min(self.config.max_timeout)
+        calculate_adaptive_timeout(self.core_config.base_timeout, None, 0, size)
+            .clamp(self.core_config.min_timeout, self.core_config.max_timeout)
     }
 
     /// Wrap an operation with timeout control
@@ -90,7 +120,7 @@ impl TimeoutManager {
 
     /// Create a timeout guard for manual timeout control
     pub fn create_guard(&self, timeout: Option<Duration>) -> TimeoutGuard {
-        TimeoutGuard::new(timeout.unwrap_or(self.config.default_timeout))
+        TimeoutGuard::new(timeout.unwrap_or(self.core_config.base_timeout))
     }
 }
 
@@ -139,6 +169,16 @@ mod tests {
     fn test_timeout_config() {
         let config = TimeoutManagerPolicy::default();
         assert!(config.default_timeout < config.max_timeout);
+    }
+
+    #[test]
+    fn test_timeout_policy_to_core_config() {
+        let policy = TimeoutManagerPolicy::default();
+        let core = policy.to_core_config();
+        assert_eq!(core.base_timeout, policy.default_timeout);
+        assert_eq!(core.max_timeout, policy.max_timeout);
+        assert_eq!(core.get_object_timeout, policy.default_timeout);
+        assert!(core.enable_dynamic_timeout);
     }
 
     #[tokio::test]

@@ -85,11 +85,7 @@ impl ConcurrencyManager {
 
         Self {
             #[cfg(feature = "timeout")]
-            timeout: Arc::new(crate::timeout::TimeoutManager::new(
-                config.default_timeout,
-                config.max_timeout,
-                config.enable_dynamic_timeout,
-            )),
+            timeout: Arc::new(crate::timeout::TimeoutManager::from_policy(config.timeout_policy())),
 
             #[cfg(feature = "lock")]
             lock: Arc::new(crate::lock::LockManager::new(
@@ -98,18 +94,10 @@ impl ConcurrencyManager {
             )),
 
             #[cfg(feature = "deadlock")]
-            deadlock: Arc::new(crate::deadlock::DeadlockManager::new(
-                config.enable_deadlock_detection,
-                config.deadlock_check_interval,
-                config.hang_threshold,
-            )),
+            deadlock: Arc::new(crate::deadlock::DeadlockManager::from_policy(config.deadlock_policy())),
 
             #[cfg(feature = "backpressure")]
-            backpressure: Arc::new(crate::backpressure::BackpressureManager::new(
-                config.backpressure_buffer_size,
-                config.high_watermark,
-                config.low_watermark,
-            )),
+            backpressure: Arc::new(crate::backpressure::BackpressureManager::from_policy(config.backpressure_policy())),
 
             #[cfg(feature = "scheduler")]
             scheduler: Arc::new(crate::scheduler::SchedulerManager::new(
