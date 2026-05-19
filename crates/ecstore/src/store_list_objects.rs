@@ -592,11 +592,11 @@ impl ECStore {
         let job1 = tokio::spawn(async move {
             let mut opts = opts;
             opts.stop_disk_at_limit = true;
-            if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await {
-                if !cancel_rx1_for_err.is_cancelled() {
-                    error!("list_merged err {:?}", err);
-                    let _ = err_tx1.send(Arc::new(err));
-                }
+            if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await
+                && !cancel_rx1_for_err.is_cancelled()
+            {
+                error!("list_merged err {:?}", err);
+                let _ = err_tx1.send(Arc::new(err));
             }
         });
 
