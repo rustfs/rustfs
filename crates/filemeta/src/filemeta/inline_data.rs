@@ -13,41 +13,46 @@
 // limitations under the License.
 
 use super::*;
+use std::collections::HashSet;
 
 impl FileMeta {
     pub fn find_unshared_data_dir_for_version(&self, version_id: Option<Uuid>) -> Option<Uuid> {
         let vid = version_id.unwrap_or_default();
         let mut target_data_dir = None;
+        let mut target_selected = false;
+        let mut other_data_dirs = HashSet::new();
 
         for version in self
             .versions
             .iter()
             .filter(|v| v.header.version_type == VersionType::Object && v.header.uses_data_dir())
         {
-            if version.header.version_id.unwrap_or_default() != vid {
+            let is_target_version = version.header.version_id.unwrap_or_default() == vid;
+            if is_target_version {
+                if target_selected {
+                    continue;
+                }
+
+                target_selected = true;
+                target_data_dir = FileMetaVersion::decode_data_dir_from_meta(&version.meta).unwrap_or_default();
+                if let Some(dir) = target_data_dir
+                    && other_data_dirs.contains(&dir)
+                {
+                    return None;
+                }
                 continue;
             }
-            target_data_dir = FileMetaVersion::decode_data_dir_from_meta(&version.meta).unwrap_or_default();
-            break;
-        }
 
-        let target_data_dir = target_data_dir?;
-
-        for version in self
-            .versions
-            .iter()
-            .filter(|v| v.header.version_type == VersionType::Object && v.header.uses_data_dir())
-        {
-            if version.header.version_id.unwrap_or_default() == vid {
-                continue;
-            }
             let dir = FileMetaVersion::decode_data_dir_from_meta(&version.meta).unwrap_or_default();
-            if dir == Some(target_data_dir) {
-                return None;
+            if let Some(dir) = dir {
+                if target_data_dir == Some(dir) {
+                    return None;
+                }
+                other_data_dirs.insert(dir);
             }
         }
 
-        Some(target_data_dir)
+        target_data_dir
     }
 
     pub fn shard_data_dir_count(&self, vid: &Option<Uuid>, data_dir: &Option<Uuid>) -> usize {
