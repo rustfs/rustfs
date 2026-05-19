@@ -238,6 +238,16 @@ pub fn operation_matches_event_name(op: S3Operation, event_name: EventName) -> b
     }
 }
 
+/// Resolves the object-delete notification event name from delete-marker state.
+#[inline]
+pub fn delete_event_name_for_marker(delete_marker: bool) -> EventName {
+    if delete_marker {
+        EventName::ObjectRemovedDeleteMarkerCreated
+    } else {
+        EventName::ObjectRemovedDelete
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +302,11 @@ mod tests {
         assert!(operation_matches_event_name(S3Operation::DeleteObjects, EventName::ObjectRemovedDelete));
 
         assert!(!operation_matches_event_name(S3Operation::GetObject, EventName::ObjectCreatedPut));
+    }
+
+    #[test]
+    fn test_delete_event_name_for_marker() {
+        assert_eq!(delete_event_name_for_marker(true), EventName::ObjectRemovedDeleteMarkerCreated);
+        assert_eq!(delete_event_name_for_marker(false), EventName::ObjectRemovedDelete);
     }
 }

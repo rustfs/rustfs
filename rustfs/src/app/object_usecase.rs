@@ -86,7 +86,7 @@ use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
-use rustfs_s3_ops::S3Operation;
+use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker};
 use rustfs_s3select_api::{
     object_store::bytes_stream,
     query::{Context, Query},
@@ -3141,11 +3141,7 @@ impl DefaultObjectUsecase {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
-                    let event_name = if dobj.delete_marker {
-                        EventName::ObjectRemovedDeleteMarkerCreated
-                    } else {
-                        EventName::ObjectRemovedDelete
-                    };
+                    let event_name = delete_event_name_for_marker(dobj.delete_marker);
                     let event_args = EventArgsBuilder::new(
                         event_name,
                         bucket.clone(),
@@ -3378,11 +3374,7 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let event_name = if delete_marker {
-            EventName::ObjectRemovedDeleteMarkerCreated
-        } else {
-            EventName::ObjectRemovedDelete
-        };
+        let event_name = delete_event_name_for_marker(delete_marker);
 
         helper = helper.event_name(event_name);
         helper = helper
