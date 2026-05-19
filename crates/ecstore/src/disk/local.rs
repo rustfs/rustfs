@@ -2514,6 +2514,7 @@ impl DiskAPI for LocalDisk {
         // TODO: Healing
 
         let search_version_id = fi.version_id.or(Some(Uuid::nil()));
+        let no_inline = fi.data.is_none() && fi.size > 0;
 
         // Check if there's an existing version with the same version_id that has a data_dir to clean up
         let has_old_data_dir = {
@@ -2527,18 +2528,30 @@ impl DiskAPI for LocalDisk {
             let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), *old_data_dir]);
         }
 
-        xlmeta.add_version(fi.clone())?;
+        xlmeta.add_version(fi)?;
 
         if xlmeta.versions.len() <= 10 {
             // TODO: Sign
         }
 
-        let new_dst_buf = xlmeta.marshal_msg()?;
-
-        self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
-            .await?;
         if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
-            let no_inline = fi.data.is_none() && fi.size > 0;
+            let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
+            let meta_skip_parent = if no_inline {
+                src_file_parent
+            } else {
+                src_volume_dir.as_path()
+            };
+            let new_dst_buf = xlmeta.marshal_msg()?;
+
+            self.write_all_private(
+                src_volume,
+                format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(),
+                new_dst_buf.into(),
+                true,
+                meta_skip_parent,
+            )
+            .await?;
+
             if no_inline && let Err(err) = rename_all(&src_data_path, &dst_data_path, &skip_parent).await {
                 let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 info!(
@@ -2547,6 +2560,10 @@ impl DiskAPI for LocalDisk {
                 );
                 return Err(err);
             }
+        } else {
+            let new_dst_buf = xlmeta.marshal_msg()?;
+            self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
+                .await?;
         }
 
         if let Some(old_data_dir) = has_old_data_dir {
