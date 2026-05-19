@@ -189,12 +189,38 @@ impl InlineData {
         }
 
         let key_bytes = key.as_bytes();
+        let mut scan_cur = Cursor::new(buf);
+        let mut scan_fields_len = rmp::decode::read_map_len(&mut scan_cur)? as usize;
+        let mut found = false;
+
+        while scan_fields_len > 0 {
+            scan_fields_len -= 1;
+
+            let str_len = rmp::decode::read_str_len(&mut scan_cur)? as usize;
+            let key_start = scan_cur.position() as usize;
+            let key_end = key_start + str_len;
+            scan_cur.set_position(key_end as u64);
+
+            let bin_len = rmp::decode::read_bin_len(&mut scan_cur)? as usize;
+            let value_start = scan_cur.position() as usize;
+            let value_end = value_start + bin_len;
+            scan_cur.set_position(value_end as u64);
+
+            if &buf[key_start..key_end] == key_bytes {
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Ok(false);
+        }
+
         let mut cur = Cursor::new(buf);
 
         let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
         let mut keys = Vec::with_capacity(fields_len);
         let mut values = Vec::with_capacity(fields_len);
-        let mut found = false;
 
         while fields_len > 0 {
             fields_len -= 1;
@@ -211,17 +237,12 @@ impl InlineData {
             cur.set_position(end as u64);
 
             if field_buff.as_slice() == key_bytes {
-                found = true;
                 continue;
             }
 
             let find_key = String::from_utf8(field_buff)?;
             keys.push(find_key);
             values.push(buf[start..end].to_vec());
-        }
-
-        if !found {
-            return Ok(false);
         }
 
         if keys.is_empty() {
