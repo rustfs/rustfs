@@ -44,7 +44,6 @@ use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use rustfs_data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
 use rustfs_config::{
@@ -52,6 +51,7 @@ use rustfs_config::{
     DEFAULT_TRANSITION_WORKERS_CAP, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, ENV_TRANSITION_QUEUE_CAPACITY,
     ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
+use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, RestoreStatusOps,
     VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
