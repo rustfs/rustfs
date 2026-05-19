@@ -335,34 +335,17 @@ impl FileMeta {
             return self.set_idx(fidx, version);
         }
 
-        // append placeholder to find insert position
-        let placeholder = FileMetaShallowVersion {
-            header: FileMetaVersionHeader {
-                mod_time: None, // None sorts before any real mod_time
-                ..Default::default()
-            },
-            meta: Vec::new(),
-        };
-        self.versions.push(placeholder);
-
         let mod_time = version.get_mod_time();
         let new_shallow = FileMetaShallowVersion::try_from(version)?;
-
-        for (idx, exist) in self.versions.iter().enumerate() {
-            let ex_mt = exist.header.mod_time;
-            let insert_here = match (ex_mt, mod_time) {
-                (None, _) => true, // placeholder: always insert before
-                (Some(em), Some(nm)) => em <= nm,
-                (Some(_), None) => false,
-            };
-            if insert_here {
-                self.versions.insert(idx, new_shallow);
-                self.versions.pop(); // remove placeholder
-                return Ok(());
-            }
-        }
-        self.versions.pop(); // remove placeholder on fallback
-        Err(Error::other("add_version failed"))
+        let insert_pos = match mod_time {
+            Some(nm) => self.versions.partition_point(|exist| match exist.header.mod_time {
+                Some(em) => em > nm,
+                None => false,
+            }),
+            None => self.versions.partition_point(|exist| exist.header.mod_time.is_some()),
+        };
+        self.versions.insert(insert_pos, new_shallow);
+        Ok(())
 
         // if !ver.valid() {
         //     return Err(Error::other("attempted to add invalid version"));
