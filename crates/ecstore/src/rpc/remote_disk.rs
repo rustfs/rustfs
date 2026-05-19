@@ -129,7 +129,7 @@ impl RemoteDisk {
             health_check: opt.health_check && env_health_check,
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
-            data_transport: build_internode_data_transport_from_env()?,
+            data_transport: build_internode_data_transport_from_env(),
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
