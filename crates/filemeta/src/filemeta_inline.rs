@@ -23,6 +23,141 @@ pub struct InlineData(Vec<u8>);
 const INLINE_DATA_VER: u8 = 1;
 
 impl InlineData {
+    fn contains_key_by<F>(&self, mut should_remove: F) -> Result<bool>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let buf = self.after_version();
+        if buf.is_empty() {
+            return Ok(false);
+        }
+
+        let mut scan_cur = Cursor::new(buf);
+        let mut scan_fields_len = rmp::decode::read_map_len(&mut scan_cur)? as usize;
+
+        while scan_fields_len > 0 {
+            scan_fields_len -= 1;
+
+            let str_len = rmp::decode::read_str_len(&mut scan_cur)? as usize;
+            let key_start = scan_cur.position() as usize;
+            let key_end = key_start + str_len;
+            scan_cur.set_position(key_end as u64);
+
+            let bin_len = rmp::decode::read_bin_len(&mut scan_cur)? as usize;
+            let value_start = scan_cur.position() as usize;
+            let value_end = value_start + bin_len;
+            scan_cur.set_position(value_end as u64);
+
+            if should_remove(&buf[key_start..key_end]) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn remove_keys_by<F>(&mut self, mut should_remove: F) -> Result<bool>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let buf = self.after_version();
+        if buf.is_empty() {
+            return Ok(false);
+        }
+
+        let mut cur = Cursor::new(buf);
+        let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
+        let mut keys = Vec::with_capacity(fields_len);
+        let mut values = Vec::with_capacity(fields_len);
+        let mut found = false;
+
+        while fields_len > 0 {
+            fields_len -= 1;
+
+            let str_len = rmp::decode::read_str_len(&mut cur)? as usize;
+            let mut field_buf = vec![0u8; str_len];
+            cur.read_exact(&mut field_buf)?;
+
+            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
+            let start = cur.position() as usize;
+            let end = start + bin_len;
+            cur.set_position(end as u64);
+
+            if should_remove(field_buf.as_slice()) {
+                found = true;
+                continue;
+            }
+
+            keys.push(String::from_utf8(field_buf)?);
+            values.push(buf[start..end].to_vec());
+        }
+
+        if !found {
+            return Ok(false);
+        }
+
+        if keys.is_empty() {
+            self.0 = Vec::new();
+            return Ok(true);
+        }
+
+        self.serialize(keys, values)?;
+        Ok(true)
+    }
+
+    fn remove_two_keys_by_bytes(&mut self, first_key: &[u8], second_key: &[u8]) -> Result<bool> {
+        let buf = self.after_version();
+        if buf.is_empty() {
+            return Ok(false);
+        }
+
+        let same = first_key == second_key;
+        let mut cur = Cursor::new(buf);
+        let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
+        let mut keys = Vec::with_capacity(fields_len + 1);
+        let mut values = Vec::with_capacity(fields_len + 1);
+        let mut found = false;
+
+        while fields_len > 0 {
+            fields_len -= 1;
+
+            let str_len = rmp::decode::read_str_len(&mut cur)? as usize;
+            let mut field_buf = vec![0u8; str_len];
+            cur.read_exact(&mut field_buf)?;
+
+            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
+            let start = cur.position() as usize;
+            let end = start + bin_len;
+            cur.set_position(end as u64);
+
+            let should_remove = if same {
+                field_buf.as_slice() == first_key
+            } else {
+                field_buf.as_slice() == first_key || field_buf.as_slice() == second_key
+            };
+
+            if should_remove {
+                found = true;
+                continue;
+            }
+
+            keys.push(String::from_utf8(field_buf)?);
+            values.push(buf[start..end].to_vec());
+        }
+
+        if !found {
+            return Ok(false);
+        }
+
+        if keys.is_empty() {
+            self.0 = Vec::new();
+            return Ok(true);
+        }
+
+        self.serialize(keys, values)?;
+        Ok(true)
+    }
+
     pub fn new() -> Self {
         Self(Vec::new())
     }
@@ -183,195 +318,29 @@ impl InlineData {
     }
 
     pub fn remove_key(&mut self, key: &str) -> Result<bool> {
-        let buf = self.after_version();
-        if buf.is_empty() {
-            return Ok(false);
-        }
-
         let key_bytes = key.as_bytes();
-        let mut scan_cur = Cursor::new(buf);
-        let mut scan_fields_len = rmp::decode::read_map_len(&mut scan_cur)? as usize;
-        let mut found = false;
-
-        while scan_fields_len > 0 {
-            scan_fields_len -= 1;
-
-            let str_len = rmp::decode::read_str_len(&mut scan_cur)? as usize;
-            let key_start = scan_cur.position() as usize;
-            let key_end = key_start + str_len;
-            scan_cur.set_position(key_end as u64);
-
-            let bin_len = rmp::decode::read_bin_len(&mut scan_cur)? as usize;
-            let value_start = scan_cur.position() as usize;
-            let value_end = value_start + bin_len;
-            scan_cur.set_position(value_end as u64);
-
-            if &buf[key_start..key_end] == key_bytes {
-                found = true;
-                break;
-            }
-        }
-
-        if !found {
+        if !self.contains_key_by(|candidate| candidate == key_bytes)? {
             return Ok(false);
         }
-
-        let mut cur = Cursor::new(buf);
-
-        let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
-        let mut keys = Vec::with_capacity(fields_len);
-        let mut values = Vec::with_capacity(fields_len);
-
-        while fields_len > 0 {
-            fields_len -= 1;
-
-            let str_len = rmp::decode::read_str_len(&mut cur)?;
-
-            let mut field_buff = vec![0u8; str_len as usize];
-
-            cur.read_exact(&mut field_buff)?;
-
-            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
-            let start = cur.position() as usize;
-            let end = start + bin_len;
-            cur.set_position(end as u64);
-
-            if field_buff.as_slice() == key_bytes {
-                continue;
-            }
-
-            let find_key = String::from_utf8(field_buff)?;
-            keys.push(find_key);
-            values.push(buf[start..end].to_vec());
-        }
-
-        if keys.is_empty() {
-            self.0 = Vec::new();
-            return Ok(true);
-        }
-
-        self.serialize(keys, values)?;
-        Ok(true)
+        self.remove_keys_by(|candidate| candidate == key_bytes)
     }
 
     pub fn remove(&mut self, remove_keys: Vec<Uuid>) -> Result<bool> {
-        let buf = self.after_version();
-        if buf.is_empty() {
-            return Ok(false);
-        }
-        let mut cur = Cursor::new(buf);
-
-        let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
-        let mut keys = Vec::with_capacity(fields_len + 1);
-        let mut values = Vec::with_capacity(fields_len + 1);
-
-        let remove_key = |found_key: &str| {
-            for key in remove_keys.iter() {
-                if key.to_string().as_str() == found_key {
-                    return true;
-                }
-            }
-            false
-        };
-
-        let mut found = false;
-
-        while fields_len > 0 {
-            fields_len -= 1;
-
-            let str_len = rmp::decode::read_str_len(&mut cur)?;
-
-            let mut field_buff = vec![0u8; str_len as usize];
-
-            cur.read_exact(&mut field_buff)?;
-
-            let find_key = String::from_utf8(field_buff)?;
-
-            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
-            let start = cur.position() as usize;
-            let end = start + bin_len;
-            cur.set_position(end as u64);
-
-            let find_value = &buf[start..end];
-
-            if !remove_key(&find_key) {
-                values.push(find_value.to_vec());
-                keys.push(find_key);
-            } else {
-                found = true;
-            }
+        let mut encoded_keys = Vec::with_capacity(remove_keys.len());
+        for key in remove_keys {
+            let mut buf = Uuid::encode_buffer();
+            encoded_keys.push(key.hyphenated().encode_lower(&mut buf).to_string().into_bytes());
         }
 
-        if !found {
-            return Ok(false);
-        }
-
-        if keys.is_empty() {
-            self.0 = Vec::new();
-            return Ok(true);
-        }
-
-        self.serialize(keys, values)?;
-        Ok(true)
+        self.remove_keys_by(|candidate| encoded_keys.iter().any(|key| candidate == key.as_slice()))
     }
 
     pub fn remove_two(&mut self, first: Uuid, second: Uuid) -> Result<bool> {
-        let buf = self.after_version();
-        if buf.is_empty() {
-            return Ok(false);
-        }
-
         let mut first_buf = Uuid::encode_buffer();
         let mut second_buf = Uuid::encode_buffer();
         let first_key = first.hyphenated().encode_lower(&mut first_buf).as_bytes();
         let second_key = second.hyphenated().encode_lower(&mut second_buf).as_bytes();
-        let same = first_key == second_key;
-
-        let mut cur = Cursor::new(buf);
-        let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
-        let mut keys = Vec::with_capacity(fields_len + 1);
-        let mut values = Vec::with_capacity(fields_len + 1);
-        let mut found = false;
-
-        while fields_len > 0 {
-            fields_len -= 1;
-
-            let str_len = rmp::decode::read_str_len(&mut cur)?;
-            let mut field_buff = vec![0u8; str_len as usize];
-            cur.read_exact(&mut field_buff)?;
-            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
-            let start = cur.position() as usize;
-            let end = start + bin_len;
-            cur.set_position(end as u64);
-
-            let should_remove = if same {
-                field_buff.as_slice() == first_key
-            } else {
-                field_buff.as_slice() == first_key || field_buff.as_slice() == second_key
-            };
-
-            if should_remove {
-                found = true;
-                continue;
-            }
-
-            let find_key = String::from_utf8(field_buff)?;
-            let find_value = &buf[start..end];
-            values.push(find_value.to_vec());
-            keys.push(find_key);
-        }
-
-        if !found {
-            return Ok(false);
-        }
-
-        if keys.is_empty() {
-            self.0 = Vec::new();
-            return Ok(true);
-        }
-
-        self.serialize(keys, values)?;
-        Ok(true)
+        self.remove_two_keys_by_bytes(first_key, second_key)
     }
     fn serialize(&mut self, keys: Vec<String>, values: Vec<Vec<u8>>) -> Result<()> {
         assert_eq!(keys.len(), values.len(), "InlineData serialize: keys/values not match");
@@ -397,5 +366,46 @@ impl InlineData {
         self.0 = wr;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_key_miss_keeps_inline_data_unchanged() {
+        let mut data = InlineData::new();
+        data.replace("keep", b"value".to_vec()).expect("seed inline data");
+        let before = data.as_slice().to_vec();
+
+        let removed = data.remove_key("missing").expect("remove_key should succeed");
+
+        assert!(!removed);
+        assert_eq!(data.as_slice(), before.as_slice());
+    }
+
+    #[test]
+    fn remove_two_removes_only_matching_keys() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let keep = Uuid::new_v4();
+        let mut data = InlineData::new();
+        data.replace(first.hyphenated().to_string().as_str(), b"first".to_vec())
+            .expect("seed first key");
+        data.replace(second.hyphenated().to_string().as_str(), b"second".to_vec())
+            .expect("seed second key");
+        data.replace(keep.hyphenated().to_string().as_str(), b"keep".to_vec())
+            .expect("seed keep key");
+
+        let removed = data.remove_two(first, second).expect("remove_two should succeed");
+
+        assert!(removed);
+        assert_eq!(data.find(first.hyphenated().to_string().as_str()).expect("find first"), None);
+        assert_eq!(data.find(second.hyphenated().to_string().as_str()).expect("find second"), None);
+        assert_eq!(
+            data.find(keep.hyphenated().to_string().as_str()).expect("find keep"),
+            Some(b"keep".to_vec())
+        );
     }
 }
