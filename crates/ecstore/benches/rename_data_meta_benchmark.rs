@@ -90,12 +90,7 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
             b.iter_batched(
                 || prepared.clone(),
                 |mut xlmeta| {
-                    let fi = make_file_info(
-                        replace_version_id,
-                        Uuid::new_v4(),
-                        64 * 1024,
-                        base_time + Duration::from_millis(1),
-                    );
+                    let fi = make_file_info(replace_version_id, Uuid::new_v4(), 64 * 1024, base_time + Duration::from_millis(1));
                     xlmeta.add_version(fi).expect("add new version");
                     let out = xlmeta.marshal_msg().expect("marshal updated meta");
                     black_box(out);

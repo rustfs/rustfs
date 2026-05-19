@@ -1194,10 +1194,10 @@ impl LocalDisk {
             skip_parent = self.root.as_path();
         }
 
-        if let Some(parent) = path.as_ref().parent() {
-            if parent != skip_parent {
-                os::make_dir_all(parent, skip_parent).await?;
-            }
+        if let Some(parent) = path.as_ref().parent()
+            && parent != skip_parent
+        {
+            os::make_dir_all(parent, skip_parent).await?;
         }
 
         let f = super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?;

@@ -226,17 +226,17 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
 
         if let Some(parent) = dir_path.as_ref().parent() {
             // Fall back to creating the missing parent chain only when the direct mkdir proves it is required.
-            if let Err(parent_err) = super::fs::make_dir_all(parent).await {
-                if parent_err.kind() != io::ErrorKind::AlreadyExists {
-                    return Err(parent_err);
-                }
+            if let Err(parent_err) = super::fs::make_dir_all(parent).await
+                && parent_err.kind() != io::ErrorKind::AlreadyExists
+            {
+                return Err(parent_err);
             }
         }
 
-        if let Err(retry_err) = super::fs::mkdir(dir_path.as_ref()).await {
-            if retry_err.kind() != io::ErrorKind::AlreadyExists {
-                return Err(retry_err);
-            }
+        if let Err(retry_err) = super::fs::mkdir(dir_path.as_ref()).await
+            && retry_err.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(retry_err);
         }
     }
 
