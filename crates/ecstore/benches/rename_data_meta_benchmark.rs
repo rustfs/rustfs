@@ -73,7 +73,7 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
                 let search_version_id = Some(replace_version_id);
                 let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(search_version_id);
                 if let Some(old_data_dir) = has_old_data_dir {
-                    let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), old_data_dir]);
+                    let _ = xlmeta.data.remove_two(replace_version_id, old_data_dir);
                 }
                 let fi = make_file_info(replace_version_id, Uuid::new_v4(), 64 * 1024, base_time + Duration::from_millis(1));
                 xlmeta.add_version(fi).expect("add new version");
