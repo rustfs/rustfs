@@ -1631,7 +1631,7 @@ impl DefaultObjectUsecase {
         }
     }
 
-    #[instrument(level = "debug", skip(self, _fs, req))]
+    #[instrument(level = "info", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let start_time = std::time::Instant::now();
         let mut req = req;
@@ -2182,7 +2182,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(
-        level = "debug",
+        level = "info",
         skip(self, req),
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
@@ -3175,7 +3175,7 @@ impl DefaultObjectUsecase {
         result
     }
 
-    #[instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "info", skip(self, req))]
     pub async fn execute_delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
