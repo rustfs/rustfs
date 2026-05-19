@@ -19,7 +19,7 @@ use super::capacity_manager::{
 };
 use super::types::{CapacityDiskRef, CapacityScanResult, CapacityScanSummary};
 use futures::{StreamExt, stream};
-use rustfs_common::capacity_scope::CapacityScopeDisk;
+use crate::capacity_scope::CapacityScopeDisk;
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_dynamic_timeout, record_capacity_scan_disk, record_capacity_scan_mode, record_capacity_scan_sampling,
     record_capacity_stall_detected, record_capacity_symlink, record_capacity_timeout_fallback,
@@ -647,7 +647,7 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
 mod tests {
     use super::*;
     use crate::capacity_manager::{DataSource, HybridStrategyConfig, create_isolated_manager};
-    use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk};
+    use crate::capacity_scope::{CapacityScope, CapacityScopeDisk};
     #[cfg(unix)]
     use rustfs_config::ENV_CAPACITY_FOLLOW_SYMLINKS;
     use serial_test::serial;

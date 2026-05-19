@@ -68,7 +68,7 @@ use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
-use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
+use rustfs_object_capacity::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
 use rustfs_config::MI_B;
 use rustfs_filemeta::{

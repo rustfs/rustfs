@@ -13,7 +13,6 @@
 // limitations under the License.
 
 pub mod bucket_stats;
-pub mod capacity_scope;
 // pub mod error;
 pub mod globals;
 pub mod heal_channel;

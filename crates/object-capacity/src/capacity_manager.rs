@@ -17,7 +17,7 @@
 use super::scan::refresh_capacity_with_scope;
 use super::types::CapacityDiskRef;
 use futures::FutureExt;
-use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
+use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH,
     DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS,
@@ -1017,7 +1017,7 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
+    use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
     use rustfs_config::{
         ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_METRICS_INTERVAL,
         ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,

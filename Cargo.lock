@@ -9426,7 +9426,6 @@ dependencies = [
  "chrono",
  "metrics",
  "rmp-serde",
- "rustfs-data-usage",
  "rustfs-madmin",
  "s3s",
  "serde",
@@ -9564,6 +9563,7 @@ dependencies = [
  "rustfs-kms",
  "rustfs-lock",
  "rustfs-madmin",
+ "rustfs-object-capacity",
  "rustfs-policy",
  "rustfs-protos",
  "rustfs-rio",
@@ -9884,7 +9884,6 @@ version = "1.0.0-beta.3"
 dependencies = [
  "criterion",
  "futures",
- "rustfs-common",
  "rustfs-config",
  "rustfs-io-metrics",
  "rustfs-utils",
