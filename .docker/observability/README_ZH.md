@@ -90,6 +90,50 @@ docker compose down -v
 -   **Grafana**: 仪表盘和数据源从 `grafana/` 目录预置。
 -   **Collector**: 编辑 `otel-collector-config.yaml` 以修改管道、处理器或导出器。
 
+### 验证 RustFS Trace
+
+当 RustFS 将 `RUSTFS_OBS_ENDPOINT` 指向这套技术栈时，应将该值视为
+OTLP/HTTP 的基础 URL，例如：
+
+```bash
+export RUSTFS_OBS_ENDPOINT=http://host.docker.internal:4318
+```
+
+RustFS 会自动在该基础 URL 后补全：
+
+- `/v1/traces`
+- `/v1/metrics`
+- `/v1/logs`
+
+需要注意：
+
+- 启动阶段通常会先看到日志和指标，因此“先有日志/指标、后有 trace”是正常现象。
+- 可见的 trace 数据通常依赖启动后的真实 HTTP/S3/gRPC 请求流量，因为请求路径上的 span 是按需创建的。
+- `RUSTFS_OBS_LOGGER_LEVEL=info` 会保留顶层请求 span，但会过滤掉很多 `debug` 级别的嵌套 span。
+  如果 Tempo 或 Jaeger 中的 trace 看起来很稀疏，建议先改成 `RUSTFS_OBS_LOGGER_LEVEL=debug`，再判断是否是 collector 或 Tempo 问题。
+
+最小验证流程：
+
+```bash
+# 1. 启动本目录下的可观测性技术栈。
+docker compose up -d
+
+# 2. 以 OTLP/HTTP 导出方式启动 RustFS，并提高 span 可见性。
+export RUSTFS_OBS_ENDPOINT=http://host.docker.internal:4318
+export RUSTFS_OBS_LOGGER_LEVEL=debug
+
+# 3. 产生真实请求流量。
+curl -I http://127.0.0.1:9000/health
+curl -I http://127.0.0.1:9000/health/ready
+
+# 4. 到 Grafana 或 Jaeger 中检查。
+# Grafana: http://localhost:3000
+# Jaeger:  http://localhost:16686
+```
+
+如果日志和指标已经正常，但 trace 仍然稀疏，最常见的原因通常是
+“还没有真实请求流量”或“`info` 级别过滤了嵌套 span”，而不是 OTLP 路由失败。
+
 ## 故障排除
 
 -   **服务健康**: 使用 `docker compose ps` 检查服务健康状况。

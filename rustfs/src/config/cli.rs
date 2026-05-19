@@ -196,7 +196,10 @@ pub struct ServerOpts {
     )]
     pub console_address: String,
 
-    /// Observability endpoint for trace, metrics and logs,only support grpc mode.
+    /// Root OTLP endpoint for traces, metrics, and logs.
+    /// For the current observability pipeline this should be an OTLP/HTTP base
+    /// URL such as `http://otel-collector:4318` or
+    /// `http://host.docker.internal:4318`.
     #[arg(
         long,
         default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(),

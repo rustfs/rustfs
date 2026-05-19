@@ -312,6 +312,77 @@ pub struct FileMetaVersion {
 }
 
 impl FileMetaVersion {
+    fn decode_data_dir_from_v2_object(buf: &[u8]) -> Result<Option<Uuid>> {
+        let mut cur = std::io::Cursor::new(buf);
+        let mut fields = rmp::decode::read_map_len(&mut cur)?;
+        let mut version_type = VersionType::Invalid;
+
+        while fields > 0 {
+            fields -= 1;
+
+            let key_len = rmp::decode::read_str_len(&mut cur)? as usize;
+            let mut key_buf = vec![0u8; key_len];
+            cur.read_exact(&mut key_buf)?;
+            let key = String::from_utf8(key_buf)?;
+
+            match key.as_str() {
+                "Type" => {
+                    let v: i64 = rmp::decode::read_int(&mut cur)?;
+                    version_type = VersionType::from_u8(v as u8);
+                }
+                "V2Obj" => {
+                    if version_type != VersionType::Object {
+                        skip_msgp_value(&mut cur)?;
+                        continue;
+                    }
+
+                    let mut first = [0u8; 1];
+                    cur.read_exact(&mut first)?;
+                    if first[0] == 0xc0 {
+                        return Ok(None);
+                    }
+
+                    let mut prepend = PrependByteReader {
+                        byte: Some(first[0]),
+                        inner: &mut cur,
+                    };
+                    let mut obj_fields = rmp::decode::read_map_len(&mut prepend)?;
+                    let mut data_dir: Option<Uuid> = None;
+
+                    while obj_fields > 0 {
+                        obj_fields -= 1;
+
+                        let obj_key_len = rmp::decode::read_str_len(&mut prepend)? as usize;
+                        let mut obj_key_buf = vec![0u8; obj_key_len];
+                        prepend.read_exact(&mut obj_key_buf)?;
+                        let obj_key = String::from_utf8(obj_key_buf)?;
+
+                        if obj_key == "DDir" {
+                            let bin_len = rmp::decode::read_bin_len(&mut prepend)? as usize;
+                            if bin_len != 16 {
+                                return Err(Error::other(format!("DDir must be 16 bytes, got {bin_len}")));
+                            }
+                            let mut raw = [0u8; 16];
+                            prepend.read_exact(&mut raw)?;
+                            let id = Uuid::from_bytes(raw);
+                            data_dir = if id.is_nil() { None } else { Some(id) };
+                            break;
+                        }
+
+                        skip_msgp_value(&mut prepend)?;
+                    }
+
+                    return Ok(data_dir);
+                }
+                _ => {
+                    skip_msgp_value(&mut cur)?;
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     pub fn valid(&self) -> bool {
         if !self.version_type.valid() {
             return false;
@@ -367,6 +438,9 @@ impl FileMetaVersion {
 
     // decode_data_dir_from_meta reads data_dir from meta TODO: directly parse only data_dir from meta buf, msg.skip
     pub fn decode_data_dir_from_meta(buf: &[u8]) -> Result<Option<Uuid>> {
+        if let Ok(data_dir) = Self::decode_data_dir_from_v2_object(buf) {
+            return Ok(data_dir);
+        }
         Ok(Self::try_from(buf)?.get_data_dir())
     }
 
@@ -3212,5 +3286,32 @@ mod tests {
         assert_eq!(fi.version_id, None);
         assert_eq!(fi.mod_time, Some(sample_mod_time()));
         assert_eq!(fi.metadata.get("x-rustfs-test").map(String::as_str), Some("gone"));
+    }
+
+    #[test]
+    fn decode_data_dir_from_meta_extracts_v2_object_fast_path() {
+        let data_dir = Uuid::new_v4();
+        let version = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(MetaObject {
+                version_id: Some(Uuid::new_v4()),
+                data_dir: Some(data_dir),
+                erasure_algorithm: ErasureAlgo::ReedSolomon,
+                erasure_m: 2,
+                erasure_n: 4,
+                erasure_block_size: 1024 * 1024,
+                erasure_index: 1,
+                erasure_dist: vec![1, 2, 3, 4, 5, 6],
+                bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+                size: 64 * 1024,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let encoded = version.marshal_msg().expect("marshal");
+        let decoded = FileMetaVersion::decode_data_dir_from_meta(&encoded).expect("decode data_dir");
+        assert_eq!(decoded, Some(data_dir));
     }
 }
