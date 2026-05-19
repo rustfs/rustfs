@@ -56,6 +56,20 @@ runs:
           libssl-dev \
           protobuf-compiler
 
+    - name: Install protoc (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew update
+        brew install protobuf
+
+    - name: Install protoc (Windows)
+      if: runner.os == 'Windows'
+      uses: arduino/setup-protoc@v3
+      with:
+        version: "29.3"
+        repo-token: ${{ github.token }}
+
     - name: Install flatc
       uses: Nugine/setup-flatc@v1
       with:
