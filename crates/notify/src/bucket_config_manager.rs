@@ -17,7 +17,7 @@ use crate::{
     notification_system_subscriber::NotificationSystemSubscriberView, notifier::EventNotifier, rule_engine::NotifyRuleEngine,
     rules::ParseConfigError,
 };
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -91,7 +91,7 @@ mod tests {
         BucketNotificationConfig, integration::NotificationMetrics,
         notification_system_subscriber::NotificationSystemSubscriberView, notifier::EventNotifier, rule_engine::NotifyRuleEngine,
     };
-    use rustfs_s3_common::EventName;
+    use rustfs_s3_types::EventName;
     use rustfs_targets::arn::TargetID;
     use std::sync::Arc;
 

@@ -86,7 +86,7 @@ use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
-use rustfs_s3_common::S3Operation;
+use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::{
     object_store::bytes_stream,
     query::{Context, Query},
@@ -1625,9 +1625,9 @@ impl DefaultObjectUsecase {
 
     fn put_object_execution_context(req: &S3Request<PutObjectInput>) -> (EventName, QuotaOperation, &'static str) {
         if req.extensions.get::<PostObjectRequestMarker>().is_some() {
-            (EventName::ObjectCreatedPost, QuotaOperation::PostObject, "POST")
+            (put_event_name_for_post_object(true), QuotaOperation::PostObject, "POST")
         } else {
-            (EventName::ObjectCreatedPut, QuotaOperation::PutObject, "PUT")
+            (put_event_name_for_post_object(false), QuotaOperation::PutObject, "PUT")
         }
     }
 
@@ -3141,11 +3141,7 @@ impl DefaultObjectUsecase {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
-                    let event_name = if dobj.delete_marker {
-                        EventName::ObjectRemovedDeleteMarkerCreated
-                    } else {
-                        EventName::ObjectRemovedDelete
-                    };
+                    let event_name = delete_event_name_for_marker(dobj.delete_marker);
                     let event_args = EventArgsBuilder::new(
                         event_name,
                         bucket.clone(),
@@ -3310,7 +3306,7 @@ impl DefaultObjectUsecase {
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
             helper = helper
-                .event_name(EventName::ObjectRemovedDelete)
+                .event_name(delete_event_name_for_marker(false))
                 .object(ObjectInfo {
                     name: key.clone(),
                     bucket: bucket.clone(),
@@ -3378,11 +3374,7 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let event_name = if delete_marker {
-            EventName::ObjectRemovedDeleteMarkerCreated
-        } else {
-            EventName::ObjectRemovedDelete
-        };
+        let event_name = delete_event_name_for_marker(delete_marker);
 
         helper = helper.event_name(event_name);
         helper = helper
@@ -4341,7 +4333,7 @@ impl DefaultObjectUsecase {
             };
 
             let event_args = rustfs_notify::EventArgs {
-                event_name: EventName::ObjectCreatedPut,
+                event_name: put_event_name_for_post_object(false),
                 bucket_name: bucket.clone(),
                 object: obj_info.clone(),
                 req_params: req_params.clone(),

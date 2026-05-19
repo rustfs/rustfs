@@ -35,10 +35,10 @@ use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use bytes::Bytes;
 use futures::lock::Mutex;
 use metrics::counter;
-use rustfs_common::internode_metrics::{
+use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, global_internode_metrics,
 };
-use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{

@@ -68,7 +68,6 @@ use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
-use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
@@ -80,8 +79,11 @@ use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_lock::local_lock::LocalLock;
 use rustfs_lock::{FastLockGuard, LockManager, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use rustfs_object_capacity::capacity_scope::{
+    CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
+};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
@@ -97,7 +99,6 @@ use rustfs_utils::{
     crypto::hex,
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
-use rustfs_workers::workers::Workers;
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::{Digest, Sha256};
 use std::hash::Hash;

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use rustfs_common::internode_metrics::{
+use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, global_internode_metrics,
 };
 use serde::de::DeserializeOwned;

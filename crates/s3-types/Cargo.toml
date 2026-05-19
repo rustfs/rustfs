@@ -13,22 +13,21 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-s3-common"
+name = "rustfs-s3-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Common S3 definitions and metrics for RustFS."
-keywords = ["s3", "common", "rustfs"]
+description = "S3 event type definitions for RustFS."
+keywords = ["s3", "event", "types", "rustfs"]
 categories = ["data-structures"]
 
 [lints]
 workspace = true
 
 [dependencies]
-metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

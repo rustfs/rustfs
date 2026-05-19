@@ -18,15 +18,15 @@ use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
-use rustfs_common::internode_metrics::{
-    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
-    global_internode_metrics,
-};
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::disk::{DiskAPI, WalkDirOptions};
 use rustfs_ecstore::rpc::verify_rpc_signature;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::find_local_disk_by_ref;
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
+    global_internode_metrics,
+};
 use rustfs_utils::net::bytes_stream;
 use s3s::Body;
 use s3s::dto::StreamingBlob;
