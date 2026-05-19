@@ -199,6 +199,14 @@ fn calculate_usage_percent(usage: usize, capacity: usize) -> f32 {
     }
 }
 
+fn state_from_high_watermark(in_high_watermark: bool, high_state: BackpressureState) -> BackpressureState {
+    if in_high_watermark {
+        high_state
+    } else {
+        BackpressureState::Normal
+    }
+}
+
 fn classify_watermark_state(usage: usize, high: usize, low: usize, currently_high: bool) -> BackpressureState {
     if usage >= high {
         BackpressureState::HighWatermark
@@ -295,16 +303,12 @@ impl BackpressurePipe {
 
     /// Get current backpressure state.
     pub fn state(&self) -> BackpressureState {
-        if self.state.load(Ordering::Relaxed) {
-            BackpressureState::BackpressureApplied
-        } else {
-            BackpressureState::Normal
-        }
+        state_from_high_watermark(self.state.load(Ordering::Relaxed), BackpressureState::BackpressureApplied)
     }
 
     /// Get current buffer usage snapshot.
     pub fn snapshot(&self) -> BackpressureSnapshot {
-        let buffer_used = self.buffer_usage.load(Ordering::Relaxed);
+        let buffer_used = self.usage();
         let usage_percent = calculate_usage_percent(buffer_used, self.config.buffer_size);
 
         BackpressureSnapshot {
@@ -319,7 +323,10 @@ impl BackpressurePipe {
     pub fn meta(&self) -> BackpressurePipeMeta {
         BackpressurePipeMeta {
             buffer_capacity: self.config.buffer_size,
-            state: self.state(),
+            state: state_from_high_watermark(
+                self.state.load(Ordering::Relaxed),
+                BackpressureState::BackpressureApplied,
+            ),
             age: self.age(),
         }
     }
@@ -327,6 +334,11 @@ impl BackpressurePipe {
     /// Get the age of this pipe.
     pub fn age(&self) -> Duration {
         self.created_at.elapsed()
+    }
+
+    /// Get current buffer usage.
+    pub fn usage(&self) -> usize {
+        self.buffer_usage.load(Ordering::Relaxed)
     }
 
     /// Record bytes written (call after successful write).
@@ -447,11 +459,7 @@ impl BackpressureMonitor {
 
     /// Get current state.
     pub fn state(&self) -> BackpressureState {
-        if self.in_high_watermark.load(Ordering::Relaxed) {
-            BackpressureState::HighWatermark
-        } else {
-            BackpressureState::Normal
-        }
+        state_from_high_watermark(self.in_high_watermark.load(Ordering::Relaxed), BackpressureState::HighWatermark)
     }
 
     /// Get current buffer usage.
@@ -467,10 +475,14 @@ impl BackpressureMonitor {
 
     /// Get a compact metadata snapshot for the monitor.
     pub fn meta(&self) -> BackpressureMonitorMeta {
+        let usage = self.buffer_usage.load(Ordering::Relaxed);
         BackpressureMonitorMeta {
             buffer_capacity: self.config.buffer_size,
-            usage_percent: self.usage_percent(),
-            state: self.state(),
+            usage_percent: calculate_usage_percent(usage, self.config.buffer_size),
+            state: state_from_high_watermark(
+                self.in_high_watermark.load(Ordering::Relaxed),
+                BackpressureState::HighWatermark,
+            ),
         }
     }
 
