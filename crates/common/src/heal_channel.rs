@@ -379,7 +379,12 @@ fn heal_response_sender() -> &'static HealResponseSender {
 
 /// Publish a heal response to subscribers.
 pub fn publish_heal_response(response: HealChannelResponse) -> Result<(), broadcast::error::SendError<HealChannelResponse>> {
-    heal_response_sender().send(response).map(|_| ())
+    let sender = heal_response_sender();
+    if sender.receiver_count() == 0 {
+        return Ok(());
+    }
+
+    sender.send(response).map(|_| ())
 }
 
 /// Subscribe to heal responses.
@@ -626,5 +631,12 @@ mod tests {
         let received = receiver.recv().await.expect("should receive heal response");
         assert_eq!(received.request_id, response.request_id);
         assert!(received.success);
+    }
+
+    #[tokio::test]
+    async fn heal_response_broadcast_without_subscribers_is_ignored() {
+        let response = create_heal_response("req-no-subscriber".to_string(), true, None, None);
+
+        publish_heal_response(response).expect("publish without subscribers should be ignored");
     }
 }
