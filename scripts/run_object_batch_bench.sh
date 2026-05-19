@@ -74,6 +74,34 @@ require_cmd() {
   fi
 }
 
+print_dry_run_command() {
+  local redact_next=false
+  local arg
+
+  printf '[DRY-RUN]'
+  for arg in "$@"; do
+    if [[ "${redact_next}" == "true" ]]; then
+      printf ' %q' "REDACTED"
+      redact_next=false
+      continue
+    fi
+
+    case "${arg}" in
+      --access-key|--secret-key)
+        printf ' %q' "${arg}"
+        redact_next=true
+        ;;
+      -accessKey=*|-secretKey=*)
+        printf ' %q' "${arg%%=*}=REDACTED"
+        ;;
+      *)
+        printf ' %q' "${arg}"
+        ;;
+    esac
+  done
+  printf '\n'
+}
+
 normalize_warp_host() {
   local raw="$1"
   raw="${raw#http://}"
@@ -200,8 +228,7 @@ run_one() {
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-      printf '[DRY-RUN] %q ' "${cmd[@]}"
-      printf '\n'
+      print_dry_run_command "${cmd[@]}"
       echo "size=$size tool=$TOOL dry_run" > "$log_file"
     else
       if ! "${cmd[@]}" 2>&1 | tee "$log_file"; then
@@ -228,8 +255,7 @@ run_one() {
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-      printf '[DRY-RUN] %q ' "${cmd[@]}"
-      printf '\n'
+      print_dry_run_command "${cmd[@]}"
       echo "size=$size tool=$TOOL dry_run" > "$log_file"
     else
       if ! "${cmd[@]}" 2>&1 | tee "$log_file"; then
@@ -251,10 +277,12 @@ main() {
   parse_args "$@"
   validate_args
   require_cmd rg
-  if [[ "$TOOL" == "warp" ]]; then
-    require_cmd "$WARP_BIN"
-  else
-    require_cmd "$S3BENCH_BIN"
+  if [[ "$DRY_RUN" != "true" ]]; then
+    if [[ "$TOOL" == "warp" ]]; then
+      require_cmd "$WARP_BIN"
+    else
+      require_cmd "$S3BENCH_BIN"
+    fi
   fi
 
   setup_output
