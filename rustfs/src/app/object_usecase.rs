@@ -3306,7 +3306,7 @@ impl DefaultObjectUsecase {
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
             helper = helper
-                .event_name(EventName::ObjectRemovedDelete)
+                .event_name(delete_event_name_for_marker(false))
                 .object(ObjectInfo {
                     name: key.clone(),
                     bucket: bucket.clone(),
@@ -4333,7 +4333,7 @@ impl DefaultObjectUsecase {
             };
 
             let event_args = rustfs_notify::EventArgs {
-                event_name: EventName::ObjectCreatedPut,
+                event_name: put_event_name_for_post_object(false),
                 bucket_name: bucket.clone(),
                 object: obj_info.clone(),
                 req_params: req_params.clone(),

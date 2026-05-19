@@ -258,6 +258,19 @@ pub fn put_event_name_for_post_object(is_post_object: bool) -> EventName {
     }
 }
 
+/// Returns `true` when the event is one of object-remove notification variants
+/// that should omit size/etag metadata.
+#[inline]
+pub fn is_object_removed_event(event_name: EventName) -> bool {
+    matches!(event_name, EventName::ObjectRemovedDelete | EventName::ObjectRemovedDeleteMarkerCreated)
+}
+
+/// Returns the event mask that matches both PUT and POST object-created events.
+#[inline]
+pub fn put_object_created_event_mask() -> u64 {
+    EventName::ObjectCreatedPut.mask() | EventName::ObjectCreatedPost.mask()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +337,20 @@ mod tests {
     fn test_put_event_name_for_post_object() {
         assert_eq!(put_event_name_for_post_object(true), EventName::ObjectCreatedPost);
         assert_eq!(put_event_name_for_post_object(false), EventName::ObjectCreatedPut);
+    }
+
+    #[test]
+    fn test_is_object_removed_event() {
+        assert!(is_object_removed_event(EventName::ObjectRemovedDelete));
+        assert!(is_object_removed_event(EventName::ObjectRemovedDeleteMarkerCreated));
+        assert!(!is_object_removed_event(EventName::ObjectCreatedPut));
+    }
+
+    #[test]
+    fn test_put_object_created_event_mask() {
+        let mask = put_object_created_event_mask();
+        assert_ne!(mask & EventName::ObjectCreatedPut.mask(), 0);
+        assert_ne!(mask & EventName::ObjectCreatedPost.mask(), 0);
+        assert_eq!(mask & EventName::ObjectRemovedDelete.mask(), 0);
     }
 }

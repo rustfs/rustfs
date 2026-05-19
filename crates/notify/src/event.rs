@@ -14,6 +14,7 @@
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use hashbrown::HashMap;
+use rustfs_s3_ops::is_object_removed_event;
 use rustfs_s3_types::{EventName, event_schema_version};
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
@@ -237,10 +238,7 @@ impl Event {
             },
         };
 
-        let is_removed_event = matches!(
-            args.event_name,
-            EventName::ObjectRemovedDelete | EventName::ObjectRemovedDeleteMarkerCreated
-        );
+        let is_removed_event = is_object_removed_event(args.event_name);
 
         if !is_removed_event {
             s3_metadata.object.size = Some(args.object.size);

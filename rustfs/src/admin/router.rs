@@ -3803,7 +3803,7 @@ mod tests {
     fn event_matches_listen_notification_respects_bucket_event_and_object_filters() {
         let filter = ListenNotificationFilter {
             bucket: Some("demo-bucket".to_string()),
-            event_mask: EventName::ObjectCreatedPut.mask() | EventName::ObjectCreatedPost.mask(),
+            event_mask: rustfs_s3_ops::put_object_created_event_mask(),
             prefix: Some("logs/".to_string()),
             suffix: Some(".json".to_string()),
         };
