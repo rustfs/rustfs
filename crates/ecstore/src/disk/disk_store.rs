@@ -44,6 +44,12 @@ use uuid::Uuid;
 const DISK_HEALTH_OK: u32 = 0;
 const DISK_HEALTH_FAULTY: u32 = 1;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeoutHealthAction {
+    MarkFailure,
+    IgnoreFailure,
+}
+
 pub const ENV_RUSTFS_DRIVE_ACTIVE_MONITORING: &str = "RUSTFS_DRIVE_ACTIVE_MONITORING";
 pub const DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING: bool = true;
 pub const SKIP_IF_SUCCESS_BEFORE: Duration = Duration::from_secs(5);
@@ -808,6 +814,21 @@ impl LocalDiskWrapper {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.track_disk_health_with_op_and_timeout_action(op, operation, timeout_duration, TimeoutHealthAction::MarkFailure)
+            .await
+    }
+
+    async fn track_disk_health_with_op_and_timeout_action<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+        timeout_health_action: TimeoutHealthAction,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         // Check if disk is faulty
         if self.health.is_faulty() {
             warn!("local disk {} health is faulty, returning error", self.to_string());
@@ -848,7 +869,9 @@ impl LocalDiskWrapper {
             Err(_) => {
                 // Timeout occurred, mark disk as potentially faulty and decrement waiting counter
                 self.health.decrement_waiting();
-                if self.health.mark_failure(&self.endpoint(), "operation_timeout") {
+                if timeout_health_action == TimeoutHealthAction::MarkFailure
+                    && self.health.mark_failure(&self.endpoint(), "operation_timeout")
+                {
                     self.spawn_recovery_monitor_if_needed();
                 }
                 counter!(
@@ -996,8 +1019,13 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
-        self.track_disk_health_with_op("walk_dir", || async { self.disk.walk_dir(opts, wr).await }, get_drive_walkdir_timeout())
-            .await
+        self.track_disk_health_with_op_and_timeout_action(
+            "walk_dir",
+            || async { self.disk.walk_dir(opts, wr).await },
+            get_drive_walkdir_timeout(),
+            TimeoutHealthAction::IgnoreFailure,
+        )
+        .await
     }
 
     async fn delete_version(
@@ -1203,6 +1231,28 @@ mod tests {
     use super::*;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::health_state::RuntimeDriveHealthState;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::AsyncWrite;
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn drive_metadata_timeout_uses_default_when_unset() {
@@ -1321,6 +1371,97 @@ mod tests {
         assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
         assert!(!health.is_faulty());
         assert!(health.offline_duration().is_none());
+    }
+
+    #[tokio::test]
+    async fn ignored_timeout_does_not_mark_drive_failure() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+
+        let result = wrapper
+            .track_disk_health_with_op_and_timeout_action(
+                "walk_dir",
+                || async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(())
+                },
+                Duration::from_millis(1),
+                TimeoutHealthAction::IgnoreFailure,
+            )
+            .await;
+
+        assert_eq!(result.expect_err("operation should time out"), DiskError::Timeout);
+        assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+        assert!(!wrapper.health.is_faulty());
+    }
+
+    #[tokio::test]
+    async fn walk_dir_writer_backpressure_timeout_does_not_mark_drive_failure() {
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+            let wrapper = LocalDiskWrapper::new(disk, false);
+            let bucket = "test-bucket";
+            let object = "test-object";
+
+            wrapper.make_volume(bucket).await.expect("bucket should be created");
+
+            let mut file_info = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+            file_info.volume = bucket.to_string();
+            file_info.name = object.to_string();
+            file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+            file_info.erasure.index = 1;
+
+            wrapper
+                .write_metadata("", bucket, object, file_info)
+                .await
+                .expect("object metadata should be written");
+
+            let mut writer = PendingWriter;
+            let result = wrapper
+                .walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        ..Default::default()
+                    },
+                    &mut writer,
+                )
+                .await;
+
+            assert_eq!(result.expect_err("walk_dir should time out"), DiskError::Timeout);
+            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!wrapper.health.is_faulty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn default_timeout_marks_drive_failure() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+
+        let result = wrapper
+            .track_disk_health_with_op(
+                "read_metadata",
+                || async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(())
+                },
+                Duration::from_millis(1),
+            )
+            .await;
+
+        assert_eq!(result.expect_err("operation should time out"), DiskError::Timeout);
+        assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Suspect);
     }
 
     #[test]

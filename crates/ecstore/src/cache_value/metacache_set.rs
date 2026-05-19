@@ -19,9 +19,10 @@ use futures::future::join_all;
 use metrics::counter;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
 use std::{
+    collections::VecDeque,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::io::AsyncRead;
@@ -112,9 +113,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
-    let fds = opts.fallback_disks.iter().flatten().cloned().collect::<Vec<_>>();
+    let fds = opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>();
     let max_disk_failures = opts.disks.len().saturating_sub(opts.min_disks);
-    let producer_errs = Arc::new(Mutex::new(vec![None; opts.disks.len()]));
+    let producer_errs: Arc<[OnceLock<DiskError>]> = (0..opts.disks.len()).map(|_| OnceLock::new()).collect::<Vec<_>>().into();
 
     let cancel_rx = CancellationToken::new();
 
@@ -137,14 +138,14 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         return Ok(());
                     }
                     TestReaderBehavior::ProducerError(err) => {
-                        producer_errs_clone.lock().expect("producer error mutex poisoned")[disk_idx] = Some(err.clone());
+                        record_producer_error(&producer_errs_clone, disk_idx, &err);
                         return Err(err);
                     }
                     TestReaderBehavior::PartialThenTimeout(entries) => {
                         let mut wr = wr;
                         let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
                         let err = DiskError::Timeout;
-                        producer_errs_clone.lock().expect("producer error mutex poisoned")[disk_idx] = Some(err.clone());
+                        record_producer_error(&producer_errs_clone, disk_idx, &err);
                         let _ = out.write(&entries).await;
                         drop(out);
                         return Err(err);
@@ -187,8 +188,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
             while need_fallback {
                 let mut disk_op = None;
-                while !fds_clone.is_empty() {
-                    let disk = fds_clone.remove(0);
+                while let Some(disk) = fds_clone.pop_front() {
                     if disk.is_online().await {
                         disk_op = Some(disk);
                         break;
@@ -198,7 +198,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 let Some(disk) = disk_op else {
                     warn!("list_path_raw: fallback disk is none");
                     let err = last_err.unwrap_or(DiskError::DiskNotFound);
-                    producer_errs_clone.lock().expect("producer error mutex poisoned")[disk_idx] = Some(err.clone());
+                    record_producer_error(&producer_errs_clone, disk_idx, &err);
                     return Err(err);
                 };
 
@@ -281,7 +281,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                             // info!("read entry disk: {}, name: {}", i, entry.name);
                             entry
                         } else {
-                            if let Some(err) = producer_errs.lock().expect("producer error mutex poisoned")[i].clone() {
+                            if let Some(err) = producer_error(&producer_errs, i) {
                                 has_err += 1;
                                 errs[i] = Some(err);
                                 continue;
@@ -293,7 +293,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         }
                     }
                     PeekOutcome::Error(err) => {
-                        if let Some(err) = producer_errs.lock().expect("producer error mutex poisoned")[i].clone() {
+                        if let Some(err) = producer_error(&producer_errs, i) {
                             has_err += 1;
                             errs[i] = Some(err);
                             continue;
@@ -510,10 +510,21 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     Ok(())
 }
 
+#[inline]
+fn record_producer_error(producer_errs: &[OnceLock<DiskError>], idx: usize, err: &DiskError) {
+    let _ = producer_errs[idx].set(err.clone());
+}
+
+#[inline]
+fn producer_error(producer_errs: &[OnceLock<DiskError>], idx: usize) -> Option<DiskError> {
+    producer_errs[idx].get().cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustfs_filemeta::MetacacheWriter;
+    use std::sync::Mutex;
 
     #[tokio::test]
     async fn list_path_raw_empty_disks_returns_read_quorum() {

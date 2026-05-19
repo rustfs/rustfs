@@ -21,8 +21,8 @@ services:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_ACCESS_KEY=rustfsadmin
-      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_ACCESS_KEY=rustfs-cluster-admin
+      - RUSTFS_SECRET_KEY=rustfs-cluster-secret
     platform: linux/amd64
     ports:
       - "9000:9000" # Map port 9001 of the host to port 9000 of the container
@@ -38,8 +38,8 @@ services:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_ACCESS_KEY=rustfsadmin
-      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_ACCESS_KEY=rustfs-cluster-admin
+      - RUSTFS_SECRET_KEY=rustfs-cluster-secret
     platform: linux/amd64
     ports:
       - "9001:9000" # Map port 9002 of the host to port 9000 of the container
@@ -55,8 +55,8 @@ services:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_ACCESS_KEY=rustfsadmin
-      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_ACCESS_KEY=rustfs-cluster-admin
+      - RUSTFS_SECRET_KEY=rustfs-cluster-secret
     platform: linux/amd64
     ports:
       - "9002:9000" # Map port 9003 of the host to port 9000 of the container
@@ -72,8 +72,8 @@ services:
       - RUSTFS_VOLUMES=http://node{0...3}:9000/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ENABLE=true
-      - RUSTFS_ACCESS_KEY=rustfsadmin
-      - RUSTFS_SECRET_KEY=rustfsadmin
+      - RUSTFS_ACCESS_KEY=rustfs-cluster-admin
+      - RUSTFS_SECRET_KEY=rustfs-cluster-secret
     platform: linux/amd64
     ports:
       - "9003:9000" # Map port 9004 of the host to port 9000 of the container

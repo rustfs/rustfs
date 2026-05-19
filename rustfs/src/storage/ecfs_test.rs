@@ -36,12 +36,12 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        CORSConfiguration, CORSRule, DefaultRetention, DeleteObjectTaggingInput, Delimiter, GetBucketAclInput, GetObjectAclInput,
-        GetObjectLegalHoldInput, GetObjectRetentionInput, GetObjectTaggingInput, LambdaFunctionConfiguration,
-        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
-        ObjectLockRetentionMode, ObjectLockRule, PutBucketAclInput, PutObjectAclInput, PutObjectLegalHoldInput,
-        PutObjectLockConfigurationInput, PutObjectRetentionInput, PutObjectTaggingInput, QueueConfiguration, Tag, Tagging,
-        TopicConfiguration,
+        CORSConfiguration, CORSRule, DefaultRetention, DeleteObjectTaggingInput, Delimiter, FilterRule, FilterRuleName,
+        GetBucketAclInput, GetObjectAclInput, GetObjectLegalHoldInput, GetObjectRetentionInput, GetObjectTaggingInput,
+        LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
+        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
+        PutBucketAclInput, PutObjectAclInput, PutObjectLegalHoldInput, PutObjectLockConfigurationInput, PutObjectRetentionInput,
+        PutObjectTaggingInput, QueueConfiguration, S3KeyFilter, Tag, Tagging, TopicConfiguration,
     };
     use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -1732,6 +1732,47 @@ mod tests {
 
         assert!(result.is_ok(), "Should succeed with valid ARN");
         assert_eq!(event_rules.len(), 1, "Should add one rule");
+    }
+
+    #[test]
+    fn test_process_queue_configurations_accepts_capitalized_filter_names() {
+        use rustfs_targets::arn::{ARN, TargetIDError};
+
+        let mut event_rules = Vec::new();
+        let valid_arn = "arn:rustfs:sqs:us-east-1:1:webhook";
+
+        let result = process_queue_configurations(
+            &mut event_rules,
+            Some(vec![QueueConfiguration {
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                queue_arn: valid_arn.to_string(),
+                filter: Some(NotificationConfigurationFilter {
+                    key: Some(S3KeyFilter {
+                        filter_rules: Some(vec![
+                            FilterRule {
+                                name: Some(FilterRuleName::from("Prefix".to_string())),
+                                value: Some("uploads/".to_string()),
+                            },
+                            FilterRule {
+                                name: Some(FilterRuleName::from("Suffix".to_string())),
+                                value: Some(".csv".to_string()),
+                            },
+                        ]),
+                    }),
+                }),
+                id: None,
+            }]),
+            |arn_str| {
+                ARN::parse(arn_str)
+                    .map(|arn| arn.target_id)
+                    .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
+            },
+        );
+
+        assert!(result.is_ok(), "capitalized filter names should be compatible");
+        assert_eq!(event_rules.len(), 1, "Should add one rule");
+        assert_eq!(event_rules[0].1, "uploads/");
+        assert_eq!(event_rules[0].2, ".csv");
     }
 
     // --- Object tag conditions for bucket policy (s3:ExistingObjectTag) ---

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::ecfs::FS;
-use crate::auth::{check_key_valid, get_condition_values_with_query, get_session_token};
+use crate::auth::{check_key_valid, get_condition_values_with_query_and_client_info, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
@@ -30,6 +30,7 @@ use rustfs_policy::policy::{
     Args, BucketPolicy, BucketPolicyArgs, bucket_policy_needs_existing_object_tag_for_args,
     bucket_policy_uses_existing_object_tag_conditions,
 };
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
@@ -334,8 +335,16 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
-        let mut conditions =
-            get_condition_values_with_query(&req.headers, cred, version_id.as_deref(), None, remote_addr, req.uri.query());
+        let client_info = req.extensions.get::<ClientInfo>();
+        let mut conditions = get_condition_values_with_query_and_client_info(
+            &req.headers,
+            cred,
+            version_id.as_deref(),
+            None,
+            remote_addr,
+            req.uri.query(),
+            client_info,
+        );
         merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
 
         let action_args = Args {
@@ -543,13 +552,15 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
     } else {
         let default_cred = rustfs_credentials::Credentials::default();
-        let mut conditions = get_condition_values_with_query(
+        let client_info = req.extensions.get::<ClientInfo>();
+        let mut conditions = get_condition_values_with_query_and_client_info(
             &req.headers,
             &default_cred,
             version_id.as_deref(),
             req.region.clone(),
             remote_addr,
             req.uri.query(),
+            client_info,
         );
         merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
 

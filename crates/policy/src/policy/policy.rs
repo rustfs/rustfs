@@ -364,31 +364,45 @@ pub mod default {
     use super::Policy;
 
     #[allow(clippy::incompatible_msrv)]
-    pub static DEFAULT_POLICIES: LazyLock<[(&'static str, Policy); 6]> = LazyLock::new(|| {
+    pub static DEFAULT_POLICIES: LazyLock<[(&'static str, Policy); 5]> = LazyLock::new(|| {
         [
             (
                 "readwrite",
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::AllActions));
-                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::S3Action(S3Action::AllActions));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Resource::S3("*".into()));
+                                hash_set
+                            }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -396,26 +410,40 @@ pub mod default {
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
-                            hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
-                            hash_set.insert(Action::S3Action(S3Action::GetBucketQuotaAction));
-                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
+                                hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
+                                hash_set.insert(Action::S3Action(S3Action::GetBucketQuotaAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Resource::S3("*".into()));
+                                hash_set
+                            }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -423,49 +451,38 @@ pub mod default {
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
-                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
-                },
-            ),
-            (
-                "writeonly",
-                Policy {
-                    id: "".into(),
-                    version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
-                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::S3Action(S3Action::PutObjectAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Resource::S3("*".into()));
+                                hash_set
+                            }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -473,31 +490,45 @@ pub mod default {
                 Policy {
                     id: "".into(),
                     version: DEFAULT_VERSION.into(),
-                    statements: vec![Statement {
-                        sid: "".into(),
-                        effect: Effect::Allow,
-                        actions: ActionSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Action::AdminAction(AdminAction::ProfilingAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::TraceAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::ConsoleLogAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::ServerInfoAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::TopLocksAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::HealthInfoAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::PrometheusAdminAction));
-                            hash_set.insert(Action::AdminAction(AdminAction::BandwidthMonitorAction));
-                            hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
-                            hash_set
-                        }),
-                        not_actions: ActionSet(Default::default()),
-                        resources: ResourceSet({
-                            let mut hash_set = HashSet::new();
-                            hash_set.insert(Resource::S3("*".into()));
-                            hash_set
-                        }),
-                        conditions: Functions::default(),
-                        ..Default::default()
-                    }],
+                    statements: vec![
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::AdminAction(AdminAction::ProfilingAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::TraceAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::ConsoleLogAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::ServerInfoAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::TopLocksAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::HealthInfoAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::PrometheusAdminAction));
+                                hash_set.insert(Action::AdminAction(AdminAction::BandwidthMonitorAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Resource::S3("*".into()));
+                                hash_set
+                            }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(Default::default()),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                    ],
                 },
             ),
             (
@@ -512,7 +543,6 @@ pub mod default {
                             actions: ActionSet({
                                 let mut hash_set = HashSet::new();
                                 hash_set.insert(Action::AdminAction(AdminAction::AllAdminActions));
-                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),
@@ -526,7 +556,6 @@ pub mod default {
                             actions: ActionSet({
                                 let mut hash_set = HashSet::new();
                                 hash_set.insert(Action::KmsAction(KmsAction::AllActions));
-                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),
@@ -540,7 +569,6 @@ pub mod default {
                             actions: ActionSet({
                                 let mut hash_set = HashSet::new();
                                 hash_set.insert(Action::S3Action(S3Action::AllActions));
-                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
                                 hash_set
                             }),
                             not_actions: ActionSet(Default::default()),
@@ -549,6 +577,19 @@ pub mod default {
                                 hash_set.insert(Resource::S3("*".into()));
                                 hash_set
                             }),
+                            conditions: Functions::default(),
+                            ..Default::default()
+                        },
+                        Statement {
+                            sid: "".into(),
+                            effect: Effect::Allow,
+                            actions: ActionSet({
+                                let mut hash_set = HashSet::new();
+                                hash_set.insert(Action::StsAction(StsAction::AssumeRoleAction));
+                                hash_set
+                            }),
+                            not_actions: ActionSet(Default::default()),
+                            resources: ResourceSet(HashSet::new()),
                             conditions: Functions::default(),
                             ..Default::default()
                         },
@@ -710,6 +751,23 @@ mod test {
 
         for (name, policy) in default::DEFAULT_POLICIES.iter() {
             assert!(policy.is_allowed(&args).await, "default policy {name} should allow sts:AssumeRole");
+        }
+    }
+
+    #[test]
+    fn test_default_policy_names_are_unique() {
+        let mut names = HashSet::new();
+        for (name, _) in default::DEFAULT_POLICIES.iter() {
+            assert!(names.insert(*name), "duplicate default policy name: {name}");
+        }
+    }
+
+    #[test]
+    fn test_default_policies_validate() {
+        for (name, policy) in default::DEFAULT_POLICIES.iter() {
+            policy
+                .validate()
+                .unwrap_or_else(|err| panic!("default policy {name} should validate: {err}"));
         }
     }
 
@@ -1441,6 +1499,166 @@ mod test {
         let result = Policy::parse_config(data.as_bytes());
         assert!(result.is_err(), "Statement with neither Resource nor NotResource should be invalid");
 
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonResource)),
+            "Error should be NonResource, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_admin_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:ServerInfo"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "Admin-only Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_sts_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["sts:AssumeRole"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "STS-only Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_kms_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "KMS-only Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_mixed_action_families_are_invalid_even_with_resource() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*", "sts:AssumeRole"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families should be rejected");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_mixed_action_families_are_invalid_even_without_resource() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*", "s3:GetObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families should be rejected even when Resource is missing");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_mixed_action_families_with_wildcard_variants_are_invalid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:*", "admin:*", "sts:AssumeRole"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Mixed action families with wildcard variants should be rejected");
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::MixedActionFamilies)),
+            "Error should be MixedActionFamilies, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_notaction_without_resource_remains_invalid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "NotAction": ["s3:DeleteObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "NotAction statement without Resource should remain invalid");
         assert!(
             matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonResource)),
             "Error should be NonResource, got: {:?}",
