@@ -504,9 +504,7 @@ impl ECStore {
 
         let mut next_marker: Option<String> = None;
         let mut next_version_idmarker: Option<String> = None;
-        if is_truncated
-            && let Some(last) = get_objects.last()
-        {
+        if is_truncated && let Some(last) = get_objects.last() {
             next_marker = Some(last.name.clone());
             // AWS S3 API returns "null" for non-versioned objects
             next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
