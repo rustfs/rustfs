@@ -52,6 +52,14 @@ Treat this file list as the default checklist for future release bumps. Only dro
 - Follow the same pattern for later beta releases unless the repository rule changes.
 - Update `rustfs.spec` release metadata and changelog entry.
 - Set `rustfs.spec` `Release` to the prerelease suffix without the base version, for example `beta.3` for `1.0.0-beta.3`.
+- `rustfs.spec` changelog must include date, git user name, git email, and target RustFS version in this format:
+- `* Thu May 20 2026 houseme <housemecn@gmail.com>`
+- `- Update RPM package to RustFS 1.0.0-beta.4`
+- Resolve identity from local git config before editing changelog:
+- `git config --get user.name`
+- `git config --get user.email`
+- Generate date in rpm changelog style (for example): `date '+%a %b %d %Y'`
+- Ensure the changelog version text matches the exact target version string for this release task.
 - Keep the release asset changes in a separate commit from the core Rust workspace version bump when the branch contains both.
 
 4. Stop and discuss before changing release policy
