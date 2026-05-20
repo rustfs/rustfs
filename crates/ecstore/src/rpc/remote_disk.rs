@@ -28,9 +28,7 @@ use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGu
 use crate::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
 };
-use crate::rpc::internode_data_transport::{
-    InternodeDataTransport, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest, build_internode_data_transport_from_env,
-};
+use crate::rpc::internode_data_transport::{InternodeDataTransport, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest};
 use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use bytes::Bytes;
 use futures::lock::Mutex;
@@ -111,7 +109,7 @@ pub struct RemoteDisk {
 }
 
 impl RemoteDisk {
-    pub async fn new(ep: &Endpoint, opt: &DiskOption) -> Result<Self> {
+    pub(crate) async fn new(ep: &Endpoint, opt: &DiskOption, data_transport: Arc<dyn InternodeDataTransport>) -> Result<Self> {
         let addr = if let Some(port) = ep.url.port() {
             format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), port)
         } else {
@@ -129,7 +127,7 @@ impl RemoteDisk {
             health_check: opt.health_check && env_health_check,
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
-            data_transport: build_internode_data_transport_from_env()?,
+            data_transport,
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
@@ -1673,8 +1671,8 @@ impl DiskAPI for RemoteDisk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::TcpHttpInternodeDataTransport;
     use rustfs_common::GLOBAL_CONN_MAP;
-    use rustfs_config::ENV_RUSTFS_INTERNODE_DATA_TRANSPORT;
     use std::sync::Once;
     use tokio::io::duplex;
     use tokio::net::TcpListener;
@@ -1695,13 +1693,6 @@ mod tests {
         });
     }
 
-    async fn new_remote_disk_with_default_transport(ep: &Endpoint, opt: &DiskOption) -> Result<RemoteDisk> {
-        temp_env::async_with_vars([(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, None::<&str>)], async {
-            RemoteDisk::new(ep, opt).await
-        })
-        .await
-    }
-
     #[tokio::test]
     async fn test_remote_disk_creation() {
         let url = url::Url::parse("http://example.com:9000/path").unwrap();
@@ -1718,7 +1709,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
 
         assert!(!remote_disk.is_local());
         assert_eq!(remote_disk.endpoint.url, url);
@@ -1726,55 +1719,6 @@ mod tests {
         assert_eq!(remote_disk.endpoint.set_idx, 1);
         assert_eq!(remote_disk.endpoint.disk_idx, 2);
         assert_eq!(remote_disk.host_name(), "example.com:9000");
-    }
-
-    #[tokio::test]
-    async fn test_remote_disk_creation_rejects_unknown_data_transport_backend() {
-        let url = url::Url::parse("http://example.com:9000/path").unwrap();
-        let endpoint = Endpoint {
-            url,
-            is_local: false,
-            pool_idx: 0,
-            set_idx: 1,
-            disk_idx: 2,
-        };
-        let disk_option = DiskOption {
-            cleanup: false,
-            health_check: false,
-        };
-
-        temp_env::async_with_vars([(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, Some("rdma"))], async {
-            let err = RemoteDisk::new(&endpoint, &disk_option)
-                .await
-                .expect_err("unknown backend should fail closed");
-            assert!(err.to_string().contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
-            assert!(err.to_string().contains("rdma"));
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_remote_disk_creation_accepts_tcp_alias_backend() {
-        let url = url::Url::parse("http://example.com:9000/path").unwrap();
-        let endpoint = Endpoint {
-            url,
-            is_local: false,
-            pool_idx: 0,
-            set_idx: 1,
-            disk_idx: 2,
-        };
-        let disk_option = DiskOption {
-            cleanup: false,
-            health_check: false,
-        };
-
-        temp_env::async_with_vars([(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, Some("tcp"))], async {
-            let remote_disk = RemoteDisk::new(&endpoint, &disk_option)
-                .await
-                .expect("tcp alias should be accepted");
-            assert_eq!(remote_disk.host_name(), "example.com:9000");
-        })
-        .await;
     }
 
     #[tokio::test]
@@ -1793,7 +1737,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
 
         // Test basic properties
         assert!(!remote_disk.is_local());
@@ -1825,7 +1771,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
         let path = remote_disk.path();
 
         // Remote disk path should be based on the URL path
@@ -1851,7 +1799,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
         assert!(remote_disk.is_online().await);
 
         drop(listener);
@@ -1882,7 +1832,9 @@ mod tests {
             health_check: true,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
         remote_disk.enable_health_check();
 
         // wait for health check connect timeout
@@ -1925,7 +1877,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
 
         // Initially, disk ID should be None
         let initial_id = remote_disk.get_disk_id().await.unwrap();
@@ -1960,7 +1914,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
         assert_eq!(remote_disk.disk_ref().await, endpoint.to_string());
 
         let disk_id = Uuid::new_v4();
@@ -1993,7 +1949,9 @@ mod tests {
                 health_check: false,
             };
 
-            let remote_disk = new_remote_disk_with_default_transport(&endpoint, &disk_option).await.unwrap();
+            let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+                .await
+                .unwrap();
 
             assert!(!remote_disk.is_local());
             assert_eq!(remote_disk.host_name(), expected_hostname);
@@ -2019,7 +1977,7 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(&valid_endpoint, &disk_option)
+        let remote_disk = RemoteDisk::new(&valid_endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
             .unwrap();
         let location = remote_disk.get_disk_location();
@@ -2037,7 +1995,7 @@ mod tests {
             disk_idx: -1,
         };
 
-        let remote_disk_invalid = new_remote_disk_with_default_transport(&invalid_endpoint, &disk_option)
+        let remote_disk_invalid = RemoteDisk::new(&invalid_endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
             .unwrap();
         let invalid_location = remote_disk_invalid.get_disk_location();
@@ -2063,7 +2021,9 @@ mod tests {
             health_check: false,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(&endpoint, &disk_option).await.unwrap();
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+            .await
+            .unwrap();
 
         // Test close operation (should succeed)
         let result = remote_disk.close().await;
@@ -2081,12 +2041,13 @@ mod tests {
             disk_idx: 0,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(
+        let remote_disk = RemoteDisk::new(
             &endpoint,
             &DiskOption {
                 cleanup: false,
                 health_check: false,
             },
+            Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();
@@ -2117,12 +2078,13 @@ mod tests {
             disk_idx: 0,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(
+        let remote_disk = RemoteDisk::new(
             &endpoint,
             &DiskOption {
                 cleanup: false,
                 health_check: false,
             },
+            Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();
@@ -2155,12 +2117,13 @@ mod tests {
             disk_idx: 0,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(
+        let remote_disk = RemoteDisk::new(
             &endpoint,
             &DiskOption {
                 cleanup: false,
                 health_check: false,
             },
+            Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();
@@ -2194,12 +2157,13 @@ mod tests {
             disk_idx: 0,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(
+        let remote_disk = RemoteDisk::new(
             &endpoint,
             &DiskOption {
                 cleanup: false,
                 health_check: false,
             },
+            Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();
@@ -2237,12 +2201,13 @@ mod tests {
             disk_idx: 0,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(
+        let remote_disk = RemoteDisk::new(
             &endpoint,
             &DiskOption {
                 cleanup: false,
                 health_check: false,
             },
+            Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();
@@ -2284,12 +2249,13 @@ mod tests {
             disk_idx: 0,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(
+        let remote_disk = RemoteDisk::new(
             &endpoint,
             &DiskOption {
                 cleanup: false,
                 health_check: false,
             },
+            Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();
@@ -2336,12 +2302,13 @@ mod tests {
             disk_idx: 0,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(
+        let remote_disk = RemoteDisk::new(
             &endpoint,
             &DiskOption {
                 cleanup: false,
                 health_check: false,
             },
+            Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();
@@ -2388,12 +2355,13 @@ mod tests {
             disk_idx: 0,
         };
 
-        let remote_disk = new_remote_disk_with_default_transport(
+        let remote_disk = RemoteDisk::new(
             &endpoint,
             &DiskOption {
                 cleanup: false,
                 health_check: false,
             },
+            Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();
