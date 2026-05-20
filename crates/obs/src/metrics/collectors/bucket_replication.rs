@@ -243,7 +243,7 @@ mod tests {
             proxied_get_tagging_requests_total: 2,
             proxied_get_tagging_requests_failures: 0,
             proxied_delete_tagging_requests_total: 1,
-            proxied_delete_tagging_requests_failures: 0,
+            proxied_delete_tagging_requests_failures: 1,
             targets: vec![BucketReplicationTargetStats {
                 target_arn: "arn:rustfs:replication:us-east-1:1:target".to_string(),
                 bandwidth_limit_bytes_per_sec: 2048,
@@ -270,6 +270,20 @@ mod tests {
                     .labels
                     .iter()
                     .any(|(key, value)| *key == TARGET_ARN_L && value == "arn:rustfs:replication:us-east-1:1:target")
+        }));
+
+        let delete_tagging_total_name = BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_TOTAL_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == delete_tagging_total_name
+                && metric.value == 1.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let delete_tagging_failures_name = BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_FAILURES_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == delete_tagging_failures_name
+                && metric.value == 1.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
         }));
     }
 

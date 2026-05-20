@@ -98,7 +98,6 @@ pub static BUCKET_REPL_PROXIED_GET_REQUESTS_TOTAL_MD: LazyLock<MetricDescriptor>
     )
 });
 
-// TODO - add a metric for the number of PUT requests proxied to replication target
 pub static BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_FAILURES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ProxiedGetTaggingRequestFailures,
@@ -135,7 +134,6 @@ pub static BUCKET_REPL_PROXIED_HEAD_REQUESTS_TOTAL_MD: LazyLock<MetricDescriptor
     )
 });
 
-// TODO - add a metric for the number of PUT requests proxied to replication target
 pub static BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ProxiedPutTaggingRequestFailures,
@@ -208,7 +206,6 @@ pub static BUCKET_REPL_BANDWIDTH_CURRENT_MD: LazyLock<MetricDescriptor> = LazyLo
     )
 });
 
-// TODO - add a metric for the number of DELETE requests proxied to replication target
 pub static BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_FAILURES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ProxiedDeleteTaggingRequestFailures,
