@@ -135,7 +135,10 @@ fn is_ipv6_addr_with_zone(addr: &str) -> bool {
 }
 
 fn is_valid_ipv6_zone(zone: &str) -> bool {
-    !zone.is_empty() && !zone.bytes().any(|ch| matches!(ch, b':' | b'/' | b'%' | b'[' | b']'))
+    !zone.is_empty()
+        && zone
+            .bytes()
+            .all(|ch| matches!(ch, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'))
 }
 
 /// checks if server_addr is valid and local host.
@@ -737,5 +740,7 @@ mod test {
         assert!(is_socket_addr("fe80::1%en0"));
         assert!(is_socket_addr("[fe80::1%en0]:9000"));
         assert!(!is_socket_addr("fe80::1%en0:9000"));
+        assert!(!is_socket_addr("fe80::1%en0 "));
+        assert!(!is_socket_addr("fe80::1%\t"));
     }
 }
