@@ -66,9 +66,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use rustfs_io_core::{
-    RequestTimeoutWrapper as CoreRequestTimeoutWrapper, TimeoutConfig as CoreTimeoutConfig, calculate_adaptive_timeout,
-};
+use rustfs_io_core::{RequestTimeoutWrapper as CoreRequestTimeoutWrapper, TimeoutConfig as CoreTimeoutConfig};
 
 /// Request-level timeout policy for GetObject.
 #[derive(Debug, Clone)]
@@ -160,12 +158,12 @@ impl GetObjectTimeoutPolicy {
             return self.get_object_timeout;
         }
 
-        // Reuse the core adaptive-timeout estimator while preserving the current
-        // storage-layer 50% safety buffer semantics. The core helper uses a 20%
-        // overhead factor, so we feed it an 80% effective rate to reach the same
-        // 1.5x envelope this request policy historically used.
+        // Keep storage-layer dynamic-timeout semantics local so request policy
+        // bounds remain authoritative. We preserve the historical 1.5x envelope:
+        // 80% effective rate * 1.2 safety margin.
         let effective_rate_bps = self.bytes_per_second.saturating_mul(4).saturating_div(5).max(1);
-        let estimated_duration = calculate_adaptive_timeout(Duration::from_secs(1), Some(effective_rate_bps), 0, object_size);
+        let estimated_secs = (object_size as f64 / effective_rate_bps as f64) * 1.2;
+        let estimated_duration = Duration::from_secs_f64(estimated_secs);
 
         // Clamp to min/max bounds
         estimated_duration
@@ -708,6 +706,23 @@ mod tests {
         // Test with very large object (should cap at max_timeout)
         let huge_timeout = config.calculate_timeout_for_size(1000 * 1024 * 1024); // 1GB
         assert!(huge_timeout <= Duration::from_secs(rustfs_config::DEFAULT_OBJECT_MAX_TIMEOUT));
+    }
+
+    #[test]
+    fn test_calculate_timeout_for_size_respects_small_min_timeout() {
+        let config = GetObjectTimeoutPolicy {
+            get_object_timeout: Duration::from_secs(30),
+            enable_dynamic_timeout: true,
+            bytes_per_second: 1024 * 1024, // 1MB/s
+            min_timeout: Duration::from_secs(1),
+            max_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+
+        // Tiny object should still honor policy min_timeout (1s),
+        // instead of being raised by any external hard floor.
+        let timeout = config.calculate_timeout_for_size(1024); // 1KB
+        assert_eq!(timeout, Duration::from_secs(1));
     }
 
     #[test]
