@@ -30,10 +30,10 @@ const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 const CONTENT_TYPE_JSON: &str = "application/json";
 
-fn unsupported_transport_error(transport: &str) -> Error {
-    Error::other(format!(
+fn unsupported_transport_message(transport: &str) -> String {
+    format!(
         "invalid {ENV_RUSTFS_INTERNODE_DATA_TRANSPORT}={transport:?}; supported values: {DEFAULT_INTERNODE_DATA_TRANSPORT}, {INTERNODE_DATA_TRANSPORT_TCP}"
-    ))
+    )
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -169,7 +169,9 @@ fn json_headers() -> HeaderMap {
     headers
 }
 
-pub fn build_internode_data_transport(configured_transport: Option<&str>) -> Result<Arc<dyn InternodeDataTransport>> {
+fn build_internode_data_transport_result(
+    configured_transport: Option<&str>,
+) -> std::result::Result<Arc<dyn InternodeDataTransport>, String> {
     match configured_transport.map(str::trim).filter(|transport| !transport.is_empty()) {
         None => Ok(Arc::new(TcpHttpInternodeDataTransport)),
         Some(transport)
@@ -178,8 +180,12 @@ pub fn build_internode_data_transport(configured_transport: Option<&str>) -> Res
         {
             Ok(Arc::new(TcpHttpInternodeDataTransport))
         }
-        Some(transport) => Err(unsupported_transport_error(transport)),
+        Some(transport) => Err(unsupported_transport_message(transport)),
     }
+}
+
+pub fn build_internode_data_transport(configured_transport: Option<&str>) -> Result<Arc<dyn InternodeDataTransport>> {
+    build_internode_data_transport_result(configured_transport).map_err(Error::other)
 }
 
 pub fn build_internode_data_transport_from_env() -> Result<Arc<dyn InternodeDataTransport>> {
@@ -191,7 +197,7 @@ pub fn build_internode_data_transport_from_env() -> Result<Arc<dyn InternodeData
 
     #[cfg(not(test))]
     INTERNODE_DATA_TRANSPORT
-        .get_or_init(|| build_internode_data_transport(configured_transport.as_deref()).map_err(|err| err.to_string()))
+        .get_or_init(|| build_internode_data_transport_result(configured_transport.as_deref()))
         .as_ref()
         .map(Arc::clone)
         .map_err(|err| Error::other(err.clone()))
@@ -302,5 +308,14 @@ mod tests {
 
         assert!(err.to_string().contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
         assert!(err.to_string().contains("rdma"));
+    }
+
+    #[test]
+    fn cached_transport_config_error_uses_raw_message() {
+        let err = build_internode_data_transport_result(Some("rdma")).expect_err("unknown backend should fail closed");
+
+        assert!(!err.starts_with("io error "));
+        assert!(err.contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
+        assert!(err.contains("rdma"));
     }
 }
