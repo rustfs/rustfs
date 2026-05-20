@@ -160,10 +160,15 @@ impl GetObjectTimeoutPolicy {
 
         // Keep storage-layer dynamic-timeout semantics local so request policy
         // bounds remain authoritative. We preserve the historical 1.5x envelope:
-        // 80% effective rate * 1.2 safety margin.
-        let effective_rate_bps = self.bytes_per_second.saturating_mul(4).saturating_div(5).max(1);
-        let estimated_secs = (object_size as f64 / effective_rate_bps as f64) * 1.2;
-        let estimated_duration = Duration::from_secs_f64(estimated_secs);
+        // object_size / (0.8 * bps) * 1.2 == object_size * 1.5 / bps.
+        //
+        // Use integer math to avoid float->Duration conversion panics on extreme
+        // values and keep behavior predictable under saturation.
+        let bytes_per_second = self.bytes_per_second.max(1);
+        let numerator = (object_size as u128).saturating_mul(3);
+        let denominator = (bytes_per_second as u128).saturating_mul(2);
+        let estimated_secs = numerator.checked_div(denominator).unwrap_or(u128::MAX);
+        let estimated_duration = Duration::from_secs(estimated_secs.min(u64::MAX as u128) as u64);
 
         // Clamp to min/max bounds
         estimated_duration
@@ -723,6 +728,21 @@ mod tests {
         // instead of being raised by any external hard floor.
         let timeout = config.calculate_timeout_for_size(1024); // 1KB
         assert_eq!(timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_calculate_timeout_for_size_huge_object_does_not_panic_and_clamps() {
+        let config = GetObjectTimeoutPolicy {
+            get_object_timeout: Duration::from_secs(300),
+            enable_dynamic_timeout: true,
+            bytes_per_second: 1,
+            min_timeout: Duration::from_secs(1),
+            max_timeout: Duration::from_secs(300),
+            ..Default::default()
+        };
+
+        let timeout = config.calculate_timeout_for_size(u64::MAX);
+        assert_eq!(timeout, Duration::from_secs(300));
     }
 
     #[test]
