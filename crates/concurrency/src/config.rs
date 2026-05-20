@@ -95,8 +95,7 @@ impl Default for LockManagerPolicy {
 }
 
 /// Main configuration for concurrency management
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ConcurrencyConfig {
     /// Feature flags
     pub features: ConcurrencyFeatures,
@@ -111,7 +110,6 @@ pub struct ConcurrencyConfig {
     /// Scheduler facade policy.
     pub scheduler_policy: SchedulerPolicy,
 }
-
 
 impl ConcurrencyConfig {
     /// Create configuration from environment variables

@@ -132,8 +132,8 @@ impl IoPriority {
     pub fn from_size(size: i64) -> Self {
         Self::from_size_with_thresholds(
             size,
-            IoSchedulerConfig::default().high_priority_size_threshold,
-            IoSchedulerConfig::default().low_priority_size_threshold,
+            rustfs_config::DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD,
         )
     }
 
@@ -1037,12 +1037,11 @@ impl IoStrategy {
 
         // Calculate priority based on request size
         let priority = if context.file_size > 0 {
-            let core_config = config.to_core_config();
-            IoPriority::from_core(CoreIoPriority::from_size(
+            IoPriority::from_size_with_thresholds(
                 context.file_size,
-                core_config.high_priority_size_threshold,
-                core_config.low_priority_size_threshold,
-            ))
+                config.high_priority_size_threshold,
+                config.low_priority_size_threshold,
+            )
         } else {
             IoPriority::Normal
         };
@@ -1312,27 +1311,38 @@ impl IoLoadMetrics {
         self.observation_count.load(Ordering::Relaxed)
     }
 }
-pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize) -> usize {
-    let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
+#[derive(Debug, Clone, Copy)]
+struct ConcurrencyThresholds {
+    medium: usize,
+    high: usize,
+}
 
-    // Record concurrent request metrics
-    {
-        use metrics::gauge;
-        gauge!("rustfs_concurrent_get_requests").set(concurrent_requests as f64);
+fn load_concurrency_thresholds() -> ConcurrencyThresholds {
+    ConcurrencyThresholds {
+        medium: rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+        ),
+        high: rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+        ),
     }
+}
+
+fn compute_concurrency_aware_buffer_size(
+    file_size: i64,
+    base_buffer_size: usize,
+    concurrent_requests: usize,
+    thresholds: ConcurrencyThresholds,
+) -> usize {
+    let medium_threshold = thresholds.medium;
+    let high_threshold = thresholds.high;
 
     // For low concurrency, use the base buffer size for maximum throughput
     if concurrent_requests <= 1 {
         return base_buffer_size;
     }
-    let medium_threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
-    );
-    let high_threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
-    );
 
     // Calculate adaptive multiplier based on concurrency level
     let adaptive_multiplier = if concurrent_requests <= 2 {
@@ -1368,6 +1378,18 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     adjusted_size.clamp(min_buffer, max_buffer)
 }
 
+pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize) -> usize {
+    let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
+
+    // Record concurrent request metrics
+    {
+        use metrics::gauge;
+        gauge!("rustfs_concurrent_get_requests").set(concurrent_requests as f64);
+    }
+
+    compute_concurrency_aware_buffer_size(file_size, base_buffer_size, concurrent_requests, load_concurrency_thresholds())
+}
+
 /// Advanced concurrency-aware buffer sizing with file size optimization
 ///
 /// This enhanced version considers both concurrency level and file size patterns
@@ -1394,6 +1416,7 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
 /// ```
 pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequential: bool) -> usize {
     let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
+    let thresholds = load_concurrency_thresholds();
 
     // For very small files, use smaller buffers regardless of concurrency
     // Replace manual max/min chain with clamp
@@ -1402,15 +1425,10 @@ pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequ
     }
 
     // Base calculation from standard function
-    let standard_size = get_concurrency_aware_buffer_size(file_size, base_buffer_size);
-    let medium_threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
-    );
-    let high_threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
-    );
+    let standard_size = compute_concurrency_aware_buffer_size(file_size, base_buffer_size, concurrent_requests, thresholds);
+
+    let medium_threshold = thresholds.medium;
+    let high_threshold = thresholds.high;
     // For sequential reads, we can be more aggressive with buffer sizes
     if is_sequential && concurrent_requests <= medium_threshold {
         return ((standard_size as f64 * 1.5) as usize).min(2 * MI_B);

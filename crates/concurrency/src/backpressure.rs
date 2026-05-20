@@ -116,7 +116,7 @@ impl BackpressureManager {
 
     /// Create a backpressure pipe
     pub fn create_pipe(&self) -> BackpressurePipe {
-        BackpressurePipe::new(self.config.clone(), self.monitor.clone())
+        BackpressurePipe::new(self.config, self.monitor.clone())
     }
 
     /// Get current state

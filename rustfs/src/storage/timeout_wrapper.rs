@@ -290,7 +290,8 @@ impl RequestTimeoutWrapper {
 
     /// Get the configured timeout for this operation
     pub fn get_timeout(&self, operation_size_hint: Option<u64>) -> Duration {
-        self.config.get_timeout_for_operation(self.effective_operation_size(operation_size_hint))
+        self.config
+            .get_timeout_for_operation(self.effective_operation_size(operation_size_hint))
     }
 
     fn new_with_parts(
@@ -311,13 +312,6 @@ impl RequestTimeoutWrapper {
 
     fn effective_operation_size(&self, operation_size_hint: Option<u64>) -> Option<u64> {
         operation_size_hint.or(self.operation_size)
-    }
-
-    fn context_fields(&self, context: Option<(&str, &str)>) -> (String, String) {
-        match context {
-            Some((bucket, key)) => (bucket.to_string(), key.to_string()),
-            None => (String::new(), String::new()),
-        }
     }
 
     /// Get the request ID.
@@ -357,7 +351,9 @@ impl RequestTimeoutWrapper {
         if !self.config.is_timeout_enabled() {
             return None;
         }
-        let timeout = self.config.get_timeout_for_operation(self.effective_operation_size(operation_size));
+        let timeout = self
+            .config
+            .get_timeout_for_operation(self.effective_operation_size(operation_size));
         self.core_wrapper.remaining(timeout)
     }
 
@@ -366,7 +362,9 @@ impl RequestTimeoutWrapper {
         if !self.config.is_timeout_enabled() {
             return false;
         }
-        let timeout = self.config.get_timeout_for_operation(self.effective_operation_size(operation_size));
+        let timeout = self
+            .config
+            .get_timeout_for_operation(self.effective_operation_size(operation_size));
         self.core_wrapper.elapsed() >= timeout
     }
 
@@ -418,7 +416,6 @@ impl RequestTimeoutWrapper {
         F: FnOnce(CancellationToken) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        let request_id = self.request_id.clone();
         let timeout_duration = self.get_timeout(None);
         let context_refs = context.as_ref().map(|(bucket, key)| (bucket.as_str(), key.as_str()));
 
@@ -445,7 +442,7 @@ impl RequestTimeoutWrapper {
 
         if let Some((bucket, key)) = context_refs {
             debug!(
-                request_id = %request_id,
+                request_id = %self.request_id,
                 bucket = %bucket,
                 key = %key,
                 timeout_secs = timeout_duration.as_secs(),
@@ -453,7 +450,7 @@ impl RequestTimeoutWrapper {
             );
         } else {
             debug!(
-                request_id = %request_id,
+                request_id = %self.request_id,
                 timeout_secs = timeout_duration.as_secs(),
                 "Starting timed operation"
             );
@@ -470,7 +467,7 @@ impl RequestTimeoutWrapper {
 
                 if let Some((bucket, key)) = context_refs {
                     debug!(
-                        request_id = %request_id,
+                        request_id = %self.request_id,
                         bucket = %bucket,
                         key = %key,
                         elapsed_ms = elapsed.as_millis(),
@@ -478,7 +475,7 @@ impl RequestTimeoutWrapper {
                     );
                 } else {
                     debug!(
-                        request_id = %request_id,
+                        request_id = %self.request_id,
                         elapsed_ms = elapsed.as_millis(),
                         "Operation completed successfully"
                     );
@@ -492,7 +489,7 @@ impl RequestTimeoutWrapper {
 
                 if let Some((bucket, key)) = context_refs {
                     debug!(
-                        request_id = %request_id,
+                        request_id = %self.request_id,
                         bucket = %bucket,
                         key = %key,
                         elapsed_ms = elapsed.as_millis(),
@@ -500,7 +497,7 @@ impl RequestTimeoutWrapper {
                     );
                 } else {
                     debug!(
-                        request_id = %request_id,
+                        request_id = %self.request_id,
                         elapsed_ms = elapsed.as_millis(),
                         "Operation failed with error"
                     );
@@ -517,7 +514,7 @@ impl RequestTimeoutWrapper {
 
                 if let Some((bucket, key)) = context_refs {
                     warn!(
-                        request_id = %request_id,
+                        request_id = %self.request_id,
                         bucket = %bucket,
                         key = %key,
                         timeout_secs = timeout_duration.as_secs(),
@@ -526,16 +523,16 @@ impl RequestTimeoutWrapper {
                     );
                 } else {
                     warn!(
-                        request_id = %request_id,
+                        request_id = %self.request_id,
                         timeout_secs = timeout_duration.as_secs(),
                         elapsed_ms = elapsed.as_millis(),
                         "Operation timed out, cancellation signal sent"
                     );
                 }
 
-                let (bucket, key) = self.context_fields(context_refs);
+                let (bucket, key) = context.unwrap_or_default();
                 TimedGetObjectResult::Timeout(TimeoutInfo {
-                    request_id,
+                    request_id: self.request_id,
                     bucket,
                     key,
                     timeout_duration,

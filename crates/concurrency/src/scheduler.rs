@@ -113,7 +113,7 @@ impl SchedulerManager {
 
     /// Create an I/O strategy
     pub fn create_strategy(&self) -> IoStrategy {
-        IoStrategy::new(self.config.clone(), self.scheduler.clone())
+        IoStrategy::new(self.config, self.scheduler.clone())
     }
 
     /// Calculate buffer size
