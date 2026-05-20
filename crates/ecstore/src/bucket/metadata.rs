@@ -941,12 +941,17 @@ mod test {
     fn parse_all_configs_parses_stored_configs_without_store_dependency() {
         let mut bm = BucketMetadata::new("test-bucket");
         bm.policy_config_json = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
-        bm.bucket_targets_config_json = Vec::new();
+        bm.bucket_targets_config_json =
+            br#"{"targets":[{"endpoint":"s3.amazonaws.com","targetbucket":"target-bucket","arn":"arn:aws:s3:::target-bucket"}]}"#
+                .to_vec();
 
         bm.parse_all_configs().unwrap();
 
         assert!(bm.policy_config.is_some());
-        assert!(bm.bucket_target_config.is_some());
+        let bucket_targets = bm.bucket_target_config.unwrap();
+        assert_eq!(bucket_targets.targets.len(), 1);
+        assert_eq!(bucket_targets.targets[0].endpoint, "s3.amazonaws.com");
+        assert_eq!(bucket_targets.targets[0].target_bucket, "target-bucket");
     }
 
     #[tokio::test]
