@@ -724,7 +724,7 @@ impl BucketMetadata {
             return Err(Error::other("errServerNotInitialized"));
         };
 
-        self.parse_all_configs(store.clone())?;
+        self.parse_all_configs()?;
 
         let mut buf: Vec<u8> = vec![0; 4];
 
@@ -752,7 +752,7 @@ impl BucketMetadata {
         Ok(())
     }
 
-    fn parse_all_configs(&mut self, _api: Arc<ECStore>) -> Result<()> {
+    fn parse_all_configs(&mut self) -> Result<()> {
         if let Err(e) = self.parse_policy_config() {
             tracing::warn!(bucket = %self.name, config = "policy", error = %e, "parse_all_configs: failed to parse");
         }
@@ -881,10 +881,8 @@ pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: 
     bm.default_timestamps();
 
     if parse {
-        bm.parse_all_configs(api)?;
+        bm.parse_all_configs()?;
     }
-
-    // TODO: parse_all_configs
 
     Ok(bm)
 }
@@ -937,6 +935,18 @@ mod test {
         let new = BucketMetadata::unmarshal(&buf).unwrap();
 
         assert_eq!(bm.name, new.name);
+    }
+
+    #[test]
+    fn parse_all_configs_parses_stored_configs_without_store_dependency() {
+        let mut bm = BucketMetadata::new("test-bucket");
+        bm.policy_config_json = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        bm.bucket_targets_config_json = Vec::new();
+
+        bm.parse_all_configs().unwrap();
+
+        assert!(bm.policy_config.is_some());
+        assert!(bm.bucket_target_config.is_some());
     }
 
     #[tokio::test]
