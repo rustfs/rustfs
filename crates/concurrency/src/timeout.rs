@@ -25,6 +25,8 @@ pub struct TimeoutManagerPolicy {
     pub default_timeout: Duration,
     /// Maximum timeout duration
     pub max_timeout: Duration,
+    /// Minimum timeout floor (prevents dynamic calculation from going too low).
+    pub min_timeout: Duration,
     /// Enable dynamic timeout calculation
     pub enable_dynamic: bool,
 }
@@ -34,6 +36,7 @@ impl Default for TimeoutManagerPolicy {
         Self {
             default_timeout: Duration::from_secs(30),
             max_timeout: Duration::from_secs(300),
+            min_timeout: Duration::from_secs(5),
             enable_dynamic: true,
         }
     }
@@ -49,7 +52,7 @@ impl TimeoutManagerPolicy {
             base_timeout: self.default_timeout,
             timeout_per_mb: Duration::ZERO,
             max_timeout: self.max_timeout,
-            min_timeout: Duration::from_secs(1),
+            min_timeout: self.min_timeout,
             get_object_timeout: self.default_timeout,
             put_object_timeout: self.max_timeout,
             list_objects_timeout: self.default_timeout,
@@ -57,9 +60,6 @@ impl TimeoutManagerPolicy {
         }
     }
 }
-
-/// Backward-compatible alias for the old timeout facade name.
-pub type TimeoutConfig = TimeoutManagerPolicy;
 
 /// Timeout manager
 pub struct TimeoutManager {
@@ -74,6 +74,7 @@ impl TimeoutManager {
             default_timeout,
             max_timeout,
             enable_dynamic,
+            ..Default::default()
         })
     }
 
@@ -177,6 +178,7 @@ mod tests {
         let core = policy.to_core_config();
         assert_eq!(core.base_timeout, policy.default_timeout);
         assert_eq!(core.max_timeout, policy.max_timeout);
+        assert_eq!(core.min_timeout, policy.min_timeout);
         assert_eq!(core.get_object_timeout, policy.default_timeout);
         assert!(core.enable_dynamic_timeout);
     }

@@ -17,9 +17,6 @@
 //! This module provides backpressure-aware pipes for object data transfer,
 //! preventing buffer overflow and memory exhaustion under high concurrency.
 
-// Allow dead_code for public API that may be used by external modules or future features
-#![allow(dead_code)]
-//!
 //! # Key Features
 //!
 //! - Configurable buffer size with high/low watermarks
@@ -103,10 +100,6 @@ impl ObjectPipeBackpressurePolicy {
     }
 }
 
-/// Backward-compatible alias for the old object pipe config name.
-#[deprecated(note = "use ObjectPipeBackpressurePolicy instead")]
-pub type BackpressureConfig = ObjectPipeBackpressurePolicy;
-
 /// Backpressure state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackpressureState {
@@ -126,47 +119,6 @@ impl std::fmt::Display for BackpressureState {
             BackpressureState::BackpressureApplied => write!(f, "backpressure_applied"),
         }
     }
-}
-
-/// Backpressure event for monitoring.
-#[derive(Debug, Clone)]
-pub struct BackpressureEvent {
-    /// Event timestamp.
-    pub timestamp: Instant,
-    /// Event type.
-    pub event_type: BackpressureEventType,
-    /// Buffer usage at event time.
-    pub buffer_usage: usize,
-    /// Buffer capacity.
-    pub buffer_capacity: usize,
-    /// Usage percentage.
-    pub usage_percent: f32,
-}
-
-/// Backpressure event type.
-#[derive(Debug, Clone, Copy)]
-pub enum BackpressureEventType {
-    /// Entered high watermark state.
-    HighWatermarkReached,
-    /// Exited high watermark state (backpressure released).
-    HighWatermarkExited,
-    /// Backpressure applied to producer.
-    BackpressureApplied,
-    /// Backpressure released.
-    BackpressureReleased,
-}
-
-/// Snapshot of backpressure state.
-#[derive(Debug, Clone, Copy)]
-pub struct BackpressureSnapshot {
-    /// Buffer capacity in bytes.
-    pub buffer_capacity: usize,
-    /// Current buffer usage in bytes (approximate).
-    pub buffer_used: usize,
-    /// Usage percentage.
-    pub usage_percent: f32,
-    /// Current state.
-    pub state: BackpressureState,
 }
 
 /// Compact metadata snapshot for object-transfer backpressure pipes.
@@ -199,41 +151,31 @@ fn calculate_usage_percent(usage: usize, capacity: usize) -> f32 {
     }
 }
 
-fn state_from_high_watermark(in_high_watermark: bool, high_state: BackpressureState) -> BackpressureState {
-    if in_high_watermark {
-        high_state
-    } else {
-        BackpressureState::Normal
-    }
-}
-
-fn classify_watermark_state(usage: usize, high: usize, low: usize, currently_high: bool) -> BackpressureState {
-    if usage >= high {
-        BackpressureState::HighWatermark
-    } else if usage <= low {
-        BackpressureState::Normal
-    } else if currently_high {
-        BackpressureState::HighWatermark
-    } else {
-        BackpressureState::Normal
-    }
-}
-
 fn apply_watermark_transition(
     in_high_watermark: &AtomicBool,
     usage: usize,
     high: usize,
     low: usize,
 ) -> (BackpressureState, bool) {
-    let current = in_high_watermark.load(Ordering::Relaxed);
-    let next_state = classify_watermark_state(usage, high, low, current);
+    let current = in_high_watermark.load(Ordering::Acquire);
+    let next_state = if usage >= high {
+        BackpressureState::HighWatermark
+    } else if usage <= low {
+        BackpressureState::Normal
+    } else if current {
+        BackpressureState::HighWatermark
+    } else {
+        BackpressureState::Normal
+    };
     let next_is_high = matches!(next_state, BackpressureState::HighWatermark);
-    let changed = in_high_watermark.swap(next_is_high, Ordering::Relaxed) != next_is_high;
+    let changed = in_high_watermark.swap(next_is_high, Ordering::AcqRel) != next_is_high;
     (next_state, changed)
 }
 
 fn saturating_sub_atomic(value: &AtomicUsize, delta: usize) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(delta)));
+    value
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_sub(delta)))
+        .ok();
 }
 
 /// A backpressure-aware pipe wrapping tokio's duplex.
@@ -315,19 +257,10 @@ impl BackpressurePipe {
 
     /// Get current backpressure state.
     pub fn state(&self) -> BackpressureState {
-        state_from_high_watermark(self.state.load(Ordering::Relaxed), BackpressureState::BackpressureApplied)
-    }
-
-    /// Get current buffer usage snapshot.
-    pub fn snapshot(&self) -> BackpressureSnapshot {
-        let buffer_used = self.usage();
-        let usage_percent = calculate_usage_percent(buffer_used, self.config.buffer_size);
-
-        BackpressureSnapshot {
-            buffer_capacity: self.config.buffer_size,
-            buffer_used,
-            usage_percent,
-            state: self.state(),
+        if self.state.load(Ordering::Acquire) {
+            BackpressureState::BackpressureApplied
+        } else {
+            BackpressureState::Normal
         }
     }
 
@@ -335,7 +268,7 @@ impl BackpressurePipe {
     pub fn meta(&self) -> BackpressurePipeMeta {
         BackpressurePipeMeta {
             buffer_capacity: self.config.buffer_size,
-            state: state_from_high_watermark(self.state.load(Ordering::Relaxed), BackpressureState::BackpressureApplied),
+            state: self.state(),
             age: self.age(),
         }
     }
@@ -347,13 +280,13 @@ impl BackpressurePipe {
 
     /// Get current buffer usage.
     pub fn usage(&self) -> usize {
-        self.buffer_usage.load(Ordering::Relaxed)
+        self.buffer_usage.load(Ordering::Acquire)
     }
 
     /// Record bytes written (call after successful write).
     pub fn record_write(&self, bytes: usize) {
         self.total_written.fetch_add(bytes, Ordering::Relaxed);
-        self.buffer_usage.fetch_add(bytes, Ordering::Relaxed);
+        self.buffer_usage.fetch_add(bytes, Ordering::Release);
         self.update_watermark_state();
     }
 
@@ -366,7 +299,7 @@ impl BackpressurePipe {
 
     /// Update watermark state and emit transition signals.
     fn update_watermark_state(&self) {
-        let usage = self.buffer_usage.load(Ordering::Relaxed);
+        let usage = self.buffer_usage.load(Ordering::Acquire);
         let usage_percent = calculate_usage_percent(usage, self.config.buffer_size) as u32;
         let (next_state, changed) =
             apply_watermark_transition(&self.state, usage, self.high_watermark_bytes, self.low_watermark_bytes);
@@ -460,7 +393,7 @@ impl BackpressureMonitor {
 
     /// Record bytes added to buffer.
     pub fn on_write(&self, bytes: usize) -> BackpressureState {
-        self.buffer_usage.fetch_add(bytes, Ordering::Relaxed);
+        self.buffer_usage.fetch_add(bytes, Ordering::Release);
         self.update_state()
     }
 
@@ -472,33 +405,37 @@ impl BackpressureMonitor {
 
     /// Get current state.
     pub fn state(&self) -> BackpressureState {
-        state_from_high_watermark(self.in_high_watermark.load(Ordering::Relaxed), BackpressureState::HighWatermark)
+        if self.in_high_watermark.load(Ordering::Acquire) {
+            BackpressureState::HighWatermark
+        } else {
+            BackpressureState::Normal
+        }
     }
 
     /// Get current buffer usage.
     pub fn usage(&self) -> usize {
-        self.buffer_usage.load(Ordering::Relaxed)
+        self.buffer_usage.load(Ordering::Acquire)
     }
 
     /// Get usage percentage.
     pub fn usage_percent(&self) -> f32 {
-        let usage = self.buffer_usage.load(Ordering::Relaxed);
+        let usage = self.buffer_usage.load(Ordering::Acquire);
         calculate_usage_percent(usage, self.config.buffer_size)
     }
 
     /// Get a compact metadata snapshot for the monitor.
     pub fn meta(&self) -> BackpressureMonitorMeta {
-        let usage = self.buffer_usage.load(Ordering::Relaxed);
+        let usage = self.buffer_usage.load(Ordering::Acquire);
         BackpressureMonitorMeta {
             buffer_capacity: self.config.buffer_size,
             usage_percent: calculate_usage_percent(usage, self.config.buffer_size),
-            state: state_from_high_watermark(self.in_high_watermark.load(Ordering::Relaxed), BackpressureState::HighWatermark),
+            state: self.state(),
         }
     }
 
     /// Update state based on current usage.
     fn update_state(&self) -> BackpressureState {
-        let usage = self.buffer_usage.load(Ordering::Relaxed);
+        let usage = self.buffer_usage.load(Ordering::Acquire);
         let usage_percent = calculate_usage_percent(usage, self.config.buffer_size) as u32;
         let (next_state, changed) =
             apply_watermark_transition(&self.in_high_watermark, usage, self.high_watermark_bytes, self.low_watermark_bytes);

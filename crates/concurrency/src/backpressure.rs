@@ -69,9 +69,6 @@ impl PipeBackpressurePolicy {
     }
 }
 
-/// Backward-compatible alias for the old backpressure facade name.
-pub type BackpressureConfig = PipeBackpressurePolicy;
-
 /// Backpressure manager
 pub struct BackpressureManager {
     config: PipeBackpressurePolicy,
@@ -210,34 +207,6 @@ impl BackpressurePipe {
         }
         should
     }
-}
-
-/// Backpressure event
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct BackpressureEvent {
-    /// Event timestamp
-    pub timestamp: Instant,
-    /// Event type
-    pub event_type: BackpressureEventType,
-    /// Buffer usage
-    pub buffer_usage: usize,
-    /// Buffer capacity
-    pub buffer_capacity: usize,
-}
-
-/// Backpressure event type
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub enum BackpressureEventType {
-    /// High watermark reached
-    HighWatermarkReached,
-    /// High watermark exited
-    HighWatermarkExited,
-    /// Backpressure applied
-    BackpressureApplied,
-    /// Backpressure released
-    BackpressureReleased,
 }
 
 #[cfg(test)]

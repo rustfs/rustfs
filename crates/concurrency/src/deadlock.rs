@@ -52,9 +52,6 @@ impl DeadlockMonitorPolicy {
     }
 }
 
-/// Backward-compatible alias for the old deadlock facade name.
-pub type DeadlockConfig = DeadlockMonitorPolicy;
-
 /// Deadlock manager
 pub struct DeadlockManager {
     config: DeadlockMonitorPolicy,

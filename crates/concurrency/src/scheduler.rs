@@ -59,9 +59,6 @@ impl SchedulerPolicy {
     }
 }
 
-/// Backward-compatible alias for the old scheduler facade name.
-pub type SchedulerConfig = SchedulerPolicy;
-
 /// Scheduler manager
 pub struct SchedulerManager {
     config: SchedulerPolicy,

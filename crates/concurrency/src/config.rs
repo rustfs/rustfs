@@ -164,31 +164,6 @@ impl ConcurrencyConfig {
 
         Ok(())
     }
-
-    /// Build the timeout facade policy from the aggregate concurrency config.
-    pub fn timeout_policy(&self) -> TimeoutManagerPolicy {
-        self.timeout_policy
-    }
-
-    /// Build the lock facade policy from the aggregate concurrency config.
-    pub fn lock_policy(&self) -> LockManagerPolicy {
-        self.lock_policy
-    }
-
-    /// Build the deadlock facade policy from the aggregate concurrency config.
-    pub fn deadlock_policy(&self) -> DeadlockMonitorPolicy {
-        self.deadlock_policy
-    }
-
-    /// Build the backpressure facade policy from the aggregate concurrency config.
-    pub fn backpressure_policy(&self) -> PipeBackpressurePolicy {
-        self.backpressure_policy
-    }
-
-    /// Build the scheduler facade policy from the aggregate concurrency config.
-    pub fn scheduler_policy(&self) -> SchedulerPolicy {
-        self.scheduler_policy
-    }
 }
 
 /// Configuration error
@@ -225,6 +200,7 @@ mod tests {
                 default_timeout: Duration::from_secs(100),
                 max_timeout: Duration::from_secs(50),
                 enable_dynamic: true,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -241,50 +217,5 @@ mod tests {
 
         let features = ConcurrencyFeatures::none();
         assert!(!features.any_enabled());
-    }
-
-    #[test]
-    fn test_timeout_policy_mapping() {
-        let config = ConcurrencyConfig::default();
-        let policy = config.timeout_policy();
-        assert_eq!(policy.default_timeout, config.timeout_policy.default_timeout);
-        assert_eq!(policy.max_timeout, config.timeout_policy.max_timeout);
-        assert_eq!(policy.enable_dynamic, config.timeout_policy.enable_dynamic);
-    }
-
-    #[test]
-    fn test_lock_policy_mapping() {
-        let config = ConcurrencyConfig::default();
-        let policy = config.lock_policy();
-        assert_eq!(policy.enabled, config.lock_policy.enabled);
-        assert_eq!(policy.acquire_timeout, config.lock_policy.acquire_timeout);
-    }
-
-    #[test]
-    fn test_deadlock_policy_mapping() {
-        let config = ConcurrencyConfig::default();
-        let policy = config.deadlock_policy();
-        assert_eq!(policy.enabled, config.deadlock_policy.enabled);
-        assert_eq!(policy.check_interval, config.deadlock_policy.check_interval);
-        assert_eq!(policy.hang_threshold, config.deadlock_policy.hang_threshold);
-    }
-
-    #[test]
-    fn test_backpressure_policy_mapping() {
-        let config = ConcurrencyConfig::default();
-        let policy = config.backpressure_policy();
-        assert_eq!(policy.buffer_size, config.backpressure_policy.buffer_size);
-        assert_eq!(policy.high_watermark, config.backpressure_policy.high_watermark);
-        assert_eq!(policy.low_watermark, config.backpressure_policy.low_watermark);
-    }
-
-    #[test]
-    fn test_scheduler_policy_mapping() {
-        let config = ConcurrencyConfig::default();
-        let policy = config.scheduler_policy();
-        assert_eq!(policy.base_buffer_size, config.scheduler_policy.base_buffer_size);
-        assert_eq!(policy.max_buffer_size, config.scheduler_policy.max_buffer_size);
-        assert_eq!(policy.high_priority_threshold, config.scheduler_policy.high_priority_threshold);
-        assert_eq!(policy.low_priority_threshold, config.scheduler_policy.low_priority_threshold);
     }
 }

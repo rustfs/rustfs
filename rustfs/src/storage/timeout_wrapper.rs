@@ -33,15 +33,6 @@
 //!
 //! - Configurable request-level timeout (default 30 seconds)
 //! - Automatic cancellation of sub-tasks on timeout
-//! - Resource cleanup on timeout (locks, memory, file handles)
-//! - Timeout metrics emitted through `rustfs-io-metrics`
-
-// Allow dead_code for public API that may be used by external modules or future features
-#![allow(dead_code)]
-//!
-//! - Configurable request-level timeout (default 30 seconds)
-//! - Automatic cancellation of sub-tasks on timeout
-//! - Resource cleanup on timeout (locks, memory, file handles)
 //! - Timeout metrics emitted through `rustfs-io-metrics`
 //!
 //! # Usage
@@ -62,11 +53,9 @@
 //! }
 //! ```
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
-
-use rustfs_io_core::{RequestTimeoutWrapper as CoreRequestTimeoutWrapper, TimeoutConfig as CoreTimeoutConfig};
 
 /// Request-level timeout policy for GetObject.
 #[derive(Debug, Clone)]
@@ -74,14 +63,6 @@ pub struct GetObjectTimeoutPolicy {
     /// GetObject request overall timeout (default 30s).
     /// After this duration, the request is cancelled and returns 504.
     pub get_object_timeout: Duration,
-
-    /// Lock acquisition timeout (default 5s).
-    /// Time to wait for a lock before giving up.
-    pub lock_acquire_timeout: Duration,
-
-    /// Disk read operation timeout (default 10s).
-    /// Individual disk read operations that exceed this are cancelled.
-    pub disk_read_timeout: Duration,
 
     /// Enable dynamic timeout calculation based on object size
     pub enable_dynamic_timeout: bool,
@@ -100,8 +81,6 @@ impl Default for GetObjectTimeoutPolicy {
     fn default() -> Self {
         Self {
             get_object_timeout: Duration::from_secs(rustfs_config::DEFAULT_OBJECT_GET_TIMEOUT),
-            lock_acquire_timeout: Duration::from_secs(rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT),
-            disk_read_timeout: Duration::from_secs(rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT),
             enable_dynamic_timeout: rustfs_config::DEFAULT_OBJECT_DYNAMIC_TIMEOUT_ENABLE,
             bytes_per_second: rustfs_config::DEFAULT_OBJECT_BYTES_PER_SECOND,
             min_timeout: Duration::from_secs(rustfs_config::DEFAULT_OBJECT_MIN_TIMEOUT),
@@ -115,16 +94,6 @@ impl GetObjectTimeoutPolicy {
     pub fn from_env() -> Self {
         let get_object_timeout =
             rustfs_utils::get_env_u64(rustfs_config::ENV_OBJECT_GET_TIMEOUT, rustfs_config::DEFAULT_OBJECT_GET_TIMEOUT);
-        let lock_acquire_timeout = rustfs_utils::get_env_u64(
-            rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT,
-            rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT,
-        );
-        let disk_read_timeout = rustfs_utils::get_env_u64(
-            rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT,
-            rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT,
-        );
-
-        // Dynamic timeout settings
         let enable_dynamic_timeout = rustfs_utils::get_env_bool(
             rustfs_config::ENV_OBJECT_DYNAMIC_TIMEOUT_ENABLE,
             rustfs_config::DEFAULT_OBJECT_DYNAMIC_TIMEOUT_ENABLE,
@@ -138,8 +107,6 @@ impl GetObjectTimeoutPolicy {
 
         Self {
             get_object_timeout: Duration::from_secs(get_object_timeout),
-            lock_acquire_timeout: Duration::from_secs(lock_acquire_timeout),
-            disk_read_timeout: Duration::from_secs(disk_read_timeout),
             enable_dynamic_timeout,
             bytes_per_second,
             min_timeout: Duration::from_secs(min_timeout_secs),
@@ -184,28 +151,7 @@ impl GetObjectTimeoutPolicy {
             _ => self.get_object_timeout,
         }
     }
-
-    /// Convert the request-level policy into a core timeout configuration.
-    ///
-    /// This is intentionally lossy: request-specific diagnostics remain in the
-    /// storage layer, while the shared timing primitive lives in `io-core`.
-    pub fn to_core_config(&self) -> CoreTimeoutConfig {
-        CoreTimeoutConfig {
-            base_timeout: self.get_object_timeout,
-            timeout_per_mb: Duration::ZERO,
-            max_timeout: self.max_timeout,
-            min_timeout: self.min_timeout,
-            get_object_timeout: self.get_object_timeout,
-            put_object_timeout: self.get_object_timeout,
-            list_objects_timeout: self.get_object_timeout,
-            enable_dynamic_timeout: false,
-        }
-    }
 }
-
-/// Backward-compatible alias for the old request timeout name.
-#[deprecated(note = "use GetObjectTimeoutPolicy instead")]
-pub type TimeoutConfig = GetObjectTimeoutPolicy;
 
 /// Information about a timeout event.
 #[derive(Debug, Clone)]
@@ -249,8 +195,8 @@ pub enum TimedGetObjectResult<T, E> {
 pub struct RequestTimeoutWrapper {
     /// Configuration.
     config: GetObjectTimeoutPolicy,
-    /// Shared core timing primitive.
-    core_wrapper: CoreRequestTimeoutWrapper,
+    /// Request start time.
+    start_time: Instant,
     /// Optional operation size hint for dynamic timeout decisions.
     operation_size: Option<u64>,
     /// Cancellation token for propagating cancellation to sub-tasks.
@@ -303,10 +249,9 @@ impl RequestTimeoutWrapper {
         cancel_token: CancellationToken,
         request_id: String,
     ) -> Self {
-        let core_wrapper = CoreRequestTimeoutWrapper::new(config.to_core_config());
         Self {
             config,
-            core_wrapper,
+            start_time: Instant::now(),
             operation_size,
             cancel_token,
             request_id,
@@ -335,12 +280,12 @@ impl RequestTimeoutWrapper {
 
     /// Check if the timeout has been exceeded.
     pub fn is_timeout(&self) -> bool {
-        self.config.is_timeout_enabled() && self.core_wrapper.elapsed() >= self.get_timeout(None)
+        self.config.is_timeout_enabled() && self.start_time.elapsed() >= self.get_timeout(None)
     }
 
     /// Get elapsed time since the request started.
     pub fn elapsed(&self) -> Duration {
-        self.core_wrapper.elapsed()
+        self.start_time.elapsed()
     }
 
     /// Get remaining time before timeout.
@@ -357,7 +302,8 @@ impl RequestTimeoutWrapper {
         let timeout = self
             .config
             .get_timeout_for_operation(self.effective_operation_size(operation_size));
-        self.core_wrapper.remaining(timeout)
+        let remaining = timeout.saturating_sub(self.start_time.elapsed());
+        if remaining == Duration::ZERO { None } else { Some(remaining) }
     }
 
     /// Check if the wrapper should timeout based on elapsed time and optional operation size
@@ -368,7 +314,7 @@ impl RequestTimeoutWrapper {
         let timeout = self
             .config
             .get_timeout_for_operation(self.effective_operation_size(operation_size));
-        self.core_wrapper.elapsed() >= timeout
+        self.start_time.elapsed() >= timeout
     }
 
     /// Execute an async operation with timeout protection.
@@ -420,22 +366,24 @@ impl RequestTimeoutWrapper {
         Fut: std::future::Future<Output = Result<T, E>>,
     {
         let timeout_duration = self.get_timeout(None);
-        let context_refs = context.as_ref().map(|(bucket, key)| (bucket.as_str(), key.as_str()));
+
+        // Build a tracing span that carries request context for all log events.
+        let span = match &context {
+            Some((bucket, key)) => tracing::info_span!(
+                "timeout_operation",
+                request_id = %self.request_id,
+                bucket = %bucket,
+                key = %key,
+            ),
+            None => tracing::info_span!(
+                "timeout_operation",
+                request_id = %self.request_id,
+            ),
+        };
+        let _guard = span.enter();
 
         if !self.config.is_timeout_enabled() {
-            if let Some((bucket, key)) = context_refs {
-                debug!(
-                    request_id = %self.request_id,
-                    bucket = %bucket,
-                    key = %key,
-                    "Timeout disabled, executing operation without timeout"
-                );
-            } else {
-                debug!(
-                    request_id = %self.request_id,
-                    "Timeout disabled, executing operation without timeout"
-                );
-            }
+            debug!("Timeout disabled, executing operation without timeout");
 
             return match operation(self.cancel_token).await {
                 Ok(result) => TimedGetObjectResult::Success(result),
@@ -443,21 +391,7 @@ impl RequestTimeoutWrapper {
             };
         }
 
-        if let Some((bucket, key)) = context_refs {
-            debug!(
-                request_id = %self.request_id,
-                bucket = %bucket,
-                key = %key,
-                timeout_secs = timeout_duration.as_secs(),
-                "Starting timed operation"
-            );
-        } else {
-            debug!(
-                request_id = %self.request_id,
-                timeout_secs = timeout_duration.as_secs(),
-                "Starting timed operation"
-            );
-        }
+        debug!(timeout_secs = timeout_duration.as_secs(), "Starting timed operation");
 
         rustfs_io_metrics::record_get_object_request_started();
 
@@ -467,44 +401,14 @@ impl RequestTimeoutWrapper {
             Ok(Ok(result)) => {
                 let elapsed = self.elapsed();
                 rustfs_io_metrics::record_get_object_request_result("success", elapsed.as_secs_f64());
-
-                if let Some((bucket, key)) = context_refs {
-                    debug!(
-                        request_id = %self.request_id,
-                        bucket = %bucket,
-                        key = %key,
-                        elapsed_ms = elapsed.as_millis(),
-                        "Operation completed successfully"
-                    );
-                } else {
-                    debug!(
-                        request_id = %self.request_id,
-                        elapsed_ms = elapsed.as_millis(),
-                        "Operation completed successfully"
-                    );
-                }
+                debug!(elapsed_ms = elapsed.as_millis(), "Operation completed successfully");
 
                 TimedGetObjectResult::Success(result)
             }
             Ok(Err(e)) => {
                 let elapsed = self.elapsed();
                 rustfs_io_metrics::record_get_object_request_result("error", elapsed.as_secs_f64());
-
-                if let Some((bucket, key)) = context_refs {
-                    debug!(
-                        request_id = %self.request_id,
-                        bucket = %bucket,
-                        key = %key,
-                        elapsed_ms = elapsed.as_millis(),
-                        "Operation failed with error"
-                    );
-                } else {
-                    debug!(
-                        request_id = %self.request_id,
-                        elapsed_ms = elapsed.as_millis(),
-                        "Operation failed with error"
-                    );
-                }
+                debug!(elapsed_ms = elapsed.as_millis(), "Operation failed with error");
 
                 TimedGetObjectResult::Error(e)
             }
@@ -515,23 +419,11 @@ impl RequestTimeoutWrapper {
                 rustfs_io_metrics::record_get_object_timeout(None, Some(elapsed.as_secs_f64()));
                 rustfs_io_metrics::record_get_object_request_result("timeout", elapsed.as_secs_f64());
 
-                if let Some((bucket, key)) = context_refs {
-                    warn!(
-                        request_id = %self.request_id,
-                        bucket = %bucket,
-                        key = %key,
-                        timeout_secs = timeout_duration.as_secs(),
-                        elapsed_ms = elapsed.as_millis(),
-                        "Operation timed out, cancellation signal sent"
-                    );
-                } else {
-                    warn!(
-                        request_id = %self.request_id,
-                        timeout_secs = timeout_duration.as_secs(),
-                        elapsed_ms = elapsed.as_millis(),
-                        "Operation timed out, cancellation signal sent"
-                    );
-                }
+                warn!(
+                    timeout_secs = timeout_duration.as_secs(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "Operation timed out, cancellation signal sent"
+                );
 
                 let (bucket, key) = context.unwrap_or_default();
                 TimedGetObjectResult::Timeout(TimeoutInfo {
@@ -574,8 +466,6 @@ mod tests {
     fn test_timeout_config_default() {
         let config = GetObjectTimeoutPolicy::default();
         assert_eq!(config.get_object_timeout, Duration::from_secs(30));
-        assert_eq!(config.lock_acquire_timeout, Duration::from_secs(5));
-        assert_eq!(config.disk_read_timeout, Duration::from_secs(10));
     }
 
     #[test]

@@ -58,7 +58,7 @@
 // Allow dead_code for public API that may be used by external modules or future features
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -66,9 +66,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use metrics::counter;
-use rustfs_io_core::{
-    DeadlockDetector as CoreDeadlockDetector, DeadlockDetectorConfig as CoreDeadlockConfig, LockType as CoreLockType,
-};
+use rustfs_io_core::DeadlockDetectorConfig as CoreDeadlockConfig;
 
 /// Request identifier type.
 pub type RequestId = String;
@@ -133,10 +131,6 @@ impl RequestHangDetectionPolicy {
         }
     }
 }
-
-/// Backward-compatible alias for the old request diagnosis config name.
-#[deprecated(note = "use RequestHangDetectionPolicy instead")]
-pub type DeadlockDetectorConfig = RequestHangDetectionPolicy;
 
 /// Lock information for tracking.
 #[derive(Debug, Clone)]
@@ -513,47 +507,63 @@ impl DeadlockDetector {
         }
     }
 
-    /// Find a cycle in the request-level wait graph by delegating cycle
-    /// detection to the shared io-core deadlock primitive.
+    /// Find a cycle in the wait graph using DFS.
     fn find_cycle(edges: &[WaitGraphEdge]) -> Option<Vec<RequestId>> {
         if edges.is_empty() {
             return None;
         }
 
-        let mut request_ids: HashMap<&RequestId, u64> = HashMap::new();
-        let mut next_id = 1_u64;
-
+        // Build adjacency list: from -> [to]
+        let mut graph: HashMap<&RequestId, Vec<&RequestId>> = HashMap::new();
         for edge in edges {
-            request_ids.entry(&edge.from).or_insert_with(|| {
-                let id = next_id;
-                next_id += 1;
-                id
-            });
-            request_ids.entry(&edge.to).or_insert_with(|| {
-                let id = next_id;
-                next_id += 1;
-                id
-            });
+            graph.entry(&edge.from).or_default().push(&edge.to);
         }
 
-        let reverse_ids: HashMap<u64, RequestId> = request_ids.iter().map(|(req, id)| (*id, (*req).clone())).collect();
-        let core_detector = CoreDeadlockDetector::new(CoreDeadlockConfig {
-            enabled: true,
-            detection_interval: Duration::from_secs(1),
-            max_hold_time: Duration::from_secs(30),
-        });
+        let mut visited: HashSet<&RequestId> = HashSet::new();
+        let mut path: Vec<&RequestId> = Vec::new();
+        let mut path_set: HashSet<&RequestId> = HashSet::new();
 
-        for edge in edges {
-            let waiter = *request_ids.get(&edge.from).expect("request id registered");
-            let waited_for = *request_ids.get(&edge.to).expect("request id registered");
-            let lock_id = core_detector.register_lock(CoreLockType::Mutex);
-            core_detector.record_acquire(lock_id, waited_for);
-            core_detector.record_wait(lock_id, waiter);
+        for start in graph.keys() {
+            if visited.contains(start) {
+                continue;
+            }
+            if Self::dfs_find_cycle(start, &graph, &mut visited, &mut path, &mut path_set) {
+                return Some(path.iter().map(|s| (*s).clone()).collect());
+            }
         }
 
-        core_detector
-            .detect_deadlock()
-            .map(|cycle| cycle.into_iter().filter_map(|id| reverse_ids.get(&id).cloned()).collect())
+        None
+    }
+
+    /// DFS helper for cycle detection.
+    fn dfs_find_cycle<'a>(
+        node: &'a RequestId,
+        graph: &HashMap<&'a RequestId, Vec<&'a RequestId>>,
+        visited: &mut HashSet<&'a RequestId>,
+        path: &mut Vec<&'a RequestId>,
+        path_set: &mut HashSet<&'a RequestId>,
+    ) -> bool {
+        visited.insert(node);
+        path.push(node);
+        path_set.insert(node);
+
+        if let Some(neighbors) = graph.get(&node) {
+            for neighbor in neighbors {
+                if path_set.contains(neighbor) {
+                    // Found cycle - trim path to just the cycle
+                    let cycle_start = path.iter().position(|n| *n == *neighbor).unwrap();
+                    path.drain(0..cycle_start);
+                    return true;
+                }
+                if !visited.contains(neighbor) && Self::dfs_find_cycle(neighbor, graph, visited, path, path_set) {
+                    return true;
+                }
+            }
+        }
+
+        path.pop();
+        path_set.remove(node);
+        false
     }
 }
 

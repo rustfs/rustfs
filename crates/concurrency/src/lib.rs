@@ -128,19 +128,19 @@ pub mod workers;
 
 // Public module exports with feature gates
 #[cfg(feature = "timeout")]
-pub use timeout::{TimeoutConfig, TimeoutGuard, TimeoutManager, TimeoutManagerPolicy};
+pub use timeout::{TimeoutGuard, TimeoutManager, TimeoutManagerPolicy};
 
 #[cfg(feature = "lock")]
 pub use lock::{LockConfig, LockManager, LockScopeGuard, OptimizedLockGuard};
 
 #[cfg(feature = "deadlock")]
-pub use deadlock::{DeadlockConfig, DeadlockManager, DeadlockMonitorPolicy, RequestTracker};
+pub use deadlock::{DeadlockManager, DeadlockMonitorPolicy, RequestTracker};
 
 #[cfg(feature = "backpressure")]
-pub use backpressure::{BackpressureConfig, BackpressureManager, BackpressurePipe, PipeBackpressurePolicy};
+pub use backpressure::{BackpressureManager, BackpressurePipe, PipeBackpressurePolicy};
 
 #[cfg(feature = "scheduler")]
-pub use scheduler::{IoStrategy, SchedulerConfig, SchedulerManager, SchedulerPolicy};
+pub use scheduler::{IoStrategy, SchedulerManager, SchedulerPolicy};
 
 // Configuration
 mod config;
@@ -155,19 +155,19 @@ pub mod prelude {
     //! Prelude module for convenient imports
 
     #[cfg(feature = "timeout")]
-    pub use crate::timeout::{TimeoutConfig, TimeoutGuard, TimeoutManager, TimeoutManagerPolicy};
+    pub use crate::timeout::{TimeoutGuard, TimeoutManager, TimeoutManagerPolicy};
 
     #[cfg(feature = "lock")]
     pub use crate::lock::{LockConfig, LockManager, LockScopeGuard, OptimizedLockGuard};
 
     #[cfg(feature = "deadlock")]
-    pub use crate::deadlock::{DeadlockConfig, DeadlockManager, DeadlockMonitorPolicy, RequestTracker};
+    pub use crate::deadlock::{DeadlockManager, DeadlockMonitorPolicy, RequestTracker};
 
     #[cfg(feature = "backpressure")]
-    pub use crate::backpressure::{BackpressureConfig, BackpressureManager, BackpressurePipe, PipeBackpressurePolicy};
+    pub use crate::backpressure::{BackpressureManager, BackpressurePipe, PipeBackpressurePolicy};
 
     #[cfg(feature = "scheduler")]
-    pub use crate::scheduler::{IoStrategy, SchedulerConfig, SchedulerManager, SchedulerPolicy};
+    pub use crate::scheduler::{IoStrategy, SchedulerManager, SchedulerPolicy};
 
     pub use crate::{ConcurrencyConfig, ConcurrencyFeatures, ConcurrencyManager};
 }
