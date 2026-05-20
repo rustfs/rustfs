@@ -77,6 +77,10 @@ pub struct GetObjectTimeoutPolicy {
     pub max_timeout: Duration,
 }
 
+/// Backward-compatible alias for external callers using the previous name.
+#[deprecated(note = "use GetObjectTimeoutPolicy instead")]
+pub type TimeoutConfig = GetObjectTimeoutPolicy;
+
 impl Default for GetObjectTimeoutPolicy {
     fn default() -> Self {
         Self {

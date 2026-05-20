@@ -1916,9 +1916,8 @@ pub fn get_buffer_size_opt_in(file_size: i64) -> usize {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use tokio::test;
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_basic() {
         let config = IoPriorityQueueConfig::default();
@@ -1937,7 +1936,7 @@ mod tests {
         assert_eq!(queue.len().await, 3);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_dequeue_order() {
         let config = IoPriorityQueueConfig::default();
@@ -1965,7 +1964,7 @@ mod tests {
         assert!(queue.is_empty().await);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_status() {
         let config = IoPriorityQueueConfig::default();
@@ -1983,7 +1982,7 @@ mod tests {
         assert_eq!(status.low_priority_waiting, 1);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_starvation_prevention() {
         let config = IoPriorityQueueConfig {
@@ -2007,7 +2006,7 @@ mod tests {
         assert_eq!(priority, IoPriority::Normal);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_from_size() {
         // High priority: < 1MB
@@ -2023,7 +2022,7 @@ mod tests {
         assert_eq!(IoPriority::from_size(100 * 1024 * 1024), IoPriority::Low);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_load_level_from_wait_duration() {
         use std::time::Duration;
@@ -2041,7 +2040,7 @@ mod tests {
         assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(300)), IoLoadLevel::Critical);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_scheduler_config_default() {
         let config = IoSchedulerConfig::default();
@@ -2083,7 +2082,7 @@ mod tests {
         assert_eq!(core.starvation_threshold, Duration::from_secs(config.starvation_threshold_secs));
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_config_from_scheduler_config() {
         let scheduler_config = IoSchedulerConfig {
@@ -2102,7 +2101,7 @@ mod tests {
         assert_eq!(config.starvation_threshold_secs, 120);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_metrics() {
         let metrics = IoPriorityMetrics::new();
@@ -2129,7 +2128,7 @@ mod tests {
     // Multi-Factor Strategy Tests
     // ============================================
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_nvme_sequential_low_load() {
         // NVMe + Sequential + Low load = maximum buffer size
@@ -2156,7 +2155,7 @@ mod tests {
         assert_eq!(strategy.bandwidth_tier, BandwidthTier::High);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_hdd_random_high_load() {
         // HDD + Random + High load = conservative buffer size
@@ -2183,7 +2182,7 @@ mod tests {
         assert!(strategy.bandwidth_limited, "Low bandwidth should be marked");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_ssd_mixed_medium_load() {
         // SSD + Mixed + Medium load = moderate buffer
@@ -2211,7 +2210,7 @@ mod tests {
         assert_eq!(strategy.access_pattern, AccessPattern::Mixed);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_critical_load_disables_features() {
         // Any media + Critical load = minimal features
@@ -2236,7 +2235,7 @@ mod tests {
         assert!(strategy.buffer_size < 200 * 1024, "Critical load should reduce buffer");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_buffer_cap_enforcement() {
         // Test that storage media caps are enforced
@@ -2261,7 +2260,7 @@ mod tests {
         assert!(strategy.debug_info.buffer_cap_applied, "Buffer cap should be applied");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_bandwidth_low_reduces_buffer() {
         // Low bandwidth should reduce buffer
@@ -2285,7 +2284,7 @@ mod tests {
         assert!(strategy.buffer_size < context.base_buffer_size, "Low bandwidth should reduce buffer");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_high_concurrency_reduction() {
         // High concurrency should reduce buffer
@@ -2308,7 +2307,7 @@ mod tests {
         assert!(strategy.buffer_size < context.base_buffer_size, "High concurrency should reduce buffer");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_sequential_boost() {
         // Sequential reads should get boost
@@ -2350,7 +2349,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_unknown_media_conservative() {
         // Unknown media should be conservative
@@ -2376,7 +2375,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_priority_classification() {
         // Test priority classification based on file size
@@ -2423,7 +2422,7 @@ mod tests {
         assert_eq!(large_strategy.priority, IoPriority::Low);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_readahead_decision_matrix() {
         // Test readahead enable/disable logic
@@ -2509,7 +2508,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_buffer_multiplier_stages() {
         // Test that all multiplier stages are applied
@@ -2544,7 +2543,7 @@ mod tests {
         assert!(strategy.should_reduce_for_bandwidth);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_compatibility_path() {
         // Test that compatibility path (from_wait_duration) still works

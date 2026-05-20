@@ -70,16 +70,23 @@ pub struct TimeoutManager {
 impl TimeoutManager {
     /// Create a new timeout manager
     pub fn new(default_timeout: Duration, max_timeout: Duration, enable_dynamic: bool) -> Self {
+        let min_timeout = default_timeout.min(max_timeout);
         Self::from_policy(TimeoutManagerPolicy {
             default_timeout,
             max_timeout,
+            min_timeout,
             enable_dynamic,
-            ..Default::default()
         })
     }
 
     /// Create a new timeout manager from the facade policy type.
     pub fn from_policy(config: TimeoutManagerPolicy) -> Self {
+        let config = TimeoutManagerPolicy {
+            // Guard clamp(min, max) from panic when callers provide an
+            // out-of-order policy (or very small max_timeout).
+            min_timeout: config.min_timeout.min(config.max_timeout),
+            ..config
+        };
         let core_config = config.to_core_config();
         Self { config, core_config }
     }
@@ -181,6 +188,26 @@ mod tests {
         assert_eq!(core.min_timeout, policy.min_timeout);
         assert_eq!(core.get_object_timeout, policy.default_timeout);
         assert!(core.enable_dynamic_timeout);
+    }
+
+    #[test]
+    fn test_timeout_manager_new_sanitizes_min_timeout_with_small_max_timeout() {
+        let manager = TimeoutManager::new(Duration::from_secs(1), Duration::from_secs(1), true);
+        let timeout = manager.calculate_timeout(1024, &[]);
+        assert_eq!(timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_timeout_manager_from_policy_sanitizes_min_timeout() {
+        let manager = TimeoutManager::from_policy(TimeoutManagerPolicy {
+            default_timeout: Duration::from_secs(30),
+            max_timeout: Duration::from_secs(1),
+            min_timeout: Duration::from_secs(5),
+            enable_dynamic: true,
+        });
+
+        assert_eq!(manager.config().min_timeout, Duration::from_secs(1));
+        assert_eq!(manager.core_config().min_timeout, Duration::from_secs(1));
     }
 
     #[tokio::test]
