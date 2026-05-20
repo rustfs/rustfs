@@ -312,6 +312,12 @@ impl SizeHistogram {
         }
         res
     }
+
+    pub fn merge_from(&mut self, other: &Self) {
+        for (dst, src) in self.0.iter_mut().zip(other.0.iter()) {
+            *dst += src;
+        }
+    }
 }
 
 /// Versions histogram for version count distribution
@@ -360,6 +366,12 @@ impl VersionsHistogram {
             res.insert(name.to_string(), *count);
         }
         res
+    }
+
+    pub fn merge_from(&mut self, other: &Self) {
+        for (dst, src) in self.0.iter_mut().zip(other.0.iter()) {
+            *dst += src;
+        }
     }
 }
 
@@ -419,6 +431,9 @@ pub struct DataUsageEntry {
     pub obj_versions: VersionsHistogram,
     pub replication_stats: Option<ReplicationAllStats>,
     pub compacted: bool,
+    /// Number of objects that failed to scan (e.g., IO errors)
+    #[serde(default)]
+    pub failed_objects: usize,
 }
 
 impl DataUsageEntry {
@@ -456,6 +471,7 @@ impl DataUsageEntry {
         self.versions += other.versions;
         self.delete_markers += other.delete_markers;
         self.size += other.size;
+        self.failed_objects += other.failed_objects;
 
         if let Some(o_rep) = &other.replication_stats {
             let s_rep = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
@@ -490,9 +506,11 @@ impl DataUsageEntry {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageCacheInfo {
     pub name: String,
-    pub next_cycle: u32,
+    pub next_cycle: u64,
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
+    #[serde(default)]
+    pub failed_objects: HashMap<String, u64>,
 }
 
 /// Data usage cache

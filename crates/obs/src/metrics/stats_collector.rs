@@ -27,7 +27,7 @@ use crate::metrics::collectors::{
     ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
 use chrono::Utc;
-use rustfs_common::{internode_metrics::global_internode_metrics, metrics::global_metrics};
+use rustfs_common::metrics::global_metrics;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, GLOBAL_TransitionState};
 use rustfs_ecstore::bucket::metadata_sys::get_quota_config;
 use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
@@ -37,6 +37,7 @@ use rustfs_ecstore::pools::{get_total_usable_capacity, get_total_usable_capacity
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
+use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -354,6 +355,8 @@ pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationS
             proxied_get_requests_failures: proxy.get_failed.max(0) as u64,
             proxied_head_requests_total: proxy.head_total.max(0) as u64,
             proxied_head_requests_failures: proxy.head_failed.max(0) as u64,
+            proxied_put_requests_total: proxy.put_total.max(0) as u64,
+            proxied_put_requests_failures: proxy.put_failed.max(0) as u64,
             proxied_put_tagging_requests_total: proxy.put_tag_total.max(0) as u64,
             proxied_put_tagging_requests_failures: proxy.put_tag_failed.max(0) as u64,
             proxied_get_tagging_requests_total: proxy.get_tag_total.max(0) as u64,

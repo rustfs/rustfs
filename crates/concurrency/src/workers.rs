@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Worker slot limiter used by long-running background workflows.
+
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tracing::info;
 
+/// Cooperative worker-slot controller for async tasks.
 pub struct Workers {
     available: Mutex<usize>, // Available working slots
     notify: Notify,          // Used to notify waiting tasks
@@ -23,20 +26,20 @@ pub struct Workers {
 }
 
 impl Workers {
-    // Create a Workers object that allows up to n jobs to execute concurrently
-    pub fn new(n: usize) -> Result<Arc<Workers>, &'static str> {
+    /// Create a [`Workers`] object that allows up to `n` jobs to execute concurrently.
+    pub fn new(n: usize) -> Result<Arc<Self>, &'static str> {
         if n == 0 {
             return Err("n must be > 0");
         }
 
-        Ok(Arc::new(Workers {
+        Ok(Arc::new(Self {
             available: Mutex::new(n),
             notify: Notify::new(),
             limit: n,
         }))
     }
 
-    // Give a job a chance to be executed
+    /// Acquire a worker slot, waiting until one becomes available.
     pub async fn take(&self) {
         loop {
             let mut available = self.available.lock().await;
@@ -51,7 +54,7 @@ impl Workers {
         }
     }
 
-    // Release a job's slot
+    /// Release a worker slot.
     pub async fn give(&self) {
         let mut available = self.available.lock().await;
         info!("worker give, {}", *available);
@@ -59,7 +62,7 @@ impl Workers {
         self.notify.notify_one(); // Notify a waiting task
     }
 
-    // Wait for all concurrent jobs to complete
+    /// Wait until all worker slots are released.
     pub async fn wait(&self) {
         loop {
             {
@@ -74,6 +77,7 @@ impl Workers {
         info!("worker wait end");
     }
 
+    /// Return the current number of available worker slots.
     pub async fn available(&self) -> usize {
         *self.available.lock().await
     }

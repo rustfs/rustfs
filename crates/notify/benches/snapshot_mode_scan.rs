@@ -6,7 +6,7 @@ use tokio::runtime::Runtime;
 
 fn build_rule_map(target: &TargetID) -> RulesMap {
     let mut rules_map = RulesMap::new();
-    rules_map.add_rule_config(&[rustfs_s3_common::EventName::ObjectCreatedPut], "*".to_string(), target.clone());
+    rules_map.add_rule_config(&[rustfs_s3_types::EventName::ObjectCreatedPut], "*".to_string(), target.clone());
     rules_map
 }
 

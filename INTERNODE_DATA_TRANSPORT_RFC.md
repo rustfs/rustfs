@@ -169,6 +169,7 @@ Existing benchmark assets:
 - `scripts/run_object_batch_bench_enhanced.sh`
 - `scripts/run_object_batch_bench_abc.sh`
 - `scripts/run_four_node_cluster_failover_bench.sh`
+- `scripts/run_internode_transport_baseline.sh` (scenario matrix wrapper for local vs distributed TCP baseline artifacts)
 - Criterion benches under `crates/ecstore/benches/`
 
 These mostly cover S3/object workload or erasure coding performance. They do
@@ -221,6 +222,15 @@ Collect:
 The baseline should produce a machine-readable artifact, for example
 `target/bench/internode-transport/<timestamp>/summary.csv`, plus the exact
 commands and configuration used.
+
+### Baseline runner entry point
+
+Use `scripts/run_internode_transport_baseline.sh` to execute a reproducible
+S3 PUT/GET matrix against `local` and `distributed` scenarios and export:
+
+- `summary.csv` (throughput/latency summary per workload and object size)
+- `internode_metric_deltas.csv` (operation-level internode metric deltas when
+  `--metrics-url` is provided)
 
 ## Transport Abstraction Proposal
 

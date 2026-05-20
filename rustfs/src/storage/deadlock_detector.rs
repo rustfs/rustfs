@@ -40,9 +40,9 @@
 //! # Usage
 //!
 //! ```ignore
-//! use crate::storage::deadlock_detector::{DeadlockDetector, DeadlockDetectorConfig};
+//! use crate::storage::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
 //!
-//! let config = DeadlockDetectorConfig::from_env();
+//! let config = RequestHangDetectionPolicy::from_env();
 //! let detector = DeadlockDetector::new(config);
 //! detector.start();
 //!
@@ -66,6 +66,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use metrics::counter;
+use rustfs_io_core::DeadlockDetectorConfig as CoreDeadlockConfig;
 
 /// Request identifier type.
 pub type RequestId = String;
@@ -73,9 +74,9 @@ pub type RequestId = String;
 /// Lock identifier type.
 pub type LockId = String;
 
-/// Deadlock detector configuration.
+/// Request-level hang and deadlock diagnosis policy.
 #[derive(Debug, Clone)]
-pub struct DeadlockDetectorConfig {
+pub struct RequestHangDetectionPolicy {
     /// Whether deadlock detection is enabled.
     pub enabled: bool,
     /// Detection check interval.
@@ -86,7 +87,7 @@ pub struct DeadlockDetectorConfig {
     pub capture_backtrace: bool,
 }
 
-impl Default for DeadlockDetectorConfig {
+impl Default for RequestHangDetectionPolicy {
     fn default() -> Self {
         Self {
             enabled: rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
@@ -97,7 +98,7 @@ impl Default for DeadlockDetectorConfig {
     }
 }
 
-impl DeadlockDetectorConfig {
+impl RequestHangDetectionPolicy {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let enabled = rustfs_utils::get_env_bool(
@@ -118,6 +119,15 @@ impl DeadlockDetectorConfig {
             check_interval,
             hang_threshold,
             capture_backtrace: false,
+        }
+    }
+
+    /// Convert the request-level policy into the shared io-core deadlock config.
+    pub fn to_core_config(&self) -> CoreDeadlockConfig {
+        CoreDeadlockConfig {
+            enabled: self.enabled,
+            detection_interval: self.check_interval,
+            max_hold_time: self.hang_threshold,
         }
     }
 }
@@ -247,7 +257,7 @@ pub struct ResourceUsage {
 /// Deadlock detector.
 pub struct DeadlockDetector {
     /// Configuration.
-    config: DeadlockDetectorConfig,
+    config: RequestHangDetectionPolicy,
     /// Active request trackers.
     requests: Arc<RwLock<HashMap<RequestId, RequestResourceTracker>>>,
     /// Detection task handle.
@@ -262,7 +272,7 @@ pub struct DeadlockDetector {
 
 impl DeadlockDetector {
     /// Create a new deadlock detector.
-    pub fn new(config: DeadlockDetectorConfig) -> Self {
+    pub fn new(config: RequestHangDetectionPolicy) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         Self {
@@ -426,7 +436,7 @@ impl DeadlockDetector {
     /// Detect deadlock cycles in the lock wait graph.
     fn detect_cycle(
         requests: &Arc<RwLock<HashMap<RequestId, RequestResourceTracker>>>,
-        config: &DeadlockDetectorConfig,
+        config: &RequestHangDetectionPolicy,
         deadlocks_detected: &Arc<AtomicU64>,
     ) {
         let requests_guard = requests.read().unwrap();
@@ -499,13 +509,16 @@ impl DeadlockDetector {
 
     /// Find a cycle in the wait graph using DFS.
     fn find_cycle(edges: &[WaitGraphEdge]) -> Option<Vec<RequestId>> {
-        // Build adjacency list
+        if edges.is_empty() {
+            return None;
+        }
+
+        // Build adjacency list: from -> [to]
         let mut graph: HashMap<&RequestId, Vec<&RequestId>> = HashMap::new();
         for edge in edges {
             graph.entry(&edge.from).or_default().push(&edge.to);
         }
 
-        // DFS with path tracking
         let mut visited: HashSet<&RequestId> = HashSet::new();
         let mut path: Vec<&RequestId> = Vec::new();
         let mut path_set: HashSet<&RequestId> = HashSet::new();
@@ -514,7 +527,6 @@ impl DeadlockDetector {
             if visited.contains(start) {
                 continue;
             }
-
             if Self::dfs_find_cycle(start, &graph, &mut visited, &mut path, &mut path_set) {
                 return Some(path.iter().map(|s| (*s).clone()).collect());
             }
@@ -543,7 +555,6 @@ impl DeadlockDetector {
                     path.drain(0..cycle_start);
                     return true;
                 }
-
                 if !visited.contains(neighbor) && Self::dfs_find_cycle(neighbor, graph, visited, path, path_set) {
                     return true;
                 }
@@ -569,7 +580,7 @@ static DEADLOCK_DETECTOR: std::sync::OnceLock<Arc<DeadlockDetector>> = std::sync
 pub fn get_deadlock_detector() -> Arc<DeadlockDetector> {
     DEADLOCK_DETECTOR
         .get_or_init(|| {
-            let config = DeadlockDetectorConfig::from_env();
+            let config = RequestHangDetectionPolicy::from_env();
             Arc::new(DeadlockDetector::new(config))
         })
         .clone()
@@ -595,7 +606,7 @@ mod tests {
 
     #[test]
     fn test_deadlock_detector_config_default() {
-        let config = DeadlockDetectorConfig::default();
+        let config = RequestHangDetectionPolicy::default();
         assert!(!config.enabled);
         assert_eq!(config.check_interval, Duration::from_secs(5));
         assert_eq!(config.hang_threshold, Duration::from_secs(10));
@@ -621,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_deadlock_detector_registration() {
-        let config = DeadlockDetectorConfig {
+        let config = RequestHangDetectionPolicy {
             enabled: true,
             ..Default::default()
         };

@@ -19,13 +19,13 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::backpressure::{BackpressureConfig, BackpressureMonitor, BackpressureState};
+    use crate::storage::backpressure::{BackpressureMonitor, BackpressureState, ObjectPipeBackpressurePolicy};
     use crate::storage::concurrency::{IoLoadLevel, IoPriority};
     use crate::storage::deadlock_detector::{
-        DeadlockDetector, DeadlockDetectorConfig, LockInfo, LockType, RequestResourceTracker,
+        DeadlockDetector, LockInfo, LockType, RequestHangDetectionPolicy, RequestResourceTracker,
     };
     use crate::storage::lock_optimizer::{LockOptimizeConfig, LockOptimizer, LockStats};
-    use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimedGetObjectResult, TimeoutConfig};
+    use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper, TimedGetObjectResult};
     use std::time::Duration;
 
     // ============================================
@@ -34,7 +34,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_wrapper_completes_within_timeout() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::from_secs(5),
             ..Default::default()
         };
@@ -52,7 +52,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_wrapper_times_out() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::from_millis(50),
             ..Default::default()
         };
@@ -76,7 +76,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_wrapper_returns_error() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::from_secs(5),
             ..Default::default()
         };
@@ -94,7 +94,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout_wrapper_disabled() {
-        let config = TimeoutConfig {
+        let config = GetObjectTimeoutPolicy {
             get_object_timeout: Duration::ZERO,
             ..Default::default()
         };
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_config_defaults() {
-        let config = BackpressureConfig::default();
+        let config = ObjectPipeBackpressurePolicy::default();
         assert_eq!(config.buffer_size, 4 * 1024 * 1024); // 4MB
         assert_eq!(config.high_watermark, 80);
         assert_eq!(config.low_watermark, 50);
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_monitor_state_transitions() {
-        let config = BackpressureConfig {
+        let config = ObjectPipeBackpressurePolicy {
             buffer_size: 1000,
             high_watermark: 80,
             low_watermark: 50,
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_usage_percent() {
-        let config = BackpressureConfig {
+        let config = ObjectPipeBackpressurePolicy {
             buffer_size: 1000,
             high_watermark: 80,
             low_watermark: 50,
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_deadlock_detector_config_defaults() {
-        let config = DeadlockDetectorConfig::default();
+        let config = RequestHangDetectionPolicy::default();
         assert!(!config.enabled); // Disabled by default
         assert_eq!(config.check_interval, Duration::from_secs(5));
         assert_eq!(config.hang_threshold, Duration::from_secs(10));
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_deadlock_detector_registration() {
-        let config = DeadlockDetectorConfig {
+        let config = RequestHangDetectionPolicy {
             enabled: true,
             ..Default::default()
         };

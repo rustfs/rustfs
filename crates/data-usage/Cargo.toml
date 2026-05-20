@@ -13,24 +13,26 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-workers"
+name = "rustfs-data-usage"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
 homepage.workspace = true
-description = "Workers for RustFS, providing background processing capabilities for tasks such as data synchronization, indexing, and more."
-keywords = ["workers", "tasks", "rustfs", "Minio"]
-categories = ["web-programming", "development-tools"]
-documentation = "https://docs.rs/rustfs-workers/latest/rustfs_workers/"
+description = "Shared data usage models and algorithms for RustFS"
+keywords = ["rustfs", "data-usage", "cache", "histogram"]
+categories = ["data-structures", "filesystem"]
 
 [lints]
 workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["sync", "time", "macros"] }
-tracing.workspace = true
+serde = { workspace = true }
+path-clean = { workspace = true }
+rmp-serde = { workspace = true }
+async-trait = { workspace = true }
+rustfs-filemeta = { workspace = true }
 
 [lib]
 doctest = false
