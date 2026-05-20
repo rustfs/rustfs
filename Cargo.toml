@@ -115,7 +115,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.3" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
-mysql_async = { version = "0.36.1", default-features = false, features = ["default-rustls", "tracing"], git = "https://github.com/blackbeam/mysql_async", rev = "98d3d8067efdf97d3e93cdca7b9231753c904aca" }
+mysql_async = { version = "0.36.1", default-features = false, features = ["default-rustls", "tracing"], git = "https://github.com/blackbeam/mysql_async", rev = "2bad388283bc3ce48801fc2ffcd22445eb6f3d24" }
 async-compression = { version = "0.4.42" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
@@ -166,7 +166,7 @@ aes-gcm = { version = "0.11.0-rc.3", features = ["rand_core"] }
 argon2 = { version = "0.6.0-rc.8" }
 blake2 = "0.11.0-rc.6"
 chacha20poly1305 = { version = "0.11.0-rc.3" }
-crc-fast = "1.9.0"
+crc-fast = "1.10.0"
 hmac = { version = "0.13.0" }
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
 openidconnect = { version = "4.0", default-features = false }
@@ -201,7 +201,7 @@ aws-config = { version = "1.8.16" }
 aws-credential-types = { version = "1.2.14" }
 aws-sdk-s3 = { version = "1.132.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-smithy-http-client = { version = "1.1.12", default-features = false, features = ["default-client", "rustls-aws-lc"] }
-aws-smithy-types = { version = "1.4.7" }
+aws-smithy-types = { version = "1.4.8" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.2"
@@ -229,7 +229,7 @@ ipnetwork = { version = "0.21.1", features = ["serde"] }
 lazy_static = "1.5.0"
 libc = "0.2.186"
 libsystemd = "0.7.2"
-local-ip-address = "0.6.12"
+local-ip-address = "0.6.13"
 memmap2 = "0.9.10"
 lz4 = "1.28.1"
 matchit = "0.9.2"
@@ -299,7 +299,7 @@ opentelemetry-otlp = { version = "0.32.0", features = ["gzip-http", "reqwest-rus
 opentelemetry_sdk = { version = "0.32.0", features = ["rt-tokio"] }
 opentelemetry-semantic-conventions = { version = "0.32.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.32.0" }
-pyroscope = { version = "2.0.3", features = ["backend-pprof-rs"] }
+pyroscope = { version = "2.0.4", features = ["backend-pprof-rs"] }
 
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
