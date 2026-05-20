@@ -25,7 +25,6 @@
 /// "2fc12fc1" => "zfs",
 /// "ff534d42" => "cifs",
 /// "53464846" => "wslfs",
-#[cfg(target_os = "linux")]
 pub(crate) fn get_fs_type(fs_type: u64) -> &'static str {
     // Magic numbers for various filesystems.
     match fs_type {
@@ -43,10 +42,7 @@ pub(crate) fn get_fs_type(fs_type: u64) -> &'static str {
 }
 
 #[cfg(test)]
-#[cfg(target_os = "linux")]
 mod tests {
-    use super::*;
-
     #[test]
     fn map_common_linux_filesystem_magic_numbers() {
         assert_eq!(get_fs_type(0x58465342), "XFS");
