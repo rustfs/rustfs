@@ -1,22 +1,33 @@
 ---
 name: rustfs-release-version-bump
-description: Prepare a RustFS release branch like PR #2957 by bumping versioned files, aligning release assets, running required verification, and finishing with commit, push, and gh PR creation. Use when publishing a new RustFS alpha, beta, or stable release.
+description: Publish a RustFS alpha/beta/stable release with an auditable flow: confirm target version and scope, update workspace and release assets (including strict rustfs.spec changelog identity/date/version format), run required verification, and finish with commit, push, and GitHub PR creation.
 ---
 
 # RustFS Release Version Bump
 
-Use this skill when the task is to prepare a new RustFS version release branch following the pattern validated in PR `#2957`.
+Use this skill to publish a RustFS release (alpha, beta, or stable) with a minimal, auditable diff and a complete ship flow (`edit -> verify -> commit -> push -> PR`).
 
-## Read first
+Validated baseline: release pattern used in PR `#2957`.
 
-- Read `AGENTS.md`.
-- Read `.github/pull_request_template.md`.
-- Inspect the current branch diff against `origin/main`.
-- Do not assume every release file should change in the same way every time.
+## Required inputs
 
-## Scope validated by PR #2957
+- Exact target version, for example `1.0.0-beta.4`.
+- Delivery scope:
+- Local only (`edit/verify`).
+- Local + git (`commit/push`).
+- Full GitHub flow (`commit/push/PR`).
 
-The `1.0.0-beta.3` release branch updated these files:
+If target version is missing or ambiguous, stop and ask before editing.
+
+## Read before editing
+
+- `AGENTS.md` (root and nearest path-specific files).
+- `.github/pull_request_template.md`.
+- Current branch status and diff against `origin/main`.
+
+## Default release file scope
+
+Treat the following file list as the default checklist for each release bump:
 
 - `Cargo.toml`
 - `Cargo.lock`
@@ -26,78 +37,89 @@ The `1.0.0-beta.3` release branch updated these files:
 - `helm/rustfs/Chart.yaml`
 - `rustfs.spec`
 
-Treat this file list as the default checklist for future release bumps. Only drop a file if the repository's current release pattern clearly says it is no longer part of the publish flow.
+Only drop a file when the current repository release process clearly no longer requires it.
 
-## Workflow
+## Hard release policy
 
-1. Confirm release intent
-- Identify the target version string exactly, for example `1.0.0-beta.4`.
-- Check whether the user wants only local commit preparation or the full `commit + push + PR` flow.
-- Compare the branch against `origin/main` and isolate only release-related edits.
-- If the target version is not explicit, stop and ask for it before editing.
+- Docker doc tags use `<version>` (for example `rustfs/rustfs:1.0.0-beta.4`), not `v<version>`.
+- Helm chart version mapping follows `beta.N -> 0.N.0`.
+- `rustfs.spec` `Release` uses prerelease suffix only (for example `beta.4`).
+- Do not change these rules without explicit confirmation.
 
-2. Update core Rust workspace versions
-- Bump the workspace version in `Cargo.toml`.
-- Bump all internal workspace crate versions in `Cargo.toml`.
-- Ensure `Cargo.lock` reflects the same release version for workspace packages.
-- Re-read the diff and verify there are no partial version leftovers.
+## Step-by-step workflow
 
-3. Align release assets
-- Update versioned Docker examples in `README.md` and `README_ZH.md` using the `<version>` tag form, for example `rustfs/rustfs:1.0.0-beta.4`.
-- Update `flake.nix` package version.
-- Update `helm/rustfs/Chart.yaml` `appVersion`.
-- Update `helm/rustfs/Chart.yaml` `version` using the release-chart rule:
+1. Confirm intent and isolate scope
+- Confirm target version string exactly.
+- Confirm whether user requested local-only or full GitHub flow.
+- Inspect current branch and ensure only release-related files are touched for this task.
+
+2. Update workspace versions
+- Bump `[workspace.package].version` in `Cargo.toml`.
+- Bump internal workspace crate dependency versions in `Cargo.toml`.
+- Update `Cargo.lock` so workspace package versions match target version.
+- Re-scan for partial leftovers.
+
+3. Update release assets
+- `README.md` and `README_ZH.md`: update versioned Docker examples to target version.
+- `flake.nix`: update package version to target version.
+- `helm/rustfs/Chart.yaml`:
+- `appVersion` = target version.
+- `version` follows chart mapping rule, for example:
 - `1.0.0-beta.3` -> `0.3.0`
 - `1.0.0-beta.4` -> `0.4.0`
-- Follow the same pattern for later beta releases unless the repository rule changes.
-- Update `rustfs.spec` release metadata and changelog entry.
-- Set `rustfs.spec` `Release` to the prerelease suffix without the base version, for example `beta.3` for `1.0.0-beta.3`.
-- Keep the release asset changes in a separate commit from the core Rust workspace version bump when the branch contains both.
+- `rustfs.spec`:
+- Set `Release` to prerelease suffix (example `beta.4`).
+- Add/update top changelog entry with exact format:
+- `* Thu May 20 2026 houseme <housemecn@gmail.com>`
+- `- Update RPM package to RustFS 1.0.0-beta.4`
+- Changelog identity and time must come from current environment:
+- `git config --get user.name`
+- `git config --get user.email`
+- `date '+%a %b %d %Y'`
+- Changelog version text must match target release version exactly.
 
-4. Stop and discuss before changing release policy
-- Ask before changing the established Docker tag style away from `<version>`.
-- Ask before changing the established Helm chart version mapping away from `beta.N -> 0.N.0`.
-- Ask before changing the established `rustfs.spec` `Release` rule away from the release suffix form such as `beta.N`.
-- Ask before widening the release scope beyond the files already validated in PR `#2957`.
+4. Verify before shipping
+- Run:
+- `cargo fmt --all`
+- `cargo fmt --all --check`
+- `make pre-commit`
+- If verification passes, run `cargo clean`.
+- If `make pre-commit` fails, return `BLOCKED` with root cause and do not silently widen scope to fix unrelated issues unless user asks.
 
-5. Verify before shipping
-- Run `make pre-commit`.
-- If verification succeeds, run `cargo clean` to remove generated build artifacts before wrapping up.
-- If `make pre-commit` fails, stop and return `BLOCKED`.
+5. Commit strategy
+- Preferred split when both parts changed:
+- `chore(release): prepare <version>` for `Cargo.toml` and `Cargo.lock`.
+- `chore(release): align release assets for <version>` for docs and packaging files.
+- If user asks for one commit, use one commit.
+- Stage only intended release files; do not include unrelated working tree changes.
 
-6. Commit structure
-- Prefer two commits when the change naturally splits:
-- `chore(release): prepare <version>` for `Cargo.toml` and `Cargo.lock`
-- `chore(release): align release assets for <version>` for docs and packaging metadata
-- If the user asks for a single commit, follow that request.
+6. Push and PR
+- Push branch:
+- `git push -u origin <branch>` (first push), or `git push` (tracking already exists).
+- Create PR with template headings unchanged:
+- `gh pr create --base main --head <branch> --title ... --body-file ...`
+- PR title/body must be English.
+- Use `N/A` for non-applicable template sections.
+- Include verification commands and any `BLOCKED` reason clearly.
 
-7. Push and PR
-- Push the release branch with `git push -u origin <branch>` or `git push` if upstream already exists.
-- Create the PR with `gh pr create --base main --head <branch> --title ... --body-file ...`.
-- Keep the PR title and body in English.
-- Keep the `.github/pull_request_template.md` headings exactly.
+## Recommended check commands
 
-## Ready-to-check commands
-
+- `git status --short --branch`
 - `git diff --name-only origin/main...HEAD`
 - `git diff --stat origin/main...HEAD`
+- `rg -n "<old_version>|<new_version>" Cargo.toml Cargo.lock README.md README_ZH.md flake.nix helm/rustfs/Chart.yaml rustfs.spec`
+- `cargo fmt --all`
+- `cargo fmt --all --check`
 - `make pre-commit`
 - `cargo clean`
-- `git status --short --branch`
 
-## Output expectations
+## Output contract
 
-When using this skill, return:
+When using this skill, always report:
 
-- The files changed for the release bump
-- Any uncertainty that needs user confirmation before editing
-- Verification status
-- Commit messages used
-- Push status and PR URL when the GitHub flow was requested
-
-## Established release policy
-
-- Docs use Docker tags in `<version>` form, not `v<version>`.
-- `helm/rustfs/Chart.yaml` `version` follows `beta.N -> 0.N.0` based on the current release policy.
-- `rustfs.spec` `Release` follows the release suffix form, for example `beta.3`.
-- If any of these rules need to change in the future, pause and confirm before editing.
+- Target version.
+- Files changed.
+- Any assumptions or uncertainties requiring confirmation.
+- Verification result (`PASSED` or `BLOCKED`) with key evidence.
+- Commit message(s) used.
+- Push status and PR URL when GitHub flow is requested.
