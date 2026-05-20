@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::error::{Error, Result};
 use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
     FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
@@ -27,14 +28,12 @@ use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGu
 use crate::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
 };
-use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
-use crate::{
-    disk::error::{Error, Result},
-    rpc::build_auth_headers,
+use crate::rpc::internode_data_transport::{
+    InternodeDataTransport, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest, build_internode_data_transport_from_env,
 };
+use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use bytes::Bytes;
 use futures::lock::Mutex;
-use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_io_metrics::internode_metrics::{
@@ -49,7 +48,6 @@ use rustfs_protos::proto_gen::node_service::{
     RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
     node_service_client::NodeServiceClient,
 };
-use rustfs_rio::{HttpReader, HttpWriter};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     io::Cursor,
@@ -109,6 +107,7 @@ pub struct RemoteDisk {
     health: Arc<DiskHealthTracker>,
     /// Cancellation token for monitoring tasks
     cancel_token: CancellationToken,
+    data_transport: Arc<dyn InternodeDataTransport>,
 }
 
 impl RemoteDisk {
@@ -130,6 +129,7 @@ impl RemoteDisk {
             health_check: opt.health_check && env_health_check,
             health: Arc::new(DiskHealthTracker::new()),
             cancel_token: CancellationToken::new(),
+            data_transport: build_internode_data_transport_from_env(),
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
 
@@ -1200,23 +1200,16 @@ impl DiskAPI for RemoteDisk {
             "walk_dir",
             || async {
                 let disk = self.disk_ref().await;
-
-                let url = format!("{}/rustfs/rpc/walk_dir?disk={}", self.endpoint.grid_host(), urlencoding::encode(&disk),);
-
                 let opts = serde_json::to_vec(&opts)?;
-
-                let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                build_auth_headers(&url, &Method::GET, &mut headers)?;
-
-                let mut reader = HttpReader::new_with_stall_timeout(
-                    url,
-                    Method::GET,
-                    headers,
-                    Some(opts),
-                    Some(get_drive_walkdir_stall_timeout()),
-                )
-                .await?;
+                let mut reader = self
+                    .data_transport
+                    .open_walk_dir(WalkDirStreamRequest {
+                        endpoint: self.endpoint.grid_host(),
+                        disk,
+                        body: opts,
+                        stall_timeout: Some(get_drive_walkdir_stall_timeout()),
+                    })
+                    .await?;
 
                 copy_stream_with_buffer(&mut reader, wr, DEFAULT_READ_BUFFER_SIZE).await?;
 
@@ -1248,21 +1241,16 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
-
-        let url = format!(
-            "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(&disk),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            offset,
-            length
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::GET, &mut headers)?;
-        Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
+        self.data_transport
+            .open_read(ReadStreamRequest {
+                endpoint: self.endpoint.grid_host(),
+                disk,
+                volume: volume.to_string(),
+                path: path.to_string(),
+                offset,
+                length,
+            })
+            .await
     }
 
     /// Zero-copy read for remote disks falls back to efficient network read.
@@ -1291,21 +1279,16 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
-
-        let url = format!(
-            "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(&disk),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            true,
-            0
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::PUT, &mut headers)?;
-        Ok(Box::new(HttpWriter::new(url, Method::PUT, headers).await?))
+        self.data_transport
+            .open_write(WriteStreamRequest {
+                endpoint: self.endpoint.grid_host(),
+                disk,
+                volume: volume.to_string(),
+                path: path.to_string(),
+                append: true,
+                size: 0,
+            })
+            .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1322,21 +1305,16 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
-
-        let url = format!(
-            "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(&disk),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            false,
-            file_size
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::PUT, &mut headers)?;
-        Ok(Box::new(HttpWriter::new(url, Method::PUT, headers).await?))
+        self.data_transport
+            .open_write(WriteStreamRequest {
+                endpoint: self.endpoint.grid_host(),
+                disk,
+                volume: volume.to_string(),
+                path: path.to_string(),
+                append: false,
+                size: file_size,
+            })
+            .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
