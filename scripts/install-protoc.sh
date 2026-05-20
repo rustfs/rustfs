@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install protoc 33.1 on macOS
+# Install protoc 33.1 on macOS and Linux
 
 set -e
 
@@ -8,15 +8,35 @@ ARCH=$(uname -m)
 INSTALL_DIR="${HOME}/.local/bin"
 PROTOC_BIN="${INSTALL_DIR}/protoc"
 
-# Select download URL based on architecture
-if [ "$ARCH" = "arm64" ]; then
-    # Apple Silicon (M1/M2/M3)
-    PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-osx-aarch_64.zip"
-elif [ "$ARCH" = "x86_64" ]; then
-    # Intel Mac
-    PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-osx-x86_64.zip"
+# Detect OS
+OS="$(uname -s)"
+
+# Select download URL based on OS and architecture
+if [ "$OS" = "Darwin" ]; then
+    if [ "$ARCH" = "arm64" ]; then
+        # Apple Silicon (M1/M2/M3)
+        PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-osx-aarch_64.zip"
+    elif [ "$ARCH" = "x86_64" ]; then
+        # Intel Mac
+        PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-osx-x86_64.zip"
+    else
+        echo "Error: Unsupported macOS architecture $ARCH"
+        exit 1
+    fi
+elif [ "$OS" = "Linux" ]; then
+    if [ "$ARCH" = "x86_64" ]; then
+        PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+    elif [ "$ARCH" = "aarch64" ]; then
+        PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-aarch_64.zip"
+    else
+        echo "Error: Unsupported Linux architecture $ARCH"
+        exit 1
+    fi
 else
-    echo "Error: Unsupported architecture $ARCH"
+    echo "Error: Unsupported OS $OS"
+    echo "On Windows, install protoc via:"
+    echo "  choco install protoc --version=${PROTOC_VERSION}"
+    echo "  or download from https://github.com/protocolbuffers/protobuf/releases"
     exit 1
 fi
 

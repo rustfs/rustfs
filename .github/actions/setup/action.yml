@@ -59,7 +59,7 @@ runs:
     - name: Install protoc
       uses: rustfs/setup-protoc@v3.0.1
       with:
-        version: "29.3"
+        version: "33.1"
         repo-token: ${{ github.token }}
 
     - name: Install flatc
