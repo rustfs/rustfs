@@ -32,6 +32,7 @@
 
 use rustfs_config::{KI_B, MI_B};
 use rustfs_io_core::io_profile::{AccessPattern, StorageMedia, StorageProfile};
+use rustfs_io_core::{IoPriorityQueueConfig as CoreIoPriorityQueueConfig, IoSchedulerConfig as CoreIoSchedulerConfig};
 use rustfs_io_metrics::bandwidth::{BandwidthSnapshot, BandwidthTier};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -129,8 +130,8 @@ impl IoPriority {
     pub fn from_size(size: i64) -> Self {
         Self::from_size_with_thresholds(
             size,
-            IoSchedulerConfig::default().high_priority_size_threshold,
-            IoSchedulerConfig::default().low_priority_size_threshold,
+            rustfs_config::DEFAULT_OBJECT_IO_HIGH_PRIORITY_SIZE_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_IO_LOW_PRIORITY_SIZE_THRESHOLD,
         )
     }
 
@@ -378,6 +379,32 @@ impl IoSchedulerConfig {
                 rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
                 rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
             ),
+        }
+    }
+
+    /// Convert storage-layer scheduler config to io-core scheduler config.
+    ///
+    /// This keeps storage-specific policy loading in place while allowing
+    /// core scheduling components to consume a normalized shared config shape.
+    pub fn to_core_config(&self) -> CoreIoSchedulerConfig {
+        CoreIoSchedulerConfig {
+            max_concurrent_reads: self.max_concurrent_reads,
+            high_priority_size_threshold: self.high_priority_size_threshold,
+            low_priority_size_threshold: self.low_priority_size_threshold,
+            queue_high_capacity: self.queue_high_capacity,
+            queue_normal_capacity: self.queue_normal_capacity,
+            queue_low_capacity: self.queue_low_capacity,
+            starvation_prevention_interval_ms: self.starvation_prevention_interval_ms,
+            starvation_threshold_secs: self.starvation_threshold_secs,
+            load_sample_window: self.load_sample_window,
+            load_high_threshold_ms: self.load_high_threshold_ms,
+            load_low_threshold_ms: self.load_low_threshold_ms,
+            enable_priority: self.enable_priority,
+            storage_detection_enabled: self.storage_detection_enabled,
+            base_buffer_size: rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE,
+            max_buffer_size: MI_B,
+            min_buffer_size: 32 * KI_B,
+            ..Default::default()
         }
     }
 }
@@ -1271,27 +1298,38 @@ impl IoLoadMetrics {
         self.observation_count.load(Ordering::Relaxed)
     }
 }
-pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize) -> usize {
-    let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
+#[derive(Debug, Clone, Copy)]
+struct ConcurrencyThresholds {
+    medium: usize,
+    high: usize,
+}
 
-    // Record concurrent request metrics
-    {
-        use metrics::gauge;
-        gauge!("rustfs_concurrent_get_requests").set(concurrent_requests as f64);
+fn load_concurrency_thresholds() -> ConcurrencyThresholds {
+    ConcurrencyThresholds {
+        medium: rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+        ),
+        high: rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+        ),
     }
+}
+
+fn compute_concurrency_aware_buffer_size(
+    file_size: i64,
+    base_buffer_size: usize,
+    concurrent_requests: usize,
+    thresholds: ConcurrencyThresholds,
+) -> usize {
+    let medium_threshold = thresholds.medium;
+    let high_threshold = thresholds.high;
 
     // For low concurrency, use the base buffer size for maximum throughput
     if concurrent_requests <= 1 {
         return base_buffer_size;
     }
-    let medium_threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
-    );
-    let high_threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
-    );
 
     // Calculate adaptive multiplier based on concurrency level
     let adaptive_multiplier = if concurrent_requests <= 2 {
@@ -1327,6 +1365,18 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     adjusted_size.clamp(min_buffer, max_buffer)
 }
 
+pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize) -> usize {
+    let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
+
+    // Record concurrent request metrics
+    {
+        use metrics::gauge;
+        gauge!("rustfs_concurrent_get_requests").set(concurrent_requests as f64);
+    }
+
+    compute_concurrency_aware_buffer_size(file_size, base_buffer_size, concurrent_requests, load_concurrency_thresholds())
+}
+
 /// Advanced concurrency-aware buffer sizing with file size optimization
 ///
 /// This enhanced version considers both concurrency level and file size patterns
@@ -1353,6 +1403,7 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
 /// ```
 pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequential: bool) -> usize {
     let concurrent_requests = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
+    let thresholds = load_concurrency_thresholds();
 
     // For very small files, use smaller buffers regardless of concurrency
     // Replace manual max/min chain with clamp
@@ -1361,15 +1412,10 @@ pub fn get_advanced_buffer_size(file_size: i64, base_buffer_size: usize, is_sequ
     }
 
     // Base calculation from standard function
-    let standard_size = get_concurrency_aware_buffer_size(file_size, base_buffer_size);
-    let medium_threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
-    );
-    let high_threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
-    );
+    let standard_size = compute_concurrency_aware_buffer_size(file_size, base_buffer_size, concurrent_requests, thresholds);
+
+    let medium_threshold = thresholds.medium;
+    let high_threshold = thresholds.high;
     // For sequential reads, we can be more aggressive with buffer sizes
     if is_sequential && concurrent_requests <= medium_threshold {
         return ((standard_size as f64 * 1.5) as usize).min(2 * MI_B);
@@ -1521,6 +1567,28 @@ impl IoPriorityQueueConfig {
                 rustfs_config::ENV_OBJECT_IO_STARVATION_THRESHOLD_SECS,
                 rustfs_config::DEFAULT_OBJECT_IO_STARVATION_THRESHOLD_SECS,
             ),
+        }
+    }
+
+    /// Convert storage-layer queue config to io-core queue config.
+    pub fn to_core_config(&self) -> CoreIoPriorityQueueConfig {
+        CoreIoPriorityQueueConfig {
+            high_capacity: self.queue_high_capacity,
+            normal_capacity: self.queue_normal_capacity,
+            low_capacity: self.queue_low_capacity,
+            starvation_interval: Duration::from_millis(self.starvation_prevention_interval_ms),
+            starvation_threshold: Duration::from_secs(self.starvation_threshold_secs),
+        }
+    }
+
+    /// Build queue config directly from a scheduler config.
+    pub fn from_scheduler_config(config: &IoSchedulerConfig) -> Self {
+        Self {
+            queue_high_capacity: config.queue_high_capacity,
+            queue_normal_capacity: config.queue_normal_capacity,
+            queue_low_capacity: config.queue_low_capacity,
+            starvation_prevention_interval_ms: config.starvation_prevention_interval_ms,
+            starvation_threshold_secs: config.starvation_threshold_secs,
         }
     }
 }
@@ -1848,9 +1916,8 @@ pub fn get_buffer_size_opt_in(file_size: i64) -> usize {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use tokio::test;
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_basic() {
         let config = IoPriorityQueueConfig::default();
@@ -1869,7 +1936,7 @@ mod tests {
         assert_eq!(queue.len().await, 3);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_dequeue_order() {
         let config = IoPriorityQueueConfig::default();
@@ -1897,7 +1964,7 @@ mod tests {
         assert!(queue.is_empty().await);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_status() {
         let config = IoPriorityQueueConfig::default();
@@ -1915,7 +1982,7 @@ mod tests {
         assert_eq!(status.low_priority_waiting, 1);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_starvation_prevention() {
         let config = IoPriorityQueueConfig {
@@ -1939,7 +2006,7 @@ mod tests {
         assert_eq!(priority, IoPriority::Normal);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_from_size() {
         // High priority: < 1MB
@@ -1955,7 +2022,7 @@ mod tests {
         assert_eq!(IoPriority::from_size(100 * 1024 * 1024), IoPriority::Low);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_load_level_from_wait_duration() {
         use std::time::Duration;
@@ -1973,7 +2040,7 @@ mod tests {
         assert_eq!(IoLoadLevel::from_wait_duration(Duration::from_millis(300)), IoLoadLevel::Critical);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_scheduler_config_default() {
         let config = IoSchedulerConfig::default();
@@ -1987,7 +2054,54 @@ mod tests {
         assert_eq!(config.starvation_threshold_secs, 5);
     }
 
-    #[test]
+    #[tokio::test]
+    #[serial]
+    async fn test_io_scheduler_config_to_core_config() {
+        let config = IoSchedulerConfig::default();
+        let core = config.to_core_config();
+        assert_eq!(core.max_concurrent_reads, config.max_concurrent_reads);
+        assert_eq!(core.high_priority_size_threshold, config.high_priority_size_threshold);
+        assert_eq!(core.low_priority_size_threshold, config.low_priority_size_threshold);
+        assert_eq!(core.queue_high_capacity, config.queue_high_capacity);
+        assert_eq!(core.queue_normal_capacity, config.queue_normal_capacity);
+        assert_eq!(core.queue_low_capacity, config.queue_low_capacity);
+        assert_eq!(core.load_high_threshold_ms, config.load_high_threshold_ms);
+        assert_eq!(core.load_low_threshold_ms, config.load_low_threshold_ms);
+        assert_eq!(core.enable_priority, config.enable_priority);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_io_priority_queue_config_to_core_config() {
+        let config = IoPriorityQueueConfig::default();
+        let core = config.to_core_config();
+        assert_eq!(core.high_capacity, config.queue_high_capacity);
+        assert_eq!(core.normal_capacity, config.queue_normal_capacity);
+        assert_eq!(core.low_capacity, config.queue_low_capacity);
+        assert_eq!(core.starvation_interval, Duration::from_millis(config.starvation_prevention_interval_ms));
+        assert_eq!(core.starvation_threshold, Duration::from_secs(config.starvation_threshold_secs));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_io_priority_queue_config_from_scheduler_config() {
+        let scheduler_config = IoSchedulerConfig {
+            queue_high_capacity: 128,
+            queue_normal_capacity: 256,
+            queue_low_capacity: 512,
+            starvation_prevention_interval_ms: 2000,
+            starvation_threshold_secs: 120,
+            ..Default::default()
+        };
+        let config = IoPriorityQueueConfig::from_scheduler_config(&scheduler_config);
+        assert_eq!(config.queue_high_capacity, 128);
+        assert_eq!(config.queue_normal_capacity, 256);
+        assert_eq!(config.queue_low_capacity, 512);
+        assert_eq!(config.starvation_prevention_interval_ms, 2000);
+        assert_eq!(config.starvation_threshold_secs, 120);
+    }
+
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_metrics() {
         let metrics = IoPriorityMetrics::new();
@@ -2014,7 +2128,7 @@ mod tests {
     // Multi-Factor Strategy Tests
     // ============================================
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_nvme_sequential_low_load() {
         // NVMe + Sequential + Low load = maximum buffer size
@@ -2041,7 +2155,7 @@ mod tests {
         assert_eq!(strategy.bandwidth_tier, BandwidthTier::High);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_hdd_random_high_load() {
         // HDD + Random + High load = conservative buffer size
@@ -2068,7 +2182,7 @@ mod tests {
         assert!(strategy.bandwidth_limited, "Low bandwidth should be marked");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_ssd_mixed_medium_load() {
         // SSD + Mixed + Medium load = moderate buffer
@@ -2096,7 +2210,7 @@ mod tests {
         assert_eq!(strategy.access_pattern, AccessPattern::Mixed);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_critical_load_disables_features() {
         // Any media + Critical load = minimal features
@@ -2121,7 +2235,7 @@ mod tests {
         assert!(strategy.buffer_size < 200 * 1024, "Critical load should reduce buffer");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_buffer_cap_enforcement() {
         // Test that storage media caps are enforced
@@ -2146,7 +2260,7 @@ mod tests {
         assert!(strategy.debug_info.buffer_cap_applied, "Buffer cap should be applied");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_bandwidth_low_reduces_buffer() {
         // Low bandwidth should reduce buffer
@@ -2170,7 +2284,7 @@ mod tests {
         assert!(strategy.buffer_size < context.base_buffer_size, "Low bandwidth should reduce buffer");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_high_concurrency_reduction() {
         // High concurrency should reduce buffer
@@ -2193,7 +2307,7 @@ mod tests {
         assert!(strategy.buffer_size < context.base_buffer_size, "High concurrency should reduce buffer");
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_sequential_boost() {
         // Sequential reads should get boost
@@ -2235,7 +2349,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_unknown_media_conservative() {
         // Unknown media should be conservative
@@ -2261,7 +2375,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_priority_classification() {
         // Test priority classification based on file size
@@ -2308,7 +2422,7 @@ mod tests {
         assert_eq!(large_strategy.priority, IoPriority::Low);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_readahead_decision_matrix() {
         // Test readahead enable/disable logic
@@ -2394,7 +2508,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_buffer_multiplier_stages() {
         // Test that all multiplier stages are applied
@@ -2429,7 +2543,7 @@ mod tests {
         assert!(strategy.should_reduce_for_bandwidth);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_multi_factor_strategy_compatibility_path() {
         // Test that compatibility path (from_wait_duration) still works
