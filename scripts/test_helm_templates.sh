@@ -132,34 +132,60 @@ if [[ $partial_empty_status -eq 0 ]]; then
   exit 1
 fi
 
-# extraVolumes and extraVolumeMounts must appear in standalone Deployment.
+command -v yq >/dev/null 2>&1 || { echo "yq is required for extra-volumes structural tests" >&2; exit 1; }
+
+# Structural helpers: verify wiring at the right YAML paths, not just string presence.
+assert_extra_volumes_wired() {
+  local output="$1" label="$2"
+
+  if ! yq eval '.spec.template.spec.volumes[].name' - <<<"$output" | grep -q "^ca-bundle$"; then
+    echo "ca-bundle not found in spec.template.spec.volumes of $label" >&2
+    exit 1
+  fi
+
+  local mount_path
+  mount_path=$(yq eval '.spec.template.spec.containers[0].volumeMounts[] | select(.name == "ca-bundle") | .mountPath' - <<<"$output")
+  if [[ "$mount_path" != "/etc/ssl/certs/ca.crt" ]]; then
+    echo "ca-bundle mountPath in containers[0] is '$mount_path', expected /etc/ssl/certs/ca.crt in $label" >&2
+    exit 1
+  fi
+
+  if yq eval '.spec.template.spec.initContainers[].volumeMounts[].name' - <<<"$output" | grep -q "^ca-bundle$"; then
+    echo "ca-bundle must not appear in initContainers volumeMounts of $label" >&2
+    exit 1
+  fi
+}
+
+assert_extra_volumes_absent() {
+  local output="$1" label="$2"
+  if yq eval '.spec.template.spec.volumes[].name' - <<<"$output" | grep -q "^ca-bundle$"; then
+    echo "ca-bundle must not appear in spec.template.spec.volumes of $label with empty extraVolumes" >&2
+    exit 1
+  fi
+}
+
+# extraVolumes/extraVolumeMounts: structural placement in standalone Deployment.
 standalone_extra_output=$(render_standalone_deployment \
   --set 'extraVolumes[0].name=ca-bundle' \
   --set 'extraVolumes[0].configMap.name=ca-bundle' \
   --set 'extraVolumeMounts[0].name=ca-bundle' \
   --set 'extraVolumeMounts[0].mountPath=/etc/ssl/certs/ca.crt' \
   --set 'extraVolumeMounts[0].subPath=ca.crt')
-if ! grep -q "ca-bundle" <<<"$standalone_extra_output"; then
-  echo "extraVolumes must render in standalone Deployment" >&2
-  exit 1
-fi
-if ! grep -q "/etc/ssl/certs/ca.crt" <<<"$standalone_extra_output"; then
-  echo "extraVolumeMounts must render in standalone Deployment" >&2
-  exit 1
-fi
+assert_extra_volumes_wired "$standalone_extra_output" "standalone Deployment"
 
-# extraVolumes and extraVolumeMounts must appear in distributed StatefulSet.
+# Empty extraVolumes must not inject ca-bundle into standalone Deployment volumes.
+standalone_default_output=$(render_standalone_deployment)
+assert_extra_volumes_absent "$standalone_default_output" "standalone Deployment"
+
+# extraVolumes/extraVolumeMounts: structural placement in distributed StatefulSet.
 distributed_extra_output=$(render_distributed_statefulset \
   --set 'extraVolumes[0].name=ca-bundle' \
   --set 'extraVolumes[0].configMap.name=ca-bundle' \
   --set 'extraVolumeMounts[0].name=ca-bundle' \
   --set 'extraVolumeMounts[0].mountPath=/etc/ssl/certs/ca.crt' \
   --set 'extraVolumeMounts[0].subPath=ca.crt')
-if ! grep -q "ca-bundle" <<<"$distributed_extra_output"; then
-  echo "extraVolumes must render in distributed StatefulSet" >&2
-  exit 1
-fi
-if ! grep -q "/etc/ssl/certs/ca.crt" <<<"$distributed_extra_output"; then
-  echo "extraVolumeMounts must render in distributed StatefulSet" >&2
-  exit 1
-fi
+assert_extra_volumes_wired "$distributed_extra_output" "distributed StatefulSet"
+
+# Empty extraVolumes must not inject ca-bundle into distributed StatefulSet volumes.
+distributed_default_output=$(render_distributed_statefulset)
+assert_extra_volumes_absent "$distributed_default_output" "distributed StatefulSet"
