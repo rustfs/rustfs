@@ -17,6 +17,7 @@
 
 mod compress_reader;
 mod encrypt_reader;
+mod s2_index;
 
 pub use compress_reader::{CompressReader, DecompressReader};
 pub use encrypt_reader::{DecryptReader, EncryptReader, derive_part_key};
@@ -39,6 +40,7 @@ pub use rustfs_rio::boxed_reader;
 pub use rustfs_rio::read_checksums;
 pub use rustfs_rio::resolve_etag_generic;
 pub use rustfs_rio::wrap_reader;
+pub use s2_index::{decode_minio_index_bytes, minio_index_storage_bytes};
 
 #[cfg(test)]
 mod tests {

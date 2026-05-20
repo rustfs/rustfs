@@ -26,10 +26,6 @@ use tokio::io::AsyncRead;
 #[cfg(feature = "rio-v2")]
 const MINIO_S2_COMPRESSION_SCHEME: &str = "klauspost/compress/s2";
 #[cfg(feature = "rio-v2")]
-const S2_INDEX_HEADER: &[u8] = b"s2idx\x00";
-#[cfg(feature = "rio-v2")]
-const S2_INDEX_TRAILER: &[u8] = b"\x00xdi2s";
-#[cfg(feature = "rio-v2")]
 const ENCRYPTED_S2_PADDING_MULTIPLE: usize = 256;
 
 pub const fn backend_name() -> &'static str {
@@ -71,10 +67,7 @@ pub fn compression_scheme_to_algorithm(scheme: &str) -> std::io::Result<Compress
 pub fn compression_index_storage_bytes(index: &Index) -> Bytes {
     #[cfg(feature = "rio-v2")]
     {
-        let encoded = index.clone().into_vec();
-        strip_index_headers(encoded.as_ref())
-            .map(Bytes::copy_from_slice)
-            .unwrap_or(encoded)
+        minio_index_storage_bytes(index)
     }
 
     #[cfg(not(feature = "rio-v2"))]
@@ -84,6 +77,13 @@ pub fn compression_index_storage_bytes(index: &Index) -> Bytes {
 }
 
 pub fn decode_compression_index_bytes(bytes: &Bytes) -> Option<Index> {
+    #[cfg(feature = "rio-v2")]
+    {
+        if let Some(decoded) = decode_minio_index_bytes(bytes) {
+            return Some(decoded);
+        }
+    }
+
     let mut decoded = Index::new();
     if decoded.load(bytes.as_ref()).is_ok() {
         return Some(decoded);
@@ -91,7 +91,7 @@ pub fn decode_compression_index_bytes(bytes: &Bytes) -> Option<Index> {
 
     #[cfg(feature = "rio-v2")]
     {
-        let restored = restore_index_headers(bytes.as_ref());
+        let restored = restore_legacy_index_headers(bytes.as_ref());
         let mut decoded = Index::new();
         if decoded.load(&restored).is_ok() {
             return Some(decoded);
@@ -119,30 +119,13 @@ where
 }
 
 #[cfg(feature = "rio-v2")]
-fn strip_index_headers(bytes: &[u8]) -> Option<&[u8]> {
-    let header_len = 4 + S2_INDEX_HEADER.len();
-    let trailer_len = 4 + S2_INDEX_TRAILER.len();
-    if bytes.len() < header_len + trailer_len {
-        return None;
-    }
-
-    if &bytes[4..header_len] != S2_INDEX_HEADER {
-        return None;
-    }
-
-    if &bytes[bytes.len() - S2_INDEX_TRAILER.len()..] != S2_INDEX_TRAILER {
-        return None;
-    }
-
-    Some(&bytes[header_len..bytes.len() - trailer_len])
-}
-
-#[cfg(feature = "rio-v2")]
-fn restore_index_headers(bytes: &[u8]) -> Vec<u8> {
+fn restore_legacy_index_headers(bytes: &[u8]) -> Vec<u8> {
     if bytes.is_empty() {
         return Vec::new();
     }
 
+    const S2_INDEX_HEADER: &[u8] = b"s2idx\x00";
+    const S2_INDEX_TRAILER: &[u8] = b"\x00xdi2s";
     let mut restored = Vec::with_capacity(4 + S2_INDEX_HEADER.len() + bytes.len() + 4 + S2_INDEX_TRAILER.len());
     restored.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18]);
     restored.extend_from_slice(S2_INDEX_HEADER);

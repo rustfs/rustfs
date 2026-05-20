@@ -46,13 +46,13 @@ artifacts/minio-fixture-lab/
 Initialize the lab root:
 
 ```powershell
-uv run python D:\Github\rustfs\test\minio_fixture_lab\lab.py init
+uv run python D:\Github\rustfs\crates\rio-v2\tests\minio_fixture_lab\lab.py init
 ```
 
 Capture one case from an existing MinIO backend tree:
 
 ```powershell
-uv run python D:\Github\rustfs\test\minio_fixture_lab\lab.py add-case `
+uv run python D:\Github\rustfs\crates\rio-v2\tests\minio_fixture_lab\lab.py add-case `
   --case-id sse-kms-singlepart-64k `
   --bucket demo `
   --object dir/object.bin `
@@ -65,7 +65,7 @@ uv run python D:\Github\rustfs\test\minio_fixture_lab\lab.py add-case `
 Capture the default automated matrix:
 
 ```powershell
-uv run python D:\Github\rustfs\test\minio_fixture_lab\lab.py capture-matrix `
+uv run python D:\Github\rustfs\crates\rio-v2\tests\minio_fixture_lab\lab.py capture-matrix `
   --root D:\Github\rustfs\artifacts\minio-fixture-lab `
   --minio-binary D:\go\bin\minio.exe `
   --endpoint https://127.0.0.1:19000
@@ -74,7 +74,7 @@ uv run python D:\Github\rustfs\test\minio_fixture_lab\lab.py capture-matrix `
 Capture only one automated case:
 
 ```powershell
-uv run python D:\Github\rustfs\test\minio_fixture_lab\lab.py capture-matrix `
+uv run python D:\Github\rustfs\crates\rio-v2\tests\minio_fixture_lab\lab.py capture-matrix `
   --root D:\Github\rustfs\artifacts\minio-fixture-lab `
   --minio-binary D:\Github\rustfs\tmp\minio.windows-amd64.RELEASE.2025-09-07T16-13-09Z.exe `
   --endpoint https://127.0.0.1:19000 `
@@ -96,11 +96,10 @@ The automated default matrix is intentionally small:
 
 The automated runner expects:
 
-- `aws` CLI in `PATH`
 - either `minio` in `PATH`, the bundled `D:\Github\rustfs\tmp\minio.windows-amd64.RELEASE.2025-09-07T16-13-09Z.exe`, `--minio-binary`, or `--minio-root` pointing at a directory containing `minio.exe`
 - a free local endpoint port
 
-When the selected matrix includes SSE-C cases, use an `https://` endpoint. The lab will mint a short-lived local self-signed certificate and call AWS CLI with `--no-verify-ssl` for the disposable local MinIO run.
+When the selected matrix includes SSE-C cases, use an `https://` endpoint. The lab will mint a short-lived local self-signed certificate and use its built-in SigV4 S3 client with certificate verification disabled for the disposable local MinIO run.
 
 The runner provisions backend directories under `--work-root` and exports the resulting backend tree into the lab.
 
@@ -112,7 +111,7 @@ key id from that configured key name automatically.
 On some Windows MinIO builds, a multi-disk backend may not come online when all disk directories live on the same volume. If you only want a local smoke run of the upload/export pipeline, try:
 
 ```powershell
-uv run python D:\Github\rustfs\test\minio_fixture_lab\lab.py capture-matrix `
+uv run python D:\Github\rustfs\crates\rio-v2\tests\minio_fixture_lab\lab.py capture-matrix `
   --root D:\Github\rustfs\artifacts\minio-fixture-lab `
   --minio-binary D:\go\bin\minio.exe `
   --endpoint https://127.0.0.1:19000 `

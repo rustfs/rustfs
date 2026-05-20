@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use minlz::{crc::crc, decode, encode};
+use minlz::{crc::crc, decode};
 use pin_project_lite::pin_project;
 use rand::RngExt;
 use rustfs_rio::{EtagResolvable, HashReaderDetector, HashReaderMut, Index, TryGetIndex};
 use rustfs_utils::CompressionAlgorithm;
+use snap::raw::Encoder as SnappyEncoder;
 use std::cmp::min;
 use std::io;
 use std::pin::Pin;
@@ -121,10 +122,7 @@ where
             let mut read_buf = ReadBuf::new(&mut this.read_buffer[..remaining]);
             match this.inner.as_mut().poll_read(cx, &mut read_buf) {
                 Poll::Pending => {
-                    if this.temp_buffer.is_empty() {
-                        return Poll::Pending;
-                    }
-                    break;
+                    return Poll::Pending;
                 }
                 Poll::Ready(Ok(())) => {
                     let n = read_buf.filled().len();
@@ -231,6 +229,7 @@ pin_project! {
         chunk_buf: Vec<u8>,
         chunk_len: usize,
         chunk_read: usize,
+        reading_chunk: bool,
         stream_initialized: bool,
     }
 }
@@ -251,6 +250,7 @@ where
             chunk_buf: Vec::new(),
             chunk_len: 0,
             chunk_read: 0,
+            reading_chunk: false,
             stream_initialized: false,
         }
     }
@@ -279,37 +279,40 @@ where
                 return Poll::Ready(Ok(()));
             }
 
-            while *this.header_read < CHUNK_HEADER_LEN {
-                let mut read_buf = ReadBuf::new(&mut this.header_buf[*this.header_read..]);
-                match this.inner.as_mut().poll_read(cx, &mut read_buf) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {
-                        let n = read_buf.filled().len();
-                        if n == 0 {
-                            if *this.header_read == 0 {
-                                *this.finished = true;
-                                return Poll::Ready(Ok(()));
+            if !*this.reading_chunk {
+                while *this.header_read < CHUNK_HEADER_LEN {
+                    let mut read_buf = ReadBuf::new(&mut this.header_buf[*this.header_read..]);
+                    match this.inner.as_mut().poll_read(cx, &mut read_buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(())) => {
+                            let n = read_buf.filled().len();
+                            if n == 0 {
+                                if *this.header_read == 0 {
+                                    *this.finished = true;
+                                    return Poll::Ready(Ok(()));
+                                }
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "unexpected EOF while reading S2 chunk header",
+                                )));
                             }
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "unexpected EOF while reading S2 chunk header",
-                            )));
+                            *this.header_read += n;
                         }
-                        *this.header_read += n;
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 }
-            }
 
-            *this.chunk_type = this.header_buf[0];
-            *this.chunk_len =
-                (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
-            *this.header_read = 0;
+                *this.chunk_type = this.header_buf[0];
+                *this.chunk_len =
+                    (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
+                *this.header_read = 0;
 
-            if this.chunk_buf.len() < *this.chunk_len {
-                this.chunk_buf.resize(*this.chunk_len, 0);
+                if this.chunk_buf.len() < *this.chunk_len {
+                    this.chunk_buf.resize(*this.chunk_len, 0);
+                }
+                *this.chunk_read = 0;
+                *this.reading_chunk = true;
             }
-            *this.chunk_read = 0;
 
             while *this.chunk_read < *this.chunk_len {
                 let mut read_buf = ReadBuf::new(&mut this.chunk_buf[*this.chunk_read..*this.chunk_len]);
@@ -330,6 +333,7 @@ where
             }
 
             let chunk = &this.chunk_buf[..*this.chunk_len];
+            *this.reading_chunk = false;
             match *this.chunk_type {
                 CHUNK_TYPE_STREAM_IDENTIFIER => {
                     if chunk != &MAGIC_CHUNK[CHUNK_HEADER_LEN..] && chunk != &MAGIC_CHUNK_SNAPPY[CHUNK_HEADER_LEN..] {
@@ -402,10 +406,10 @@ where
 }
 
 fn build_s2_chunk(uncompressed: &[u8]) -> io::Result<Vec<u8>> {
-    let compressed = encode(uncompressed);
+    let compressed = encode_block(uncompressed)?;
     let checksum = crc(uncompressed);
     let dst_limit = uncompressed.len().saturating_sub(uncompressed.len() / 32).saturating_sub(5);
-    let (chunk_type, payload) = if compressed.len() <= dst_limit {
+    let (chunk_type, payload) = if compressed.len() <= dst_limit && compressed_payload_matches(&compressed, uncompressed) {
         (CHUNK_TYPE_COMPRESSED_DATA, compressed)
     } else {
         (CHUNK_TYPE_UNCOMPRESSED_DATA, uncompressed.to_vec())
@@ -424,6 +428,16 @@ fn build_s2_chunk(uncompressed: &[u8]) -> io::Result<Vec<u8>> {
     out.extend_from_slice(&checksum.to_le_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
+}
+
+fn encode_block(uncompressed: &[u8]) -> io::Result<Vec<u8>> {
+    SnappyEncoder::new()
+        .compress_vec(uncompressed)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn compressed_payload_matches(compressed: &[u8], uncompressed: &[u8]) -> bool {
+    decode(compressed).is_ok_and(|decoded| decoded == uncompressed)
 }
 
 fn build_padding_chunk(current_size: usize, padding_multiple: usize) -> io::Result<Option<Vec<u8>>> {
@@ -466,7 +480,14 @@ fn decode_chunk(chunk: &[u8], compressed: bool) -> io::Result<Vec<u8>> {
 
     let actual_crc = crc(&decompressed);
     if actual_crc != expected_crc {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "S2 CRC mismatch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "S2 CRC mismatch: expected={expected_crc:08x} actual={actual_crc:08x} compressed={compressed} payload_len={} decompressed_len={}",
+                payload.len(),
+                decompressed.len()
+            ),
+        ));
     }
 
     Ok(decompressed)
@@ -476,7 +497,55 @@ fn decode_chunk(chunk: &[u8], compressed: bool) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::AsyncReadExt;
+
+    struct PendingAfterBytes<R> {
+        inner: R,
+        max_chunk: usize,
+        pending_next: bool,
+    }
+
+    impl<R> PendingAfterBytes<R> {
+        fn new(inner: R, max_chunk: usize) -> Self {
+            Self {
+                inner,
+                max_chunk,
+                pending_next: false,
+            }
+        }
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for PendingAfterBytes<R> {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if self.pending_next {
+                self.pending_next = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let allowed = self.max_chunk.min(buf.remaining());
+            if allowed == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let mut scratch = vec![0u8; allowed];
+            let mut limited = ReadBuf::new(&mut scratch);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Ready(Ok(())) => {
+                    let filled = limited.filled();
+                    if !filled.is_empty() {
+                        buf.put_slice(filled);
+                        self.pending_next = true;
+                    }
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
 
     fn s2_chunk_types(stream: &[u8]) -> Vec<u8> {
         let mut chunk_types = Vec::new();
@@ -491,6 +560,16 @@ mod tests {
         chunk_types
     }
 
+    #[test]
+    fn compressed_payload_match_rejects_corrupt_payload() {
+        let plaintext = b"compressible-rio-v2-block-".repeat(4096);
+        let mut compressed = encode_block(&plaintext).expect("encode payload");
+        let last = compressed.last_mut().expect("compressed payload");
+        *last ^= 0x80;
+
+        assert!(!compressed_payload_matches(&compressed, &plaintext));
+    }
+
     #[tokio::test]
     async fn s2_compress_reader_roundtrip() {
         let plaintext = b"hello-rio-v2-s2-".repeat(32_768);
@@ -499,6 +578,61 @@ mod tests {
         reader.read_to_end(&mut compressed).await.expect("read compressed data");
 
         assert!(compressed.starts_with(MAGIC_CHUNK));
+
+        let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor.read_to_end(&mut actual).await.expect("read decompressed data");
+
+        assert_eq!(actual, plaintext);
+    }
+
+    #[tokio::test]
+    async fn s2_compress_reader_roundtrip_near_erasure_boundary() {
+        let size = 4 * 1024 * 1024 - 97;
+        let plaintext = pseudo_random_bytes(size);
+        let mut reader = CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default());
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("read compressed data");
+
+        let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor.read_to_end(&mut actual).await.expect("read decompressed data");
+
+        assert_eq!(actual, plaintext);
+    }
+
+    fn pseudo_random_bytes(size: usize) -> Vec<u8> {
+        (0..size)
+            .scan(0x9e37_79b9_7f4a_7c15u64, |state, _| {
+                *state ^= *state << 7;
+                *state ^= *state >> 9;
+                *state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                Some((*state >> 32) as u8)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn s2_compress_reader_roundtrip_large_random() {
+        let plaintext = pseudo_random_bytes(8 * 1024 * 1024 + 123);
+        let mut reader = CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default());
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("read compressed data");
+
+        let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor.read_to_end(&mut actual).await.expect("read decompressed data");
+
+        assert_eq!(actual, plaintext);
+    }
+
+    #[tokio::test]
+    async fn s2_compress_reader_roundtrip_with_pending_source() {
+        let plaintext = pseudo_random_bytes(2 * 1024 * 1024 + 17);
+        let pending_reader = PendingAfterBytes::new(Cursor::new(plaintext.clone()), 257);
+        let mut reader = CompressReader::new(pending_reader, CompressionAlgorithm::default());
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("read compressed data");
 
         let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
         let mut actual = Vec::new();
@@ -522,6 +656,50 @@ mod tests {
 
         assert!(n > 0);
         assert_eq!(&buf[..n], plaintext.as_slice());
+    }
+
+    #[tokio::test]
+    async fn s2_decompress_reader_resumes_chunk_body_after_pending() {
+        let plaintext = pseudo_random_bytes(1024 * 1024 + 123);
+        let mut compressed = Vec::new();
+        CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default())
+            .read_to_end(&mut compressed)
+            .await
+            .expect("compress plaintext");
+
+        let pending_reader = PendingAfterBytes::new(Cursor::new(compressed), 257);
+        let mut decompressor = DecompressReader::new(pending_reader, CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor.read_to_end(&mut actual).await.expect("read decompressed data");
+
+        assert_eq!(actual, plaintext);
+    }
+
+    #[tokio::test]
+    async fn s2_decompress_reader_handles_concatenated_streams_after_pending() {
+        let first = pseudo_random_bytes(16 * 1024 * 1024);
+        let second = pseudo_random_bytes(12 * 1024 * 1024 + 123);
+        let mut first_compressed = Vec::new();
+        CompressReader::new(Cursor::new(first.clone()), CompressionAlgorithm::default())
+            .read_to_end(&mut first_compressed)
+            .await
+            .expect("compress first stream");
+        let mut second_compressed = Vec::new();
+        CompressReader::new(Cursor::new(second.clone()), CompressionAlgorithm::default())
+            .read_to_end(&mut second_compressed)
+            .await
+            .expect("compress second stream");
+
+        first_compressed.extend_from_slice(&second_compressed);
+
+        let pending_reader = PendingAfterBytes::new(Cursor::new(first_compressed), 4096);
+        let mut decompressor = DecompressReader::new(pending_reader, CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor.read_to_end(&mut actual).await.expect("read decompressed data");
+
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

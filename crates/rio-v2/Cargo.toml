@@ -30,6 +30,7 @@ workspace = true
 
 [dependencies]
 aes-gcm.workspace = true
+bytes.workspace = true
 hex.workspace = true
 hmac.workspace = true
 minlz = "0.1.3"
@@ -37,11 +38,12 @@ pin-project-lite.workspace = true
 rand.workspace = true
 rustfs-rio.workspace = true
 rustfs-utils.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
+snap.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 rustfs-filemeta.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 walkdir.workspace = true

@@ -103,6 +103,14 @@ Do not open a PR with code changes when the required checks fail.
 - Use environment variables or vault tooling for sensitive configuration.
 - For localhost-sensitive tests, verify proxy settings to avoid traffic leakage.
 
+## Tools
+
+### xl.meta decode tool Quick Use
+
+```
+cargo run -p rustfs-filemeta --example dump_fileinfo -- "/path/to/file/xl.meta"
+```
+
 ## Scoped Guidance in This Repository
 
 - `.github/AGENTS.md`

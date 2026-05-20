@@ -164,18 +164,19 @@ class RequestRecordTests(unittest.TestCase):
 
 
 class MultipartManifestTests(unittest.TestCase):
-    def test_complete_multipart_argument_is_inline_json(self) -> None:
+    def test_complete_multipart_payload_is_xml(self) -> None:
         parts = [
             {"ETag": '"etag-1"', "PartNumber": 1},
             {"ETag": '"etag-2"', "PartNumber": 2},
         ]
 
-        argument = lab.build_complete_multipart_argument(parts)
+        payload = lab.build_complete_multipart_xml(parts).decode("utf-8")
 
-        self.assertEqual(
-            argument,
-            '{"Parts":[{"ETag":"\\"etag-1\\"","PartNumber":1},{"ETag":"\\"etag-2\\"","PartNumber":2}]}',
-        )
+        self.assertIn("<CompleteMultipartUpload>", payload)
+        self.assertIn("<PartNumber>1</PartNumber>", payload)
+        self.assertIn("<ETag>\"etag-1\"</ETag>", payload)
+        self.assertIn("<PartNumber>2</PartNumber>", payload)
+        self.assertIn("<ETag>\"etag-2\"</ETag>", payload)
 
 
 class KmsSecretKeyTests(unittest.TestCase):

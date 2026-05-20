@@ -10096,6 +10096,7 @@ name = "rustfs-rio-v2"
 version = "1.0.0-beta.3"
 dependencies = [
  "aes-gcm 0.11.0-rc.3",
+ "bytes",
  "hex",
  "hmac 0.13.0",
  "minlz",
@@ -10107,6 +10108,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "snap",
  "tokio",
  "walkdir",
 ]

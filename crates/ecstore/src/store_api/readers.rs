@@ -469,11 +469,23 @@ impl ReadPlan {
                 total_plaintext_size,
             } => {
                 let dec_reader = DecompressReader::new(reader, algorithm);
+                #[cfg(feature = "rio-v2")]
+                let dec_reader = StreamConsumer::new(dec_reader);
                 let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if decompressed_offset > 0
                     || decompressed_length != total_plaintext_size as i64
                 {
-                    match RangedDecompressReader::new(dec_reader, decompressed_offset, decompressed_length, total_plaintext_size)
-                    {
+                    #[cfg(feature = "rio-v2")]
+                    let ranged_result = RangedDecompressReader::new_draining(
+                        dec_reader,
+                        decompressed_offset,
+                        decompressed_length,
+                        total_plaintext_size,
+                    );
+                    #[cfg(not(feature = "rio-v2"))]
+                    let ranged_result =
+                        RangedDecompressReader::new(dec_reader, decompressed_offset, decompressed_length, total_plaintext_size);
+
+                    match ranged_result {
                         Ok(ranged_reader) => {
                             tracing::debug!(
                                 "Successfully created RangedDecompressReader for offset={}, length={}",
@@ -571,13 +583,24 @@ impl ReadPlan {
 
                 let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if let Some(algo) = compression {
                     let decompressed_reader = DecompressReader::new(decrypted_reader, algo);
+                    #[cfg(feature = "rio-v2")]
+                    let decompressed_reader = StreamConsumer::new(decompressed_reader);
                     if plaintext_offset > 0 || plaintext_length != total_plaintext_size as i64 {
-                        Box::new(RangedDecompressReader::new(
+                        #[cfg(feature = "rio-v2")]
+                        let ranged_reader = RangedDecompressReader::new_draining(
                             decompressed_reader,
                             plaintext_offset,
                             plaintext_length,
                             total_plaintext_size,
-                        )?)
+                        )?;
+                        #[cfg(not(feature = "rio-v2"))]
+                        let ranged_reader = RangedDecompressReader::new(
+                            decompressed_reader,
+                            plaintext_offset,
+                            plaintext_length,
+                            total_plaintext_size,
+                        )?;
+                        Box::new(ranged_reader)
                     } else {
                         Box::new(LimitReader::new(decompressed_reader, total_plaintext_size))
                     }
@@ -790,17 +813,27 @@ impl HTTPRangeSpec {
 /// This implementation acknowledges that compressed streams (like LZ4) must be decompressed sequentially
 /// from the beginning, so it streams and discards data until reaching the target offset.
 #[derive(Debug)]
-pub struct RangedDecompressReader<R> {
-    inner: R,
+pub struct RangedDecompressReader<R: AsyncRead + Unpin + Send + Sync + 'static> {
+    inner: Option<R>,
     target_offset: usize,
     target_length: usize,
     current_offset: usize,
     bytes_returned: usize,
     scratch: Vec<u8>,
+    drain_on_done: bool,
+    drain_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> RangedDecompressReader<R> {
+impl<R: AsyncRead + Unpin + Send + Sync + 'static> RangedDecompressReader<R> {
     pub fn new(inner: R, offset: usize, length: i64, total_size: usize) -> Result<Self> {
+        Self::new_with_drain(inner, offset, length, total_size, false)
+    }
+
+    pub fn new_draining(inner: R, offset: usize, length: i64, total_size: usize) -> Result<Self> {
+        Self::new_with_drain(inner, offset, length, total_size, true)
+    }
+
+    fn new_with_drain(inner: R, offset: usize, length: i64, total_size: usize, drain_on_done: bool) -> Result<Self> {
         // Validate the range request
         if offset >= total_size {
             tracing::debug!("Range offset {} exceeds total size {}", offset, total_size);
@@ -819,17 +852,40 @@ impl<R: AsyncRead + Unpin + Send + Sync> RangedDecompressReader<R> {
         );
 
         Ok(Self {
-            inner,
+            inner: Some(inner),
             target_offset: offset,
             target_length: actual_length,
             current_offset: 0,
             bytes_returned: 0,
             scratch: vec![0u8; 8192],
+            drain_on_done,
+            drain_task: None,
         })
+    }
+
+    fn start_drain(&mut self) {
+        if !self.drain_on_done || self.drain_task.is_some() {
+            return;
+        }
+
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+
+        self.drain_task = Some(tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match inner.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        }));
     }
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for RangedDecompressReader<R> {
+impl<R: AsyncRead + Unpin + Send + Sync + 'static> AsyncRead for RangedDecompressReader<R> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -844,6 +900,7 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for RangedDecompressReader<R>
         loop {
             // If we've returned all the bytes we need, return EOF
             if this.bytes_returned >= this.target_length {
+                this.start_drain();
                 return Poll::Ready(Ok(()));
             }
 
@@ -856,7 +913,11 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for RangedDecompressReader<R>
             let scratch_len = std::cmp::min(this.scratch.len(), std::cmp::max(buf_capacity, 1));
             let mut temp_read_buf = ReadBuf::new(&mut this.scratch[..scratch_len]);
 
-            match Pin::new(&mut this.inner).poll_read(cx, &mut temp_read_buf) {
+            let Some(inner) = this.inner.as_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+
+            match Pin::new(inner).poll_read(cx, &mut temp_read_buf) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(())) => {
@@ -930,6 +991,14 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for RangedDecompressReader<R>
                     }
                 }
             }
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync + 'static> Drop for RangedDecompressReader<R> {
+    fn drop(&mut self) {
+        if self.bytes_returned >= self.target_length {
+            self.start_drain();
         }
     }
 }

@@ -241,12 +241,14 @@
                 }
             },
             "env": {
-                "RUST_LOG": "rustfs=debug,ecstore=debug,s3s=debug,iam=debug",
+                "RUST_LOG": "rustfs=error,ecstore=error,s3s=error,iam=error",
                 "RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS": "true",
                 "RUST_BACKTRACE": "full",
                 "RUSTFS_ACCESS_KEY": "rustfsadmin",
                 "RUSTFS_SECRET_KEY": "rustfsadmin",
                 "RUSTFS_VOLUMES": "./target/rio-v2/test{1...4}",
+                "RUSTFS_SCANNER_ENABLED": "false",
+                "RUSTFS_HEAL_ENABLED": "false",
                 "RUSTFS_REGION": "us-east-1",
                 "RUSTFS_ADDRESS": ":9000",
                 "RUSTFS_CONSOLE_ENABLE": "true",
@@ -254,11 +256,11 @@
                 "RUSTFS_OBS_LOG_DIRECTORY": "./target/logs/rio-v2",
                 "RUSTFS_UNSAFE_BYPASS_DISK_CHECK": "true",
                 "RUSTFS_COMPRESSION_ENABLED": "true",
-                "RUSTFS_KMS_ENABLE": "true",
+                "RUSTFS_KMS_ENABLE": "false",
                 "RUSTFS_KMS_BACKEND": "local",
                 "RUSTFS_KMS_KEY_DIR": "./target/rio-v2/kms-key-dir",
-                "RUSTFS_KMS_LOCAL_MASTER_KEY": "my-secret-key",
-                "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-rio-v2-master-key"
+                "RUSTFS_KMS_LOCAL_MASTER_KEY": "my-secret-key", // Some Password
+                "RUSTFS_KMS_DEFAULT_KEY_ID": "rustfs-master-key",
             },
             "args": [],
             "cwd": "${workspaceFolder}"

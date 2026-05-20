@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -12,8 +13,10 @@ import ssl
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +29,7 @@ DEFAULT_WORK_ROOT = DEFAULT_ROOT / "_runner"
 DEFAULT_MINIO_BINARY = (
     Path(__file__).resolve().parents[4]
     / "tmp"
-    / "minio.windows-amd64.RELEASE.2025-09-07T16-13-09Z.exe"
+    / "minio.darwin-arm64.RELEASE.2025-09-07T16-13-09Z"
 )
 DEFAULT_KMS_KEY_ID = "minio-default-key"
 DEFAULT_KMS_SECRET_KEY = (
@@ -35,6 +38,9 @@ DEFAULT_KMS_SECRET_KEY = (
 LAB_KMS_SECRET_KEY_ENV = "MINIO_FIXTURE_LAB_KMS_SECRET_KEY"
 DEFAULT_ENDPOINT = "http://127.0.0.1:9000"
 DEFAULT_DISK_COUNT = 4
+DEFAULT_ACCESS_KEY = "minioadmin"
+DEFAULT_SECRET_KEY = "minioadmin"
+DEFAULT_REGION = "us-east-1"
 MULTIPART_CHUNK_SIZE = 5 * 1024 * 1024
 DEFAULT_BUCKET = "demo"
 DEFAULT_OBJECT = "dir/object.bin"
@@ -264,7 +270,7 @@ def ensure_layout(paths: LabPaths) -> None:
         {
             "schema_version": 1,
             "created_at_utc": utc_now(),
-            "root": str(paths.root).replace("\\", "/"),
+            "root": ".",
             "description": "Captured MinIO fixture cases for RustFS compatibility validation.",
         },
     )
@@ -287,6 +293,8 @@ def store_case_artifacts(
     ensure_dir(paths.cases)
     case_dir = paths.cases / case_id
     backend_dir = case_dir / "backend"
+    if case_dir.exists():
+        shutil.rmtree(case_dir)
     ensure_dir(case_dir)
 
     exported_files = copy_tree(source_tree.resolve(), backend_dir)
@@ -312,7 +320,7 @@ def store_case_artifacts(
         "bucket": bucket,
         "object": object_name,
         "version_id": version_id,
-        "source_tree": str(source_tree.resolve()).replace("\\", "/"),
+        "source_tree": str(source_tree).replace("\\", "/"),
         "notes": notes,
         "artifacts": {
             "backend_dir": "backend",
@@ -370,49 +378,49 @@ def ensure_local_tls_certificates(certs_dir: Path, hostname: str) -> None:
         return
 
     ensure_dir(certs_dir)
-    uv = resolve_existing_command("uv")
-    generator = r"""
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-import ipaddress
-import sys
-
-certs_dir = Path(sys.argv[1])
-hostname = sys.argv[2]
-key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
-san_entries = [x509.DNSName("localhost")]
-try:
-    san_entries.append(x509.IPAddress(ipaddress.ip_address(hostname)))
-except ValueError:
-    san_entries.append(x509.DNSName(hostname))
-san_entries.append(x509.IPAddress(ipaddress.ip_address("127.0.0.1")))
-cert = (
-    x509.CertificateBuilder()
-    .subject_name(subject)
-    .issuer_name(issuer)
-    .public_key(key.public_key())
-    .serial_number(x509.random_serial_number())
-    .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=5))
-    .not_valid_after(datetime.now(timezone.utc) + timedelta(days=30))
-    .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
-    .sign(key, hashes.SHA256())
-)
-(certs_dir / "private.key").write_bytes(
-    key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
+    openssl = resolve_existing_command("openssl")
+    san_entries = ["DNS:localhost", "IP:127.0.0.1"]
+    try:
+        ipaddress.ip_address(hostname)
+        san_entries.append(f"IP:{hostname}")
+    except ValueError:
+        san_entries.append(f"DNS:{hostname}")
+    config_path = certs_dir / "openssl.cnf"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[req]",
+                "distinguished_name = req_distinguished_name",
+                "x509_extensions = v3_req",
+                "prompt = no",
+                "[req_distinguished_name]",
+                f"CN = {hostname}",
+                "[v3_req]",
+                f"subjectAltName = {','.join(san_entries)}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
     )
-)
-(certs_dir / "public.crt").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-"""
     subprocess.run(
-        [str(uv), "run", "--with", "cryptography", "python", "-c", generator, str(certs_dir), hostname],
+        [
+            str(openssl),
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "30",
+            "-keyout",
+            str(private_key),
+            "-out",
+            str(public_crt),
+            "-config",
+            str(config_path),
+            "-extensions",
+            "v3_req",
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -428,6 +436,8 @@ def build_server_command(
         "server",
         "--address",
         f"{host}:{port}",
+        "--console-address",
+        f"{host}:{port + 1}",
     ]
     if certs_dir is not None:
         command += ["--certs-dir", str(certs_dir.resolve())]
@@ -467,13 +477,186 @@ def minio_env(kms_secret_key: KmsSecretKeyConfig) -> dict[str, str]:
     return env
 
 
-def aws_env() -> dict[str, str]:
-    env = dict(os.environ)
-    env["AWS_ACCESS_KEY_ID"] = "minioadmin"
-    env["AWS_SECRET_ACCESS_KEY"] = "minioadmin"
-    env["AWS_DEFAULT_REGION"] = "us-east-1"
-    env["AWS_EC2_METADATA_DISABLED"] = "true"
-    return env
+class S3Client:
+    def __init__(
+        self,
+        endpoint: str,
+        access_key: str = DEFAULT_ACCESS_KEY,
+        secret_key: str = DEFAULT_SECRET_KEY,
+        region: str = DEFAULT_REGION,
+    ) -> None:
+        self.endpoint = endpoint.rstrip("/")
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.region = region
+        self.parsed_endpoint = urlparse(self.endpoint)
+        self.ssl_context = ssl._create_unverified_context() if is_https_endpoint(endpoint) else None
+
+    def request(
+        self,
+        method: str,
+        bucket: str | None = None,
+        key: str | None = None,
+        *,
+        query: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"",
+    ) -> tuple[int, dict[str, str], bytes]:
+        path = "/"
+        if bucket is not None:
+            path += urllib.parse.quote(bucket, safe="")
+            if key is not None:
+                path += "/" + urllib.parse.quote(key, safe="/")
+        query = query or {}
+        headers = dict(headers or {})
+        signed_headers = self.sign_headers(method, path, query, headers, body)
+        url = self.endpoint + path
+        if query:
+            url += "?" + urllib.parse.urlencode(sorted(query.items()), quote_via=urllib.parse.quote)
+        request = urllib.request.Request(url, data=body if method != "HEAD" else None, method=method)
+        for name, value in signed_headers.items():
+            request.add_header(name, value)
+        try:
+            with urllib.request.urlopen(request, timeout=30, context=self.ssl_context) as response:
+                return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
+        except urllib.error.HTTPError as err:
+            payload = err.read()
+            raise RuntimeError(
+                f"S3 request failed: {method} {url}\nstatus: {err.code}\nbody:\n{payload.decode('utf-8', errors='replace')}"
+            ) from err
+
+    def sign_headers(
+        self,
+        method: str,
+        canonical_uri: str,
+        query: dict[str, str],
+        headers: dict[str, str],
+        body: bytes,
+    ) -> dict[str, str]:
+        now = datetime.now(timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp = now.strftime("%Y%m%d")
+        payload_hash = hashlib.sha256(body).hexdigest()
+        host = self.parsed_endpoint.netloc
+        signed_headers = {k.lower(): v.strip() for k, v in headers.items()}
+        signed_headers["host"] = host
+        signed_headers["x-amz-content-sha256"] = payload_hash
+        signed_headers["x-amz-date"] = amz_date
+
+        canonical_query = "&".join(
+            f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
+            for k, v in sorted(query.items())
+        )
+        canonical_headers = "".join(f"{k}:{signed_headers[k]}\n" for k in sorted(signed_headers))
+        signed_header_names = ";".join(sorted(signed_headers))
+        canonical_request = "\n".join(
+            [
+                method,
+                canonical_uri,
+                canonical_query,
+                canonical_headers,
+                signed_header_names,
+                payload_hash,
+            ]
+        )
+        scope = f"{date_stamp}/{self.region}/s3/aws4_request"
+        string_to_sign = "\n".join(
+            [
+                "AWS4-HMAC-SHA256",
+                amz_date,
+                scope,
+                hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+            ]
+        )
+        signature = hmac.new(
+            self.signing_key(date_stamp),
+            string_to_sign.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        signed_headers["authorization"] = (
+            f"AWS4-HMAC-SHA256 Credential={self.access_key}/{scope}, "
+            f"SignedHeaders={signed_header_names}, Signature={signature}"
+        )
+        return signed_headers
+
+    def signing_key(self, date_stamp: str) -> bytes:
+        key = ("AWS4" + self.secret_key).encode("utf-8")
+        for value in (date_stamp, self.region, "s3", "aws4_request"):
+            key = hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
+        return key
+
+    def list_buckets(self) -> None:
+        self.request("GET")
+
+    def create_bucket(self, bucket: str) -> None:
+        self.request("PUT", bucket=bucket)
+
+    def put_object(
+        self,
+        bucket: str,
+        key: str,
+        body: bytes,
+        headers: dict[str, str],
+    ) -> None:
+        self.request("PUT", bucket=bucket, key=key, headers=headers, body=body)
+
+    def create_multipart_upload(self, bucket: str, key: str, headers: dict[str, str]) -> str:
+        _, _, body = self.request("POST", bucket=bucket, key=key, query={"uploads": ""}, headers=headers)
+        root = ET.fromstring(body)
+        upload_id = root.findtext("{*}UploadId")
+        if upload_id is None:
+            raise RuntimeError(f"missing UploadId in create multipart response: {body!r}")
+        return upload_id
+
+    def upload_part(
+        self,
+        bucket: str,
+        key: str,
+        upload_id: str,
+        part_number: int,
+        body: bytes,
+        headers: dict[str, str],
+    ) -> str:
+        _, response_headers, _ = self.request(
+            "PUT",
+            bucket=bucket,
+            key=key,
+            query={"partNumber": str(part_number), "uploadId": upload_id},
+            headers=headers,
+            body=body,
+        )
+        etag = response_headers.get("etag")
+        if etag is None:
+            raise RuntimeError("missing ETag in upload part response")
+        return etag
+
+    def complete_multipart_upload(
+        self,
+        bucket: str,
+        key: str,
+        upload_id: str,
+        parts: list[dict[str, Any]],
+    ) -> None:
+        body = build_complete_multipart_xml(parts)
+        self.request(
+            "POST",
+            bucket=bucket,
+            key=key,
+            query={"uploadId": upload_id},
+            headers={"content-type": "application/xml"},
+            body=body,
+        )
+
+    def head_object(self, bucket: str, key: str, headers: dict[str, str]) -> dict[str, Any]:
+        _, response_headers, _ = self.request("HEAD", bucket=bucket, key=key, headers=headers)
+        return {
+            "ContentLength": int(response_headers.get("content-length", "0")),
+            "ServerSideEncryption": response_headers.get("x-amz-server-side-encryption"),
+            "SSECustomerAlgorithm": response_headers.get("x-amz-server-side-encryption-customer-algorithm"),
+            "SSECustomerKeyMD5": response_headers.get("x-amz-server-side-encryption-customer-key-md5"),
+            "SSEKMSKeyId": response_headers.get("x-amz-server-side-encryption-aws-kms-key-id"),
+            "VersionId": response_headers.get("x-amz-version-id"),
+        }
 
 
 def wait_for_minio(endpoint: str, process: subprocess.Popen[str], timeout_seconds: int) -> None:
@@ -492,161 +675,40 @@ def wait_for_minio(endpoint: str, process: subprocess.Popen[str], timeout_second
     raise TimeoutError(f"timed out waiting for MinIO health endpoint: {health_url}")
 
 
-def wait_for_s3_ready(endpoint: str, timeout_seconds: int) -> None:
+def wait_for_s3_ready(client: S3Client, timeout_seconds: int) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         try:
-            run_command(
-                aws_base_command(endpoint) + ["list-buckets"],
-                env=aws_env(),
-                expect_json=True,
-            )
+            client.list_buckets()
             return
         except RuntimeError:
             time.sleep(1)
-    raise TimeoutError(f"timed out waiting for S3 API readiness: {endpoint}")
+    raise TimeoutError(f"timed out waiting for S3 API readiness: {client.endpoint}")
 
 
-def run_command(
-    args: list[str],
-    *,
-    env: dict[str, str],
-    cwd: Path | None = None,
-    expect_json: bool = False,
-) -> dict[str, Any] | None:
-    completed = subprocess.run(
-        args,
-        cwd=str(cwd) if cwd is not None else None,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "command failed: "
-            + " ".join(args)
-            + f"\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
-        )
-    if expect_json:
-        stdout = completed.stdout.strip()
-        return json.loads(stdout) if stdout else {}
-    return None
+def create_bucket(client: S3Client, case: FixtureCase) -> None:
+    client.create_bucket(case.bucket)
 
 
-def aws_base_command(endpoint: str) -> list[str]:
-    aws = resolve_existing_command("aws")
-    command = [
-        str(aws),
-        "--no-cli-pager",
-        "--output",
-        "json",
-        "--endpoint-url",
-        endpoint,
-    ]
-    if is_https_endpoint(endpoint):
-        command.append("--no-verify-ssl")
-    command.append("s3api")
-    return command
+def build_complete_multipart_xml(parts: list[dict[str, Any]]) -> bytes:
+    root = ET.Element("CompleteMultipartUpload")
+    for part in parts:
+        part_element = ET.SubElement(root, "Part")
+        ET.SubElement(part_element, "PartNumber").text = str(part["PartNumber"])
+        ET.SubElement(part_element, "ETag").text = part["ETag"]
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def create_bucket(endpoint: str, case: FixtureCase) -> None:
-    run_command(
-        aws_base_command(endpoint) + ["create-bucket", "--bucket", case.bucket],
-        env=aws_env(),
-    )
-
-
-def write_multipart_manifest(parts: list[dict[str, Any]], path: Path) -> None:
-    payload = {
-        "Parts": [
-            {"ETag": part["ETag"], "PartNumber": part["PartNumber"]}
-            for part in parts
-        ]
-    }
-    write_json(path, payload)
-
-
-def build_complete_multipart_argument(parts: list[dict[str, Any]]) -> str:
-    payload = {
-        "Parts": [
-            {"ETag": part["ETag"], "PartNumber": part["PartNumber"]}
-            for part in parts
-        ]
-    }
-    return json.dumps(payload, separators=(",", ":"))
-
-
-def upload_case(endpoint: str, case: FixtureCase, payload_file: Path) -> dict[str, Any]:
-    headers = build_request_record(case)["headers"]
-    base = aws_base_command(endpoint)
+def upload_case(client: S3Client, case: FixtureCase, payload_file: Path) -> dict[str, Any]:
+    request_record = build_request_record(case)
+    headers = request_record["headers"]
+    headers["content-type"] = "binary/octet-stream"
 
     if not case.multipart:
-        command = base + [
-            "put-object",
-            "--bucket",
-            case.bucket,
-            "--key",
-            case.object_name,
-            "--body",
-            str(payload_file),
-        ]
-        if case.encryption == "SSE-C":
-            command += [
-                "--sse-customer-algorithm",
-                headers["x-amz-server-side-encryption-customer-algorithm"],
-                "--sse-customer-key",
-                headers["x-amz-server-side-encryption-customer-key"],
-                "--sse-customer-key-md5",
-                headers["x-amz-server-side-encryption-customer-key-md5"],
-            ]
-        elif headers.get("x-amz-server-side-encryption") == "AES256":
-            command += ["--server-side-encryption", "AES256"]
-        else:
-            command += [
-                "--server-side-encryption",
-                "aws:kms",
-                "--ssekms-key-id",
-                headers["x-amz-server-side-encryption-aws-kms-key-id"],
-            ]
-            context_header = headers.get("x-amz-server-side-encryption-context")
-            if context_header is not None:
-                command += ["--ssekms-encryption-context", context_header]
-        run_command(command, env=aws_env())
-        return build_request_record(case)
+        client.put_object(case.bucket, case.object_name, payload_file.read_bytes(), headers)
+        return request_record
 
-    create_command = base + [
-        "create-multipart-upload",
-        "--bucket",
-        case.bucket,
-        "--key",
-        case.object_name,
-    ]
-    if case.encryption == "SSE-C":
-        create_command += [
-            "--sse-customer-algorithm",
-            headers["x-amz-server-side-encryption-customer-algorithm"],
-            "--sse-customer-key",
-            headers["x-amz-server-side-encryption-customer-key"],
-            "--sse-customer-key-md5",
-            headers["x-amz-server-side-encryption-customer-key-md5"],
-        ]
-    elif headers.get("x-amz-server-side-encryption") == "AES256":
-        create_command += ["--server-side-encryption", "AES256"]
-    else:
-        create_command += [
-            "--server-side-encryption",
-            "aws:kms",
-            "--ssekms-key-id",
-            headers["x-amz-server-side-encryption-aws-kms-key-id"],
-        ]
-        context_header = headers.get("x-amz-server-side-encryption-context")
-        if context_header is not None:
-            create_command += ["--ssekms-encryption-context", context_header]
-
-    create_result = run_command(create_command, env=aws_env(), expect_json=True)
-    assert create_result is not None
-    upload_id = create_result["UploadId"]
+    upload_id = client.create_multipart_upload(case.bucket, case.object_name, headers)
 
     parts = []
     with payload_file.open("rb") as handle:
@@ -657,87 +719,25 @@ def upload_case(endpoint: str, case: FixtureCase, payload_file: Path) -> dict[st
                 break
             part_file = payload_file.parent / f"part-{part_number}.bin"
             part_file.write_bytes(chunk)
-            if case.encryption == "SSE-C":
-                upload_result = run_command(
-                    base
-                    + [
-                        "upload-part",
-                        "--bucket",
-                        case.bucket,
-                        "--key",
-                        case.object_name,
-                        "--upload-id",
-                        upload_id,
-                        "--part-number",
-                        str(part_number),
-                        "--body",
-                        str(part_file),
-                        "--sse-customer-algorithm",
-                        headers["x-amz-server-side-encryption-customer-algorithm"],
-                        "--sse-customer-key",
-                        headers["x-amz-server-side-encryption-customer-key"],
-                        "--sse-customer-key-md5",
-                        headers["x-amz-server-side-encryption-customer-key-md5"],
-                    ],
-                    env=aws_env(),
-                    expect_json=True,
-                )
-            else:
-                upload_result = run_command(
-                    base
-                    + [
-                        "upload-part",
-                        "--bucket",
-                        case.bucket,
-                        "--key",
-                        case.object_name,
-                        "--upload-id",
-                        upload_id,
-                        "--part-number",
-                        str(part_number),
-                        "--body",
-                        str(part_file),
-                    ],
-                    env=aws_env(),
-                    expect_json=True,
-                )
-            assert upload_result is not None
-            parts.append({"ETag": upload_result["ETag"], "PartNumber": part_number})
+            part_headers = headers if case.encryption == "SSE-C" else {}
+            etag = client.upload_part(
+                case.bucket,
+                case.object_name,
+                upload_id,
+                part_number,
+                chunk,
+                part_headers,
+            )
+            parts.append({"ETag": etag, "PartNumber": part_number})
             part_number += 1
 
-    run_command(
-        base
-        + [
-            "complete-multipart-upload",
-            "--bucket",
-            case.bucket,
-            "--key",
-            case.object_name,
-            "--upload-id",
-            upload_id,
-            "--multipart-upload",
-            build_complete_multipart_argument(parts),
-        ],
-        env=aws_env(),
-    )
-    return build_request_record(case)
+    client.complete_multipart_upload(case.bucket, case.object_name, upload_id, parts)
+    return request_record
 
 
-def head_case(endpoint: str, case: FixtureCase) -> dict[str, Any]:
-    command = aws_base_command(endpoint) + ["head-object", "--bucket", case.bucket, "--key", case.object_name]
-    if case.encryption == "SSE-C":
-        headers = build_request_record(case)["headers"]
-        command += [
-            "--sse-customer-algorithm",
-            headers["x-amz-server-side-encryption-customer-algorithm"],
-            "--sse-customer-key",
-            headers["x-amz-server-side-encryption-customer-key"],
-            "--sse-customer-key-md5",
-            headers["x-amz-server-side-encryption-customer-key-md5"],
-        ]
-    result = run_command(command, env=aws_env(), expect_json=True)
-    assert result is not None
-    return result
+def head_case(client: S3Client, case: FixtureCase) -> dict[str, Any]:
+    headers = build_request_record(case)["headers"] if case.encryption == "SSE-C" else {}
+    return client.head_object(case.bucket, case.object_name, headers)
 
 
 def stop_process(process: subprocess.Popen[str]) -> None:
@@ -763,7 +763,7 @@ def capture_case(
     preserve_workdir: bool,
     kms_secret_key: KmsSecretKeyConfig,
 ) -> Path:
-    case_workdir = work_root.resolve() / case.case_id
+    case_workdir = work_root / case.case_id
     if case_workdir.exists():
         shutil.rmtree(case_workdir)
     ensure_dir(case_workdir)
@@ -789,11 +789,12 @@ def capture_case(
             text=True,
         )
         try:
+            client = S3Client(endpoint)
             wait_for_minio(endpoint, process, timeout_seconds)
-            wait_for_s3_ready(endpoint, timeout_seconds)
-            create_bucket(endpoint, case)
-            request_payload = upload_case(endpoint, case, payload_file)
-            head_payload = head_case(endpoint, case)
+            wait_for_s3_ready(client, timeout_seconds)
+            create_bucket(client, case)
+            request_payload = upload_case(client, case, payload_file)
+            head_payload = head_case(client, case)
         finally:
             stop_process(process)
 
@@ -811,14 +812,11 @@ def capture_case(
         capture_payload={
             "endpoint": endpoint,
             "launcher_kind": launcher.kind,
-            "launcher_command": server_command,
+            "disk_count": disk_count,
             "kms_key_id": kms_secret_key.key_id,
-            "workdir": str(case_workdir).replace("\\", "/"),
-            "server_log": "server.log",
         },
     )
 
-    shutil.copy2(server_log_path, case_dir / "server.log")
     if not preserve_workdir:
         shutil.rmtree(case_workdir)
     return case_dir

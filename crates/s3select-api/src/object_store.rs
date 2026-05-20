@@ -491,7 +491,10 @@ where
     AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
         pin_mut!(stream);
         let mut remaining: usize = content_length;
-        while let Some(result) = stream.next().await {
+        while remaining > 0 {
+            let Some(result) = stream.next().await else {
+                break;
+            };
             let mut bytes = result.map_err(|e| o_Error::Generic {
                 store: "",
                 source: Box::new(e),
@@ -508,7 +511,13 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::{extract_json_sub_path_from_expression, flatten_json_document_to_ndjson, replace_symbol};
+    use super::{bytes_stream, extract_json_sub_path_from_expression, flatten_json_document_to_ndjson, replace_symbol};
+    use bytes::Bytes;
+    use futures::{TryStreamExt, stream};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn test_replace() {
@@ -521,6 +530,29 @@ mod test {
             Ok(s) => println!("slice: {s}"),
             Err(e) => eprintln!("Error converting to string: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_bytes_stream_stops_at_content_length() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let stream_poll_count = Arc::clone(&poll_count);
+        let source = stream::unfold(0, move |index| {
+            let stream_poll_count = Arc::clone(&stream_poll_count);
+            async move {
+                stream_poll_count.fetch_add(1, Ordering::SeqCst);
+                let bytes = match index {
+                    0 => Bytes::from_static(b"abcd"),
+                    1 => Bytes::from_static(b"efgh"),
+                    _ => return None,
+                };
+                Some((Ok::<_, std::io::Error>(bytes), index + 1))
+            }
+        });
+
+        let chunks: Vec<Bytes> = bytes_stream(source, 4).try_collect().await.unwrap();
+
+        assert_eq!(chunks, vec![Bytes::from_static(b"abcd")]);
+        assert_eq!(poll_count.load(Ordering::SeqCst), 1);
     }
 
     /// A JSON array is split into one NDJSON line per element.
