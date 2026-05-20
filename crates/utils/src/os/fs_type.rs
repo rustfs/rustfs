@@ -43,6 +43,8 @@ pub(crate) fn get_fs_type(fs_type: u64) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::get_fs_type;
+
     #[test]
     fn map_common_linux_filesystem_magic_numbers() {
         assert_eq!(get_fs_type(0x58465342), "XFS");
