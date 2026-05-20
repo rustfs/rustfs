@@ -32,7 +32,7 @@ use crate::storage::options::{
 use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_to_metadata, map_get_object_reader_error};
-use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
+use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use crate::storage::*;
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -159,7 +159,7 @@ impl Drop for DeadlockRequestGuard {
 }
 
 struct GetObjectBootstrap {
-    timeout_config: TimeoutConfig,
+    timeout_config: GetObjectTimeoutPolicy,
     wrapper: RequestTimeoutWrapper,
     request_start: std::time::Instant,
     request_guard: GetObjectGuard,
@@ -215,6 +215,12 @@ struct GetObjectOutputContext {
     event_info: ObjectInfo,
     response_content_length: i64,
     optimal_buffer_size: usize,
+}
+
+enum GetObjectTimeoutStage {
+    BeforeProcessing,
+    DiskPermitWait { permit_wait_duration: Duration },
+    BeforeRead,
 }
 
 async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &ObjectOptions, existing: Option<&ObjectInfo>) {
@@ -443,14 +449,14 @@ fn should_buffer_get_object_in_memory_with_threshold(
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
-    use crate::storage::deadlock_detector::{DeadlockDetector, DeadlockDetectorConfig};
+    use crate::storage::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
     use std::sync::Arc;
 
     #[test]
     fn deadlock_request_guard_unregisters_on_drop() {
-        let detector = Arc::new(DeadlockDetector::new(DeadlockDetectorConfig {
+        let detector = Arc::new(DeadlockDetector::new(RequestHangDetectionPolicy {
             enabled: true,
-            ..DeadlockDetectorConfig::default()
+            ..RequestHangDetectionPolicy::default()
         }));
         let request_id = "test-request-id".to_string();
 
@@ -1112,7 +1118,7 @@ impl DefaultObjectUsecase {
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
-        let timeout_config = TimeoutConfig::from_env();
+        let timeout_config = GetObjectTimeoutPolicy::from_env();
         let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
         let request_start = std::time::Instant::now();
         let request_guard = ConcurrencyManager::track_request();
@@ -1123,16 +1129,7 @@ impl DefaultObjectUsecase {
         deadlock_detector.register_request(&request_id, format!("GetObject {bucket}/{key}"));
         let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
 
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out before processing"
-            );
-            return Err(s3_error!(InternalError, "Request timeout before processing"));
-        }
+        Self::ensure_get_object_not_timed_out(&wrapper, &timeout_config, bucket, key, GetObjectTimeoutStage::BeforeProcessing)?;
 
         rustfs_io_metrics::record_get_object_request_start(concurrent_requests);
 
@@ -1154,7 +1151,7 @@ impl DefaultObjectUsecase {
     async fn acquire_get_object_io_planning<'a>(
         manager: &'a ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
-        timeout_config: &TimeoutConfig,
+        timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
         key: &str,
     ) -> S3Result<GetObjectIoPlanning<'a>> {
@@ -1165,19 +1162,13 @@ impl DefaultObjectUsecase {
             .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?;
         let permit_wait_duration = permit_wait_start.elapsed();
 
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                wait_ms = permit_wait_duration.as_millis(),
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out while waiting for disk permit"
-            );
-
-            rustfs_io_metrics::record_get_object_timeout(Some("disk_permit"), Some(wrapper.elapsed().as_secs_f64()));
-            return Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"));
-        }
+        Self::ensure_get_object_not_timed_out(
+            wrapper,
+            timeout_config,
+            bucket,
+            key,
+            GetObjectTimeoutStage::DiskPermitWait { permit_wait_duration },
+        )?;
 
         let queue_status = manager.io_queue_status();
         let queue_snapshot = GetObjectQueueSnapshot::from_available_permits(
@@ -1199,17 +1190,7 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::record_io_queue_congestion();
         }
 
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out before reading object"
-            );
-            rustfs_io_metrics::record_get_object_timeout(Some("before_read"), Some(wrapper.elapsed().as_secs_f64()));
-            return Err(s3_error!(InternalError, "Request timeout before reading object"));
-        }
+        Self::ensure_get_object_not_timed_out(wrapper, timeout_config, bucket, key, GetObjectTimeoutStage::BeforeRead)?;
 
         Ok(GetObjectIoPlanning {
             _disk_permit: disk_permit,
@@ -1274,7 +1255,7 @@ impl DefaultObjectUsecase {
         req: &S3Request<GetObjectInput>,
         manager: &'a ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
-        timeout_config: &TimeoutConfig,
+        timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
         key: &str,
         rs: Option<HTTPRangeSpec>,
@@ -2024,7 +2005,7 @@ impl DefaultObjectUsecase {
 
     fn finalize_get_object_completion(
         wrapper: &RequestTimeoutWrapper,
-        timeout_config: &TimeoutConfig,
+        timeout_config: &GetObjectTimeoutPolicy,
         total_duration: Duration,
         response_content_length: i64,
         optimal_buffer_size: usize,
@@ -2050,6 +2031,57 @@ impl DefaultObjectUsecase {
             "GetObject completed: size={} duration={:?} buffer={}",
             response_content_length, total_duration, optimal_buffer_size
         );
+    }
+
+    fn ensure_get_object_not_timed_out(
+        wrapper: &RequestTimeoutWrapper,
+        timeout_config: &GetObjectTimeoutPolicy,
+        bucket: &str,
+        key: &str,
+        stage: GetObjectTimeoutStage,
+    ) -> S3Result<()> {
+        if !wrapper.is_timeout() {
+            return Ok(());
+        }
+
+        let timeout_secs = timeout_config.get_object_timeout.as_secs();
+        let elapsed_ms = wrapper.elapsed().as_millis();
+
+        match stage {
+            GetObjectTimeoutStage::BeforeProcessing => {
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    timeout_secs,
+                    elapsed_ms,
+                    "GetObject request timed out before processing"
+                );
+                Err(s3_error!(InternalError, "Request timeout before processing"))
+            }
+            GetObjectTimeoutStage::DiskPermitWait { permit_wait_duration } => {
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    wait_ms = permit_wait_duration.as_millis(),
+                    timeout_secs,
+                    elapsed_ms,
+                    "GetObject request timed out while waiting for disk permit"
+                );
+                rustfs_io_metrics::record_get_object_timeout(Some("disk_permit"), Some(wrapper.elapsed().as_secs_f64()));
+                Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"))
+            }
+            GetObjectTimeoutStage::BeforeRead => {
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    timeout_secs,
+                    elapsed_ms,
+                    "GetObject request timed out before reading object"
+                );
+                rustfs_io_metrics::record_get_object_timeout(Some("before_read"), Some(wrapper.elapsed().as_secs_f64()));
+                Err(s3_error!(InternalError, "Request timeout before reading object"))
+            }
+        }
     }
 
     async fn finalize_get_object_response(

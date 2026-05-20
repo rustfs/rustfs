@@ -557,8 +557,6 @@ impl LocalDiskWrapper {
 
     /// Monitor disk writability periodically
     async fn monitor_disk_writable(disk: Arc<LocalDisk>, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
-        // TODO: config interval
-
         let mut interval = time::interval(get_drive_active_check_interval());
 
         loop {
