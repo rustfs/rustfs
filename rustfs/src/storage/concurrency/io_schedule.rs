@@ -2068,7 +2068,7 @@ mod tests {
         assert_eq!(config.starvation_threshold_secs, 5);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_scheduler_config_to_core_config() {
         let config = IoSchedulerConfig::default();
@@ -2084,7 +2084,7 @@ mod tests {
         assert_eq!(core.enable_priority, config.enable_priority);
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_config_to_core_config() {
         let config = IoPriorityQueueConfig::default();
@@ -2096,7 +2096,7 @@ mod tests {
         assert_eq!(core.starvation_threshold, Duration::from_secs(config.starvation_threshold_secs));
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
     async fn test_io_priority_queue_config_from_core_config() {
         let core = rustfs_io_core::IoPriorityQueueConfig::default();
