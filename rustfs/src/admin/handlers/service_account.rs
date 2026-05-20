@@ -92,16 +92,6 @@ fn merge_derived_service_account_claims(
     }
 }
 
-fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &str) -> bool {
-    let caller_parent = if caller.parent_user.is_empty() {
-        caller.access_key.as_str()
-    } else {
-        caller.parent_user.as_str()
-    };
-
-    caller_parent == target_parent_user
-}
-
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
     debug!("{action}, e: {:?}", err);
     if is_err_no_such_service_account(&err) {
@@ -403,6 +393,10 @@ fn request_user_name(cred: &StoredCredentials) -> &str {
     }
 }
 
+fn can_update_service_account_target(caller: &StoredCredentials, owner: bool, target_parent_user: &str) -> bool {
+    owner || request_user_name(caller) == target_parent_user
+}
+
 async fn build_info_service_account_resp<T: IamStore>(
     iam_store: &rustfs_iam::sys::IamSys<T>,
     account: &StoredCredentials,
@@ -528,11 +522,6 @@ impl Operation for UpdateServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        // let svc_account = iam_store.get_service_account(&access_key).await.map_err(|e| {
-        //     debug!("get service account failed, e: {:?}", e);
-        //     s3_error!(InternalError, "get service account failed")
-        // })?;
-
         let body =
             read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), input_cred.secret_key.expose())
                 .await?;
@@ -573,7 +562,7 @@ impl Operation for UpdateServiceAccount {
             .await
             .map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
 
-        if !is_service_account_owner_of(&cred, &svc_account.parent_user) {
+        if !can_update_service_account_target(&cred, owner, &svc_account.parent_user) {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
@@ -1552,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn update_service_account_requires_requester_parent_match() {
+    fn update_service_account_target_scope_allows_owner_or_matching_parent() {
         let parent_owner = StoredCredentials {
             access_key: "owner-user".to_string(),
             parent_user: String::new(),
@@ -1569,9 +1558,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
-        assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
-        assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
+        assert!(can_update_service_account_target(&parent_owner, false, "owner-user"));
+        assert!(can_update_service_account_target(&derived_owner, false, "owner-user"));
+        assert!(!can_update_service_account_target(&foreign_user, false, "owner-user"));
+        assert!(can_update_service_account_target(&foreign_user, true, "owner-user"));
     }
 
     #[test]

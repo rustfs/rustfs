@@ -1800,6 +1800,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_service_account_session_policy_without_update_admin_cannot_update_service_accounts() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+        let root_access_key = get_global_action_cred()
+            .expect("root credentials should be initialized")
+            .access_key;
+        let session_policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::public/*"]}]
+}"#,
+        )
+        .expect("session policy should parse");
+
+        let (cred, _) = iam_sys
+            .new_service_account(
+                &root_access_key,
+                None,
+                NewServiceAccountOpts {
+                    access_key: "svc-no-update-admin".to_string(),
+                    secret_key: "svcNoUpdateAdminSecret".to_string(),
+                    session_policy: Some(session_policy),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("service account should be created");
+        let stored = iam_sys
+            .get_user(&cred.access_key)
+            .await
+            .expect("service account should exist");
+        let claims = stored
+            .credentials
+            .claims
+            .as_ref()
+            .expect("service account should have claims");
+
+        let groups = stored.credentials.groups.clone();
+        let args = Args {
+            account: &stored.credentials.access_key,
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction),
+            bucket: "",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims,
+            deny_only: false,
+        };
+
+        assert!(
+            !iam_sys.is_allowed(&args).await,
+            "service account session policy without UpdateServiceAccount must not self-escalate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_account_session_policy_with_update_admin_can_update_service_accounts() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+        let root_access_key = get_global_action_cred()
+            .expect("root credentials should be initialized")
+            .access_key;
+        let session_policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Action":["admin:UpdateServiceAccount"]}]
+}"#,
+        )
+        .expect("session policy should parse");
+
+        let (cred, _) = iam_sys
+            .new_service_account(
+                &root_access_key,
+                None,
+                NewServiceAccountOpts {
+                    access_key: "svc-with-update-admin".to_string(),
+                    secret_key: "svcWithUpdateAdminSecret".to_string(),
+                    session_policy: Some(session_policy),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("service account should be created");
+        let stored = iam_sys
+            .get_user(&cred.access_key)
+            .await
+            .expect("service account should exist");
+        let claims = stored
+            .credentials
+            .claims
+            .as_ref()
+            .expect("service account should have claims");
+
+        let groups = stored.credentials.groups.clone();
+        let args = Args {
+            account: &stored.credentials.access_key,
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction),
+            bucket: "",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims,
+            deny_only: false,
+        };
+
+        assert!(
+            iam_sys.is_allowed(&args).await,
+            "service account with explicit UpdateServiceAccount admin permission should be allowed"
+        );
+    }
+
+    #[tokio::test]
     async fn test_created_sts_credentials_authorize_with_session_token_claims() {
         ensure_test_global_credentials();
 

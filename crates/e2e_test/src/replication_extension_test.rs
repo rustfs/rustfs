@@ -667,6 +667,27 @@ async fn get_account_info(
     Ok(response.json().await?)
 }
 
+async fn get_service_account_info(
+    env: &RustFSTestEnvironment,
+    signer_access_key: &str,
+    signer_secret_key: &str,
+    access_key: &str,
+) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+    let url = format!(
+        "{}/rustfs/admin/v3/info-service-account?accessKey={}",
+        env.url,
+        urlencoding::encode(access_key)
+    );
+    let response = signed_request(http::Method::GET, &url, signer_access_key, signer_secret_key, None, None).await?;
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("service account info failed: {status} {body}").into());
+    }
+
+    Ok(response.json().await?)
+}
+
 async fn wait_for_service_accounts(
     env: &RustFSTestEnvironment,
     signer_access_key: &str,
@@ -2441,6 +2462,31 @@ async fn test_service_account_policy_from_accountinfo_round_trips_real_single_no
             .any(|account| account.access_key == "svcacct-info-sample"),
         "created service account should be listed for parent user: {:?}",
         listed.accounts
+    );
+
+    let info = get_service_account_info(&env, &env.access_key, &env.secret_key, "svcacct-info-sample").await?;
+    assert_eq!(info.get("name").and_then(|value| value.as_str()), Some("svcacct-info-sample"));
+    assert_eq!(
+        info.get("description").and_then(|value| value.as_str()),
+        Some("service account created from accountinfo sample policy")
+    );
+    assert_eq!(info.get("accountStatus").and_then(|value| value.as_str()), Some("on"));
+    assert_eq!(
+        info.get("impliedPolicy").and_then(|value| value.as_bool()),
+        Some(false),
+        "created service account should keep the embedded policy"
+    );
+    let returned_policy = info
+        .get("policy")
+        .and_then(|value| value.as_str())
+        .ok_or("info-service-account should return embedded policy")?;
+    let returned_policy: serde_json::Value = serde_json::from_str(returned_policy)?;
+    assert!(
+        returned_policy
+            .get("Statement")
+            .and_then(|value| value.as_array())
+            .is_some_and(|statements| !statements.is_empty()),
+        "info-service-account should return a non-empty policy: {returned_policy}"
     );
 
     Ok(())
