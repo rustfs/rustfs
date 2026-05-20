@@ -355,6 +355,8 @@ pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationS
             proxied_get_requests_failures: proxy.get_failed.max(0) as u64,
             proxied_head_requests_total: proxy.head_total.max(0) as u64,
             proxied_head_requests_failures: proxy.head_failed.max(0) as u64,
+            proxied_put_requests_total: proxy.put_total.max(0) as u64,
+            proxied_put_requests_failures: proxy.put_failed.max(0) as u64,
             proxied_put_tagging_requests_total: proxy.put_tag_total.max(0) as u64,
             proxied_put_tagging_requests_failures: proxy.put_tag_failed.max(0) as u64,
             proxied_get_tagging_requests_total: proxy.get_tag_total.max(0) as u64,
