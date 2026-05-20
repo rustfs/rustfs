@@ -187,7 +187,7 @@ setup_output() {
   fi
   mkdir -p "$OUT_DIR"
   SUMMARY_CSV="$OUT_DIR/summary.csv"
-  echo "size,tool,concurrency,status,throughput,requests_per_sec,avg_latency,log_file" > "$SUMMARY_CSV"
+  echo "size,tool,concurrency,status,throughput,requests_per_sec,avg_latency,error_count,log_file" > "$SUMMARY_CSV"
 }
 
 resolve_bucket() {
@@ -212,6 +212,27 @@ collect_metrics() {
   reqps="$(extract_value '([0-9]+(\\.[0-9]+)?\\s*(req/s|ops/s|requests/s))' "$log_file")"
   latency="$(extract_value '([0-9]+(\\.[0-9]+)?\\s*(ms|us|µs|s))(\\s*(avg|mean))?' "$log_file")"
   echo "${throughput:-N/A},${reqps:-N/A},${latency:-N/A}"
+}
+
+collect_error_count() {
+  local log_file="$1"
+  local count
+
+  count="$(
+    { rg -io '(errors?|failures?)[[:space:]:=]+[0-9]+' "$log_file" || true; } \
+      | awk '{ value = $0; gsub(/[^0-9]/, "", value); if (value != "") sum += value } END { if (NR > 0) print sum }'
+  )"
+  if [[ -n "$count" ]]; then
+    echo "$count"
+    return
+  fi
+
+  if [[ "$TOOL" == "warp" ]]; then
+    count="$(rg -c 'warp: <ERROR>' "$log_file" || true)"
+  else
+    count="$(rg -ci '(^|[[:space:]])(error|failed|failure)(:|[[:space:]])' "$log_file" || true)"
+  fi
+  echo "${count:-0}"
 }
 
 run_one() {
@@ -279,27 +300,25 @@ run_one() {
     fi
   fi
 
-  if [[ "$DRY_RUN" != "true" ]] && [[ "$TOOL" == "warp" ]]; then
-    # Warp may still exit with code 0 even when it prints runtime failures.
-    # Treat explicit error lines as failed runs to keep summary.csv reliable.
-    if rg -q 'warp: <ERROR>' "$log_file"; then
-      status="failed"
-    fi
-  fi
-
-  local metrics throughput reqps latency
+  local metrics throughput reqps latency error_count
   if [[ "$DRY_RUN" != "true" ]]; then
     metrics="$(collect_metrics "$log_file")"
     throughput="$(echo "$metrics" | cut -d',' -f1)"
     reqps="$(echo "$metrics" | cut -d',' -f2)"
     latency="$(echo "$metrics" | cut -d',' -f3)"
+    error_count="$(collect_error_count "$log_file")"
+    # Warp may still exit with code 0 even when it prints runtime failures.
+    if [[ "$TOOL" == "warp" && "$error_count" != "0" ]]; then
+      status="failed"
+    fi
   else
     throughput="N/A"
     reqps="N/A"
     latency="N/A"
+    error_count="N/A"
   fi
 
-  echo "$size,$TOOL,$CONCURRENCY,$status,$throughput,$reqps,$latency,$log_file" >> "$SUMMARY_CSV"
+  echo "$size,$TOOL,$CONCURRENCY,$status,$throughput,$reqps,$latency,$error_count,$log_file" >> "$SUMMARY_CSV"
 }
 
 main() {
@@ -308,6 +327,7 @@ main() {
   resolve_bucket
   if [[ "$DRY_RUN" != "true" ]]; then
     require_cmd rg
+    require_cmd awk
     if [[ "$TOOL" == "warp" ]]; then
       require_cmd "$WARP_BIN"
     else
