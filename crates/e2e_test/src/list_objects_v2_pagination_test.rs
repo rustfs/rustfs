@@ -612,4 +612,252 @@ mod tests {
 
         env.stop_server();
     }
+
+    /// Regression test: delimiter listing must not produce false-positive truncation
+    /// when many raw keys collapse into a small number of CommonPrefixes.
+    ///
+    /// Scenario: 30 objects across 3 directories + 2 direct files under prefix.
+    /// With max_keys=1000, all 5 visible results (3 prefixes + 2 objects) fit in one
+    /// page, so IsTruncated must be false even though raw entry count is much larger.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_delimiter_collapsed_prefix_no_false_truncation() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 delimiter collapsed-prefix no false truncation");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-collapsed-prefix";
+        let prefix = "data/";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Create objects under 3 subdirectories (10 each = 30 raw keys)
+        let dirs = ["alpha/", "beta/", "gamma/"];
+        let mut expected_keys = Vec::new();
+        for dir in &dirs {
+            for i in 0..10 {
+                let key = format!("{prefix}{dir}file{i:02}.txt");
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .body(ByteStream::from_static(b"x"))
+                    .send()
+                    .await
+                    .expect("Failed to put object");
+                expected_keys.push(key);
+            }
+        }
+        // Add 2 direct objects under prefix
+        for name in ["readme.txt", "config.json"] {
+            let key = format!("{prefix}{name}");
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(&key)
+                .body(ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .expect("Failed to put object");
+            expected_keys.push(key);
+        }
+
+        // List with delimiter="/", max_keys large enough to cover all visible results
+        // Visible: 3 common prefixes + 2 direct objects = 5
+        let output = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .delimiter("/")
+            .max_keys(1000)
+            .send()
+            .await
+            .expect("Failed to list objects");
+
+        let listed_keys: Vec<String> = output.contents().iter().filter_map(|obj| obj.key()).map(|k| k.to_string()).collect();
+        let listed_prefixes: Vec<String> = output
+            .common_prefixes()
+            .iter()
+            .filter_map(|cp| cp.prefix())
+            .map(|p| p.to_string())
+            .collect();
+
+        // KEY ASSERTION: IsTruncated must be false because all visible results fit within max_keys
+        let is_truncated = output.is_truncated().unwrap_or(false);
+        assert!(
+            !is_truncated,
+            "BUG: IsTruncated should be false when all visible results ({} objects + {} prefixes = {}) fit within max_keys (1000)",
+            listed_keys.len(),
+            listed_prefixes.len(),
+            listed_keys.len() + listed_prefixes.len()
+        );
+
+        assert!(
+            output.next_continuation_token().is_none(),
+            "NextContinuationToken should be None when IsTruncated is false"
+        );
+
+        // All 32 objects must be covered (listed_keys + keys under listed_prefixes)
+        let total_raw_count = expected_keys.len();
+        let keys_under_prefixes: usize = listed_prefixes
+            .iter()
+            .map(|p| {
+                let dir = p.trim_end_matches('/');
+                expected_keys.iter().filter(|k| k.starts_with(&format!("{dir}/"))).count()
+            })
+            .sum();
+        let covered = listed_keys.len() + keys_under_prefixes;
+
+        assert_eq!(
+            covered, total_raw_count,
+            "Collapsed-prefix listing must cover all {} objects, got {} (keys={}, under_prefixes={})",
+            total_raw_count, covered, listed_keys.len(), keys_under_prefixes
+        );
+
+        info!(
+            "Collapsed-prefix test passed: {} objects covered ({} keys + {} prefixes), IsTruncated=false",
+            covered,
+            listed_keys.len(),
+            listed_prefixes.len()
+        );
+
+        env.stop_server();
+    }
+
+    /// Regression test: delimiter listing pagination must traverse all keys
+    /// even when the visible result count per page is much smaller than the
+    /// raw entry count (due to CommonPrefix collapse).
+    ///
+    /// Scenario: many objects under a few directories, paginated with a small
+    /// max_keys. Each page returns few visible results but the server must
+    /// correctly set IsTruncated and provide a valid continuation token so
+    /// the client can retrieve all data.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_delimiter_small_page_traverses_all() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 delimiter small page traverses all keys");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-delimiter-small-page";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Create 20 objects: 5 directories with 3 files each + 5 root-level files
+        let mut all_keys = Vec::new();
+        let dirs = ["dir-a/", "dir-b/", "dir-c/", "dir-d/", "dir-e/"];
+        for dir in &dirs {
+            for i in 0..3 {
+                let key = format!("{dir}file{i}.txt");
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .body(ByteStream::from_static(b"x"))
+                    .send()
+                    .await
+                    .expect("Failed to put object");
+                all_keys.push(key);
+            }
+        }
+        for i in 0..5 {
+            let key = format!("root{i}.txt");
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(&key)
+                .body(ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .expect("Failed to put object");
+            all_keys.push(key);
+        }
+
+        // Paginate with delimiter="/" and max_keys=3
+        // Visible per page: up to 3 (mix of CommonPrefixes and objects)
+        let mut listed_keys = Vec::new();
+        let mut listed_prefixes = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        let mut page_count = 0;
+        let mut last_page_is_truncated: bool;
+
+        loop {
+            let mut request = client.list_objects_v2().bucket(bucket).delimiter("/").max_keys(3);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let output = request.send().await.expect("Failed to list objects");
+            last_page_is_truncated = output.is_truncated().unwrap_or(false);
+
+            for obj in output.contents() {
+                if let Some(key) = obj.key() {
+                    listed_keys.push(key.to_string());
+                }
+            }
+            for cp in output.common_prefixes() {
+                if let Some(p) = cp.prefix() {
+                    listed_prefixes.push(p.to_string());
+                }
+            }
+
+            page_count += 1;
+
+            if last_page_is_truncated {
+                continuation_token = output.next_continuation_token().map(|s| s.to_string());
+                assert!(
+                    continuation_token.is_some(),
+                    "BUG: NextContinuationToken must be present when IsTruncated is true"
+                );
+            } else {
+                break;
+            }
+
+            if page_count > 20 {
+                panic!("Too many pages, possible infinite loop in delimiter pagination");
+            }
+        }
+
+        // Last page must have IsTruncated=false
+        assert!(
+            !last_page_is_truncated,
+            "BUG: Last page must have IsTruncated=false after all results returned"
+        );
+
+        // Verify all objects are covered: root files listed directly + files under listed prefixes
+        let keys_under_prefixes: HashSet<String> = all_keys
+            .iter()
+            .filter(|k| {
+                listed_prefixes
+                    .iter()
+                    .any(|p| k.starts_with(&format!("{}/", p.trim_end_matches('/'))))
+            })
+            .cloned()
+            .collect();
+        let listed_set: HashSet<String> = listed_keys.iter().cloned().collect();
+        let covered: HashSet<String> = listed_set.union(&keys_under_prefixes).cloned().collect();
+        let expected_set: HashSet<String> = all_keys.iter().cloned().collect();
+
+        assert_eq!(
+            covered, expected_set,
+            "Delimiter pagination must cover all {} objects, missing: {:?}",
+            expected_set.difference(&covered).collect::<Vec<_>>().len(),
+            expected_set.difference(&covered)
+        );
+
+        info!(
+            "Delimiter small-page test passed: {} objects covered in {} pages",
+            covered.len(),
+            page_count
+        );
+
+        env.stop_server();
+    }
 }
