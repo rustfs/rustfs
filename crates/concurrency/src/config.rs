@@ -149,6 +149,9 @@ impl ConcurrencyConfig {
         if self.timeout_policy.default_timeout > self.timeout_policy.max_timeout {
             return Err(ConfigError::InvalidTimeout("default_timeout cannot exceed max_timeout".to_string()));
         }
+        if self.timeout_policy.min_timeout > self.timeout_policy.max_timeout {
+            return Err(ConfigError::InvalidTimeout("min_timeout cannot exceed max_timeout".to_string()));
+        }
 
         if self.backpressure_policy.high_watermark <= self.backpressure_policy.low_watermark
             || self.backpressure_policy.high_watermark > 100
@@ -159,7 +162,9 @@ impl ConcurrencyConfig {
         }
 
         if self.scheduler_policy.base_buffer_size > self.scheduler_policy.max_buffer_size {
-            return Err(ConfigError::InvalidScheduler("io_buffer_size cannot exceed max_buffer_size".to_string()));
+            return Err(ConfigError::InvalidScheduler(
+                "base_buffer_size cannot exceed max_buffer_size".to_string(),
+            ));
         }
 
         Ok(())
@@ -207,6 +212,22 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "validate() should return an error when default_timeout > max_timeout"
+        );
+    }
+
+    #[test]
+    fn test_invalid_min_timeout() {
+        let config = ConcurrencyConfig {
+            timeout_policy: TimeoutManagerPolicy {
+                min_timeout: Duration::from_secs(100),
+                max_timeout: Duration::from_secs(50),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "validate() should return an error when min_timeout > max_timeout"
         );
     }
 

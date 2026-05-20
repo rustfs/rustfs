@@ -401,12 +401,10 @@ impl IoSchedulerConfig {
             load_low_threshold_ms: self.load_low_threshold_ms,
             enable_priority: self.enable_priority,
             storage_detection_enabled: self.storage_detection_enabled,
-            sequential_detection_enabled: true,
-            bandwidth_monitoring_enabled: true,
-            adaptive_buffer_enabled: true,
             base_buffer_size: rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE,
             max_buffer_size: MI_B,
             min_buffer_size: 32 * KI_B,
+            ..Default::default()
         }
     }
 }
