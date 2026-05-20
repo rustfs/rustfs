@@ -611,7 +611,6 @@ mod tests {
             bytes_per_second: 1024 * 1024, // 1MB/s
             min_timeout: Duration::from_secs(1),
             max_timeout: Duration::from_secs(30),
-            ..Default::default()
         };
 
         // Tiny object should still honor policy min_timeout (1s),
@@ -628,7 +627,6 @@ mod tests {
             bytes_per_second: 1,
             min_timeout: Duration::from_secs(1),
             max_timeout: Duration::from_secs(300),
-            ..Default::default()
         };
 
         let timeout = config.calculate_timeout_for_size(u64::MAX);
@@ -748,7 +746,6 @@ mod tests {
             bytes_per_second: 1024 * 1024,
             min_timeout: Duration::from_secs(1),
             max_timeout: Duration::from_secs(300),
-            ..Default::default()
         };
         let size = 100 * 1024 * 1024;
         let wrapper = RequestTimeoutWrapper::with_operation_size(config.clone(), Some(size));
