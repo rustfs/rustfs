@@ -279,7 +279,7 @@ run_one() {
     fi
   fi
 
-  if [[ "$TOOL" == "warp" ]]; then
+  if [[ "$DRY_RUN" != "true" ]] && [[ "$TOOL" == "warp" ]]; then
     # Warp may still exit with code 0 even when it prints runtime failures.
     # Treat explicit error lines as failed runs to keep summary.csv reliable.
     if rg -q 'warp: <ERROR>' "$log_file"; then
@@ -288,10 +288,16 @@ run_one() {
   fi
 
   local metrics throughput reqps latency
-  metrics="$(collect_metrics "$log_file")"
-  throughput="$(echo "$metrics" | cut -d',' -f1)"
-  reqps="$(echo "$metrics" | cut -d',' -f2)"
-  latency="$(echo "$metrics" | cut -d',' -f3)"
+  if [[ "$DRY_RUN" != "true" ]]; then
+    metrics="$(collect_metrics "$log_file")"
+    throughput="$(echo "$metrics" | cut -d',' -f1)"
+    reqps="$(echo "$metrics" | cut -d',' -f2)"
+    latency="$(echo "$metrics" | cut -d',' -f3)"
+  else
+    throughput="N/A"
+    reqps="N/A"
+    latency="N/A"
+  fi
 
   echo "$size,$TOOL,$CONCURRENCY,$status,$throughput,$reqps,$latency,$log_file" >> "$SUMMARY_CSV"
 }
@@ -300,8 +306,8 @@ main() {
   parse_args "$@"
   validate_args
   resolve_bucket
-  require_cmd rg
   if [[ "$DRY_RUN" != "true" ]]; then
+    require_cmd rg
     if [[ "$TOOL" == "warp" ]]; then
       require_cmd "$WARP_BIN"
     else
