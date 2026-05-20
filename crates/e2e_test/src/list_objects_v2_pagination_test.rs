@@ -677,7 +677,12 @@ mod tests {
             .await
             .expect("Failed to list objects");
 
-        let listed_keys: Vec<String> = output.contents().iter().filter_map(|obj| obj.key()).map(|k| k.to_string()).collect();
+        let listed_keys: Vec<String> = output
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key())
+            .map(|k| k.to_string())
+            .collect();
         let listed_prefixes: Vec<String> = output
             .common_prefixes()
             .iter()
@@ -712,9 +717,13 @@ mod tests {
         let covered = listed_keys.len() + keys_under_prefixes;
 
         assert_eq!(
-            covered, total_raw_count,
+            covered,
+            total_raw_count,
             "Collapsed-prefix listing must cover all {} objects, got {} (keys={}, under_prefixes={})",
-            total_raw_count, covered, listed_keys.len(), keys_under_prefixes
+            total_raw_count,
+            covered,
+            listed_keys.len(),
+            keys_under_prefixes
         );
 
         info!(
@@ -846,7 +855,8 @@ mod tests {
         let expected_set: HashSet<String> = all_keys.iter().cloned().collect();
 
         assert_eq!(
-            covered, expected_set,
+            covered,
+            expected_set,
             "Delimiter pagination must cover all {} objects, missing: {:?}",
             expected_set.difference(&covered).collect::<Vec<_>>().len(),
             expected_set.difference(&covered)
