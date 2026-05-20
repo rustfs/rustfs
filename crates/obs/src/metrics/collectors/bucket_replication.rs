@@ -22,11 +22,14 @@ use crate::metrics::schema::bucket_replication::{
     BUCKET_REPL_PROXIED_DELETE_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_GET_REQUESTS_FAILURES_MD,
     BUCKET_REPL_PROXIED_GET_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_FAILURES_MD,
     BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_HEAD_REQUESTS_FAILURES_MD,
-    BUCKET_REPL_PROXIED_HEAD_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD,
+    BUCKET_REPL_PROXIED_HEAD_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_PUT_REQUESTS_FAILURES_MD,
+    BUCKET_REPL_PROXIED_PUT_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD,
     BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_SENT_BYTES_MD, BUCKET_REPL_SENT_COUNT_MD,
     BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, TARGET_ARN_L,
 };
 use std::borrow::Cow;
+
+const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 20;
 
 #[derive(Debug, Clone, Default)]
 pub struct BucketReplicationTargetStats {
@@ -59,6 +62,8 @@ pub struct BucketReplicationStats {
     pub proxied_get_requests_failures: u64,
     pub proxied_head_requests_total: u64,
     pub proxied_head_requests_failures: u64,
+    pub proxied_put_requests_total: u64,
+    pub proxied_put_requests_failures: u64,
     pub proxied_put_tagging_requests_total: u64,
     pub proxied_put_tagging_requests_failures: u64,
     pub proxied_get_tagging_requests_total: u64,
@@ -99,7 +104,11 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
         return Vec::new();
     }
 
-    let mut metrics = Vec::new();
+    let metric_count = stats
+        .iter()
+        .map(|stat| BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET + stat.targets.len())
+        .sum();
+    let mut metrics = Vec::with_capacity(metric_count);
     for stat in stats {
         let bucket_label: Cow<'static, str> = Cow::Owned(stat.bucket.clone());
 
@@ -157,6 +166,17 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
             PrometheusMetric::from_descriptor(
                 &BUCKET_REPL_PROXIED_HEAD_REQUESTS_FAILURES_MD,
                 stat.proxied_head_requests_failures as f64,
+            )
+            .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_PROXIED_PUT_REQUESTS_TOTAL_MD, stat.proxied_put_requests_total as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(
+                &BUCKET_REPL_PROXIED_PUT_REQUESTS_FAILURES_MD,
+                stat.proxied_put_requests_failures as f64,
             )
             .with_label(BUCKET_L, bucket_label.clone()),
         );
@@ -238,6 +258,8 @@ mod tests {
             proxied_get_requests_failures: 1,
             proxied_head_requests_total: 4,
             proxied_head_requests_failures: 0,
+            proxied_put_requests_total: 6,
+            proxied_put_requests_failures: 2,
             proxied_put_tagging_requests_total: 3,
             proxied_put_tagging_requests_failures: 1,
             proxied_get_tagging_requests_total: 2,
@@ -253,12 +275,26 @@ mod tests {
         }];
 
         let metrics = collect_bucket_replication_metrics(&stats);
-        assert_eq!(metrics.len(), 19);
+        assert_eq!(metrics.len(), 21);
 
         let sent_name = BUCKET_REPL_SENT_COUNT_MD.get_full_metric_name();
         assert!(metrics.iter().any(|metric| {
             metric.name == sent_name
                 && metric.value == 8.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let put_total_name = BUCKET_REPL_PROXIED_PUT_REQUESTS_TOTAL_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == put_total_name
+                && metric.value == 6.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let put_failures_name = BUCKET_REPL_PROXIED_PUT_REQUESTS_FAILURES_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == put_failures_name
+                && metric.value == 2.0
                 && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
         }));
 
