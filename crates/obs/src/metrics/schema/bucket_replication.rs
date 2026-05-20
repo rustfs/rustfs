@@ -26,6 +26,9 @@ pub const TARGET_ARN_L: &str = "target_arn";
 /// Replication range
 pub const RANGE_L: &str = "range";
 
+const PROXIED_PUT_REQUESTS_TOTAL: &str = "proxied_put_requests_total";
+const PROXIED_PUT_REQUESTS_FAILURES: &str = "proxied_put_requests_failures";
+
 pub static BUCKET_REPL_LAST_HR_FAILED_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::LastHourFailedBytes,
@@ -138,6 +141,24 @@ pub static BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD: LazyLock<Metric
     new_counter_md(
         MetricName::ProxiedPutTaggingRequestFailures,
         "Number of failures in PUT tagging requests proxied to replication target",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_PROXIED_PUT_REQUESTS_FAILURES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(PROXIED_PUT_REQUESTS_FAILURES),
+        "Number of failures in PUT requests proxied to replication target",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_PROXIED_PUT_REQUESTS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(PROXIED_PUT_REQUESTS_TOTAL),
+        "Number of PUT requests proxied to replication target",
         &[BUCKET_L],
         subsystems::BUCKET_REPLICATION,
     )
