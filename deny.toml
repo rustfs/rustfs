@@ -44,8 +44,10 @@ allow-git = [
     # Pinned to a specific commit in workspace Cargo.toml.
     "https://github.com/rustfs/s3s",
     # Temporary git source for russh until required upstream fixes are released.
-    # owner: rustfs-maintainers  review: 2026-07
+    # owner: rustfs-maintainers  review: 2026-05
     "https://github.com/Eugeny/russh",
+    # Temporary git source for mysql_async until required upstream fixes are released.
+    # owner: rustfs-maintainers  review: 2026-05
     "https://github.com/blackbeam/mysql_async",
 ]
 
