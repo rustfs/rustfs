@@ -412,12 +412,7 @@ impl IoSchedulerConfig {
             load_low_threshold_ms: self.load_low_threshold_ms,
             enable_priority: self.enable_priority,
             storage_detection_enabled: self.storage_detection_enabled,
-            sequential_detection_enabled: true,
-            bandwidth_monitoring_enabled: true,
-            adaptive_buffer_enabled: true,
-            base_buffer_size: rustfs_config::DEFAULT_OBJECT_IO_BUFFER_SIZE,
-            max_buffer_size: MI_B,
-            min_buffer_size: 32 * KI_B,
+            ..CoreIoSchedulerConfig::default()
         }
     }
 }
@@ -1600,7 +1595,7 @@ impl IoPriorityQueueConfig {
             queue_high_capacity: config.high_capacity,
             queue_normal_capacity: config.normal_capacity,
             queue_low_capacity: config.low_capacity,
-            starvation_prevention_interval_ms: config.starvation_interval.as_millis() as u64,
+            starvation_prevention_interval_ms: u64::try_from(config.starvation_interval.as_millis()).unwrap_or(u64::MAX),
             starvation_threshold_secs: config.starvation_threshold.as_secs(),
         }
     }
