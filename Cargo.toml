@@ -258,7 +258,7 @@ redis = { version = "1.2.1", features = ["connection-manager", "tokio-rustls-com
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = { version = "8.11.0" }
 rustc-hash = { version = "2.1.2" }
-s3s = { git = "https://github.com/rustfs/s3s", rev = "a3b16608df35aaeed8fff08b4988d03f4ca9445b", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s", rev = "507e1312b211c3ddc214b03875d6fabd15d22ed5", features = ["minio"] }
 serial_test = "3.4.0"
 shadow-rs = { version = "2.0.0", default-features = false }
 siphasher = "1.0.3"
