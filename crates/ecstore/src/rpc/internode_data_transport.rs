@@ -17,12 +17,14 @@ use crate::disk::{FileReader, FileWriter};
 use crate::rpc::build_auth_headers;
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
-use rustfs_config::{DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT};
+use rustfs_config::{
+    DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP,
+    KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
+};
 use rustfs_rio::{HttpReader, HttpWriter};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-pub const INTERNODE_DATA_TRANSPORT_TCP: &str = "tcp";
 static INTERNODE_DATA_TRANSPORT: OnceLock<std::result::Result<Arc<dyn InternodeDataTransport>, String>> = OnceLock::new();
 
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
@@ -32,7 +34,8 @@ const CONTENT_TYPE_JSON: &str = "application/json";
 
 fn unsupported_transport_message(transport: &str) -> String {
     format!(
-        "invalid {ENV_RUSTFS_INTERNODE_DATA_TRANSPORT}={transport:?}; supported values: {DEFAULT_INTERNODE_DATA_TRANSPORT}, {INTERNODE_DATA_TRANSPORT_TCP}"
+        "invalid {ENV_RUSTFS_INTERNODE_DATA_TRANSPORT}={transport:?}; supported values: {}",
+        KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS.join(", ")
     )
 }
 
@@ -87,6 +90,11 @@ pub struct WalkDirStreamRequest {
     pub stall_timeout: Option<Duration>,
 }
 
+/// Data-plane stream opener used by `RemoteDisk`.
+///
+/// This boundary is limited to remote disk streams that can move large payloads.
+/// Internode metadata, lock, health, and administrative calls remain on the
+/// existing gRPC control plane.
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;

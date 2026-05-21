@@ -2,7 +2,6 @@
 name: rustfs-release-version-bump
 description: Publish a RustFS alpha/beta/stable release with an auditable flow: confirm target version and scope, update workspace and release assets (including strict rustfs.spec changelog identity/date/version format), run required verification, and finish with commit, push, and GitHub PR creation.
 ---
-
 # RustFS Release Version Bump
 
 Use this skill to publish a RustFS release (alpha, beta, or stable) with a minimal, auditable diff and a complete ship flow (`edit -> verify -> commit -> push -> PR`).

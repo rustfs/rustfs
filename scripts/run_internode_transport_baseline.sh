@@ -125,9 +125,9 @@ setup_output() {
     OUT_DIR="target/bench/internode-transport-$(date +%Y%m%d-%H%M%S)"
   fi
   mkdir -p "${OUT_DIR}"
-  echo "scenario,endpoint,workload,concurrency,size,status,throughput,requests_per_sec,avg_latency,log_file,run_dir" > "${OUT_DIR}/summary.csv"
+  echo "scenario,endpoint,workload,concurrency,size,status,throughput,requests_per_sec,avg_latency,error_count,log_file,run_dir" > "${OUT_DIR}/summary.csv"
   if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
-    echo "scenario,workload,concurrency,size,metric,operation,before,after,delta" > "${OUT_DIR}/internode_metric_deltas.csv"
+    echo "scenario,workload,concurrency,size,metric,operation,backend,before,after,delta" > "${OUT_DIR}/internode_metric_deltas.csv"
   fi
 }
 
@@ -190,15 +190,20 @@ extract_internode_rows() {
   awk '
   $1 ~ /^rustfs_system_network_internode_operation_/ {
     metric = $1
+    sub(/\{.*/, "", metric)
     op = "all"
+    backend = "unknown"
     if (match($0, /operation="[^"]+"/)) {
       op = substr($0, RSTART + 11, RLENGTH - 12)
+    }
+    if (match($0, /backend="[^"]+"/)) {
+      backend = substr($0, RSTART + 9, RLENGTH - 10)
     }
     n = split($0, parts, " ")
     value = parts[n]
     gsub(/[[:space:]]+/, "", value)
     if (value ~ /^[0-9]+([.][0-9]+)?$/) {
-      print metric "," op "," value
+      print metric "," op "," backend "," value
     }
   }' "${src}"
 }
@@ -219,18 +224,19 @@ append_metric_deltas() {
 
   awk -F',' -v scenario="${scenario}" -v workload="${workload}" -v conc="${conc}" -v size="${size}" '
     FNR==NR {
-      key = $1 SUBSEP $2
-      before[key] = $3
+      key = $1 SUBSEP $2 SUBSEP $3
+      before[key] = $4
       next
     }
     {
-      key = $1 SUBSEP $2
+      key = $1 SUBSEP $2 SUBSEP $3
       metric = $1
       operation = $2
-      afterv = $3 + 0
+      backend = $3
+      afterv = $4 + 0
       beforev = (key in before ? before[key] + 0 : 0)
       delta = afterv - beforev
-      printf "%s,%s,%s,%s,%s,%s,%.0f,%.0f,%.0f\n", scenario, workload, conc, size, metric, operation, beforev, afterv, delta
+      printf "%s,%s,%s,%s,%s,%s,%s,%.0f,%.0f,%.0f\n", scenario, workload, conc, size, metric, operation, backend, beforev, afterv, delta
     }
   ' "${before_rows}" "${after_rows}" >> "${OUT_DIR}/internode_metric_deltas.csv"
 
@@ -253,7 +259,7 @@ append_object_summary() {
   awk -F',' -v scenario="${scenario}" -v endpoint="${endpoint}" -v workload="${workload}" -v run_dir="${run_dir}" '
     NR == 1 { next }
     {
-      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", scenario, endpoint, workload, $3, $1, $4, $5, $6, $7, $8, run_dir
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", scenario, endpoint, workload, $3, $1, $4, $5, $6, $7, $8, $9, run_dir
     }
   ' "${src}" >> "${OUT_DIR}/summary.csv"
 }
