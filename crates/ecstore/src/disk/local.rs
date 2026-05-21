@@ -1183,6 +1183,11 @@ impl LocalDisk {
             }
         }
 
+        // Ensure Tokio's file write is driven to completion before callers expose
+        // metadata paths to subsequent reads.
+        f.flush().await.map_err(to_file_error)?;
+        f.shutdown().await.map_err(to_file_error)?;
+
         Ok(())
     }
 
@@ -1993,11 +1998,7 @@ impl DiskAPI for LocalDisk {
             let meta_op = match lstat_std(&src_file_path).map_err(|e| to_file_error(e).into()) {
                 Ok(meta) => Some(meta),
                 Err(e) => {
-                    if e != DiskError::FileNotFound {
-                        return Err(e);
-                    }
-
-                    None
+                    return Err(e);
                 }
             };
 
@@ -2009,9 +2010,21 @@ impl DiskAPI for LocalDisk {
             }
 
             remove_std(&dst_file_path).map_err(to_file_error)?;
+        } else {
+            let meta = lstat_std(&src_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
+            if meta.is_dir() {
+                warn!("rename_part src is dir {:?}", &src_file_path);
+                return Err(DiskError::FileAccessDenied);
+            }
         }
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
+
+        let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
+        if src_is_dir != dst_meta.is_dir() {
+            warn!("rename_part dst type changed after rename {:?}", &dst_file_path);
+            return Err(DiskError::FileAccessDenied);
+        }
 
         self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
 

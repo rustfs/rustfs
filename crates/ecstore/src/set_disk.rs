@@ -130,6 +130,7 @@ pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
@@ -268,6 +269,10 @@ fn record_lock_release(bucket: &str, object: &str, lock_id: &str, lock_type: &st
         lock_type = %lock_type,
         "Lock released for deadlock tracking"
     );
+}
+
+fn issue3031_diag_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_ISSUE3031_DIAG_ENABLE, false)
 }
 
 fn build_tiered_decommission_file_info(
@@ -3262,6 +3267,7 @@ impl MultipartOperations for SetDisks {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
+        let read_quorum = fi.read_quorum(self.default_read_quorum());
 
         let disks = self.disks.read().await;
 
@@ -3278,7 +3284,7 @@ impl MultipartOperations for SetDisks {
         let part_numbers = uploaded_parts.iter().map(|v| v.part_num).collect::<Vec<usize>>();
 
         let object_parts =
-            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, write_quorum).await?;
+            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum).await?;
 
         if object_parts.len() != uploaded_parts.len() {
             return Err(Error::other("part result number err"));
@@ -3302,6 +3308,21 @@ impl MultipartOperations for SetDisks {
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
                 error!("complete_multipart_upload part error: {:?}", &err);
+                if issue3031_diag_enabled() {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        op = "complete_multipart_upload",
+                        bucket = %bucket,
+                        object = %object,
+                        upload_id = %upload_id,
+                        uploaded_part_num = uploaded_parts[i].part_num,
+                        observed_part_num = part.number,
+                        read_quorum = read_quorum,
+                        write_quorum = write_quorum,
+                        error = %err,
+                        "issue3031_complete_part_error"
+                    );
+                }
             }
 
             if uploaded_parts[i].part_num != part.number {
