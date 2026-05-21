@@ -858,7 +858,7 @@ mod tests {
             covered,
             expected_set,
             "Delimiter pagination must cover all {} objects, missing: {:?}",
-            expected_set.difference(&covered).collect::<Vec<_>>().len(),
+            expected_set.difference(&covered).count(),
             expected_set.difference(&covered)
         );
 
