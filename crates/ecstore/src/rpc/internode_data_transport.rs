@@ -90,6 +90,11 @@ pub struct WalkDirStreamRequest {
     pub stall_timeout: Option<Duration>,
 }
 
+/// Data-plane stream opener used by `RemoteDisk`.
+///
+/// This boundary is limited to remote disk streams that can move large payloads.
+/// Internode metadata, lock, health, and administrative calls remain on the
+/// existing gRPC control plane.
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;
