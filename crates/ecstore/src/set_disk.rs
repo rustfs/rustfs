@@ -130,6 +130,7 @@ pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
@@ -271,7 +272,7 @@ fn record_lock_release(bucket: &str, object: &str, lock_id: &str, lock_type: &st
 }
 
 fn issue3031_diag_enabled() -> bool {
-    rustfs_utils::get_env_bool("RUSTFS_ISSUE3031_DIAG_ENABLE", false)
+    rustfs_utils::get_env_bool(ENV_ISSUE3031_DIAG_ENABLE, false)
 }
 
 fn build_tiered_decommission_file_info(

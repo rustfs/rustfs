@@ -202,10 +202,10 @@ impl SetDisks {
 
     #[tracing::instrument(skip(self))]
     pub(super) async fn cleanup_multipart_path(&self, paths: &[String]) {
-        let disks = self.get_disks_internal().await;
         if paths.is_empty() {
             return;
         }
+        let disks = self.get_disks_internal().await;
 
         let mut errs = Vec::with_capacity(disks.len());
 
