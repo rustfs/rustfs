@@ -59,6 +59,9 @@ pub enum Error {
     #[error("Heal task already exists: {task_id}")]
     TaskAlreadyExists { task_id: String },
 
+    #[error("Invalid heal client token")]
+    InvalidClientToken,
+
     #[error("Heal manager is not running")]
     ManagerNotRunning,
 

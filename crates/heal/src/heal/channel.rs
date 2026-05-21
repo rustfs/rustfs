@@ -14,7 +14,7 @@
 
 use crate::heal::{
     manager::HealManager,
-    task::{HealOptions, HealPriority, HealRequest, HealType},
+    task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
     utils,
 };
 use crate::{Error, Result};
@@ -83,8 +83,16 @@ impl HealChannelProcessor {
     async fn process_command(&self, command: HealChannelCommand) -> Result<()> {
         match command {
             HealChannelCommand::Start { request, response_tx } => self.process_start_request(request, response_tx).await,
-            HealChannelCommand::Query { heal_path, client_token } => self.process_query_request(heal_path, client_token).await,
-            HealChannelCommand::Cancel { heal_path } => self.process_cancel_request(heal_path).await,
+            HealChannelCommand::Query {
+                heal_path,
+                client_token,
+                response_tx,
+            } => self.process_query_request(heal_path, client_token, response_tx).await,
+            HealChannelCommand::Cancel {
+                heal_path,
+                client_token,
+                response_tx,
+            } => self.process_cancel_request(heal_path, client_token, response_tx).await,
         }
     }
 
@@ -166,36 +174,96 @@ impl HealChannelProcessor {
     }
 
     /// Process query request
-    async fn process_query_request(&self, heal_path: String, client_token: String) -> Result<()> {
+    async fn process_query_request(
+        &self,
+        heal_path: String,
+        client_token: String,
+        response_tx: oneshot::Sender<std::result::Result<HealChannelResponse, String>>,
+    ) -> Result<()> {
         info!("Processing heal query request for path: {}", heal_path);
 
-        // TODO: Implement query logic based on heal_path and client_token
-        // For now, return a placeholder response
+        let (summary, detail) = match self.heal_manager.get_task_status_for_path(&heal_path, &client_token).await {
+            Ok(HealTaskStatus::Pending | HealTaskStatus::Running) => ("running".to_string(), None),
+            Ok(HealTaskStatus::Completed) => ("finished".to_string(), None),
+            Ok(HealTaskStatus::Cancelled) => ("stopped".to_string(), Some("heal task cancelled".to_string())),
+            Ok(HealTaskStatus::Timeout) => ("stopped".to_string(), Some("heal task timed out".to_string())),
+            Ok(HealTaskStatus::Failed { error }) => ("stopped".to_string(), Some(error)),
+            Err(crate::Error::TaskNotFound { .. }) => ("finished".to_string(), None),
+            Err(crate::Error::InvalidClientToken) => {
+                let response = HealChannelResponse {
+                    request_id: client_token,
+                    success: false,
+                    data: None,
+                    error: Some("invalid heal client token".to_string()),
+                };
+                let _ = response_tx.send(Ok(response.clone()));
+                self.publish_response(response);
+                return Ok(());
+            }
+            Err(err) => {
+                let error_text = err.to_string();
+                let response = HealChannelResponse {
+                    request_id: client_token,
+                    success: false,
+                    data: None,
+                    error: Some(error_text.clone()),
+                };
+                let _ = response_tx.send(Ok(response.clone()));
+                self.publish_response(response);
+                return Ok(());
+            }
+        };
+
         let response = HealChannelResponse {
             request_id: client_token,
             success: true,
-            data: Some(format!("Query result for path: {heal_path}").into_bytes()),
-            error: None,
+            data: Some(summary.into_bytes()),
+            error: detail,
         };
 
+        let _ = response_tx.send(Ok(response.clone()));
         self.publish_response(response);
 
         Ok(())
     }
 
     /// Process cancel request
-    async fn process_cancel_request(&self, heal_path: String) -> Result<()> {
+    async fn process_cancel_request(
+        &self,
+        heal_path: String,
+        client_token: String,
+        response_tx: oneshot::Sender<std::result::Result<HealChannelResponse, String>>,
+    ) -> Result<()> {
         info!("Processing heal cancel request for path: {}", heal_path);
 
-        // TODO: Implement cancel logic based on heal_path
-        // For now, return a placeholder response
-        let response = HealChannelResponse {
-            request_id: heal_path.clone(),
-            success: true,
-            data: Some(format!("Cancel request for path: {heal_path}").into_bytes()),
-            error: None,
+        let request_id = if client_token.is_empty() {
+            heal_path.clone()
+        } else {
+            client_token.clone()
         };
 
+        let cancel_result = if client_token.is_empty() {
+            self.heal_manager.cancel_tasks_for_path(&heal_path).await.map(|_| ())
+        } else {
+            self.heal_manager.cancel_task(&client_token).await
+        };
+
+        let response = match cancel_result {
+            Ok(()) => HealChannelResponse {
+                request_id,
+                success: true,
+                data: Some("stopped".as_bytes().to_vec()),
+                error: None,
+            },
+            Err(err) => HealChannelResponse {
+                request_id,
+                success: false,
+                data: None,
+                error: Some(err.to_string()),
+            },
+        };
+
+        let _ = response_tx.send(Ok(response.clone()));
         self.publish_response(response);
 
         Ok(())
@@ -690,5 +758,166 @@ mod tests {
             .await
             .expect("processor should surface invalid request through response channel");
         assert!(rx.await.expect("oneshot should resolve").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_process_query_request_reports_finished_when_task_is_not_active() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_query_request("bucket".to_string(), "completed-token".to_string(), tx)
+            .await
+            .expect("query should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("query response should be returned");
+        assert!(response.success);
+        assert_eq!(response.request_id, "completed-token");
+        assert_eq!(response.data.as_deref(), Some("finished".as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn test_process_query_request_reports_running_for_queued_task() {
+        let heal_manager = create_test_heal_manager();
+        let request = HealRequest::bucket("bucket".to_string());
+        let task_id = request.id.clone();
+        assert_eq!(
+            heal_manager
+                .submit_heal_request(request)
+                .await
+                .expect("request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_query_request("bucket".to_string(), task_id.clone(), tx)
+            .await
+            .expect("query should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("query response should be returned");
+        assert!(response.success);
+        assert_eq!(response.request_id, task_id);
+        assert_eq!(response.data.as_deref(), Some("running".as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn test_process_query_request_rejects_wrong_token_for_active_path() {
+        let heal_manager = create_test_heal_manager();
+        let request = HealRequest::bucket("bucket".to_string());
+        assert_eq!(
+            heal_manager
+                .submit_heal_request(request)
+                .await
+                .expect("request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_query_request("bucket".to_string(), "wrong-token".to_string(), tx)
+            .await
+            .expect("query should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("query response should be returned");
+        assert!(!response.success);
+        assert_eq!(response.request_id, "wrong-token");
+        assert_eq!(response.error.as_deref(), Some("invalid heal client token"));
+    }
+
+    #[tokio::test]
+    async fn test_process_cancel_request_cancels_queued_task_by_token() {
+        let heal_manager = create_test_heal_manager();
+        let request = HealRequest::bucket("bucket".to_string());
+        let task_id = request.id.clone();
+        heal_manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+
+        let processor = HealChannelProcessor::new(heal_manager.clone());
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_cancel_request("bucket".to_string(), task_id.clone(), tx)
+            .await
+            .expect("cancel should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("cancel response should be returned");
+        assert!(response.success);
+        assert_eq!(response.request_id, task_id);
+        assert_eq!(response.data.as_deref(), Some("stopped".as_bytes()));
+        assert!(matches!(
+            heal_manager.get_task_status(&response.request_id).await,
+            Err(crate::Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_process_cancel_request_cancels_queued_task_by_path() {
+        let heal_manager = create_test_heal_manager();
+        let request = HealRequest::bucket("bucket".to_string());
+        let task_id = request.id.clone();
+        heal_manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+
+        let processor = HealChannelProcessor::new(heal_manager.clone());
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_cancel_request("bucket".to_string(), String::new(), tx)
+            .await
+            .expect("cancel should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("cancel response should be returned");
+        assert!(response.success);
+        assert_eq!(response.request_id, "bucket");
+        assert_eq!(response.data.as_deref(), Some("stopped".as_bytes()));
+        assert!(matches!(
+            heal_manager.get_task_status(&task_id).await,
+            Err(crate::Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_process_cancel_request_reports_unknown_task() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_cancel_request("missing".to_string(), "missing-token".to_string(), tx)
+            .await
+            .expect("cancel should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("cancel response should be returned");
+        assert!(!response.success);
+        assert_eq!(response.request_id, "missing-token");
+        assert!(response.error.unwrap_or_default().contains("Heal task not found"));
     }
 }
