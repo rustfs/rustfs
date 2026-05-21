@@ -14,7 +14,6 @@
 
 use crate::last_minute::{AccElem, LastMinuteLatency};
 use chrono::{DateTime, Utc};
-use rustfs_madmin::metrics::{ScannerMetrics as M_ScannerMetrics, TimedAction};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -351,6 +350,32 @@ pub struct CurrentCycle {
     pub started: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerTimedAction {
+    pub count: u64,
+    pub acc_time: u64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScannerLastMinute {
+    pub actions: HashMap<String, ScannerTimedAction>,
+    pub ilm: HashMap<String, ScannerTimedAction>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScannerMetricsReport {
+    pub collected_at: DateTime<Utc>,
+    pub current_cycle: u64,
+    pub current_started: DateTime<Utc>,
+    pub cycles_completed_at: Vec<DateTime<Utc>>,
+    pub ongoing_buckets: usize,
+    pub life_time_ops: HashMap<String, u64>,
+    pub life_time_ilm: HashMap<String, u64>,
+    pub last_minute: ScannerLastMinute,
+    pub active_paths: Vec<String>,
+}
+
 impl CurrentCycle {
     pub fn unmarshal(&mut self, buf: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         *self = rmp_serde::from_slice(buf)?;
@@ -572,8 +597,8 @@ impl Metrics {
     }
 
     /// Build a full metrics report snapshot.
-    pub async fn report(&self) -> M_ScannerMetrics {
-        let mut m = M_ScannerMetrics::default();
+    pub async fn report(&self) -> ScannerMetricsReport {
+        let mut m = ScannerMetricsReport::default();
 
         if let Some(cycle) = self.get_cycle().await {
             m.current_cycle = cycle.current;
@@ -606,7 +631,7 @@ impl Metrics {
             {
                 m.last_minute.actions.insert(
                     metric.as_str().to_string(),
-                    TimedAction {
+                    ScannerTimedAction {
                         count: last_min.n,
                         acc_time: last_min.total,
                         bytes: last_min.size,
@@ -633,7 +658,7 @@ impl Metrics {
             {
                 m.last_minute.ilm.insert(
                     action.as_str().to_string(),
-                    TimedAction {
+                    ScannerTimedAction {
                         count: last_min.n,
                         acc_time: last_min.total,
                         bytes: last_min.size,

@@ -1042,7 +1042,7 @@ mod tests {
             "Records": []
         });
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket-a".to_string(),
             "fallback%2Fvalue.txt".to_string(),
             "application/json",
@@ -1059,7 +1059,7 @@ mod tests {
             "Records": []
         });
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket-a".to_string(),
             "hello+world%2Ftest.txt".to_string(),
             "application/json",

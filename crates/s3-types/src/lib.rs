@@ -12,4 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod workers;
+mod event_name;
+
+pub use event_name::{EventName, ParseEventNameError, event_schema_version};

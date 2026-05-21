@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod capacity_manager;
+pub mod capacity_scope;
 pub mod scan;
 pub mod types;
 

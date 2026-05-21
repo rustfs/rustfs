@@ -1015,7 +1015,7 @@ mod tests {
         let entity = EntityTarget {
             object_name: "bucket%2Fobj.txt".to_string(),
             bucket_name: "testbucket".to_string(),
-            event_name: rustfs_s3_common::EventName::ObjectCreatedPut,
+            event_name: rustfs_s3_types::EventName::ObjectCreatedPut,
             data: serde_json::json!({"eventTime": "2026-05-03T10:00:00Z"}),
         };
 
@@ -1061,7 +1061,7 @@ mod tests {
 
         let body = br#"{"Records":[]}"#.to_vec();
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "testbucket".to_string(),
             "obj.txt".to_string(),
             "application/json",
@@ -1120,7 +1120,7 @@ mod tests {
             br#"{"EventName":"s3:ObjectCreated:Put","Key":"bucket/obj.txt","Records":[{"eventTime":"2026-05-03T10:00:00Z"}]}"#
                 .to_vec();
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "testbucket".to_string(),
             "obj.txt".to_string(),
             "application/json",

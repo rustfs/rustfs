@@ -1180,8 +1180,6 @@ impl LocalDisk {
             }
             InternalBuf::Owned(buf) => {
                 f.write_all(buf.as_ref()).await.map_err(to_file_error)?;
-                // Ensure write errors are observed before returning for owned buffers.
-                f.sync_all().await.map_err(to_file_error)?;
             }
         }
 
@@ -3053,7 +3051,6 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(skip(self))]
     async fn disk_info(&self, _: &DiskInfoOptions) -> Result<DiskInfo> {
         let mut info = Cache::get(self.disk_info_cache.clone()).await?;
-        // TODO: nr_requests, rotational
         info.nr_requests = self.nrrequests;
         info.rotational = self.rotational;
         info.mount_path = self.path().to_str().unwrap().to_string();
@@ -3721,6 +3718,8 @@ mod test {
         assert!(!disk_info.fs_type.is_empty(), "fs_type should not be empty on this platform");
         assert!(disk_info.total > 0);
         assert!(disk_info.free <= disk_info.total);
+        assert_eq!(disk_info.nr_requests, disk.nrrequests);
+        assert_eq!(disk_info.rotational, disk.rotational);
         assert!(!disk_info.mount_path.is_empty());
         assert!(!disk_info.endpoint.is_empty());
 

@@ -52,7 +52,7 @@ use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_rio::{CompressReader, EncryptReader, HashReader};
 #[cfg(test)]
 use rustfs_rio::{DecryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use rustfs_s3_common::S3Operation;
+use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{

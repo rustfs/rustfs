@@ -17,9 +17,6 @@
 //! This module provides backpressure-aware pipes for object data transfer,
 //! preventing buffer overflow and memory exhaustion under high concurrency.
 
-// Allow dead_code for public API that may be used by external modules or future features
-#![allow(dead_code)]
-//!
 //! # Key Features
 //!
 //! - Configurable buffer size with high/low watermarks
@@ -39,17 +36,16 @@
 //!              [High Watermark?] --> Apply Backpressure
 //! ```
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{DuplexStream, duplex};
 use tracing::{debug, warn};
 
 use metrics::counter;
 
-/// Backpressure pipe configuration.
-#[derive(Debug, Clone)]
-pub struct BackpressureConfig {
+/// Object-transfer duplex pipe backpressure policy.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectPipeBackpressurePolicy {
     /// Buffer size in bytes (default 4MB).
     pub buffer_size: usize,
     /// High watermark percentage (default 80%).
@@ -60,7 +56,7 @@ pub struct BackpressureConfig {
     pub low_watermark: u32,
 }
 
-impl Default for BackpressureConfig {
+impl Default for ObjectPipeBackpressurePolicy {
     fn default() -> Self {
         Self {
             buffer_size: rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
@@ -70,7 +66,7 @@ impl Default for BackpressureConfig {
     }
 }
 
-impl BackpressureConfig {
+impl ObjectPipeBackpressurePolicy {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         let buffer_size = rustfs_utils::get_env_usize(
@@ -125,45 +121,61 @@ impl std::fmt::Display for BackpressureState {
     }
 }
 
-/// Backpressure event for monitoring.
-#[derive(Debug, Clone)]
-pub struct BackpressureEvent {
-    /// Event timestamp.
-    pub timestamp: Instant,
-    /// Event type.
-    pub event_type: BackpressureEventType,
-    /// Buffer usage at event time.
-    pub buffer_usage: usize,
-    /// Buffer capacity.
-    pub buffer_capacity: usize,
-    /// Usage percentage.
-    pub usage_percent: f32,
-}
-
-/// Backpressure event type.
-#[derive(Debug, Clone, Copy)]
-pub enum BackpressureEventType {
-    /// Entered high watermark state.
-    HighWatermarkReached,
-    /// Exited high watermark state (backpressure released).
-    HighWatermarkExited,
-    /// Backpressure applied to producer.
-    BackpressureApplied,
-    /// Backpressure released.
-    BackpressureReleased,
-}
-
-/// Snapshot of backpressure state.
-#[derive(Debug, Clone)]
-pub struct BackpressureSnapshot {
+/// Compact metadata snapshot for object-transfer backpressure pipes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackpressurePipeMeta {
     /// Buffer capacity in bytes.
     pub buffer_capacity: usize,
-    /// Current buffer usage in bytes (approximate).
-    pub buffer_used: usize,
-    /// Usage percentage.
-    pub usage_percent: f32,
-    /// Current state.
+    /// Current backpressure state.
     pub state: BackpressureState,
+    /// Age of the pipe since creation.
+    pub age: Duration,
+}
+
+/// Compact metadata snapshot for the lightweight backpressure monitor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BackpressureMonitorMeta {
+    /// Buffer capacity in bytes.
+    pub buffer_capacity: usize,
+    /// Current buffer usage percentage.
+    pub usage_percent: f32,
+    /// Current backpressure state.
+    pub state: BackpressureState,
+}
+
+fn calculate_usage_percent(usage: usize, capacity: usize) -> f32 {
+    if capacity > 0 {
+        (usage as f32 / capacity as f32) * 100.0
+    } else {
+        0.0
+    }
+}
+
+fn apply_watermark_transition(
+    in_high_watermark: &AtomicBool,
+    usage: usize,
+    high: usize,
+    low: usize,
+) -> (BackpressureState, bool) {
+    let current = in_high_watermark.load(Ordering::Acquire);
+    let next_state = if usage >= high {
+        BackpressureState::HighWatermark
+    } else if usage <= low {
+        BackpressureState::Normal
+    } else if current {
+        BackpressureState::HighWatermark
+    } else {
+        BackpressureState::Normal
+    };
+    let next_is_high = matches!(next_state, BackpressureState::HighWatermark);
+    let changed = in_high_watermark.swap(next_is_high, Ordering::AcqRel) != next_is_high;
+    (next_state, changed)
+}
+
+fn saturating_sub_atomic(value: &AtomicUsize, delta: usize) {
+    value
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_sub(delta)))
+        .ok();
 }
 
 /// A backpressure-aware pipe wrapping tokio's duplex.
@@ -176,33 +188,41 @@ pub struct BackpressurePipe {
     /// Writer end of the duplex pipe.
     writer: DuplexStream,
     /// Configuration.
-    config: BackpressureConfig,
+    config: ObjectPipeBackpressurePolicy,
     /// Current buffer usage (approximate, updated on write).
-    buffer_usage: Arc<AtomicUsize>,
+    buffer_usage: AtomicUsize,
     /// Current backpressure state.
-    state: Arc<AtomicBool>, // true = in high watermark state
+    state: AtomicBool, // true = in high watermark state
     /// Total bytes written.
-    total_written: Arc<AtomicUsize>,
+    total_written: AtomicUsize,
     /// Total bytes read.
-    total_read: Arc<AtomicUsize>,
+    total_read: AtomicUsize,
+    /// Cached high watermark threshold in bytes.
+    high_watermark_bytes: usize,
+    /// Cached low watermark threshold in bytes.
+    low_watermark_bytes: usize,
+    /// Pipe creation timestamp.
+    created_at: Instant,
 }
 
 impl BackpressurePipe {
     /// Create a new backpressure-aware pipe with default configuration.
     pub fn new() -> Self {
-        Self::with_config(BackpressureConfig::from_env())
+        Self::with_config(ObjectPipeBackpressurePolicy::from_env())
     }
 
     /// Create a new backpressure-aware pipe with custom configuration.
-    pub fn with_config(config: BackpressureConfig) -> Self {
+    pub fn with_config(config: ObjectPipeBackpressurePolicy) -> Self {
         let (reader, writer) = duplex(config.buffer_size);
+        let high_watermark_bytes = config.high_watermark_bytes();
+        let low_watermark_bytes = config.low_watermark_bytes();
 
         debug!(
             buffer_size = config.buffer_size,
             high_watermark = config.high_watermark,
             low_watermark = config.low_watermark,
-            high_watermark_bytes = config.high_watermark_bytes(),
-            low_watermark_bytes = config.low_watermark_bytes(),
+            high_watermark_bytes,
+            low_watermark_bytes,
             "Created backpressure pipe"
         );
 
@@ -210,10 +230,13 @@ impl BackpressurePipe {
             reader,
             writer,
             config,
-            buffer_usage: Arc::new(AtomicUsize::new(0)),
-            state: Arc::new(AtomicBool::new(false)),
-            total_written: Arc::new(AtomicUsize::new(0)),
-            total_read: Arc::new(AtomicUsize::new(0)),
+            buffer_usage: AtomicUsize::new(0),
+            state: AtomicBool::new(false),
+            total_written: AtomicUsize::new(0),
+            total_read: AtomicUsize::new(0),
+            high_watermark_bytes,
+            low_watermark_bytes,
+            created_at: Instant::now(),
         }
     }
 
@@ -234,81 +257,79 @@ impl BackpressurePipe {
 
     /// Get current backpressure state.
     pub fn state(&self) -> BackpressureState {
-        if self.state.load(Ordering::Relaxed) {
+        if self.state.load(Ordering::Acquire) {
             BackpressureState::BackpressureApplied
         } else {
             BackpressureState::Normal
         }
     }
 
-    /// Get current buffer usage snapshot.
-    pub fn snapshot(&self) -> BackpressureSnapshot {
-        let buffer_used = self.buffer_usage.load(Ordering::Relaxed);
-        let usage_percent = if self.config.buffer_size > 0 {
-            (buffer_used as f64 / self.config.buffer_size as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        BackpressureSnapshot {
+    /// Get a compact metadata snapshot for the pipe.
+    pub fn meta(&self) -> BackpressurePipeMeta {
+        BackpressurePipeMeta {
             buffer_capacity: self.config.buffer_size,
-            buffer_used,
-            usage_percent: usage_percent as f32,
             state: self.state(),
+            age: self.age(),
         }
+    }
+
+    /// Get the age of this pipe.
+    pub fn age(&self) -> Duration {
+        self.created_at.elapsed()
+    }
+
+    /// Get current buffer usage.
+    pub fn usage(&self) -> usize {
+        self.buffer_usage.load(Ordering::Acquire)
     }
 
     /// Record bytes written (call after successful write).
     pub fn record_write(&self, bytes: usize) {
         self.total_written.fetch_add(bytes, Ordering::Relaxed);
-        self.buffer_usage.fetch_add(bytes, Ordering::Relaxed);
-        self.check_high_watermark();
+        self.buffer_usage.fetch_add(bytes, Ordering::Release);
+        self.update_watermark_state();
     }
 
     /// Record bytes read (call after successful read).
     pub fn record_read(&self, bytes: usize) {
         self.total_read.fetch_add(bytes, Ordering::Relaxed);
-        self.buffer_usage.fetch_sub(bytes, Ordering::Relaxed);
-        self.check_low_watermark();
+        saturating_sub_atomic(&self.buffer_usage, bytes);
+        self.update_watermark_state();
     }
 
-    /// Check if high watermark is reached.
-    fn check_high_watermark(&self) {
-        let usage = self.buffer_usage.load(Ordering::Relaxed);
-        let threshold = self.config.high_watermark_bytes();
+    /// Update watermark state and emit transition signals.
+    fn update_watermark_state(&self) {
+        let usage = self.buffer_usage.load(Ordering::Acquire);
+        let usage_percent = calculate_usage_percent(usage, self.config.buffer_size) as u32;
+        let (next_state, changed) =
+            apply_watermark_transition(&self.state, usage, self.high_watermark_bytes, self.low_watermark_bytes);
 
-        if usage >= threshold && !self.state.load(Ordering::Relaxed) {
-            self.state.store(true, Ordering::Relaxed);
+        if changed {
+            match next_state {
+                BackpressureState::HighWatermark => {
+                    counter!("rustfs_backpressure_events_total", "state" => "high_watermark").increment(1);
 
-            counter!("rustfs_backpressure_events_total", "state" => "high_watermark").increment(1);
+                    warn!(
+                        buffer_usage = usage,
+                        buffer_capacity = self.config.buffer_size,
+                        usage_percent,
+                        high_watermark = self.config.high_watermark,
+                        "Backpressure: high watermark reached"
+                    );
+                }
+                BackpressureState::Normal => {
+                    counter!("rustfs_backpressure_events_total", "state" => "normal").increment(1);
 
-            warn!(
-                buffer_usage = usage,
-                buffer_capacity = self.config.buffer_size,
-                usage_percent = (usage as f64 / self.config.buffer_size as f64 * 100.0) as u32,
-                high_watermark = self.config.high_watermark,
-                "Backpressure: high watermark reached"
-            );
-        }
-    }
-
-    /// Check if low watermark is reached (backpressure can be released).
-    fn check_low_watermark(&self) {
-        let usage = self.buffer_usage.load(Ordering::Relaxed);
-        let threshold = self.config.low_watermark_bytes();
-
-        if usage <= threshold && self.state.load(Ordering::Relaxed) {
-            self.state.store(false, Ordering::Relaxed);
-
-            counter!("rustfs_backpressure_events_total", "state" => "normal").increment(1);
-
-            debug!(
-                buffer_usage = usage,
-                buffer_capacity = self.config.buffer_size,
-                usage_percent = (usage as f64 / self.config.buffer_size as f64 * 100.0) as u32,
-                low_watermark = self.config.low_watermark,
-                "Backpressure: returned to normal"
-            );
+                    debug!(
+                        buffer_usage = usage,
+                        buffer_capacity = self.config.buffer_size,
+                        usage_percent,
+                        low_watermark = self.config.low_watermark,
+                        "Backpressure: returned to normal"
+                    );
+                }
+                BackpressureState::BackpressureApplied => {}
+            }
         }
     }
 
@@ -340,43 +361,51 @@ impl Default for BackpressurePipe {
 /// wrap the streams but provides monitoring capabilities.
 pub struct BackpressureMonitor {
     /// Configuration.
-    config: BackpressureConfig,
+    config: ObjectPipeBackpressurePolicy,
     /// Current buffer usage.
-    buffer_usage: Arc<AtomicUsize>,
+    buffer_usage: AtomicUsize,
     /// In high watermark state.
-    in_high_watermark: Arc<AtomicBool>,
+    in_high_watermark: AtomicBool,
+    /// Cached high watermark threshold in bytes.
+    high_watermark_bytes: usize,
+    /// Cached low watermark threshold in bytes.
+    low_watermark_bytes: usize,
 }
 
 impl BackpressureMonitor {
     /// Create a new monitor with default configuration.
     pub fn new() -> Self {
-        Self::with_config(BackpressureConfig::from_env())
+        Self::with_config(ObjectPipeBackpressurePolicy::from_env())
     }
 
     /// Create a new monitor with custom configuration.
-    pub fn with_config(config: BackpressureConfig) -> Self {
+    pub fn with_config(config: ObjectPipeBackpressurePolicy) -> Self {
+        let high_watermark_bytes = config.high_watermark_bytes();
+        let low_watermark_bytes = config.low_watermark_bytes();
         Self {
             config,
-            buffer_usage: Arc::new(AtomicUsize::new(0)),
-            in_high_watermark: Arc::new(AtomicBool::new(false)),
+            buffer_usage: AtomicUsize::new(0),
+            in_high_watermark: AtomicBool::new(false),
+            high_watermark_bytes,
+            low_watermark_bytes,
         }
     }
 
     /// Record bytes added to buffer.
     pub fn on_write(&self, bytes: usize) -> BackpressureState {
-        self.buffer_usage.fetch_add(bytes, Ordering::Relaxed);
+        self.buffer_usage.fetch_add(bytes, Ordering::Release);
         self.update_state()
     }
 
     /// Record bytes removed from buffer.
     pub fn on_read(&self, bytes: usize) -> BackpressureState {
-        self.buffer_usage.fetch_sub(bytes, Ordering::Relaxed);
+        saturating_sub_atomic(&self.buffer_usage, bytes);
         self.update_state()
     }
 
     /// Get current state.
     pub fn state(&self) -> BackpressureState {
-        if self.in_high_watermark.load(Ordering::Relaxed) {
+        if self.in_high_watermark.load(Ordering::Acquire) {
             BackpressureState::HighWatermark
         } else {
             BackpressureState::Normal
@@ -385,41 +414,46 @@ impl BackpressureMonitor {
 
     /// Get current buffer usage.
     pub fn usage(&self) -> usize {
-        self.buffer_usage.load(Ordering::Relaxed)
+        self.buffer_usage.load(Ordering::Acquire)
     }
 
     /// Get usage percentage.
     pub fn usage_percent(&self) -> f32 {
-        let usage = self.buffer_usage.load(Ordering::Relaxed);
-        if self.config.buffer_size > 0 {
-            (usage as f32 / self.config.buffer_size as f32) * 100.0
-        } else {
-            0.0
+        let usage = self.buffer_usage.load(Ordering::Acquire);
+        calculate_usage_percent(usage, self.config.buffer_size)
+    }
+
+    /// Get a compact metadata snapshot for the monitor.
+    pub fn meta(&self) -> BackpressureMonitorMeta {
+        let usage = self.buffer_usage.load(Ordering::Acquire);
+        BackpressureMonitorMeta {
+            buffer_capacity: self.config.buffer_size,
+            usage_percent: calculate_usage_percent(usage, self.config.buffer_size),
+            state: self.state(),
         }
     }
 
     /// Update state based on current usage.
     fn update_state(&self) -> BackpressureState {
-        let usage = self.buffer_usage.load(Ordering::Relaxed);
-        let high = self.config.high_watermark_bytes();
-        let low = self.config.low_watermark_bytes();
+        let usage = self.buffer_usage.load(Ordering::Acquire);
+        let usage_percent = calculate_usage_percent(usage, self.config.buffer_size) as u32;
+        let (next_state, changed) =
+            apply_watermark_transition(&self.in_high_watermark, usage, self.high_watermark_bytes, self.low_watermark_bytes);
 
-        if usage >= high {
-            if !self.in_high_watermark.swap(true, Ordering::Relaxed) {
+        if matches!(next_state, BackpressureState::HighWatermark) {
+            if changed {
                 counter!("rustfs_backpressure_events_total", "state" => "high_watermark").increment(1);
 
-                debug!(usage_percent = self.usage_percent() as u32, "Backpressure: entered high watermark");
+                debug!(usage_percent, "Backpressure: entered high watermark");
             }
             BackpressureState::HighWatermark
-        } else if usage <= low {
-            if self.in_high_watermark.swap(false, Ordering::Relaxed) {
+        } else {
+            if changed {
                 counter!("rustfs_backpressure_events_total", "state" => "normal").increment(1);
 
-                debug!(usage_percent = self.usage_percent() as u32, "Backpressure: returned to normal");
+                debug!(usage_percent, "Backpressure: returned to normal");
             }
             BackpressureState::Normal
-        } else {
-            self.state()
         }
     }
 }
@@ -436,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_config_default() {
-        let config = BackpressureConfig::default();
+        let config = ObjectPipeBackpressurePolicy::default();
         assert_eq!(config.buffer_size, 4 * 1024 * 1024);
         assert_eq!(config.high_watermark, 80);
         assert_eq!(config.low_watermark, 50);
@@ -444,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_config_watermarks() {
-        let config = BackpressureConfig {
+        let config = ObjectPipeBackpressurePolicy {
             buffer_size: 1000,
             high_watermark: 80,
             low_watermark: 50,
@@ -462,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_monitor() {
-        let config = BackpressureConfig {
+        let config = ObjectPipeBackpressurePolicy {
             buffer_size: 1000,
             high_watermark: 80,
             low_watermark: 50,
@@ -471,14 +505,18 @@ mod tests {
 
         // Initially normal
         assert_eq!(monitor.state(), BackpressureState::Normal);
+        assert_eq!(monitor.meta().buffer_capacity, 1000);
+        assert_eq!(monitor.meta().usage_percent, 0.0);
 
         // Write to reach high watermark
         let state = monitor.on_write(850);
         assert_eq!(state, BackpressureState::HighWatermark);
+        assert_eq!(monitor.meta().usage_percent, 85.0);
 
         // Read to go below low watermark
         let state = monitor.on_read(400);
         assert_eq!(state, BackpressureState::Normal);
+        assert_eq!(monitor.meta().usage_percent, 45.0);
     }
 
     #[tokio::test]
@@ -486,5 +524,28 @@ mod tests {
         let pipe = BackpressurePipe::new();
         assert_eq!(pipe.capacity(), 4 * 1024 * 1024);
         assert_eq!(pipe.state(), BackpressureState::Normal);
+        assert_eq!(pipe.meta().buffer_capacity, 4 * 1024 * 1024);
+        assert!(pipe.meta().age <= pipe.age());
+    }
+
+    #[test]
+    fn test_backpressure_pipe_state_transitions() {
+        let config = ObjectPipeBackpressurePolicy {
+            buffer_size: 1000,
+            high_watermark: 80,
+            low_watermark: 50,
+        };
+        let pipe = BackpressurePipe::with_config(config);
+
+        assert_eq!(pipe.state(), BackpressureState::Normal);
+        assert_eq!(pipe.meta().state, BackpressureState::Normal);
+
+        pipe.record_write(850);
+        assert_eq!(pipe.state(), BackpressureState::BackpressureApplied);
+        assert_eq!(pipe.meta().state, BackpressureState::BackpressureApplied);
+
+        pipe.record_read(400);
+        assert_eq!(pipe.state(), BackpressureState::Normal);
+        assert_eq!(pipe.meta().state, BackpressureState::Normal);
     }
 }

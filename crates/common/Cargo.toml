@@ -33,12 +33,8 @@ tonic = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 metrics = { workspace = true }
-rustfs-madmin = { workspace = true }
-rustfs-filemeta = { workspace = true }
 serde = { workspace = true }
-path-clean = { workspace = true }
 rmp-serde = { workspace = true }
-async-trait = { workspace = true }
 s3s = { workspace = true }
 tracing = { workspace = true }
 

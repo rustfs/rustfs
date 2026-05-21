@@ -308,7 +308,7 @@ mod tests {
     use super::*;
     use crate::{rule_engine::NotifyRuleEngine, rules::RulesMap};
     use async_trait::async_trait;
-    use rustfs_s3_common::EventName;
+    use rustfs_s3_types::EventName;
     use rustfs_targets::StoreError;
     use rustfs_targets::{
         TargetError,

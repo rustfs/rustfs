@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_appauth::token::{Token, parse_license_with_public_key};
+use rustfs_crypto::{Token, parse_license_with_public_key};
 use std::fmt;
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
@@ -328,7 +328,7 @@ mod tests {
         RsaPrivateKey, RsaPublicKey,
         pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
     };
-    use rustfs_appauth::token::sign_license_token;
+    use rustfs_crypto::sign_license_token;
     use serial_test::serial;
 
     #[test]

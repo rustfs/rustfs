@@ -16,6 +16,7 @@
 mod encdec;
 mod error;
 mod jwt;
+pub mod license_token;
 
 pub use encdec::decrypt::decrypt_data;
 pub use encdec::encrypt::encrypt_data;
@@ -25,3 +26,4 @@ pub use encdec::stream_io::{decrypt_stream_io, encrypt_stream_io};
 pub use error::Error;
 pub use jwt::decode::decode as jwt_decode;
 pub use jwt::encode::encode as jwt_encode;
+pub use license_token::{Token, parse_license_with_public_key, parse_signed_license_token, sign_license_token};
