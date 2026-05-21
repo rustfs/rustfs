@@ -36,6 +36,12 @@ pub const DEFAULT_INTERNODE_RPC_TIMEOUT_SECS: u64 = 10;
 pub const ENV_RUSTFS_INTERNODE_DATA_TRANSPORT: &str = "RUSTFS_INTERNODE_DATA_TRANSPORT";
 pub const DEFAULT_INTERNODE_DATA_TRANSPORT: &str = "tcp-http";
 
+/// Legacy alias for "tcp-http". Both values select the TCP/HTTP transport backend.
+pub const INTERNODE_DATA_TRANSPORT_TCP: &str = "tcp";
+
+/// Known internode transport backend names accepted by the config parser.
+pub const KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS: &[&str] = &[DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +70,7 @@ mod tests {
         assert_eq!(ENV_INTERNODE_RPC_TIMEOUT_SECS, "RUSTFS_INTERNODE_RPC_TIMEOUT_SECS");
         assert_eq!(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, "RUSTFS_INTERNODE_DATA_TRANSPORT");
         assert_eq!(DEFAULT_INTERNODE_DATA_TRANSPORT, "tcp-http");
+        assert_eq!(INTERNODE_DATA_TRANSPORT_TCP, "tcp");
+        assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp"]);
     }
 }
