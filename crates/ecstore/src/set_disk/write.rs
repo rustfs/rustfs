@@ -202,6 +202,9 @@ impl SetDisks {
 
     #[tracing::instrument(skip(self))]
     pub(super) async fn cleanup_multipart_path(&self, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
         let disks = self.get_disks_internal().await;
 
         let mut errs = Vec::with_capacity(disks.len());
@@ -288,6 +291,27 @@ impl SetDisks {
                     errs.push(Some(e));
                 }
             }
+        }
+
+        if issue3031_diag_enabled() {
+            let success_count = errs.iter().filter(|err| err.is_none()).count();
+            let error_count = errs.len().saturating_sub(success_count);
+            let disk_not_found_count = errs.iter().filter(|err| matches!(err, Some(DiskError::DiskNotFound))).count();
+            let file_not_found_count = errs.iter().filter(|err| matches!(err, Some(DiskError::FileNotFound))).count();
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                src_bucket = %src_bucket,
+                src_object = %src_object,
+                dst_bucket = %dst_bucket,
+                dst_object = %dst_object,
+                write_quorum = write_quorum,
+                disk_count = errs.len(),
+                success_count = success_count,
+                error_count = error_count,
+                disk_not_found_count = disk_not_found_count,
+                file_not_found_count = file_not_found_count,
+                "issue3031_rename_part_context"
+            );
         }
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {

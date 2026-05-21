@@ -144,18 +144,24 @@ impl SetDisks {
         for (part_idx, part_info) in part_meta_paths.iter().enumerate() {
             let mut part_meta_quorum = HashMap::new();
             let mut part_infos = Vec::new();
-            for (j, parts) in object_parts.iter().enumerate() {
+            let mut present_count = 0usize;
+            let mut missing_or_empty_count = 0usize;
+            let mut mismatched_response_count = 0usize;
+            for parts in object_parts.iter() {
                 if parts.len() != part_meta_paths.len() {
+                    mismatched_response_count += 1;
                     *part_meta_quorum.entry(part_info.clone()).or_insert(0) += 1;
                     continue;
                 }
 
                 if !parts[part_idx].etag.is_empty() {
+                    present_count += 1;
                     *part_meta_quorum.entry(parts[part_idx].etag.clone()).or_insert(0) += 1;
                     part_infos.push(parts[part_idx].clone());
                     continue;
                 }
 
+                missing_or_empty_count += 1;
                 *part_meta_quorum.entry(part_info.clone()).or_insert(0) += 1;
             }
 
@@ -194,6 +200,22 @@ impl SetDisks {
             {
                 ret[part_idx] = found.clone();
             } else {
+                if issue3031_diag_enabled() {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        bucket = %bucket,
+                        part_meta_path = %part_info,
+                        part_id = part_numbers[part_idx],
+                        read_quorum = read_quorum,
+                        max_quorum = max_quorum,
+                        disk_response_count = object_parts.len(),
+                        present_count = present_count,
+                        missing_or_empty_count = missing_or_empty_count,
+                        mismatched_response_count = mismatched_response_count,
+                        max_vote_is_missing_marker = max_etag.map(|etag| etag == part_info).unwrap_or(false),
+                        "issue3031_read_parts_part_quorum"
+                    );
+                }
                 ret[part_idx] = ObjectPartInfo {
                     number: part_numbers[part_idx],
                     error: Some(format!("part.{} not found", part_numbers[part_idx])),
