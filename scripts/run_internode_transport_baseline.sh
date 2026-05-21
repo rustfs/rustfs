@@ -125,7 +125,7 @@ setup_output() {
     OUT_DIR="target/bench/internode-transport-$(date +%Y%m%d-%H%M%S)"
   fi
   mkdir -p "${OUT_DIR}"
-  echo "scenario,endpoint,workload,concurrency,size,status,throughput,requests_per_sec,avg_latency,log_file,run_dir" > "${OUT_DIR}/summary.csv"
+  echo "scenario,endpoint,workload,concurrency,size,status,throughput,requests_per_sec,avg_latency,error_count,log_file,run_dir" > "${OUT_DIR}/summary.csv"
   if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
     echo "scenario,workload,concurrency,size,metric,operation,before,after,delta" > "${OUT_DIR}/internode_metric_deltas.csv"
   fi
@@ -253,7 +253,7 @@ append_object_summary() {
   awk -F',' -v scenario="${scenario}" -v endpoint="${endpoint}" -v workload="${workload}" -v run_dir="${run_dir}" '
     NR == 1 { next }
     {
-      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", scenario, endpoint, workload, $3, $1, $4, $5, $6, $7, $8, run_dir
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", scenario, endpoint, workload, $3, $1, $4, $5, $6, $7, $8, $9, run_dir
     }
   ' "${src}" >> "${OUT_DIR}/summary.csv"
 }
