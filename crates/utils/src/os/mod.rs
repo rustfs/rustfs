@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(target_os = "linux")]
 mod fs_type;
 
 #[cfg(target_os = "linux")]

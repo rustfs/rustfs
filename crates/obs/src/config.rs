@@ -54,6 +54,8 @@ use rustfs_utils::{
 };
 use serde::{Deserialize, Serialize};
 use std::env;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 const LEGACY_ENV_OBS_PROFILING_ENABLED: &str = "RUSTFS_OBS_PROFILING_ENABLED";
 
@@ -429,32 +431,49 @@ pub fn is_production_environment() -> bool {
 mod tests {
     use super::*;
 
+    static PROFILING_ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_profiling_env_lock<F>(f: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = PROFILING_ENV_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        f();
+    }
+
+    fn extract_profiling_export_enabled() -> Option<bool> {
+        OtelConfig::extract_otel_config_from_env(None).profiling_export_enabled
+    }
+
     #[test]
     fn profiling_export_defaults_to_disabled_when_unset() {
-        temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
-            temp_env::with_var_unset(LEGACY_ENV_OBS_PROFILING_ENABLED, || {
-                let config = OtelConfig::extract_otel_config_from_env(None);
-                assert_eq!(config.profiling_export_enabled, Some(false));
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
+                temp_env::with_var_unset(LEGACY_ENV_OBS_PROFILING_ENABLED, || {
+                    assert_eq!(extract_profiling_export_enabled(), Some(DEFAULT_OBS_PROFILING_EXPORT_ENABLED));
+                });
             });
         });
     }
 
     #[test]
     fn profiling_export_accepts_legacy_env_alias() {
-        temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
-            temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
-                let config = OtelConfig::extract_otel_config_from_env(None);
-                assert_eq!(config.profiling_export_enabled, Some(true));
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
+                temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
+                    assert_eq!(extract_profiling_export_enabled(), Some(true));
+                });
             });
         });
     }
 
     #[test]
     fn canonical_profiling_toggle_has_priority_over_legacy_alias() {
-        temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
-            temp_env::with_var(ENV_OBS_PROFILING_EXPORT_ENABLED, Some("false"), || {
-                let config = OtelConfig::extract_otel_config_from_env(None);
-                assert_eq!(config.profiling_export_enabled, Some(false));
+        with_profiling_env_lock(|| {
+            temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
+                temp_env::with_var(ENV_OBS_PROFILING_EXPORT_ENABLED, Some("false"), || {
+                    assert_eq!(extract_profiling_export_enabled(), Some(false));
+                });
             });
         });
     }

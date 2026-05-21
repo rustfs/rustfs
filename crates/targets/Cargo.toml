@@ -16,7 +16,6 @@ rustfs-config = { workspace = true, features = ["notify", "constants", "audit"] 
 rustfs-ecstore = { workspace = true }
 rustfs-utils = { workspace = true, features = ["notify", "tls"] }
 rustfs-s3-types = { workspace = true }
-rustfs-s3-ops = { workspace = true }
 async-trait = { workspace = true }
 async-nats = { workspace = true }
 deadpool-postgres = { workspace = true }

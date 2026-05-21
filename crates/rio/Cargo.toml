@@ -42,7 +42,6 @@ tokio-util.workspace = true
 faster-hex.workspace = true
 futures.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
-rustfs-common.workspace = true
 rustfs-io-metrics.workspace = true
 rustfs-utils = { workspace = true, features = ["io", "hash", "compress", "tls"] }
 serde_json.workspace = true
