@@ -21,7 +21,7 @@ use futures::stream;
 use http::{Extensions, HeaderMap, Method, Uri};
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
 use rustfs_ecstore::{
-    bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
+    bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     bucket::metadata_sys,
     client::object_api_utils::to_s3s_etag,
     client::transition_api::{ReadCloser, ReaderImpl},
@@ -185,6 +185,15 @@ async fn set_bucket_lifecycle_transition_with_tier(
     Ok(())
 }
 
+async fn set_bucket_object_lock_enabled(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let object_lock_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ObjectLockConfiguration>
+    <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+</ObjectLockConfiguration>"#;
+    metadata_sys::update(bucket_name, OBJECT_LOCK_CONFIG, object_lock_xml.as_bytes().to_vec()).await?;
+    Ok(())
+}
+
 fn expiration_lifecycle_configuration(prefix: &str) -> BucketLifecycleConfiguration {
     BucketLifecycleConfiguration {
         expiry_updated_at: None,
@@ -211,6 +220,54 @@ fn expiration_lifecycle_configuration(prefix: &str) -> BucketLifecycleConfigurat
                 ..Default::default()
             }),
             id: Some("expire-existing".to_string()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }],
+    }
+}
+
+fn expired_object_delete_marker_lifecycle_configuration() -> BucketLifecycleConfiguration {
+    BucketLifecycleConfiguration {
+        expiry_updated_at: None,
+        rules: vec![LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            expiration: Some(LifecycleExpiration {
+                expired_object_delete_marker: Some(true),
+                ..Default::default()
+            }),
+            filter: Some(LifecycleRuleFilter {
+                prefix: Some("test/".to_string()),
+                ..Default::default()
+            }),
+            id: Some("expired-delete-marker".to_string()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }],
+    }
+}
+
+fn del_marker_expiration_lifecycle_configuration(days: i32) -> BucketLifecycleConfiguration {
+    BucketLifecycleConfiguration {
+        expiry_updated_at: None,
+        rules: vec![LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: Some(DelMarkerExpiration { days: Some(days) }),
+            expiration: Some(LifecycleExpiration {
+                days: Some(30),
+                ..Default::default()
+            }),
+            filter: Some(LifecycleRuleFilter {
+                prefix: Some("test/".to_string()),
+                ..Default::default()
+            }),
+            id: Some("del-marker-expiration".to_string()),
             noncurrent_version_expiration: None,
             noncurrent_version_transitions: None,
             prefix: None,
@@ -1025,5 +1082,69 @@ async fn put_bucket_lifecycle_configuration_expires_existing_objects() {
     assert!(
         wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
         "existing object should be lifecycle-deleted after lifecycle update"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn put_bucket_lifecycle_configuration_allows_expired_delete_marker_on_object_lock_bucket() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultBucketUsecase::without_context();
+
+    let bucket = format!("test-lock-expired-del-marker-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_object_lock_enabled(bucket.as_str())
+        .await
+        .expect("Failed to enable object lock for bucket");
+
+    let req = build_request(
+        PutBucketLifecycleConfigurationInput::builder()
+            .bucket(bucket.clone())
+            .lifecycle_configuration(Some(expired_object_delete_marker_lifecycle_configuration()))
+            .build()
+            .unwrap(),
+        Method::PUT,
+    );
+
+    usecase
+        .execute_put_bucket_lifecycle_configuration(req)
+        .await
+        .expect("ExpiredObjectDeleteMarker should be accepted on object-lock bucket");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn put_bucket_lifecycle_configuration_rejects_del_marker_expiration_on_object_lock_bucket() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultBucketUsecase::without_context();
+
+    let bucket = format!("test-lock-del-marker-exp-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_object_lock_enabled(bucket.as_str())
+        .await
+        .expect("Failed to enable object lock for bucket");
+
+    let req = build_request(
+        PutBucketLifecycleConfigurationInput::builder()
+            .bucket(bucket.clone())
+            .lifecycle_configuration(Some(del_marker_expiration_lifecycle_configuration(1)))
+            .build()
+            .unwrap(),
+        Method::PUT,
+    );
+
+    let err = usecase
+        .execute_put_bucket_lifecycle_configuration(req)
+        .await
+        .expect_err("DelMarkerExpiration must be rejected on object-lock bucket");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+    let message = err.message().unwrap_or_default();
+    assert!(
+        message.contains(
+            "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket"
+        ),
+        "unexpected error message: {message}"
     );
 }
