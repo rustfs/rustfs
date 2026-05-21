@@ -660,7 +660,11 @@ impl HealTask {
             Ok(result) => {
                 info!("Bucket heal completed successfully: {} ({} drives)", bucket, result.after.drives.len());
 
-                {
+                if self.options.recursive {
+                    self.heal_bucket_objects(bucket).await?;
+                }
+
+                if !self.options.recursive {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(3, 3, 0, 0);
                 }
@@ -679,6 +683,97 @@ impl HealTask {
                 })
             }
         }
+    }
+
+    async fn heal_bucket_objects(&self, bucket: &str) -> Result<()> {
+        let mut continuation_token: Option<String> = None;
+        let mut scanned = 0u64;
+        let mut healed = 0u64;
+        let mut failed = 0u64;
+        let mut bytes = 0u64;
+
+        let heal_opts = HealOpts {
+            recursive: false,
+            dry_run: self.options.dry_run,
+            remove: self.options.remove_corrupted,
+            recreate: self.options.recreate_missing,
+            scan_mode: self.options.scan_mode,
+            update_parity: self.options.update_parity,
+            no_lock: false,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+
+        loop {
+            self.check_control_flags().await?;
+            let (objects, next_token, is_truncated) = self
+                .await_with_control(
+                    self.storage
+                        .list_objects_for_heal_page(bucket, "", continuation_token.as_deref()),
+                )
+                .await?;
+
+            for object in objects {
+                self.check_control_flags().await?;
+                scanned += 1;
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.set_current_object(Some(format!("{bucket}/{object}")));
+                    progress.update_progress(scanned, healed, failed, bytes);
+                }
+
+                match self.await_with_control(self.storage.object_exists(bucket, &object)).await {
+                    Ok(false) => {
+                        healed += 1;
+                    }
+                    Ok(true) => match self
+                        .await_with_control(self.storage.heal_object(bucket, &object, None, &heal_opts))
+                        .await
+                    {
+                        Ok((result, None)) => {
+                            healed += 1;
+                            bytes = bytes.saturating_add(result.object_size as u64);
+                        }
+                        Ok((_, Some(err))) => {
+                            failed += 1;
+                            warn!("Failed to heal object {}/{}: {}", bucket, object, err);
+                        }
+                        Err(err) => {
+                            failed += 1;
+                            warn!("Failed to heal object {}/{}: {}", bucket, object, err);
+                        }
+                    },
+                    Err(err) => {
+                        failed += 1;
+                        warn!("Failed to check object {}/{} before heal: {}", bucket, object, err);
+                    }
+                }
+
+                {
+                    let mut progress = self.progress.write().await;
+                    progress.update_progress(scanned, healed, failed, bytes);
+                }
+            }
+
+            if !is_truncated {
+                break;
+            }
+
+            continuation_token = next_token;
+            if continuation_token.is_none() {
+                warn!("List is truncated but no continuation token was returned for bucket {}", bucket);
+                break;
+            }
+        }
+
+        if failed > 0 {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Failed to heal {failed} object(s) in bucket {bucket}"),
+            });
+        }
+
+        info!("Recursive bucket heal completed for {}: {} scanned, {} healed", bucket, scanned, healed);
+        Ok(())
     }
 
     async fn heal_metadata(&self, bucket: &str, object: &str) -> Result<()> {
@@ -1070,5 +1165,162 @@ impl std::fmt::Debug for HealTask {
             .field("options", &self.options)
             .field("created_at", &self.created_at)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heal::storage::DiskStatus;
+    use rustfs_ecstore::{
+        disk::{DiskStore, endpoint::Endpoint},
+        store_api::{BucketInfo, ObjectInfo},
+    };
+    use rustfs_madmin::heal_commands::HealResultItem;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockStorage {
+        listed: Mutex<bool>,
+        healed_objects: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HealStorageAPI for MockStorage {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<ObjectInfo>> {
+            Ok(None)
+        }
+
+        async fn get_object_data(&self, _bucket: &str, _object: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_object(&self, _bucket: &str, _object: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<DiskStatus> {
+            Ok(DiskStatus::Ok)
+        }
+
+        async fn format_disk(&self, _endpoint: &Endpoint) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>> {
+            Ok(Some(BucketInfo {
+                name: bucket.to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn object_exists(&self, _bucket: &str, _object: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn get_object_size(&self, _bucket: &str, _object: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
+
+        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            object: &str,
+            _version_id: Option<&str>,
+            _opts: &HealOpts,
+        ) -> Result<(HealResultItem, Option<Error>)> {
+            self.healed_objects.lock().unwrap().push(object.to_string());
+            Ok((
+                HealResultItem {
+                    object_size: 1,
+                    ..Default::default()
+                },
+                None,
+            ))
+        }
+
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
+            Ok(HealResultItem::default())
+        }
+
+        async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+            Ok((HealResultItem::default(), None))
+        }
+
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<String>> {
+            Ok(vec!["object-a".to_string(), "object-b".to_string()])
+        }
+
+        async fn list_objects_for_heal_page(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            continuation_token: Option<&str>,
+        ) -> Result<(Vec<String>, Option<String>, bool)> {
+            let mut listed = self.listed.lock().unwrap();
+            if continuation_token.is_none() && !*listed {
+                *listed = true;
+                Ok((vec!["object-a".to_string(), "object-b".to_string()], None, false))
+            } else {
+                Ok((Vec::new(), None, false))
+            }
+        }
+
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore> {
+            Err(Error::other("not implemented in tests"))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recursive_bucket_heal_visits_objects() {
+        let storage = Arc::new(MockStorage::default());
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.heal_bucket("bucket-a")
+            .await
+            .expect("recursive bucket heal should succeed");
+
+        assert_eq!(
+            storage.healed_objects.lock().unwrap().as_slice(),
+            ["object-a".to_string(), "object-b".to_string()]
+        );
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_scanned, 2);
+        assert_eq!(progress.objects_healed, 2);
     }
 }

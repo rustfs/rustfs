@@ -20,7 +20,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_common::heal_channel::HealOpts;
+use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_ecstore::bucket::utils::is_valid_object_prefix;
 use rustfs_ecstore::new_object_layer_fn;
@@ -207,6 +207,29 @@ fn encode_heal_task_status(summary: String, failure_detail: String, heal_setting
         heal_settings,
         items: Vec::new(),
     })
+}
+
+fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
+    let mut heal_request = rustfs_common::heal_channel::create_heal_request(
+        hip.bucket.clone(),
+        if hip.obj_prefix.is_empty() {
+            None
+        } else {
+            Some(hip.obj_prefix.clone())
+        },
+        hip.force_start,
+        Some(HealChannelPriority::Normal),
+    );
+
+    heal_request.pool_index = hip.hs.pool;
+    heal_request.set_index = hip.hs.set;
+    heal_request.scan_mode = Some(hip.hs.scan_mode);
+    heal_request.remove_corrupted = Some(hip.hs.remove);
+    heal_request.recreate_missing = Some(hip.hs.recreate);
+    heal_request.update_parity = Some(hip.hs.update_parity);
+    heal_request.recursive = Some(hip.hs.recursive);
+    heal_request.dry_run = Some(hip.hs.dry_run);
+    heal_request
 }
 
 fn heal_channel_response_summary(response: &rustfs_common::heal_channel::HealChannelResponse) -> String {
@@ -430,16 +453,7 @@ impl Operation for HealHandler {
             let client_address = client_address.clone();
             spawn(async move {
                 // Create heal request through channel
-                let heal_request = rustfs_common::heal_channel::create_heal_request(
-                    hip.bucket.clone(),
-                    if hip.obj_prefix.is_empty() {
-                        None
-                    } else {
-                        Some(hip.obj_prefix.clone())
-                    },
-                    hip.force_start,
-                    Some(rustfs_common::heal_channel::HealChannelPriority::Normal),
-                );
+                let heal_request = build_heal_channel_request(&hip);
                 let client_token = heal_request.id.clone();
 
                 match rustfs_common::heal_channel::send_heal_request_with_admission(heal_request).await {
@@ -517,9 +531,9 @@ impl Operation for BackgroundHealStatusHandler {
 mod tests {
     use super::extract_heal_init_params;
     use super::{
-        HealInitParams, HealResp, encode_background_heal_status, encode_heal_start_success, encode_heal_task_status,
-        heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status, should_handle_root_heal_directly,
-        validate_heal_request_mode, validate_heal_target,
+        HealInitParams, HealResp, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,
+        encode_heal_task_status, heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status,
+        should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
     use bytes::Bytes;
     use http::StatusCode;
@@ -805,6 +819,41 @@ mod tests {
         assert!(json["settings"].is_object());
         let start_time = json["startTime"].as_str().expect("startTime should be a string");
         OffsetDateTime::parse(start_time, &Rfc3339).expect("startTime should be RFC3339");
+    }
+
+    #[test]
+    fn test_build_heal_channel_request_preserves_client_options() {
+        let hip = HealInitParams {
+            bucket: "bucket-a".to_string(),
+            obj_prefix: "prefix-a".to_string(),
+            force_start: true,
+            hs: HealOpts {
+                recursive: true,
+                dry_run: true,
+                remove: true,
+                recreate: false,
+                scan_mode: HealScanMode::Deep,
+                update_parity: false,
+                no_lock: true,
+                pool: Some(1),
+                set: Some(2),
+            },
+            ..Default::default()
+        };
+
+        let request = build_heal_channel_request(&hip);
+
+        assert_eq!(request.bucket, "bucket-a");
+        assert_eq!(request.object_prefix.as_deref(), Some("prefix-a"));
+        assert!(request.force_start);
+        assert_eq!(request.pool_index, Some(1));
+        assert_eq!(request.set_index, Some(2));
+        assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(request.remove_corrupted, Some(true));
+        assert_eq!(request.recreate_missing, Some(false));
+        assert_eq!(request.update_parity, Some(false));
+        assert_eq!(request.recursive, Some(true));
+        assert_eq!(request.dry_run, Some(true));
     }
 
     #[test]

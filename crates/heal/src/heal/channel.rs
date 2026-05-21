@@ -324,7 +324,9 @@ impl HealChannelProcessor {
             options.update_parity = true;
         }
 
-        Ok(HealRequest::new(heal_type, options, priority))
+        let mut heal_request = HealRequest::new(heal_type, options, priority);
+        heal_request.id = request.id;
+        Ok(heal_request)
     }
 
     fn publish_response(&self, response: HealChannelResponse) {
@@ -484,6 +486,7 @@ mod tests {
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+        assert_eq!(heal_request.id, "test-id");
         assert!(matches!(heal_request.heal_type, HealType::Bucket { .. }));
         assert_eq!(heal_request.priority, HealPriority::Normal);
     }
