@@ -16,6 +16,7 @@ use crate::heal::{ErasureSetHealer, progress::HealProgress, storage::HealStorage
 use crate::{Error, Result};
 use metrics::{counter, histogram};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
 use std::{
     future::Future,
@@ -196,6 +197,8 @@ pub struct HealTask {
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
     pub progress: Arc<RwLock<HealProgress>>,
+    /// Result items collected from storage heal calls.
+    pub result_items: Arc<RwLock<Vec<HealResultItem>>>,
     /// Created time
     pub created_at: SystemTime,
     /// Queue admission time
@@ -220,6 +223,7 @@ impl HealTask {
             options: request.options,
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
+            result_items: Arc::new(RwLock::new(Vec::new())),
             created_at: request.created_at,
             enqueued_at: request.enqueued_at,
             started_at: Arc::new(RwLock::new(None)),
@@ -411,6 +415,14 @@ impl HealTask {
         self.progress.read().await.clone()
     }
 
+    pub async fn get_result_items(&self) -> Vec<HealResultItem> {
+        self.result_items.read().await.clone()
+    }
+
+    async fn record_result_item(&self, result: HealResultItem) {
+        self.result_items.write().await.push(result);
+    }
+
     // specific heal implementation method
     #[tracing::instrument(skip(self), fields(bucket = %bucket, object = %object, version_id = ?version_id))]
     async fn heal_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
@@ -521,6 +533,7 @@ impl HealTask {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(3, 3, object_size, object_size);
                 }
+                self.record_result_item(result).await;
                 Ok(())
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
@@ -601,6 +614,7 @@ impl HealTask {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(4, 4, object_size, object_size);
                 }
+                self.record_result_item(result).await;
                 Ok(())
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
@@ -659,6 +673,7 @@ impl HealTask {
         match heal_result {
             Ok(result) => {
                 info!("Bucket heal completed successfully: {} ({} drives)", bucket, result.after.drives.len());
+                self.record_result_item(result).await;
 
                 if self.options.recursive {
                     self.heal_bucket_objects(bucket).await?;
@@ -733,6 +748,7 @@ impl HealTask {
                         Ok((result, None)) => {
                             healed += 1;
                             bytes = bytes.saturating_add(result.object_size as u64);
+                            self.record_result_item(result).await;
                         }
                         Ok((_, Some(err))) => {
                             failed += 1;
@@ -850,6 +866,7 @@ impl HealTask {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(3, 3, 0, 0);
                 }
+                self.record_result_item(result).await;
                 Ok(())
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
@@ -925,6 +942,7 @@ impl HealTask {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(2, 2, 0, 0);
                 }
+                self.record_result_item(result).await;
                 Ok(())
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
@@ -1018,6 +1036,7 @@ impl HealTask {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(3, 3, object_size, object_size);
                 }
+                self.record_result_item(result).await;
                 Ok(())
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
@@ -1322,5 +1341,8 @@ mod tests {
         let progress = task.get_progress().await;
         assert_eq!(progress.objects_scanned, 2);
         assert_eq!(progress.objects_healed, 2);
+        let result_items = task.get_result_items().await;
+        assert_eq!(result_items.len(), 3);
+        assert_eq!(result_items.iter().filter(|item| item.object_size == 1).count(), 2);
     }
 }

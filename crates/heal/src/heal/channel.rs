@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::heal::{
-    manager::HealManager,
+    manager::{HealManager, HealTaskReport},
     task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
     utils,
 };
@@ -22,6 +22,8 @@ use rustfs_common::heal_channel::{
     HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse,
     HealScanMode, publish_heal_response,
 };
+use rustfs_madmin::heal_commands::HealResultItem;
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
@@ -34,6 +36,12 @@ pub struct HealChannelProcessor {
     response_sender: mpsc::UnboundedSender<HealChannelResponse>,
     /// Response receiver
     response_receiver: mpsc::UnboundedReceiver<HealChannelResponse>,
+}
+
+#[derive(Serialize)]
+struct HealTaskStatusPayload {
+    summary: String,
+    items: Vec<HealResultItem>,
 }
 
 impl HealChannelProcessor {
@@ -182,13 +190,28 @@ impl HealChannelProcessor {
     ) -> Result<()> {
         info!("Processing heal query request for path: {}", heal_path);
 
-        let (summary, detail) = match self.heal_manager.get_task_status_for_path(&heal_path, &client_token).await {
-            Ok(HealTaskStatus::Pending | HealTaskStatus::Running) => ("running".to_string(), None),
-            Ok(HealTaskStatus::Completed) => ("finished".to_string(), None),
-            Ok(HealTaskStatus::Cancelled) => ("stopped".to_string(), Some("heal task cancelled".to_string())),
-            Ok(HealTaskStatus::Timeout) => ("stopped".to_string(), Some("heal task timed out".to_string())),
-            Ok(HealTaskStatus::Failed { error }) => ("stopped".to_string(), Some(error)),
-            Err(crate::Error::TaskNotFound { .. }) => ("finished".to_string(), None),
+        let (summary, detail, items) = match self.heal_manager.get_task_report_for_path(&heal_path, &client_token).await {
+            Ok(HealTaskReport {
+                status: HealTaskStatus::Pending | HealTaskStatus::Running,
+                result_items,
+            }) => ("running".to_string(), None, result_items),
+            Ok(HealTaskReport {
+                status: HealTaskStatus::Completed,
+                result_items,
+            }) => ("finished".to_string(), None, result_items),
+            Ok(HealTaskReport {
+                status: HealTaskStatus::Cancelled,
+                result_items,
+            }) => ("stopped".to_string(), Some("heal task cancelled".to_string()), result_items),
+            Ok(HealTaskReport {
+                status: HealTaskStatus::Timeout,
+                result_items,
+            }) => ("stopped".to_string(), Some("heal task timed out".to_string()), result_items),
+            Ok(HealTaskReport {
+                status: HealTaskStatus::Failed { error },
+                result_items,
+            }) => ("stopped".to_string(), Some(error), result_items),
+            Err(crate::Error::TaskNotFound { .. }) => ("finished".to_string(), None, Vec::new()),
             Err(crate::Error::InvalidClientToken) => {
                 let response = HealChannelResponse {
                     request_id: client_token,
@@ -214,10 +237,13 @@ impl HealChannelProcessor {
             }
         };
 
+        let data = serde_json::to_vec(&HealTaskStatusPayload { summary, items })
+            .map_err(|e| crate::Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
+
         let response = HealChannelResponse {
             request_id: client_token,
             success: true,
-            data: Some(summary.into_bytes()),
+            data: Some(data),
             error: detail,
         };
 
@@ -780,7 +806,11 @@ mod tests {
             .expect("query response should be returned");
         assert!(response.success);
         assert_eq!(response.request_id, "completed-token");
-        assert_eq!(response.data.as_deref(), Some("finished".as_bytes()));
+        let payload: serde_json::Value =
+            serde_json::from_slice(response.data.as_deref().expect("status payload should be present"))
+                .expect("status payload should be json");
+        assert_eq!(payload["summary"], "finished");
+        assert_eq!(payload["items"].as_array().expect("items should be an array").len(), 0);
     }
 
     #[tokio::test]
@@ -810,7 +840,11 @@ mod tests {
             .expect("query response should be returned");
         assert!(response.success);
         assert_eq!(response.request_id, task_id);
-        assert_eq!(response.data.as_deref(), Some("running".as_bytes()));
+        let payload: serde_json::Value =
+            serde_json::from_slice(response.data.as_deref().expect("status payload should be present"))
+                .expect("status payload should be json");
+        assert_eq!(payload["summary"], "running");
+        assert_eq!(payload["items"].as_array().expect("items should be an array").len(), 0);
     }
 
     #[tokio::test]

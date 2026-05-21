@@ -23,6 +23,7 @@ use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
+use rustfs_madmin::heal_commands::HealResultItem;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
@@ -94,7 +95,14 @@ enum QueuePushOutcome {
 struct CompletedHealStatus {
     heal_type: HealType,
     status: HealTaskStatus,
+    result_items: Vec<HealResultItem>,
     completed_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealTaskReport {
+    pub status: HealTaskStatus,
+    pub result_items: Vec<HealResultItem>,
 }
 
 impl PriorityHealQueue {
@@ -653,6 +661,51 @@ impl HealManager {
         })
     }
 
+    pub async fn get_task_report_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskReport> {
+        {
+            let active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(task_id)
+                && heal_type_matches_path(&task.heal_type, heal_path)
+            {
+                return Ok(HealTaskReport {
+                    status: task.get_status().await,
+                    result_items: task.get_result_items().await,
+                });
+            }
+        }
+
+        {
+            let queue = self.heal_queue.lock().await;
+            if queue.contains_request_id_matching_path(task_id, heal_path) {
+                return Ok(HealTaskReport {
+                    status: HealTaskStatus::Pending,
+                    result_items: Vec::new(),
+                });
+            }
+        }
+
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(task_id)
+                && heal_type_matches_path(&completed.heal_type, heal_path)
+            {
+                return Ok(HealTaskReport {
+                    status: completed.status.clone(),
+                    result_items: completed.result_items.clone(),
+                });
+            }
+        }
+
+        if self.path_has_task(heal_path).await {
+            return Err(Error::InvalidClientToken);
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
     /// Get task status for a path-bound client token.
     ///
     /// If the token is unknown but no task remains for the path, the caller can
@@ -1073,6 +1126,7 @@ impl HealManager {
                         let completed_status_entry = CompletedHealStatus {
                             heal_type: completed_task.heal_type.clone(),
                             status: completed_status.clone(),
+                            result_items: completed_task.get_result_items().await,
                             completed_at: SystemTime::now(),
                         };
                         let mut completed_heals_guard = completed_heals_clone.lock().await;
@@ -1844,6 +1898,7 @@ mod tests {
                     bucket: "bucket".to_string(),
                 },
                 status: HealTaskStatus::Completed,
+                result_items: Vec::new(),
                 completed_at: SystemTime::now(),
             },
         );
@@ -1855,6 +1910,40 @@ mod tests {
                 .expect("recent completed task should be queryable"),
             HealTaskStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_task_report_for_path_reads_completed_items() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager.completed_heals.lock().await.insert(
+            "completed-token".to_string(),
+            CompletedHealStatus {
+                heal_type: HealType::Object {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                },
+                status: HealTaskStatus::Completed,
+                result_items: vec![HealResultItem {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    object_size: 1024,
+                    ..Default::default()
+                }],
+                completed_at: SystemTime::now(),
+            },
+        );
+
+        let report = manager
+            .get_task_report_for_path("bucket/object", "completed-token")
+            .await
+            .expect("recent completed task report should be queryable");
+
+        assert_eq!(report.status, HealTaskStatus::Completed);
+        assert_eq!(report.result_items.len(), 1);
+        assert_eq!(report.result_items[0].object_size, 1024);
     }
 
     #[tokio::test]
