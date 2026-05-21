@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Install protoc 33.1 on macOS and Linux
+# Install protoc 34.1 on macOS and Linux
 
 set -e
 
-PROTOC_VERSION="33.1"
+PROTOC_VERSION="34.1"
 ARCH=$(uname -m)
 INSTALL_DIR="${HOME}/.local/bin"
 PROTOC_BIN="${INSTALL_DIR}/protoc"
