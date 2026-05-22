@@ -602,7 +602,9 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                             info!("TLS certificates reloaded successfully");
                             holder.swap(&new_holder);
                         }
-                        Ok(None) => debug!("TLS reload: no server certificates found in directory, skipping"),
+                        Ok(None) => {
+                            warn!("TLS reload returned no acceptor despite configured TLS path; keeping previous acceptor")
+                        }
                         Err(e) => warn!("TLS certificate reload failed (will retry): {}", e),
                     }
                 }
@@ -625,9 +627,9 @@ mod tests {
     fn ensure_rustls_crypto_provider() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            rustls::crypto::aws_lc_rs::default_provider()
-                .install_default()
-                .expect("install rustls crypto provider for tests");
+            if rustls::crypto::CryptoProvider::get_default().is_none() {
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            }
         });
     }
 
