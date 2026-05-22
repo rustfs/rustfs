@@ -107,6 +107,9 @@ pub struct WalkDirStreamRequest {
 /// This boundary is limited to remote disk streams that can move large payloads.
 /// Internode metadata, lock, health, and administrative calls remain on the
 /// existing gRPC control plane.
+///
+/// Buffer ownership, backend selection, and fallback expectations are documented
+/// in `crates/ecstore/docs/internode-transport/`.
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;
@@ -248,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_http_capabilities_do_not_advertise_rdma_specific_features() {
+    fn tcp_http_capabilities_do_not_advertise_stricter_backend_features() {
         let capabilities = TcpHttpInternodeDataTransport.capabilities();
 
         assert!(!capabilities.zero_copy_candidate);
@@ -337,18 +340,19 @@ mod tests {
 
     #[test]
     fn transport_config_rejects_unknown_backend() {
-        let err = build_internode_data_transport(Some("rdma")).expect_err("unknown backend should fail closed");
+        let err = build_internode_data_transport(Some("unsupported-backend")).expect_err("unknown backend should fail closed");
 
         assert!(err.to_string().contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
-        assert!(err.to_string().contains("rdma"));
+        assert!(err.to_string().contains("unsupported-backend"));
     }
 
     #[test]
     fn cached_transport_config_error_uses_raw_message() {
-        let err = build_internode_data_transport_result(Some("rdma")).expect_err("unknown backend should fail closed");
+        let err =
+            build_internode_data_transport_result(Some("unsupported-backend")).expect_err("unknown backend should fail closed");
 
         assert!(!err.starts_with("io error "));
         assert!(err.contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
-        assert!(err.contains("rdma"));
+        assert!(err.contains("unsupported-backend"));
     }
 }
