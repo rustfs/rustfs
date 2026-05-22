@@ -33,6 +33,7 @@ use rustfs_config::{
 use rustfs_tls_runtime::{
     OutboundTlsMaterial as RuntimeOutboundTlsMaterial, ServerTlsMaterial as RuntimeServerTlsMaterial, TlsGeneration, TlsSource,
     WebPkiClientVerifierOptions, build_webpki_client_verifier, create_multi_cert_resolver, publish_global_outbound_tls_state,
+    record_tls_generation, record_tls_publication_fail, record_tls_reload_result, record_tls_reload_skipped,
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -93,11 +94,16 @@ impl TlsMaterialSnapshot {
 
     /// Apply outbound material to global state (root CAs, mTLS identity).
     pub async fn apply_outbound(&self) {
+        self.apply_outbound_with_generation(TlsGeneration(1)).await;
+    }
+
+    pub async fn apply_outbound_with_generation(&self, generation: TlsGeneration) {
         let outbound = RuntimeOutboundTlsMaterial {
             root_ca_pem: self.outbound.root_ca_pem.clone(),
             mtls_identity: self.outbound.mtls_identity.clone(),
         };
-        publish_global_outbound_tls_state(TlsGeneration(1), &outbound).await;
+        publish_global_outbound_tls_state(generation, &outbound).await;
+        record_tls_generation("rustfs_server_reload_loop", generation.0);
         if !self.outbound.root_ca_pem.is_empty() {
             info!("Configured custom root certificates for inter-node communication");
         }
@@ -482,26 +488,34 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        let mut generation = 1_u64;
         loop {
             interval.tick().await;
 
             match TlsMaterialSnapshot::load(&tls_path).await {
                 Ok(snapshot) => {
                     // Always refresh outbound material (root CAs, mTLS identity) on reload.
-                    snapshot.apply_outbound().await;
+                    generation = generation.saturating_add(1);
+                    snapshot.apply_outbound_with_generation(TlsGeneration(generation)).await;
 
                     match snapshot.build_tls_acceptor(&tls_path).await {
                         Ok(Some(new_holder)) => {
                             info!("TLS certificates reloaded successfully");
                             holder.swap(&new_holder);
+                            record_tls_reload_result("rustfs_server_reload_loop", "ok", None, Some(generation));
                         }
                         Ok(None) => {
+                            record_tls_reload_skipped("rustfs_server_reload_loop", "no_acceptor");
                             warn!("TLS reload returned no acceptor despite configured TLS path; keeping previous acceptor")
                         }
-                        Err(e) => warn!("TLS certificate reload failed (will retry): {}", e),
+                        Err(e) => {
+                            record_tls_publication_fail("rustfs_server_reload_loop");
+                            warn!("TLS certificate reload failed (will retry): {}", e)
+                        }
                     }
                 }
                 Err(e) => {
+                    record_tls_publication_fail("rustfs_server_reload_loop");
                     warn!("TLS material reload failed (will retry): {}", e);
                 }
             }
@@ -529,7 +543,7 @@ mod tests {
     fn write_test_cert_pair(dir: &Path, subject: &str) {
         let CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![subject.to_string()]).unwrap();
         fs::write(dir.join(RUSTFS_TLS_CERT), cert.pem()).unwrap();
-        fs::write(dir.join(RUSTFS_TLS_KEY), signing_key.serialize_pem()).unwrap();
+        fs::write(dir.join(rustfs_config::RUSTFS_TLS_KEY), signing_key.serialize_pem()).unwrap();
     }
 
     #[tokio::test]

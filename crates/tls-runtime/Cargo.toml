@@ -34,6 +34,7 @@ arc-swap.workspace = true
 metrics.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }

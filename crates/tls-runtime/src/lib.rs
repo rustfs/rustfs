@@ -33,13 +33,18 @@ pub use coordinator::{TlsConsumer, TlsReloadCoordinator};
 pub use error::TlsRuntimeError;
 pub use fingerprint::TlsFingerprint;
 pub use material::{OutboundTlsMaterial, ServerTlsMaterial, TlsMaterialSnapshot};
+pub use metrics::{
+    TLS_OUTBOUND_GLOBAL_CONSUMER, TLS_RUNTIME_FOUNDATION_CONSUMER, init_tls_metrics, record_tls_consumer_stale_generation,
+    record_tls_generation, record_tls_publication_fail, record_tls_reload_result, record_tls_reload_skipped,
+};
 pub use outbound::{
     GlobalOutboundTlsStateSummary, GlobalPublishedOutboundTlsState, load_global_outbound_tls_state,
     publish_global_outbound_tls_state, summarize_global_outbound_tls_state,
 };
 pub use server::{ReloadableServerCertResolver, spawn_server_cert_reload_loop};
 pub use source::{TlsFileLayout, TlsSource, TlsSourceKind};
-pub use state::{TlsGeneration, TlsPublishedState, TlsReloadRuntimeState};
+pub use state::{TlsGeneration, TlsPublishedState, TlsReloadRuntimeState, TlsRuntimeStatusSnapshot};
+pub use state::{TlsRuntimeConsumerSection, TlsRuntimeOutboundSection, TlsRuntimeRuntimeSection, TlsRuntimeServerSection};
 
 #[cfg(test)]
 mod tests {

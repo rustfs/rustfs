@@ -16,12 +16,14 @@ use crate::certs::{CertDirectoryLoadOptions, load_all_certs_from_directory};
 use crate::config::TlsReloadOptions;
 use crate::error::TlsRuntimeError;
 use crate::material::{ServerTlsMaterial, server_material_fingerprint};
+use crate::metrics::{record_tls_generation, record_tls_publication_fail, record_tls_reload_result, record_tls_reload_skipped};
 use crate::source::TlsSource;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -93,14 +95,17 @@ impl ResolverState {
 pub struct ReloadableServerCertResolver {
     source: TlsSource,
     current: RwLock<ResolverState>,
+    generation: AtomicU64,
 }
 
 impl ReloadableServerCertResolver {
     pub fn load_from_source(source: TlsSource) -> Result<Arc<Self>, TlsRuntimeError> {
         let state = ResolverState::load_from_source(&source)?;
+        record_tls_generation("server_resolver", 1);
         Ok(Arc::new(Self {
             source,
             current: RwLock::new(state),
+            generation: AtomicU64::new(1),
         }))
     }
 
@@ -118,6 +123,7 @@ impl ReloadableServerCertResolver {
                 }
                 let cert_count = new_state.cert_count;
                 *guard = new_state;
+                self.generation.fetch_add(1, Ordering::Relaxed);
                 Ok(Some(cert_count))
             }
             Err(poisoned) => {
@@ -127,9 +133,14 @@ impl ReloadableServerCertResolver {
                 }
                 let cert_count = new_state.cert_count;
                 *guard = new_state;
+                self.generation.fetch_add(1, Ordering::Relaxed);
                 Ok(Some(cert_count))
             }
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 }
 
@@ -196,6 +207,7 @@ pub fn spawn_server_cert_reload_loop(
 
             match resolver.reload() {
                 Ok(Some(cert_count)) => {
+                    record_tls_reload_result(protocol, "ok", None, Some(resolver.generation()));
                     info!(
                         protocol,
                         cert_dir = %resolver.source.base_dir.display(),
@@ -204,6 +216,7 @@ pub fn spawn_server_cert_reload_loop(
                     );
                 }
                 Ok(None) => {
+                    record_tls_reload_skipped(protocol, "unchanged");
                     debug!(
                         protocol,
                         cert_dir = %resolver.source.base_dir.display(),
@@ -211,6 +224,7 @@ pub fn spawn_server_cert_reload_loop(
                     );
                 }
                 Err(e) => {
+                    record_tls_publication_fail(protocol);
                     warn!(
                         protocol,
                         cert_dir = %resolver.source.base_dir.display(),

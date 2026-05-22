@@ -15,9 +15,15 @@
 use crate::config::{ReloadDetectMode, TlsReloadOptions};
 use crate::error::TlsRuntimeError;
 use crate::material::TlsMaterialSnapshot;
-use crate::metrics::{record_tls_reload_result, record_tls_reload_skipped};
+use crate::metrics::{
+    TLS_RUNTIME_FOUNDATION_CONSUMER, record_tls_generation, record_tls_publication_fail, record_tls_reload_result,
+    record_tls_reload_skipped,
+};
 use crate::source::TlsSource;
-use crate::state::{TlsGeneration, TlsPublishedState, TlsReloadRuntimeState};
+use crate::state::{
+    TlsGeneration, TlsPublishedState, TlsReloadRuntimeState, TlsRuntimeConsumerSection, TlsRuntimeOutboundSection,
+    TlsRuntimeRuntimeSection, TlsRuntimeServerSection, TlsRuntimeStatusSnapshot, detect_mode_label,
+};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -46,17 +52,45 @@ impl TlsReloadCoordinator {
         &self.options
     }
 
+    pub async fn status_snapshot(&self, runtime_state: &TlsReloadRuntimeState<TlsMaterialSnapshot>) -> TlsRuntimeStatusSnapshot {
+        let current = runtime_state.current.load();
+        let last_attempt = runtime_state.last_attempt_unix_ms();
+        let last_success = runtime_state.last_success_unix_ms();
+
+        TlsRuntimeStatusSnapshot {
+            runtime: TlsRuntimeRuntimeSection {
+                generation: current.generation.0,
+                reload_enabled: self.options.enabled,
+                detect_mode: detect_mode_label(self.options.detect_mode),
+                last_attempt_time: (last_attempt != 0).then_some(last_attempt),
+                last_success_time: (last_success != 0).then_some(last_success),
+                last_error: runtime_state.last_error.read().await.clone(),
+                source_path: self.source.base_dir.display().to_string(),
+            },
+            outbound: TlsRuntimeOutboundSection {
+                has_roots: !current.material.outbound.root_ca_pem.is_empty(),
+                has_mtls_identity: current.material.outbound.mtls_identity.is_some(),
+            },
+            server: TlsRuntimeServerSection {
+                has_material: current.material.server.is_some(),
+            },
+            consumer: TlsRuntimeConsumerSection { stale_generation: false },
+        }
+    }
+
     pub async fn load_initial_snapshot(&self) -> Result<TlsMaterialSnapshot, TlsRuntimeError> {
         TlsMaterialSnapshot::load(&self.source).await
     }
 
     pub async fn publish_initial_state(&self, snapshot: TlsMaterialSnapshot) -> Arc<TlsPublishedState<TlsMaterialSnapshot>> {
-        Arc::new(TlsPublishedState {
+        let published = Arc::new(TlsPublishedState {
             generation: TlsGeneration(1),
             fingerprint: snapshot.fingerprint.clone(),
             material: Arc::new(snapshot),
             loaded_at_unix_ms: unix_time_ms(),
-        })
+        });
+        record_tls_generation(TLS_RUNTIME_FOUNDATION_CONSUMER, published.generation.0);
+        published
     }
 
     pub async fn reload_once<C>(
@@ -74,7 +108,7 @@ impl TlsReloadCoordinator {
         let current = runtime_state.current.load();
         if current.fingerprint == snapshot.fingerprint {
             debug!(source = %self.source.base_dir.display(), "TLS material unchanged; skipping publication");
-            record_tls_reload_skipped("unchanged");
+            record_tls_reload_skipped(TLS_RUNTIME_FOUNDATION_CONSUMER, "unchanged");
             return Ok(None);
         }
 
@@ -85,12 +119,20 @@ impl TlsReloadCoordinator {
             loaded_at_unix_ms: unix_time_ms(),
         });
 
-        consumer.on_publish(published.generation, published.clone())?;
+        if let Err(err) = consumer.on_publish(published.generation, published.clone()) {
+            record_tls_publication_fail(TLS_RUNTIME_FOUNDATION_CONSUMER);
+            return Err(err);
+        }
         runtime_state.current.store(published.clone());
         runtime_state.last_good.store(published.clone());
         runtime_state.mark_success(unix_time_ms());
         *runtime_state.last_error.write().await = None;
-        record_tls_reload_result("ok", Some(started_at.elapsed().as_secs_f64()), Some(published.generation.0));
+        record_tls_reload_result(
+            TLS_RUNTIME_FOUNDATION_CONSUMER,
+            "ok",
+            Some(started_at.elapsed().as_secs_f64()),
+            Some(published.generation.0),
+        );
 
         Ok(Some(published))
     }

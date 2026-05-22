@@ -20,11 +20,14 @@ mod generated;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_common::{GLOBAL_CONN_MAP, evict_connection};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-use rustfs_tls_runtime::load_global_outbound_tls_state;
+use rustfs_tls_runtime::{GlobalOutboundTlsStateSummary, load_global_outbound_tls_state, record_tls_consumer_stale_generation};
 use std::{
+    collections::HashMap,
     error::Error,
+    sync::LazyLock,
     time::{Duration, Instant},
 };
+use tokio::sync::Mutex;
 use tonic::{
     Request, Status,
     service::interceptor::InterceptedService,
@@ -47,6 +50,31 @@ pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 /// It is used to identify HTTPS URLs.
 /// Default value: https://
 const RUSTFS_HTTPS_PREFIX: &str = "https://";
+static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtosTlsStatusView {
+    pub generation: u64,
+    pub has_root_ca: bool,
+    pub has_mtls_identity: bool,
+}
+
+pub async fn protos_tls_status_view() -> ProtosTlsStatusView {
+    let state = load_global_outbound_tls_state().await;
+    ProtosTlsStatusView {
+        generation: state.generation.0,
+        has_root_ca: state.root_ca_pem.as_ref().is_some_and(|pem| !pem.is_empty()),
+        has_mtls_identity: state.mtls_identity.is_some(),
+    }
+}
+
+pub fn protos_tls_status_from_summary(summary: GlobalOutboundTlsStateSummary) -> ProtosTlsStatusView {
+    ProtosTlsStatusView {
+        generation: summary.generation.0,
+        has_root_ca: summary.has_root_ca,
+        has_mtls_identity: summary.has_mtls_identity,
+    }
+}
 
 fn internode_connect_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(
@@ -116,6 +144,16 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         .timeout(rpc_timeout);
 
     let outbound_tls = load_global_outbound_tls_state().await;
+    let generation = outbound_tls.generation.0;
+    let mut stale_generation = false;
+    {
+        let generation_cache = TLS_GENERATION_CACHE.lock().await;
+        if let Some(cached_generation) = generation_cache.get(addr)
+            && *cached_generation != generation
+        {
+            stale_generation = true;
+        }
+    }
     if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
         if outbound_tls.root_ca_pem.is_none() {
             debug!("No custom root certificate configured; using system roots for TLS: {}", addr);
@@ -168,6 +206,13 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     {
         GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel.clone());
     }
+    {
+        let mut generation_cache = TLS_GENERATION_CACHE.lock().await;
+        generation_cache.insert(addr.to_string(), generation);
+    }
+    if stale_generation {
+        record_tls_consumer_stale_generation("protos_grpc_channel");
+    }
 
     debug!("Successfully created and cached gRPC channel to: {}", addr);
     Ok(channel)
@@ -178,4 +223,5 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 pub async fn evict_failed_connection(addr: &str) {
     warn!("Evicting failed gRPC connection: {}", addr);
     evict_connection(addr).await;
+    TLS_GENERATION_CACHE.lock().await.remove(addr);
 }

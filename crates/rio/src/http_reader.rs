@@ -22,7 +22,10 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
     INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
-use rustfs_tls_runtime::{load_cert_bundle_der_bytes, load_global_outbound_tls_state};
+use rustfs_tls_runtime::{
+    GlobalOutboundTlsStateSummary, load_cert_bundle_der_bytes, load_global_outbound_tls_state,
+    record_tls_consumer_stale_generation,
+};
 use rustfs_utils::get_env_opt_str;
 use rustls_pki_types::pem::PemObject;
 use std::io::IoSlice;
@@ -59,6 +62,30 @@ struct CachedClients {
     generation: u64,
     client: Client,
     local_client: Client,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RioTlsStatusView {
+    pub generation: u64,
+    pub has_root_ca: bool,
+    pub has_mtls_identity: bool,
+}
+
+pub async fn rio_tls_status_view() -> RioTlsStatusView {
+    let state = load_global_outbound_tls_state().await;
+    RioTlsStatusView {
+        generation: state.generation.0,
+        has_root_ca: state.root_ca_pem.as_ref().is_some_and(|pem| !pem.is_empty()),
+        has_mtls_identity: state.mtls_identity.is_some(),
+    }
+}
+
+pub fn rio_tls_status_from_summary(summary: GlobalOutboundTlsStateSummary) -> RioTlsStatusView {
+    RioTlsStatusView {
+        generation: summary.generation.0,
+        has_root_ca: summary.has_root_ca,
+        has_mtls_identity: summary.has_mtls_identity,
+    }
 }
 
 static CLIENT_CACHE: LazyLock<Mutex<Option<CachedClients>>> = LazyLock::new(|| Mutex::new(None));
@@ -132,6 +159,7 @@ async fn get_http_client(url: &str) -> Client {
     let disable_proxy = should_bypass_proxy_for_url(url);
     let generation = outbound_tls.generation.0;
 
+    let mut observed_stale_generation = false;
     if let Some(client) = {
         let guard = CLIENT_CACHE.lock().await;
         guard.as_ref().and_then(|cached| {
@@ -142,6 +170,7 @@ async fn get_http_client(url: &str) -> Client {
                     cached.client.clone()
                 })
             } else {
+                observed_stale_generation = true;
                 None
             }
         })
@@ -151,6 +180,9 @@ async fn get_http_client(url: &str) -> Client {
 
     let client = build_http_client(false, &outbound_tls).await;
     let local_client = build_http_client(true, &outbound_tls).await;
+    if observed_stale_generation {
+        record_tls_consumer_stale_generation("rio_http_reader");
+    }
     let cached = CachedClients {
         generation,
         client,

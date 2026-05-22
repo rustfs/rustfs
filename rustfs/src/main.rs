@@ -234,6 +234,9 @@ async fn async_main() -> Result<()> {
                 return Err(Error::other(e.to_string()));
             }
         }
+        if rustfs_obs::observability_metric_enabled() {
+            rustfs_tls_runtime::init_tls_metrics();
+        }
     }
 
     // Run parameters
