@@ -20,6 +20,7 @@ use rustfs_common::MtlsIdentityPem;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::io::ErrorKind;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -137,17 +138,11 @@ fn load_server_material(source: &TlsSource, base_dir: &Path) -> Result<Option<Se
                 .map_err(|e| TlsRuntimeError::Material(format!("load root TLS private key {}: {e}", root_key.display())))?;
             Ok(Some(ServerTlsMaterial::SingleCert { certs, key }))
         }
-        Err(err) => {
-            let message = err.to_string();
-            if message.contains("No valid certificate/private key pair found") {
-                return Ok(None);
-            }
-
-            Err(TlsRuntimeError::Material(format!(
-                "discover server TLS certificates under '{}': {err}",
-                base_dir.display()
-            )))
-        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(TlsRuntimeError::Material(format!(
+            "discover server TLS certificates under '{}': {err}",
+            base_dir.display()
+        ))),
     }
 }
 

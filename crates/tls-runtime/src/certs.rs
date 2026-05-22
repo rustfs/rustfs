@@ -312,10 +312,10 @@ pub fn load_all_certs_from_directory(
     }
 
     if cert_key_pairs.is_empty() {
-        return Err(certs_error(format!(
-            "No valid certificate/private key pair found in directory {}",
-            dir.display()
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("No valid certificate/private key pair found in directory {}", dir.display()),
+        ));
     }
 
     Ok(cert_key_pairs)
@@ -423,6 +423,7 @@ mod tests {
         let result = load_all_certs_from_directory(default_load_options(temp_dir.path()));
         assert!(result.is_err());
         let error = result.expect_err("empty directory should error");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
         assert!(error.to_string().contains("No valid certificate/private key pair found"));
     }
 

@@ -31,10 +31,12 @@ use redis::{
     io::tcp::{TcpSettings, socket2},
 };
 use rustfs_config::{REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY};
-use rustfs_tls_runtime::load_cert_bundle_der_bytes;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -697,7 +699,11 @@ fn read_root_cert(tls: &RedisTlsConfig) -> Result<Option<Vec<u8>>, TargetError> 
         return Ok(None);
     }
 
-    let certs_der = load_cert_bundle_der_bytes(&tls.ca_path)
+    let pem =
+        std::fs::read(&tls.ca_path).map_err(|e| TargetError::Configuration(format!("Failed to read Redis root CA cert: {e}")))?;
+    let mut reader = BufReader::new(pem.as_slice());
+    let certs_der = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TargetError::Configuration(format!("Failed to parse Redis root CA cert: {e}")))?;
 
     if certs_der.is_empty() {
@@ -706,9 +712,7 @@ fn read_root_cert(tls: &RedisTlsConfig) -> Result<Option<Vec<u8>>, TargetError> 
         ));
     }
 
-    std::fs::read(&tls.ca_path)
-        .map(Some)
-        .map_err(|e| TargetError::Configuration(format!("Failed to read Redis root CA cert: {e}")))
+    Ok(Some(pem))
 }
 
 fn map_redis_error(err: RedisError) -> TargetError {

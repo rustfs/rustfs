@@ -19,10 +19,12 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, open_target_queue_store, persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, open_target_queue_store,
+        persist_queued_payload_to_store, refresh_tls_fingerprint_state,
     },
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use reqwest::{Client, StatusCode, Url};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use serde::Serialize;
@@ -105,7 +107,8 @@ where
     id: TargetID,
     args: WebhookArgs,
     health_check_url: Option<Url>,
-    http_client: Arc<Client>,
+    http_client: Arc<Mutex<Client>>,
+    tls_state: Arc<Mutex<TargetTlsState>>,
     // Add Send + Sync constraints to ensure thread safety
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     initialized: AtomicBool,
@@ -125,6 +128,7 @@ where
             args: self.args.clone(),
             health_check_url: self.health_check_url.clone(),
             http_client: Arc::clone(&self.http_client),
+            tls_state: Arc::clone(&self.tls_state),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             initialized: AtomicBool::new(self.initialized.load(Ordering::SeqCst)),
             cancel_sender: self.cancel_sender.clone(),
@@ -147,7 +151,7 @@ where
         };
 
         // Build HTTP client using the helper function
-        let http_client = Arc::new(Self::build_http_client(&args)?);
+        let http_client = Arc::new(Mutex::new(Self::build_http_client(&args)?));
 
         let queue_store = open_target_queue_store(
             &args.queue_dir,
@@ -166,6 +170,7 @@ where
             args,
             health_check_url,
             http_client,
+            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
             store: queue_store,
             initialized: AtomicBool::new(false),
             cancel_sender,
@@ -221,6 +226,20 @@ where
             .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {e}")))
     }
 
+    async fn refresh_tls(&self) -> Result<(), TargetError> {
+        let next_fingerprint =
+            build_target_tls_fingerprint(&self.args.client_ca, &self.args.client_cert, &self.args.client_key).await?;
+        {
+            let mut tls_state_guard = self.tls_state.lock();
+            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint, || {
+                if let Ok(new_client) = Self::build_http_client(&self.args) {
+                    *self.http_client.lock() = new_client;
+                }
+            });
+        }
+        Ok(())
+    }
+
     fn health_check_url(endpoint: &Url) -> Result<Url, TargetError> {
         endpoint
             .host()
@@ -238,7 +257,8 @@ where
             return Ok(false);
         };
 
-        match tokio::time::timeout(Duration::from_secs(5), self.http_client.head(health_check_url.as_str()).send()).await {
+        let client = self.http_client.lock().clone();
+        match tokio::time::timeout(Duration::from_secs(5), client.head(health_check_url.as_str()).send()).await {
             Ok(Ok(resp)) => {
                 debug!(
                     target = %self.id,
@@ -307,8 +327,10 @@ where
             "Sending webhook payload"
         );
 
-        let mut req_builder = self
-            .http_client
+        self.refresh_tls().await?;
+
+        let client = self.http_client.lock().clone();
+        let mut req_builder = client
             .post(self.args.endpoint.as_str())
             .header("Content-Type", meta.content_type.as_str());
 
@@ -433,6 +455,7 @@ where
     async fn close(&self) -> Result<(), TargetError> {
         // Send cancel signal to background tasks
         let _ = self.cancel_sender.try_send(());
+        self.tls_state.lock().reset();
         info!("Webhook target closed: {}", self.id);
         Ok(())
     }

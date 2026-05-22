@@ -148,10 +148,7 @@ impl TlsMaterialSnapshot {
                 let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
                 Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
             }
-            None => Err(TlsMaterialError::Io(format!(
-                "No usable TLS certificate material found under '{}'",
-                tls_dir.display()
-            ))),
+            None => Ok(None),
         }
     }
 
@@ -619,18 +616,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_tls_acceptor_rejects_empty_tls_directory() {
+    async fn build_tls_acceptor_returns_none_for_empty_tls_directory() {
         let temp_dir = TempDir::new().unwrap();
         let snapshot = TlsMaterialSnapshot::load(temp_dir.path().to_str().unwrap())
             .await
             .expect("outbound TLS load for empty dir should succeed");
 
-        let err = match snapshot.build_tls_acceptor(temp_dir.path().to_str().unwrap()).await {
-            Ok(_) => panic!("empty TLS directory should fail"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("No usable TLS certificate material found"));
+        let acceptor = snapshot
+            .build_tls_acceptor(temp_dir.path().to_str().unwrap())
+            .await
+            .expect("empty TLS directory should be treated as no acceptor");
+        assert!(acceptor.is_none());
     }
 
     #[tokio::test]

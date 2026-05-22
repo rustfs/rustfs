@@ -20,7 +20,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store, refresh_tls_fingerprint_state,
+        persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -226,12 +226,12 @@ where
     async fn get_or_connect(&self) -> Result<async_nats::Client, TargetError> {
         let next_fingerprint =
             build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
-
-        {
+        let tls_changed = {
             let mut tls_state_guard = self.tls_state.lock().unwrap();
-            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || {
-                self.invalidate_cached_client_connection()
-            });
+            tls_state_guard.refresh(next_fingerprint)
+        };
+        if tls_changed {
+            self.invalidate_cached_client_connection();
         }
 
         if let Some(client) = self.client.lock().unwrap().clone() {
