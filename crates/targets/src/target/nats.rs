@@ -219,9 +219,8 @@ where
         })
     }
 
-    fn invalidate_cached_client(&self) {
+    fn invalidate_cached_client_connection(&self) {
         *self.client.lock().unwrap() = None;
-        self.tls_state.lock().unwrap().reset();
     }
 
     async fn get_or_connect(&self) -> Result<async_nats::Client, TargetError> {
@@ -230,7 +229,9 @@ where
 
         {
             let mut tls_state_guard = self.tls_state.lock().unwrap();
-            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || self.invalidate_cached_client());
+            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || {
+                self.invalidate_cached_client_connection()
+            });
         }
 
         if let Some(client) = self.client.lock().unwrap().clone() {

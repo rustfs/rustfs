@@ -79,9 +79,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+use tokio::sync::OnceCell;
 use tracing::warn;
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
@@ -102,7 +102,7 @@ const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
 const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
-static SITE_REPLICATION_PEER_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+static SITE_REPLICATION_PEER_CLIENT: OnceCell<Result<reqwest::Client, String>> = OnceCell::const_new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SiteReplicationState {
@@ -447,13 +447,13 @@ async fn persist_site_replication_state(state: &SiteReplicationState) -> S3Resul
     }
 }
 
-fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
+async fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
         .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
         .pool_idle_timeout(Some(Duration::from_secs(60)));
 
-    let outbound_tls = tokio::runtime::Handle::current().block_on(load_global_outbound_tls_state());
+    let outbound_tls = load_global_outbound_tls_state().await;
     if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
         let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
         let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
@@ -481,8 +481,10 @@ fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build site replication peer client failed: {e}")))
 }
 
-fn site_replication_peer_client() -> S3Result<&'static reqwest::Client> {
-    let result = SITE_REPLICATION_PEER_CLIENT.get_or_init(|| build_site_replication_peer_client().map_err(|e| e.to_string()));
+async fn site_replication_peer_client() -> S3Result<&'static reqwest::Client> {
+    let result = SITE_REPLICATION_PEER_CLIENT
+        .get_or_init(|| async { build_site_replication_peer_client().await.map_err(|e| e.to_string()) })
+        .await;
     result.as_ref().map_err(|err| {
         S3Error::with_message(
             S3ErrorCode::InternalError,
@@ -944,7 +946,7 @@ async fn send_peer_admin_request<T: Serialize>(
             .unwrap_or("us-east-1"),
     );
 
-    let mut req = site_replication_peer_client()?.request(reqwest::Method::PUT, &url);
+    let mut req = site_replication_peer_client().await?.request(reqwest::Method::PUT, &url);
     for (name, value) in signed.headers() {
         req = req.header(name, value);
     }

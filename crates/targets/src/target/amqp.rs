@@ -357,7 +357,7 @@ where
             build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)?;
         {
             let mut tls_state_guard = self.tls_state.lock();
-            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || self.clear_connection());
+            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || self.clear_connection_cache());
         }
 
         if let Some(connection) = self.connection.lock().clone()
@@ -381,8 +381,12 @@ where
         Ok(connection)
     }
 
-    fn clear_connection(&self) {
+    fn clear_connection_cache(&self) {
         *self.connection.lock() = None;
+    }
+
+    fn clear_connection(&self) {
+        self.clear_connection_cache();
         self.tls_state.lock().reset();
     }
 

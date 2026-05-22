@@ -22,7 +22,7 @@
 //! 2. Call `snapshot.apply_outbound()` to set global root CAs and mTLS identity.
 //! 3. TLS acceptor construction is handled internally during server startup.
 
-use rustfs_common::MtlsIdentityPem;
+use rustfs_common::{MtlsIdentityPem, get_global_outbound_tls_generation};
 use rustfs_config::{
     DEFAULT_SERVER_MTLS_ENABLE, DEFAULT_TLS_KEYLOG, DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL,
     DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA, ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_SERVER_MTLS_ENABLE,
@@ -94,7 +94,8 @@ impl TlsMaterialSnapshot {
 
     /// Apply outbound material to global state (root CAs, mTLS identity).
     pub async fn apply_outbound(&self) {
-        self.apply_outbound_with_generation(TlsGeneration(1)).await;
+        let next_generation = TlsGeneration(get_global_outbound_tls_generation().saturating_add(1));
+        self.apply_outbound_with_generation(next_generation).await;
     }
 
     pub async fn apply_outbound_with_generation(&self, generation: TlsGeneration) {

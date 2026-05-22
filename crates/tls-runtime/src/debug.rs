@@ -126,9 +126,7 @@ mod tests {
                 has_mtls_identity: false,
             },
             server: TlsRuntimeServerSection { has_material: true },
-            consumer: TlsRuntimeConsumerSection {
-                stale_generation: false,
-            },
+            consumer: TlsRuntimeConsumerSection { stale_generation: false },
         };
 
         let response = TlsDebugStatusResponse::builder(foundation)

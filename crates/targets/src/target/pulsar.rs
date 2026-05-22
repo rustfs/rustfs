@@ -219,8 +219,12 @@ where
         })
     }
 
-    fn clear_cached_client(&self) {
+    fn clear_cached_client_connection(&self) {
         self.client.lock().unwrap().take();
+    }
+
+    fn clear_cached_client(&self) {
+        self.clear_cached_client_connection();
         self.tls_state.lock().unwrap().reset();
     }
 
@@ -228,7 +232,9 @@ where
         let next_fingerprint = build_target_tls_fingerprint(&self.args.tls_ca, "", "")?;
         {
             let mut tls_state_guard = self.tls_state.lock().unwrap();
-            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || self.clear_cached_client());
+            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || {
+                self.clear_cached_client_connection()
+            });
         }
 
         if let Some(client) = self.client.lock().unwrap().clone() {

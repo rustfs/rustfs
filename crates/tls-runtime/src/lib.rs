@@ -15,8 +15,8 @@
 pub mod certs;
 pub mod config;
 pub mod coordinator;
-pub mod error;
 pub mod debug;
+pub mod error;
 pub mod fingerprint;
 pub mod material;
 pub mod metrics;
@@ -31,10 +31,8 @@ pub use certs::{
 };
 pub use config::{ReloadApplyHint, ReloadDetectMode, TlsReloadOptions};
 pub use coordinator::{TlsConsumer, TlsReloadCoordinator};
+pub use debug::{TlsConsumerStatusItem, TlsConsumerStatusSource, TlsDebugStatusResponse, TlsDebugStatusResponseBuilder};
 pub use error::TlsRuntimeError;
-pub use debug::{
-    TlsConsumerStatusItem, TlsConsumerStatusSource, TlsDebugStatusResponse, TlsDebugStatusResponseBuilder,
-};
 pub use fingerprint::TlsFingerprint;
 pub use material::{OutboundTlsMaterial, ServerTlsMaterial, TlsMaterialSnapshot};
 pub use metrics::{
@@ -42,8 +40,8 @@ pub use metrics::{
     record_tls_generation, record_tls_publication_fail, record_tls_reload_result, record_tls_reload_skipped,
 };
 pub use outbound::{
-    GlobalOutboundTlsStateSummary, GlobalPublishedOutboundTlsState, load_global_outbound_tls_state,
-    publish_global_outbound_tls_state, summarize_global_outbound_tls_state,
+    GlobalOutboundTlsStateSummary, GlobalPublishedOutboundTlsState, load_global_outbound_tls_generation,
+    load_global_outbound_tls_state, publish_global_outbound_tls_state, summarize_global_outbound_tls_state,
 };
 pub use server::{ReloadableServerCertResolver, spawn_server_cert_reload_loop};
 pub use source::{TlsFileLayout, TlsSource, TlsSourceKind};

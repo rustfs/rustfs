@@ -22,10 +22,9 @@ use matchit::Params;
 use rustfs_ecstore::client::transition_api::transition_tls_status_view;
 use rustfs_protos::protos_tls_status_view;
 use rustfs_rio::rio_tls_status_view;
-use rustfs_tls_runtime::{TlsRuntimeStatusSnapshot, load_global_outbound_tls_state};
+use rustfs_tls_runtime::{TlsDebugStatusResponse, TlsRuntimeStatusSnapshot, load_global_outbound_tls_state};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result};
-use serde::Serialize;
 
 pub fn register_tls_debug_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -37,20 +36,6 @@ pub fn register_tls_debug_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 }
 
 pub struct TlsStatusHandler {}
-
-#[derive(Debug, Clone, Serialize)]
-struct TlsConsumerStatusItem {
-    consumer: &'static str,
-    generation: u64,
-    has_root_ca: bool,
-    has_mtls_identity: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct TlsDebugStatusResponse {
-    foundation: TlsRuntimeStatusSnapshot,
-    consumers: Vec<TlsConsumerStatusItem>,
-}
 
 #[async_trait::async_trait]
 impl Operation for TlsStatusHandler {
@@ -73,29 +58,11 @@ impl Operation for TlsStatusHandler {
         let protos = protos_tls_status_view().await;
         let rio = rio_tls_status_view().await;
         let ecstore = transition_tls_status_view().await;
-        let payload = TlsDebugStatusResponse {
-            foundation: status,
-            consumers: vec![
-                TlsConsumerStatusItem {
-                    consumer: "protos_grpc_channel",
-                    generation: protos.generation,
-                    has_root_ca: protos.has_root_ca,
-                    has_mtls_identity: protos.has_mtls_identity,
-                },
-                TlsConsumerStatusItem {
-                    consumer: "rio_http_reader",
-                    generation: rio.generation,
-                    has_root_ca: rio.has_root_ca,
-                    has_mtls_identity: rio.has_mtls_identity,
-                },
-                TlsConsumerStatusItem {
-                    consumer: "ecstore_transition_client",
-                    generation: ecstore.generation,
-                    has_root_ca: ecstore.has_root_ca,
-                    has_mtls_identity: ecstore.has_mtls_identity,
-                },
-            ],
-        };
+        let payload = TlsDebugStatusResponse::builder(status)
+            .push_consumer(protos)
+            .push_consumer(rio)
+            .push_consumer(ecstore)
+            .build();
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -108,12 +75,12 @@ impl Operation for TlsStatusHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{TlsConsumerStatusItem, TlsDebugStatusResponse, TlsStatusHandler};
+    use super::TlsStatusHandler;
     use crate::admin::router::Operation;
-    use rustfs_tls_runtime::TlsRuntimeStatusSnapshot;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
+    use rustfs_tls_runtime::TlsRuntimeStatusSnapshot;
     use s3s::{Body, S3ErrorCode, S3Request};
 
     fn build_tls_status_request() -> S3Request<Body> {
@@ -150,15 +117,13 @@ mod tests {
             true,
             false,
         );
-        let payload = TlsDebugStatusResponse {
-            foundation: status,
-            consumers: vec![TlsConsumerStatusItem {
-                consumer: "protos_grpc_channel",
+        let payload = rustfs_tls_runtime::TlsDebugStatusResponse::builder(status)
+            .push_consumer(rustfs_protos::ProtosTlsStatusView {
                 generation: 7,
                 has_root_ca: true,
                 has_mtls_identity: false,
-            }],
-        };
+            })
+            .build();
 
         let json = serde_json::to_value(payload).expect("json should serialize");
         assert!(json.get("foundation").is_some());

@@ -129,9 +129,11 @@ fn load_server_material(source: &TlsSource, base_dir: &Path) -> Result<Option<Se
         }
         Ok(_) => Ok(None),
         Err(_err) if has_root_pair => {
-            let certs = load_certs(root_cert.to_str().unwrap_or_default())
+            let root_cert_path = path_to_utf8_str(&root_cert, "root TLS certificate")?;
+            let root_key_path = path_to_utf8_str(&root_key, "root TLS private key")?;
+            let certs = load_certs(root_cert_path)
                 .map_err(|e| TlsRuntimeError::Material(format!("load root TLS certificate {}: {e}", root_cert.display())))?;
-            let key = load_private_key(root_key.to_str().unwrap_or_default())
+            let key = load_private_key(root_key_path)
                 .map_err(|e| TlsRuntimeError::Material(format!("load root TLS private key {}: {e}", root_key.display())))?;
             Ok(Some(ServerTlsMaterial::SingleCert { certs, key }))
         }
@@ -147,6 +149,11 @@ fn load_server_material(source: &TlsSource, base_dir: &Path) -> Result<Option<Se
             )))
         }
     }
+}
+
+fn path_to_utf8_str<'a>(path: &'a Path, description: &str) -> Result<&'a str, TlsRuntimeError> {
+    path.to_str()
+        .ok_or_else(|| TlsRuntimeError::Material(format!("{description} path '{}' is not valid UTF-8", path.display())))
 }
 
 fn combine_optional_pem(primary: Option<&[u8]>, fallback: Option<&[u8]>) -> Vec<u8> {

@@ -18,11 +18,13 @@ use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
 use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
 use libunftp::options::FtpsRequired;
+use rustfs_config::{DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL};
 use rustfs_tls_runtime::{ReloadableServerCertResolver, TlsReloadOptions, spawn_server_cert_reload_loop};
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -68,6 +70,14 @@ impl<S> FtpsServer<S>
 where
     S: StorageBackend + Clone + Send + Sync + 'static + Debug,
 {
+    fn tls_reload_options() -> TlsReloadOptions {
+        let mut options = TlsReloadOptions::default();
+        options.enabled = rustfs_utils::get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE);
+        options.interval =
+            Duration::from_secs(rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5));
+        options
+    }
+
     /// Create a new FTPS server
     pub async fn new(config: FtpsConfig, storage: S) -> Result<Self, FtpsInitError> {
         config.validate().await?;
@@ -119,7 +129,7 @@ where
                 let _reload_task = spawn_server_cert_reload_loop(
                     "ftps",
                     resolver.clone(),
-                    TlsReloadOptions::default(),
+                    Self::tls_reload_options(),
                     reload_shutdown_rx.clone(),
                 );
 

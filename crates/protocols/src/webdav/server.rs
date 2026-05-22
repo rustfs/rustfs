@@ -24,11 +24,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rustfs_config::{DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL};
 use rustfs_tls_runtime::{ReloadableServerCertResolver, TlsReloadOptions, spawn_server_cert_reload_loop};
 use rustls::ServerConfig;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio_rustls::TlsAcceptor;
@@ -49,6 +51,14 @@ impl<S> WebDavServer<S>
 where
     S: StorageBackend + Clone + Send + Sync + 'static + std::fmt::Debug,
 {
+    fn tls_reload_options() -> TlsReloadOptions {
+        let mut options = TlsReloadOptions::default();
+        options.enabled = rustfs_utils::get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE);
+        options.interval =
+            Duration::from_secs(rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5));
+        options
+    }
+
     /// Create a new WebDAV server
     pub async fn new(config: WebDavConfig, storage: S) -> Result<Self, WebDavInitError> {
         config.validate().await?;
@@ -73,7 +83,7 @@ where
                 let _reload_task = spawn_server_cert_reload_loop(
                     "webdav",
                     resolver.clone(),
-                    TlsReloadOptions::default(),
+                    Self::tls_reload_options(),
                     reload_shutdown_rx.clone(),
                 );
 

@@ -53,6 +53,10 @@ pub async fn load_global_outbound_tls_state() -> GlobalPublishedOutboundTlsState
     }
 }
 
+pub fn load_global_outbound_tls_generation() -> TlsGeneration {
+    TlsGeneration(get_global_outbound_tls_generation())
+}
+
 pub async fn summarize_global_outbound_tls_state() -> GlobalOutboundTlsStateSummary {
     let state = load_global_outbound_tls_state().await;
     GlobalOutboundTlsStateSummary {

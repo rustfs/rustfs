@@ -23,8 +23,8 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 use rustfs_tls_runtime::{
-    GlobalOutboundTlsStateSummary, TlsConsumerStatusSource, load_cert_bundle_der_bytes, load_global_outbound_tls_state,
-    record_tls_consumer_stale_generation,
+    GlobalOutboundTlsStateSummary, TlsConsumerStatusSource, load_cert_bundle_der_bytes, load_global_outbound_tls_generation,
+    load_global_outbound_tls_state, record_tls_consumer_stale_generation,
 };
 use rustfs_utils::get_env_opt_str;
 use rustls_pki_types::pem::PemObject;
@@ -173,9 +173,8 @@ fn should_bypass_proxy_for_url(url: &str) -> bool {
 async fn get_http_client(url: &str) -> Client {
     // Reuse HTTP connection pools while keeping loopback traffic away from
     // system proxies so local RPC/tests do not leak to proxy listeners.
-    let outbound_tls = load_global_outbound_tls_state().await;
     let disable_proxy = should_bypass_proxy_for_url(url);
-    let generation = outbound_tls.generation.0;
+    let generation = load_global_outbound_tls_generation().0;
 
     let mut observed_stale_generation = false;
     if let Some(client) = {
@@ -189,6 +188,25 @@ async fn get_http_client(url: &str) -> Client {
                 })
             } else {
                 observed_stale_generation = true;
+                None
+            }
+        })
+    } {
+        return client;
+    }
+
+    let outbound_tls = load_global_outbound_tls_state().await;
+    let generation = outbound_tls.generation.0;
+    if let Some(client) = {
+        let guard = CLIENT_CACHE.lock().await;
+        guard.as_ref().and_then(|cached| {
+            if cached.generation == generation {
+                Some(if disable_proxy {
+                    cached.local_client.clone()
+                } else {
+                    cached.client.clone()
+                })
+            } else {
                 None
             }
         })

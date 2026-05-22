@@ -51,7 +51,9 @@ use md5::Md5;
 use rand::{Rng, RngExt};
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_rio::HashReader;
-use rustfs_tls_runtime::{GlobalOutboundTlsStateSummary, load_global_outbound_tls_state, record_tls_generation};
+use rustfs_tls_runtime::{
+    GlobalOutboundTlsStateSummary, TlsConsumerStatusSource, load_global_outbound_tls_state, record_tls_generation,
+};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
     net::get_endpoint_url,
@@ -110,6 +112,24 @@ pub fn transition_tls_status_from_summary(summary: GlobalOutboundTlsStateSummary
         generation: summary.generation.0,
         has_root_ca: summary.has_root_ca,
         has_mtls_identity: summary.has_mtls_identity,
+    }
+}
+
+impl TlsConsumerStatusSource for TransitionTlsStatusView {
+    fn consumer_name(&self) -> &'static str {
+        "ecstore_transition_client"
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn has_root_ca(&self) -> bool {
+        self.has_root_ca
+    }
+
+    fn has_mtls_identity(&self) -> bool {
+        self.has_mtls_identity
     }
 }
 

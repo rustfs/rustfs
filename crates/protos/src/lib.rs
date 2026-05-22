@@ -21,8 +21,7 @@ use proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_common::{GLOBAL_CONN_MAP, evict_connection};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_tls_runtime::{
-    GlobalOutboundTlsStateSummary, TlsConsumerStatusSource, load_global_outbound_tls_state,
-    record_tls_consumer_stale_generation,
+    GlobalOutboundTlsStateSummary, TlsConsumerStatusSource, load_global_outbound_tls_state, record_tls_consumer_stale_generation,
 };
 use std::{
     collections::HashMap,
