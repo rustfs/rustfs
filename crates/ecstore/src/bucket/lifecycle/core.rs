@@ -329,7 +329,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     }
                 }
                 // Object Lock + DelMarkerExpiration conflict
-                if r.del_marker_expiration.as_ref().and_then(|d| d.days).is_some_and(|d| d > 0) {
+                if r.del_marker_expiration.is_some() {
                     return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
                 }
             }
@@ -2170,6 +2170,37 @@ mod tests {
                 }),
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: Some(s3s::dto::DelMarkerExpiration { days: Some(1) }),
+                filter: None,
+                id: Some("test-rule".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let locked_config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            ..Default::default()
+        };
+
+        let err = lc.validate(&locked_config).await.unwrap_err();
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_BUCKET_LOCKED);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_zero_day_del_marker_expiration_on_locked_bucket() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: Some(s3s::dto::DelMarkerExpiration { days: Some(0) }),
                 filter: None,
                 id: Some("test-rule".to_string()),
                 noncurrent_version_expiration: None,

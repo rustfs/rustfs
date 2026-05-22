@@ -1148,3 +1148,39 @@ async fn put_bucket_lifecycle_configuration_rejects_del_marker_expiration_on_obj
         "unexpected error message: {message}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn put_bucket_lifecycle_configuration_rejects_zero_day_del_marker_expiration_on_object_lock_bucket() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultBucketUsecase::without_context();
+
+    let bucket = format!("test-lock-del-marker-exp0-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_object_lock_enabled(bucket.as_str())
+        .await
+        .expect("Failed to enable object lock for bucket");
+
+    let req = build_request(
+        PutBucketLifecycleConfigurationInput::builder()
+            .bucket(bucket.clone())
+            .lifecycle_configuration(Some(del_marker_expiration_lifecycle_configuration(0)))
+            .build()
+            .unwrap(),
+        Method::PUT,
+    );
+
+    let err = usecase
+        .execute_put_bucket_lifecycle_configuration(req)
+        .await
+        .expect_err("DelMarkerExpiration with zero days must be rejected on object-lock bucket");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+    let message = err.message().unwrap_or_default();
+    assert!(
+        message.contains(
+            "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket"
+        ),
+        "unexpected error message: {message}"
+    );
+}
