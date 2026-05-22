@@ -41,23 +41,35 @@ fn unsupported_transport_message(transport: &str) -> String {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct InternodeDataTransportCapabilities {
-    pub stream_read: bool,
-    pub stream_write: bool,
-    pub walk_dir: bool,
-    pub registered_memory: bool,
-    pub scatter_gather: bool,
-    pub zero_copy_receive: bool,
+    /// Backend can open a streaming remote disk reader.
+    pub streaming_read: bool,
+    /// Backend can open a streaming remote disk writer.
+    pub streaming_write: bool,
+    /// Backend can stream walk-dir responses.
+    pub streaming_walk_dir: bool,
+    /// Backend has an API shape that could avoid an extra user-space copy.
+    pub zero_copy_candidate: bool,
+    /// Backend cannot transfer payloads unless buffers are registered or pinned.
+    pub registered_memory_required: bool,
+    /// Backend preserves in-order delivery for each opened transfer.
+    pub ordered_delivery: bool,
+    /// Largest payload the backend accepts for one transfer, or no RustFS-level cap.
+    pub max_transfer_size: Option<usize>,
+    /// Backend can participate in the behavior-preserving TCP fallback path.
+    pub fallback_supported: bool,
 }
 
 impl InternodeDataTransportCapabilities {
     pub const fn tcp_http() -> Self {
         Self {
-            stream_read: true,
-            stream_write: true,
-            walk_dir: true,
-            registered_memory: false,
-            scatter_gather: false,
-            zero_copy_receive: false,
+            streaming_read: true,
+            streaming_write: true,
+            streaming_walk_dir: true,
+            zero_copy_candidate: false,
+            registered_memory_required: false,
+            ordered_delivery: true,
+            max_transfer_size: None,
+            fallback_supported: true,
         }
     }
 }
@@ -90,6 +102,11 @@ pub struct WalkDirStreamRequest {
     pub stall_timeout: Option<Duration>,
 }
 
+/// Data-plane stream opener used by `RemoteDisk`.
+///
+/// This boundary is limited to remote disk streams that can move large payloads.
+/// Internode metadata, lock, health, and administrative calls remain on the
+/// existing gRPC control plane.
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;
@@ -218,14 +235,27 @@ mod tests {
         assert_eq!(
             transport.capabilities(),
             InternodeDataTransportCapabilities {
-                stream_read: true,
-                stream_write: true,
-                walk_dir: true,
-                registered_memory: false,
-                scatter_gather: false,
-                zero_copy_receive: false,
+                streaming_read: true,
+                streaming_write: true,
+                streaming_walk_dir: true,
+                zero_copy_candidate: false,
+                registered_memory_required: false,
+                ordered_delivery: true,
+                max_transfer_size: None,
+                fallback_supported: true,
             }
         );
+    }
+
+    #[test]
+    fn tcp_http_capabilities_do_not_advertise_rdma_specific_features() {
+        let capabilities = TcpHttpInternodeDataTransport.capabilities();
+
+        assert!(!capabilities.zero_copy_candidate);
+        assert!(!capabilities.registered_memory_required);
+        assert!(capabilities.ordered_delivery);
+        assert_eq!(capabilities.max_transfer_size, None);
+        assert!(capabilities.fallback_supported);
     }
 
     #[test]

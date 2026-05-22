@@ -25,7 +25,7 @@ use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::find_local_disk_by_ref;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
-    global_internode_metrics,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 use rustfs_utils::net::bytes_stream;
 use s3s::Body;
@@ -143,7 +143,9 @@ fn internode_http_operation(path: &str) -> Option<&'static str> {
 
 fn record_internode_rpc_error(operation: Option<&'static str>) {
     match operation {
-        Some(operation) => global_internode_metrics().record_error_for_operation(operation),
+        Some(operation) => {
+            global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
+        }
         None => global_internode_metrics().record_error(),
     }
 }
@@ -183,7 +185,10 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("read file err {e}")),
     };
 
-    global_internode_metrics().record_incoming_request_for_operation(INTERNODE_OPERATION_READ_FILE_STREAM);
+    global_internode_metrics().record_incoming_request_for_operation_and_backend(
+        INTERNODE_OPERATION_READ_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+    );
     let stream = read_file_body_stream(file, query.length, INTERNODE_OPERATION_READ_FILE_STREAM);
 
     Response::builder()
@@ -202,7 +207,7 @@ where
 {
     let metrics = global_internode_metrics().clone();
     let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
-        metrics.record_sent_bytes_for_operation(operation, bytes.len());
+        metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
         bytes
     });
 
@@ -244,10 +249,15 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         }
     });
 
-    global_internode_metrics().record_incoming_request_for_operation(INTERNODE_OPERATION_WALK_DIR);
+    global_internode_metrics()
+        .record_incoming_request_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
     let metrics = global_internode_metrics().clone();
     let stream = ReaderStream::with_capacity(rd, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
-        metrics.record_sent_bytes_for_operation(INTERNODE_OPERATION_WALK_DIR, bytes.len());
+        metrics.record_sent_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_WALK_DIR,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            bytes.len(),
+        );
         bytes
     });
 
@@ -284,8 +294,15 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}")),
     };
 
-    global_internode_metrics().record_incoming_request_for_operation(INTERNODE_OPERATION_PUT_FILE_STREAM);
-    global_internode_metrics().record_recv_bytes_for_operation(INTERNODE_OPERATION_PUT_FILE_STREAM, copied as usize);
+    global_internode_metrics().record_incoming_request_for_operation_and_backend(
+        INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+    );
+    global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+        INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        copied as usize,
+    );
 
     if let Err(e) = file.flush().await {
         return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}"));

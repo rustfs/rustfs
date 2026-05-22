@@ -130,6 +130,7 @@ pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
@@ -268,6 +269,10 @@ fn record_lock_release(bucket: &str, object: &str, lock_id: &str, lock_type: &st
         lock_type = %lock_type,
         "Lock released for deadlock tracking"
     );
+}
+
+fn issue3031_diag_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_ISSUE3031_DIAG_ENABLE, false)
 }
 
 fn build_tiered_decommission_file_info(
@@ -3262,6 +3267,7 @@ impl MultipartOperations for SetDisks {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
+        let read_quorum = fi.read_quorum(self.default_read_quorum());
 
         let disks = self.disks.read().await;
 
@@ -3278,7 +3284,7 @@ impl MultipartOperations for SetDisks {
         let part_numbers = uploaded_parts.iter().map(|v| v.part_num).collect::<Vec<usize>>();
 
         let object_parts =
-            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, write_quorum).await?;
+            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum).await?;
 
         if object_parts.len() != uploaded_parts.len() {
             return Err(Error::other("part result number err"));
@@ -3302,6 +3308,21 @@ impl MultipartOperations for SetDisks {
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
                 error!("complete_multipart_upload part error: {:?}", &err);
+                if issue3031_diag_enabled() {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        op = "complete_multipart_upload",
+                        bucket = %bucket,
+                        object = %object,
+                        upload_id = %upload_id,
+                        uploaded_part_num = uploaded_parts[i].part_num,
+                        observed_part_num = part.number,
+                        read_quorum = read_quorum,
+                        write_quorum = write_quorum,
+                        error = %err,
+                        "issue3031_complete_part_error"
+                    );
+                }
             }
 
             if uploaded_parts[i].part_num != part.number {
@@ -4108,18 +4129,24 @@ async fn disks_with_all_parts(
         }
     }
 
-    // Build dataErrsByDisk from dataErrsByPart
-    for (part, disks) in data_errs_by_part.iter() {
-        for disk_idx in disks.iter() {
-            if let Some(parts) = data_errs_by_disk.get_mut(disk_idx)
-                && *part < parts.len()
+    populate_data_errs_by_disk(&mut data_errs_by_disk, &data_errs_by_part);
+
+    Ok((data_errs_by_disk, data_errs_by_part))
+}
+
+fn populate_data_errs_by_disk(
+    data_errs_by_disk: &mut HashMap<usize, Vec<usize>>,
+    data_errs_by_part: &HashMap<usize, Vec<usize>>,
+) {
+    for (part_index, part_errs) in data_errs_by_part {
+        for (disk_index, part_err) in part_errs.iter().enumerate() {
+            if let Some(disk_errs) = data_errs_by_disk.get_mut(&disk_index)
+                && *part_index < disk_errs.len()
             {
-                parts[*part] = disks[*disk_idx];
+                disk_errs[*part_index] = *part_err;
             }
         }
     }
-
-    Ok((data_errs_by_disk, data_errs_by_part))
 }
 
 pub fn should_heal_object_on_disk(
@@ -5384,6 +5411,25 @@ mod tests {
         // Test with part corruption
         let (should_heal, _, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
         assert!(should_heal);
+    }
+
+    #[test]
+    fn test_populate_data_errs_by_disk_uses_disk_index_not_error_code() {
+        let mut data_errs_by_disk = HashMap::from([
+            (0, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (1, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (2, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+        ]);
+        let data_errs_by_part = HashMap::from([
+            (0, vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]),
+            (1, vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS]),
+        ]);
+
+        populate_data_errs_by_disk(&mut data_errs_by_disk, &data_errs_by_part);
+
+        assert_eq!(data_errs_by_disk.get(&0).unwrap(), &vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS]);
+        assert_eq!(data_errs_by_disk.get(&1).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_CORRUPT]);
+        assert_eq!(data_errs_by_disk.get(&2).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
     }
 
     #[tokio::test]

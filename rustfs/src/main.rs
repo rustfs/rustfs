@@ -572,10 +572,6 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         init_heal_manager(heal_storage, None).await?;
     }
 
-    if enable_scanner {
-        init_data_scanner(ctx.clone(), store.clone()).await;
-    }
-
     if !enable_heal && !enable_scanner {
         info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
@@ -609,6 +605,10 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     rustfs_common::set_global_init_time_now().await;
     // Publish ready only after all critical bootstrap metadata is in place
     state_manager.update(ServiceState::Ready);
+
+    if enable_scanner {
+        init_data_scanner(ctx.clone(), store.clone()).await;
+    }
 
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;

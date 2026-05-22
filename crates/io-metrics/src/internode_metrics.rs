@@ -24,13 +24,48 @@ pub const INTERNODE_OPERATION_PUT_FILE_STREAM: &str = "put_file_stream";
 pub const INTERNODE_OPERATION_WALK_DIR: &str = "walk_dir";
 pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
 pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
+pub const INTERNODE_TRANSPORT_BACKEND_TCP_HTTP: &str = "tcp-http";
+pub const INTERNODE_TRANSPORT_BACKEND_GRPC: &str = "grpc";
+pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
 
 const OPERATION_LABEL: &str = "operation";
+const BACKEND_LABEL: &str = "backend";
 const INTERNODE_OPERATION_SENT_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_sent_bytes_total";
 const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_recv_bytes_total";
 const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
 const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_incoming_total";
 const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InternodeOperationMetricDescriptor {
+    pub name: &'static str,
+    pub labels: &'static [&'static str],
+}
+
+const OPERATION_BACKEND_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL];
+
+pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &[
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_SENT_BYTES_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_RECV_BYTES_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_ERRORS_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InternodeMetricsSnapshot {
@@ -68,13 +103,17 @@ impl InternodeMetrics {
     }
 
     pub fn record_sent_bytes_for_operation(&self, operation: &'static str, bytes: usize) {
+        self.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_UNKNOWN, bytes);
+    }
+
+    pub fn record_sent_bytes_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, bytes: usize) {
         self.record_sent_bytes(bytes);
 
         let bytes = bytes as u64;
         if bytes == 0 {
             return;
         }
-        counter!(INTERNODE_OPERATION_SENT_BYTES_TOTAL, OPERATION_LABEL => operation).increment(bytes);
+        counter!(INTERNODE_OPERATION_SENT_BYTES_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(bytes);
     }
 
     pub fn record_recv_bytes(&self, bytes: usize) {
@@ -87,13 +126,17 @@ impl InternodeMetrics {
     }
 
     pub fn record_recv_bytes_for_operation(&self, operation: &'static str, bytes: usize) {
+        self.record_recv_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_UNKNOWN, bytes);
+    }
+
+    pub fn record_recv_bytes_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, bytes: usize) {
         self.record_recv_bytes(bytes);
 
         let bytes = bytes as u64;
         if bytes == 0 {
             return;
         }
-        counter!(INTERNODE_OPERATION_RECV_BYTES_TOTAL, OPERATION_LABEL => operation).increment(bytes);
+        counter!(INTERNODE_OPERATION_RECV_BYTES_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(bytes);
     }
 
     pub fn record_outgoing_request(&self) {
@@ -102,8 +145,13 @@ impl InternodeMetrics {
     }
 
     pub fn record_outgoing_request_for_operation(&self, operation: &'static str) {
+        self.record_outgoing_request_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_UNKNOWN);
+    }
+
+    pub fn record_outgoing_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_outgoing_request();
-        counter!(INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL, OPERATION_LABEL => operation).increment(1);
+        counter!(INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
+            .increment(1);
     }
 
     pub fn record_incoming_request(&self) {
@@ -112,8 +160,13 @@ impl InternodeMetrics {
     }
 
     pub fn record_incoming_request_for_operation(&self, operation: &'static str) {
+        self.record_incoming_request_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_UNKNOWN);
+    }
+
+    pub fn record_incoming_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_incoming_request();
-        counter!(INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL, OPERATION_LABEL => operation).increment(1);
+        counter!(INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
+            .increment(1);
     }
 
     pub fn record_error(&self) {
@@ -122,8 +175,12 @@ impl InternodeMetrics {
     }
 
     pub fn record_error_for_operation(&self, operation: &'static str) {
+        self.record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_UNKNOWN);
+    }
+
+    pub fn record_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_error();
-        counter!(INTERNODE_OPERATION_ERRORS_TOTAL, OPERATION_LABEL => operation).increment(1);
+        counter!(INTERNODE_OPERATION_ERRORS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
     }
 
     pub fn record_dial_result(&self, duration: Duration, success: bool) {
@@ -216,11 +273,25 @@ mod tests {
     fn operation_metrics_also_update_aggregate_snapshot() {
         let metrics = InternodeMetrics::default();
 
-        metrics.record_sent_bytes_for_operation(INTERNODE_OPERATION_READ_FILE_STREAM, 128);
-        metrics.record_recv_bytes_for_operation(INTERNODE_OPERATION_PUT_FILE_STREAM, 256);
-        metrics.record_outgoing_request_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
-        metrics.record_incoming_request_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
-        metrics.record_error_for_operation(INTERNODE_OPERATION_WALK_DIR);
+        metrics.record_sent_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_READ_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            128,
+        );
+        metrics.record_recv_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_PUT_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            256,
+        );
+        metrics.record_outgoing_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
+        metrics.record_incoming_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_READ_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
+        metrics.record_error_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.sent_bytes_total, 128);
@@ -228,5 +299,13 @@ mod tests {
         assert_eq!(snapshot.outgoing_requests_total, 1);
         assert_eq!(snapshot.incoming_requests_total, 1);
         assert_eq!(snapshot.errors_total, 1);
+    }
+
+    #[test]
+    fn operation_metric_descriptors_include_backend_and_operation_labels() {
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 5);
+        for metric in INTERNODE_OPERATION_METRICS {
+            assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
+        }
     }
 }

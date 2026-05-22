@@ -260,9 +260,17 @@ pub enum HealChannelCommand {
         response_tx: oneshot::Sender<Result<HealAdmissionResult, String>>,
     },
     /// Query heal task status
-    Query { heal_path: String, client_token: String },
+    Query {
+        heal_path: String,
+        client_token: String,
+        response_tx: oneshot::Sender<Result<HealChannelResponse, String>>,
+    },
     /// Cancel heal task
-    Cancel { heal_path: String },
+    Cancel {
+        heal_path: String,
+        client_token: String,
+        response_tx: oneshot::Sender<Result<HealChannelResponse, String>>,
+    },
 }
 
 /// Heal request from admin to ahm
@@ -407,14 +415,36 @@ pub async fn send_heal_request(request: HealChannelRequest) -> Result<(), String
     }
 }
 
+async fn receive_heal_channel_response(
+    response_rx: oneshot::Receiver<Result<HealChannelResponse, String>>,
+) -> Result<HealChannelResponse, String> {
+    response_rx
+        .await
+        .map_err(|e| format!("Failed to receive heal channel response: {e}"))?
+}
+
 /// Send heal query request
-pub async fn query_heal_status(heal_path: String, client_token: String) -> Result<(), String> {
-    send_heal_command(HealChannelCommand::Query { heal_path, client_token }).await
+pub async fn query_heal_status(heal_path: String, client_token: String) -> Result<HealChannelResponse, String> {
+    let (response_tx, response_rx) = oneshot::channel();
+    send_heal_command(HealChannelCommand::Query {
+        heal_path,
+        client_token,
+        response_tx,
+    })
+    .await?;
+    receive_heal_channel_response(response_rx).await
 }
 
 /// Send heal cancel request
-pub async fn cancel_heal_task(heal_path: String) -> Result<(), String> {
-    send_heal_command(HealChannelCommand::Cancel { heal_path }).await
+pub async fn cancel_heal_task(heal_path: String, client_token: String) -> Result<HealChannelResponse, String> {
+    let (response_tx, response_rx) = oneshot::channel();
+    send_heal_command(HealChannelCommand::Cancel {
+        heal_path,
+        client_token,
+        response_tx,
+    })
+    .await?;
+    receive_heal_channel_response(response_rx).await
 }
 
 /// Create a new heal request
