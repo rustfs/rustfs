@@ -66,8 +66,8 @@ pub fn hex(data: impl AsRef<[u8]>) -> String {
 /// * `s` - A string slice to be verified
 ///
 /// # Returns
-/// A `bool` indicating whether the input string is a valid SHA-256 checksum (64
-///
+/// A `bool` indicating whether the input string is exactly 64 lowercase hexadecimal characters.
+/// Uppercase hexadecimal characters are not accepted.
 pub fn is_sha256_checksum(s: &str) -> bool {
     let is_lowercase_hex = |c: u8| matches!(c, b'0'..=b'9' | b'a'..=b'f');
     s.len() == 64 && s.as_bytes().iter().copied().all(is_lowercase_hex)
