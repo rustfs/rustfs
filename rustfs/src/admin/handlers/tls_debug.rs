@@ -22,7 +22,9 @@ use matchit::Params;
 use rustfs_ecstore::client::transition_api::transition_tls_status_view;
 use rustfs_protos::protos_tls_status_view;
 use rustfs_rio::rio_tls_status_view;
-use rustfs_tls_runtime::{TlsDebugStatusResponse, TlsRuntimeStatusSnapshot, load_global_outbound_tls_state};
+use rustfs_tls_runtime::{
+    TlsConsumerStatusSource, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot, load_global_outbound_tls_state,
+};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result};
 
@@ -59,9 +61,7 @@ impl Operation for TlsStatusHandler {
         let rio = rio_tls_status_view().await;
         let ecstore = transition_tls_status_view().await;
         let payload = TlsDebugStatusResponse::builder(status)
-            .push_consumer(protos)
-            .push_consumer(rio)
-            .push_consumer(ecstore)
+            .push_consumers([protos.into_status_item(), rio.into_status_item(), ecstore.into_status_item()])
             .build();
 
         let mut headers = HeaderMap::new();
@@ -80,7 +80,7 @@ mod tests {
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
-    use rustfs_tls_runtime::TlsRuntimeStatusSnapshot;
+    use rustfs_tls_runtime::{TlsConsumerStatusSource, TlsRuntimeStatusSnapshot};
     use s3s::{Body, S3ErrorCode, S3Request};
 
     fn build_tls_status_request() -> S3Request<Body> {
@@ -118,11 +118,12 @@ mod tests {
             false,
         );
         let payload = rustfs_tls_runtime::TlsDebugStatusResponse::builder(status)
-            .push_consumer(rustfs_protos::ProtosTlsStatusView {
+            .push_consumers([rustfs_protos::ProtosTlsStatusView {
                 generation: 7,
                 has_root_ca: true,
                 has_mtls_identity: false,
-            })
+            }
+            .into_status_item()])
             .build();
 
         let json = serde_json::to_value(payload).expect("json should serialize");

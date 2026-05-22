@@ -72,6 +72,14 @@ impl TlsDebugStatusResponseBuilder {
         self
     }
 
+    pub fn push_consumers<I>(mut self, sources: I) -> Self
+    where
+        I: IntoIterator<Item = TlsConsumerStatusItem>,
+    {
+        self.consumers.extend(sources);
+        self
+    }
+
     pub fn build(self) -> TlsDebugStatusResponse {
         TlsDebugStatusResponse {
             foundation: self.foundation,
@@ -130,7 +138,7 @@ mod tests {
         };
 
         let response = TlsDebugStatusResponse::builder(foundation)
-            .push_consumer(TestConsumer)
+            .push_consumers([TestConsumer.into_status_item()])
             .build();
 
         let json = serde_json::to_value(response).expect("response should serialize");
