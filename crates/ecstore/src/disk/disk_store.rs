@@ -27,6 +27,8 @@ use crate::global::GLOBAL_LOCAL_DISK_ID_MAP;
 use bytes::Bytes;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+#[cfg(not(test))]
+use std::sync::OnceLock;
 use std::{
     path::PathBuf,
     sync::{
@@ -50,9 +52,53 @@ enum TimeoutHealthAction {
     IgnoreFailure,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeoutHealthPolicy {
+    MarkFailure,
+    IgnoreScanner,
+}
+
+impl TimeoutHealthPolicy {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            rustfs_config::DRIVE_TIMEOUT_HEALTH_ACTION_MARK_FAILURE => Some(Self::MarkFailure),
+            rustfs_config::DRIVE_TIMEOUT_HEALTH_ACTION_IGNORE_SCANNER => Some(Self::IgnoreScanner),
+            _ => None,
+        }
+    }
+
+    fn scanner_timeout_health_action(self) -> TimeoutHealthAction {
+        match self {
+            Self::MarkFailure => TimeoutHealthAction::MarkFailure,
+            Self::IgnoreScanner => TimeoutHealthAction::IgnoreFailure,
+        }
+    }
+}
+
 pub const ENV_RUSTFS_DRIVE_ACTIVE_MONITORING: &str = "RUSTFS_DRIVE_ACTIVE_MONITORING";
 pub const DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING: bool = true;
 pub const SKIP_IF_SUCCESS_BEFORE: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriveTimeoutProfile {
+    Default,
+    HighLatency,
+}
+
+impl DriveTimeoutProfile {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            rustfs_config::DRIVE_TIMEOUT_PROFILE_DEFAULT => Some(Self::Default),
+            rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY => Some(Self::HighLatency),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(test))]
+static DRIVE_TIMEOUT_PROFILE_CACHE: OnceLock<DriveTimeoutProfile> = OnceLock::new();
+#[cfg(not(test))]
+static DRIVE_TIMEOUT_HEALTH_POLICY_CACHE: OnceLock<TimeoutHealthPolicy> = OnceLock::new();
 
 lazy_static::lazy_static! {
     static ref TEST_DATA: Bytes = Bytes::from(vec![42u8; 2048]);
@@ -66,10 +112,39 @@ pub fn get_max_timeout_duration() -> Duration {
     ))
 }
 
-fn get_drive_timeout_duration(env_key: &str, default_secs: u64) -> Duration {
+fn resolve_drive_timeout_profile_from_env() -> DriveTimeoutProfile {
+    let raw = rustfs_utils::get_env_str(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE);
+    if let Some(profile) = DriveTimeoutProfile::parse(&raw) {
+        return profile;
+    }
+    warn!(
+        env = rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE,
+        value = %raw,
+        default = rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE,
+        "Invalid drive timeout profile; falling back to default"
+    );
+    DriveTimeoutProfile::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE).unwrap_or(DriveTimeoutProfile::Default)
+}
+
+fn get_drive_timeout_profile() -> DriveTimeoutProfile {
+    #[cfg(test)]
+    {
+        resolve_drive_timeout_profile_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        *DRIVE_TIMEOUT_PROFILE_CACHE.get_or_init(resolve_drive_timeout_profile_from_env)
+    }
+}
+
+fn get_drive_timeout_duration(env_key: &str, default_secs: u64, high_latency_secs: Option<u64>) -> Duration {
+    let fallback_default = match (get_drive_timeout_profile(), high_latency_secs) {
+        (DriveTimeoutProfile::HighLatency, Some(secs)) => secs,
+        _ => default_secs,
+    };
     Duration::from_secs(
         rustfs_utils::get_env_opt_u64_with_aliases(env_key, &[rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION])
-            .unwrap_or(default_secs),
+            .unwrap_or(fallback_default),
     )
 }
 
@@ -77,6 +152,7 @@ pub fn get_drive_metadata_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS,
         rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS,
+        Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS),
     )
 }
 
@@ -84,6 +160,7 @@ pub fn get_drive_disk_info_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_DRIVE_DISK_INFO_TIMEOUT_SECS,
         rustfs_config::DEFAULT_DRIVE_DISK_INFO_TIMEOUT_SECS,
+        Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS),
     )
 }
 
@@ -91,6 +168,7 @@ pub fn get_drive_list_dir_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_DRIVE_LIST_DIR_TIMEOUT_SECS,
         rustfs_config::DEFAULT_DRIVE_LIST_DIR_TIMEOUT_SECS,
+        Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS),
     )
 }
 
@@ -98,6 +176,7 @@ pub fn get_drive_walkdir_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS,
         rustfs_config::DEFAULT_DRIVE_WALKDIR_TIMEOUT_SECS,
+        Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS),
     )
 }
 
@@ -105,6 +184,7 @@ pub fn get_drive_walkdir_stall_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS,
         rustfs_config::DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS,
+        Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS),
     )
 }
 
@@ -120,6 +200,34 @@ pub fn get_drive_active_check_timeout() -> Duration {
         rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS,
         rustfs_config::DEFAULT_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS,
     ))
+}
+
+fn resolve_drive_timeout_health_policy_from_env() -> TimeoutHealthPolicy {
+    let raw = rustfs_utils::get_env_str(
+        rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION,
+        rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION,
+    );
+    if let Some(policy) = TimeoutHealthPolicy::parse(&raw) {
+        return policy;
+    }
+    warn!(
+        env = rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION,
+        value = %raw,
+        default = rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION,
+        "Invalid drive timeout health action policy; falling back to default"
+    );
+    TimeoutHealthPolicy::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION).unwrap_or(TimeoutHealthPolicy::MarkFailure)
+}
+
+fn get_drive_timeout_health_policy() -> TimeoutHealthPolicy {
+    #[cfg(test)]
+    {
+        resolve_drive_timeout_health_policy_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        *DRIVE_TIMEOUT_HEALTH_POLICY_CACHE.get_or_init(resolve_drive_timeout_health_policy_from_env)
+    }
 }
 
 /// DiskHealthTracker tracks the health status of a disk.
@@ -470,6 +578,8 @@ pub struct LocalDiskWrapper {
     cancel_token: CancellationToken,
     /// Disk ID for stale checking
     disk_id: Arc<RwLock<Option<Uuid>>>,
+    /// Timeout policy for scanner-sensitive operations, loaded once on wrapper initialization.
+    timeout_health_policy: TimeoutHealthPolicy,
 }
 
 impl LocalDiskWrapper {
@@ -486,6 +596,7 @@ impl LocalDiskWrapper {
             health_check: health_check && env_health_check,
             cancel_token: CancellationToken::new(),
             disk_id: Arc::new(RwLock::new(None)),
+            timeout_health_policy: get_drive_timeout_health_policy(),
         };
         record_drive_runtime_state(&wrapper.disk.endpoint(), RuntimeDriveHealthState::Online);
         wrapper
@@ -509,6 +620,10 @@ impl LocalDiskWrapper {
 
     pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
         self.health.record_capacity_probe(total, used, free);
+    }
+
+    fn scanner_timeout_health_action(&self) -> TimeoutHealthAction {
+        self.timeout_health_policy.scanner_timeout_health_action()
     }
 
     #[cfg(test)]
@@ -558,6 +673,7 @@ impl LocalDiskWrapper {
     /// Monitor disk writability periodically
     async fn monitor_disk_writable(disk: Arc<LocalDisk>, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
         let mut interval = time::interval(get_drive_active_check_interval());
+        let active_check_timeout = get_drive_active_check_timeout();
 
         loop {
             tokio::select! {
@@ -596,7 +712,7 @@ impl LocalDiskWrapper {
                         &test_obj,
                         &TEST_DATA,
                         true,
-                        get_drive_active_check_timeout(),
+                        active_check_timeout,
                     )
                     .await
                     .is_err()
@@ -691,6 +807,7 @@ impl LocalDiskWrapper {
     /// Monitor disk status and try to bring it back online
     async fn monitor_disk_status(disk: Arc<LocalDisk>, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
         let check_every = get_drive_returning_probe_interval();
+        let active_check_timeout = get_drive_active_check_timeout();
 
         let mut interval = time::interval(check_every);
 
@@ -711,7 +828,7 @@ impl LocalDiskWrapper {
                         &test_obj,
                         &TEST_DATA,
                         false,
-                        get_drive_active_check_timeout(),
+                        active_check_timeout,
                     )
                     .await
                     {
@@ -893,10 +1010,11 @@ impl LocalDiskWrapper {
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
-        self.track_disk_health_with_op(
+        self.track_disk_health_with_op_and_timeout_action(
             "read_metadata",
             || async { self.disk.read_metadata(volume, path).await },
             get_drive_metadata_timeout(),
+            self.scanner_timeout_health_action(),
         )
         .await
     }
@@ -973,7 +1091,7 @@ impl DiskAPI for LocalDiskWrapper {
             return Err(DiskError::FaultyDisk);
         }
 
-        self.track_disk_health_with_op(
+        self.track_disk_health_with_op_and_timeout_action(
             "disk_info",
             || async {
                 let result = self.disk.disk_info(opts).await?;
@@ -987,6 +1105,7 @@ impl DiskAPI for LocalDiskWrapper {
                 Ok(result)
             },
             get_drive_disk_info_timeout(),
+            self.scanner_timeout_health_action(),
         )
         .await
     }
@@ -1021,7 +1140,7 @@ impl DiskAPI for LocalDiskWrapper {
             "walk_dir",
             || async { self.disk.walk_dir(opts, wr).await },
             get_drive_walkdir_timeout(),
-            TimeoutHealthAction::IgnoreFailure,
+            self.scanner_timeout_health_action(),
         )
         .await
     }
@@ -1130,10 +1249,11 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
-        self.track_disk_health_with_op(
+        self.track_disk_health_with_op_and_timeout_action(
             "list_dir",
             || async { self.disk.list_dir(origvolume, volume, dir_path, count).await },
             get_drive_list_dir_timeout(),
+            self.scanner_timeout_health_action(),
         )
         .await
     }
@@ -1256,10 +1376,44 @@ mod tests {
     fn drive_metadata_timeout_uses_default_when_unset() {
         temp_env::with_var_unset(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, || {
             temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
-                assert_eq!(
-                    get_drive_metadata_timeout(),
-                    Duration::from_secs(rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS)
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, || {
+                    assert_eq!(
+                        get_drive_metadata_timeout(),
+                        Duration::from_secs(rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS)
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn drive_metadata_timeout_uses_high_latency_profile_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var(
+                    rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE,
+                    Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY),
+                    || {
+                        assert_eq!(
+                            get_drive_metadata_timeout(),
+                            Duration::from_secs(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS)
+                        );
+                    },
                 );
+            });
+        });
+    }
+
+    #[test]
+    fn drive_metadata_timeout_invalid_profile_falls_back_to_default() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, Some("invalid"), || {
+                    assert_eq!(
+                        get_drive_metadata_timeout(),
+                        Duration::from_secs(rustfs_config::DEFAULT_DRIVE_METADATA_TIMEOUT_SECS)
+                    );
+                });
             });
         });
     }
@@ -1398,6 +1552,58 @@ mod tests {
 
     #[tokio::test]
     async fn walk_dir_writer_backpressure_timeout_does_not_mark_drive_failure() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1")),
+                (
+                    rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION,
+                    Some(rustfs_config::DRIVE_TIMEOUT_HEALTH_ACTION_IGNORE_SCANNER),
+                ),
+            ],
+            async {
+                let dir = tempfile::tempdir().expect("temp dir should be created");
+                let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8"))
+                    .expect("endpoint should parse");
+                let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+                let wrapper = LocalDiskWrapper::new(disk, false);
+                let bucket = "test-bucket";
+                let object = "test-object";
+
+                wrapper.make_volume(bucket).await.expect("bucket should be created");
+
+                let mut file_info = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+                file_info.volume = bucket.to_string();
+                file_info.name = object.to_string();
+                file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+                file_info.erasure.index = 1;
+
+                wrapper
+                    .write_metadata("", bucket, object, file_info)
+                    .await
+                    .expect("object metadata should be written");
+
+                let mut writer = PendingWriter;
+                let result = wrapper
+                    .walk_dir(
+                        WalkDirOptions {
+                            bucket: bucket.to_string(),
+                            recursive: true,
+                            ..Default::default()
+                        },
+                        &mut writer,
+                    )
+                    .await;
+
+                assert_eq!(result.expect_err("walk_dir should time out"), DiskError::Timeout);
+                assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+                assert!(!wrapper.health.is_faulty());
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn walk_dir_writer_backpressure_timeout_marks_drive_failure_by_default() {
         temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
             let dir = tempfile::tempdir().expect("temp dir should be created");
             let endpoint =
@@ -1433,8 +1639,7 @@ mod tests {
                 .await;
 
             assert_eq!(result.expect_err("walk_dir should time out"), DiskError::Timeout);
-            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
-            assert!(!wrapper.health.is_faulty());
+            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Suspect);
         })
         .await;
     }
@@ -1460,6 +1665,40 @@ mod tests {
 
         assert_eq!(result.expect_err("operation should time out"), DiskError::Timeout);
         assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Suspect);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn drive_timeout_health_policy_defaults_to_mark_failure() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION, || {
+            let policy = get_drive_timeout_health_policy();
+            assert_eq!(policy, TimeoutHealthPolicy::MarkFailure);
+            assert_eq!(policy.scanner_timeout_health_action(), TimeoutHealthAction::MarkFailure);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn drive_timeout_health_policy_respects_ignore_scanner() {
+        temp_env::with_var(
+            rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION,
+            Some(rustfs_config::DRIVE_TIMEOUT_HEALTH_ACTION_IGNORE_SCANNER),
+            || {
+                let policy = get_drive_timeout_health_policy();
+                assert_eq!(policy, TimeoutHealthPolicy::IgnoreScanner);
+                assert_eq!(policy.scanner_timeout_health_action(), TimeoutHealthAction::IgnoreFailure);
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn drive_timeout_health_policy_invalid_value_falls_back_to_default() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION, Some("invalid"), || {
+            let policy = get_drive_timeout_health_policy();
+            assert_eq!(policy, TimeoutHealthPolicy::MarkFailure);
+            assert_eq!(policy.scanner_timeout_health_action(), TimeoutHealthAction::MarkFailure);
+        });
     }
 
     #[test]
