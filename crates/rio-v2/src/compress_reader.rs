@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use minlz::{crc::crc, decode};
+use minlz::{Encoder as MinlzEncoder, crc::crc, decode};
 use pin_project_lite::pin_project;
 use rand::RngExt;
 use rustfs_rio::{EtagResolvable, HashReaderDetector, HashReaderMut, Index, TryGetIndex};
 use rustfs_utils::CompressionAlgorithm;
-use snap::raw::Encoder as SnappyEncoder;
 use std::cmp::min;
+use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -54,6 +54,29 @@ pin_project! {
         read_buffer: Vec<u8>,
         wrote_stream_header: bool,
         padding_multiple: Option<usize>,
+        block_encoder: S2BlockEncoder,
+    }
+}
+
+struct S2BlockEncoder {
+    inner: MinlzEncoder,
+}
+
+impl S2BlockEncoder {
+    fn new() -> Self {
+        Self {
+            inner: MinlzEncoder::new(),
+        }
+    }
+
+    fn encode(&mut self, uncompressed: &[u8]) -> Vec<u8> {
+        self.inner.encode(uncompressed)
+    }
+}
+
+impl fmt::Debug for S2BlockEncoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S2BlockEncoder").finish_non_exhaustive()
     }
 }
 
@@ -79,6 +102,7 @@ where
             read_buffer: vec![0u8; block_size],
             wrote_stream_header: false,
             padding_multiple: None,
+            block_encoder: S2BlockEncoder::new(),
         }
     }
 
@@ -170,7 +194,7 @@ where
             return Poll::Ready(Err(err));
         }
 
-        let block = build_s2_chunk(this.temp_buffer.as_slice())?;
+        let block = build_s2_chunk(this.temp_buffer.as_slice(), this.block_encoder)?;
         *this.uncompressed_written += this.temp_buffer.len();
         *this.written += block.len();
         this.index.total_uncompressed = *this.uncompressed_written as i64;
@@ -405,8 +429,8 @@ where
     }
 }
 
-fn build_s2_chunk(uncompressed: &[u8]) -> io::Result<Vec<u8>> {
-    let compressed = encode_block(uncompressed)?;
+fn build_s2_chunk(uncompressed: &[u8], encoder: &mut S2BlockEncoder) -> io::Result<Vec<u8>> {
+    let compressed = encode_block(uncompressed, encoder);
     let checksum = crc(uncompressed);
     let dst_limit = uncompressed.len().saturating_sub(uncompressed.len() / 32).saturating_sub(5);
     let (chunk_type, payload) = if compressed.len() <= dst_limit {
@@ -430,10 +454,8 @@ fn build_s2_chunk(uncompressed: &[u8]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn encode_block(uncompressed: &[u8]) -> io::Result<Vec<u8>> {
-    SnappyEncoder::new()
-        .compress_vec(uncompressed)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+fn encode_block(uncompressed: &[u8], encoder: &mut S2BlockEncoder) -> Vec<u8> {
+    encoder.encode(uncompressed)
 }
 
 fn build_padding_chunk(current_size: usize, padding_multiple: usize) -> io::Result<Option<Vec<u8>>> {
@@ -557,9 +579,10 @@ mod tests {
     }
 
     #[test]
-    fn snap_encoded_payload_decodes_with_minlz() {
+    fn minlz_encoded_payload_decodes_with_minlz() {
         let plaintext = b"compressible-rio-v2-block-".repeat(4096);
-        let compressed = encode_block(&plaintext).expect("encode payload");
+        let mut encoder = S2BlockEncoder::new();
+        let compressed = encode_block(&plaintext, &mut encoder);
         let decoded = decode(&compressed).expect("decode payload");
 
         assert_eq!(decoded, plaintext);

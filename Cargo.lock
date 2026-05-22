@@ -6360,9 +6360,9 @@ dependencies = [
 
 [[package]]
 name = "minlz"
-version = "0.1.3"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e2f4749a37e62e26c6b3966f2f43b62f9abf78c9c2d2bc80f6df965e1641f73"
+checksum = "20c19c645132db7e3664aabe291a16896f601053c6b5f567f4c5a196e6817827"
 dependencies = [
  "crc",
 ]
@@ -10108,7 +10108,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "snap",
  "tokio",
  "walkdir",
 ]

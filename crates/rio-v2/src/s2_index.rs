@@ -19,7 +19,7 @@ use std::io;
 
 const S2_INDEX_HEADER: &[u8] = b"s2idx\x00";
 const S2_INDEX_TRAILER: &[u8] = b"\x00xdi2s";
-const CHUNK_TYPE_INDEX: u8 = 0x50;
+const CHUNK_TYPE_INDEX: u8 = 0x99;
 const SKIPPABLE_FRAME_HEADER: usize = 4;
 const MAX_INDEX_ENTRIES: usize = 1 << 16;
 
@@ -389,6 +389,13 @@ mod tests {
 
         let stored = minio_index_storage_bytes(&source);
         assert!(!stored.starts_with(&[CHUNK_TYPE_INDEX, 0x2a, 0x4d, 0x18]));
+        assert_eq!(
+            S2Index::load(&restore_index_headers(&stored))
+                .expect("restore full index")
+                .info
+                .len(),
+            2
+        );
 
         let decoded = decode_minio_index_bytes(&stored).expect("decode headerless MinIO index");
         assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
@@ -414,7 +421,10 @@ mod tests {
             ],
         };
         let full = index.into_full_bytes();
+        assert_eq!(full[0], CHUNK_TYPE_INDEX);
         let headerless = Bytes::copy_from_slice(remove_index_headers(full.as_ref()).expect("strip index headers"));
+        let restored = restore_index_headers(&headerless);
+        assert_eq!(restored[0], CHUNK_TYPE_INDEX);
 
         let decoded = decode_minio_index_bytes(&headerless).expect("decode index with unknown compressed total");
         assert_eq!(decoded.total_uncompressed, 4_194_304);

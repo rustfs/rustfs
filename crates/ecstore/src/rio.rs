@@ -127,7 +127,7 @@ fn restore_legacy_index_headers(bytes: &[u8]) -> Vec<u8> {
     const S2_INDEX_HEADER: &[u8] = b"s2idx\x00";
     const S2_INDEX_TRAILER: &[u8] = b"\x00xdi2s";
     let mut restored = Vec::with_capacity(4 + S2_INDEX_HEADER.len() + bytes.len() + 4 + S2_INDEX_TRAILER.len());
-    restored.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18]);
+    restored.extend_from_slice(&[0x99, 0x2A, 0x4D, 0x18]);
     restored.extend_from_slice(S2_INDEX_HEADER);
     restored.extend_from_slice(bytes);
 
