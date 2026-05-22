@@ -740,10 +740,9 @@ mod tests {
     /// even when the visible result count per page is much smaller than the
     /// raw entry count (due to CommonPrefix collapse).
     ///
-    /// Scenario: many objects under a few directories, paginated with a small
-    /// max_keys. Each page returns few visible results but the server must
-    /// correctly set IsTruncated and provide a valid continuation token so
-    /// the client can retrieve all data.
+    /// Scenario: 1000 objects across 100 directories, paginated with max_keys=50.
+    /// Each page returns up to 50 CommonPrefixes. The server must correctly set
+    /// IsTruncated and provide a valid continuation token across all pages.
     #[tokio::test]
     #[serial]
     async fn test_list_objects_v2_delimiter_small_page_traverses_all() {
@@ -758,12 +757,12 @@ mod tests {
 
         create_bucket(&client, bucket).await.expect("Failed to create bucket");
 
-        // Create 20 objects: 5 directories with 3 files each + 5 root-level files
+        // Create 1000 objects: 100 directories with 10 files each
         let mut all_keys = Vec::new();
-        let dirs = ["dir-a/", "dir-b/", "dir-c/", "dir-d/", "dir-e/"];
+        let dirs: Vec<String> = (0..100).map(|i| format!("dir-{:03}/", i)).collect();
         for dir in &dirs {
-            for i in 0..3 {
-                let key = format!("{dir}file{i}.txt");
+            for i in 0..10 {
+                let key = format!("{dir}file{:02}.txt", i);
                 client
                     .put_object()
                     .bucket(bucket)
@@ -775,21 +774,9 @@ mod tests {
                 all_keys.push(key);
             }
         }
-        for i in 0..5 {
-            let key = format!("root{i}.txt");
-            client
-                .put_object()
-                .bucket(bucket)
-                .key(&key)
-                .body(ByteStream::from_static(b"x"))
-                .send()
-                .await
-                .expect("Failed to put object");
-            all_keys.push(key);
-        }
 
-        // Paginate with delimiter="/" and max_keys=3
-        // Visible per page: up to 3 (mix of CommonPrefixes and objects)
+        // Paginate with delimiter="/" and max_keys=50
+        // Visible per page: up to 50 CommonPrefixes
         let mut listed_keys = Vec::new();
         let mut listed_prefixes = Vec::new();
         let mut continuation_token: Option<String> = None;
@@ -797,7 +784,7 @@ mod tests {
         let mut last_page_is_truncated: bool;
 
         loop {
-            let mut request = client.list_objects_v2().bucket(bucket).delimiter("/").max_keys(3);
+            let mut request = client.list_objects_v2().bucket(bucket).delimiter("/").max_keys(50);
 
             if let Some(token) = continuation_token.take() {
                 request = request.continuation_token(token);
@@ -840,7 +827,7 @@ mod tests {
             "BUG: Last page must have IsTruncated=false after all results returned"
         );
 
-        // Verify all objects are covered: root files listed directly + files under listed prefixes
+        // Verify all objects are covered via listed prefixes
         let keys_under_prefixes: HashSet<String> = all_keys
             .iter()
             .filter(|k| {
@@ -867,6 +854,178 @@ mod tests {
             covered.len(),
             page_count
         );
+
+        env.stop_server();
+    }
+
+    /// Regression test: raw entries exceed MaxKeys but all collapse into fewer
+    /// visible CommonPrefixes — IsTruncated must be false because there are no
+    /// more visible results beyond the collapsed prefixes.
+    ///
+    /// Scenario: 10 directories with 200 files each = 2000 raw keys.
+    /// With MaxKeys=1000, the raw entry count exceeds MaxKeys (disk_has_more=true),
+    /// but after delimiter collapse only 10 CommonPrefixes are visible (10 < 1000).
+    /// IsTruncated must be false since there are no additional visible results.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_raw_exceeds_maxkeys_but_visible_below() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 raw > MaxKeys but visible < MaxKeys after collapse");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-raw-exceeds-visible-below";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Create 10 directories × 200 files = 2000 raw keys
+        let dir_count = 10;
+        let files_per_dir = 200;
+        let mut all_keys = Vec::new();
+        for d in 0..dir_count {
+            let dir = format!("dir-{:02}/", d);
+            for f in 0..files_per_dir {
+                let key = format!("{}file{:03}.txt", dir, f);
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .body(ByteStream::from_static(b"x"))
+                    .send()
+                    .await
+                    .expect("Failed to put object");
+                all_keys.push(key);
+            }
+        }
+
+        // List with delimiter="/", max_keys=1000
+        // Visible: 10 CommonPrefixes (dir-00/ .. dir-09/) = 10 visible << 1000 MaxKeys
+        // But raw entry count (2000+1001 requested) exceeds MaxKeys
+        let output = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .delimiter("/")
+            .max_keys(1000)
+            .send()
+            .await
+            .expect("Failed to list objects");
+
+        let listed_keys: Vec<String> = output
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key())
+            .map(|k| k.to_string())
+            .collect();
+        let listed_prefixes: Vec<String> = output
+            .common_prefixes()
+            .iter()
+            .filter_map(|cp| cp.prefix())
+            .map(|p| p.to_string())
+            .collect();
+
+        // KEY ASSERTION: IsTruncated must be false because visible results (10)
+        // are far below MaxKeys (1000), even though raw entries exceeded MaxKeys.
+        let is_truncated = output.is_truncated().unwrap_or(false);
+        assert!(
+            !is_truncated,
+            "BUG: IsTruncated should be false when visible results ({} objects + {} prefixes = {}) < MaxKeys (1000), even if raw entries exceeded MaxKeys",
+            listed_keys.len(),
+            listed_prefixes.len(),
+            listed_keys.len() + listed_prefixes.len()
+        );
+
+        assert!(
+            output.next_continuation_token().is_none(),
+            "NextContinuationToken should be None when IsTruncated is false"
+        );
+
+        // All objects must be covered by listed prefixes
+        assert_eq!(
+            listed_prefixes.len(),
+            dir_count,
+            "Expected {} prefixes, got {}",
+            dir_count,
+            listed_prefixes.len()
+        );
+        for d in 0..dir_count {
+            let prefix = format!("dir-{:02}/", d);
+            assert!(listed_prefixes.contains(&prefix), "Missing prefix: {}", prefix);
+        }
+
+        info!(
+            "Raw-exceeds-visible test passed: {} raw keys → {} prefixes, IsTruncated=false",
+            all_keys.len(),
+            listed_prefixes.len()
+        );
+
+        env.stop_server();
+    }
+
+    /// Regression test: pagination with MaxKeys exceeding S3 limit (1000) and delimiter.
+    /// The server caps MaxKeys to 1000. With delimiter="/", many raw keys collapse into
+    /// few CommonPrefixes. Visible results (prefixes) < capped MaxKeys → IsTruncated=false.
+    ///
+    /// This complements test_list_objects_v2_max_keys_above_limit_returns_token which
+    /// tests the non-delimiter case.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_maxkeys_above_limit_with_delimiter() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 MaxKeys above limit with delimiter");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-maxkeys-limit-delimiter";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // 12 dirs × 100 files = 1200 raw keys
+        let dir_count = 12;
+        let files_per_dir = 100;
+        for d in 0..dir_count {
+            for f in 0..files_per_dir {
+                let key = format!("dir-{:02}/file{:03}.txt", d, f);
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(&key)
+                    .body(ByteStream::from_static(b"x"))
+                    .send()
+                    .await
+                    .expect("Failed to put object");
+            }
+        }
+
+        // With delimiter: 12 CommonPrefixes visible, all fit within capped 1000
+        let output = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .delimiter("/")
+            .max_keys(2000)
+            .send()
+            .await
+            .expect("Failed to list objects");
+
+        assert_eq!(
+            output.common_prefixes().len(),
+            dir_count,
+            "Expected {} prefixes, got {}",
+            dir_count,
+            output.common_prefixes().len()
+        );
+        assert_eq!(output.max_keys(), Some(1000));
+        // 12 visible < 1000 capped MaxKeys → not truncated
+        assert!(
+            !output.is_truncated().unwrap_or(false),
+            "BUG: IsTruncated should be false when visible ({}) < capped MaxKeys (1000)",
+            output.common_prefixes().len()
+        );
+
+        info!("MaxKeys above limit with delimiter test passed");
 
         env.stop_server();
     }

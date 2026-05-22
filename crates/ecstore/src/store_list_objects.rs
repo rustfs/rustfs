@@ -404,7 +404,10 @@ impl ECStore {
         // After delimiter collapse, re-evaluate is_truncated based on visible results.
         // Multiple raw entries may collapse into one CommonPrefix, so the original
         // get_objects-based truncation can be inaccurate.
-        if !is_truncated && disk_has_more && (!objects.is_empty() || !prefixes.is_empty()) {
+        // Only set is_truncated when visible results reached max_keys — if they
+        // didn't, there are genuinely no more visible results even though the disk
+        // had more raw entries (they all collapsed into already-seen prefixes).
+        if !is_truncated && disk_has_more && (objects.len() + prefixes.len() >= max_keys as usize) {
             is_truncated = true;
             // Compute next_marker from visible results since get_objects was consumed.
             // Prefer last object name; fall back to last prefix for marker.
@@ -532,7 +535,10 @@ impl ECStore {
         // After delimiter collapse, re-evaluate is_truncated based on visible results.
         // Multiple raw entries may collapse into one CommonPrefix, so the original
         // get_objects-based truncation can be inaccurate.
-        if !is_truncated && disk_has_more && (!objects.is_empty() || !prefixes.is_empty()) {
+        // Only set is_truncated when visible results reached max_keys — if they
+        // didn't, there are genuinely no more visible results even though the disk
+        // had more raw entries (they all collapsed into already-seen prefixes).
+        if !is_truncated && disk_has_more && (objects.len() + prefixes.len() >= max_keys as usize) {
             is_truncated = true;
             // Compute markers from visible results since get_objects was consumed.
             if let Some(last) = objects.last() {
