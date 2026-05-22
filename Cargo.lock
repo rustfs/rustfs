@@ -9252,6 +9252,7 @@ dependencies = [
  "pin-project-lite",
  "pprof-pyroscope-fork",
  "rand 0.10.1",
+ "rcgen",
  "reqwest",
  "rmp-serde",
  "rsa 0.10.0-rc.18",
