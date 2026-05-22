@@ -34,7 +34,8 @@ const ERR_LIFECYCLE_NO_RULE: &str = "Lifecycle configuration should have at leas
 const ERR_LIFECYCLE_DUPLICATE_ID: &str = "Rule ID must be unique. Found same ID for more than one rule";
 const _ERR_XML_NOT_WELL_FORMED: &str =
     "The XML you provided was not well-formed or did not validate against our published schema";
-const ERR_LIFECYCLE_BUCKET_LOCKED: &str = "ExpiredObjectDeleteMarker is not allowed on a bucket with Object Lock enabled";
+const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
+    "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket";
 const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration should have at most 1000 rules";
 const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "Lifecycle expiration days must not be negative";
 const ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS: &str = "Lifecycle noncurrent expiration days must not be negative";
@@ -320,14 +321,15 @@ impl Lifecycle for BucketLifecycleConfiguration {
             r.validate()?;
             if let Some(object_lock_enabled) = lr.object_lock_enabled.as_ref()
                 && object_lock_enabled.as_str() == ObjectLockEnabled::ENABLED
-                && let Some(expiration) = r.expiration.as_ref()
             {
-                // Object Lock + ExpiredObjectDeleteMarker conflict
-                if expiration.expired_object_delete_marker.is_some_and(|v| v) {
-                    return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
+                if let Some(expiration) = r.expiration.as_ref() {
+                    // Object Lock + ExpiredObjectAllVersions conflict (MinIO extension)
+                    if expiration.expired_object_all_versions.is_some_and(|v| v) {
+                        return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
+                    }
                 }
-                // Object Lock + ExpiredObjectAllVersions conflict (MinIO extension)
-                if expiration.expired_object_all_versions.is_some_and(|v| v) {
+                // Object Lock + DelMarkerExpiration conflict
+                if r.del_marker_expiration.is_some() {
                     return Err(std::io::Error::other(ERR_LIFECYCLE_BUCKET_LOCKED));
                 }
             }
@@ -2060,11 +2062,11 @@ mod tests {
         assert_eq!(event_after.due, Some(future_date));
     }
 
-    // --- TASK-002 tests: Object Lock + ExpiredObjectDeleteMarker conflict ---
+    // --- TASK-002 tests: Object Lock + ExpiredObjectDeleteMarker compatibility ---
 
     #[tokio::test]
     #[serial]
-    async fn validate_rejects_expired_object_delete_marker_on_locked_bucket() {
+    async fn validate_allows_expired_object_delete_marker_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
@@ -2089,8 +2091,9 @@ mod tests {
             ..Default::default()
         };
 
-        let err = lc.validate(&locked_config).await.unwrap_err();
-        assert_eq!(err.to_string(), ERR_LIFECYCLE_BUCKET_LOCKED);
+        lc.validate(&locked_config)
+            .await
+            .expect("expected validation to pass for ExpiredObjectDeleteMarker on locked bucket");
     }
 
     #[tokio::test]
@@ -2152,6 +2155,68 @@ mod tests {
         lc.validate(&locked_config)
             .await
             .expect("expected days-based expiration to pass on locked bucket");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_del_marker_expiration_on_locked_bucket() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: Some(s3s::dto::DelMarkerExpiration { days: Some(1) }),
+                filter: None,
+                id: Some("test-rule".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let locked_config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            ..Default::default()
+        };
+
+        let err = lc.validate(&locked_config).await.unwrap_err();
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_BUCKET_LOCKED);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_zero_day_del_marker_expiration_on_locked_bucket() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: Some(s3s::dto::DelMarkerExpiration { days: Some(0) }),
+                filter: None,
+                id: Some("test-rule".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let locked_config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            ..Default::default()
+        };
+
+        let err = lc.validate(&locked_config).await.unwrap_err();
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_BUCKET_LOCKED);
     }
 
     // --- TASK-003 tests: Round up to next UTC processing boundary ---
