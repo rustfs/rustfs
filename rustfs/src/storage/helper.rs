@@ -27,10 +27,10 @@ use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
-use rustfs_utils::{
+use rustfs_targets::{
     extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
-    http::headers::AMZ_REQUEST_ID,
 };
+use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
 use std::future::Future;

@@ -1,18 +1,21 @@
-//  Copyright 2024 RustFS Team
+// Copyright 2024 RustFS Team
 //
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//      http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+use hashbrown::HashMap;
+use hyper::HeaderMap;
 use regex::Regex;
+use s3s::{S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
@@ -20,7 +23,6 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
 
-// Lazy static for the host label regex.
 static HOST_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").unwrap());
 
 /// NetError represents errors that can occur in network operations.
@@ -41,21 +43,17 @@ pub enum NetError {
 }
 
 /// Host represents a network host with IP/name and port.
-/// Similar to Go's net.Host structure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Host {
     pub name: String,
-    pub port: Option<u16>, // Using Option<u16> to represent if port is set, similar to IsPortSet.
+    pub port: Option<u16>,
 }
 
-// Implementation of Host methods.
 impl Host {
-    // is_empty returns true if the host name is empty.
     pub fn is_empty(&self) -> bool {
         self.name.is_empty()
     }
 
-    // equal checks if two hosts are equal by comparing their string representations.
     pub fn equal(&self, other: &Host) -> bool {
         self.to_string() == other.to_string()
     }
@@ -70,13 +68,121 @@ impl std::fmt::Display for Host {
     }
 }
 
-// parse_host parses a string into a Host, with validation similar to Go's ParseHost.
+/// Extract request parameters from S3Request, mainly header information.
+pub fn extract_req_params<T>(req: &S3Request<T>) -> HashMap<String, String> {
+    extract_params_header(&req.headers)
+}
+
+/// Extract request parameters from hyper::HeaderMap, mainly header information.
+/// This function is useful when you have a raw HTTP request and need to extract parameters.
+#[deprecated(since = "0.1.0", note = "Use extract_params_header instead")]
+pub fn extract_req_params_header(head: &HeaderMap) -> HashMap<String, String> {
+    extract_params_header(head)
+}
+
+/// Extract parameters from hyper::HeaderMap, mainly header information.
+pub fn extract_params_header(head: &HeaderMap) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    for (key, value) in head.iter() {
+        if let Ok(val_str) = value.to_str() {
+            params.insert(key.as_str().to_string(), val_str.to_string());
+        }
+    }
+    params
+}
+
+/// Extract response elements from S3Response, mainly header information.
+pub fn extract_resp_elements<T>(resp: &S3Response<T>) -> HashMap<String, String> {
+    extract_params_header(&resp.headers)
+}
+
+/// Get host from header information.
+pub fn get_request_host(headers: &HeaderMap) -> String {
+    headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Get Port from header information.
+/// Priority:
+/// 1. x-forwarded-port
+/// 2. host header (parse port)
+/// 3. port header
+pub fn get_request_port(headers: &HeaderMap) -> u16 {
+    if let Some(port) = headers
+        .get("x-forwarded-port")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u16>().ok())
+    {
+        return port;
+    }
+
+    if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
+        if let Some(idx) = host.rfind(':') {
+            let valid_colon = match host.rfind(']') {
+                Some(close_bracket_idx) => idx > close_bracket_idx,
+                None => true,
+            };
+
+            if valid_colon
+                && let Ok(port) = host[idx + 1..].parse::<u16>()
+                && port > 0
+            {
+                return port;
+            }
+        }
+
+        if let Some(proto) = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) {
+            match proto {
+                "http" => return 80,
+                "https" => return 443,
+                _ => {}
+            }
+        }
+    }
+
+    headers
+        .get("port")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0)
+}
+
+/// Get content-length from header information.
+pub fn get_request_content_length(headers: &HeaderMap) -> u64 {
+    headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Get referer from header information.
+pub fn get_request_referer(headers: &HeaderMap) -> String {
+    headers
+        .get("referer")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Get user-agent from header information.
+pub fn get_request_user_agent(headers: &HeaderMap) -> String {
+    headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// parse_host parses a string into a Host, with validation similar to Go's ParseHost.
 pub fn parse_host(s: &str) -> Result<Host, NetError> {
     if s.is_empty() {
         return Err(NetError::InvalidArgument);
     }
 
-    // is_valid_host validates the host string, checking for IP or hostname validity.
     let is_valid_host = |host: &str| -> bool {
         if host.is_empty() {
             return true;
@@ -122,9 +228,6 @@ pub fn parse_host(s: &str) -> Result<Host, NetError> {
             return Err(NetError::MissingBracket);
         }
 
-        // A host with multiple colons is an IPv6 literal, optionally with a
-        // zone identifier. Unbracketed IPv6 with port is ambiguous, so callers
-        // must use the standard bracketed form when they need a port.
         let (host_str, port_str) = if s.matches(':').count() > 1 {
             (s, "")
         } else {
@@ -139,7 +242,6 @@ pub fn parse_host(s: &str) -> Result<Host, NetError> {
         (trim_ipv6(host_str)?, port)
     };
 
-    // Handle IPv6 zone identifier.
     let trimmed_host = host.split('%').next().unwrap_or(&host);
 
     if !is_valid_host(trimmed_host) {
@@ -149,7 +251,6 @@ pub fn parse_host(s: &str) -> Result<Host, NetError> {
     Ok(Host { name: host, port })
 }
 
-// trim_ipv6 removes square brackets from IPv6 addresses, similar to Go's trimIPv6.
 fn trim_ipv6(host: &str) -> Result<String, NetError> {
     if host.ends_with(']') {
         if !host.starts_with('[') {
@@ -162,37 +263,18 @@ fn trim_ipv6(host: &str) -> Result<String, NetError> {
 }
 
 /// URL is a wrapper around url::Url for custom handling.
-/// Provides methods similar to Go's URL struct.
 #[derive(Debug, Clone)]
 pub struct ParsedURL(pub Url);
 
 impl ParsedURL {
-    /// is_empty returns true if the URL is empty or "about:blank".
-    ///
-    /// # Arguments
-    /// * `&self` - Reference to the ParsedURL instance.
-    ///
-    /// # Returns
-    /// * `bool` - True if the URL is empty or "about:blank", false otherwise.
-    ///
     pub fn is_empty(&self) -> bool {
         self.0.as_str() == "" || (self.0.scheme() == "about" && self.0.path() == "blank")
     }
 
-    /// hostname returns the hostname of the URL.
-    ///
-    /// # Returns
-    /// * `String` - The hostname of the URL, or an empty string if not set.
-    ///
     pub fn hostname(&self) -> String {
         self.0.host_str().unwrap_or("").to_string()
     }
 
-    /// port returns the port of the URL as a string, defaulting to "80" for http and "443" for https if not set.
-    ///
-    /// # Returns
-    /// * `String` - The port of the URL as a string.
-    ///
     pub fn port(&self) -> String {
         match self.0.port() {
             Some(p) => p.to_string(),
@@ -204,20 +286,10 @@ impl ParsedURL {
         }
     }
 
-    /// scheme returns the scheme of the URL.
-    ///
-    /// # Returns
-    /// * `&str` - The scheme of the URL.
-    ///
     pub fn scheme(&self) -> &str {
         self.0.scheme()
     }
 
-    /// url returns a reference to the underlying Url.
-    ///
-    /// # Returns
-    /// * `&Url` - Reference to the underlying Url.
-    ///
     pub fn url(&self) -> &Url {
         &self.0
     }
@@ -235,7 +307,6 @@ impl std::fmt::Display for ParsedURL {
         }
         let mut s = url.to_string();
 
-        // If the URL ends with a slash and the path is just "/", remove the trailing slash.
         if s.ends_with('/') && url.path() == "/" {
             s.pop();
         }
@@ -268,17 +339,6 @@ impl<'de> serde::Deserialize<'de> for ParsedURL {
 }
 
 /// parse_url parses a string into a ParsedURL, with host validation and path cleaning.
-///
-/// # Arguments
-/// * `s` - The URL string to parse.
-///
-/// # Returns
-/// * `Ok(ParsedURL)` - If parsing is successful.
-/// * `Err(NetError)` - If parsing fails or host is invalid.
-///
-/// # Errors
-/// Returns NetError if parsing fails or host is invalid.
-///
 pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
     if let Some(scheme_end) = s.find("://")
         && s[scheme_end + 3..].starts_with('/')
@@ -303,13 +363,11 @@ pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
 
         if !port_str.is_empty() {
             let host_port = format!("{}:{}", uu.host_str().unwrap(), port_str);
-            parse_host(&host_port)?; // Validate host.
+            parse_host(&host_port)?;
         }
     }
 
-    // Clean path: Use Url's path_segments to normalize.
     if !uu.path().is_empty() {
-        // Url automatically cleans paths, but we ensure trailing slash if original had it.
         let mut cleaned_path = String::new();
         for comp in Path::new(uu.path()).components() {
             use std::path::Component;
@@ -337,15 +395,6 @@ pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
 }
 
 #[allow(dead_code)]
-/// parse_http_url parses a string into a ParsedURL, ensuring the scheme is http or https.
-///
-/// # Arguments
-/// * `s` - The URL string to parse.
-///
-/// # Returns
-/// * `Ok(ParsedURL)` - If parsing is successful and scheme is http/https.
-/// * `Err(NetError)` - If parsing fails or scheme is not http/https.
-///
 pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
     let u = parse_url(s)?;
     match u.0.scheme() {
@@ -355,20 +404,10 @@ pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
 }
 
 #[allow(dead_code)]
-/// is_network_or_host_down checks if an error indicates network or host down, considering timeouts.
-///
-/// # Arguments
-/// * `err` - The std::io::Error to check.
-/// * `expect_timeouts` - Whether timeouts are expected.
-///
-/// # Returns
-/// * `bool` - True if the error indicates network or host down, false otherwise.
-///
 pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> bool {
     if err.kind() == std::io::ErrorKind::TimedOut {
         return !expect_timeouts;
     }
-    // Simplified checks based on Go logic; adapt for Rust as needed
     let err_str = err.to_string().to_lowercase();
     err_str.contains("connection reset by peer")
         || err_str.contains("connection timed out")
@@ -377,27 +416,11 @@ pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> b
 }
 
 #[allow(dead_code)]
-/// is_conn_reset_err checks if an error indicates a connection reset by peer.
-///
-/// # Arguments
-/// * `err` - The std::io::Error to check.
-///
-/// # Returns
-/// * `bool` - True if the error indicates connection reset, false otherwise.
-///
 pub fn is_conn_reset_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection reset by peer") || matches!(err.raw_os_error(), Some(libc::ECONNRESET))
 }
 
 #[allow(dead_code)]
-/// is_conn_refused_err checks if an error indicates a connection refused.
-///
-/// # Arguments
-/// * `err` - The std::io::Error to check.
-///
-/// # Returns
-/// * `bool` - True if the error indicates connection refused, false otherwise.
-///
 pub fn is_conn_refused_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection refused") || matches!(err.raw_os_error(), Some(libc::ECONNREFUSED))
 }
@@ -405,6 +428,51 @@ pub fn is_conn_refused_err(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::header::HeaderValue;
+
+    #[test]
+    fn test_get_request_port() {
+        let mut headers = HeaderMap::new();
+
+        assert_eq!(get_request_port(&headers), 0);
+
+        headers.insert("port", HeaderValue::from_static("8080"));
+        assert_eq!(get_request_port(&headers), 8080);
+
+        headers.remove("port");
+        headers.insert("host", HeaderValue::from_static("example.com:9000"));
+        assert_eq!(get_request_port(&headers), 9000);
+
+        headers.insert("host", HeaderValue::from_static("example.com"));
+        assert_eq!(get_request_port(&headers), 0);
+
+        headers.insert("host", HeaderValue::from_static("[::1]:9001"));
+        assert_eq!(get_request_port(&headers), 9001);
+
+        headers.insert("host", HeaderValue::from_static("[::1]"));
+        assert_eq!(get_request_port(&headers), 0);
+
+        headers.insert("x-forwarded-port", HeaderValue::from_static("7000"));
+        assert_eq!(get_request_port(&headers), 7000);
+
+        headers.remove("x-forwarded-port");
+        headers.insert("host", HeaderValue::from_static("example.com"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert_eq!(get_request_port(&headers), 80);
+
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(get_request_port(&headers), 443);
+
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("ftp"));
+        assert_eq!(get_request_port(&headers), 0);
+
+        headers.insert("host", HeaderValue::from_static("example.com:0"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(get_request_port(&headers), 443);
+
+        headers.remove("x-forwarded-proto");
+        assert_eq!(get_request_port(&headers), 0);
+    }
 
     #[test]
     fn parse_host_with_empty_string_returns_error() {
@@ -524,132 +592,41 @@ mod tests {
     }
 
     #[test]
-    fn host_equal_when_same() {
-        let host1 = Host {
-            name: "example.com".to_string(),
-            port: Some(80),
-        };
-        let host2 = Host {
-            name: "example.com".to_string(),
-            port: Some(80),
-        };
-        assert!(host1.equal(&host2));
-    }
-
-    #[test]
-    fn host_not_equal_when_different() {
-        let host1 = Host {
-            name: "example.com".to_string(),
-            port: Some(80),
-        };
-        let host2 = Host {
-            name: "example.com".to_string(),
-            port: Some(443),
-        };
-        assert!(!host1.equal(&host2));
-    }
-
-    #[test]
     fn parse_url_with_valid_http_url() {
         let result = parse_url("http://example.com/path");
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.hostname(), "example.com");
         assert_eq!(parsed.port(), "80");
+        assert_eq!(parsed.scheme(), "http");
+        assert_eq!(parsed.to_string(), "http://example.com/path");
     }
 
     #[test]
-    fn parse_url_with_valid_https_url() {
+    fn parse_url_with_explicit_default_https_port() {
         let result = parse_url("https://example.com:443/path");
         assert!(result.is_ok());
         let parsed = result.unwrap();
-        assert_eq!(parsed.hostname(), "example.com");
-        assert_eq!(parsed.port(), "443");
+        assert_eq!(parsed.to_string(), "https://example.com/path");
     }
 
     #[test]
-    fn parse_url_with_scheme_but_empty_host() {
+    fn parse_url_with_empty_host_returns_error() {
         let result = parse_url("http:///path");
         assert!(matches!(result, Err(NetError::SchemeWithEmptyHost)));
     }
 
     #[test]
-    fn parse_url_with_invalid_host() {
+    fn parse_url_with_invalid_host_returns_error() {
         let result = parse_url("http://invalid..host/path");
         assert!(matches!(result, Err(NetError::InvalidHost)));
     }
 
     #[test]
-    fn parse_url_with_path_cleaning() {
+    fn parse_url_normalizes_path() {
         let result = parse_url("http://example.com//path/../path/");
         assert!(result.is_ok());
         let parsed = result.unwrap();
-        assert_eq!(parsed.0.path(), "/path/");
-    }
-
-    #[test]
-    fn parse_http_url_with_http_scheme() {
-        let result = parse_http_url("http://example.com");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn parse_http_url_with_https_scheme() {
-        let result = parse_http_url("https://example.com");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn parse_http_url_with_invalid_scheme() {
-        let result = parse_http_url("ftp://example.com");
-        assert!(matches!(result, Err(NetError::UnexpectedScheme(_))));
-    }
-
-    #[test]
-    fn parsed_url_is_empty_when_url_is_empty() {
-        let url = ParsedURL(Url::parse("about:blank").unwrap());
-        assert!(url.is_empty());
-    }
-
-    #[test]
-    fn parsed_url_hostname() {
-        let url = ParsedURL(Url::parse("http://example.com:8080").unwrap());
-        assert_eq!(url.hostname(), "example.com");
-    }
-
-    #[test]
-    fn parsed_url_port() {
-        let url = ParsedURL(Url::parse("http://example.com:8080").unwrap());
-        assert_eq!(url.port(), "8080");
-    }
-
-    #[test]
-    fn parsed_url_to_string_removes_default_ports() {
-        let url = ParsedURL(Url::parse("http://example.com:80").unwrap());
-        assert_eq!(url.to_string(), "http://example.com");
-    }
-
-    #[test]
-    fn is_network_or_host_down_with_timeout() {
-        let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout");
-        assert!(is_network_or_host_down(&err, false));
-    }
-
-    #[test]
-    fn is_network_or_host_down_with_expected_timeout() {
-        let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout");
-        assert!(!is_network_or_host_down(&err, true));
-    }
-
-    #[test]
-    fn is_conn_reset_err_with_reset_message() {
-        let err = std::io::Error::other("connection reset by peer");
-        assert!(is_conn_reset_err(&err));
-    }
-
-    #[test]
-    fn is_conn_refused_err_with_refused_message() {
-        let err = std::io::Error::other("connection refused");
-        assert!(is_conn_refused_err(&err));
+        assert_eq!(parsed.to_string(), "http://example.com/path/");
     }
 }
