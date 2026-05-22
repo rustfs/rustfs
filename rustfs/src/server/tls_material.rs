@@ -32,10 +32,12 @@ use rustfs_config::{
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
+use std::{fs, io};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
@@ -106,56 +108,31 @@ impl TlsMaterialSnapshot {
             return Ok(None);
         }
 
+        let tls_dir = validate_server_tls_directory(tls_path)?;
+
         let mtls_verifier = rustfs_utils::build_webpki_client_verifier(
-            rustfs_utils::WebPkiClientVerifierOptions::builder(tls_path, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CA_CERT)
+            rustfs_utils::WebPkiClientVerifierOptions::builder(&tls_dir, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CA_CERT)
                 .enabled(get_env_bool(ENV_SERVER_MTLS_ENABLE, DEFAULT_SERVER_MTLS_ENABLE))
                 .build(),
         )
         .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
 
-        // Try multi-cert (SNI) first
-        let multi_cert_error = match rustfs_utils::load_all_certs_from_directory(
-            rustfs_utils::CertDirectoryLoadOptions::builder(tls_path, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
-        ) {
-            Ok(cert_key_pairs) => match rustfs_utils::create_multi_cert_resolver(cert_key_pairs) {
-                Ok(resolver) => {
-                    let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
-                    info!("Created TLS acceptor with SNI resolver");
-                    let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
-                    return Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))));
-                }
-                Err(e) => {
-                    return Err(TlsMaterialError::Parse(format!("failed to build multi-cert resolver: {e}")));
-                }
-            },
-            Err(e) => {
-                debug!("load_all_certs_from_directory failed, trying single-cert fallback");
-                Some(e.to_string())
+        match load_server_certificate_material(&tls_dir)? {
+            ServerCertificateMaterial::SingleCert { certs, key } => {
+                let config = build_server_config(ServerCertSource::SingleCert { certs, key }, mtls_verifier)?;
+                info!("Created TLS acceptor with root single certificate");
+                let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
+                Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
             }
-        };
-
-        // Fallback: single cert
-        let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
-        let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
-        if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
-            let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| TlsMaterialError::Io(format!("load certs: {e}")))?;
-            let key = rustfs_utils::load_private_key(&key_path).map_err(|e| TlsMaterialError::Io(format!("load key: {e}")))?;
-
-            let config = build_server_config(ServerCertSource::SingleCert { certs, key }, mtls_verifier)?;
-            info!("Created TLS acceptor with single certificate");
-            let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
-            return Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))));
+            ServerCertificateMaterial::MultiCert { cert_key_pairs } => {
+                let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)
+                    .map_err(|e| TlsMaterialError::Parse(format!("build multi-cert resolver: {e}")))?;
+                let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
+                info!("Created TLS acceptor with SNI resolver");
+                let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
+                Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
+            }
         }
-
-        if let Some(err) = multi_cert_error {
-            return Err(TlsMaterialError::Io(format!(
-                "failed to discover TLS certificates under '{}': {}",
-                tls_path, err
-            )));
-        }
-
-        debug!("No valid TLS certificates found, starting with HTTP");
-        Ok(None)
     }
 
     fn empty() -> Self {
@@ -166,6 +143,130 @@ impl TlsMaterialSnapshot {
             },
         }
     }
+}
+
+fn validate_server_tls_directory(tls_path: &str) -> Result<PathBuf, TlsMaterialError> {
+    let tls_dir = PathBuf::from(tls_path);
+    let metadata = fs::metadata(&tls_dir).map_err(|e| {
+        let kind = if e.kind() == io::ErrorKind::NotFound {
+            "TLS directory does not exist"
+        } else {
+            "Failed to inspect TLS directory"
+        };
+        TlsMaterialError::Io(format!("{kind}: {} ({e})", tls_dir.display()))
+    })?;
+
+    if !metadata.is_dir() {
+        return Err(TlsMaterialError::Io(format!("TLS path is not a directory: {}", tls_dir.display())));
+    }
+
+    Ok(tls_dir)
+}
+
+fn load_server_certificate_material(tls_dir: &Path) -> Result<ServerCertificateMaterial, TlsMaterialError> {
+    let root_cert_pair = inspect_root_server_cert_pair(tls_dir);
+    if has_discoverable_domain_cert_pair(tls_dir)? {
+        return load_multi_cert_material(tls_dir);
+    }
+
+    match root_cert_pair {
+        RootCertPairState::Complete { cert_path, key_path } => load_root_single_cert_material(&cert_path, &key_path),
+        RootCertPairState::MissingCert { cert_path } => Err(TlsMaterialError::Io(format!(
+            "TLS root certificate file missing: {}",
+            cert_path.display()
+        ))),
+        RootCertPairState::MissingKey { key_path } => {
+            Err(TlsMaterialError::Io(format!("TLS root private key file missing: {}", key_path.display())))
+        }
+        RootCertPairState::Absent => Err(TlsMaterialError::Io(format!(
+            "No usable TLS certificate material found under '{}'",
+            tls_dir.display()
+        ))),
+    }
+}
+
+fn inspect_root_server_cert_pair(tls_dir: &Path) -> RootCertPairState {
+    let cert_path = tls_dir.join(RUSTFS_TLS_CERT);
+    let key_path = tls_dir.join(RUSTFS_TLS_KEY);
+    let cert_exists = cert_path.exists();
+    let key_exists = key_path.exists();
+
+    match (cert_exists, key_exists) {
+        (true, true) => RootCertPairState::Complete { cert_path, key_path },
+        (false, false) => RootCertPairState::Absent,
+        (false, true) => RootCertPairState::MissingCert { cert_path },
+        (true, false) => RootCertPairState::MissingKey { key_path },
+    }
+}
+
+fn has_discoverable_domain_cert_pair(tls_dir: &Path) -> Result<bool, TlsMaterialError> {
+    for entry in
+        fs::read_dir(tls_dir).map_err(|e| TlsMaterialError::Io(format!("read TLS directory {}: {e}", tls_dir.display())))?
+    {
+        let entry = entry.map_err(|e| TlsMaterialError::Io(format!("read TLS directory entry in {}: {e}", tls_dir.display())))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let Some(domain_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_discoverable_cert_domain_dir(domain_name) {
+            continue;
+        }
+
+        if path.join(RUSTFS_TLS_CERT).exists() && path.join(RUSTFS_TLS_KEY).exists() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn is_discoverable_cert_domain_dir(domain_name: &str) -> bool {
+    !domain_name.starts_with('.')
+}
+
+fn load_root_single_cert_material(cert_path: &Path, key_path: &Path) -> Result<ServerCertificateMaterial, TlsMaterialError> {
+    let cert_path_str = cert_path
+        .to_str()
+        .ok_or_else(|| TlsMaterialError::Io(format!("invalid UTF-8 in TLS root certificate path: {cert_path:?}")))?;
+    let key_path_str = key_path
+        .to_str()
+        .ok_or_else(|| TlsMaterialError::Io(format!("invalid UTF-8 in TLS root private key path: {key_path:?}")))?;
+    let certs = rustfs_utils::load_certs(cert_path_str)
+        .map_err(|e| TlsMaterialError::Io(format!("load root TLS certificate {}: {e}", cert_path.display())))?;
+    let key = rustfs_utils::load_private_key(key_path_str)
+        .map_err(|e| TlsMaterialError::Io(format!("load root TLS private key {}: {e}", key_path.display())))?;
+
+    Ok(ServerCertificateMaterial::SingleCert { certs, key })
+}
+
+fn load_multi_cert_material(tls_dir: &Path) -> Result<ServerCertificateMaterial, TlsMaterialError> {
+    let cert_key_pairs = rustfs_utils::load_all_certs_from_directory(
+        rustfs_utils::CertDirectoryLoadOptions::builder(tls_dir, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY).build(),
+    )
+    .map_err(|e| TlsMaterialError::Io(format!("discover multi-cert TLS certificates under '{}': {e}", tls_dir.display())))?;
+
+    Ok(ServerCertificateMaterial::MultiCert { cert_key_pairs })
+}
+
+enum RootCertPairState {
+    Complete { cert_path: PathBuf, key_path: PathBuf },
+    MissingCert { cert_path: PathBuf },
+    MissingKey { key_path: PathBuf },
+    Absent,
+}
+
+enum ServerCertificateMaterial {
+    SingleCert {
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    },
+    MultiCert {
+        cert_key_pairs: HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    },
 }
 
 // ── Server Config Construction ──
@@ -511,4 +612,154 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::CertifiedKey;
+    use std::fs;
+    use std::sync::Once;
+    use tempfile::TempDir;
+
+    fn ensure_rustls_crypto_provider() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .expect("install rustls crypto provider for tests");
+        });
+    }
+
+    fn write_test_cert_pair(dir: &Path, subject: &str) {
+        let CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![subject.to_string()]).unwrap();
+        fs::write(dir.join(RUSTFS_TLS_CERT), cert.pem()).unwrap();
+        fs::write(dir.join(RUSTFS_TLS_KEY), signing_key.serialize_pem()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_tls_acceptor_accepts_root_single_cert_with_trailing_slash() {
+        ensure_rustls_crypto_provider();
+        let temp_dir = TempDir::new().unwrap();
+        write_test_cert_pair(temp_dir.path(), "localhost");
+
+        let snapshot = TlsMaterialSnapshot::load(&format!("{}/", temp_dir.path().display()))
+            .await
+            .expect("TLS material load should succeed");
+        let acceptor = snapshot
+            .build_tls_acceptor(&format!("{}/", temp_dir.path().display()))
+            .await
+            .expect("root single-cert TLS acceptor should build");
+
+        assert!(acceptor.is_some());
+    }
+
+    #[tokio::test]
+    async fn build_tls_acceptor_accepts_symlinked_root_single_cert_directory() {
+        ensure_rustls_crypto_provider();
+        let temp_dir = TempDir::new().unwrap();
+        let real_dir = temp_dir.path().join("tls-real");
+        fs::create_dir(&real_dir).unwrap();
+        write_test_cert_pair(&real_dir, "localhost");
+
+        let symlink_dir = temp_dir.path().join("tls-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real_dir, &symlink_dir).unwrap();
+
+        let snapshot = TlsMaterialSnapshot::load(symlink_dir.to_str().unwrap())
+            .await
+            .expect("TLS material load through symlink should succeed");
+        let acceptor = snapshot
+            .build_tls_acceptor(symlink_dir.to_str().unwrap())
+            .await
+            .expect("TLS acceptor should build through symlink");
+
+        assert!(acceptor.is_some());
+    }
+
+    #[tokio::test]
+    async fn build_tls_acceptor_rejects_missing_tls_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let missing_dir = temp_dir.path().join("missing");
+        let snapshot = TlsMaterialSnapshot::empty();
+
+        let err = match snapshot.build_tls_acceptor(missing_dir.to_str().unwrap()).await {
+            Ok(_) => panic!("missing TLS directory should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("TLS directory does not exist"));
+    }
+
+    #[tokio::test]
+    async fn build_tls_acceptor_rejects_tls_path_that_is_not_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("tls-file");
+        fs::write(&file_path, "not-a-directory").unwrap();
+        let snapshot = TlsMaterialSnapshot::empty();
+
+        let err = match snapshot.build_tls_acceptor(file_path.to_str().unwrap()).await {
+            Ok(_) => panic!("regular file TLS path should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("TLS path is not a directory"));
+    }
+
+    #[tokio::test]
+    async fn build_tls_acceptor_rejects_empty_tls_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let snapshot = TlsMaterialSnapshot::load(temp_dir.path().to_str().unwrap())
+            .await
+            .expect("outbound TLS load for empty dir should succeed");
+
+        let err = match snapshot.build_tls_acceptor(temp_dir.path().to_str().unwrap()).await {
+            Ok(_) => panic!("empty TLS directory should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("No usable TLS certificate material found"));
+    }
+
+    #[tokio::test]
+    async fn build_tls_acceptor_still_supports_multi_cert_directories() {
+        ensure_rustls_crypto_provider();
+        let temp_dir = TempDir::new().unwrap();
+        let domain_dir = temp_dir.path().join("example.com");
+        fs::create_dir(&domain_dir).unwrap();
+        write_test_cert_pair(&domain_dir, "example.com");
+
+        let snapshot = TlsMaterialSnapshot::load(temp_dir.path().to_str().unwrap())
+            .await
+            .expect("TLS material load for multi-cert dir should succeed");
+        let acceptor = snapshot
+            .build_tls_acceptor(temp_dir.path().to_str().unwrap())
+            .await
+            .expect("multi-cert TLS acceptor should build");
+
+        assert!(acceptor.is_some());
+    }
+
+    #[tokio::test]
+    async fn build_tls_acceptor_prefers_multi_cert_when_root_and_domain_pairs_both_exist() {
+        ensure_rustls_crypto_provider();
+        let temp_dir = TempDir::new().unwrap();
+        write_test_cert_pair(temp_dir.path(), "default.local");
+
+        let domain_dir = temp_dir.path().join("example.com");
+        fs::create_dir(&domain_dir).unwrap();
+        write_test_cert_pair(&domain_dir, "example.com");
+
+        let snapshot = TlsMaterialSnapshot::load(temp_dir.path().to_str().unwrap())
+            .await
+            .expect("TLS material load for mixed root/domain layout should succeed");
+        let acceptor = snapshot
+            .build_tls_acceptor(temp_dir.path().to_str().unwrap())
+            .await
+            .expect("multi-cert TLS acceptor should still build when root pair also exists");
+
+        assert!(acceptor.is_some());
+    }
 }
