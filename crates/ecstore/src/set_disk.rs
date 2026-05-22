@@ -68,7 +68,6 @@ use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
-use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
@@ -80,8 +79,11 @@ use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_lock::local_lock::LocalLock;
 use rustfs_lock::{FastLockGuard, LockManager, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use rustfs_object_capacity::capacity_scope::{
+    CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
+};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
@@ -97,7 +99,6 @@ use rustfs_utils::{
     crypto::hex,
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
-use rustfs_workers::workers::Workers;
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
@@ -129,6 +130,7 @@ pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
@@ -267,6 +269,10 @@ fn record_lock_release(bucket: &str, object: &str, lock_id: &str, lock_type: &st
         lock_type = %lock_type,
         "Lock released for deadlock tracking"
     );
+}
+
+fn issue3031_diag_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_ISSUE3031_DIAG_ENABLE, false)
 }
 
 fn build_tiered_decommission_file_info(
@@ -1937,8 +1943,11 @@ impl ObjectOperations for SetDisks {
             None
         };
 
+        // Use the same full xl.meta read path as GetObject metadata resolution.
+        // This avoids HEAD/GetObject metadata visibility skew immediately after
+        // PutObject/CompleteMultipartUpload.
         let (fi, _, _) = self
-            .get_object_fileinfo(bucket, object, opts, false)
+            .get_object_fileinfo(bucket, object, opts, true)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
@@ -3258,6 +3267,7 @@ impl MultipartOperations for SetDisks {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
+        let read_quorum = fi.read_quorum(self.default_read_quorum());
 
         let disks = self.disks.read().await;
 
@@ -3274,7 +3284,7 @@ impl MultipartOperations for SetDisks {
         let part_numbers = uploaded_parts.iter().map(|v| v.part_num).collect::<Vec<usize>>();
 
         let object_parts =
-            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, write_quorum).await?;
+            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum).await?;
 
         if object_parts.len() != uploaded_parts.len() {
             return Err(Error::other("part result number err"));
@@ -3298,6 +3308,21 @@ impl MultipartOperations for SetDisks {
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
                 error!("complete_multipart_upload part error: {:?}", &err);
+                if issue3031_diag_enabled() {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        op = "complete_multipart_upload",
+                        bucket = %bucket,
+                        object = %object,
+                        upload_id = %upload_id,
+                        uploaded_part_num = uploaded_parts[i].part_num,
+                        observed_part_num = part.number,
+                        read_quorum = read_quorum,
+                        write_quorum = write_quorum,
+                        error = %err,
+                        "issue3031_complete_part_error"
+                    );
+                }
             }
 
             if uploaded_parts[i].part_num != part.number {
@@ -5554,6 +5579,36 @@ mod tests {
         let data_dirs = vec![Some(uuid1), Some(uuid2), None];
         let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
         assert_eq!(result, None); // No UUID meets quorum of 2
+    }
+
+    #[test]
+    fn test_object_quorum_from_meta_returns_not_found_when_all_metadata_is_missing() {
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            Some(DiskError::VolumeNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::FileNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+            .expect_err("missing metadata should map to FileNotFound");
+
+        assert_eq!(err, DiskError::FileNotFound);
+    }
+
+    #[test]
+    fn test_object_quorum_from_meta_preserves_read_quorum_for_mixed_failures() {
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            Some(DiskError::VolumeNotFound),
+            Some(DiskError::FileCorrupt),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+            .expect_err("mixed metadata failures should keep quorum semantics");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
     #[test]

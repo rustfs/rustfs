@@ -872,10 +872,7 @@ mod tests {
         let result = call_peer_with_timeout(
             Duration::from_millis(5),
             "peer-3",
-            || async {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                Ok::<_, Error>(build_props("slow"))
-            },
+            std::future::pending::<Result<ServerProperties>>,
             || build_props("fallback"),
         )
         .await;
@@ -919,5 +916,19 @@ mod tests {
         assert!(msg.contains("load_bucket_metadata(bucket-a)"));
         assert!(msg.contains("1 failure(s)"));
         assert!(msg.contains("peer[0]"));
+    }
+
+    #[tokio::test]
+    async fn load_transition_tier_config_reports_unreachable_peers() {
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+        };
+
+        let results = sys.load_transition_tier_config().await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].host.is_empty());
+        assert!(results[0].err.is_some());
+        assert!(results[0].err.as_ref().unwrap().to_string().contains("peer is not reachable"));
     }
 }

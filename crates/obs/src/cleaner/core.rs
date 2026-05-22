@@ -504,7 +504,7 @@ impl LogCleaner {
             if let Some(err) = last_err {
                 return Err(err);
             }
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(windows))]

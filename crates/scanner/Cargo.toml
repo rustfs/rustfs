@@ -42,7 +42,6 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 time = { workspace = true }
 chrono = { workspace = true }
-path-clean = { workspace = true }
 rmp-serde = { workspace = true }
 rustfs-filemeta = { workspace = true }
 tokio-util = { workspace = true }
@@ -51,6 +50,7 @@ http = { workspace = true }
 rand = { workspace = true }
 s3s = { workspace = true }
 metrics = { workspace = true }
+rustfs-data-usage = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

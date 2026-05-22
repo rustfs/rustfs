@@ -54,6 +54,46 @@ Strict mode is available when you explicitly want `/health/ready == 200` as the 
 WAIT_PROBE_MODE=ready ./scripts/run_four_node_cluster_failover_bench.sh
 ```
 
+### Profiling + Trace Validation
+
+The profiling-focused 4-node compose keeps profiling enabled and points RustFS
+to an OTLP/HTTP collector endpoint:
+
+```bash
+docker compose -f .docker/compose/docker-compose.cluster.local-build.profiling-amd64.yml up -d
+```
+
+Important behavior notes:
+
+- `RUSTFS_OBS_ENDPOINT` is the OTLP/HTTP base URL. RustFS automatically sends
+  traces to `/v1/traces`, metrics to `/v1/metrics`, and logs to `/v1/logs`.
+- Startup usually produces logs and metrics first. That does not guarantee
+  visible traces yet.
+- Trace data becomes obvious only after real HTTP/S3/gRPC requests hit RustFS.
+- `RUSTFS_OBS_LOGGER_LEVEL=info` keeps the top-level request span but filters
+  many nested `debug` spans. If Tempo/Jaeger looks sparse, retry with
+  `RUSTFS_OBS_LOGGER_LEVEL=debug` before suspecting the collector.
+
+Minimal trace verification flow:
+
+```bash
+# 1. Start the profiling compose with richer span visibility.
+RUSTFS_OBS_LOGGER_LEVEL=debug \
+docker compose -f .docker/compose/docker-compose.cluster.local-build.profiling-amd64.yml up -d
+
+# 2. Generate real request traffic after startup.
+curl -I http://127.0.0.1:9000/health
+curl -I http://127.0.0.1:9000/health/ready
+
+# 3. Then inspect Tempo or Jaeger.
+# Grafana: http://localhost:3000
+# Jaeger:  http://localhost:16686
+```
+
+If logs and metrics are present but traces are sparse, the most common cause is
+"no real request traffic yet" or "`info` level filtered nested spans", not an
+OTLP routing failure.
+
 ### (Deprecated) Minimal Observability
 
 ```bash

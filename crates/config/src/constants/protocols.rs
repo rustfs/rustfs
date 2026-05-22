@@ -69,6 +69,8 @@ pub const DEFAULT_SFTP_HOST_KEY_DIR: Option<&str> = None;
 pub const ENV_SFTP_ENABLE: &str = "RUSTFS_SFTP_ENABLE";
 pub const ENV_SFTP_ADDRESS: &str = "RUSTFS_SFTP_ADDRESS";
 pub const ENV_SFTP_HOST_KEY_DIR: &str = "RUSTFS_SFTP_HOST_KEY_DIR";
+pub const ENV_SFTP_HOST_KEY_RELOAD_ENABLE: &str = "RUSTFS_SFTP_HOST_KEY_RELOAD_ENABLE";
+pub const ENV_SFTP_HOST_KEY_RELOAD_INTERVAL: &str = "RUSTFS_SFTP_HOST_KEY_RELOAD_INTERVAL";
 pub const ENV_SFTP_IDLE_TIMEOUT: &str = "RUSTFS_SFTP_IDLE_TIMEOUT";
 /// S3 multipart part size in bytes. Default DEFAULT_SFTP_PART_SIZE (16 MiB).
 /// Valid range 5 MiB to 5 GiB (S3 protocol bounds), enforced at startup.
@@ -145,6 +147,12 @@ pub const ENV_SFTP_READ_CACHE_TOTAL_MEM_BYTES: &str = "RUSTFS_SFTP_READ_CACHE_TO
 
 /// Default idle session timeout in seconds.
 pub const DEFAULT_SFTP_IDLE_TIMEOUT: u64 = 600;
+
+/// Default SFTP host key hot reload enabled state.
+pub const DEFAULT_SFTP_HOST_KEY_RELOAD_ENABLE: bool = false;
+
+/// Default SFTP host key hot reload interval in seconds.
+pub const DEFAULT_SFTP_HOST_KEY_RELOAD_INTERVAL: u64 = 30;
 
 /// Default S3 multipart upload part size in bytes (16 MiB).
 ///

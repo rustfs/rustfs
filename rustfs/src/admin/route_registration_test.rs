@@ -14,8 +14,8 @@
 
 use crate::admin::{
     handlers::{
-        audit, bucket_meta, heal, health, kms, module_switch, oidc, pools, profile_admin, quota, rebalance, replication,
-        site_replication, sts, system, tier, user,
+        audit, bucket_meta, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools, profile_admin,
+        quota, rebalance, replication, site_replication, sts, system, tier, user,
     },
     router::{AdminOperation, S3Router},
 };
@@ -54,6 +54,8 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
     audit::register_audit_target_route(router).expect("register audit target route");
     module_switch::register_module_switch_route(router).expect("register module switch route");
+    plugins_catalog::register_plugin_catalog_route(router).expect("register plugin catalog route");
+    plugins_instances::register_plugin_instance_route(router).expect("register plugin instances route");
     replication::register_replication_route(router).expect("register replication route");
     site_replication::register_site_replication_route(router).expect("register site replication route");
     profile_admin::register_profiling_route(router).expect("register profile route");
@@ -101,6 +103,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/audit/target/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/module-switches"));
     assert_route(&router, Method::PUT, &admin_path("/v3/module-switches"));
+    assert_route(&router, Method::GET, &admin_path("/v4/plugins/catalog"));
+    assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances"));
+    assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances/example-id"));
+    assert_route(&router, Method::PUT, &admin_path("/v4/plugins/instances/example-id"));
+    assert_route(&router, Method::DELETE, &admin_path("/v4/plugins/instances/example-id"));
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));

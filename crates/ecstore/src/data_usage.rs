@@ -27,7 +27,7 @@ pub use local_snapshot::{
     data_usage_dir, data_usage_state_dir, ensure_data_usage_layout, read_snapshot as read_local_snapshot, snapshot_file_name,
     snapshot_object_path, snapshot_path, write_snapshot as write_local_snapshot,
 };
-use rustfs_common::data_usage::{
+use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_io_metrics::record_system_path_failure;
@@ -686,7 +686,7 @@ pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_common::data_usage::BucketUsageInfo;
+    use rustfs_data_usage::BucketUsageInfo;
 
     fn aggregate_for_test(
         inputs: Vec<(DiskUsageStatus, Result<Option<LocalUsageSnapshot>, Error>)>,

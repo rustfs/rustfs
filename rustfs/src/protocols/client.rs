@@ -14,11 +14,81 @@
 
 use crate::storage::ecfs::FS;
 use http::{HeaderMap, Method};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Result};
 use tokio_stream::Stream;
 use tracing::trace;
+
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b']')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'^')
+    .add(b'|')
+    .add(b'\\');
+
+const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &PATH_SEGMENT_ENCODE_SET.add(b'&').add(b'+').add(b'/').add(b'=');
+
+fn encode_path_segment(value: &str) -> String {
+    utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
+}
+
+fn encode_object_key_path(key: &str) -> String {
+    key.split('/').map(encode_path_segment).collect::<Vec<_>>().join("/")
+}
+
+fn encode_query_component(value: &str) -> String {
+    utf8_percent_encode(value, QUERY_COMPONENT_ENCODE_SET).to_string()
+}
+
+fn append_query_param(uri: &mut String, first: &mut bool, key: &str, value: Option<&str>) {
+    if *first {
+        uri.push('?');
+        *first = false;
+    } else {
+        uri.push('&');
+    }
+
+    uri.push_str(&encode_query_component(key));
+    if let Some(value) = value {
+        uri.push('=');
+        uri.push_str(&encode_query_component(value));
+    }
+}
+
+fn parse_protocol_uri(uri: String, context: String) -> S3Result<http::Uri> {
+    uri.parse()
+        .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("invalid URI for {context}: {e}")))
+}
+
+fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
+    let mut uri = format!("/{}", encode_path_segment(bucket));
+    let mut first = true;
+    for (key, value) in query {
+        append_query_param(&mut uri, &mut first, key, *value);
+    }
+    parse_protocol_uri(uri, format!("bucket={bucket}"))
+}
+
+fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
+    let mut uri = format!("/{}/{}", encode_path_segment(bucket), encode_object_key_path(key));
+    let mut first = true;
+    for (query_key, value) in query {
+        append_query_param(&mut uri, &mut first, query_key, *value);
+    }
+    parse_protocol_uri(uri, format!("bucket={bucket} key={key}"))
+}
 
 /// Request parameters for creating S3 requests
 #[derive(Debug)]
@@ -131,7 +201,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build GetObjectInput: {}", e))
         })?;
 
-        let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
+        let uri = build_object_uri(bucket, key, &[])?;
         let req = self
             .create_request(
                 input,
@@ -162,7 +232,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.clone();
         let key = input.key.clone();
-        let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
+        let uri = build_object_uri(&bucket, &key, &[])?;
 
         let mut headers = HeaderMap::default();
         if let Some(ref body) = input.body {
@@ -213,7 +283,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build DeleteObjectInput: {}", e))
             })?;
 
-        let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
+        let uri = build_object_uri(bucket, key, &[])?;
         let req = self
             .create_request(
                 input,
@@ -251,7 +321,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build HeadObjectInput: {}", e))
             })?;
 
-        let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
+        let uri = build_object_uri(bucket, key, &[])?;
         let req = self
             .create_request(
                 input,
@@ -279,7 +349,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build HeadBucketInput: {}", e))
         })?;
 
-        let uri: http::Uri = format!("/{}", bucket).parse().unwrap_or_default();
+        let uri = build_bucket_uri(bucket, &[])?;
         let req = self
             .create_request(
                 input,
@@ -309,7 +379,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         trace!("Protocol storage client ListObjectsV2 request: bucket={}", input.bucket);
 
         let bucket = input.bucket.clone();
-        let uri: http::Uri = format!("/{}?list-type=2", bucket).parse().unwrap_or_default();
+        let uri = build_bucket_uri(&bucket, &[("list-type", Some("2"))])?;
         let req = self
             .create_request(
                 input,
@@ -364,7 +434,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build CreateBucketInput: {}", e))
         })?;
 
-        let uri: http::Uri = format!("/{}", bucket).parse().unwrap_or_default();
+        let uri = build_bucket_uri(bucket, &[])?;
         let req = self
             .create_request(
                 input,
@@ -413,7 +483,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build GetObjectInput: {}", e))
             })?;
 
-        let uri: http::Uri = format!("/{}{}", bucket, key).parse().unwrap_or_default();
+        let uri = build_object_uri(bucket, key, &[])?;
         let req = self
             .create_request(
                 input,
@@ -444,12 +514,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.clone();
         let key = input.key.clone();
-        let uri: http::Uri = format!("/{}{}", bucket, key).parse().map_err(|e| {
-            s3s::S3Error::with_message(
-                s3s::S3ErrorCode::InvalidRequest,
-                format!("invalid URI for bucket={} key={}: {}", bucket, key, e),
-            )
-        })?;
+        let uri = build_object_uri(&bucket, &key, &[])?;
 
         let req = self
             .create_request(
@@ -478,7 +543,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build DeleteBucketInput: {}", e))
         })?;
 
-        let uri: http::Uri = format!("/{}", bucket).parse().unwrap_or_default();
+        let uri = build_bucket_uri(bucket, &[])?;
         let req = self
             .create_request(
                 input,
@@ -512,12 +577,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.clone();
         let key = input.key.clone();
-        let uri: http::Uri = format!("/{}{}?uploads", bucket, key).parse().map_err(|e| {
-            s3s::S3Error::with_message(
-                s3s::S3ErrorCode::InvalidRequest,
-                format!("invalid URI for bucket={} key={}: {}", bucket, key, e),
-            )
-        })?;
+        let uri = build_object_uri(&bucket, &key, &[("uploads", None)])?;
 
         let req = self
             .create_request(
@@ -554,14 +614,15 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let key = input.key.clone();
         let part_number = input.part_number;
         let upload_id = input.upload_id.clone();
-        let uri: http::Uri = format!("/{}{}?partNumber={}&uploadId={}", bucket, key, part_number, upload_id)
-            .parse()
-            .map_err(|e| {
-                s3s::S3Error::with_message(
-                    s3s::S3ErrorCode::InvalidRequest,
-                    format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
-                )
-            })?;
+        let part_number = part_number.to_string();
+        let uri = build_object_uri(
+            &bucket,
+            &key,
+            &[
+                ("partNumber", Some(part_number.as_str())),
+                ("uploadId", Some(upload_id.as_str())),
+            ],
+        )?;
 
         // Set content-length from the body size hint so ecfs can bound
         // the read and validate the part size. Prefer the exact upper
@@ -618,12 +679,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         let upload_id = input.upload_id.clone();
-        let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id).parse().map_err(|e| {
-            s3s::S3Error::with_message(
-                s3s::S3ErrorCode::InvalidRequest,
-                format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
-            )
-        })?;
+        let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
 
         let req = self
             .create_request(
@@ -659,12 +715,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.clone();
         let key = input.key.clone();
         let upload_id = input.upload_id.clone();
-        let uri: http::Uri = format!("/{}{}?uploadId={}", bucket, key, upload_id).parse().map_err(|e| {
-            s3s::S3Error::with_message(
-                s3s::S3ErrorCode::InvalidRequest,
-                format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
-            )
-        })?;
+        let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
 
         let req = self
             .create_request(
@@ -701,14 +752,15 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let key = input.key.clone();
         let part_number = input.part_number;
         let upload_id = input.upload_id.clone();
-        let uri: http::Uri = format!("/{}{}?partNumber={}&uploadId={}", bucket, key, part_number, upload_id)
-            .parse()
-            .map_err(|e| {
-                s3s::S3Error::with_message(
-                    s3s::S3ErrorCode::InvalidRequest,
-                    format!("invalid URI for bucket={} key={} upload_id={}: {}", bucket, key, upload_id, e),
-                )
-            })?;
+        let part_number = part_number.to_string();
+        let uri = build_object_uri(
+            &bucket,
+            &key,
+            &[
+                ("partNumber", Some(part_number.as_str())),
+                ("uploadId", Some(upload_id.as_str())),
+            ],
+        )?;
 
         let req = self
             .create_request(
@@ -728,5 +780,46 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             Ok(response) => Ok(response.output),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_object_uri_encodes_key_segments_without_flattening_slashes() {
+        let uri = build_object_uri("bucket", "dir/file name%raw?x", &[]).expect("uri should parse");
+
+        assert_eq!(uri.to_string(), "/bucket/dir/file%20name%25raw%3Fx");
+    }
+
+    #[test]
+    fn build_object_uri_preserves_leading_slash_in_object_key() {
+        let uri = build_object_uri("bucket", "/absolute/key", &[]).expect("uri should parse");
+
+        assert_eq!(uri.to_string(), "/bucket//absolute/key");
+    }
+
+    #[test]
+    fn build_object_uri_encodes_multipart_query_values() {
+        let uri = build_object_uri(
+            "bucket",
+            "multipart object",
+            &[("partNumber", Some("7")), ("uploadId", Some("upload/id+with=value"))],
+        )
+        .expect("uri should parse");
+
+        assert_eq!(
+            uri.to_string(),
+            "/bucket/multipart%20object?partNumber=7&uploadId=upload%2Fid%2Bwith%3Dvalue"
+        );
+    }
+
+    #[test]
+    fn build_bucket_uri_encodes_list_type_query() {
+        let uri = build_bucket_uri("bucket", &[("list-type", Some("2"))]).expect("uri should parse");
+
+        assert_eq!(uri.to_string(), "/bucket?list-type=2");
     }
 }

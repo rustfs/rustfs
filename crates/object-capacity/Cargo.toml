@@ -35,7 +35,6 @@ harness = false
 workspace = true
 
 [dependencies]
-rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-io-metrics = { workspace = true }
 rustfs-utils = { workspace = true }

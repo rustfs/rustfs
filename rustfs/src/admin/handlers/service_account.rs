@@ -120,18 +120,21 @@ fn map_temp_account_lookup_error(err: rustfs_iam::error::Error, action: &str) ->
     }
 }
 
+fn parse_service_account_policy(policy: &serde_json::Value) -> S3Result<Policy> {
+    let policy_bytes = serde_json::to_vec(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
+    Policy::parse_config(&policy_bytes).map_err(|e| {
+        debug!("parse service account policy failed, e: {:?}", e);
+        let message = e.to_string().replace('\'', "");
+        s3_error!(InvalidArgument, "invalid service account policy: {}", message)
+    })
+}
+
 fn parse_update_service_account_policy(new_policy: Option<serde_json::Value>) -> S3Result<Option<Policy>> {
     let Some(policy) = new_policy else {
         return Ok(None);
     };
 
-    let policy_bytes = serde_json::to_vec(&policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
-    let sp = Policy::parse_config(&policy_bytes).map_err(|e| {
-        debug!("parse policy failed, e: {:?}", e);
-        s3_error!(InvalidArgument, "parse policy failed")
-    })?;
-
-    Ok(Some(sp))
+    Ok(Some(parse_service_account_policy(&policy)?))
 }
 
 pub fn register_service_account_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -219,13 +222,7 @@ impl Operation for AddServiceAccount {
         create_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
 
         let session_policy = if let Some(policy) = &create_req.policy {
-            let policy_bytes =
-                serde_json::to_vec(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
-            let p = Policy::parse_config(&policy_bytes).map_err(|e| {
-                debug!("parse policy failed, e: {:?}", e);
-                s3_error!(InvalidArgument, "parse policy failed")
-            })?;
-            Some(p)
+            Some(parse_service_account_policy(policy)?)
         } else {
             None
         };
@@ -1535,6 +1532,23 @@ mod tests {
         let policy = policy.unwrap();
         assert!(policy.version.is_empty());
         assert!(policy.statements.is_empty());
+    }
+
+    #[test]
+    fn parse_service_account_policy_reports_missing_resource() {
+        let err = parse_service_account_policy(&json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"]
+                }
+            ]
+        }))
+        .expect_err("policy without Resource should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("invalid service account policy: Resource is empty"));
     }
 
     #[test]

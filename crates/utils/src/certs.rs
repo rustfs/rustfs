@@ -288,6 +288,10 @@ pub fn certs_error(err: String) -> Error {
     Error::other(err)
 }
 
+fn is_discoverable_cert_domain_dir(domain_name: &str) -> bool {
+    !domain_name.starts_with('.')
+}
+
 /// Load all certificates and private keys in the directory
 /// This function loads all certificate and private key pairs from the specified directory.
 /// It looks for files named `options.cert_filename` and `options.key_filename` in each subdirectory.
@@ -347,6 +351,10 @@ pub fn load_all_certs_from_directory(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| certs_error(format!("invalid domain name directory:{path:?}")))?;
+            if !is_discoverable_cert_domain_dir(domain_name) {
+                debug!("skip internal certificate directory: {:?}", path);
+                continue;
+            }
 
             // find certificate and private key files
             let cert_path = path.join(&options.cert_filename); // e.g., rustfs_cert.pem
@@ -475,6 +483,13 @@ mod tests {
 
     fn default_load_options(path: impl Into<PathBuf>) -> CertDirectoryLoadOptions {
         CertDirectoryLoadOptions::builder(path, "rustfs_cert.pem", "rustfs_key.pem").build()
+    }
+
+    fn write_test_cert_pair(dir: &std::path::Path) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["example.com".to_string()]).unwrap();
+        fs::write(dir.join("rustfs_cert.pem"), cert.pem()).unwrap();
+        fs::write(dir.join("rustfs_key.pem"), signing_key.serialize_pem()).unwrap();
     }
 
     #[test]
@@ -673,6 +688,30 @@ mod tests {
                 .to_string()
                 .contains("No valid certificate/private key pair found")
         );
+    }
+
+    #[test]
+    fn test_load_all_certs_skips_kubernetes_secret_projection_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+        write_test_cert_pair(temp_dir.path());
+
+        let domain_dir = temp_dir.path().join("example.com");
+        fs::create_dir(&domain_dir).unwrap();
+        write_test_cert_pair(&domain_dir);
+
+        for internal_dir_name in ["..data", "..2026_04_28_18_33_53.4209048473"] {
+            let internal_dir = temp_dir.path().join(internal_dir_name);
+            fs::create_dir(&internal_dir).unwrap();
+            write_test_cert_pair(&internal_dir);
+        }
+
+        let certs = load_all_certs_from_directory(default_load_options(temp_dir.path())).unwrap();
+
+        assert!(certs.contains_key("default"));
+        assert!(certs.contains_key("example.com"));
+        assert!(!certs.contains_key("..data"));
+        assert!(!certs.contains_key("..2026_04_28_18_33_53.4209048473"));
+        assert_eq!(certs.len(), 2);
     }
 
     #[test]

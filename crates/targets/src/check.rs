@@ -298,3 +298,61 @@ pub async fn check_amqp_broker_available(args: &crate::target::amqp::AMQPArgs) -
         Err(_) => Err(crate::TargetError::Timeout("AMQP connection timed out".to_string())),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        TargetError,
+        target::{TargetType, mysql::MySqlArgs},
+    };
+
+    fn mysql_args() -> MySqlArgs {
+        MySqlArgs {
+            enable: true,
+            dsn_string: "rustfs:password@tcp(127.0.0.1:3306)/rustfs_events".to_string(),
+            table: "rustfs_events".to_string(),
+            format: "access".to_string(),
+            tls_ca: String::new(),
+            tls_client_cert: String::new(),
+            tls_client_key: String::new(),
+            queue_dir: String::new(),
+            queue_limit: 100,
+            max_open_connections: 2,
+            target_type: TargetType::NotifyEvent,
+        }
+    }
+
+    #[test]
+    fn check_mysql_server_available_rejects_invalid_table_before_connecting() {
+        let mut args = mysql_args();
+        args.table = "rustfs-events".to_string();
+
+        let err = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(check_mysql_server_available(&args))
+            .expect_err("invalid table should fail before opening a network connection");
+
+        match err {
+            TargetError::Configuration(msg) => assert!(msg.contains("not a valid identifier")),
+            other => panic!("expected configuration error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_mysql_server_available_rejects_unpaired_tls_client_fields_before_connecting() {
+        let mut args = mysql_args();
+        args.dsn_string = "rustfs:password@tcp(127.0.0.1:3306)/rustfs_events?tls=true".to_string();
+        args.tls_client_cert = "/etc/ssl/mysql/client.pem".to_string();
+
+        let err = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(check_mysql_server_available(&args))
+            .expect_err("unpaired TLS client fields should fail before opening a network connection");
+
+        match err {
+            TargetError::Configuration(msg) => assert!(msg.contains("must be specified together")),
+            other => panic!("expected configuration error, got {other:?}"),
+        }
+    }
+}

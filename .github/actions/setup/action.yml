@@ -53,18 +53,19 @@ runs:
           musl-tools \
           build-essential \
           pkg-config \
-          libssl-dev
+          libssl-dev \
+          protobuf-compiler
 
     - name: Install protoc
-      uses: arduino/setup-protoc@v3
+      uses: rustfs/setup-protoc@v3.0.1
       with:
-        version: "33.1"
-        repo-token: ${{ inputs.github-token }}
+        version: "34.1"
+        repo-token: ${{ github.token }}
 
     - name: Install flatc
-      uses: Nugine/setup-flatc@v1.2.4
+      uses: Nugine/setup-flatc@v1
       with:
-        version: "25.9.23"
+        version: "25.12.19"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable

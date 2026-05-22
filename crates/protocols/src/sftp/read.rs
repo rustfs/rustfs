@@ -15,7 +15,7 @@
 //! Read-side operation handlers: open_read and the body of the read()
 //! Handler trait method.
 
-use super::attrs::{s3_attrs_to_sftp, timestamp_to_mtime};
+use super::attrs::{apply_user_metadata_to_sftp_attrs, s3_attrs_to_sftp, timestamp_to_mtime};
 use super::constants::limits::{MAX_READ_LEN, READ_CACHE_DISABLED};
 use super::driver::SftpDriver;
 use super::errors::{SftpError, s3_error_to_sftp};
@@ -54,7 +54,10 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             .await?;
         let size = head.content_length.unwrap_or(0).max(0) as u64;
         let mtime = timestamp_to_mtime(head.last_modified);
-        let attrs = s3_attrs_to_sftp(size, mtime, false);
+        let mut attrs = s3_attrs_to_sftp(size, mtime, false);
+        if let Some(metadata) = head.metadata {
+            apply_user_metadata_to_sftp_attrs(&mut attrs, &metadata);
+        }
 
         let read_cache = self.new_read_cache();
         let handle = self.allocate_handle(HandleState::File {

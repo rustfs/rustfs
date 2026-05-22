@@ -1,0 +1,4 @@
+interface:
+  display_name: "RustFS Release Bump"
+  short_description: "Prepare RustFS release branches like PR #2957."
+  default_prompt: "Use $rustfs-release-version-bump to prepare a RustFS release version, ask about any unclear version policy, and finish the commit/push/PR flow."

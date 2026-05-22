@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Target, TargetError, config::collect_target_configs};
+use crate::{
+    PluginRuntimeAdapter, RuntimeActivation, Target, TargetError,
+    config::collect_target_configs,
+    manifest::{TargetPluginManifest, builtin_target_manifest},
+};
 use hashbrown::HashMap;
 use rustfs_ecstore::config::{Config, KVS};
 use serde::Serialize;
@@ -41,12 +45,70 @@ pub enum TargetRequestValidator {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetAdminMetadata {
+    subsystem: &'static str,
+    request_validator: TargetRequestValidator,
+}
+
+impl TargetAdminMetadata {
+    pub fn new(subsystem: &'static str, request_validator: TargetRequestValidator) -> Self {
+        Self {
+            subsystem,
+            request_validator,
+        }
+    }
+
+    #[inline]
+    pub fn subsystem(&self) -> &'static str {
+        self.subsystem
+    }
+
+    #[inline]
+    pub fn request_validator(&self) -> TargetRequestValidator {
+        self.request_validator
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinTargetAdminDescriptor {
+    manifest: TargetPluginManifest,
+    valid_fields: &'static [&'static str],
+    admin: TargetAdminMetadata,
+}
+
+impl BuiltinTargetAdminDescriptor {
+    pub fn new(manifest: TargetPluginManifest, valid_fields: &'static [&'static str], admin: TargetAdminMetadata) -> Self {
+        Self {
+            manifest,
+            valid_fields,
+            admin,
+        }
+    }
+
+    #[inline]
+    pub fn manifest(&self) -> &TargetPluginManifest {
+        &self.manifest
+    }
+
+    #[inline]
+    pub fn valid_fields(&self) -> &'static [&'static str] {
+        self.valid_fields
+    }
+
+    #[inline]
+    pub fn admin_metadata(&self) -> TargetAdminMetadata {
+        self.admin
+    }
+}
+
 #[derive(Clone)]
 pub struct TargetPluginDescriptor<E>
 where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
     create_target: TargetCreateFn<E>,
+    manifest: TargetPluginManifest,
     target_type: &'static str,
     valid_fields: &'static [&'static str],
     valid_fields_set: Arc<HashSet<String>>,
@@ -67,9 +129,23 @@ where
         Create: Fn(String, &KVS) -> Result<BoxedTarget<E>, TargetError> + Send + Sync + 'static,
         Validate: Fn(&KVS) -> Result<(), TargetError> + Send + Sync + 'static,
     {
+        Self::with_manifest(builtin_target_manifest(target_type), valid_fields, validate_config, create_target)
+    }
+
+    pub fn with_manifest<Create, Validate>(
+        manifest: TargetPluginManifest,
+        valid_fields: &'static [&'static str],
+        validate_config: Validate,
+        create_target: Create,
+    ) -> Self
+    where
+        Create: Fn(String, &KVS) -> Result<BoxedTarget<E>, TargetError> + Send + Sync + 'static,
+        Validate: Fn(&KVS) -> Result<(), TargetError> + Send + Sync + 'static,
+    {
         Self {
             create_target: Arc::new(create_target),
-            target_type,
+            manifest,
+            target_type: manifest.target_type,
             valid_fields,
             valid_fields_set: Arc::new(valid_fields.iter().map(|field| (*field).to_string()).collect()),
             validate_config: Arc::new(validate_config),
@@ -79,6 +155,11 @@ where
     #[inline]
     pub fn target_type(&self) -> &'static str {
         self.target_type
+    }
+
+    #[inline]
+    pub fn manifest(&self) -> &TargetPluginManifest {
+        &self.manifest
     }
 
     #[inline]
@@ -108,8 +189,7 @@ where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
     plugin: TargetPluginDescriptor<E>,
-    request_validator: TargetRequestValidator,
-    subsystem: &'static str,
+    admin: TargetAdminMetadata,
 }
 
 impl<E> BuiltinTargetDescriptor<E>
@@ -119,8 +199,7 @@ where
     pub fn new(subsystem: &'static str, request_validator: TargetRequestValidator, plugin: TargetPluginDescriptor<E>) -> Self {
         Self {
             plugin,
-            request_validator,
-            subsystem,
+            admin: TargetAdminMetadata::new(subsystem, request_validator),
         }
     }
 
@@ -130,13 +209,31 @@ where
     }
 
     #[inline]
+    pub fn admin_metadata(&self) -> TargetAdminMetadata {
+        self.admin
+    }
+
+    #[inline]
     pub fn request_validator(&self) -> TargetRequestValidator {
-        self.request_validator
+        self.admin.request_validator()
     }
 
     #[inline]
     pub fn subsystem(&self) -> &'static str {
-        self.subsystem
+        self.admin.subsystem()
+    }
+}
+
+impl<E> From<BuiltinTargetDescriptor<E>> for BuiltinTargetAdminDescriptor
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    fn from(descriptor: BuiltinTargetDescriptor<E>) -> Self {
+        Self::new(
+            *descriptor.plugin().manifest(),
+            descriptor.plugin().valid_fields(),
+            descriptor.admin_metadata(),
+        )
     }
 }
 
@@ -220,6 +317,19 @@ where
         info!(count = successful_targets.len(), "All target processing completed");
         Ok(successful_targets)
     }
+
+    pub async fn create_activation_from_config<A>(
+        &self,
+        config: &Config,
+        route_prefix: &str,
+        adapter: &A,
+    ) -> Result<RuntimeActivation<E>, TargetError>
+    where
+        A: PluginRuntimeAdapter<E> + ?Sized,
+    {
+        let targets = self.create_targets_from_config(config, route_prefix).await?;
+        Ok(adapter.activate_with_replay(targets).await)
+    }
 }
 
 pub fn boxed_target<E, T>(target: T) -> BoxedTarget<E>
@@ -228,4 +338,107 @@ where
     T: Target<E> + Send + Sync + 'static,
 {
     Box::new(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TargetPluginDescriptor, TargetPluginRegistry};
+    use crate::runtime::adapter::BuiltinPluginRuntimeAdapter;
+    use crate::store::{Key, Store};
+    use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
+    use crate::{StoreError, Target, TargetError};
+    use async_trait::async_trait;
+    use rustfs_config::ENABLE_KEY;
+    use rustfs_ecstore::config::{Config, KVS};
+    use serde::{Serialize, de::DeserializeOwned};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct TestTarget {
+        id: crate::arn::TargetID,
+    }
+
+    #[async_trait]
+    impl<E> Target<E> for TestTarget
+    where
+        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    {
+        fn id(&self) -> crate::arn::TargetID {
+            self.id.clone()
+        }
+
+        async fn is_active(&self) -> Result<bool, TargetError> {
+            Ok(true)
+        }
+
+        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
+            None
+        }
+
+        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
+            Box::new(self.clone())
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    fn builtin_adapter() -> BuiltinPluginRuntimeAdapter<String> {
+        BuiltinPluginRuntimeAdapter::new(
+            Arc::new(|_event| Box::pin(async {})),
+            Arc::new(|_target_id, _has_replay| {}),
+            None,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            "stopping plugin registry test replay worker",
+        )
+    }
+
+    #[tokio::test]
+    async fn registry_creates_activation_from_config_via_runtime_adapter() {
+        let mut registry = TargetPluginRegistry::new();
+        registry.register(TargetPluginDescriptor::new(
+            "test",
+            &[ENABLE_KEY, "endpoint"],
+            |_config| Ok(()),
+            |id, _config| {
+                Ok(Box::new(TestTarget {
+                    id: crate::arn::TargetID::new(id, "test".to_string()),
+                }))
+            },
+        ));
+
+        let mut cfg = Config(HashMap::new());
+        let mut section = HashMap::new();
+        let mut primary = KVS::new();
+        primary.insert(ENABLE_KEY.to_string(), "on".to_string());
+        primary.insert("endpoint".to_string(), "https://example.com/hook".to_string());
+        section.insert("primary".to_string(), primary);
+        cfg.0.insert("notify_test".to_string(), section);
+
+        let adapter = builtin_adapter();
+        let activation = registry
+            .create_activation_from_config(&cfg, "notify_", &adapter)
+            .await
+            .expect("activation should be created through runtime adapter");
+
+        assert_eq!(activation.targets.len(), 1);
+        assert_eq!(activation.targets[0].id().to_string(), "primary:test");
+        assert!(activation.replay_workers.is_empty());
+    }
 }

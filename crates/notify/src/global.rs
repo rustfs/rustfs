@@ -17,7 +17,7 @@ use crate::{
     NotificationSystem, NotificationTargetMetricSnapshot,
 };
 use rustfs_ecstore::config::Config;
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
 use std::sync::{Arc, OnceLock};
 use tracing::error;
@@ -31,6 +31,20 @@ pub async fn initialize(config: Config) -> Result<(), NotificationError> {
     let system = NotificationSystem::new(config);
     // `init` is asynchronous and responsible for performing I/O-intensive initialization
     system.init().await?;
+
+    match NOTIFICATION_SYSTEM.set(Arc::new(system)) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized)),
+    }
+}
+
+/// Initialize the global notification system only for live in-process consumers.
+///
+/// This does not load configured notification targets or bucket rules. It exists so
+/// ListenBucketNotification clients can receive live events even when external
+/// notification targets are disabled.
+pub fn initialize_live_events() -> Result<(), NotificationError> {
+    let system = NotificationSystem::new(Config::new());
 
     match NOTIFICATION_SYSTEM.set(Arc::new(system)) {
         Ok(_) => Ok(()),

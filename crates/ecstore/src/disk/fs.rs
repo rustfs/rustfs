@@ -545,7 +545,7 @@ mod tests {
 
         // Create two different files
         tokio::fs::write(&file1_path, b"content1").await.unwrap();
-        tokio::fs::write(&file2_path, b"content2").await.unwrap();
+        tokio::fs::write(&file2_path, b"different content").await.unwrap();
 
         // Get metadata
         let metadata1 = tokio::fs::metadata(&file1_path).await.unwrap();

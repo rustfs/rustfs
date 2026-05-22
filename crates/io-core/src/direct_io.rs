@@ -287,7 +287,7 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         {
             // Non-Linux should return UnsupportedPlatform
-            let file = std::fs::File::open("/dev/null").unwrap();
+            let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
             assert!(matches!(DirectIoReader::new(file, 0, 512), Err(DirectIoError::UnsupportedPlatform)));
         }
     }

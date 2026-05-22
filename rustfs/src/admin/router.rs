@@ -65,7 +65,7 @@ use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
@@ -510,7 +510,7 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         })
         .transpose()?;
     let version_id = query_value_exact(&filtered_uri, "versionId").filter(|value| !value.is_empty());
-    let range = parse_optional_header(&req.headers, http::header::RANGE)?
+    let range = parse_optional_header(&req.headers, header::RANGE)?
         .map(|value| Range::parse(&value).map_err(|_| s3_error!(InvalidArgument, "Range header is invalid")))
         .transpose()?;
 
@@ -520,13 +520,10 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         .part_number(part_number)
         .version_id(version_id)
         .range(range)
-        .if_match(parse_optional_etag_condition_header::<IfMatch>(&req.headers, http::header::IF_MATCH)?)
-        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(
-            &req.headers,
-            http::header::IF_NONE_MATCH,
-        )?)
-        .if_modified_since(parse_optional_timestamp_header(&req.headers, http::header::IF_MODIFIED_SINCE)?)
-        .if_unmodified_since(parse_optional_timestamp_header(&req.headers, http::header::IF_UNMODIFIED_SINCE)?);
+        .if_match(parse_optional_etag_condition_header::<IfMatch>(&req.headers, header::IF_MATCH)?)
+        .if_none_match(parse_optional_etag_condition_header::<IfNoneMatch>(&req.headers, header::IF_NONE_MATCH)?)
+        .if_modified_since(parse_optional_timestamp_header(&req.headers, header::IF_MODIFIED_SINCE)?)
+        .if_unmodified_since(parse_optional_timestamp_header(&req.headers, header::IF_UNMODIFIED_SINCE)?);
 
     builder = builder.sse_customer_algorithm(parse_optional_header(
         &req.headers,
@@ -3806,7 +3803,7 @@ mod tests {
     fn event_matches_listen_notification_respects_bucket_event_and_object_filters() {
         let filter = ListenNotificationFilter {
             bucket: Some("demo-bucket".to_string()),
-            event_mask: EventName::ObjectCreatedPut.mask() | EventName::ObjectCreatedPost.mask(),
+            event_mask: rustfs_s3_ops::put_object_created_event_mask(),
             prefix: Some("logs/".to_string()),
             suffix: Some(".json".to_string()),
         };

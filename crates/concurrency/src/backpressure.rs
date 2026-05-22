@@ -14,15 +14,17 @@
 
 //! Backpressure management
 
-use rustfs_io_core::{BackpressureMonitor as CoreBackpressureMonitor, BackpressureState};
+use rustfs_io_core::{
+    BackpressureConfig as CoreBackpressureConfig, BackpressureMonitor as CoreBackpressureMonitor, BackpressureState,
+};
 use rustfs_io_metrics::backpressure_metrics;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{DuplexStream, duplex};
 
-/// Backpressure configuration
-#[derive(Debug, Clone)]
-pub struct BackpressureConfig {
+/// Facade policy for duplex-pipe watermark backpressure.
+#[derive(Debug, Clone, Copy)]
+pub struct PipeBackpressurePolicy {
     /// Buffer size in bytes
     pub buffer_size: usize,
     /// High watermark percentage
@@ -31,7 +33,7 @@ pub struct BackpressureConfig {
     pub low_watermark: u32,
 }
 
-impl Default for BackpressureConfig {
+impl Default for PipeBackpressurePolicy {
     fn default() -> Self {
         Self {
             buffer_size: 4 * 1024 * 1024, // 4MB
@@ -41,7 +43,7 @@ impl Default for BackpressureConfig {
     }
 }
 
-impl BackpressureConfig {
+impl PipeBackpressurePolicy {
     /// Calculate high watermark threshold in bytes
     pub fn high_watermark_bytes(&self) -> usize {
         (self.buffer_size as u64 * self.high_watermark as u64 / 100) as usize
@@ -51,40 +53,57 @@ impl BackpressureConfig {
     pub fn low_watermark_bytes(&self) -> usize {
         (self.buffer_size as u64 * self.low_watermark as u64 / 100) as usize
     }
+
+    /// Convert the facade policy into the reusable io-core admission-pressure config.
+    ///
+    /// The concurrency layer still owns duplex buffer sizing, but the shared
+    /// overload/admission primitive lives in `io-core`.
+    pub fn to_core_config(&self) -> CoreBackpressureConfig {
+        CoreBackpressureConfig {
+            max_concurrent: 32,
+            high_water_mark: self.high_watermark as f64 / 100.0,
+            low_water_mark: self.low_watermark as f64 / 100.0,
+            cooldown: std::time::Duration::from_millis(100),
+            enabled: true,
+        }
+    }
 }
 
 /// Backpressure manager
 pub struct BackpressureManager {
-    config: BackpressureConfig,
+    config: PipeBackpressurePolicy,
+    core_config: CoreBackpressureConfig,
     monitor: Arc<CoreBackpressureMonitor>,
 }
 
 impl BackpressureManager {
     /// Create a new backpressure manager
     pub fn new(buffer_size: usize, high_watermark: u32, low_watermark: u32) -> Self {
-        let config = BackpressureConfig {
+        Self::from_policy(PipeBackpressurePolicy {
             buffer_size,
             high_watermark,
             low_watermark,
-        };
+        })
+    }
 
-        let core_config = rustfs_io_core::BackpressureConfig {
-            max_concurrent: 32,
-            high_water_mark: high_watermark as f64 / 100.0,
-            low_water_mark: low_watermark as f64 / 100.0,
-            cooldown: std::time::Duration::from_millis(100),
-            enabled: true,
-        };
-
+    /// Create a new backpressure manager from the facade policy type.
+    pub fn from_policy(config: PipeBackpressurePolicy) -> Self {
+        let core_config = config.to_core_config();
         Self {
             config,
+            core_config: core_config.clone(),
             monitor: Arc::new(CoreBackpressureMonitor::new(core_config)),
         }
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &BackpressureConfig {
+    pub fn config(&self) -> &PipeBackpressurePolicy {
         &self.config
+    }
+
+    /// Get the derived io-core admission-pressure configuration.
+    pub fn core_config(&self) -> &CoreBackpressureConfig {
+        &self.core_config
     }
 
     /// Get the monitor
@@ -94,7 +113,7 @@ impl BackpressureManager {
 
     /// Create a backpressure pipe
     pub fn create_pipe(&self) -> BackpressurePipe {
-        BackpressurePipe::new(self.config.clone(), self.monitor.clone())
+        BackpressurePipe::new(self.config, self.monitor.clone())
     }
 
     /// Get current state
@@ -112,13 +131,24 @@ impl BackpressureManager {
 pub struct BackpressurePipe {
     reader: DuplexStream,
     writer: DuplexStream,
-    config: BackpressureConfig,
+    config: PipeBackpressurePolicy,
     monitor: Arc<CoreBackpressureMonitor>,
     created_at: Instant,
 }
 
+/// Shared pipe metadata snapshot for facade-level backpressure pipes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackpressurePipeMeta {
+    /// Configured duplex buffer capacity in bytes.
+    pub buffer_capacity: usize,
+    /// Current backpressure state reported by the shared core monitor.
+    pub state: BackpressureState,
+    /// Age of the pipe since creation.
+    pub age: std::time::Duration,
+}
+
 impl BackpressurePipe {
-    fn new(config: BackpressureConfig, monitor: Arc<CoreBackpressureMonitor>) -> Self {
+    fn new(config: PipeBackpressurePolicy, monitor: Arc<CoreBackpressureMonitor>) -> Self {
         let (reader, writer) = duplex(config.buffer_size);
 
         Self {
@@ -146,7 +176,7 @@ impl BackpressurePipe {
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &BackpressureConfig {
+    pub fn config(&self) -> &PipeBackpressurePolicy {
         &self.config
     }
 
@@ -160,6 +190,15 @@ impl BackpressurePipe {
         self.created_at.elapsed()
     }
 
+    /// Get a compact metadata snapshot for the pipe.
+    pub fn meta(&self) -> BackpressurePipeMeta {
+        BackpressurePipeMeta {
+            buffer_capacity: self.config.buffer_size,
+            state: self.state(),
+            age: self.age(),
+        }
+    }
+
     /// Check if should apply backpressure
     pub fn should_apply_backpressure(&self) -> bool {
         let should = self.monitor.should_apply_backpressure();
@@ -170,43 +209,24 @@ impl BackpressurePipe {
     }
 }
 
-/// Backpressure event
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct BackpressureEvent {
-    /// Event timestamp
-    pub timestamp: Instant,
-    /// Event type
-    pub event_type: BackpressureEventType,
-    /// Buffer usage
-    pub buffer_usage: usize,
-    /// Buffer capacity
-    pub buffer_capacity: usize,
-}
-
-/// Backpressure event type
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub enum BackpressureEventType {
-    /// High watermark reached
-    HighWatermarkReached,
-    /// High watermark exited
-    HighWatermarkExited,
-    /// Backpressure applied
-    BackpressureApplied,
-    /// Backpressure released
-    BackpressureReleased,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_backpressure_config() {
-        let config = BackpressureConfig::default();
+        let config = PipeBackpressurePolicy::default();
         assert_eq!(config.buffer_size, 4 * 1024 * 1024);
         assert!(config.high_watermark > config.low_watermark);
+    }
+
+    #[test]
+    fn test_backpressure_policy_to_core_config() {
+        let policy = PipeBackpressurePolicy::default();
+        let core = policy.to_core_config();
+        assert_eq!(core.high_water_mark, policy.high_watermark as f64 / 100.0);
+        assert_eq!(core.low_water_mark, policy.low_watermark as f64 / 100.0);
+        assert!(core.enabled);
     }
 
     #[test]
@@ -220,5 +240,6 @@ mod tests {
         let manager = BackpressureManager::new(1024, 80, 50);
         let pipe = manager.create_pipe();
         assert_eq!(pipe.state(), BackpressureState::Normal);
+        assert_eq!(pipe.meta().buffer_capacity, 1024);
     }
 }

@@ -155,6 +155,12 @@ pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
 /// Environment variable for server secret key file.
 pub const ENV_RUSTFS_SECRET_KEY_FILE: &str = "RUSTFS_SECRET_KEY_FILE";
 
+/// Environment variable to explicitly allow public default root credentials.
+///
+/// This is intended for local development only. Production startup paths should
+/// provide non-default `RUSTFS_ACCESS_KEY` and `RUSTFS_SECRET_KEY` values.
+pub const ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS: &str = "RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS";
+
 /// Environment variable for server OBS endpoint.
 pub const ENV_RUSTFS_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
 
@@ -293,9 +299,9 @@ pub const DEFAULT_OBS_LOGS_EXPORT_ENABLED: bool = true;
 
 /// Default profiling export enabled
 /// It is used to enable or disable exporting profiles
-/// Default value: false
+/// Default value: true
 /// Environment variable: RUSTFS_OBS_PROFILING_EXPORT_ENABLED
-pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = false;
+pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = true;
 
 /// Default log local logging enabled for rustfs
 /// This is the default log local logging enabled for rustfs.

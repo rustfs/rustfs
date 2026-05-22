@@ -13,9 +13,11 @@ RUN_BENCHMARK="${RUN_BENCHMARK:-true}"
 KEEP_UP="${KEEP_UP:-false}"
 PRECHECK_AUTO_CLEANUP="${PRECHECK_AUTO_CLEANUP:-true}"
 WAIT_PROBE_MODE="${WAIT_PROBE_MODE:-service}"
+COMPOSE_UP_NO_BUILD="${COMPOSE_UP_NO_BUILD:-false}"
 
-RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfsadmin}"
-RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfsadmin}"
+RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}"
+RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}"
+RUSTFS_DOCKER_PLATFORM="${RUSTFS_DOCKER_PLATFORM:-}"
 RUSTFS_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK="${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
 
@@ -29,6 +31,8 @@ BENCH_WAIT_MODE="${BENCH_WAIT_MODE:-ready}"
 
 BENCH_ENDPOINT="${BENCH_ENDPOINT:-http://127.0.0.1:9000}"
 BENCH_BUCKET="${BENCH_BUCKET:-rustfs-four-node-bench}"
+BENCH_AUTO_NEW_BUCKET="${BENCH_AUTO_NEW_BUCKET:-true}"
+BENCH_BUCKET_PREFIX="${BENCH_BUCKET_PREFIX:-rustfs-four-node-bench}"
 BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-}"
 BENCH_CONCURRENCIES="${BENCH_CONCURRENCIES:-}"
 BENCH_DURATION="${BENCH_DURATION:-60s}"
@@ -65,6 +69,7 @@ Options:
 Environment:
   CLUSTER_COMPOSE OBS_COMPOSE PROJECT_NAME IMAGE_TAG
   WITH_OBSERVABILITY BUILD_LOCAL_IMAGE RUN_FAILOVER RUN_BENCHMARK KEEP_UP
+  COMPOSE_UP_NO_BUILD (true|false, default: false)
   RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY RUSTFS_OBS_ENDPOINT
   PRECHECK_AUTO_CLEANUP (true|false, default: true)
   WAIT_PROBE_MODE (service|ready, default: service)
@@ -73,6 +78,8 @@ Environment:
   BENCH_CONCURRENCIES BENCH_DURATION BENCH_SIZES OUT_DIR
   BENCH_WAIT_MODE (ready|service, default: ready)
   BENCH_READY_TIMEOUT_SECS (default: 180)
+  BENCH_AUTO_NEW_BUCKET (true|false, default: true)
+  BENCH_BUCKET_PREFIX (default: rustfs-four-node-bench)
 USAGE
 }
 
@@ -543,12 +550,19 @@ run_benchmark() {
   local bench_out_dir
   local conc
   local conc_dir
+  local bench_bucket
+  local -a bench_extra_args=()
   bench_out_dir="${OUT_DIR}/benchmark"
   mkdir -p "${bench_out_dir}"
 
   if ! command -v warp >/dev/null 2>&1; then
     log_error "warp is required for benchmark phase. Please install warp or run with --skip-bench."
     exit 1
+  fi
+
+  bench_bucket="${BENCH_BUCKET}"
+  if [[ "${BENCH_AUTO_NEW_BUCKET}" == "true" ]]; then
+    bench_extra_args+=(--auto-new-bucket)
   fi
 
   log_info "Waiting for benchmark endpoint readiness (mode=${BENCH_WAIT_MODE})"
@@ -574,7 +588,9 @@ run_benchmark() {
         --endpoint "${BENCH_ENDPOINT}" \
         --access-key "${RUSTFS_ACCESS_KEY}" \
         --secret-key "${RUSTFS_SECRET_KEY}" \
-        --bucket "${BENCH_BUCKET}" \
+        --bucket "${bench_bucket}" \
+        --bucket-prefix "${BENCH_BUCKET_PREFIX}" \
+        "${bench_extra_args[@]}" \
         --concurrency "${conc}" \
         --duration "${BENCH_DURATION}" \
         --sizes "${BENCH_SIZES}" \
@@ -690,6 +706,8 @@ main() {
   resolve_bool "RUN_FAILOVER" "${RUN_FAILOVER}"
   resolve_bool "RUN_BENCHMARK" "${RUN_BENCHMARK}"
   resolve_bool "KEEP_UP" "${KEEP_UP}"
+  resolve_bool "COMPOSE_UP_NO_BUILD" "${COMPOSE_UP_NO_BUILD}"
+  resolve_bool "BENCH_AUTO_NEW_BUCKET" "${BENCH_AUTO_NEW_BUCKET}"
   resolve_bool "PRECHECK_AUTO_CLEANUP" "${PRECHECK_AUTO_CLEANUP}"
   resolve_probe_mode
   resolve_bench_wait_mode
@@ -731,7 +749,12 @@ main() {
 
   if [[ "${BUILD_LOCAL_IMAGE}" == "true" ]]; then
     log_info "Building local image from Dockerfile.source: ${IMAGE_TAG}"
-    docker build -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+    if [[ -n "${RUSTFS_DOCKER_PLATFORM}" ]]; then
+      log_info "Using docker build platform: ${RUSTFS_DOCKER_PLATFORM}"
+      docker build --platform "${RUSTFS_DOCKER_PLATFORM}" -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+    else
+      docker build -f "${PROJECT_ROOT}/Dockerfile.source" -t "${IMAGE_TAG}" "${PROJECT_ROOT}"
+    fi
   else
     log_info "Skipping image build"
   fi
@@ -739,7 +762,11 @@ main() {
   run_precheck_after_build
 
   log_info "Starting compose stack"
-  compose up -d
+  if [[ "${COMPOSE_UP_NO_BUILD}" == "true" ]]; then
+    compose up -d --no-build
+  else
+    compose up -d
+  fi
 
   log_info "Waiting for 4-node cluster readiness (mode=${WAIT_PROBE_MODE})"
   wait_cluster_ready

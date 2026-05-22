@@ -22,9 +22,9 @@ use rustfs_io_metrics::io_metrics;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Scheduler configuration
-#[derive(Debug, Clone)]
-pub struct SchedulerConfig {
+/// Facade policy for the concurrency-layer scheduler manager.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerPolicy {
     /// Base buffer size
     pub base_buffer_size: usize,
     /// Maximum buffer size
@@ -35,7 +35,7 @@ pub struct SchedulerConfig {
     pub low_priority_threshold: usize,
 }
 
-impl Default for SchedulerConfig {
+impl Default for SchedulerPolicy {
     fn default() -> Self {
         Self {
             base_buffer_size: 64 * 1024,              // 64KB
@@ -46,9 +46,23 @@ impl Default for SchedulerConfig {
     }
 }
 
+impl SchedulerPolicy {
+    /// Convert facade policy to io-core scheduler config.
+    pub fn to_core_config(&self) -> rustfs_io_core::IoSchedulerConfig {
+        rustfs_io_core::IoSchedulerConfig {
+            base_buffer_size: self.base_buffer_size,
+            max_buffer_size: self.max_buffer_size,
+            high_priority_size_threshold: self.high_priority_threshold,
+            low_priority_size_threshold: self.low_priority_threshold,
+            ..rustfs_io_core::IoSchedulerConfig::default()
+        }
+    }
+}
+
 /// Scheduler manager
 pub struct SchedulerManager {
-    config: SchedulerConfig,
+    config: SchedulerPolicy,
+    core_config: rustfs_io_core::IoSchedulerConfig,
     scheduler: Arc<CoreIoScheduler>,
 }
 
@@ -60,24 +74,33 @@ impl SchedulerManager {
         high_priority_threshold: usize,
         low_priority_threshold: usize,
     ) -> Self {
-        let config = SchedulerConfig {
+        Self::from_policy(SchedulerPolicy {
             base_buffer_size,
             max_buffer_size,
             high_priority_threshold,
             low_priority_threshold,
-        };
+        })
+    }
 
-        let core_config = rustfs_io_core::IoSchedulerConfig::default();
+    /// Create a scheduler manager from facade policy.
+    pub fn from_policy(config: SchedulerPolicy) -> Self {
+        let core_config = config.to_core_config();
 
         Self {
             config,
+            core_config: core_config.clone(),
             scheduler: Arc::new(CoreIoScheduler::new(core_config)),
         }
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &SchedulerConfig {
+    pub fn config(&self) -> &SchedulerPolicy {
         &self.config
+    }
+
+    /// Get the derived io-core scheduler config.
+    pub fn core_config(&self) -> &rustfs_io_core::IoSchedulerConfig {
+        &self.core_config
     }
 
     /// Get the scheduler
@@ -87,7 +110,7 @@ impl SchedulerManager {
 
     /// Create an I/O strategy
     pub fn create_strategy(&self) -> IoStrategy {
-        IoStrategy::new(self.config.clone(), self.scheduler.clone())
+        IoStrategy::new(self.config, self.scheduler.clone())
     }
 
     /// Calculate buffer size
@@ -111,12 +134,12 @@ impl SchedulerManager {
 
 /// I/O strategy
 pub struct IoStrategy {
-    config: SchedulerConfig,
+    config: SchedulerPolicy,
     scheduler: Arc<CoreIoScheduler>,
 }
 
 impl IoStrategy {
-    fn new(config: SchedulerConfig, scheduler: Arc<CoreIoScheduler>) -> Self {
+    fn new(config: SchedulerPolicy, scheduler: Arc<CoreIoScheduler>) -> Self {
         Self { config, scheduler }
     }
 
@@ -191,7 +214,7 @@ impl IoStrategy {
     }
 
     /// Get the configuration
-    pub fn config(&self) -> &SchedulerConfig {
+    pub fn config(&self) -> &SchedulerPolicy {
         &self.config
     }
 }
@@ -202,8 +225,18 @@ mod tests {
 
     #[test]
     fn test_scheduler_config() {
-        let config = SchedulerConfig::default();
+        let config = SchedulerPolicy::default();
         assert!(config.base_buffer_size < config.max_buffer_size);
+    }
+
+    #[test]
+    fn test_scheduler_policy_to_core_config() {
+        let policy = SchedulerPolicy::default();
+        let core = policy.to_core_config();
+        assert_eq!(core.base_buffer_size, policy.base_buffer_size);
+        assert_eq!(core.max_buffer_size, policy.max_buffer_size);
+        assert_eq!(core.high_priority_size_threshold, policy.high_priority_threshold);
+        assert_eq!(core.low_priority_size_threshold, policy.low_priority_threshold);
     }
 
     #[test]

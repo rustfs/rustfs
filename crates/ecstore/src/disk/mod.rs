@@ -37,6 +37,7 @@ use crate::disk::disk_store::LocalDiskWrapper;
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
 use crate::rpc::RemoteDisk;
+use crate::rpc::build_internode_data_transport_from_env;
 use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
@@ -476,7 +477,8 @@ pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
         Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(s), opt.health_check)))))
     } else {
-        let remote_disk = RemoteDisk::new(ep, opt).await?;
+        let data_transport = build_internode_data_transport_from_env();
+        let remote_disk = RemoteDisk::new(ep, opt, data_transport?).await?;
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
     }
 }
@@ -789,7 +791,6 @@ mod tests {
     use super::*;
     use endpoint::Endpoint;
     use local::LocalDisk;
-    use std::path::PathBuf;
     use tokio::fs;
     use uuid::Uuid;
 
@@ -1094,7 +1095,7 @@ mod tests {
         assert!(disk.is_ok());
 
         let disk = disk.unwrap();
-        assert_eq!(disk.path(), PathBuf::from(test_dir).canonicalize().unwrap());
+        assert_eq!(disk.path(), rustfs_utils::canonicalize(test_dir).unwrap());
         assert!(disk.is_local());
         // Note: is_online() might return false for local disks without proper initialization
         // This is expected behavior for test environments
@@ -1155,6 +1156,7 @@ mod tests {
                 cleanup: false,
                 health_check: false,
             },
+            Arc::new(crate::rpc::TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();

@@ -18,7 +18,7 @@ use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
-use crate::auth::get_condition_values;
+use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
@@ -64,11 +64,12 @@ use rustfs_policy::policy::{
     action::{Action, S3Action},
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
 };
-use rustfs_s3_common::S3Operation;
+use rustfs_s3_ops::S3Operation;
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},
 };
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use rustfs_utils::string::parse_bool;
@@ -144,22 +145,18 @@ fn validate_notification_filter_rules(
             return Err(s3_error!(InvalidArgument, "{}", invalid_filter_value_message(&cfg_scope, value)));
         }
 
-        match name.as_str() {
-            "prefix" => {
-                if has_prefix {
-                    return Err(s3_error!(InvalidArgument, "duplicate notification filter name 'prefix' ({cfg_scope})"));
-                }
-                has_prefix = true;
+        if name.as_str().eq_ignore_ascii_case("prefix") {
+            if has_prefix {
+                return Err(s3_error!(InvalidArgument, "duplicate notification filter name 'prefix' ({cfg_scope})"));
             }
-            "suffix" => {
-                if has_suffix {
-                    return Err(s3_error!(InvalidArgument, "duplicate notification filter name 'suffix' ({cfg_scope})"));
-                }
-                has_suffix = true;
+            has_prefix = true;
+        } else if name.as_str().eq_ignore_ascii_case("suffix") {
+            if has_suffix {
+                return Err(s3_error!(InvalidArgument, "duplicate notification filter name 'suffix' ({cfg_scope})"));
             }
-            other => {
-                return Err(s3_error!(InvalidArgument, "{}", invalid_filter_name_message(&cfg_scope, other)));
-            }
+            has_suffix = true;
+        } else {
+            return Err(s3_error!(InvalidArgument, "{}", invalid_filter_name_message(&cfg_scope, name.as_str())));
         }
     }
 
@@ -1022,6 +1019,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketPolicyInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1036,6 +1034,8 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_POLICY_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context);
 
         let item = sr_bucket_meta_item(bucket.clone(), "policy");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1108,6 +1108,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeletePublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1122,6 +1123,8 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "delete public access block", request_context);
 
         Ok(S3Response::with_status(DeletePublicAccessBlockOutput::default(), StatusCode::NO_CONTENT))
     }
@@ -1302,7 +1305,15 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        let conditions = get_condition_values(&req.headers, &rustfs_credentials::Credentials::default(), None, None, remote_addr);
+        let client_info = req.extensions.get::<ClientInfo>();
+        let conditions = get_condition_values_with_client_info(
+            &req.headers,
+            &rustfs_credentials::Credentials::default(),
+            None,
+            None,
+            remote_addr,
+            client_info,
+        );
 
         let read_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,
@@ -1678,6 +1689,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketPolicyInput>,
     ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketPolicyInput { bucket, policy, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1723,6 +1735,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket policy", request_context);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "policy");
         item.policy = Some(serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
@@ -1807,6 +1821,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutPublicAccessBlockInput {
             bucket,
             public_access_block_configuration,
@@ -1826,6 +1841,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put public access block", request_context);
 
         Ok(S3Response::new(PutPublicAccessBlockOutput::default()))
     }
@@ -1891,7 +1908,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
-    #[instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "info", skip(self, req))]
     pub async fn execute_list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         // warn!("list_objects_v2 req {:?}", &req.input);
         let ListObjectsV2Input {
@@ -2101,6 +2118,35 @@ mod tests {
         let mut req = build_request(input, method);
         req.extensions.insert(req_info);
         req
+    }
+
+    fn usecase_method_source<'a>(source: &'a str, method: &str) -> &'a str {
+        let start_marker = format!("pub async fn {method}");
+        let start = source.find(&start_marker).expect("method should exist");
+        let rest = &source[start + start_marker.len()..];
+        let end = rest.find("\n    pub async fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn bucket_policy_and_public_access_block_changes_notify_peer_metadata_reload() {
+        let source = include_str!("bucket_usecase.rs");
+        for (method, operation) in [
+            ("execute_delete_bucket_policy", "delete bucket policy"),
+            ("execute_put_bucket_policy", "put bucket policy"),
+            ("execute_delete_public_access_block", "delete public access block"),
+            ("execute_put_public_access_block", "put public access block"),
+        ] {
+            let body = usecase_method_source(source, method);
+            assert!(
+                body.contains("notify_bucket_metadata_reload("),
+                "{method} should notify peers to reload cached bucket metadata"
+            );
+            assert!(
+                body.contains(operation),
+                "{method} should identify the bucket metadata operation in reload logs"
+            );
+        }
     }
 
     fn replication_rule_for_target(arn: &str) -> ReplicationRule {
@@ -2997,7 +3043,7 @@ mod tests {
 
     #[test]
     fn validate_notification_configuration_filters_rejects_invalid_filter_name() {
-        let raw_name = "Prefix".repeat(100);
+        let raw_name = "unsupported".repeat(100);
         let cfg = NotificationConfiguration {
             queue_configurations: Some(vec![QueueConfiguration {
                 id: Some("q1".to_string()),
@@ -3020,6 +3066,34 @@ mod tests {
         let msg = err.message().unwrap_or_default();
         assert!(msg.contains("len="), "error message should include summarized length");
         assert!(!msg.contains(&raw_name), "error message should not echo full raw filter name");
+    }
+
+    #[test]
+    fn validate_notification_configuration_filters_accepts_case_insensitive_filter_names() {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(vec![QueueConfiguration {
+                id: Some("q1".to_string()),
+                queue_arn: "arn:rustfs:sqs:us-east-1:1:webhook".to_string(),
+                events: vec!["s3:ObjectCreated:*".to_string().into()],
+                filter: Some(NotificationConfigurationFilter {
+                    key: Some(S3KeyFilter {
+                        filter_rules: Some(vec![
+                            FilterRule {
+                                name: Some(FilterRuleName::from("Prefix".to_string())),
+                                value: Some("uploads/".to_string()),
+                            },
+                            FilterRule {
+                                name: Some(FilterRuleName::from("Suffix".to_string())),
+                                value: Some(".csv".to_string()),
+                            },
+                        ]),
+                    }),
+                }),
+            }]),
+            ..Default::default()
+        };
+
+        validate_notification_configuration_filters(&cfg).expect("capitalized filter names should be accepted");
     }
 
     #[test]
@@ -3179,7 +3253,7 @@ mod tests {
                     filter: Some(NotificationConfigurationFilter {
                         key: Some(S3KeyFilter {
                             filter_rules: Some(vec![FilterRule {
-                                name: Some(FilterRuleName::from("Prefix".to_string())),
+                                name: Some(FilterRuleName::from("unsupported".to_string())),
                                 value: Some("uploads/".to_string()),
                             }]),
                         }),

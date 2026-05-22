@@ -1,0 +1,38 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "rustfs-data-usage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "Shared data usage models and algorithms for RustFS"
+keywords = ["rustfs", "data-usage", "cache", "histogram"]
+categories = ["data-structures", "filesystem"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+path-clean = { workspace = true }
+rmp-serde = { workspace = true }
+async-trait = { workspace = true }
+rustfs-filemeta = { workspace = true }
+
+[lib]
+doctest = false

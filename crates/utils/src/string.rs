@@ -236,12 +236,13 @@ pub fn match_as_pattern_prefix(pattern: &str, text: &str) -> bool {
     text.len() <= pattern.len()
 }
 
-static ELLIPSES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(.*)(\{[0-9a-z]*\.\.\.[0-9a-z]*\})(.*)").unwrap());
+static ELLIPSES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(.*)(\{[0-9A-Fa-f]*\.\.\.[0-9A-Fa-f]*\})(.*)").unwrap());
 
 /// Ellipses constants
 const OPEN_BRACES: &str = "{";
 const CLOSE_BRACES: &str = "}";
 const ELLIPSES: &str = "...";
+const MAX_ELLIPSES_RANGE_SIZE: usize = 10_000;
 
 /// ellipses pattern, describes the range and also the
 /// associated prefix and suffixes.
@@ -358,7 +359,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
         Some(caps) => caps,
         None => {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4"
+                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
             )));
         }
     };
@@ -397,7 +398,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
             || p.suffix.contains(CLOSE_BRACES)
         {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4"
+                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
             )));
         }
     }
@@ -432,6 +433,7 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
 /// example:
 /// {1...64}
 /// {33...64}
+/// {0a...0f}
 ///
 /// # Arguments
 /// * `pattern` - A string slice representing the ellipses range pattern
@@ -468,17 +470,37 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
         return Err(Error::other("Invalid argument"));
     }
 
-    // TODO: Add support for hexadecimals.
-    let start = ellipses_range[0].parse::<usize>().map_err(Error::other)?;
-    let end = ellipses_range[1].parse::<usize>().map_err(Error::other)?;
+    let is_hex_range = ellipses_range
+        .iter()
+        .any(|value| value.bytes().any(|ch| matches!(ch, b'a'..=b'f' | b'A'..=b'F')));
+    let is_upper_hex_range = ellipses_range
+        .iter()
+        .any(|value| value.bytes().any(|ch| matches!(ch, b'A'..=b'F')));
+    let radix = if is_hex_range { 16 } else { 10 };
+    let start = usize::from_str_radix(ellipses_range[0], radix).map_err(Error::other)?;
+    let end = usize::from_str_radix(ellipses_range[1], radix).map_err(Error::other)?;
 
     if start > end {
         return Err(Error::other("Invalid argument:range start cannot be bigger than end"));
     }
 
-    let mut ret: Vec<String> = Vec::with_capacity(end - start + 1);
+    let range_size = end
+        .checked_sub(start)
+        .and_then(|size| size.checked_add(1))
+        .ok_or_else(|| Error::other("Invalid argument:range size overflow"))?;
+    if range_size > MAX_ELLIPSES_RANGE_SIZE {
+        return Err(Error::other("Invalid argument:range is too large"));
+    }
+
+    let mut ret: Vec<String> = Vec::with_capacity(range_size);
     for i in start..=end {
-        if ellipses_range[0].starts_with('0') && ellipses_range[0].len() > 1 {
+        if is_hex_range {
+            if is_upper_hex_range {
+                ret.push(format!("{i:0width$X}", width = ellipses_range[1].len()));
+            } else {
+                ret.push(format!("{i:0width$x}", width = ellipses_range[1].len()));
+            }
+        } else if ellipses_range[0].starts_with('0') && ellipses_range[0].len() > 1 {
             ret.push(format!("{:0width$}", i, width = ellipses_range[1].len()));
         } else {
             ret.push(format!("{i}"));
@@ -846,6 +868,18 @@ mod tests {
                     vec!["036"],
                 ],
             },
+            TestCase {
+                num: 22,
+                pattern: "{0a...0f}",
+                success: true,
+                want: vec![vec!["0a"], vec!["0b"], vec!["0c"], vec!["0d"], vec!["0e"], vec!["0f"]],
+            },
+            TestCase {
+                num: 23,
+                pattern: "{0A...0F}",
+                success: true,
+                want: vec![vec!["0A"], vec!["0B"], vec!["0C"], vec!["0D"], vec!["0E"], vec!["0F"]],
+            },
         ];
 
         for test_case in test_cases {
@@ -870,6 +904,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_find_ellipses_patterns_error_mentions_hex_ranges() {
+        let err = find_ellipses_patterns("{1..64}").unwrap_err();
+        assert!(err.to_string().contains("decimal or hexadecimal"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn test_parse_ellipses_range_rejects_oversized_ranges() {
+        let err = parse_ellipses_range("{0...10000}").unwrap_err();
+        assert!(err.to_string().contains("range is too large"), "unexpected error message: {err}");
     }
 
     #[test]

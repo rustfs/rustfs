@@ -54,6 +54,17 @@ pub fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 
 pub struct ProfileHandler {}
 
+#[allow(dead_code)]
+fn map_cpu_profile_collect_error_message(err: &str) -> (StatusCode, String) {
+    if err.contains("start running cpu profiler error") {
+        return (
+            StatusCode::CONFLICT,
+            "CPU profiler is already running. Disable RUSTFS_OBS_PROFILING_EXPORT_ENABLED or retry later.".to_string(),
+        );
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to collect CPU profile: {err}"))
+}
+
 #[async_trait::async_trait]
 impl Operation for ProfileHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -95,15 +106,19 @@ impl Operation for ProfileHandler {
                             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
                             Ok(S3Response::with_headers((StatusCode::OK, Body::from(bytes)), headers))
                         }
-                        Err(e) => Ok(S3Response::new((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Body::from(format!("Failed to read profile file: {e}")),
-                        ))),
+                        Err(e) => {
+                            error!("Failed to read profile file {}: {}", path.display(), e);
+                            Ok(S3Response::new((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Body::from(format!("Failed to read profile file: {e}")),
+                            )))
+                        }
                     },
-                    Err(e) => Ok(S3Response::new((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Body::from(format!("Failed to collect CPU profile: {e}")),
-                    ))),
+                    Err(e) => {
+                        let (status, message) = map_cpu_profile_collect_error_message(&e);
+                        error!("CPU protobuf profile collection failed: {}", e);
+                        Ok(S3Response::new((status, Body::from(message))))
+                    }
                 },
                 "flamegraph" | "svg" => {
                     let freq = get_env_usize(ENV_CPU_FREQ, DEFAULT_CPU_FREQ) as i32;
@@ -213,6 +228,7 @@ mod tests {
     use crate::admin::router::Operation;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
+    use hyper::StatusCode;
     use matchit::Params;
     use s3s::{Body, S3ErrorCode, S3Request};
 
@@ -267,5 +283,13 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(err.message(), Some("Signature is required"));
+    }
+
+    #[test]
+    fn cpu_profile_collect_error_maps_profiler_conflict_to_409() {
+        let (status, message) =
+            super::map_cpu_profile_collect_error_message("create profiler failed: start running cpu profiler error");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("CPU profiler is already running"));
     }
 }

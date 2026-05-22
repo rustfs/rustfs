@@ -651,6 +651,22 @@ async fn list_service_accounts(
     Ok(response.json().await?)
 }
 
+async fn get_account_info(
+    env: &RustFSTestEnvironment,
+    signer_access_key: &str,
+    signer_secret_key: &str,
+) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/accountinfo", env.url);
+    let response = signed_request(http::Method::GET, &url, signer_access_key, signer_secret_key, None, None).await?;
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("account info failed: {status} {body}").into());
+    }
+
+    Ok(response.json().await?)
+}
+
 async fn wait_for_service_accounts(
     env: &RustFSTestEnvironment,
     signer_access_key: &str,
@@ -2375,6 +2391,57 @@ async fn test_site_replication_replicates_group_policy_backed_access_real_dual_n
     let target_user_client = create_user_s3_client(&target_env, username, secret_key);
     let fetched = wait_for_user_get_object(&target_user_client, bucket, key).await?;
     assert_eq!(fetched, payload);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_service_account_policy_from_accountinfo_round_trips_real_single_node() -> TestResult {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let account_info = get_account_info(&env, &env.access_key, &env.secret_key).await?;
+    let policy_str = account_info
+        .get("policy")
+        .and_then(|value| value.as_str())
+        .ok_or("account info policy should be a JSON string")?;
+
+    let policy: serde_json::Value = serde_json::from_str(policy_str)?;
+    let statements = policy
+        .get("Statement")
+        .and_then(|value| value.as_array())
+        .ok_or("account info policy should include Statement array")?;
+
+    assert!(!statements.is_empty(), "account info policy Statement should not be empty: {policy}");
+
+    let req = AddServiceAccountReq {
+        policy: Some(policy),
+        target_user: None,
+        access_key: "svcacct-info-sample".to_string(),
+        secret_key: "svcacct-info-sample-secret-key-123456".to_string(),
+        name: Some("svcacct-info-sample".to_string()),
+        description: Some("service account created from accountinfo sample policy".to_string()),
+        expiration: None,
+        comment: None,
+    };
+
+    let created = add_service_account(&env, &env.access_key, &env.secret_key, &req).await?;
+    assert_eq!(created.0, "svcacct-info-sample");
+
+    let listed =
+        wait_for_service_accounts(&env, &env.access_key, &env.secret_key, Some(&env.access_key), &["svcacct-info-sample"])
+            .await?;
+    assert!(
+        listed
+            .accounts
+            .iter()
+            .any(|account| account.access_key == "svcacct-info-sample"),
+        "created service account should be listed for parent user: {:?}",
+        listed.accounts
+    );
 
     Ok(())
 }

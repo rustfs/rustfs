@@ -12,154 +12,53 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(all(
-    not(target_os = "windows"),
-    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
-))]
-pub mod allocator;
-
-#[cfg(target_os = "windows")]
-mod windows_impl {
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+mod unsupported_impl {
     use std::path::PathBuf;
     use std::time::Duration;
     use tracing::info;
 
     pub async fn init_from_env() {
-        info!("Profiling initialization skipped on Windows platform (not supported)");
+        let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
+        info!(
+            target_os = std::env::consts::OS,
+            target_env,
+            target_arch = std::env::consts::ARCH,
+            "Profiling initialization skipped on unsupported platform"
+        );
     }
 
     /// Stop all background profiling tasks
     pub fn shutdown_profiling() {
-        info!("profiling: shutdown called on Windows platform (no-op)");
+        let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
+        info!(
+            target_os = std::env::consts::OS,
+            target_env,
+            target_arch = std::env::consts::ARCH,
+            "profiling: shutdown called on unsupported platform (no-op)"
+        );
     }
 
     pub async fn dump_cpu_pprof_for(_duration: Duration) -> Result<PathBuf, String> {
-        Err("CPU profiling is not supported on Windows platform".to_string())
+        Err(unsupported_message("CPU profiling"))
     }
 
     pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
-        Err("Memory profiling is not supported on Windows platform".to_string())
+        Err(unsupported_message("Memory profiling"))
     }
-}
-#[cfg(target_os = "windows")]
-pub use windows_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};
 
-#[cfg(all(
-    not(target_os = "windows"),
-    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
-))]
-mod generic_impl {
-    use super::allocator;
-    use rustfs_config::{
-        DEFAULT_ENABLE_PROFILING, DEFAULT_MEM_INTERVAL_SECS, DEFAULT_MEM_PERIODIC, DEFAULT_OUTPUT_DIR, ENV_ENABLE_PROFILING,
-        ENV_MEM_INTERVAL_SECS, ENV_MEM_PERIODIC, ENV_OUTPUT_DIR,
-    };
-    use rustfs_utils::{get_env_bool, get_env_str, get_env_u64};
-    use std::fs::create_dir_all;
-    use std::path::PathBuf;
-    use std::sync::OnceLock;
-    use std::time::Duration;
-    use tokio::time::sleep;
-    use tokio_util::sync::CancellationToken;
-    use tracing::{debug, error, info, warn};
-
-    // Global cancellation token for periodic profiling tasks
-    static PROFILING_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
-
-    fn get_platform_info() -> (String, String, String) {
-        (
-            std::env::consts::OS.to_string(),
-            option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown").to_string(),
-            std::env::consts::ARCH.to_string(),
+    fn unsupported_message(feature: &str) -> String {
+        let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
+        format!(
+            "{feature} is only supported on linux x86_64 gnu. target_os={}, target_env={target_env}, target_arch={}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
         )
     }
-
-    fn output_dir() -> PathBuf {
-        let dir = get_env_str(ENV_OUTPUT_DIR, DEFAULT_OUTPUT_DIR);
-        let p = PathBuf::from(dir);
-        if let Err(e) = create_dir_all(&p) {
-            warn!("profiling: create output dir {} failed: {}, fallback to current dir", p.display(), e);
-            return PathBuf::from(".");
-        }
-        p
-    }
-
-    fn ts() -> String {
-        jiff::Zoned::now().strftime("%Y%m%dT%H%M%S").to_string()
-    }
-
-    pub async fn init_from_env() {
-        let enabled = get_env_bool(ENV_ENABLE_PROFILING, DEFAULT_ENABLE_PROFILING);
-        if !enabled {
-            debug!("profiling: disabled by env");
-            return;
-        }
-
-        allocator::set_enabled(true);
-        info!("profiling: Memory profiling enabled (mimalloc + tracing)");
-
-        // Initialize cancellation token
-        let token = PROFILING_CANCEL_TOKEN.get_or_init(CancellationToken::new).clone();
-
-        // Memory periodic dump
-        let mem_periodic = get_env_bool(ENV_MEM_PERIODIC, DEFAULT_MEM_PERIODIC);
-        let mem_interval = Duration::from_secs(get_env_u64(ENV_MEM_INTERVAL_SECS, DEFAULT_MEM_INTERVAL_SECS));
-        if mem_periodic {
-            start_memory_periodic(mem_interval, token).await;
-        }
-    }
-
-    async fn start_memory_periodic(interval: Duration, token: CancellationToken) {
-        info!(?interval, "start periodic memory pprof dump");
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => {
-                        info!("periodic memory profiling task cancelled");
-                        break;
-                    }
-                    _ = sleep(interval) => {
-                        let out = output_dir().join(format!("mem_profile_periodic_{}.pb", ts()));
-                        match allocator::dump_profile(&out) {
-                            Ok(_) => info!("periodic memory profile dumped to {}", out.display()),
-                            Err(e) => error!("periodic mem dump failed: {}", e),
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    /// Stop all background profiling tasks
-    pub fn shutdown_profiling() {
-        if let Some(token) = PROFILING_CANCEL_TOKEN.get() {
-            token.cancel();
-        }
-        allocator::set_enabled(false);
-    }
-
-    pub async fn dump_cpu_pprof_for(_duration: Duration) -> Result<PathBuf, String> {
-        let (target_os, target_env, target_arch) = get_platform_info();
-        let msg = format!(
-            "CPU profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}"
-        );
-        Err(msg)
-    }
-
-    pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
-        let out = output_dir().join(format!("mem_profile_{}.pb", ts()));
-        allocator::dump_profile(&out).map(|_| {
-            info!("Memory profile exported: {}", out.display());
-            out
-        })
-    }
 }
 
-#[cfg(all(
-    not(target_os = "windows"),
-    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
-))]
-pub use generic_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+pub use unsupported_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 mod linux_impl {

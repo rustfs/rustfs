@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #[cfg(target_os = "linux")]
+mod fs_type;
+
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(unix, not(target_os = "linux")))]
 mod unix;

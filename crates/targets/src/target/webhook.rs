@@ -13,24 +13,21 @@
 // limitations under the License.
 
 use crate::{
-    StoreError, Target, TargetLog,
+    StoreError, Target,
     arn::TargetID,
     error::TargetError,
-    store::{Key, QueueStore, Store},
+    store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, queue_store_subdir_name,
+        TargetType, build_queued_payload, open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
-use rustfs_config::audit::AUDIT_STORE_EXTENSION;
-use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{
     marker::PhantomData,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -151,28 +148,14 @@ where
         // Build HTTP client using the helper function
         let http_client = Arc::new(Self::build_http_client(&args)?);
 
-        // Build storage
-        let queue_store = if !args.queue_dir.is_empty() {
-            let queue_dir =
-                PathBuf::from(&args.queue_dir).join(queue_store_subdir_name(ChannelTargetType::Webhook.as_str(), &target_id.id));
-
-            let extension = match args.target_type {
-                TargetType::AuditLog => AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => NOTIFY_STORE_EXTENSION,
-            };
-
-            let store = QueueStore::<QueuedPayload>::new(queue_dir, args.queue_limit, extension);
-
-            if let Err(e) = store.open() {
-                error!("Failed to open store for Webhook target {}: {}", target_id.id, e);
-                return Err(TargetError::Storage(format!("{e}")));
-            }
-
-            // Make sure that the Store trait implemented by QueueStore matches the expected error type
-            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
-        } else {
-            None
-        };
+        let queue_store = open_target_queue_store(
+            &args.queue_dir,
+            args.queue_limit,
+            args.target_type,
+            ChannelTargetType::Webhook.as_str(),
+            &target_id,
+            "Failed to open store for Webhook target",
+        )?;
 
         // Create a cancel channel
         let (cancel_sender, _) = mpsc::channel(1);
@@ -302,22 +285,7 @@ where
     }
 
     fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
-        let object_name = crate::target::decode_object_name(&event.object_name)?;
-        let key = format!("{}/{}", event.bucket_name, object_name);
-        let log = TargetLog {
-            event_name: event.event_name,
-            key,
-            records: vec![event.data.clone()],
-        };
-        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
-        let meta = QueuedPayloadMeta::new(
-            event.event_name,
-            event.bucket_name.clone(),
-            event.object_name.clone(),
-            "application/json",
-            body.len(),
-        );
-        Ok(QueuedPayload::new(meta, body))
+        build_queued_payload(event)
     }
 
     async fn send_body(&self, body: Vec<u8>, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
@@ -408,16 +376,9 @@ where
         };
 
         if let Some(store) = &self.store {
-            let encoded = match queued.encode() {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    self.delivery_counters.record_final_failure();
-                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
-                }
-            };
-            if let Err(e) = store.put_raw(&encoded) {
+            if let Err(e) = persist_queued_payload_to_store(store.as_ref(), &queued) {
                 self.delivery_counters.record_final_failure();
-                return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+                return Err(e);
             }
             debug!("Event saved to store for target: {}", self.id);
             Ok(())

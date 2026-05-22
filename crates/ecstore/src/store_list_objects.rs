@@ -50,6 +50,10 @@ const MAX_OBJECT_LIST: i32 = 1000;
 
 const METACACHE_SHARE_PREFIX: bool = false;
 
+fn normalize_max_keys(max_keys: i32) -> i32 {
+    max_keys.min(MAX_OBJECT_LIST)
+}
+
 fn ensure_non_empty_listing_disks(bucket: &str, path: &str, disks: &[DiskStore]) -> Result<()> {
     if disks.is_empty() {
         warn!(
@@ -58,6 +62,26 @@ fn ensure_non_empty_listing_disks(bucket: &str, path: &str, disks: &[DiskStore])
             "listing candidate disks collapsed to empty set"
         );
         return Err(StorageError::ErasureReadQuorum);
+    }
+
+    Ok(())
+}
+
+fn walk_result_from_set_errors(errs: &[Option<Error>]) -> Result<()> {
+    if is_all_not_found(errs) {
+        if is_all_volume_not_found(errs) {
+            return Err(StorageError::VolumeNotFound);
+        }
+
+        return Ok(());
+    }
+
+    for err in errs.iter().flatten() {
+        if err == &Error::Unexpected || err.is_not_found() {
+            continue;
+        }
+
+        return Err(err.clone());
     }
 
     Ok(())
@@ -213,7 +237,7 @@ impl ListPathOptions {
                 MARKER_TAG_VERSION,
                 id.to_owned(),
                 self.pool_idx.unwrap_or_default(),
-                self.pool_idx.unwrap_or_default(),
+                self.set_idx.unwrap_or_default(),
             )
         } else {
             format!("{marker}[rustfs_cache:{MARKER_TAG_VERSION},return:]")
@@ -267,6 +291,7 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<ListObjectsInfo> {
+        let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
@@ -315,7 +340,7 @@ impl ECStore {
                 ..Default::default()
             });
 
-        if let Some(err) = list_result.err.clone()
+        if let Some(err) = list_result.err.take()
             && err != rustfs_filemeta::Error::Unexpected
         {
             return Err(to_object_err(err.into(), vec![bucket, prefix]));
@@ -390,6 +415,7 @@ impl ECStore {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
+        let max_keys = normalize_max_keys(max_keys);
         if marker.is_none() && version_marker.is_some() {
             return Err(StorageError::NotImplemented);
         }
@@ -427,7 +453,7 @@ impl ECStore {
                 ..Default::default()
             });
 
-        if let Some(err) = list_result.err.clone()
+        if let Some(err) = list_result.err.take()
             && err != rustfs_filemeta::Error::Unexpected
         {
             return Err(to_object_err(err.into(), vec![bucket, prefix]));
@@ -561,11 +587,14 @@ impl ECStore {
         let store = self.clone();
         let opts = o.clone();
         let cancel_rx1 = cancel.clone();
+        let cancel_rx1_for_err = cancel_rx1.clone();
         let err_tx1 = err_tx.clone();
         let job1 = tokio::spawn(async move {
             let mut opts = opts;
             opts.stop_disk_at_limit = true;
-            if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await {
+            if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await
+                && !cancel_rx1_for_err.is_cancelled()
+            {
                 error!("list_merged err {:?}", err);
                 let _ = err_tx1.send(Arc::new(err));
             }
@@ -611,6 +640,11 @@ impl ECStore {
 
         // wait spawns exit
         join_all(vec![job1, job2]).await;
+
+        if let Ok(err) = err_rx.try_recv() {
+            error!("list_path err_rx.try_recv() ok {:?}", &err);
+            result.err = Some(err.as_ref().clone().into());
+        }
 
         if result.err.is_some() {
             return Ok(result);
@@ -956,32 +990,35 @@ impl ECStore {
         tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await });
 
         let walk_results = join_all(futures).await;
-        for (idx, walk_result) in walk_results.into_iter().enumerate() {
-            if let Err(err) = walk_result {
-                error!(
-                    bucket = %bucket,
-                    prefix = %prefix,
-                    set_task_index = idx,
-                    error = ?err,
-                    "walk_internal list_path_raw task failed"
-                );
+        let mut errs = Vec::new();
+        for walk_result in walk_results {
+            match walk_result {
+                Ok(()) => errs.push(None),
+                Err(err) => errs.push(Some(err.into())),
             }
         }
 
-        Ok(())
+        let result = walk_result_from_set_errors(&errs);
+        if let Err(err) = &result {
+            error!(
+                bucket = %bucket,
+                prefix = %prefix,
+                error = ?err,
+                set_errors = ?errs,
+                "walk_internal list_path_raw tasks failed"
+            );
+        }
+
+        result
     }
 }
 
 async fn gather_results(
-    _rx: CancellationToken,
+    rx: CancellationToken,
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
     results_tx: Sender<MetaCacheEntriesSortedResult>,
 ) -> Result<()> {
-    let mut returned = false;
-
-    let mut sender = Some(results_tx);
-
     let mut recv = recv;
     let mut entries = Vec::new();
     while let Some(mut entry) = recv.recv().await {
@@ -989,10 +1026,6 @@ async fn gather_results(
         {
             // normalize windows path separator
             entry.name = entry.name.replace("\\", "/");
-        }
-
-        if returned {
-            continue;
         }
 
         // TODO: rx.recv()
@@ -1027,9 +1060,13 @@ async fn gather_results(
 
         // TODO: Lifecycle
 
+        entries.push(Some(entry));
+
         if opts.limit > 0 && entries.len() >= opts.limit as usize {
-            if let Some(tx) = sender {
-                tx.send(MetaCacheEntriesSortedResult {
+            rx.cancel();
+
+            results_tx
+                .send(MetaCacheEntriesSortedResult {
                     entries: Some(MetaCacheEntriesSorted {
                         o: MetaCacheEntries(entries.clone()),
                         ..Default::default()
@@ -1038,20 +1075,13 @@ async fn gather_results(
                 })
                 .await
                 .map_err(Error::other)?;
-
-                returned = true;
-                sender = None;
-            }
-            continue;
+            return Ok(());
         }
-
-        entries.push(Some(entry));
-        // entries.push(entry);
     }
 
     // finish not full, return eof
-    if let Some(tx) = sender {
-        tx.send(MetaCacheEntriesSortedResult {
+    results_tx
+        .send(MetaCacheEntriesSortedResult {
             entries: Some(MetaCacheEntriesSorted {
                 o: MetaCacheEntries(entries.clone()),
                 ..Default::default()
@@ -1060,7 +1090,6 @@ async fn gather_results(
         })
         .await
         .map_err(Error::other)?;
-    }
 
     Ok(())
 }
@@ -1299,6 +1328,8 @@ impl SetDisks {
 
         let tx1 = sender.clone();
         let tx2 = sender.clone();
+        let cancel_for_send1 = rx.clone();
+        let cancel_for_send2 = rx.clone();
 
         list_path_raw(
             rx,
@@ -1315,8 +1346,11 @@ impl SetDisks {
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                     Box::pin({
                         let value = tx1.clone();
+                        let cancel_token = cancel_for_send1.clone();
                         async move {
-                            if let Err(err) = value.send(entry).await {
+                            if let Err(err) = value.send(entry).await
+                                && !cancel_token.is_cancelled()
+                            {
                                 error!("list_path send fail {:?}", err);
                             }
                         }
@@ -1326,9 +1360,11 @@ impl SetDisks {
                     Box::pin({
                         let value = tx2.clone();
                         let resolver = resolver.clone();
+                        let cancel_token = cancel_for_send2.clone();
                         async move {
                             if let Some(entry) = entries.resolve(resolver)
                                 && let Err(err) = value.send(entry).await
+                                && !cancel_token.is_cancelled()
                             {
                                 error!("list_path send fail {:?}", err);
                             }
@@ -1340,7 +1376,7 @@ impl SetDisks {
             },
         )
         .await
-        .map_err(Error::other)
+        .map_err(Error::from)
     }
 }
 
@@ -1405,7 +1441,62 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
+    use super::{ListPathOptions, MAX_OBJECT_LIST, gather_results, max_keys_plus_one, walk_result_from_set_errors};
+    use crate::error::StorageError;
+    use rustfs_filemeta::MetaCacheEntry;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    fn test_meta_entry(name: &str) -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn gather_results_returns_after_limit_without_waiting_for_input_close() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+
+        entry_tx.send(test_meta_entry("obj-a")).await.unwrap();
+
+        let handle = tokio::spawn(gather_results(
+            CancellationToken::new(),
+            ListPathOptions {
+                bucket: "bucket".to_owned(),
+                limit: 1,
+                incl_deleted: true,
+                ..Default::default()
+            },
+            entry_rx,
+            result_tx,
+        ));
+
+        let result = timeout(Duration::from_secs(1), result_rx.recv())
+            .await
+            .expect("limited result should be sent promptly")
+            .expect("limited result should be present");
+        assert_eq!(result.entries.unwrap().entries().len(), 1);
+
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("gather_results should finish after sending a limited result")
+            .expect("gather_results task should not panic")
+            .expect("gather_results should succeed");
+    }
+
+    #[test]
+    fn test_max_keys_plus_one_caps_before_lookahead() {
+        assert_eq!(max_keys_plus_one(999, true), 1000);
+        assert_eq!(max_keys_plus_one(MAX_OBJECT_LIST, true), MAX_OBJECT_LIST + 1);
+        assert_eq!(max_keys_plus_one(MAX_OBJECT_LIST + 1, true), MAX_OBJECT_LIST + 1);
+        assert_eq!(max_keys_plus_one(i32::MAX, true), MAX_OBJECT_LIST + 1);
+        assert_eq!(max_keys_plus_one(-1, true), MAX_OBJECT_LIST + 1);
+    }
 
     /// Test that "null" version marker is handled correctly
     /// AWS S3 API uses "null" string to represent non-versioned objects
@@ -1475,6 +1566,75 @@ mod test {
         };
         assert!(parsed.is_some());
         assert_eq!(parsed.unwrap().to_string(), uuid_str);
+    }
+
+    #[test]
+    fn list_path_marker_round_trip_preserves_set_index() {
+        let mut opts = ListPathOptions {
+            id: Some("list-cache-id".to_string()),
+            pool_idx: Some(3),
+            set_idx: Some(7),
+            ..Default::default()
+        };
+
+        let marker = opts.encode_marker("photos/2026/image.jpg");
+        let expected_marker = format!(
+            "photos/2026/image.jpg[rustfs_cache:{},id:list-cache-id,p:3,s:7]",
+            super::MARKER_TAG_VERSION
+        );
+        assert_eq!(marker, expected_marker);
+
+        let mut parsed = ListPathOptions {
+            marker: Some(marker),
+            ..Default::default()
+        };
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert_eq!(parsed.set_idx, Some(7));
+        assert!(!parsed.create);
+    }
+
+    #[test]
+    fn walk_result_from_set_errors_returns_non_eof_error() {
+        let err = walk_result_from_set_errors(&[Some(StorageError::Unexpected), Some(StorageError::FileAccessDenied)])
+            .expect_err("walk should fail when any set reports a real listing error");
+
+        assert_eq!(err, StorageError::FileAccessDenied);
+    }
+
+    #[test]
+    fn walk_result_from_set_errors_prefers_real_error_over_not_found() {
+        let err = walk_result_from_set_errors(&[
+            Some(StorageError::VolumeNotFound),
+            Some(StorageError::DiskNotFound),
+            Some(StorageError::FileAccessDenied),
+        ])
+        .expect_err("walk should report the real listing error");
+
+        assert_eq!(err, StorageError::FileAccessDenied);
+    }
+
+    #[test]
+    fn walk_result_from_set_errors_preserves_volume_not_found() {
+        let err = walk_result_from_set_errors(&[Some(StorageError::VolumeNotFound), Some(StorageError::VolumeNotFound)])
+            .expect_err("all volume-not-found set errors should remain visible");
+
+        assert_eq!(err, StorageError::VolumeNotFound);
+    }
+
+    #[test]
+    fn walk_result_from_set_errors_allows_missing_entries() {
+        walk_result_from_set_errors(&[Some(StorageError::FileNotFound), Some(StorageError::VolumeNotFound)])
+            .expect("missing objects under an existing listing path should not fail the walk");
+    }
+
+    #[test]
+    fn walk_result_from_set_errors_ignores_only_unexpected_and_successes() {
+        walk_result_from_set_errors(&[None, Some(StorageError::Unexpected)])
+            .expect("successful sets and unexpected EOF-style markers should not fail the walk");
     }
 
     // use std::sync::Arc;

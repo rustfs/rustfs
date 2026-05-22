@@ -18,12 +18,15 @@ use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
-use rustfs_common::internode_metrics::global_internode_metrics;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_ecstore::disk::{DiskAPI, WalkDirOptions};
 use rustfs_ecstore::rpc::verify_rpc_signature;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::find_local_disk_by_ref;
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+};
 use rustfs_utils::net::bytes_stream;
 use s3s::Body;
 use s3s::dto::StreamingBlob;
@@ -106,8 +109,9 @@ fn is_internode_rpc_path(path: &str) -> bool {
 }
 
 async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
+    let operation = internode_http_operation(req.uri().path());
     if let Err(response) = verify_internode_rpc_signature(req.uri(), req.method(), req.headers()) {
-        global_internode_metrics().record_error();
+        record_internode_rpc_error(operation);
         return *response;
     }
 
@@ -122,10 +126,28 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
     };
 
     if !response.status().is_success() {
-        global_internode_metrics().record_error();
+        record_internode_rpc_error(operation);
     }
 
     response
+}
+
+fn internode_http_operation(path: &str) -> Option<&'static str> {
+    match path {
+        READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        PUT_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
+        _ => None,
+    }
+}
+
+fn record_internode_rpc_error(operation: Option<&'static str>) {
+    match operation {
+        Some(operation) => {
+            global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
+        }
+        None => global_internode_metrics().record_error(),
+    }
 }
 
 fn verify_internode_rpc_signature(uri: &Uri, method: &Method, headers: &HeaderMap) -> Result<(), RpcErrorResponse> {
@@ -163,8 +185,11 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("read file err {e}")),
     };
 
-    global_internode_metrics().record_incoming_request();
-    let stream = read_file_body_stream(file, query.length);
+    global_internode_metrics().record_incoming_request_for_operation_and_backend(
+        INTERNODE_OPERATION_READ_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+    );
+    let stream = read_file_body_stream(file, query.length, INTERNODE_OPERATION_READ_FILE_STREAM);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -172,13 +197,17 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         .expect("failed to build read file stream response")
 }
 
-fn read_file_body_stream<R>(reader: R, length: usize) -> Pin<Box<dyn futures::Stream<Item = io::Result<Bytes>> + Send + Sync>>
+fn read_file_body_stream<R>(
+    reader: R,
+    length: usize,
+    operation: &'static str,
+) -> Pin<Box<dyn futures::Stream<Item = io::Result<Bytes>> + Send + Sync>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
 {
     let metrics = global_internode_metrics().clone();
     let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
-        metrics.record_sent_bytes(bytes.len());
+        metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
         bytes
     });
 
@@ -220,10 +249,15 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         }
     });
 
-    global_internode_metrics().record_incoming_request();
+    global_internode_metrics()
+        .record_incoming_request_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
     let metrics = global_internode_metrics().clone();
     let stream = ReaderStream::with_capacity(rd, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
-        metrics.record_sent_bytes(bytes.len());
+        metrics.record_sent_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_WALK_DIR,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            bytes.len(),
+        );
         bytes
     });
 
@@ -260,8 +294,15 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}")),
     };
 
-    global_internode_metrics().record_incoming_request();
-    global_internode_metrics().record_recv_bytes(copied as usize);
+    global_internode_metrics().record_incoming_request_for_operation_and_backend(
+        INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+    );
+    global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+        INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        copied as usize,
+    );
 
     if let Err(e) = file.flush().await {
         return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}"));
@@ -338,6 +379,17 @@ mod tests {
     }
 
     #[test]
+    fn internode_http_operation_maps_only_known_routes() {
+        assert_eq!(
+            internode_http_operation(READ_FILE_STREAM_PATH),
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM)
+        );
+        assert_eq!(internode_http_operation(PUT_FILE_STREAM_PATH), Some(INTERNODE_OPERATION_PUT_FILE_STREAM));
+        assert_eq!(internode_http_operation(WALK_DIR_PATH), Some(INTERNODE_OPERATION_WALK_DIR));
+        assert_eq!(internode_http_operation("/rustfs/rpc/unknown"), None);
+    }
+
+    #[test]
     fn rpc_head_signature_verification_is_skipped() {
         let uri: Uri = READ_FILE_STREAM_PATH.parse().expect("uri");
         let headers = HeaderMap::new();
@@ -377,7 +429,7 @@ mod tests {
             writer.write_all(b"hello world").await.expect("write succeeds");
         });
 
-        let mut stream = read_file_body_stream(reader, 0);
+        let mut stream = read_file_body_stream(reader, 0, INTERNODE_OPERATION_READ_FILE_STREAM);
         let mut out = Vec::new();
         while let Some(chunk) = stream.next().await {
             out.extend_from_slice(&chunk.expect("chunk succeeds"));
@@ -393,7 +445,7 @@ mod tests {
             writer.write_all(b"hello world").await.expect("write succeeds");
         });
 
-        let mut stream = read_file_body_stream(reader, 5);
+        let mut stream = read_file_body_stream(reader, 5, INTERNODE_OPERATION_READ_FILE_STREAM);
         let mut out = Vec::new();
         while let Some(chunk) = stream.next().await {
             out.extend_from_slice(&chunk.expect("chunk succeeds"));

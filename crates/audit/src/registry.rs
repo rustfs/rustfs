@@ -13,17 +13,16 @@
 //  limitations under the License.
 
 use crate::{AuditEntry, AuditError, AuditResult, factory::builtin_target_plugins};
-use hashbrown::HashMap;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_targets::arn::TargetID;
-use rustfs_targets::{Target, TargetError, TargetPluginRegistry};
-use tracing::{error, info};
+use rustfs_targets::{SharedTarget, Target, TargetError, TargetPluginRegistry, TargetRuntimeManager};
+use tracing::info;
 
 /// Registry for managing audit targets
 pub struct AuditRegistry {
     /// Storage for created targets
-    targets: HashMap<String, Box<dyn Target<AuditEntry> + Send + Sync>>,
+    targets: TargetRuntimeManager<AuditEntry>,
     /// Registered plugins for creating targets
     plugins: TargetPluginRegistry<AuditEntry>,
 }
@@ -41,7 +40,7 @@ impl AuditRegistry {
         plugins.register_all(builtin_target_plugins());
 
         AuditRegistry {
-            targets: HashMap::new(),
+            targets: TargetRuntimeManager::new(),
             plugins,
         }
     }
@@ -92,8 +91,14 @@ impl AuditRegistry {
     /// # Arguments
     /// * `id` - The identifier for the target.
     /// * `target` - The target instance to be added.
-    pub fn add_target(&mut self, id: String, target: Box<dyn Target<AuditEntry> + Send + Sync>) {
-        self.targets.insert(id, target);
+    pub fn add_target(&mut self, _id: String, target: Box<dyn Target<AuditEntry> + Send + Sync>) {
+        debug_assert_eq!(_id, target.id().to_string());
+        self.targets.add_boxed(target);
+    }
+
+    pub fn add_shared_target(&mut self, _id: String, target: SharedTarget<AuditEntry>) {
+        debug_assert_eq!(_id, target.id().to_string());
+        self.targets.add_arc(target);
     }
 
     /// Removes a target from the registry
@@ -103,8 +108,8 @@ impl AuditRegistry {
     ///
     /// # Returns
     /// * `Option<Box<dyn Target<AuditEntry> + Send + Sync>>` - The removed target if it existed.
-    pub fn remove_target(&mut self, id: &str) -> Option<Box<dyn Target<AuditEntry> + Send + Sync>> {
-        self.targets.remove(id)
+    pub async fn remove_target(&mut self, id: &str) -> Option<rustfs_targets::SharedTarget<AuditEntry>> {
+        self.targets.remove_and_close(id).await
     }
 
     /// Gets a target from the registry
@@ -114,13 +119,21 @@ impl AuditRegistry {
     ///
     /// # Returns
     /// * `Option<&(dyn Target<AuditEntry> + Send + Sync)>` - The target if it exists.
-    pub fn get_target(&self, id: &str) -> Option<&(dyn Target<AuditEntry> + Send + Sync)> {
-        self.targets.get(id).map(|t| t.as_ref())
+    pub fn get_target(&self, id: &str) -> Option<rustfs_targets::SharedTarget<AuditEntry>> {
+        self.targets.get(id)
     }
 
     /// Lists cloned target values for runtime inspection without exposing mutable registry access.
-    pub fn list_target_values(&self) -> Vec<Box<dyn Target<AuditEntry> + Send + Sync>> {
-        self.targets.values().map(|target| target.clone_dyn()).collect()
+    pub fn list_target_values(&self) -> Vec<rustfs_targets::SharedTarget<AuditEntry>> {
+        self.targets.values()
+    }
+
+    pub fn runtime_manager(&self) -> &TargetRuntimeManager<AuditEntry> {
+        &self.targets
+    }
+
+    pub fn runtime_manager_mut(&mut self) -> &mut TargetRuntimeManager<AuditEntry> {
+        &mut self.targets
     }
 
     /// Lists all target IDs
@@ -128,7 +141,7 @@ impl AuditRegistry {
     /// # Returns
     /// * `Vec<String>` - A vector of all target IDs in the registry.
     pub fn list_targets(&self) -> Vec<String> {
-        self.targets.keys().cloned().collect()
+        self.targets.keys()
     }
 
     /// Closes all targets and clears the registry
@@ -136,20 +149,23 @@ impl AuditRegistry {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure.
     pub async fn close_all(&mut self) -> AuditResult<()> {
-        let mut errors = Vec::new();
+        let mut first_error = None;
 
-        for (id, target) in self.targets.drain() {
-            if let Err(e) = target.close().await {
-                error!(target_id = %id, error = %e, "Failed to close audit target");
-                errors.push(e);
+        for target_id in self.targets.keys() {
+            if let Some(target) = self.targets.remove(&target_id)
+                && let Err(err) = target.close().await
+            {
+                tracing::error!(target_id = %target_id, error = %err, "Failed to close target during shutdown");
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
             }
         }
 
-        if let Some(error) = errors.into_iter().next() {
-            return Err(AuditError::Target(error));
+        match first_error {
+            Some(err) => Err(AuditError::Target(err)),
+            None => Ok(()),
         }
-
-        Ok(())
     }
 
     /// Creates a unique key for a target based on its type and ID
@@ -224,7 +240,8 @@ impl AuditRegistry {
         target: Box<dyn Target<AuditEntry> + Send + Sync>,
     ) -> AuditResult<()> {
         let key = self.create_key(target_type, target_id);
-        self.targets.insert(key, target);
+        debug_assert_eq!(key, target.id().to_string());
+        self.targets.add_boxed(target);
         Ok(())
     }
 }
@@ -232,12 +249,98 @@ impl AuditRegistry {
 #[cfg(test)]
 mod tests {
     use super::AuditRegistry;
-    use rustfs_targets::target::ChannelTargetType;
+    use crate::{AuditEntry, AuditError};
+    use rustfs_targets::arn::TargetID;
+    use rustfs_targets::store::{Key, Store};
+    use rustfs_targets::target::{ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta};
+    use rustfs_targets::{StoreError, Target, TargetError};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct CloseTestTarget {
+        id: TargetID,
+        close_calls: Arc<AtomicUsize>,
+        fail_on_close: bool,
+    }
+
+    impl CloseTestTarget {
+        fn new(id: TargetID, close_calls: Arc<AtomicUsize>, fail_on_close: bool) -> Self {
+            Self {
+                id,
+                close_calls,
+                fail_on_close,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Target<AuditEntry> for CloseTestTarget {
+        fn id(&self) -> TargetID {
+            self.id.clone()
+        }
+
+        async fn is_active(&self) -> Result<bool, TargetError> {
+            Ok(true)
+        }
+
+        async fn save(&self, _event: Arc<EntityTarget<AuditEntry>>) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), TargetError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_on_close {
+                Err(TargetError::Unknown("close failed".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
+            None
+        }
+
+        fn clone_dyn(&self) -> Box<dyn Target<AuditEntry> + Send + Sync> {
+            Box::new(self.clone())
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn registry_registers_amqp_factory() {
         let registry = AuditRegistry::new();
 
         assert!(registry.supports_target_type(ChannelTargetType::Amqp.as_str()));
+    }
+
+    #[tokio::test]
+    async fn close_all_returns_first_error_and_clears_targets() {
+        let mut registry = AuditRegistry::new();
+        let ok_calls = Arc::new(AtomicUsize::new(0));
+        let fail_calls = Arc::new(AtomicUsize::new(0));
+
+        let ok_id = TargetID::new("ok".to_string(), "webhook".to_string());
+        let fail_id = TargetID::new("fail".to_string(), "webhook".to_string());
+
+        registry.add_target(ok_id.to_string(), Box::new(CloseTestTarget::new(ok_id, Arc::clone(&ok_calls), false)));
+        registry.add_target(
+            fail_id.to_string(),
+            Box::new(CloseTestTarget::new(fail_id, Arc::clone(&fail_calls), true)),
+        );
+
+        let result = registry.close_all().await;
+
+        assert!(matches!(result, Err(AuditError::Target(TargetError::Unknown(_)))));
+        assert_eq!(ok_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fail_calls.load(Ordering::SeqCst), 1);
+        assert!(registry.list_targets().is_empty());
     }
 }

@@ -236,3 +236,30 @@ impl NodeService {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_storage_info_rpc_payload_uses_msgpack_map_encoding() {
+        let info = rustfs_madmin::StorageInfo {
+            disks: Vec::new(),
+            backend: rustfs_madmin::BackendInfo {
+                backend_type: rustfs_madmin::BackendByte::Erasure,
+                standard_sc_data: vec![2, 2],
+                total_sets: vec![1, 1],
+                drives_per_set: vec![4, 4],
+                ..Default::default()
+            },
+        };
+
+        let encoded = encode_msgpack_map(&info).expect("storage info should serialize");
+        assert_eq!(encoded.first().copied(), Some(0x82));
+
+        let mut decoder = Deserializer::new(Cursor::new(encoded));
+        let decoded: rustfs_madmin::StorageInfo = Deserialize::deserialize(&mut decoder).expect("storage info should decode");
+        assert_eq!(decoded.backend.drives_per_set, vec![4, 4]);
+        assert_eq!(decoded.backend.total_sets, vec![1, 1]);
+    }
+}
