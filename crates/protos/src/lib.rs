@@ -20,9 +20,7 @@ mod generated;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_common::{GLOBAL_CONN_MAP, evict_connection};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-use rustfs_tls_runtime::{
-    GlobalOutboundTlsStateSummary, TlsConsumerStatusSource, load_global_outbound_tls_state, record_tls_consumer_stale_generation,
-};
+use rustfs_tls_runtime::{load_global_outbound_tls_state, record_tls_consumer_stale_generation};
 use std::{
     collections::HashMap,
     error::Error,
@@ -53,48 +51,6 @@ pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 /// Default value: https://
 const RUSTFS_HTTPS_PREFIX: &str = "https://";
 static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProtosTlsStatusView {
-    pub generation: u64,
-    pub has_root_ca: bool,
-    pub has_mtls_identity: bool,
-}
-
-pub async fn protos_tls_status_view() -> ProtosTlsStatusView {
-    let state = load_global_outbound_tls_state().await;
-    ProtosTlsStatusView {
-        generation: state.generation.0,
-        has_root_ca: state.root_ca_pem.as_ref().is_some_and(|pem| !pem.is_empty()),
-        has_mtls_identity: state.mtls_identity.is_some(),
-    }
-}
-
-pub fn protos_tls_status_from_summary(summary: GlobalOutboundTlsStateSummary) -> ProtosTlsStatusView {
-    ProtosTlsStatusView {
-        generation: summary.generation.0,
-        has_root_ca: summary.has_root_ca,
-        has_mtls_identity: summary.has_mtls_identity,
-    }
-}
-
-impl TlsConsumerStatusSource for ProtosTlsStatusView {
-    fn consumer_name(&self) -> &'static str {
-        "protos_grpc_channel"
-    }
-
-    fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    fn has_root_ca(&self) -> bool {
-        self.has_root_ca
-    }
-
-    fn has_mtls_identity(&self) -> bool {
-        self.has_mtls_identity
-    }
-}
 
 fn internode_connect_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(

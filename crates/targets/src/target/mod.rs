@@ -539,26 +539,27 @@ pub(crate) fn mark_target_disconnected_on_connectivity_error(connected: &AtomicB
     }
 }
 
-pub(crate) fn build_target_tls_fingerprint(
+pub(crate) async fn build_target_tls_fingerprint(
     ca_path: &str,
     client_cert_path: &str,
     client_key_path: &str,
 ) -> Result<TargetTlsFingerprintState, TargetError> {
-    fn load_optional_digest(path: &str) -> Result<Option<[u8; 32]>, TargetError> {
+    async fn load_optional_digest(path: &str) -> Result<Option<[u8; 32]>, TargetError> {
         if path.is_empty() {
             return Ok(None);
         }
 
-        let bytes =
-            std::fs::read(path).map_err(|e| TargetError::Configuration(format!("Failed to read TLS material '{path}': {e}")))?;
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| TargetError::Configuration(format!("Failed to read TLS material '{path}': {e}")))?;
         let digest = rustfs_tls_runtime::TlsFingerprint::from_optional_bytes(Some(&bytes), None, None, None, None).server_sha256;
         Ok(digest)
     }
 
     Ok(TargetTlsFingerprintState {
-        ca_sha256: load_optional_digest(ca_path)?,
-        client_cert_sha256: load_optional_digest(client_cert_path)?,
-        client_key_sha256: load_optional_digest(client_key_path)?,
+        ca_sha256: load_optional_digest(ca_path).await?,
+        client_cert_sha256: load_optional_digest(client_cert_path).await?,
+        client_key_sha256: load_optional_digest(client_key_path).await?,
     })
 }
 

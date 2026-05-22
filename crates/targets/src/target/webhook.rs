@@ -191,6 +191,11 @@ where
             // Use user-provided custom CA certificate
             let certs_der = load_cert_bundle_der_bytes(&args.client_ca)
                 .map_err(|e| TargetError::Configuration(format!("Failed to parse root CA cert: {e}")))?;
+            if certs_der.is_empty() {
+                return Err(TargetError::Configuration(
+                    "Webhook client_ca did not contain any parsable certificates".to_string(),
+                ));
+            }
             for cert_der in certs_der {
                 let ca_cert = reqwest::Certificate::from_der(&cert_der)
                     .map_err(|e| TargetError::Configuration(format!("Failed to load root CA cert: {e}")))?;

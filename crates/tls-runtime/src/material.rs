@@ -188,7 +188,7 @@ fn serialize_server_material_for_fingerprint(material: &ServerTlsMaterial) -> Ve
         }
         ServerTlsMaterial::MultiCert { cert_key_pairs } => {
             let mut entries = cert_key_pairs.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
 
             let mut bytes = Vec::new();
             for (domain, (certs, key)) in entries {

@@ -26,7 +26,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
-        open_target_queue_store, persist_queued_payload_to_store, refresh_tls_fingerprint_state,
+        open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -354,10 +354,13 @@ where
 
     async fn get_or_connect(&self) -> Result<Arc<AMQPConnection>, TargetError> {
         let next_fingerprint =
-            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)?;
-        {
+            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
+        let tls_changed = {
             let mut tls_state_guard = self.tls_state.lock();
-            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || self.clear_connection_cache());
+            tls_state_guard.refresh(next_fingerprint)
+        };
+        if tls_changed {
+            self.clear_connection_handle();
         }
 
         if let Some(connection) = self.connection.lock().clone()
@@ -381,14 +384,17 @@ where
         Ok(connection)
     }
 
-    fn clear_connection_cache(&self) {
+    fn clear_connection_handle(&self) {
         *self.connection.lock() = None;
+    }
+
+    fn clear_connection_cache(&self) {
+        self.clear_connection_handle();
         self.tls_state.lock().reset();
     }
 
     fn clear_connection(&self) {
         self.clear_connection_cache();
-        self.tls_state.lock().reset();
     }
 
     async fn send_body(&self, body: &[u8]) -> Result<(), TargetError> {

@@ -88,35 +88,38 @@ impl TlsRuntimeStatusSnapshot {
         self.server.has_material || self.outbound.has_roots || self.outbound.has_mtls_identity
     }
 
-    pub fn from_outbound_only(
-        source_path: String,
-        generation: u64,
-        reload_enabled: bool,
-        detect_mode: &'static str,
-        last_attempt_time: Option<u64>,
-        last_success_time: Option<u64>,
-        last_error: Option<String>,
-        has_roots: bool,
-        has_mtls_identity: bool,
-    ) -> Self {
+    pub fn from_outbound_only(args: OutboundOnlySnapshotArgs) -> Self {
         Self {
             runtime: TlsRuntimeRuntimeSection {
-                generation,
-                reload_enabled,
-                detect_mode,
-                last_attempt_time,
-                last_success_time,
-                last_error,
-                source_path,
+                generation: args.generation,
+                reload_enabled: args.reload_enabled,
+                detect_mode: args.detect_mode,
+                last_attempt_time: args.last_attempt_time,
+                last_success_time: args.last_success_time,
+                last_error: args.last_error,
+                source_path: args.source_path,
             },
             outbound: TlsRuntimeOutboundSection {
-                has_roots,
-                has_mtls_identity,
+                has_roots: args.has_roots,
+                has_mtls_identity: args.has_mtls_identity,
             },
             server: TlsRuntimeServerSection { has_material: false },
             consumer: TlsRuntimeConsumerSection { stale_generation: false },
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboundOnlySnapshotArgs {
+    pub source_path: String,
+    pub generation: u64,
+    pub reload_enabled: bool,
+    pub detect_mode: &'static str,
+    pub last_attempt_time: Option<u64>,
+    pub last_success_time: Option<u64>,
+    pub last_error: Option<String>,
+    pub has_roots: bool,
+    pub has_mtls_identity: bool,
 }
 
 pub fn detect_mode_label(mode: crate::config::ReloadDetectMode) -> &'static str {

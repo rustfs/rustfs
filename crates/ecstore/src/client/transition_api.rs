@@ -51,9 +51,7 @@ use md5::Md5;
 use rand::{Rng, RngExt};
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_rio::HashReader;
-use rustfs_tls_runtime::{
-    GlobalOutboundTlsStateSummary, TlsConsumerStatusSource, load_global_outbound_tls_state, record_tls_generation,
-};
+use rustfs_tls_runtime::{load_global_outbound_tls_state, record_tls_generation};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
     net::get_endpoint_url,
@@ -90,48 +88,6 @@ const SUCCESS_STATUS: [StatusCode; 3] = [StatusCode::OK, StatusCode::NO_CONTENT,
 const C_UNKNOWN: i32 = -1;
 const C_OFFLINE: i32 = 0;
 const C_ONLINE: i32 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransitionTlsStatusView {
-    pub generation: u64,
-    pub has_root_ca: bool,
-    pub has_mtls_identity: bool,
-}
-
-pub async fn transition_tls_status_view() -> TransitionTlsStatusView {
-    let state = load_global_outbound_tls_state().await;
-    TransitionTlsStatusView {
-        generation: state.generation.0,
-        has_root_ca: state.root_ca_pem.as_ref().is_some_and(|pem| !pem.is_empty()),
-        has_mtls_identity: state.mtls_identity.is_some(),
-    }
-}
-
-pub fn transition_tls_status_from_summary(summary: GlobalOutboundTlsStateSummary) -> TransitionTlsStatusView {
-    TransitionTlsStatusView {
-        generation: summary.generation.0,
-        has_root_ca: summary.has_root_ca,
-        has_mtls_identity: summary.has_mtls_identity,
-    }
-}
-
-impl TlsConsumerStatusSource for TransitionTlsStatusView {
-    fn consumer_name(&self) -> &'static str {
-        "ecstore_transition_client"
-    }
-
-    fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    fn has_root_ca(&self) -> bool {
-        self.has_root_ca
-    }
-
-    fn has_mtls_identity(&self) -> bool {
-        self.has_mtls_identity
-    }
-}
 
 fn invalid_utf8_header_error(scope: &str, header_name: &str) -> std::io::Error {
     signer_error::invalid_utf8_header_error(scope, header_name)

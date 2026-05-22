@@ -20,7 +20,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, invalidate_cache_on_connectivity_error,
-        open_target_queue_store, persist_queued_payload_to_store, refresh_tls_fingerprint_state,
+        open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -200,17 +200,14 @@ where
 
     async fn get_or_build_producer(&self) -> Result<Arc<AsyncProducer>, TargetError> {
         let next_fingerprint =
-            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)?;
-        {
+            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
+        let tls_changed = {
             let mut tls_state_guard = self.tls_state.lock().await;
-            let producer = self.producer.clone();
-            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || {
-                let producer = producer.clone();
-                tokio::spawn(async move {
-                    let mut cached = producer.lock().await;
-                    *cached = None;
-                });
-            });
+            tls_state_guard.refresh(next_fingerprint)
+        };
+        if tls_changed {
+            let mut cached = self.producer.lock().await;
+            *cached = None;
         }
 
         let mut cached = self.producer.lock().await;

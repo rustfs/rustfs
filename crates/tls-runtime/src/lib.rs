@@ -31,7 +31,7 @@ pub use certs::{
 };
 pub use config::{ReloadApplyHint, ReloadDetectMode, TlsReloadOptions};
 pub use coordinator::{TlsConsumer, TlsReloadCoordinator};
-pub use debug::{TlsConsumerStatusItem, TlsConsumerStatusSource, TlsDebugStatusResponse, TlsDebugStatusResponseBuilder};
+pub use debug::{TlsConsumerStatusItem, TlsDebugStatusResponse, TlsDebugStatusResponseBuilder};
 pub use error::TlsRuntimeError;
 pub use fingerprint::TlsFingerprint;
 pub use material::{OutboundTlsMaterial, ServerTlsMaterial, TlsMaterialSnapshot};
@@ -45,6 +45,7 @@ pub use outbound::{
 };
 pub use server::{ReloadableServerCertResolver, spawn_server_cert_reload_loop};
 pub use source::{TlsFileLayout, TlsSource, TlsSourceKind};
+pub use state::OutboundOnlySnapshotArgs;
 pub use state::{TlsGeneration, TlsPublishedState, TlsReloadRuntimeState, TlsRuntimeStatusSnapshot};
 pub use state::{TlsRuntimeConsumerSection, TlsRuntimeOutboundSection, TlsRuntimeRuntimeSection, TlsRuntimeServerSection};
 

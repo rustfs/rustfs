@@ -23,25 +23,6 @@ pub struct TlsConsumerStatusItem {
     pub has_mtls_identity: bool,
 }
 
-pub trait TlsConsumerStatusSource {
-    fn consumer_name(&self) -> &'static str;
-    fn generation(&self) -> u64;
-    fn has_root_ca(&self) -> bool;
-    fn has_mtls_identity(&self) -> bool;
-
-    fn into_status_item(self) -> TlsConsumerStatusItem
-    where
-        Self: Sized,
-    {
-        TlsConsumerStatusItem {
-            consumer: self.consumer_name(),
-            generation: self.generation(),
-            has_root_ca: self.has_root_ca(),
-            has_mtls_identity: self.has_mtls_identity(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TlsDebugStatusResponse {
     pub foundation: TlsRuntimeStatusSnapshot,
@@ -64,14 +45,6 @@ impl TlsDebugStatusResponse {
 }
 
 impl TlsDebugStatusResponseBuilder {
-    pub fn push_consumer<S>(mut self, source: S) -> Self
-    where
-        S: TlsConsumerStatusSource,
-    {
-        self.consumers.push(source.into_status_item());
-        self
-    }
-
     pub fn push_consumers<I>(mut self, sources: I) -> Self
     where
         I: IntoIterator<Item = TlsConsumerStatusItem>,
@@ -90,32 +63,11 @@ impl TlsDebugStatusResponseBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{TlsConsumerStatusSource, TlsDebugStatusResponse};
+    use super::{TlsConsumerStatusItem, TlsDebugStatusResponse};
     use crate::state::{
         TlsRuntimeConsumerSection, TlsRuntimeOutboundSection, TlsRuntimeRuntimeSection, TlsRuntimeServerSection,
         TlsRuntimeStatusSnapshot,
     };
-
-    #[derive(Clone, Copy)]
-    struct TestConsumer;
-
-    impl TlsConsumerStatusSource for TestConsumer {
-        fn consumer_name(&self) -> &'static str {
-            "test_consumer"
-        }
-
-        fn generation(&self) -> u64 {
-            7
-        }
-
-        fn has_root_ca(&self) -> bool {
-            true
-        }
-
-        fn has_mtls_identity(&self) -> bool {
-            false
-        }
-    }
 
     #[test]
     fn builder_produces_structured_response() {
@@ -138,7 +90,12 @@ mod tests {
         };
 
         let response = TlsDebugStatusResponse::builder(foundation)
-            .push_consumers([TestConsumer.into_status_item()])
+            .push_consumers([TlsConsumerStatusItem {
+                consumer: "test_consumer",
+                generation: 7,
+                has_root_ca: true,
+                has_mtls_identity: false,
+            }])
             .build();
 
         let json = serde_json::to_value(response).expect("response should serialize");

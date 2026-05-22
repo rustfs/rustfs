@@ -229,7 +229,7 @@ where
     }
 
     async fn get_or_connect_client(&self) -> Result<Pulsar<TokioExecutor>, TargetError> {
-        let next_fingerprint = build_target_tls_fingerprint(&self.args.tls_ca, "", "")?;
+        let next_fingerprint = build_target_tls_fingerprint(&self.args.tls_ca, "", "").await?;
         {
             let mut tls_state_guard = self.tls_state.lock().unwrap();
             refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || {

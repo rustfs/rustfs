@@ -109,7 +109,8 @@ pub fn get_request_host(headers: &HeaderMap) -> String {
 /// Priority:
 /// 1. x-forwarded-port
 /// 2. host header (parse port)
-/// 3. port header
+/// 3. x-forwarded-proto inferred default (http=80, https=443) when host has no explicit port
+/// 4. port header
 pub fn get_request_port(headers: &HeaderMap) -> u16 {
     if let Some(port) = headers
         .get("x-forwarded-port")

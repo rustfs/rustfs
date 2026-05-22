@@ -71,11 +71,11 @@ where
     S: StorageBackend + Clone + Send + Sync + 'static + Debug,
 {
     fn tls_reload_options() -> TlsReloadOptions {
-        let mut options = TlsReloadOptions::default();
-        options.enabled = rustfs_utils::get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE);
-        options.interval =
-            Duration::from_secs(rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5));
-        options
+        TlsReloadOptions {
+            enabled: rustfs_utils::get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE),
+            interval: Duration::from_secs(rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5)),
+            ..TlsReloadOptions::default()
+        }
     }
 
     /// Create a new FTPS server

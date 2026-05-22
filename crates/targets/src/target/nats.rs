@@ -225,7 +225,7 @@ where
 
     async fn get_or_connect(&self) -> Result<async_nats::Client, TargetError> {
         let next_fingerprint =
-            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)?;
+            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
 
         {
             let mut tls_state_guard = self.tls_state.lock().unwrap();
