@@ -19,14 +19,14 @@ use http::StatusCode;
 use http::{HeaderMap, HeaderValue};
 use hyper::Method;
 use matchit::Params;
-use rustfs_ecstore::client::transition_api::transition_tls_status_view;
-use rustfs_protos::protos_tls_status_view;
-use rustfs_rio::rio_tls_status_view;
+use rustfs_ecstore::client::transition_api::transition_tls_status_from_summary;
+use rustfs_protos::protos_tls_status_from_summary;
+use rustfs_rio::rio_tls_status_from_summary;
 use rustfs_tls_runtime::{
-    TlsConsumerStatusSource, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot, load_global_outbound_tls_state,
+    TlsConsumerStatusSource, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot, summarize_global_outbound_tls_state,
 };
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 pub fn register_tls_debug_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -45,7 +45,7 @@ impl Operation for TlsStatusHandler {
         authorize_profile_request(&req).await?;
 
         let tls_path = rustfs_utils::get_env_opt_str(rustfs_config::ENV_RUSTFS_TLS_PATH).unwrap_or_default();
-        let outbound = load_global_outbound_tls_state().await;
+        let outbound = summarize_global_outbound_tls_state().await;
         let status = TlsRuntimeStatusSnapshot::from_outbound_only(
             tls_path,
             outbound.generation.0,
@@ -54,22 +54,21 @@ impl Operation for TlsStatusHandler {
             None,
             None,
             None,
-            outbound.root_ca_pem.as_ref().is_some_and(|pem| !pem.is_empty()),
-            outbound.mtls_identity.is_some(),
+            outbound.has_root_ca,
+            outbound.has_mtls_identity,
         );
-        let protos = protos_tls_status_view().await;
-        let rio = rio_tls_status_view().await;
-        let ecstore = transition_tls_status_view().await;
+        let protos = protos_tls_status_from_summary(outbound);
+        let rio = rio_tls_status_from_summary(outbound);
+        let ecstore = transition_tls_status_from_summary(outbound);
         let payload = TlsDebugStatusResponse::builder(status)
             .push_consumers([protos.into_status_item(), rio.into_status_item(), ecstore.into_status_item()])
             .build();
+        let body = serde_json::to_vec(&payload)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize tls status failed: {e}")))?;
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(S3Response::with_headers(
-            (StatusCode::OK, Body::from(serde_json::to_string(&payload).unwrap_or_default())),
-            headers,
-        ))
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
     }
 }
 

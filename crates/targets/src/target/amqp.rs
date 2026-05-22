@@ -383,6 +383,7 @@ where
 
     fn clear_connection_cache(&self) {
         *self.connection.lock() = None;
+        self.tls_state.lock().reset();
     }
 
     fn clear_connection(&self) {

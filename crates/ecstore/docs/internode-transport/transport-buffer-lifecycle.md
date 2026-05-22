@@ -1,8 +1,30 @@
 # Internode Buffer Lifecycle and Copy Count
 
 Status: P1-D analysis only. This document records the current TCP/HTTP
-internode data path and the ownership boundaries that matter before designing
-RDMA/RoCE/InfiniBand backends. It does not claim RDMA support exists.
+internode data path and the ownership boundaries that matter for the
+backend-neutral `InternodeDataTransport` adapter. It does not implement a new
+backend or change production behavior.
+
+## Open-source Scope
+
+The OSS scope is:
+
+- define buffer ownership and copy-count behavior for the current
+  `InternodeDataTransport` adapter;
+- keep `tcp-http` as the default backend;
+- keep existing TCP/HTTP behavior unchanged;
+- document copy hotspots and ownership gaps for maintainable transport code;
+- avoid hardware-specific dependencies or backend implementations.
+
+The OSS scope is not:
+
+- RDMA support;
+- DPU support;
+- DOCA support;
+- BlueField support;
+- RoCE/InfiniBand support;
+- hardware benchmark planning;
+- hardware-specific backend implementation.
 
 ## Scope
 
@@ -74,30 +96,30 @@ through `ParallelReader` in `crates/ecstore/src/erasure_coding/decode.rs` and
 | 6 | `RemoteDisk::read_file_zero_copy` | Medium when used | Remote zero-copy reads buffer the whole stream into memory. The name does not mean zero-copy over the network. |
 | 7 | URL/query/header/JSON serialization | Low | Metadata copies are small and not on the large payload hot path. |
 
-## RDMA-Blocking Ownership Issues
+## Adapter Ownership Gaps
 
 1. `FileReader` and `FileWriter` are boxed `AsyncRead`/`AsyncWrite` trait
-   objects. They expose borrowed buffers per poll, not registered memory
-   regions, memory keys, scatter/gather lists, or completion ownership.
+   objects. They expose borrowed buffers per poll, not stable backend-owned
+   regions, transfer handles, or explicit completion ownership.
 2. `InternodeDataTransport` currently returns stream traits only. Its
-   capabilities advertise that TCP/HTTP has no registered memory,
-   scatter/gather, or zero-copy receive support, but there is no backend API to
-   pass registered buffers.
+   capabilities advertise that TCP/HTTP does not require backend-specific
+   buffer registration and is not a zero-copy candidate, but there is no
+   backend API to pass stable backend-managed buffers.
 3. `HttpWriter` must own outgoing chunks because the async request body outlives
-   the caller's borrowed `&[u8]`. A zero-copy backend would need a different
+   the caller's borrowed `&[u8]`. A lower-copy backend would need a different
    lifetime contract or an owned buffer pool.
 4. Server write handling normalizes all incoming body chunks into a new
    `BytesMut`. Avoiding that copy would require passing incoming `Bytes` or
-   registered receive buffers directly into the disk/bitrot writer contract.
+   backend-owned receive buffers directly into the disk/bitrot writer contract.
 5. Erasure decode owns shard `Vec<u8>` buffers and write-back happens through
-   `AsyncWrite`. A zero-copy backend would need explicit ownership of shard
+   `AsyncWrite`. A lower-copy backend would need explicit ownership of shard
    buffers across decode, reconstruction, and network completion.
 6. Erasure encode materializes `Vec<Bytes>` blocks before fanout. A
-   scatter/gather backend would need an encode output representation that can be
-   sent as stable slices without repacking.
+   backend that can send multiple stable slices would need an encode output
+   representation that can be transferred without repacking.
 7. The HTTP auth and URL construction boundary is part of the current TCP/HTTP
-   backend. A non-HTTP backend will need equivalent peer authentication and disk
-   addressing without assuming URL query parameters.
+   backend. A non-HTTP backend would need equivalent peer authentication and
+   disk addressing without assuming URL query parameters.
 8. Local disk zero-copy exists only for local reads via `read_file_zero_copy`.
    Remote disks deliberately fall back to network streaming and full-buffer
    collection for the zero-copy helper.
