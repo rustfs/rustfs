@@ -20,7 +20,7 @@ use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
-    global_internode_metrics,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 use rustfs_utils::get_env_opt_str;
 use std::io::IoSlice;
@@ -459,7 +459,8 @@ fn record_internode_outgoing_request(track: bool, operation: Option<&'static str
     }
 
     match operation {
-        Some(operation) => global_internode_metrics().record_outgoing_request_for_operation(operation),
+        Some(operation) => global_internode_metrics()
+            .record_outgoing_request_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP),
         None => global_internode_metrics().record_outgoing_request(),
     }
 }
@@ -470,7 +471,11 @@ fn record_internode_sent_bytes(track: bool, operation: Option<&'static str>, byt
     }
 
     match operation {
-        Some(operation) => global_internode_metrics().record_sent_bytes_for_operation(operation, bytes),
+        Some(operation) => global_internode_metrics().record_sent_bytes_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            bytes,
+        ),
         None => global_internode_metrics().record_sent_bytes(bytes),
     }
 }
@@ -481,7 +486,11 @@ fn record_internode_recv_bytes(track: bool, operation: Option<&'static str>, byt
     }
 
     match operation {
-        Some(operation) => global_internode_metrics().record_recv_bytes_for_operation(operation, bytes),
+        Some(operation) => global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            bytes,
+        ),
         None => global_internode_metrics().record_recv_bytes(bytes),
     }
 }
@@ -492,7 +501,9 @@ fn record_internode_error(track: bool, operation: Option<&'static str>) {
     }
 
     match operation {
-        Some(operation) => global_internode_metrics().record_error_for_operation(operation),
+        Some(operation) => {
+            global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
+        }
         None => global_internode_metrics().record_error(),
     }
 }

@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Internode transport baseline runner.
 # Reuses scripts/run_object_batch_bench.sh and exports reproducible artifacts:
+# - run manifest with scenario/tool metadata and git revision
 # - object benchmark summaries per scenario/workload/concurrency
 # - optional internode operation metric deltas from a Prometheus text endpoint
 
@@ -61,6 +62,7 @@ Optional:
 
 Notes:
   - This baseline covers S3 PUT/GET workloads and records internode metric deltas when --metrics-url is set.
+  - The run manifest intentionally omits access keys, secret keys, and extra args to avoid writing credentials to artifacts.
   - Healing/replication-specific workloads should be run separately and appended to the same artifact directory.
 USAGE
 }
@@ -123,10 +125,45 @@ setup_output() {
     OUT_DIR="target/bench/internode-transport-$(date +%Y%m%d-%H%M%S)"
   fi
   mkdir -p "${OUT_DIR}"
-  echo "scenario,endpoint,workload,concurrency,size,status,throughput,requests_per_sec,avg_latency,log_file,run_dir" > "${OUT_DIR}/summary.csv"
+  echo "scenario,endpoint,workload,concurrency,size,status,throughput,requests_per_sec,avg_latency,error_count,log_file,run_dir" > "${OUT_DIR}/summary.csv"
   if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
-    echo "scenario,workload,concurrency,size,metric,operation,before,after,delta" > "${OUT_DIR}/internode_metric_deltas.csv"
+    echo "scenario,workload,concurrency,size,metric,operation,backend,before,after,delta" > "${OUT_DIR}/internode_metric_deltas.csv"
   fi
+}
+
+write_run_manifest() {
+  local manifest="${OUT_DIR}/run_manifest.txt"
+  local git_commit git_dirty rustc_version
+
+  git_commit="$(git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || echo "unknown")"
+  if [[ -n "$(git -C "${PROJECT_ROOT}" status --porcelain 2>/dev/null || true)" ]]; then
+    git_dirty="true"
+  else
+    git_dirty="false"
+  fi
+  rustc_version="$(rustc --version 2>/dev/null || echo "unknown")"
+
+  {
+    echo "created_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "git_commit=${git_commit}"
+    echo "git_dirty=${git_dirty}"
+    echo "rustc_version=${rustc_version}"
+    echo "kernel=$(uname -srvmo 2>/dev/null || echo "unknown")"
+    echo "tool=${TOOL}"
+    echo "region=${REGION}"
+    echo "bucket_prefix=${BUCKET_PREFIX}"
+    echo "scenarios=${SCENARIOS}"
+    echo "sizes=${SIZES}"
+    echo "concurrencies=${CONCURRENCIES}"
+    echo "duration=${DURATION}"
+    echo "samples=${SAMPLES}"
+    echo "insecure=${INSECURE}"
+    echo "metrics_url=${INTERNODE_METRICS_URL:-N/A}"
+    echo "out_dir=${OUT_DIR}"
+    echo "extra_args_present=$([[ -n "${EXTRA_ARGS}" ]] && echo true || echo false)"
+    echo "access_key=REDACTED"
+    echo "secret_key=REDACTED"
+  } > "${manifest}"
 }
 
 collect_internode_snapshot() {
@@ -153,15 +190,20 @@ extract_internode_rows() {
   awk '
   $1 ~ /^rustfs_system_network_internode_operation_/ {
     metric = $1
+    sub(/\{.*/, "", metric)
     op = "all"
+    backend = "unknown"
     if (match($0, /operation="[^"]+"/)) {
       op = substr($0, RSTART + 11, RLENGTH - 12)
+    }
+    if (match($0, /backend="[^"]+"/)) {
+      backend = substr($0, RSTART + 9, RLENGTH - 10)
     }
     n = split($0, parts, " ")
     value = parts[n]
     gsub(/[[:space:]]+/, "", value)
     if (value ~ /^[0-9]+([.][0-9]+)?$/) {
-      print metric "," op "," value
+      print metric "," op "," backend "," value
     }
   }' "${src}"
 }
@@ -182,18 +224,19 @@ append_metric_deltas() {
 
   awk -F',' -v scenario="${scenario}" -v workload="${workload}" -v conc="${conc}" -v size="${size}" '
     FNR==NR {
-      key = $1 SUBSEP $2
-      before[key] = $3
+      key = $1 SUBSEP $2 SUBSEP $3
+      before[key] = $4
       next
     }
     {
-      key = $1 SUBSEP $2
+      key = $1 SUBSEP $2 SUBSEP $3
       metric = $1
       operation = $2
-      afterv = $3 + 0
+      backend = $3
+      afterv = $4 + 0
       beforev = (key in before ? before[key] + 0 : 0)
       delta = afterv - beforev
-      printf "%s,%s,%s,%s,%s,%s,%.0f,%.0f,%.0f\n", scenario, workload, conc, size, metric, operation, beforev, afterv, delta
+      printf "%s,%s,%s,%s,%s,%s,%s,%.0f,%.0f,%.0f\n", scenario, workload, conc, size, metric, operation, backend, beforev, afterv, delta
     }
   ' "${before_rows}" "${after_rows}" >> "${OUT_DIR}/internode_metric_deltas.csv"
 
@@ -216,7 +259,7 @@ append_object_summary() {
   awk -F',' -v scenario="${scenario}" -v endpoint="${endpoint}" -v workload="${workload}" -v run_dir="${run_dir}" '
     NR == 1 { next }
     {
-      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", scenario, endpoint, workload, $3, $1, $4, $5, $6, $7, $8, run_dir
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", scenario, endpoint, workload, $3, $1, $4, $5, $6, $7, $8, $9, run_dir
     }
   ' "${src}" >> "${OUT_DIR}/summary.csv"
 }
@@ -315,9 +358,11 @@ main() {
   fi
 
   setup_output
+  write_run_manifest
   run_all
 
   echo "Artifacts:"
+  echo "  ${OUT_DIR}/run_manifest.txt"
   echo "  ${OUT_DIR}/summary.csv"
   if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
     echo "  ${OUT_DIR}/internode_metric_deltas.csv"

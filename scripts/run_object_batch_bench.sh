@@ -78,6 +78,34 @@ require_cmd() {
   fi
 }
 
+print_dry_run_command() {
+  local redact_next=false
+  local arg
+
+  printf '[DRY-RUN]'
+  for arg in "$@"; do
+    if [[ "${redact_next}" == "true" ]]; then
+      printf ' %q' "REDACTED"
+      redact_next=false
+      continue
+    fi
+
+    case "${arg}" in
+      --access-key|--secret-key)
+        printf ' %q' "${arg}"
+        redact_next=true
+        ;;
+      -accessKey=*|-secretKey=*)
+        printf ' %q' "${arg%%=*}=REDACTED"
+        ;;
+      *)
+        printf ' %q' "${arg}"
+        ;;
+    esac
+  done
+  printf '\n'
+}
+
 normalize_warp_host() {
   local raw="$1"
   raw="${raw#http://}"
@@ -159,7 +187,7 @@ setup_output() {
   fi
   mkdir -p "$OUT_DIR"
   SUMMARY_CSV="$OUT_DIR/summary.csv"
-  echo "size,tool,concurrency,status,throughput,requests_per_sec,avg_latency,log_file" > "$SUMMARY_CSV"
+  echo "size,tool,concurrency,status,throughput,requests_per_sec,avg_latency,error_count,log_file" > "$SUMMARY_CSV"
 }
 
 resolve_bucket() {
@@ -184,6 +212,27 @@ collect_metrics() {
   reqps="$(extract_value '([0-9]+(\\.[0-9]+)?\\s*(req/s|ops/s|requests/s))' "$log_file")"
   latency="$(extract_value '([0-9]+(\\.[0-9]+)?\\s*(ms|us|µs|s))(\\s*(avg|mean))?' "$log_file")"
   echo "${throughput:-N/A},${reqps:-N/A},${latency:-N/A}"
+}
+
+collect_error_count() {
+  local log_file="$1"
+  local count
+
+  count="$(
+    { rg -io '(errors?|failures?)[[:space:]:=]+[0-9]+' "$log_file" || true; } \
+      | awk '{ value = $0; gsub(/[^0-9]/, "", value); if (value != "") sum += value } END { if (NR > 0) print sum }'
+  )"
+  if [[ -n "$count" ]]; then
+    echo "$count"
+    return
+  fi
+
+  if [[ "$TOOL" == "warp" ]]; then
+    count="$(rg -c 'warp: <ERROR>' "$log_file" || true)"
+  else
+    count="$(rg -ci '(^|[[:space:]])(error|failed|failure)(:|[[:space:]])' "$log_file" || true)"
+  fi
+  echo "${count:-0}"
 }
 
 run_one() {
@@ -215,8 +264,7 @@ run_one() {
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-      printf '[DRY-RUN] %q ' "${cmd[@]}"
-      printf '\n'
+      print_dry_run_command "${cmd[@]}"
       echo "size=$size tool=$TOOL dry_run" > "$log_file"
     else
       if ! "${cmd[@]}" 2>&1 | tee "$log_file"; then
@@ -243,8 +291,7 @@ run_one() {
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-      printf '[DRY-RUN] %q ' "${cmd[@]}"
-      printf '\n'
+      print_dry_run_command "${cmd[@]}"
       echo "size=$size tool=$TOOL dry_run" > "$log_file"
     else
       if ! "${cmd[@]}" 2>&1 | tee "$log_file"; then
@@ -253,32 +300,39 @@ run_one() {
     fi
   fi
 
-  if [[ "$TOOL" == "warp" ]]; then
+  local metrics throughput reqps latency error_count
+  if [[ "$DRY_RUN" != "true" ]]; then
+    metrics="$(collect_metrics "$log_file")"
+    throughput="$(echo "$metrics" | cut -d',' -f1)"
+    reqps="$(echo "$metrics" | cut -d',' -f2)"
+    latency="$(echo "$metrics" | cut -d',' -f3)"
+    error_count="$(collect_error_count "$log_file")"
     # Warp may still exit with code 0 even when it prints runtime failures.
-    # Treat explicit error lines as failed runs to keep summary.csv reliable.
-    if rg -q 'warp: <ERROR>' "$log_file"; then
+    if [[ "$TOOL" == "warp" && "$error_count" != "0" ]]; then
       status="failed"
     fi
+  else
+    throughput="N/A"
+    reqps="N/A"
+    latency="N/A"
+    error_count="N/A"
   fi
 
-  local metrics throughput reqps latency
-  metrics="$(collect_metrics "$log_file")"
-  throughput="$(echo "$metrics" | cut -d',' -f1)"
-  reqps="$(echo "$metrics" | cut -d',' -f2)"
-  latency="$(echo "$metrics" | cut -d',' -f3)"
-
-  echo "$size,$TOOL,$CONCURRENCY,$status,$throughput,$reqps,$latency,$log_file" >> "$SUMMARY_CSV"
+  echo "$size,$TOOL,$CONCURRENCY,$status,$throughput,$reqps,$latency,$error_count,$log_file" >> "$SUMMARY_CSV"
 }
 
 main() {
   parse_args "$@"
   validate_args
   resolve_bucket
-  require_cmd rg
-  if [[ "$TOOL" == "warp" ]]; then
-    require_cmd "$WARP_BIN"
-  else
-    require_cmd "$S3BENCH_BIN"
+  if [[ "$DRY_RUN" != "true" ]]; then
+    require_cmd rg
+    require_cmd awk
+    if [[ "$TOOL" == "warp" ]]; then
+      require_cmd "$WARP_BIN"
+    else
+      require_cmd "$S3BENCH_BIN"
+    fi
   fi
 
   setup_output
