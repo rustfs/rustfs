@@ -88,6 +88,15 @@ Drive timeout health-action policy:
   - `mark_failure` (default): timeout marks failure and may transition drive runtime state.
   - `ignore_scanner`: timeout does not mark failure for scanner-sensitive operations (`walk_dir`, `read_metadata`, `list_dir`, `disk_info`).
 
+Drive timeout profile preset:
+- `RUSTFS_DRIVE_TIMEOUT_PROFILE`
+  - `default` (default): keep current timeout defaults.
+  - `high_latency`: use 60s default timeout for scanner-sensitive operations when no per-operation timeout override is set (`read_metadata`, `disk_info`, `list_dir`, `walk_dir`, `walk_dir_stall`).
+- Precedence:
+  - Explicit per-operation timeout env (`RUSTFS_DRIVE_*_TIMEOUT_SECS`) takes highest precedence.
+  - Then `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION` legacy fallback.
+  - Then the profile-derived default (`default` or `high_latency`).
+
 ## Startup filesystem boundary policy
 
 - `RUSTFS_UNSUPPORTED_FS_POLICY` controls startup behavior when RustFS detects local endpoint filesystems that are outside the supported production boundary.
