@@ -83,6 +83,11 @@ Legacy compatibility fallback:
 - `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION`
   This legacy variable is treated as a deprecated fallback for the operation-specific drive timeout variables above when a canonical variable is unset.
 
+Drive timeout health-action policy:
+- `RUSTFS_DRIVE_TIMEOUT_HEALTH_ACTION`
+  - `mark_failure` (default): timeout marks failure and may transition drive runtime state.
+  - `ignore_scanner`: timeout does not mark failure for scanner-sensitive operations (`walk_dir`, `read_metadata`, `list_dir`, `disk_info`).
+
 ## Startup filesystem boundary policy
 
 - `RUSTFS_UNSUPPORTED_FS_POLICY` controls startup behavior when RustFS detects local endpoint filesystems that are outside the supported production boundary.
