@@ -32,6 +32,7 @@ workspace = true
 
 [features]
 default = []
+experimental-rdma-sim = []
 
 [dependencies]
 rustfs-filemeta.workspace = true

@@ -39,6 +39,11 @@ pub const DEFAULT_INTERNODE_DATA_TRANSPORT: &str = "tcp-http";
 /// Legacy alias for "tcp-http". Both values select the TCP/HTTP transport backend.
 pub const INTERNODE_DATA_TRANSPORT_TCP: &str = "tcp";
 
+/// Experimental RDMA-like simulator backend. Accepted only by crates that enable
+/// their own `experimental-rdma-sim` feature.
+pub const INTERNODE_DATA_TRANSPORT_RDMA_SIM: &str = "rdma-sim";
+pub const INTERNODE_DATA_TRANSPORT_RDMA_SIM_FEATURE: &str = "experimental-rdma-sim";
+
 /// Known internode transport backend names accepted by the config parser.
 pub const KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS: &[&str] = &[DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP];
 
@@ -71,6 +76,8 @@ mod tests {
         assert_eq!(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, "RUSTFS_INTERNODE_DATA_TRANSPORT");
         assert_eq!(DEFAULT_INTERNODE_DATA_TRANSPORT, "tcp-http");
         assert_eq!(INTERNODE_DATA_TRANSPORT_TCP, "tcp");
+        assert_eq!(INTERNODE_DATA_TRANSPORT_RDMA_SIM, "rdma-sim");
+        assert_eq!(INTERNODE_DATA_TRANSPORT_RDMA_SIM_FEATURE, "experimental-rdma-sim");
         assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp"]);
     }
 }

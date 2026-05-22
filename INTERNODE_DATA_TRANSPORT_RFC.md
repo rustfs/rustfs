@@ -1,7 +1,7 @@
 # RFC: Pluggable Internode Data Transport
 
 > Status: draft
-> Last updated: 2026-05-21
+> Last updated: 2026-05-22
 > Scope: internode data-path analysis, benchmark baseline, and transport boundary
 
 ## Summary
@@ -32,6 +32,9 @@ Current implementation status:
   transport.
 - `NodeService` gRPC remains the internode control plane and continues to carry
   metadata/control operations.
+- `rdma-sim` is available only with the `experimental-rdma-sim` feature as a
+  removable architecture spike for `read_file_stream`. It is not real RDMA and
+  is not a production backend.
 
 ## Goals
 

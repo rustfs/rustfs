@@ -26,6 +26,7 @@ pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
 pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
 pub const INTERNODE_TRANSPORT_BACKEND_TCP_HTTP: &str = "tcp-http";
 pub const INTERNODE_TRANSPORT_BACKEND_GRPC: &str = "grpc";
+pub const INTERNODE_TRANSPORT_BACKEND_RDMA_SIM: &str = "rdma-sim";
 pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
 
 const OPERATION_LABEL: &str = "operation";
