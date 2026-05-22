@@ -20,7 +20,10 @@ mod generated;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_common::{GLOBAL_CONN_MAP, evict_connection};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-use rustfs_tls_runtime::{GlobalOutboundTlsStateSummary, load_global_outbound_tls_state, record_tls_consumer_stale_generation};
+use rustfs_tls_runtime::{
+    GlobalOutboundTlsStateSummary, TlsConsumerStatusSource, load_global_outbound_tls_state,
+    record_tls_consumer_stale_generation,
+};
 use std::{
     collections::HashMap,
     error::Error,
@@ -73,6 +76,24 @@ pub fn protos_tls_status_from_summary(summary: GlobalOutboundTlsStateSummary) ->
         generation: summary.generation.0,
         has_root_ca: summary.has_root_ca,
         has_mtls_identity: summary.has_mtls_identity,
+    }
+}
+
+impl TlsConsumerStatusSource for ProtosTlsStatusView {
+    fn consumer_name(&self) -> &'static str {
+        "protos_grpc_channel"
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn has_root_ca(&self) -> bool {
+        self.has_root_ca
+    }
+
+    fn has_mtls_identity(&self) -> bool {
+        self.has_mtls_identity
     }
 }
 

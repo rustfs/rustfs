@@ -16,6 +16,7 @@ pub mod certs;
 pub mod config;
 pub mod coordinator;
 pub mod error;
+pub mod debug;
 pub mod fingerprint;
 pub mod material;
 pub mod metrics;
@@ -31,6 +32,9 @@ pub use certs::{
 pub use config::{ReloadApplyHint, ReloadDetectMode, TlsReloadOptions};
 pub use coordinator::{TlsConsumer, TlsReloadCoordinator};
 pub use error::TlsRuntimeError;
+pub use debug::{
+    TlsConsumerStatusItem, TlsConsumerStatusSource, TlsDebugStatusResponse, TlsDebugStatusResponseBuilder,
+};
 pub use fingerprint::TlsFingerprint;
 pub use material::{OutboundTlsMaterial, ServerTlsMaterial, TlsMaterialSnapshot};
 pub use metrics::{

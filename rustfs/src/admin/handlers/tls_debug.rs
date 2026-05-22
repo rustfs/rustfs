@@ -108,8 +108,9 @@ impl Operation for TlsStatusHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::TlsStatusHandler;
+    use super::{TlsConsumerStatusItem, TlsDebugStatusResponse, TlsStatusHandler};
     use crate::admin::router::Operation;
+    use rustfs_tls_runtime::TlsRuntimeStatusSnapshot;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
@@ -134,5 +135,34 @@ mod tests {
         let result = TlsStatusHandler {}.call(build_tls_status_request(), Params::new()).await;
         let err = result.expect_err("tls status handler must reject unauthenticated requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn tls_debug_response_schema_is_structured() {
+        let status = TlsRuntimeStatusSnapshot::from_outbound_only(
+            "/tmp/tls".to_string(),
+            7,
+            true,
+            "poll",
+            Some(1),
+            Some(2),
+            Some("x".to_string()),
+            true,
+            false,
+        );
+        let payload = TlsDebugStatusResponse {
+            foundation: status,
+            consumers: vec![TlsConsumerStatusItem {
+                consumer: "protos_grpc_channel",
+                generation: 7,
+                has_root_ca: true,
+                has_mtls_identity: false,
+            }],
+        };
+
+        let json = serde_json::to_value(payload).expect("json should serialize");
+        assert!(json.get("foundation").is_some());
+        assert!(json.get("consumers").is_some());
+        assert!(json["consumers"].is_array());
     }
 }

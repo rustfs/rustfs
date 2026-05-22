@@ -23,7 +23,7 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 use rustfs_tls_runtime::{
-    GlobalOutboundTlsStateSummary, load_cert_bundle_der_bytes, load_global_outbound_tls_state,
+    GlobalOutboundTlsStateSummary, TlsConsumerStatusSource, load_cert_bundle_der_bytes, load_global_outbound_tls_state,
     record_tls_consumer_stale_generation,
 };
 use rustfs_utils::get_env_opt_str;
@@ -85,6 +85,24 @@ pub fn rio_tls_status_from_summary(summary: GlobalOutboundTlsStateSummary) -> Ri
         generation: summary.generation.0,
         has_root_ca: summary.has_root_ca,
         has_mtls_identity: summary.has_mtls_identity,
+    }
+}
+
+impl TlsConsumerStatusSource for RioTlsStatusView {
+    fn consumer_name(&self) -> &'static str {
+        "rio_http_reader"
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn has_root_ca(&self) -> bool {
+        self.has_root_ca
+    }
+
+    fn has_mtls_identity(&self) -> bool {
+        self.has_mtls_identity
     }
 }
 
