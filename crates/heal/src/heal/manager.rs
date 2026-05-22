@@ -313,7 +313,7 @@ impl PriorityHealQueue {
 fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
     let heal_path = heal_path.trim_matches('/');
     if heal_path.is_empty() {
-        return true;
+        return false;
     }
 
     match heal_type {
@@ -1887,6 +1887,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_task_status_for_empty_path_does_not_match_unrelated_tasks() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::bucket("bucket".to_string());
+        let request_id = request.id.clone();
+
+        manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_status_for_path("", &request_id).await,
+            Err(Error::TaskNotFound { .. })
+        ));
+        assert!(matches!(
+            manager.get_task_status_for_path("", "wrong-token").await,
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn test_get_task_status_reads_recent_completed_status() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let manager = HealManager::new(storage, None);
@@ -1944,6 +1967,22 @@ mod tests {
         assert_eq!(report.status, HealTaskStatus::Completed);
         assert_eq!(report.result_items.len(), 1);
         assert_eq!(report.result_items[0].object_size, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_get_task_report_for_empty_path_does_not_match_unrelated_tasks() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager
+            .submit_heal_request(HealRequest::bucket("bucket".to_string()))
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_report_for_path("", "wrong-token").await,
+            Err(Error::TaskNotFound { .. })
+        ));
     }
 
     #[tokio::test]

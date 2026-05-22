@@ -877,6 +877,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_query_request_empty_path_ignores_unrelated_tasks() {
+        let heal_manager = create_test_heal_manager();
+        heal_manager
+            .submit_heal_request(HealRequest::bucket("bucket".to_string()))
+            .await
+            .expect("request should be accepted");
+
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_query_request(String::new(), "wrong-token".to_string(), tx)
+            .await
+            .expect("query should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("query response should be returned");
+        assert!(response.success);
+        let payload: serde_json::Value =
+            serde_json::from_slice(response.data.as_deref().expect("status payload should be present"))
+                .expect("status payload should be json");
+        assert_eq!(payload["summary"], "finished");
+        assert_eq!(payload["items"].as_array().expect("items should be an array").len(), 0);
+    }
+
+    #[tokio::test]
     async fn test_process_cancel_request_cancels_queued_task_by_token() {
         let heal_manager = create_test_heal_manager();
         let request = HealRequest::bucket("bucket".to_string());
