@@ -83,6 +83,14 @@ Legacy compatibility fallback:
 - `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION`
   This legacy variable is treated as a deprecated fallback for the operation-specific drive timeout variables above when a canonical variable is unset.
 
+## Startup filesystem boundary policy
+
+- `RUSTFS_UNSUPPORTED_FS_POLICY` controls startup behavior when RustFS detects local endpoint filesystems that are outside the supported production boundary.
+  - `warn` (default): log warning and continue startup.
+  - `fail`: abort startup with an error.
+
+RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard.
+
 ## 📄 License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.
