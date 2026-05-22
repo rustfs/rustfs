@@ -35,7 +35,8 @@ use futures::lock::Mutex;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    global_internode_metrics,
 };
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
@@ -1558,7 +1559,10 @@ impl DiskAPI for RemoteDisk {
                 let data_len = data.len();
                 let disk = self.disk_ref().await;
                 let mut client = self.get_client().await.map_err(|err| {
-                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
                     Error::other(format!("can not get client, err: {err}"))
                 })?;
                 let request = Request::new(WriteAllRequest {
@@ -1568,19 +1572,32 @@ impl DiskAPI for RemoteDisk {
                     data,
                 });
 
-                global_internode_metrics().record_outgoing_request_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                global_internode_metrics().record_outgoing_request_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                );
                 let response = match client.write_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
-                        global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                        global_internode_metrics().record_error_for_operation_and_backend(
+                            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                            INTERNODE_TRANSPORT_BACKEND_GRPC,
+                        );
                         return Err(err.into());
                     }
                 };
 
-                global_internode_metrics().record_sent_bytes_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL, data_len);
+                global_internode_metrics().record_sent_bytes_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    data_len,
+                );
 
                 if !response.success {
-                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_WRITE_ALL);
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
                     return Err(response.error.unwrap_or_default().into());
                 }
 
@@ -1599,7 +1616,10 @@ impl DiskAPI for RemoteDisk {
             || async {
                 let disk = self.disk_ref().await;
                 let mut client = self.get_client().await.map_err(|err| {
-                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_READ_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
                     Error::other(format!("can not get client, err: {err}"))
                 })?;
                 let request = Request::new(ReadAllRequest {
@@ -1608,22 +1628,34 @@ impl DiskAPI for RemoteDisk {
                     path: path.to_string(),
                 });
 
-                global_internode_metrics().record_outgoing_request_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                global_internode_metrics().record_outgoing_request_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_READ_ALL,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                );
                 let response = match client.read_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
-                        global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                        global_internode_metrics().record_error_for_operation_and_backend(
+                            INTERNODE_OPERATION_GRPC_READ_ALL,
+                            INTERNODE_TRANSPORT_BACKEND_GRPC,
+                        );
                         return Err(err.into());
                     }
                 };
 
                 if !response.success {
-                    global_internode_metrics().record_error_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL);
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_READ_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                global_internode_metrics()
-                    .record_recv_bytes_for_operation(INTERNODE_OPERATION_GRPC_READ_ALL, response.data.len());
+                global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_READ_ALL,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    response.data.len(),
+                );
                 Ok(response.data)
             },
             get_max_timeout_duration(),

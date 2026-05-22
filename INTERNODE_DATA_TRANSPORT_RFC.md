@@ -1,7 +1,7 @@
 # RFC: Pluggable Internode Data Transport
 
 > Status: draft
-> Last updated: 2026-05-19
+> Last updated: 2026-05-21
 > Scope: internode data-path analysis, benchmark baseline, and transport boundary
 
 ## Summary
@@ -18,6 +18,20 @@ RDMA/RoCE is still a plausible future optimization for large internode disk
 data transfers, but it should not replace the whole internode RPC surface.
 The correct first step is to isolate the data plane, establish a TCP baseline,
 and introduce a pluggable transport boundary only around high-volume streams.
+
+Current implementation status:
+
+- `InternodeDataTransport` exists in
+  `crates/ecstore/src/rpc/internode_data_transport.rs`.
+- The default and only production backend is `tcp-http`; `tcp` is accepted as
+  an alias.
+- `RUSTFS_INTERNODE_DATA_TRANSPORT` selects the backend. Blank or unset values
+  use `tcp-http`; invalid values fail closed.
+- `RemoteDisk::read_file_stream`, `RemoteDisk::create_file`,
+  `RemoteDisk::append_file`, and `RemoteDisk::walk_dir` delegate to the
+  transport.
+- `NodeService` gRPC remains the internode control plane and continues to carry
+  metadata/control operations.
 
 ## Goals
 
@@ -110,6 +124,68 @@ are the only reasonable first candidates for a pluggable transport.
 | P1 | `ReadAll` / `WriteAll` | `RemoteDisk::read_all` / `write_all` | gRPC unary disk handlers | gRPC unary `bytes` payload | Moves bytes today, but should be measured before treating it as a high-throughput data path. |
 | P2 | proto `WriteStream` / `ReadAt` | currently not used | currently returns unimplemented | gRPC streaming definitions exist but are not implemented | Possible future API shape, not a current production path. |
 
+## P1 Data Path Inventory
+
+Classification:
+
+- Covered by `InternodeDataTransport`: `RemoteDisk` opens the transfer through
+  the transport abstraction.
+- Still direct TCP/HTTP/gRPC: bytes move over a fixed internode protocol
+  outside the transport abstraction.
+- Metadata/control-plane only: payloads are expected to be small metadata,
+  namespace, lock, health, or admin messages.
+- Not relevant: declared or test-only paths that are not current production
+  data paths.
+
+### Covered by `InternodeDataTransport`
+
+| Path | Owner references | Server references | Classification | Notes |
+| --- | --- | --- | --- | --- |
+| Remote shard read stream | `crates/ecstore/src/rpc/remote_disk.rs::RemoteDisk::read_file_stream`; `crates/ecstore/src/rpc/internode_data_transport.rs::InternodeDataTransport::open_read`; `crates/ecstore/src/bitrot.rs::create_bitrot_reader` | `rustfs/src/storage/rpc/http_service.rs::handle_read_file` | Covered by `InternodeDataTransport` | Object GET, repair reads, and erasure decode use this path for remote shard bytes. |
+| Remote shard write stream | `RemoteDisk::create_file`; `RemoteDisk::append_file`; `InternodeDataTransport::open_write`; `crates/ecstore/src/bitrot.rs::create_bitrot_writer` | `rustfs/src/storage/rpc/http_service.rs::handle_put_file` | Covered by `InternodeDataTransport` | Object PUT and multipart part upload use this path for remote shard bytes. |
+| Remote namespace walk stream | `RemoteDisk::walk_dir`; `InternodeDataTransport::open_walk_dir`; `crates/ecstore/src/cache_value/metacache_set.rs` walk producers | `rustfs/src/storage/rpc/http_service.rs::handle_walk_dir` | Covered by `InternodeDataTransport` | High-volume listing/scanner/heal metadata stream. It is not object byte data, but it is a large internode stream. |
+| Remote zero-copy read fallback | `RemoteDisk::read_file_zero_copy` | same as remote shard read stream | Covered by `InternodeDataTransport` through `read_file_stream` | The remote path buffers the stream into `Bytes`; true zero-copy is not guaranteed for remote disks. |
+
+### Still Direct TCP/HTTP/gRPC
+
+| Path | Owner references | Server references | Classification | Notes |
+| --- | --- | --- | --- | --- |
+| `ReadAll` | `RemoteDisk::read_all`; `crates/ecstore/src/store_init.rs`; heal resume metadata readers | `rustfs/src/storage/rpc/disk.rs::handle_read_all` | Still direct gRPC | Unary `bytes` response. Currently used mostly for metadata/config files; measure before moving. |
+| `WriteAll` | `RemoteDisk::write_all`; `crates/ecstore/src/store_init.rs`; heal resume metadata writers | `rustfs/src/storage/rpc/disk.rs::handle_write_all` | Still direct gRPC | Unary `bytes` request. Currently used mostly for metadata/config/checkpoint writes. |
+| `ReadMultiple` | `RemoteDisk::read_multiple`; `crates/ecstore/src/set_disk/read.rs::read_multiple_files` | `rustfs/src/storage/rpc/disk.rs::handle_read_multiple` | Still direct gRPC | Returns multiple small file payloads, usually metadata/listing support. Could become large with many entries. |
+| `ReadParts` | `RemoteDisk::read_parts`; `crates/ecstore/src/set_disk/read.rs::read_parts`; multipart list/complete paths | `rustfs/src/storage/rpc/disk.rs::handle_read_parts` | Still direct gRPC | Encoded `ObjectPartInfo` metadata, not object data. |
+| `RenamePart` | `RemoteDisk::rename_part`; `crates/ecstore/src/set_disk/write.rs::rename_part` | `rustfs/src/storage/rpc/disk.rs::handle_rename_part` | Still direct gRPC | Carries part metadata while committing multipart data already written through stream writers. |
+| `ListDir` | `RemoteDisk::list_dir`; multipart/lifecycle metadata listing callers | `rustfs/src/storage/rpc/disk.rs::handle_list_dir` | Still direct gRPC | Directory name listing, metadata/control-plane unless measured otherwise. |
+| Legacy gRPC `WalkDir` | `rustfs/src/storage/rpc/node_service.rs::NodeService::walk_dir` | same file | Still direct gRPC | Server implementation remains, but current `RemoteDisk::walk_dir` uses HTTP through the transport. Keep until callers are audited or compatibility policy is set. |
+
+### Metadata/control-plane only
+
+| Area | Owner references | Classification | Notes |
+| --- | --- | --- | --- |
+| Disk metadata and namespace mutations | `RemoteDisk::{read_metadata,write_metadata,update_metadata,read_version,read_xl,rename_data,rename_file,delete*,verify_file,check_parts,disk_info}` | Metadata/control-plane only | These remain on gRPC by design. |
+| Peer/bucket/admin operations | `crates/ecstore/src/rpc/{peer_s3_client.rs,peer_rest_client.rs,remote_locker.rs}` and matching `rustfs/src/storage/rpc/*` handlers | Metadata/control-plane only | Not candidates for a data-plane backend without separate measurements. |
+| Store init and format operations | `crates/ecstore/src/store_init.rs` | Metadata/control-plane only | Uses `ReadAll`/`WriteAll` for small format/config objects. |
+| Heal orchestration | `crates/heal/src/heal/storage.rs` and `crates/ecstore/src/set_disk.rs::heal_object` | Metadata/control-plane plus covered data reads | Heal object data reads go through `get_object_reader` and then covered shard streams; resume/checkpoint metadata uses direct gRPC disk metadata calls. |
+
+### Not Relevant Current Paths
+
+| Path | Owner references | Classification | Notes |
+| --- | --- | --- | --- |
+| Proto `Write` | `crates/protos/src/node.proto`; `rustfs/src/storage/rpc/disk.rs::handle_write` | Not relevant | Handler is unimplemented. |
+| Proto `WriteStream` | `crates/protos/src/node.proto`; `rustfs/src/storage/rpc/node_service.rs::write_stream` | Not relevant | Returns `unimplemented`. |
+| Proto `ReadAt` | `crates/protos/src/node.proto`; `rustfs/src/storage/rpc/node_service.rs::read_at` | Not relevant | Returns `unimplemented`. |
+| E2E reliant gRPC helpers | `crates/e2e_test/src/reliant/*` | Not relevant | Test harnesses, not production internode data-path callers. |
+
+### Current Limitations
+
+| Risk | Limitation |
+| --- | --- |
+| Medium | `ReadAll` and `WriteAll` still carry unary `bytes` over gRPC. They appear metadata-oriented today, but there is no size threshold or routing policy. |
+| Medium | `ReadMultiple` can aggregate many metadata files into one gRPC response. |
+| Low | Legacy gRPC `WalkDir` remains implemented while `RemoteDisk::walk_dir` uses HTTP through the transport. |
+| Medium | Remote `read_file_zero_copy` is a buffered read over the transport, not a remote zero-copy contract. |
+| Medium | Server-side TCP HTTP route handling is outside the client-side trait. |
+
 ## Current Object Write Path
 
 For object PUTs in distributed erasure mode, the relevant flow is:
@@ -117,7 +193,8 @@ For object PUTs in distributed erasure mode, the relevant flow is:
 1. Upper storage layers prepare object data and erasure metadata.
 2. `SetDisks` selects local and remote disks.
 3. `create_bitrot_writer` calls `disk.create_file(...)` for each shard writer.
-4. For a remote disk, `RemoteDisk::create_file` returns an `HttpWriter`.
+4. For a remote disk, `RemoteDisk::create_file` delegates to
+   `InternodeDataTransport::open_write`.
 5. `HttpWriter` sends an HTTP `PUT` to `/rustfs/rpc/put_file_stream`.
 6. The remote node's `handle_put_file` opens the local file writer and copies
    incoming body chunks into it.
@@ -133,7 +210,8 @@ For object GETs and repair reads in distributed erasure mode, the relevant flow 
 1. `SetDisks` prepares shard readers for the selected disks.
 2. `create_bitrot_reader` uses local zero-copy only when `disk.is_local()`.
 3. For a remote disk, it calls `disk.read_file_stream(...)`.
-4. `RemoteDisk::read_file_stream` returns an `HttpReader`.
+4. `RemoteDisk::read_file_stream` delegates to
+   `InternodeDataTransport::open_read`.
 5. `HttpReader` sends an HTTP `GET` to `/rustfs/rpc/read_file_stream`.
 6. The remote node's `handle_read_file` opens the local disk stream and returns
    it as an HTTP streaming body.
@@ -143,7 +221,7 @@ This is the primary read data-plane candidate.
 
 ## Existing Metrics and Benchmark Surface
 
-RustFS already has coarse internode metrics in `crates/common/src/internode_metrics.rs`:
+RustFS already has coarse internode metrics in `crates/io-metrics/src/internode_metrics.rs`:
 
 - sent bytes
 - received bytes
@@ -153,9 +231,8 @@ RustFS already has coarse internode metrics in `crates/common/src/internode_metr
 - dial errors
 - average dial time
 
-These metrics are useful as a starting point, but they are not enough for a
-transport RFC. A transport benchmark needs route-level and operation-level
-measurements for at least:
+These metrics are useful as a starting point. For backend comparisons, the
+relevant route-level and operation-level dimensions are:
 
 - `read_file_stream`
 - `put_file_stream`
@@ -177,8 +254,8 @@ not yet isolate internode transport cost.
 
 ## Required TCP Baseline
 
-Before adding a transport abstraction or any RDMA backend, collect a baseline
-for the current TCP/HTTP/gRPC implementation.
+Before adding any non-TCP backend, collect a baseline for the current
+TCP/HTTP/gRPC implementation.
 
 ### Topology
 
@@ -246,15 +323,16 @@ be considered.
 
 ### Candidate boundary
 
-The narrowest useful boundary is remote disk stream transfer:
+The current boundary is remote disk stream transfer:
 
 ```rust
 #[async_trait::async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter>;
-    async fn walk_dir(&self, request: WalkDirStreamRequest, writer: &mut dyn AsyncWrite) -> Result<()>;
-    fn capabilities(&self) -> InternodeTransportCapabilities;
+    async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader>;
+    fn name(&self) -> &'static str;
+    fn capabilities(&self) -> InternodeDataTransportCapabilities;
 }
 ```
 
@@ -268,22 +346,22 @@ Initial request fields should mirror the current HTTP query parameters:
 - length
 - append/create mode
 - expected size
-- auth or transfer token material
+- optional stall timeout for long-running listing streams
 
 The initial TCP backend can keep the current signed HTTP URLs internally.
 
 ### Integration point
 
-`RemoteDisk` should delegate only these methods to the data transport:
+`RemoteDisk` delegates only these methods to the data transport:
 
 - `read_file_stream`
 - `read_file_zero_copy` as a wrapper over `read_file_stream` unless the backend
   supports a stronger zero-copy API
 - `append_file`
 - `create_file`
-- optionally `walk_dir`
+- `walk_dir`
 
-All other `RemoteDisk` methods should continue using the current gRPC client
+All other `RemoteDisk` methods continue using the current gRPC client
 until measurements prove otherwise.
 
 ### Capability model
@@ -310,8 +388,13 @@ Fallback rules:
 
 - If no explicit data transport is configured, use the current TCP/HTTP
   implementation.
-- If an experimental backend fails initialization, either fail fast with a clear
-  error or fall back to TCP only when the configured policy allows fallback.
+- The current accepted values for `RUSTFS_INTERNODE_DATA_TRANSPORT` are
+  `tcp-http` and the `tcp` alias. Empty and unset values use `tcp-http`.
+- Invalid configured values fail closed with an error that includes the env var
+  name and invalid value.
+- If a future experimental backend fails initialization, either fail fast with a
+  clear error or fall back to TCP only when the configured policy allows
+  fallback.
 - Runtime fallback must preserve object correctness and quorum semantics.
 - Fallback events must be logged and counted in metrics.
 - CI and local development must not require RDMA-capable hardware.
@@ -319,11 +402,47 @@ Fallback rules:
 Suggested future configuration shape:
 
 ```text
-RUSTFS_INTERNODE_DATA_TRANSPORT=tcp
+RUSTFS_INTERNODE_DATA_TRANSPORT=tcp-http
 RUSTFS_INTERNODE_DATA_TRANSPORT_FALLBACK=tcp
 ```
 
-Do not add these settings until there is an implementation PR that uses them.
+Do not add fallback settings until there is an implementation PR that uses them.
+
+## Baseline Validation Commands
+
+Dry-run command:
+
+```bash
+scripts/run_internode_transport_baseline.sh \
+  --access-key minioadmin \
+  --secret-key minioadmin \
+  --scenarios local=http://127.0.0.1:9000,distributed=http://127.0.0.1:9001 \
+  --sizes 4KiB,1MiB \
+  --concurrencies 1 \
+  --duration 10s \
+  --dry-run
+```
+
+Real TCP baseline command with metrics:
+
+```bash
+RUSTFS_INTERNODE_DATA_TRANSPORT=tcp-http \
+scripts/run_internode_transport_baseline.sh \
+  --access-key "$RUSTFS_ACCESS_KEY" \
+  --secret-key "$RUSTFS_SECRET_KEY" \
+  --scenarios local=http://127.0.0.1:9000,distributed=http://127.0.0.1:9001 \
+  --metrics-url http://127.0.0.1:9000/metrics \
+  --out-dir target/bench/internode-transport/manual-run
+```
+
+Expected artifacts:
+
+- `run_manifest.txt`
+- `summary.csv`
+- `internode_metric_deltas.csv` when `--metrics-url` is provided
+
+The baseline validates the default TCP/HTTP path only. It must not be used to
+claim RDMA, RoCE, or InfiniBand support.
 
 ## Future RDMA/RoCE/InfiniBand Boundary
 
@@ -331,7 +450,7 @@ A future RDMA backend should be experimental and feature-gated. It should be
 designed as an optional data-plane backend, not as a replacement for the gRPC
 control plane.
 
-Required design areas:
+A future non-TCP backend would need an explicit design for:
 
 - peer capability discovery over the existing gRPC control plane
 - connection management and health mapping into existing disk fault handling
@@ -345,9 +464,8 @@ Required design areas:
   fallback, and errors
 - hardware and kernel compatibility matrix
 
-The first RDMA prototype should target `read_file_stream` and `put_file_stream`
-only. `walk_dir`, metadata RPCs, locks, admin RPCs, and bucket coordination
-should remain on gRPC unless a later benchmark identifies a specific bottleneck.
+`walk_dir`, metadata RPCs, locks, admin RPCs, and bucket coordination remain
+outside the current data-plane boundary.
 
 ## DPU, DOCA, DPDK, SPDK, and SmartNIC Notes
 
@@ -359,42 +477,5 @@ These technologies should not drive the first abstraction:
   and does not have a custom packet data plane.
 - SPDK may be relevant only if RustFS adds a raw block or NVMe-oriented local
   storage backend. The current disk model is filesystem-based.
-- SmartNIC offload should be discussed only after the data-plane boundary and
-  baseline metrics show where CPU is spent.
-
-## Suggested PR Sequence
-
-1. Add this RFC and the current-path classification.
-2. Add route-level internode metrics for `/rustfs/rpc/read_file_stream`,
-   `/rustfs/rpc/put_file_stream`, `/rustfs/rpc/walk_dir`, and gRPC disk byte
-   calls.
-3. Add an internode transport benchmark harness that can run against a local
-   multi-node cluster and produce repeatable artifacts.
-4. Introduce an `InternodeDataTransport` wrapper with a TCP/HTTP backend that
-   preserves current behavior.
-5. Move `RemoteDisk` stream methods to the transport wrapper without changing
-   default behavior.
-6. Add an experimental feature-gated RDMA/RoCE backend only after the baseline
-   proves that internode byte transfer is a limiting factor.
-
-## Open Questions
-
-- Which production workload is the primary target: large-object throughput,
-  small-object tail latency, healing throughput, or rebalance throughput?
-- Should `ReadAll` and `WriteAll` stay as gRPC unary calls, or should large
-  payloads be redirected to the data transport?
-- Is `walk_dir` a metadata control stream or a secondary data-plane stream for
-  scanner/healing workloads?
-- What is the acceptable fallback policy for an explicitly configured
-  experimental backend?
-- How should an RDMA backend preserve authentication and encryption guarantees
-  currently provided by signed HTTP requests and TLS-capable gRPC/HTTP clients?
-- What hardware matrix is required before accepting a non-default RDMA backend?
-
-## Immediate Next Steps
-
-- Create a focused issue from this RFC.
-- Add route-level internode metrics before changing transport code.
-- Extend existing benchmark scripts or add a new script to isolate remote disk
-  stream read/write throughput.
-- Keep the first code PR behavior-preserving and TCP-only.
+- SmartNIC offload is outside the current boundary because this RFC does not
+  establish a CPU-offload bottleneck.
