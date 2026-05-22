@@ -47,6 +47,16 @@ pub const DEFAULT_DRIVE_ACTIVE_CHECK_INTERVAL_SECS: u64 = 15;
 pub const ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS: &str = "RUSTFS_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS";
 pub const DEFAULT_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS: u64 = 5;
 
+/// Timeout-to-health transition policy for drive operations.
+///
+/// Accepted values:
+/// - "mark_failure" (default): timeout marks failure and may transition runtime state.
+/// - "ignore_scanner": timeout does not mark failure for scanner-sensitive operations.
+pub const ENV_DRIVE_TIMEOUT_HEALTH_ACTION: &str = "RUSTFS_DRIVE_TIMEOUT_HEALTH_ACTION";
+pub const DRIVE_TIMEOUT_HEALTH_ACTION_MARK_FAILURE: &str = "mark_failure";
+pub const DRIVE_TIMEOUT_HEALTH_ACTION_IGNORE_SCANNER: &str = "ignore_scanner";
+pub const DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION: &str = DRIVE_TIMEOUT_HEALTH_ACTION_MARK_FAILURE;
+
 /// Number of consecutive failures before a suspect drive is classified as offline.
 pub const ENV_DRIVE_SUSPECT_FAILURE_THRESHOLD: &str = "RUSTFS_DRIVE_SUSPECT_FAILURE_THRESHOLD";
 pub const DEFAULT_DRIVE_SUSPECT_FAILURE_THRESHOLD: u64 = 2;

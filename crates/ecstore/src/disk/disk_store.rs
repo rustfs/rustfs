@@ -50,6 +50,12 @@ enum TimeoutHealthAction {
     IgnoreFailure,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeoutHealthPolicy {
+    MarkFailure,
+    IgnoreScanner,
+}
+
 pub const ENV_RUSTFS_DRIVE_ACTIVE_MONITORING: &str = "RUSTFS_DRIVE_ACTIVE_MONITORING";
 pub const DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING: bool = true;
 pub const SKIP_IF_SUCCESS_BEFORE: Duration = Duration::from_secs(5);
@@ -120,6 +126,33 @@ pub fn get_drive_active_check_timeout() -> Duration {
         rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS,
         rustfs_config::DEFAULT_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS,
     ))
+}
+
+fn get_drive_timeout_health_policy() -> TimeoutHealthPolicy {
+    let raw = rustfs_utils::get_env_str(
+        rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION,
+        rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION,
+    );
+    match raw.trim().to_ascii_lowercase().as_str() {
+        rustfs_config::DRIVE_TIMEOUT_HEALTH_ACTION_MARK_FAILURE => TimeoutHealthPolicy::MarkFailure,
+        rustfs_config::DRIVE_TIMEOUT_HEALTH_ACTION_IGNORE_SCANNER => TimeoutHealthPolicy::IgnoreScanner,
+        _ => {
+            warn!(
+                env = rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION,
+                value = %raw,
+                default = rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION,
+                "Invalid drive timeout health action policy; falling back to default"
+            );
+            TimeoutHealthPolicy::MarkFailure
+        }
+    }
+}
+
+fn scanner_timeout_health_action() -> TimeoutHealthAction {
+    match get_drive_timeout_health_policy() {
+        TimeoutHealthPolicy::MarkFailure => TimeoutHealthAction::MarkFailure,
+        TimeoutHealthPolicy::IgnoreScanner => TimeoutHealthAction::IgnoreFailure,
+    }
 }
 
 /// DiskHealthTracker tracks the health status of a disk.
@@ -893,10 +926,11 @@ impl LocalDiskWrapper {
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
-        self.track_disk_health_with_op(
+        self.track_disk_health_with_op_and_timeout_action(
             "read_metadata",
             || async { self.disk.read_metadata(volume, path).await },
             get_drive_metadata_timeout(),
+            scanner_timeout_health_action(),
         )
         .await
     }
@@ -973,7 +1007,7 @@ impl DiskAPI for LocalDiskWrapper {
             return Err(DiskError::FaultyDisk);
         }
 
-        self.track_disk_health_with_op(
+        self.track_disk_health_with_op_and_timeout_action(
             "disk_info",
             || async {
                 let result = self.disk.disk_info(opts).await?;
@@ -987,6 +1021,7 @@ impl DiskAPI for LocalDiskWrapper {
                 Ok(result)
             },
             get_drive_disk_info_timeout(),
+            scanner_timeout_health_action(),
         )
         .await
     }
@@ -1130,10 +1165,11 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
-        self.track_disk_health_with_op(
+        self.track_disk_health_with_op_and_timeout_action(
             "list_dir",
             || async { self.disk.list_dir(origvolume, volume, dir_path, count).await },
             get_drive_list_dir_timeout(),
+            scanner_timeout_health_action(),
         )
         .await
     }
@@ -1460,6 +1496,33 @@ mod tests {
 
         assert_eq!(result.expect_err("operation should time out"), DiskError::Timeout);
         assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Suspect);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn drive_timeout_health_policy_defaults_to_mark_failure() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION, || {
+            assert_eq!(get_drive_timeout_health_policy(), TimeoutHealthPolicy::MarkFailure);
+            assert_eq!(scanner_timeout_health_action(), TimeoutHealthAction::MarkFailure);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn drive_timeout_health_policy_respects_ignore_scanner() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION, Some("ignore_scanner"), || {
+            assert_eq!(get_drive_timeout_health_policy(), TimeoutHealthPolicy::IgnoreScanner);
+            assert_eq!(scanner_timeout_health_action(), TimeoutHealthAction::IgnoreFailure);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn drive_timeout_health_policy_invalid_value_falls_back_to_default() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION, Some("invalid"), || {
+            assert_eq!(get_drive_timeout_health_policy(), TimeoutHealthPolicy::MarkFailure);
+            assert_eq!(scanner_timeout_health_action(), TimeoutHealthAction::MarkFailure);
+        });
     }
 
     #[test]
