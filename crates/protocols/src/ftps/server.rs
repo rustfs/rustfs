@@ -17,8 +17,8 @@ use super::driver::FtpsDriver;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
 use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
-use crate::tls_hot_reload::{ReloadableCertResolver, spawn_cert_reload_loop};
 use libunftp::options::FtpsRequired;
+use rustfs_tls_runtime::{ReloadableServerCertResolver, TlsReloadOptions, spawn_server_cert_reload_loop};
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::path::Path;
@@ -114,9 +114,14 @@ where
             if let Some(cert_dir) = &self.config.cert_dir {
                 debug!("Enabling FTPS with multi-certificate support from directory: {}", cert_dir);
 
-                let resolver = ReloadableCertResolver::load_from_directory(cert_dir)
+                let resolver = ReloadableServerCertResolver::load_from_directory(cert_dir)
                     .map_err(|e| FtpsInitError::InvalidConfig(format!("Failed to create certificate resolver: {}", e)))?;
-                let _reload_task = spawn_cert_reload_loop("ftps", cert_dir.clone(), resolver.clone(), reload_shutdown_rx.clone());
+                let _reload_task = spawn_server_cert_reload_loop(
+                    "ftps",
+                    resolver.clone(),
+                    TlsReloadOptions::default(),
+                    reload_shutdown_rx.clone(),
+                );
 
                 // Build ServerConfig with SNI support
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

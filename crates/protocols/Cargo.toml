@@ -92,6 +92,7 @@ rustls = { workspace = true, optional = true }
 rustfs-keystone = { workspace = true, optional = true }
 rustfs-ecstore = { workspace = true, optional = true }
 rustfs-rio = { workspace = true, optional = true }
+rustfs-tls-runtime = { workspace = true }
 axum = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }

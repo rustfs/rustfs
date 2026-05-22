@@ -29,10 +29,7 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_config::{
-    DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_RUSTFS_TLS_PATH, ENV_TRUST_LEAF_CERT_AS_CA,
-    MAX_ADMIN_REQUEST_BODY_SIZE, RUSTFS_CA_CERT, RUSTFS_TLS_CERT,
-};
+use rustfs_config::{DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_TLS_PATH, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -67,7 +64,9 @@ use rustfs_policy::policy::{
 };
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
+use rustfs_tls_runtime::load_global_outbound_tls_state;
 use rustfs_utils::http::get_source_scheme;
+use rustls_pki_types::pem::PemObject;
 use s3s::dto::{
     BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus,
     Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule,
@@ -448,56 +447,32 @@ async fn persist_site_replication_state(state: &SiteReplicationState) -> S3Resul
     }
 }
 
-fn add_root_certificates_from_file(
-    mut builder: reqwest::ClientBuilder,
-    cert_path: &std::path::Path,
-    description: &str,
-) -> S3Result<reqwest::ClientBuilder> {
-    if !cert_path.exists() {
-        return Ok(builder);
-    }
-
-    std::fs::read(cert_path).map_err(|e| {
-        S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("failed to read {description} {}: {e}", cert_path.display()),
-        )
-    })?;
-
-    let certs_der = rustfs_utils::load_cert_bundle_der_bytes(cert_path.to_string_lossy().as_ref()).map_err(|e| {
-        S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("failed to parse {description} {}: {e}", cert_path.display()),
-        )
-    })?;
-
-    for cert_der in certs_der {
-        let cert = reqwest::Certificate::from_der(&cert_der).map_err(|e| {
-            S3Error::with_message(
-                S3ErrorCode::InternalError,
-                format!("failed to load {description} {}: {e}", cert_path.display()),
-            )
-        })?;
-        builder = builder.add_root_certificate(cert);
-    }
-
-    Ok(builder)
-}
-
 fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
         .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
         .pool_idle_timeout(Some(Duration::from_secs(60)));
 
-    let tls_path = rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH);
-    if !tls_path.is_empty() {
-        let tls_dir = std::path::Path::new(&tls_path);
-        builder = add_root_certificates_from_file(builder, &tls_dir.join(RUSTFS_CA_CERT), "site-replication CA cert")?;
+    let outbound_tls = tokio::runtime::Handle::current().block_on(load_global_outbound_tls_state());
+    if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
+        let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
+        let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to parse published site-replication CA certs: {e}"),
+                )
+            })?;
 
-        if rustfs_utils::get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA) {
-            builder =
-                add_root_certificates_from_file(builder, &tls_dir.join(RUSTFS_TLS_CERT), "site-replication leaf cert as CA")?;
+        for cert_der in certs_der {
+            let cert = reqwest::Certificate::from_der(cert_der.as_ref()).map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to load published site-replication CA cert: {e}"),
+                )
+            })?;
+            builder = builder.add_root_certificate(cert);
         }
     }
 

@@ -19,13 +19,14 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, invalidate_cache_on_connectivity_error, open_target_queue_store,
-        persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, invalidate_cache_on_connectivity_error,
+        open_target_queue_store, persist_queued_payload_to_store, refresh_tls_fingerprint_state,
     },
 };
 use async_trait::async_trait;
 use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
 use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAcks, SecurityConfig};
+use rustfs_tls_runtime::{load_cert_bundle_der_bytes, load_private_key};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{marker::PhantomData, sync::Arc, time::Duration};
@@ -104,6 +105,7 @@ where
     args: KafkaArgs,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     producer: Arc<Mutex<Option<Arc<AsyncProducer>>>>,
+    tls_state: Arc<Mutex<TargetTlsState>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: PhantomData<E>,
 }
@@ -144,6 +146,7 @@ where
             args,
             store: queue_store,
             producer: Arc::new(Mutex::new(None)),
+            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
@@ -164,9 +167,27 @@ where
         if self.args.tls_enable {
             let mut security = SecurityConfig::new();
             if !self.args.tls_ca.is_empty() {
+                let certs = load_cert_bundle_der_bytes(&self.args.tls_ca)
+                    .map_err(|e| Self::map_kafka_error(KafkaError::Config(e.to_string()), "Failed to parse Kafka tls_ca"))?;
+                if certs.is_empty() {
+                    return Err(TargetError::Configuration(
+                        "Kafka tls_ca did not contain any parsable certificates".to_string(),
+                    ));
+                }
                 security = security.with_ca_cert(self.args.tls_ca.clone());
             }
             if !self.args.tls_client_cert.is_empty() && !self.args.tls_client_key.is_empty() {
+                let certs = load_cert_bundle_der_bytes(&self.args.tls_client_cert).map_err(|e| {
+                    Self::map_kafka_error(KafkaError::Config(e.to_string()), "Failed to parse Kafka tls_client_cert")
+                })?;
+                if certs.is_empty() {
+                    return Err(TargetError::Configuration(
+                        "Kafka tls_client_cert did not contain any parsable certificates".to_string(),
+                    ));
+                }
+                let _ = load_private_key(&self.args.tls_client_key).map_err(|e| {
+                    Self::map_kafka_error(KafkaError::Config(e.to_string()), "Failed to parse Kafka tls_client_key")
+                })?;
                 security = security.with_client_cert(self.args.tls_client_cert.clone(), self.args.tls_client_key.clone());
             }
             config = config.with_security(security);
@@ -178,6 +199,20 @@ where
     }
 
     async fn get_or_build_producer(&self) -> Result<Arc<AsyncProducer>, TargetError> {
+        let next_fingerprint =
+            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)?;
+        {
+            let mut tls_state_guard = self.tls_state.lock().await;
+            let producer = self.producer.clone();
+            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || {
+                let producer = producer.clone();
+                tokio::spawn(async move {
+                    let mut cached = producer.lock().await;
+                    *cached = None;
+                });
+            });
+        }
+
         let mut cached = self.producer.lock().await;
         if let Some(producer) = cached.as_ref() {
             return Ok(Arc::clone(producer));
@@ -191,6 +226,7 @@ where
     async fn invalidate_cached_producer(&self) {
         let mut cached = self.producer.lock().await;
         *cached = None;
+        self.tls_state.lock().await.reset();
     }
 
     /// Serializes the event and builds a QueuedPayload
@@ -230,6 +266,7 @@ where
             args: self.args.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             producer: Arc::clone(&self.producer),
+            tls_state: Arc::clone(&self.tls_state),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })

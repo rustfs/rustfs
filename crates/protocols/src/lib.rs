@@ -17,9 +17,6 @@
 pub mod common;
 pub mod constants;
 
-#[cfg(any(feature = "ftps", feature = "webdav"))]
-mod tls_hot_reload;
-
 #[cfg(feature = "ftps")]
 pub mod ftps;
 

@@ -16,7 +16,6 @@ use super::config::{WebDavConfig, WebDavInitError};
 use super::driver::WebDavDriver;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
-use crate::tls_hot_reload::{ReloadableCertResolver, spawn_cert_reload_loop};
 use bytes::Bytes;
 use dav_server::DavHandler;
 use dav_server::fakels::FakeLs;
@@ -25,6 +24,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rustfs_tls_runtime::{ReloadableServerCertResolver, TlsReloadOptions, spawn_server_cert_reload_loop};
 use rustls::ServerConfig;
 use std::convert::Infallible;
 use std::net::IpAddr;
@@ -68,10 +68,14 @@ where
             if let Some(cert_dir) = &self.config.cert_dir {
                 debug!("Enabling WebDAV TLS with certificates from: {}", cert_dir);
 
-                let resolver = ReloadableCertResolver::load_from_directory(cert_dir)
+                let resolver = ReloadableServerCertResolver::load_from_directory(cert_dir)
                     .map_err(|e| WebDavInitError::Tls(format!("Failed to create certificate resolver: {}", e)))?;
-                let _reload_task =
-                    spawn_cert_reload_loop("webdav", cert_dir.clone(), resolver.clone(), reload_shutdown_rx.clone());
+                let _reload_task = spawn_server_cert_reload_loop(
+                    "webdav",
+                    resolver.clone(),
+                    TlsReloadOptions::default(),
+                    reload_shutdown_rx.clone(),
+                );
 
                 let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
