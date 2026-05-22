@@ -199,7 +199,7 @@ fn get_drive_timeout_health_policy() -> TimeoutHealthPolicy {
         default = rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION,
         "Invalid drive timeout health action policy; falling back to default"
     );
-    TimeoutHealthPolicy::MarkFailure
+    TimeoutHealthPolicy::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION).unwrap_or(TimeoutHealthPolicy::MarkFailure)
 }
 
 /// DiskHealthTracker tracks the health status of a disk.

@@ -49,14 +49,14 @@ fn get_unsupported_fs_policy() -> UnsupportedFsPolicy {
         default = DEFAULT_RUSTFS_UNSUPPORTED_FS_POLICY,
         "Invalid unsupported filesystem policy; falling back to default"
     );
-    UnsupportedFsPolicy::Warn
+    UnsupportedFsPolicy::parse(DEFAULT_RUSTFS_UNSUPPORTED_FS_POLICY).unwrap_or(UnsupportedFsPolicy::Warn)
 }
 
 fn is_unsupported_fs_type(fs_type: &str) -> bool {
     let normalized = fs_type.trim().to_ascii_lowercase();
     matches!(
         normalized.as_str(),
-        "nfs" | "cifs" | "smb2" | "fuse" | "fuseblk" | "overlayfs" | "9p" | "ceph" | "glusterfs" | "gfs" | "gfs2"
+        "nfs" | "cifs" | "smb2" | "fuse" | "fuseblk" | "overlayfs" | "9p" | "v9fs" | "ceph" | "glusterfs" | "gfs" | "gfs2"
     ) || normalized.starts_with("fuse.")
 }
 
@@ -139,6 +139,7 @@ mod tests {
         assert!(is_unsupported_fs_type("smb2"));
         assert!(is_unsupported_fs_type("fuse"));
         assert!(is_unsupported_fs_type("fuse.sshfs"));
+        assert!(is_unsupported_fs_type("v9fs"));
         assert!(is_unsupported_fs_type("overlayfs"));
     }
 
@@ -154,5 +155,16 @@ mod tests {
         assert_eq!(UnsupportedFsPolicy::parse("warn"), Some(UnsupportedFsPolicy::Warn));
         assert_eq!(UnsupportedFsPolicy::parse("FAIL"), Some(UnsupportedFsPolicy::Fail));
         assert_eq!(UnsupportedFsPolicy::parse("unknown"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn invalid_policy_falls_back_to_configured_default() {
+        temp_env::with_var(ENV_RUSTFS_UNSUPPORTED_FS_POLICY, Some("invalid"), || {
+            assert_eq!(
+                get_unsupported_fs_policy(),
+                UnsupportedFsPolicy::parse(DEFAULT_RUSTFS_UNSUPPORTED_FS_POLICY).unwrap_or(UnsupportedFsPolicy::Warn)
+            );
+        });
     }
 }
