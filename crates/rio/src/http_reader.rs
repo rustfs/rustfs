@@ -22,7 +22,9 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
     INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
+use rustfs_tls_runtime::{load_cert_bundle_der_bytes, load_global_outbound_tls_state};
 use rustfs_utils::get_env_opt_str;
+use rustls_pki_types::pem::PemObject;
 use std::io::IoSlice;
 use std::io::{self, Error};
 use std::net::IpAddr;
@@ -32,7 +34,7 @@ use std::sync::LazyLock;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{self, Sleep};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
@@ -42,66 +44,26 @@ const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 
-/// Get the TLS path from the RUSTFS_TLS_PATH environment variable.
-/// If the variable is not set, return None.
-fn tls_path() -> Option<&'static std::path::PathBuf> {
-    static TLS_PATH: LazyLock<Option<std::path::PathBuf>> =
-        LazyLock::new(|| get_env_opt_str("RUSTFS_TLS_PATH").and_then(|s| if s.is_empty() { None } else { Some(s.into()) }));
-    TLS_PATH.as_ref()
-}
-
-/// Load CA root certificates from the RUSTFS_TLS_PATH directory.
-/// The CA certificates should be in PEM format and stored in the file
-/// specified by the RUSTFS_CA_CERT constant.
-/// If the file does not exist or cannot be read, return the builder unchanged.
-fn load_ca_roots_from_tls_path(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    let Some(tp) = tls_path() else {
-        return builder;
-    };
-    let ca_path = tp.join(rustfs_config::RUSTFS_CA_CERT);
-    if !ca_path.exists() {
-        return builder;
-    }
-
-    let Ok(certs_der) = rustfs_utils::load_cert_bundle_der_bytes(ca_path.to_str().unwrap_or_default()) else {
-        return builder;
-    };
-
+fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[Vec<u8>]) -> reqwest::ClientBuilder {
     let mut b = builder;
     for der in certs_der {
-        if let Ok(cert) = Certificate::from_der(&der) {
+        if let Ok(cert) = Certificate::from_der(der) {
             b = b.add_root_certificate(cert);
         }
     }
     b
 }
 
-/// Load optional mTLS identity from the RUSTFS_TLS_PATH directory.
-/// The client certificate and private key should be in PEM format and stored in the files
-/// specified by RUSTFS_CLIENT_CERT_FILENAME and RUSTFS_CLIENT_KEY_FILENAME constants.
-/// If the files do not exist or cannot be read, return None.
-fn load_optional_mtls_identity_from_tls_path() -> Option<Identity> {
-    let tp = tls_path()?;
-    let cert = std::fs::read(tp.join(rustfs_config::RUSTFS_CLIENT_CERT_FILENAME)).ok()?;
-    let key = std::fs::read(tp.join(rustfs_config::RUSTFS_CLIENT_KEY_FILENAME)).ok()?;
-
-    let mut pem = Vec::with_capacity(cert.len() + key.len() + 1);
-    pem.extend_from_slice(&cert);
-    if !pem.ends_with(b"\n") {
-        pem.push(b'\n');
-    }
-    pem.extend_from_slice(&key);
-
-    match Identity::from_pem(&pem) {
-        Ok(id) => Some(id),
-        Err(e) => {
-            error!("Failed to load mTLS identity from PEM: {e}");
-            None
-        }
-    }
+#[derive(Clone)]
+struct CachedClients {
+    generation: u64,
+    client: Client,
+    local_client: Client,
 }
 
-fn build_http_client(disable_proxy: bool) -> Client {
+static CLIENT_CACHE: LazyLock<Mutex<Option<CachedClients>>> = LazyLock::new(|| Mutex::new(None));
+
+async fn build_http_client(disable_proxy: bool, outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState) -> Client {
     let mut builder = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .tcp_keepalive(std::time::Duration::from_secs(10))
@@ -113,9 +75,39 @@ fn build_http_client(disable_proxy: bool) -> Client {
         builder = builder.no_proxy();
     }
 
-    builder = load_ca_roots_from_tls_path(builder);
-    if let Some(id) = load_optional_mtls_identity_from_tls_path() {
-        builder = builder.identity(id);
+    if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
+        let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
+        if let Ok(certs_der) = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader).collect::<Result<Vec<_>, _>>() {
+            let certs_der = certs_der.into_iter().map(|cert| cert.to_vec()).collect::<Vec<_>>();
+            builder = add_root_certificates_from_der(builder, &certs_der);
+        }
+    } else if let Some(tp) = get_env_opt_str("RUSTFS_TLS_PATH").and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(s))
+        }
+    }) {
+        let ca_path = tp.join(rustfs_config::RUSTFS_CA_CERT);
+        if ca_path.exists()
+            && let Ok(certs_der) = load_cert_bundle_der_bytes(ca_path.to_str().unwrap_or_default())
+        {
+            builder = add_root_certificates_from_der(builder, &certs_der);
+        }
+    }
+
+    if let Some(identity) = outbound_tls.mtls_identity.as_ref() {
+        let mut pem = Vec::with_capacity(identity.cert_pem.len() + identity.key_pem.len() + 1);
+        pem.extend_from_slice(&identity.cert_pem);
+        if !pem.ends_with(b"\n") {
+            pem.push(b'\n');
+        }
+        pem.extend_from_slice(&identity.key_pem);
+
+        match Identity::from_pem(&pem) {
+            Ok(id) => builder = builder.identity(id),
+            Err(e) => error!("Failed to load mTLS identity from PEM: {e}"),
+        }
     }
 
     builder.build().expect("Failed to create global HTTP client")
@@ -133,17 +125,47 @@ fn should_bypass_proxy_for_url(url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
 }
 
-fn get_http_client(url: &str) -> Client {
+async fn get_http_client(url: &str) -> Client {
     // Reuse HTTP connection pools while keeping loopback traffic away from
     // system proxies so local RPC/tests do not leak to proxy listeners.
-    static CLIENT: LazyLock<Client> = LazyLock::new(|| build_http_client(false));
-    static LOCAL_CLIENT: LazyLock<Client> = LazyLock::new(|| build_http_client(true));
+    let outbound_tls = load_global_outbound_tls_state().await;
+    let disable_proxy = should_bypass_proxy_for_url(url);
+    let generation = outbound_tls.generation.0;
 
-    if should_bypass_proxy_for_url(url) {
-        return LOCAL_CLIENT.clone();
+    if let Some(client) = {
+        let guard = CLIENT_CACHE.lock().await;
+        guard.as_ref().and_then(|cached| {
+            if cached.generation == generation {
+                Some(if disable_proxy {
+                    cached.local_client.clone()
+                } else {
+                    cached.client.clone()
+                })
+            } else {
+                None
+            }
+        })
+    } {
+        return client;
     }
 
-    CLIENT.clone()
+    let client = build_http_client(false, &outbound_tls).await;
+    let local_client = build_http_client(true, &outbound_tls).await;
+    let cached = CachedClients {
+        generation,
+        client,
+        local_client,
+    };
+
+    let return_client = if disable_proxy {
+        cached.local_client.clone()
+    } else {
+        cached.client.clone()
+    };
+
+    let mut guard = CLIENT_CACHE.lock().await;
+    *guard = Some(cached);
+    return_client
 }
 
 pin_project! {
@@ -197,7 +219,7 @@ impl HttpReader {
     ) -> io::Result<Self> {
         let track_internode_metrics = is_internode_rpc_url(&url);
         let internode_operation = internode_rpc_operation(&url);
-        let client = get_http_client(&url);
+        let client = get_http_client(&url).await;
         let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
         if let Some(body) = body {
             request = request.body(body);
@@ -379,7 +401,7 @@ impl HttpWriter {
             //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
             // );
 
-            let client = get_http_client(&url_clone);
+            let client = get_http_client(&url_clone).await;
             let request = client
                 .request(method_clone, url_clone.clone())
                 .headers(headers_clone.clone())

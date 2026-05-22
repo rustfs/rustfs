@@ -32,6 +32,7 @@ use rumqttc::{
 use rustfs_config::{
     EnableState, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_WS_PATH_ALLOWLIST,
 };
+use rustfs_tls_runtime::{load_certs, load_private_key};
 use rustls::ClientConfig;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -185,8 +186,7 @@ fn validate_path_is_absolute(path: &str, field: &str) -> Result<(), TargetError>
 }
 
 fn build_root_store(ca_path: &str, trust_leaf_as_ca: bool) -> Result<rustls::RootCertStore, TargetError> {
-    let certs =
-        rustfs_utils::load_certs(ca_path).map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_ca: {e}")))?;
+    let certs = load_certs(ca_path).map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_ca: {e}")))?;
     let mut store = rustls::RootCertStore::empty();
 
     if trust_leaf_as_ca {
@@ -222,9 +222,9 @@ fn build_mqtt_tls_transport(broker: &Url, tls: &MQTTTlsConfig) -> Result<Transpo
             if tls.client_cert_path.is_empty() {
                 builder.with_no_client_auth()
             } else {
-                let certs = rustfs_utils::load_certs(&tls.client_cert_path)
+                let certs = load_certs(&tls.client_cert_path)
                     .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_cert: {e}")))?;
-                let key = rustfs_utils::load_private_key(&tls.client_key_path)
+                let key = load_private_key(&tls.client_key_path)
                     .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_key: {e}")))?;
                 builder
                     .with_client_auth_cert(certs, key)
@@ -237,9 +237,9 @@ fn build_mqtt_tls_transport(broker: &Url, tls: &MQTTTlsConfig) -> Result<Transpo
             if tls.client_cert_path.is_empty() {
                 builder.with_no_client_auth()
             } else {
-                let certs = rustfs_utils::load_certs(&tls.client_cert_path)
+                let certs = load_certs(&tls.client_cert_path)
                     .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_cert: {e}")))?;
-                let key = rustfs_utils::load_private_key(&tls.client_key_path)
+                let key = load_private_key(&tls.client_key_path)
                     .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_key: {e}")))?;
                 builder
                     .with_client_auth_cert(certs, key)

@@ -47,6 +47,7 @@ members = [
     "crates/signer", # client signer
     "crates/targets", # Target-specific configurations and utilities
     "crates/trusted-proxies", # Trusted proxies management
+    "crates/tls-runtime", # Project-wide TLS runtime foundation
     "crates/utils", # Utility functions and helpers
     "crates/io-metrics", # Zero-copy metrics collection for performance analysis
     "crates/io-core", # Zero-copy core reader and writer implementations
@@ -110,6 +111,7 @@ rustfs-scanner = { path = "crates/scanner", version = "1.0.0-beta.4" }
 rustfs-signer = { path = "crates/signer", version = "1.0.0-beta.4" }
 rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-beta.4" }
 rustfs-targets = { path = "crates/targets", version = "1.0.0-beta.4" }
+rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.0-beta.4" }
 rustfs-utils = { path = "crates/utils", version = "1.0.0-beta.4" }
 rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.4" }
 

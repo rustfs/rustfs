@@ -18,8 +18,9 @@
 mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection};
+use rustfs_common::{GLOBAL_CONN_MAP, evict_connection};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+use rustfs_tls_runtime::load_global_outbound_tls_state;
 use std::{
     error::Error,
     time::{Duration, Instant},
@@ -114,14 +115,14 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         // Overall timeout for any RPC - fail fast on unresponsive peers
         .timeout(rpc_timeout);
 
-    let root_cert = GLOBAL_ROOT_CERT.read().await;
+    let outbound_tls = load_global_outbound_tls_state().await;
     if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
-        if root_cert.is_none() {
+        if outbound_tls.root_ca_pem.is_none() {
             debug!("No custom root certificate configured; using system roots for TLS: {}", addr);
             // If no custom root cert is configured, try to use system roots.
             connector = connector.tls_config(ClientTlsConfig::new())?;
         }
-        if let Some(cert_pem) = root_cert.as_ref() {
+        if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
             let ca = Certificate::from_pem(cert_pem);
             // Derive the hostname from the HTTPS URL for TLS hostname verification.
             let domain = addr
@@ -134,8 +135,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
                 .unwrap_or("");
             let tls = if !domain.is_empty() {
                 let mut cfg = ClientTlsConfig::new().ca_certificate(ca).domain_name(domain);
-                let mtls_identity = GLOBAL_MTLS_IDENTITY.read().await;
-                if let Some(id) = mtls_identity.as_ref() {
+                if let Some(id) = outbound_tls.mtls_identity.as_ref() {
                     let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
                     cfg = cfg.identity(identity);
                 }

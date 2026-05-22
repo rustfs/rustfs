@@ -19,7 +19,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload_with_records, open_target_queue_store, persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, open_target_queue_store,
+        persist_queued_payload_to_store, refresh_tls_fingerprint_state,
     },
 };
 use async_trait::async_trait;
@@ -169,6 +170,7 @@ where
     id: TargetID,
     args: NATSArgs,
     client: Mutex<Option<async_nats::Client>>,
+    tls_state: Mutex<TargetTlsState>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     connected: AtomicBool,
     delivery_counters: Arc<TargetDeliveryCounters>,
@@ -184,6 +186,7 @@ where
             id: self.id.clone(),
             args: self.args.clone(),
             client: Mutex::new(self.client.lock().unwrap().clone()),
+            tls_state: Mutex::new(self.tls_state.lock().unwrap().clone()),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: AtomicBool::new(self.connected.load(Ordering::SeqCst)),
             delivery_counters: Arc::clone(&self.delivery_counters),
@@ -208,6 +211,7 @@ where
             id: target_id,
             args,
             client: Mutex::new(None),
+            tls_state: Mutex::new(TargetTlsState::default()),
             store: queue_store,
             connected: AtomicBool::new(false),
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
@@ -215,7 +219,20 @@ where
         })
     }
 
+    fn invalidate_cached_client(&self) {
+        *self.client.lock().unwrap() = None;
+        self.tls_state.lock().unwrap().reset();
+    }
+
     async fn get_or_connect(&self) -> Result<async_nats::Client, TargetError> {
+        let next_fingerprint =
+            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)?;
+
+        {
+            let mut tls_state_guard = self.tls_state.lock().unwrap();
+            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || self.invalidate_cached_client());
+        }
+
         if let Some(client) = self.client.lock().unwrap().clone() {
             return Ok(client);
         }
@@ -295,6 +312,7 @@ where
 
     async fn close(&self) -> Result<(), TargetError> {
         let client = self.client.lock().unwrap().take();
+        self.tls_state.lock().unwrap().reset();
         self.connected.store(false, Ordering::SeqCst);
         if let Some(client) = client {
             client
@@ -333,5 +351,49 @@ where
 
     fn record_final_failure(&self) {
         self.delivery_counters.record_final_failure();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args() -> NATSArgs {
+        NATSArgs {
+            enable: true,
+            address: "nats://127.0.0.1:4222".to_string(),
+            subject: "rustfs.events".to_string(),
+            username: String::new(),
+            password: String::new(),
+            token: String::new(),
+            credentials_file: String::new(),
+            tls_ca: String::new(),
+            tls_client_cert: String::new(),
+            tls_client_key: String::new(),
+            tls_required: false,
+            queue_dir: String::new(),
+            queue_limit: 0,
+            target_type: TargetType::NotifyEvent,
+        }
+    }
+
+    #[test]
+    fn validate_nats_rejects_multiple_auth_methods() {
+        let args = NATSArgs {
+            token: "abc".to_string(),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            ..base_args()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn validate_nats_rejects_relative_queue_dir() {
+        let args = NATSArgs {
+            queue_dir: "relative/path".to_string(),
+            ..base_args()
+        };
+        assert!(args.validate().is_err());
     }
 }

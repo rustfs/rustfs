@@ -38,12 +38,10 @@ use crate::{
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rustfs_config::{POSTGRES_DSN_STRING, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY};
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustfs_tls_runtime::{load_certs, load_private_key};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_postgres::Config;
@@ -425,11 +423,9 @@ pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, Tar
             let _ = root_store.add(cert);
         }
     } else {
-        let pem = std::fs::read(&args.tls_ca)
-            .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CA}: {e}")))?;
-        let mut reader = BufReader::new(pem.as_slice());
-        for cert in CertificateDer::pem_reader_iter(&mut reader) {
-            let cert = cert.map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CA}: {e}")))?;
+        let certs =
+            load_certs(&args.tls_ca).map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CA}: {e}")))?;
+        for cert in certs {
             root_store
                 .add(cert)
                 .map_err(|e| TargetError::Configuration(format!("failed to add CA cert: {e}")))?;
@@ -439,16 +435,9 @@ pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, Tar
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
 
     let client_config = if !args.tls_client_cert.is_empty() && !args.tls_client_key.is_empty() {
-        let cert_pem = std::fs::read(&args.tls_client_cert)
-            .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CLIENT_CERT}: {e}")))?;
-        let key_pem = std::fs::read(&args.tls_client_key)
-            .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CLIENT_KEY}: {e}")))?;
-
-        let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut BufReader::new(cert_pem.as_slice()))
-            .collect::<Result<_, _>>()
+        let certs = load_certs(&args.tls_client_cert)
             .map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CLIENT_CERT}: {e}")))?;
-
-        let key = PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_pem.as_slice()))
+        let key = load_private_key(&args.tls_client_key)
             .map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CLIENT_KEY}: {e}")))?;
 
         builder

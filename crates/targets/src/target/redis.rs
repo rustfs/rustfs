@@ -31,6 +31,7 @@ use redis::{
     io::tcp::{TcpSettings, socket2},
 };
 use rustfs_config::{REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY};
+use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
@@ -694,6 +695,15 @@ fn read_client_tls(tls: &RedisTlsConfig) -> Result<Option<ClientTlsConfig>, Targ
 fn read_root_cert(tls: &RedisTlsConfig) -> Result<Option<Vec<u8>>, TargetError> {
     if tls.ca_path.is_empty() {
         return Ok(None);
+    }
+
+    let certs_der = load_cert_bundle_der_bytes(&tls.ca_path)
+        .map_err(|e| TargetError::Configuration(format!("Failed to parse Redis root CA cert: {e}")))?;
+
+    if certs_der.is_empty() {
+        return Err(TargetError::Configuration(
+            "Redis root CA cert did not contain any parsable certificates".to_string(),
+        ));
     }
 
     std::fs::read(&tls.ca_path)

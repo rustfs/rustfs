@@ -25,8 +25,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload_with_records, is_connectivity_error, open_target_queue_store,
-        persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
+        open_target_queue_store, persist_queued_payload_to_store, refresh_tls_fingerprint_state,
     },
 };
 use async_trait::async_trait;
@@ -37,6 +37,7 @@ use lapin::{
 };
 use parking_lot::Mutex;
 use rustfs_config::{AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY};
+use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
@@ -196,16 +197,24 @@ async fn build_tls_config(args: &AMQPArgs) -> Result<OwnedTLSConfig, TargetError
     let cert_chain = if args.tls_ca.is_empty() {
         None
     } else {
-        Some(
-            tokio::fs::read_to_string(&args.tls_ca)
-                .await
-                .map_err(|e| TargetError::Configuration(format!("Failed to read {AMQP_TLS_CA}: {e}")))?,
-        )
+        let certs_der = load_cert_bundle_der_bytes(&args.tls_ca)
+            .map_err(|e| TargetError::Configuration(format!("Failed to parse {AMQP_TLS_CA}: {e}")))?;
+        if certs_der.is_empty() {
+            return Err(TargetError::Configuration(format!(
+                "{AMQP_TLS_CA} did not contain any parsable certificates"
+            )));
+        }
+        let pem = tokio::fs::read_to_string(&args.tls_ca)
+            .await
+            .map_err(|e| TargetError::Configuration(format!("Failed to read {AMQP_TLS_CA}: {e}")))?;
+        Some(pem)
     };
 
     let identity = if args.tls_client_cert.is_empty() {
         None
     } else {
+        let _ = load_cert_bundle_der_bytes(&args.tls_client_cert)
+            .map_err(|e| TargetError::Configuration(format!("Failed to parse {AMQP_TLS_CLIENT_CERT}: {e}")))?;
         let pem = tokio::fs::read(&args.tls_client_cert)
             .await
             .map_err(|e| TargetError::Configuration(format!("Failed to read {AMQP_TLS_CLIENT_CERT}: {e}")))?;
@@ -290,6 +299,7 @@ where
     id: TargetID,
     args: AMQPArgs,
     connection: Arc<Mutex<Option<Arc<AMQPConnection>>>>,
+    tls_state: Arc<Mutex<TargetTlsState>>,
     connect_lock: Arc<AsyncMutex<()>>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
@@ -305,6 +315,7 @@ where
             id: self.id.clone(),
             args: self.args.clone(),
             connection: Arc::clone(&self.connection),
+            tls_state: Arc::clone(&self.tls_state),
             connect_lock: Arc::clone(&self.connect_lock),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             delivery_counters: Arc::clone(&self.delivery_counters),
@@ -329,6 +340,7 @@ where
             id: target_id,
             args,
             connection: Arc::new(Mutex::new(None)),
+            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
             connect_lock: Arc::new(AsyncMutex::new(())),
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
@@ -341,6 +353,13 @@ where
     }
 
     async fn get_or_connect(&self) -> Result<Arc<AMQPConnection>, TargetError> {
+        let next_fingerprint =
+            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)?;
+        {
+            let mut tls_state_guard = self.tls_state.lock();
+            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint.clone(), || self.clear_connection());
+        }
+
         if let Some(connection) = self.connection.lock().clone()
             && connection.connection.status().connected()
             && connection.channel.status().connected()
@@ -364,6 +383,7 @@ where
 
     fn clear_connection(&self) {
         *self.connection.lock() = None;
+        self.tls_state.lock().reset();
     }
 
     async fn send_body(&self, body: &[u8]) -> Result<(), TargetError> {

@@ -840,9 +840,9 @@ dependencies = [
 
 [[package]]
 name = "autocfg"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-config"
@@ -9288,10 +9288,12 @@ dependencies = [
  "rustfs-scanner",
  "rustfs-signer",
  "rustfs-targets",
+ "rustfs-tls-runtime",
  "rustfs-trusted-proxies",
  "rustfs-utils",
  "rustfs-zip",
  "rustls",
+ "rustls-pki-types",
  "s3s",
  "serde",
  "serde_json",
@@ -9510,9 +9512,11 @@ dependencies = [
  "rustfs-rio",
  "rustfs-s3-types",
  "rustfs-signer",
+ "rustfs-tls-runtime",
  "rustfs-utils",
  "rustix 1.1.4",
  "rustls",
+ "rustls-pki-types",
  "s3s",
  "serde",
  "serde_json",
@@ -9948,6 +9952,7 @@ dependencies = [
  "rustfs-keystone",
  "rustfs-policy",
  "rustfs-rio",
+ "rustfs-tls-runtime",
  "rustfs-utils",
  "rustls",
  "s3s",
@@ -9980,6 +9985,7 @@ dependencies = [
  "rustfs-common",
  "rustfs-config",
  "rustfs-io-metrics",
+ "rustfs-tls-runtime",
  "rustfs-utils",
  "tonic",
  "tonic-prost",
@@ -10007,7 +10013,9 @@ dependencies = [
  "reqwest",
  "rustfs-config",
  "rustfs-io-metrics",
+ "rustfs-tls-runtime",
  "rustfs-utils",
+ "rustls-pki-types",
  "s3s",
  "serde",
  "serde_json",
@@ -10136,22 +10144,26 @@ dependencies = [
  "criterion",
  "deadpool-postgres",
  "hashbrown 0.17.1",
+ "hyper",
  "hyper-rustls",
  "lapin",
+ "libc",
  "mysql_async",
  "parking_lot 0.12.5",
  "pulsar",
  "redis",
+ "regex",
  "reqwest",
  "rumqttc-next",
  "rustfs-config",
  "rustfs-ecstore",
  "rustfs-kafka-async",
  "rustfs-s3-types",
- "rustfs-utils",
+ "rustfs-tls-runtime",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "s3s",
  "serde",
  "serde_json",
  "snap",
@@ -10165,6 +10177,24 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "rustfs-tls-runtime"
+version = "1.0.0-beta.4"
+dependencies = [
+ "arc-swap",
+ "metrics",
+ "rcgen",
+ "rustfs-common",
+ "rustfs-config",
+ "rustls",
+ "rustls-pki-types",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -10217,8 +10247,6 @@ dependencies = [
  "rcgen",
  "regex",
  "rustix 1.1.4",
- "rustls",
- "rustls-pki-types",
  "s3s",
  "serde",
  "sha1 0.11.0",

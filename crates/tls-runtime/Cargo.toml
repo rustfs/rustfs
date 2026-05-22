@@ -13,38 +13,36 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-protos"
+name = "rustfs-tls-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Protocol definitions for RustFS, providing gRPC and FlatBuffers interfaces for communication between components."
-keywords = ["protocols", "gRPC", "FlatBuffers", "rustfs", "Minio"]
-categories = ["web-programming", "development-tools", "data-structures", "asynchronous"]
-documentation = "https://docs.rs/rustfs-protos/latest/rustfs_protos/"
+description = "Project-wide TLS runtime foundation for RustFS."
+keywords = ["tls", "runtime", "rustls", "hot-reload", "rustfs"]
+categories = ["network-programming", "web-programming", "development-tools"]
 
 [lints]
 workspace = true
 
-[[bin]]
-name = "gproto"
-path = "src/main.rs"
-
 [dependencies]
 rustfs-common.workspace = true
-rustfs-io-metrics.workspace = true
 rustfs-config.workspace = true
-rustfs-tls-runtime.workspace = true
-rustfs-utils.workspace = true
-flatbuffers = { workspace = true }
-prost = { workspace = true }
-tonic = { workspace = true, features = ["transport"] }
-tonic-prost = { workspace = true }
-tonic-prost-build = { workspace = true }
-tracing = { workspace = true }
+arc-swap.workspace = true
+metrics.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lib]
-test = false
 doctest = false

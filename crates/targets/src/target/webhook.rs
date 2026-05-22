@@ -24,6 +24,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
+use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{
@@ -188,11 +189,13 @@ where
             );
         } else if !args.client_ca.is_empty() {
             // Use user-provided custom CA certificate
-            let ca_cert_pem = std::fs::read(&args.client_ca)
-                .map_err(|e| TargetError::Configuration(format!("Failed to read root CA cert: {e}")))?;
-            let ca_cert = reqwest::Certificate::from_pem(&ca_cert_pem)
+            let certs_der = load_cert_bundle_der_bytes(&args.client_ca)
                 .map_err(|e| TargetError::Configuration(format!("Failed to parse root CA cert: {e}")))?;
-            client_builder = client_builder.add_root_certificate(ca_cert);
+            for cert_der in certs_der {
+                let ca_cert = reqwest::Certificate::from_der(&cert_der)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to load root CA cert: {e}")))?;
+                client_builder = client_builder.add_root_certificate(ca_cert);
+            }
         }
         // If neither is set, use the system's default trust store
 

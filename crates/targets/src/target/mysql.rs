@@ -26,6 +26,7 @@ use crate::{
 use async_trait::async_trait;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, prelude::Queryable};
 use rustfs_config::{MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY};
+use rustfs_tls_runtime::{load_certs, load_private_key};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
@@ -548,9 +549,15 @@ where
             super::ensure_rustls_provider_installed();
             let mut ssl_opts = SslOpts::default();
             if !self.args.tls_ca.is_empty() {
+                let _ = load_certs(&self.args.tls_ca)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to load MySQL tls_ca: {e}")))?;
                 ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(self.args.tls_ca.clone()).into()]);
             }
             if !self.args.tls_client_cert.is_empty() && !self.args.tls_client_key.is_empty() {
+                let _ = load_certs(&self.args.tls_client_cert)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to load MySQL tls_client_cert: {e}")))?;
+                let _ = load_private_key(&self.args.tls_client_key)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to load MySQL tls_client_key: {e}")))?;
                 let identity = mysql_async::ClientIdentity::new(
                     PathBuf::from(self.args.tls_client_cert.clone()).into(),
                     PathBuf::from(self.args.tls_client_key.clone()).into(),

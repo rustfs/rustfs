@@ -37,6 +37,38 @@ pub mod pulsar;
 pub mod redis;
 pub mod webhook;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TargetTlsFingerprintState {
+    pub ca_sha256: Option<[u8; 32]>,
+    pub client_cert_sha256: Option<[u8; 32]>,
+    pub client_key_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TargetTlsGeneration(pub u64);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TargetTlsState {
+    pub generation: TargetTlsGeneration,
+    pub fingerprint: Option<TargetTlsFingerprintState>,
+}
+
+impl TargetTlsState {
+    pub(crate) fn refresh(&mut self, next_fingerprint: TargetTlsFingerprintState) -> bool {
+        if self.fingerprint.as_ref() == Some(&next_fingerprint) {
+            return false;
+        }
+
+        self.generation = TargetTlsGeneration(self.generation.0.saturating_add(1));
+        self.fingerprint = Some(next_fingerprint);
+        true
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// A read-only snapshot of delivery counters for a target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TargetDeliverySnapshot {
@@ -507,6 +539,39 @@ pub(crate) fn mark_target_disconnected_on_connectivity_error(connected: &AtomicB
     }
 }
 
+pub(crate) fn build_target_tls_fingerprint(
+    ca_path: &str,
+    client_cert_path: &str,
+    client_key_path: &str,
+) -> Result<TargetTlsFingerprintState, TargetError> {
+    fn load_optional_digest(path: &str) -> Result<Option<[u8; 32]>, TargetError> {
+        if path.is_empty() {
+            return Ok(None);
+        }
+
+        let bytes =
+            std::fs::read(path).map_err(|e| TargetError::Configuration(format!("Failed to read TLS material '{path}': {e}")))?;
+        let digest = rustfs_tls_runtime::TlsFingerprint::from_optional_bytes(Some(&bytes), None, None, None, None).server_sha256;
+        Ok(digest)
+    }
+
+    Ok(TargetTlsFingerprintState {
+        ca_sha256: load_optional_digest(ca_path)?,
+        client_cert_sha256: load_optional_digest(client_cert_path)?,
+        client_key_sha256: load_optional_digest(client_key_path)?,
+    })
+}
+
+pub(crate) fn refresh_tls_fingerprint_state(
+    state: &mut TargetTlsState,
+    next_fingerprint: TargetTlsFingerprintState,
+    invalidate_cached_connection: impl FnOnce(),
+) {
+    if state.refresh(next_fingerprint) {
+        invalidate_cached_connection();
+    }
+}
+
 pub(crate) fn delete_stored_payload(
     store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync),
     key: &Key,
@@ -528,6 +593,48 @@ pub(crate) fn ensure_rustls_provider_installed() {
     }
     if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
         debug!("rustls provider already installed or unavailable: {err:?}");
+    }
+}
+
+#[cfg(test)]
+mod tls_state_tests {
+    use super::{TargetTlsFingerprintState, TargetTlsGeneration, TargetTlsState};
+
+    #[test]
+    fn refresh_increments_generation_only_when_fingerprint_changes() {
+        let mut state = TargetTlsState::default();
+        let first = TargetTlsFingerprintState {
+            ca_sha256: Some([1; 32]),
+            client_cert_sha256: None,
+            client_key_sha256: None,
+        };
+        let second = TargetTlsFingerprintState {
+            ca_sha256: Some([2; 32]),
+            client_cert_sha256: None,
+            client_key_sha256: None,
+        };
+
+        assert!(state.refresh(first.clone()));
+        assert_eq!(state.generation, TargetTlsGeneration(1));
+        assert!(!state.refresh(first));
+        assert_eq!(state.generation, TargetTlsGeneration(1));
+        assert!(state.refresh(second));
+        assert_eq!(state.generation, TargetTlsGeneration(2));
+    }
+
+    #[test]
+    fn reset_clears_generation_and_fingerprint() {
+        let mut state = TargetTlsState {
+            generation: TargetTlsGeneration(5),
+            fingerprint: Some(TargetTlsFingerprintState {
+                ca_sha256: Some([9; 32]),
+                client_cert_sha256: None,
+                client_key_sha256: None,
+            }),
+        };
+
+        state.reset();
+        assert_eq!(state, TargetTlsState::default());
     }
 }
 
