@@ -70,12 +70,6 @@ pub use crypto::*;
 #[cfg(feature = "compress")]
 pub use compress::*;
 
-#[cfg(feature = "notify")]
-mod notify;
-
-#[cfg(feature = "notify")]
-pub use notify::*;
-
 #[cfg(feature = "obj")]
 pub mod obj;
 

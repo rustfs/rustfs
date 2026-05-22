@@ -14,20 +14,24 @@ documentation = "https://docs.rs/rustfs-targets/latest/rustfs_targets/"
 [dependencies]
 rustfs-config = { workspace = true, features = ["notify", "constants", "audit"] }
 rustfs-ecstore = { workspace = true }
-rustfs-utils = { workspace = true, features = ["notify", "tls"] }
+rustfs-tls-runtime = { workspace = true }
 rustfs-s3-types = { workspace = true }
 async-trait = { workspace = true }
 async-nats = { workspace = true }
 deadpool-postgres = { workspace = true }
+hyper = { workspace = true }
 hyper-rustls = { workspace = true }
 lapin = { workspace = true }
+libc = { workspace = true }
 pulsar = { workspace = true }
+regex = { workspace = true }
 reqwest = { workspace = true }
 rumqttc = { workspace = true }
 redis = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pki-types = { workspace = true }
+s3s = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snap = { workspace = true }
