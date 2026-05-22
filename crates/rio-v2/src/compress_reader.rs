@@ -409,7 +409,7 @@ fn build_s2_chunk(uncompressed: &[u8]) -> io::Result<Vec<u8>> {
     let compressed = encode_block(uncompressed)?;
     let checksum = crc(uncompressed);
     let dst_limit = uncompressed.len().saturating_sub(uncompressed.len() / 32).saturating_sub(5);
-    let (chunk_type, payload) = if compressed.len() <= dst_limit && compressed_payload_matches(&compressed, uncompressed) {
+    let (chunk_type, payload) = if compressed.len() <= dst_limit {
         (CHUNK_TYPE_COMPRESSED_DATA, compressed)
     } else {
         (CHUNK_TYPE_UNCOMPRESSED_DATA, uncompressed.to_vec())
@@ -434,10 +434,6 @@ fn encode_block(uncompressed: &[u8]) -> io::Result<Vec<u8>> {
     SnappyEncoder::new()
         .compress_vec(uncompressed)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
-}
-
-fn compressed_payload_matches(compressed: &[u8], uncompressed: &[u8]) -> bool {
-    decode(compressed).is_ok_and(|decoded| decoded == uncompressed)
 }
 
 fn build_padding_chunk(current_size: usize, padding_multiple: usize) -> io::Result<Option<Vec<u8>>> {
@@ -561,13 +557,12 @@ mod tests {
     }
 
     #[test]
-    fn compressed_payload_match_rejects_corrupt_payload() {
+    fn snap_encoded_payload_decodes_with_minlz() {
         let plaintext = b"compressible-rio-v2-block-".repeat(4096);
-        let mut compressed = encode_block(&plaintext).expect("encode payload");
-        let last = compressed.last_mut().expect("compressed payload");
-        *last ^= 0x80;
+        let compressed = encode_block(&plaintext).expect("encode payload");
+        let decoded = decode(&compressed).expect("decode payload");
 
-        assert!(!compressed_payload_matches(&compressed, &plaintext));
+        assert_eq!(decoded, plaintext);
     }
 
     #[tokio::test]
