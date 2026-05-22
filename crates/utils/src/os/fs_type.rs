@@ -45,6 +45,7 @@ pub(crate) fn get_fs_type(fs_type: u64) -> &'static str {
         0x73717368 => "SQUASHFS",
         0xFF534D42 => "CIFS",
         0xFE534D42 => "SMB2",
+        0x01021997 => "V9FS",
         0xca451a4e => "BCACHEFS",
         _ => "UNKNOWN",
     }
@@ -71,6 +72,7 @@ mod tests {
         assert_eq!(get_fs_type(0x73717368), "SQUASHFS");
         assert_eq!(get_fs_type(0xFF534D42), "CIFS");
         assert_eq!(get_fs_type(0xFE534D42), "SMB2");
+        assert_eq!(get_fs_type(0x01021997), "V9FS");
         assert_eq!(get_fs_type(0xca451a4e), "BCACHEFS");
     }
 }
