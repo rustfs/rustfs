@@ -97,6 +97,8 @@ impl DriveTimeoutProfile {
 
 #[cfg(not(test))]
 static DRIVE_TIMEOUT_PROFILE_CACHE: OnceLock<DriveTimeoutProfile> = OnceLock::new();
+#[cfg(not(test))]
+static DRIVE_TIMEOUT_HEALTH_POLICY_CACHE: OnceLock<TimeoutHealthPolicy> = OnceLock::new();
 
 lazy_static::lazy_static! {
     static ref TEST_DATA: Bytes = Bytes::from(vec![42u8; 2048]);
@@ -121,7 +123,7 @@ fn resolve_drive_timeout_profile_from_env() -> DriveTimeoutProfile {
         default = rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE,
         "Invalid drive timeout profile; falling back to default"
     );
-    DriveTimeoutProfile::Default
+    DriveTimeoutProfile::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_PROFILE).unwrap_or(DriveTimeoutProfile::Default)
 }
 
 fn get_drive_timeout_profile() -> DriveTimeoutProfile {
@@ -200,7 +202,7 @@ pub fn get_drive_active_check_timeout() -> Duration {
     ))
 }
 
-fn get_drive_timeout_health_policy() -> TimeoutHealthPolicy {
+fn resolve_drive_timeout_health_policy_from_env() -> TimeoutHealthPolicy {
     let raw = rustfs_utils::get_env_str(
         rustfs_config::ENV_DRIVE_TIMEOUT_HEALTH_ACTION,
         rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION,
@@ -215,6 +217,17 @@ fn get_drive_timeout_health_policy() -> TimeoutHealthPolicy {
         "Invalid drive timeout health action policy; falling back to default"
     );
     TimeoutHealthPolicy::parse(rustfs_config::DEFAULT_DRIVE_TIMEOUT_HEALTH_ACTION).unwrap_or(TimeoutHealthPolicy::MarkFailure)
+}
+
+fn get_drive_timeout_health_policy() -> TimeoutHealthPolicy {
+    #[cfg(test)]
+    {
+        resolve_drive_timeout_health_policy_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        *DRIVE_TIMEOUT_HEALTH_POLICY_CACHE.get_or_init(resolve_drive_timeout_health_policy_from_env)
+    }
 }
 
 /// DiskHealthTracker tracks the health status of a disk.
