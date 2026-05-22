@@ -69,7 +69,6 @@ pub fn hex(data: impl AsRef<[u8]>) -> String {
 /// A `bool` indicating whether the input string is a valid SHA-256 checksum (64
 ///
 pub fn is_sha256_checksum(s: &str) -> bool {
-    // TODO: optimize
     let is_lowercase_hex = |c: u8| matches!(c, b'0'..=b'9' | b'a'..=b'f');
     s.len() == 64 && s.as_bytes().iter().copied().all(is_lowercase_hex)
 }
@@ -154,4 +153,17 @@ fn test_base64_encoding_decoding() {
     let decoded_string = String::from_utf8(decoded_bytes).unwrap();
 
     assert_eq!(decoded_string, original_uuid_timestamp)
+}
+
+#[test]
+fn sha256_checksum_accepts_exact_lowercase_hex() {
+    assert!(is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+}
+
+#[test]
+fn sha256_checksum_rejects_wrong_length_or_non_lowercase_hex() {
+    assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"));
+    assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"));
+    assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"));
+    assert!(!is_sha256_checksum("0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"));
 }
