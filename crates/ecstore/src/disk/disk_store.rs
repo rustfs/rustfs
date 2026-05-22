@@ -673,6 +673,7 @@ impl LocalDiskWrapper {
     /// Monitor disk writability periodically
     async fn monitor_disk_writable(disk: Arc<LocalDisk>, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
         let mut interval = time::interval(get_drive_active_check_interval());
+        let active_check_timeout = get_drive_active_check_timeout();
 
         loop {
             tokio::select! {
@@ -711,7 +712,7 @@ impl LocalDiskWrapper {
                         &test_obj,
                         &TEST_DATA,
                         true,
-                        get_drive_active_check_timeout(),
+                        active_check_timeout,
                     )
                     .await
                     .is_err()
@@ -806,6 +807,7 @@ impl LocalDiskWrapper {
     /// Monitor disk status and try to bring it back online
     async fn monitor_disk_status(disk: Arc<LocalDisk>, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
         let check_every = get_drive_returning_probe_interval();
+        let active_check_timeout = get_drive_active_check_timeout();
 
         let mut interval = time::interval(check_every);
 
@@ -826,7 +828,7 @@ impl LocalDiskWrapper {
                         &test_obj,
                         &TEST_DATA,
                         false,
-                        get_drive_active_check_timeout(),
+                        active_check_timeout,
                     )
                     .await
                     {
