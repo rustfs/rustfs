@@ -275,7 +275,7 @@ fn should_force_zero_content_length_for_empty_body_route<B>(req: &HttpRequest<B>
         return false;
     }
 
-    if is_empty_body_admin_path(req.method(), req.uri().path()) {
+    if is_empty_body_admin_path(req.method(), req.uri()) {
         return true;
     }
 
@@ -286,7 +286,8 @@ fn should_force_zero_content_length_for_empty_body_route<B>(req: &HttpRequest<B>
     is_empty_body_s3_path(req.method(), req.uri())
 }
 
-fn is_empty_body_admin_path(method: &Method, path: &str) -> bool {
+fn is_empty_body_admin_path(method: &Method, uri: &http::Uri) -> bool {
+    let path = uri.path();
     match *method {
         Method::PUT => matches!(
             path,
@@ -295,19 +296,38 @@ fn is_empty_body_admin_path(method: &Method, path: &str) -> bool {
                 | "/rustfs/admin/v3/set-user-status"
                 | "/rustfs/admin/v3/set-group-status"
         ),
-        Method::POST => matches!(
-            path,
-            "/minio/admin/v3/rebalance/start"
-                | "/minio/admin/v3/rebalance/stop"
-                | "/minio/admin/v3/pools/decommission"
-                | "/minio/admin/v3/pools/cancel"
-                | "/rustfs/admin/v3/rebalance/start"
-                | "/rustfs/admin/v3/rebalance/stop"
-                | "/rustfs/admin/v3/pools/decommission"
-                | "/rustfs/admin/v3/pools/cancel"
-        ),
+        Method::POST => {
+            matches!(
+                path,
+                "/minio/admin/v3/rebalance/start"
+                    | "/minio/admin/v3/rebalance/stop"
+                    | "/minio/admin/v3/pools/decommission"
+                    | "/minio/admin/v3/pools/cancel"
+                    | "/rustfs/admin/v3/rebalance/start"
+                    | "/rustfs/admin/v3/rebalance/stop"
+                    | "/rustfs/admin/v3/pools/decommission"
+                    | "/rustfs/admin/v3/pools/cancel"
+            ) || is_heal_status_query(path, uri.query())
+        }
         _ => false,
     }
+}
+
+fn is_heal_status_query(path: &str, query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+
+    if !path.find("/v3/heal/").is_some_and(|index| path[..index].ends_with("/admin")) {
+        return false;
+    }
+
+    query.split('&').any(|param| {
+        param
+            .split_once('=')
+            .map(|(key, value)| key == "clientToken" && !value.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn is_empty_body_s3_path(method: &Method, uri: &http::Uri) -> bool {
@@ -1318,6 +1338,40 @@ mod tests {
         let headers = headers.lock().expect("captured headers").take().expect("captured headers");
         assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
         assert!(headers.get(http::header::TRANSFER_ENCODING).is_none());
+    }
+
+    #[test]
+    fn admin_heal_status_query_without_content_length_is_normalized() {
+        let paths = [
+            format!("{ADMIN_PREFIX}/v3/heal/?clientToken=root-heal"),
+            format!("{ADMIN_PREFIX}/v3/heal/bucket?clientToken=bucket-heal"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path.clone())
+                .header(http::header::TRANSFER_ENCODING, "chunked")
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_heal_start_without_status_token_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{ADMIN_PREFIX}/v3/heal/"))
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
     }
 
     #[test]
