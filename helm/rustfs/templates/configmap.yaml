@@ -86,6 +86,9 @@ data:
   RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: {{ .cache_save_timeout_secs | quote }}
     {{- end }}
   {{- end }}
+  {{- if .Values.config.rustfs.network_mount_mode }}
+  RUSTFS_NETWORK_MOUNT_MODE: {{ .Values.config.rustfs.network_mount_mode | quote }}
+  {{- end }}
   {{- if .Values.config.rustfs.kms.enabled }}
     {{- if eq .Values.config.rustfs.kms.type "vault" }}
       {{- with .Values.config.rustfs.kms.vault }}
