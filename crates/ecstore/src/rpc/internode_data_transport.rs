@@ -329,11 +329,26 @@ mod tests {
     }
 
     #[test]
+    fn transport_config_known_backends_are_current_oss_values() {
+        assert_eq!(
+            KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
+            &[DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP]
+        );
+
+        for configured in KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS {
+            let transport = build_internode_data_transport(Some(configured)).unwrap();
+
+            assert_eq!(transport.name(), DEFAULT_INTERNODE_DATA_TRANSPORT);
+        }
+    }
+
+    #[test]
     fn transport_config_rejects_unknown_backend() {
         let err = build_internode_data_transport(Some("unsupported-backend")).expect_err("unknown backend should fail closed");
 
         assert!(err.to_string().contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
         assert!(err.to_string().contains("unsupported-backend"));
+        assert!(err.to_string().contains("supported values: tcp-http, tcp"));
     }
 
     #[test]
