@@ -1171,9 +1171,7 @@ impl LocalDisk {
 
         match data {
             InternalBuf::Ref(buf) => {
-                let mut f = self
-                    .open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent)
-                    .await?;
+                let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
                 f.write_all(buf).await.map_err(to_file_error)?;
             }
             InternalBuf::Owned(buf) => {
