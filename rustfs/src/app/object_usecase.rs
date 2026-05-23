@@ -35,9 +35,6 @@ use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_
 use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use crate::storage::*;
 use bytes::Bytes;
-use datafusion::arrow::{
-    csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
-};
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
@@ -87,11 +84,7 @@ use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
-use rustfs_s3select_api::{
-    object_store::bytes_stream,
-    query::{Context, Query},
-};
-use rustfs_s3select_query::get_global_db;
+use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
@@ -127,8 +120,6 @@ use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
@@ -3950,74 +3941,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        info!("handle select_object_content");
-
-        let input = Arc::new(req.input);
-        info!("{:?}", input);
-
-        let db = get_global_db((*input).clone(), false).await.map_err(|e| {
-            error!("get global db failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
-        let result = db
-            .execute(&query)
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
-
-        let results = result
-            .result()
-            .chunk_result()
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?
-            .to_vec();
-
-        let mut buffer = Vec::new();
-        if input.request.output_serialization.csv.is_some() {
-            let mut csv_writer = CsvWriterBuilder::new().with_header(false).build(&mut buffer);
-            for batch in results {
-                csv_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to csv. e: {}", e.to_string()))?;
-            }
-        } else if input.request.output_serialization.json.is_some() {
-            let mut json_writer = JsonWriterBuilder::new()
-                .with_explicit_nulls(true)
-                .build::<_, JsonArray>(&mut buffer);
-            for batch in results {
-                json_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to json. e: {}", e.to_string()))?;
-            }
-            json_writer
-                .finish()
-                .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
-        } else {
-            return Err(s3_error!(
-                InvalidArgument,
-                "Unsupported output format. Supported formats are CSV and JSON"
-            ));
-        }
-
-        let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
-        let stream = ReceiverStream::new(rx);
-        spawn_traced(async move {
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
-                .await;
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Records(RecordsEvent {
-                    payload: Some(Bytes::from(buffer)),
-                })))
-                .await;
-            let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
-
-            drop(tx);
-        });
-
-        Ok(S3Response::new(SelectObjectContentOutput {
-            payload: Some(SelectObjectContentEventStream::new(stream)),
-        }))
+        crate::app::select_object::execute_select_object_content(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]

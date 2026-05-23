@@ -117,6 +117,15 @@ impl Output {
         }
     }
 
+    pub fn into_record_batch_stream(self) -> QueryResult<SendableRecordBatchStream> {
+        match self {
+            Self::StreamData(stream) => Ok(stream),
+            Self::Nil(_) => Err(QueryError::NotImplemented {
+                err: "empty select output stream".to_string(),
+            }),
+        }
+    }
+
     pub async fn num_rows(self) -> usize {
         match self.chunk_result().await {
             Ok(rb) => rb.iter().map(|e| e.num_rows()).sum(),
