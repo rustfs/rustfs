@@ -24,7 +24,7 @@ use crate::disk::{
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
-    fs::{O_APPEND, O_CREATE, O_RDONLY, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
+    fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
     os,
     os::{check_path_length, is_empty_dir, is_root_disk, rename_all},
 };
@@ -1162,40 +1162,41 @@ impl LocalDisk {
         Ok(())
     }
     // write_all_internal do write file
-    async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, _sync: bool, skip_parent: &Path) -> Result<()> {
+    async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
         if let Some(parent) = file_path.parent()
             && parent != skip_parent
         {
             os::make_dir_all(parent, skip_parent).await?;
         }
 
-        let path = file_path.to_path_buf();
-        enum BlockingWriteData {
-            Copied(Vec<u8>),
-            Owned(Bytes),
-        }
-        let data = match data {
-            InternalBuf::Ref(buf) => BlockingWriteData::Copied(buf.to_vec()),
-            InternalBuf::Owned(buf) => BlockingWriteData::Owned(buf),
-        };
-
-        tokio::task::spawn_blocking(move || {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(path)
-                .map_err(to_file_error)?;
-
-            match &data {
-                BlockingWriteData::Copied(buf) => std::io::Write::write_all(&mut f, buf).map_err(to_file_error)?,
-                BlockingWriteData::Owned(buf) => std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?,
+        match data {
+            InternalBuf::Ref(buf) => {
+                let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
+                tokio::io::AsyncWriteExt::write_all(&mut f, buf)
+                    .await
+                    .map_err(to_file_error)?;
             }
+            InternalBuf::Owned(data) => {
+                let path = file_path.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(path)
+                        .map_err(to_file_error)?;
 
-            Ok::<(), std::io::Error>(())
-        })
-        .await
-        .map_err(DiskError::from)??;
+                    std::io::Write::write_all(&mut f, data.as_ref()).map_err(to_file_error)?;
+
+                    Ok::<(), std::io::Error>(())
+                })
+                .await
+                .map_err(DiskError::from)??;
+            }
+        }
+
+        // Keep existing durability contract: this path intentionally ignores `sync`.
+        let _ = sync;
 
         Ok(())
     }
