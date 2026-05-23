@@ -163,7 +163,12 @@ impl TlsMaterialSnapshot {
 }
 
 fn map_runtime_tls_error(err: rustfs_tls_runtime::TlsRuntimeError) -> TlsMaterialError {
-    TlsMaterialError::Io(err.to_string())
+    match &err {
+        rustfs_tls_runtime::TlsRuntimeError::Material(msg) | rustfs_tls_runtime::TlsRuntimeError::Publication(msg) => {
+            TlsMaterialError::Parse(msg.clone())
+        }
+        _ => TlsMaterialError::Io(err.to_string()),
+    }
 }
 
 // ── Server Config Construction ──
@@ -486,7 +491,7 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        let mut generation = 1_u64;
+        let mut generation = get_global_outbound_tls_generation();
         loop {
             interval.tick().await;
 
