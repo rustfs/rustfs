@@ -381,31 +381,27 @@ The initial TCP backend can keep the current signed HTTP URLs internally.
 `RemoteDisk` delegates only these methods to the data transport:
 
 - `read_file_stream`
-- `read_file_zero_copy` as a wrapper over `read_file_stream` unless the backend
-  supports a stronger zero-copy API
+- `read_file_zero_copy` as the current wrapper over `read_file_stream`
 - `append_file`
 - `create_file`
 - `walk_dir`
 
 All other `RemoteDisk` methods continue using the current gRPC client
-until measurements prove otherwise.
+in this adapter scope.
 
 ### Capability model
 
 Avoid hard-coding transport-specific assumptions into the generic interface.
-Use capabilities:
+The current conservative capability fields are:
 
-- stream read
-- stream write
-- bounded range read
-- bidirectional streaming
-- backend-specific buffer registration or staging requirements
-- stable buffer ownership support
-- copy-reduced receive into caller-owned or backend-owned buffers
-- authenticated out-of-band transfer
-- transport fallback support
+- streaming read
+- streaming write
+- streaming walk-dir
+- ordered delivery
+- maximum transfer size
+- fallback support
 
-The first TCP backend should report only capabilities that it actually provides.
+The TCP/HTTP backend should report only capabilities that it actually provides.
 
 ## TCP Fallback Requirements
 
@@ -474,8 +470,9 @@ The current adapter boundary has these constraints:
 - Metrics must identify the selected backend and operation without high-cardinality
   labels.
 
-`walk_dir`, metadata RPCs, locks, admin RPCs, and bucket coordination remain
-outside the current data-plane boundary.
+The current `RemoteDisk::walk_dir` stream is routed through the adapter.
+Metadata RPCs, locks, admin RPCs, bucket coordination, and the legacy gRPC
+`WalkDir` handler remain outside the current data-plane boundary.
 
 ## Out of Scope
 
