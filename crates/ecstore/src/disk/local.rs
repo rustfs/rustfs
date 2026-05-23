@@ -1162,7 +1162,7 @@ impl LocalDisk {
         Ok(())
     }
     // write_all_internal do write file
-    async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
+    async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, _sync: bool, skip_parent: &Path) -> Result<()> {
         if let Some(parent) = file_path.parent()
             && parent != skip_parent
         {
@@ -1170,9 +1170,13 @@ impl LocalDisk {
         }
 
         let path = file_path.to_path_buf();
-        let data: Vec<u8> = match data {
-            InternalBuf::Ref(buf) => buf.to_vec(),
-            InternalBuf::Owned(buf) => buf.as_ref().to_vec(),
+        enum BlockingWriteData {
+            Copied(Vec<u8>),
+            Owned(Bytes),
+        }
+        let data = match data {
+            InternalBuf::Ref(buf) => BlockingWriteData::Copied(buf.to_vec()),
+            InternalBuf::Owned(buf) => BlockingWriteData::Owned(buf),
         };
 
         tokio::task::spawn_blocking(move || {
@@ -1183,10 +1187,9 @@ impl LocalDisk {
                 .open(path)
                 .map_err(to_file_error)?;
 
-            std::io::Write::write_all(&mut f, &data).map_err(to_file_error)?;
-
-            if sync {
-                f.sync_all().map_err(to_file_error)?;
+            match &data {
+                BlockingWriteData::Copied(buf) => std::io::Write::write_all(&mut f, buf).map_err(to_file_error)?,
+                BlockingWriteData::Owned(buf) => std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?,
             }
 
             Ok::<(), std::io::Error>(())
