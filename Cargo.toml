@@ -158,7 +158,7 @@ quick-xml = "0.40.1"
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.149", features = ["raw_value"] }
+serde_json = { version = "1.0.150", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
 
 # Cryptography and Security
@@ -189,7 +189,7 @@ time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros
 # Database
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime", "with-serde_json-1"] }
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14.0"
 
 # Utilities and Tools
 anyhow = "1.0.102"
@@ -307,7 +307,7 @@ unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
 russh = { version = "0.60.3", git = "https://github.com/Eugeny/russh", rev = "fc6e3ab4cd4338e94ae64e17aeed2acee9335e6b" }
-russh-sftp = "2.1.2"
+russh-sftp = "2.2.2"
 
 # WebDAV
 dav-server = "0.11.0"

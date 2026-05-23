@@ -1,23 +1,22 @@
-# RFC: Pluggable Internode Data Transport
+# RFC: Internode Transport Adapter Boundary
 
 > Status: draft
-> Last updated: 2026-05-21
-> Scope: internode data-path analysis, benchmark baseline, and transport boundary
+> Last updated: 2026-05-22
+> Scope: OSS internode data-plane adapter analysis, benchmark baseline, and
+> transport boundary
 
 ## Summary
 
-RustFS does not currently include RDMA, RoCE, InfiniBand, DPU, BlueField/DOCA,
-DPDK, SPDK, or SmartNIC offload support. The current distributed internode
-paths use TCP-based HTTP/gRPC transports:
+The current distributed internode paths use TCP-based HTTP/gRPC transports:
 
 - `tonic` gRPC `NodeService` for most control, metadata, lock, health, and
   peer operations.
 - HTTP streaming routes under `/rustfs/rpc/` for remote disk file streams.
 
-RDMA/RoCE is still a plausible future optimization for large internode disk
-data transfers, but it should not replace the whole internode RPC surface.
-The correct first step is to isolate the data plane, establish a TCP baseline,
-and introduce a pluggable transport boundary only around high-volume streams.
+This document frames the existing work as an OSS `InternodeDataTransport`
+adapter boundary. The adapter keeps RustFS data-plane logic separate from the
+concrete transport backend while preserving the current TCP/HTTP behavior as
+the default implementation.
 
 Current implementation status:
 
@@ -33,25 +32,52 @@ Current implementation status:
 - `NodeService` gRPC remains the internode control plane and continues to carry
   metadata/control operations.
 
+Related design notes in this directory:
+
+- `transport-capabilities.md`
+- `transport-buffer-lifecycle.md`
+- `transport-buffer-contract.md`
+- `transport-fallback-and-selection.md`
+
+## Open-source Scope
+
+The OSS scope is:
+
+- define a clear `InternodeDataTransport` adapter boundary;
+- keep `tcp-http` as the default backend;
+- keep existing TCP/HTTP behavior unchanged;
+- keep internode data-plane behavior observable through metrics and baseline
+  tooling;
+- document buffer ownership, fallback, and capability expectations for
+  maintainable transport code;
+- avoid adding dependencies or backend implementations.
+
+The OSS scope is not:
+
+- adding another transport backend;
+- replacing the gRPC control plane;
+- adding benchmark plans for another transport;
+- adding runtime plugin loading;
+- changing object correctness semantics.
+
 ## Goals
 
 - Document the current internode control plane and data plane.
-- Identify the existing transfer paths that could benefit from a future
-  high-throughput backend.
+- Identify the existing transfer paths covered by the
+  `InternodeDataTransport` adapter and the paths that remain on gRPC.
 - Define the minimum benchmark baseline required before transport changes.
 - Sketch a pluggable transport boundary that preserves the current TCP/HTTP
   behavior as the default backend.
-- Reserve explicit boundaries for future RDMA/RoCE/InfiniBand work without
-  committing RustFS to a specific vendor stack.
+- Document backend-neutral capability, fallback, buffer ownership, and
+  observability expectations.
 
 ## Non-Goals
 
-- Implement RDMA, RoCE, InfiniBand, DPU, DOCA, DPDK, SPDK, or SmartNIC support.
+- Implement another transport backend.
 - Replace `tonic` gRPC for control-plane RPCs.
 - Redesign erasure coding, quorum handling, disk health tracking, or object
   correctness semantics.
-- Require RDMA-capable hardware for default development, CI, or ordinary
-  RustFS deployments.
+- Change default development, CI, or ordinary RustFS deployment requirements.
 
 ## Current Internode Architecture
 
@@ -92,9 +118,9 @@ classes of RPCs:
 - peer rest service: node health, metrics, IAM/policy reload, rebalance,
   profiling, events, and admin-style operations
 
-The service layout is practical today, but it is too broad to become an RDMA
-surface. A future high-throughput transport should target only disk data
-streams and keep this gRPC service as the control plane.
+The service layout is practical today, but it is too broad to become the
+transport adapter surface. A pluggable data transport should target only disk
+data streams and keep this gRPC service as the control plane.
 
 ## Control Plane vs Data Plane
 
@@ -122,7 +148,7 @@ are the only reasonable first candidates for a pluggable transport.
 | P0 | `put_file_stream` | `RemoteDisk::create_file` and `RemoteDisk::append_file` | `handle_put_file` in `http_service.rs` | HTTP `PUT /rustfs/rpc/put_file_stream` with a streaming request body | Main remote disk write stream used by bitrot writers and erasure writes. |
 | P1 | `walk_dir` | `RemoteDisk::walk_dir` | `handle_walk_dir` in `http_service.rs` | HTTP `GET /rustfs/rpc/walk_dir` with a streamed metadata listing | Can be high-volume during scans/healing, but it is metadata-oriented rather than object byte data. |
 | P1 | `ReadAll` / `WriteAll` | `RemoteDisk::read_all` / `write_all` | gRPC unary disk handlers | gRPC unary `bytes` payload | Moves bytes today, but should be measured before treating it as a high-throughput data path. |
-| P2 | proto `WriteStream` / `ReadAt` | currently not used | currently returns unimplemented | gRPC streaming definitions exist but are not implemented | Possible future API shape, not a current production path. |
+| P2 | proto `WriteStream` / `ReadAt` | currently not used | currently returns unimplemented | gRPC streaming definitions exist but are not implemented | Declared proto shape, not a current production path. |
 
 ## P1 Data Path Inventory
 
@@ -254,8 +280,8 @@ not yet isolate internode transport cost.
 
 ## Required TCP Baseline
 
-Before adding any non-TCP backend, collect a baseline for the current
-TCP/HTTP/gRPC implementation.
+Before changing internode data transport behavior or comparing a non-default
+backend, collect a baseline for the current TCP/HTTP/gRPC implementation.
 
 ### Topology
 
@@ -281,7 +307,7 @@ Preferred:
 | Remote disk stream read | shard-sized ranges from `read_file_stream` | 1, 16, 64 | Isolated internode read path. |
 | Remote disk stream write | shard-sized writes through `put_file_stream` | 1, 16, 64 | Isolated internode write path. |
 | Healing / repair | missing disk or missing shard scenario | controlled | Rebuild throughput and read/write amplification. |
-| Scanner walk | large bucket/object namespace | controlled | Metadata streaming pressure, not primary RDMA target. |
+| Scanner walk | large bucket/object namespace | controlled | Metadata streaming pressure, not the primary object-byte transport path. |
 
 ### Measurements
 
@@ -318,8 +344,8 @@ only below `RemoteDisk`, where remote disk byte streams are opened today.
 
 The first implementation should be a no-behavior-change TCP/HTTP backend that
 wraps the current `HttpReader`, `HttpWriter`, and `/rustfs/rpc/*` handlers.
-Only after that wrapper is benchmarked should an experimental RDMA/RoCE backend
-be considered.
+Non-default backend work should not proceed until the default wrapper is
+measured and adapter gaps are documented.
 
 ### Candidate boundary
 
@@ -366,15 +392,16 @@ until measurements prove otherwise.
 
 ### Capability model
 
-Avoid hard-coding RDMA assumptions into the generic interface. Use capabilities:
+Avoid hard-coding transport-specific assumptions into the generic interface.
+Use capabilities:
 
 - stream read
 - stream write
 - bounded range read
 - bidirectional streaming
-- registered memory support
-- scatter/gather support
-- zero-copy receive into caller-owned buffers
+- backend-specific buffer registration or staging requirements
+- stable buffer ownership support
+- copy-reduced receive into caller-owned or backend-owned buffers
 - authenticated out-of-band transfer
 - transport fallback support
 
@@ -392,19 +419,9 @@ Fallback rules:
   `tcp-http` and the `tcp` alias. Empty and unset values use `tcp-http`.
 - Invalid configured values fail closed with an error that includes the env var
   name and invalid value.
-- If a future experimental backend fails initialization, either fail fast with a
-  clear error or fall back to TCP only when the configured policy allows
-  fallback.
+- Unsupported configured backends fail closed during transport construction.
 - Runtime fallback must preserve object correctness and quorum semantics.
 - Fallback events must be logged and counted in metrics.
-- CI and local development must not require RDMA-capable hardware.
-
-Suggested future configuration shape:
-
-```text
-RUSTFS_INTERNODE_DATA_TRANSPORT=tcp-http
-RUSTFS_INTERNODE_DATA_TRANSPORT_FALLBACK=tcp
-```
 
 Do not add fallback settings until there is an implementation PR that uses them.
 
@@ -442,40 +459,25 @@ Expected artifacts:
 - `internode_metric_deltas.csv` when `--metrics-url` is provided
 
 The baseline validates the default TCP/HTTP path only. It must not be used to
-claim RDMA, RoCE, or InfiniBand support.
+claim support or performance for any other transport.
 
-## Future RDMA/RoCE/InfiniBand Boundary
+## Adapter Constraints
 
-A future RDMA backend should be experimental and feature-gated. It should be
-designed as an optional data-plane backend, not as a replacement for the gRPC
-control plane.
+The current adapter boundary has these constraints:
 
-A future non-TCP backend would need an explicit design for:
-
-- peer capability discovery over the existing gRPC control plane
-- connection management and health mapping into existing disk fault handling
-- memory registration lifecycle and registration cache
-- buffer ownership, pinning, alignment, and lifetime rules
-- scatter/gather behavior for erasure shards
-- authentication and authorization for out-of-band data transfers
-- encryption/TLS-equivalent story or a documented deployment boundary
-- timeout, cancellation, retry, and fallback behavior
-- metrics for registration cost, transfer latency, bytes, queue depth, retries,
-  fallback, and errors
-- hardware and kernel compatibility matrix
+- `tcp-http` is the default and only OSS backend.
+- Backend selection is explicit and fail-closed.
+- The gRPC control plane remains responsible for metadata, health, locks, and
+  coordination.
+- Transport errors must preserve existing disk health, quorum, timeout, and
+  integrity semantics.
+- Metrics must identify the selected backend and operation without high-cardinality
+  labels.
 
 `walk_dir`, metadata RPCs, locks, admin RPCs, and bucket coordination remain
 outside the current data-plane boundary.
 
-## DPU, DOCA, DPDK, SPDK, and SmartNIC Notes
+## Out of Scope
 
-These technologies should not drive the first abstraction:
-
-- DPU/BlueField/DOCA may become relevant for TLS, checksum, compression, or
-  storage/network offload, but they are vendor- and deployment-specific.
-- DPDK is a poor first fit because RustFS is currently an HTTP/S3 object store
-  and does not have a custom packet data plane.
-- SPDK may be relevant only if RustFS adds a raw block or NVMe-oriented local
-  storage backend. The current disk model is filesystem-based.
-- SmartNIC offload is outside the current boundary because this RFC does not
-  establish a CPU-offload bottleneck.
+This RFC does not add a plugin system, split the adapter into a separate crate,
+add accepted backend values, or implement a new transport backend.
