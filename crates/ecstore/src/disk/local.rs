@@ -1175,20 +1175,24 @@ impl LocalDisk {
             InternalBuf::Owned(buf) => buf.as_ref().to_vec(),
         };
 
-        let mut f = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)
-            .await
-            .map_err(to_file_error)?;
+        tokio::task::spawn_blocking(move || {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .map_err(to_file_error)?;
 
-        f.write_all(data.as_ref())
-            .await
-            .map_err(to_file_error)?;
-        if sync {
-            f.sync_all().await.map_err(to_file_error)?;
-        }
+            std::io::Write::write_all(&mut f, &data).map_err(to_file_error)?;
+
+            if sync {
+                f.sync_all().map_err(to_file_error)?;
+            }
+
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(DiskError::from)??;
 
         Ok(())
     }
