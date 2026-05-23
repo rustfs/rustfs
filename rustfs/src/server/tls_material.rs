@@ -491,14 +491,14 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        let mut generation = get_global_outbound_tls_generation();
         loop {
             interval.tick().await;
 
             match TlsMaterialSnapshot::load(&tls_path).await {
                 Ok(snapshot) => {
-                    // Always refresh outbound material (root CAs, mTLS identity) on reload.
-                    generation = generation.saturating_add(1);
+                    // Derive generation from the global counter on each tick so it
+                    // stays monotonic even if other code paths publish outbound TLS.
+                    let generation = get_global_outbound_tls_generation().saturating_add(1);
                     snapshot.apply_outbound_with_generation(TlsGeneration(generation)).await;
 
                     match snapshot.build_tls_acceptor(&tls_path).await {

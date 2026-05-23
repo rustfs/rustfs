@@ -172,7 +172,12 @@ async fn get_http_client(url: &str) -> Client {
     };
 
     let mut guard = CLIENT_CACHE.lock().await;
-    *guard = Some(cached);
+    // Guard against races: only overwrite the cache if it is empty or
+    // contains an older generation, so a slower task cannot regress the
+    // TLS state after a faster task already cached a newer generation.
+    if guard.as_ref().is_none_or(|c| c.generation <= generation) {
+        *guard = Some(cached);
+    }
     return_client
 }
 

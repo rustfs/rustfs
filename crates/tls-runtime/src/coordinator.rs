@@ -189,10 +189,7 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::TlsFingerprint;
-    use crate::material::OutboundTlsMaterial;
     use crate::source::TlsSource;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     struct NopConsumer;
@@ -209,31 +206,21 @@ mod tests {
 
     #[tokio::test]
     async fn reload_once_skips_when_fingerprint_unchanged() {
-        let source = TlsSource::from_directory(std::env::temp_dir());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = TlsSource::from_directory(temp.path().to_path_buf());
         let options = TlsReloadOptions::default();
         let coordinator = TlsReloadCoordinator::new(source.clone(), options);
 
-        let initial_material = crate::material::TlsMaterialSnapshot {
-            source: source.clone(),
-            server: Some(crate::material::ServerTlsMaterial::MultiCert {
-                cert_key_pairs: HashMap::new(),
-            }),
-            outbound: OutboundTlsMaterial {
-                root_ca_pem: Vec::new(),
-                mtls_identity: None,
-            },
-            fingerprint: TlsFingerprint::default(),
-        };
-
-        let initial = coordinator.publish_initial_state(initial_material).await;
+        // Load the actual snapshot from the (empty) temp dir so its fingerprint
+        // matches what reload_once will observe on the next load.
+        let initial_snapshot = coordinator.load_initial_snapshot().await.expect("initial load");
+        let initial = coordinator.publish_initial_state(initial_snapshot).await;
         let runtime_state = TlsReloadRuntimeState::new(initial);
 
-        // The snapshot loaded from disk will have a different fingerprint (files don't match)
-        // but we test the logic: load_initial_snapshot + compare → should differ
         let consumer = NopConsumer;
         let result = coordinator.reload_once(&runtime_state, &consumer).await;
-        // It will try to load from temp dir and likely fail or return new state
-        // Just verify the method runs without panic
-        assert!(result.is_ok() || result.is_err());
+        // Fingerprint has not changed → should skip and return Ok(None).
+        assert!(result.is_ok(), "reload_once should succeed: {:?}", result.err());
+        assert!(result.unwrap().is_none(), "should skip when fingerprint unchanged");
     }
 }
