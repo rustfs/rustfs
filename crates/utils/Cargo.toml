@@ -32,20 +32,17 @@ bytes = { workspace = true, optional = true }
 crc-fast = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-hashbrown = { workspace = true, optional = true }
 hex-simd = { workspace = true, optional = true }
 highway = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
-libc = { workspace = true, optional = true }
 local-ip-address = { workspace = true, optional = true }
 lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 netif = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
-s3s = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
@@ -53,7 +50,6 @@ convert_case = { workspace = true, optional = true }
 siphasher = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
-thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["io-util", "macros"] }
 tracing = { workspace = true }
 transform-stream = { workspace = true, optional = true }
@@ -61,7 +57,6 @@ url = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
-rcgen = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 temp-env = { workspace = true }
@@ -75,7 +70,7 @@ workspace = true
 [features]
 default = ["ip"]  # features that are enabled by default
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
-net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:thiserror", "dep:tokio"]  # network features with DNS resolver
+net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:hyper", "dep:tokio"]  # network features with DNS resolver
 io = ["dep:tokio"]
 tls = []  # Compatibility shim: TLS cert loading moved to rustfs-tls-runtime
 path = []  # path manipulation features

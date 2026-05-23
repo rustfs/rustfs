@@ -27,7 +27,7 @@ categories = ["network-programming", "filesystem"]
 
 [features]
 default = []
-ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls"]
+ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls", "dep:rustfs-tls-runtime"]
 swift = [
     "dep:rustfs-keystone",
     "dep:rustfs-ecstore",
@@ -53,7 +53,7 @@ swift = [
     "dep:base64",
     "dep:async-compression",
 ]
-webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls", "dep:percent-encoding"]
+webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls", "dep:percent-encoding", "dep:rustfs-tls-runtime"]
 sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2"]
 
 [dependencies]
@@ -63,6 +63,7 @@ rustfs-credentials = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-utils = { workspace = true }
 rustfs-config = { workspace = true }
+rustfs-tls-runtime = { workspace = true, optional = true }
 
 # Async dependencies
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time","io-uring"] }
@@ -92,7 +93,6 @@ rustls = { workspace = true, optional = true }
 rustfs-keystone = { workspace = true, optional = true }
 rustfs-ecstore = { workspace = true, optional = true }
 rustfs-rio = { workspace = true, optional = true }
-rustfs-tls-runtime = { workspace = true }
 axum = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
@@ -129,7 +129,6 @@ socket2 = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = "1"
-rcgen = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [package.metadata.docs.rs]
