@@ -38,6 +38,7 @@ Related design notes in this directory:
 - `transport-buffer-lifecycle.md`
 - `transport-buffer-contract.md`
 - `transport-fallback-and-selection.md`
+- `transport-metrics-and-baseline.md`
 
 ## Open-source Scope
 
@@ -334,6 +335,9 @@ S3 PUT/GET matrix against `local` and `distributed` scenarios and export:
 - `summary.csv` (throughput/latency summary per workload and object size)
 - `internode_metric_deltas.csv` (operation-level internode metric deltas when
   `--metrics-url` is provided)
+
+See `transport-metrics-and-baseline.md` for current metric names, labels,
+operation values, baseline inputs, and baseline artifact fields.
 
 ## Transport Abstraction Proposal
 
