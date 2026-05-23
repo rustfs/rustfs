@@ -233,6 +233,18 @@ pub async fn start_http_server(
             Error::other(e.to_string())
         }
     })?;
+
+    // Fail closed: if TLS was explicitly configured but no server certificates
+    // were found, refuse to start rather than silently falling back to plain HTTP.
+    let tls_acceptor = match (tls_path_configured, tls_acceptor) {
+        (true, None) => {
+            return Err(Error::other(format!(
+                "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but no server certificates were found",
+                tls_path
+            )));
+        }
+        (_, acceptor) => acceptor,
+    };
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 

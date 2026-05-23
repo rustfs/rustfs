@@ -224,12 +224,13 @@ where
         let next_fingerprint =
             build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
         let tls_changed = {
-            let mut tls_state_guard = self.tls_state.lock().await;
-            tls_state_guard.refresh(next_fingerprint)
+            let tls_state_guard = self.tls_state.lock().await;
+            tls_state_guard.needs_update(&next_fingerprint)
         };
         if tls_changed {
             let mut cached = self.producer.lock().await;
             *cached = None;
+            self.tls_state.lock().await.refresh(next_fingerprint);
         }
 
         let mut cached = self.producer.lock().await;

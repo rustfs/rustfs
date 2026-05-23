@@ -48,6 +48,13 @@ impl TargetTlsState {
         true
     }
 
+    /// Checks whether `candidate` differs from the stored fingerprint without
+    /// mutating state. Use this to gate a rebuild, then call `refresh` only
+    /// after the rebuild succeeds.
+    pub fn needs_update(&self, candidate: &TargetTlsFingerprint) -> bool {
+        self.fingerprint.as_ref() != Some(candidate)
+    }
+
     /// Resets state to default (generation 0, no fingerprint).
     pub fn reset(&mut self) {
         *self = Self::default();

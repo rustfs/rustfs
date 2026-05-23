@@ -563,12 +563,13 @@ where
         let next_fingerprint =
             super::build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
         let tls_changed = {
-            let mut tls_state_guard = self.tls_state.lock();
-            tls_state_guard.refresh(next_fingerprint)
+            let tls_state_guard = self.tls_state.lock();
+            tls_state_guard.needs_update(&next_fingerprint)
         };
         if tls_changed {
             let mut guard = self.pool.lock().await;
             *guard = None;
+            self.tls_state.lock().refresh(next_fingerprint);
         }
 
         {

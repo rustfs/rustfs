@@ -400,13 +400,14 @@ where
             )
             .await?;
             let tls_changed = {
-                let mut tls_state_guard = self.tls_state.lock();
-                tls_state_guard.refresh(next_fingerprint)
+                let tls_state_guard = self.tls_state.lock();
+                tls_state_guard.needs_update(&next_fingerprint)
             };
             if tls_changed {
                 let new_client = build_redis_client(&self.args)?;
                 *self.publisher_client.lock() = new_client;
                 self.invalidate_cached_publisher().await;
+                self.tls_state.lock().refresh(next_fingerprint);
             }
         }
 

@@ -248,11 +248,12 @@ where
         } else {
             let next_fingerprint = build_target_tls_fingerprint(&self.args.tls_ca, "", "").await?;
             let tls_changed = {
-                let mut tls_state_guard = self.tls_state.lock().unwrap();
-                tls_state_guard.refresh(next_fingerprint)
+                let tls_state_guard = self.tls_state.lock().unwrap();
+                tls_state_guard.needs_update(&next_fingerprint)
             };
             if tls_changed {
                 self.clear_cached_client_connection();
+                self.tls_state.lock().unwrap().refresh(next_fingerprint);
             }
         }
 
