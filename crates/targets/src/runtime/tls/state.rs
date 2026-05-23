@@ -120,4 +120,8 @@ pub struct TargetTlsStatusSnapshot {
     pub last_attempt_time: Option<u64>,
     pub last_success_time: Option<u64>,
     pub last_error: Option<String>,
+    /// TLS file paths this target watches (for admin diagnostics).
+    pub ca_path: String,
+    pub client_cert_path: String,
+    pub client_key_path: String,
 }

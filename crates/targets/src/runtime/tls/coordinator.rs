@@ -172,6 +172,9 @@ impl TargetTlsReloadCoordinator {
             last_attempt_time: if last_attempt > 0 { Some(last_attempt) } else { None },
             last_success_time: if last_success > 0 { Some(last_success) } else { None },
             last_error,
+            ca_path: runtime_state.inputs.ca_path.clone(),
+            client_cert_path: runtime_state.inputs.client_cert_path.clone(),
+            client_key_path: runtime_state.inputs.client_key_path.clone(),
         }
     }
 }
@@ -188,6 +191,7 @@ async fn spawn_target_poll_loop<T: ReloadableTargetTls>(
     interval.tick().await; // skip the immediate first tick
 
     let label = &runtime_state.inputs.target_label;
+    let debounce = options.debounce;
     debug!(target = %label, interval_secs = options.interval.as_secs(), "TLS reload poll loop started");
 
     loop {
@@ -198,6 +202,17 @@ async fn spawn_target_poll_loop<T: ReloadableTargetTls>(
                 return;
             }
             _ = interval.tick() => {
+                // Enforce minimum stable age: if the last attempt was too recent
+                // (e.g. a rapid succession of ticks), wait one debounce period
+                // before reading files again to avoid picking up half-written certs.
+                let last_attempt = runtime_state.last_attempt_unix_ms();
+                if last_attempt > 0 {
+                    let elapsed_since_last = unix_time_ms().saturating_sub(last_attempt);
+                    if elapsed_since_last < debounce.as_millis() as u64 {
+                        continue;
+                    }
+                }
+
                 if let Err(err) = reload_target_once(target.as_ref(), runtime_state.as_ref(), &options).await {
                     warn!(target = %label, error = %err, "TLS reload poll check failed (will retry)");
                 }

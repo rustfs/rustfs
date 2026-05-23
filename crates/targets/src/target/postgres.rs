@@ -30,7 +30,8 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     runtime::tls::{
-        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsRuntimeState, config::ReloadApplyMode,
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState,
+        config::{ReloadApplyMode, TlsReloadOptions},
         validate_tls_material,
     },
     store::{Key, Store},
@@ -618,6 +619,51 @@ where
     /// the legacy per-send fingerprint check is used instead.
     pub fn with_tls_coordinator(&mut self, state: Arc<TargetTlsRuntimeState<Pool>>) {
         self.tls_runtime_state = Some(state);
+    }
+
+    /// Registers this target with the TLS reload coordinator.
+    ///
+    /// The coordinator builds the initial material and spawns a background
+    /// poll loop. On success the runtime state is stored and the inline
+    /// fingerprint check in `send_body` is bypassed. On failure the inline
+    /// path is preserved.
+    pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
+        let options = TlsReloadOptions::default();
+        // Create a lightweight shell for the coordinator — same args but no store
+        // and an initial dummy pool (coordinator rebuilds it on first reload).
+        let shell_args = self.args.clone();
+        let shell_id = self.id.id.clone();
+        let target_id = TargetID::new(shell_id, ChannelTargetType::Postgres.as_str().to_string());
+
+        let initial_pool = match build_pool(&shell_args) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(target_id = %target_id, error = %err, "Failed to build initial PostgreSQL pool for TLS reload shell");
+                return;
+            }
+        };
+
+        let shell = PostgresTarget::<E> {
+            id: target_id,
+            namespace_sql: namespace_upsert_sql(&shell_args.schema, &shell_args.table),
+            access_sql: access_insert_sql(&shell_args.schema, &shell_args.table),
+            args: shell_args,
+            pool: Arc::new(parking_lot::Mutex::new(initial_pool)),
+            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
+            tls_runtime_state: None,
+            store: None,
+            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
+            _phantom: std::marker::PhantomData,
+        };
+
+        match coordinator.register(Arc::new(shell), options).await {
+            Ok(state) => {
+                self.tls_runtime_state = Some(state);
+            }
+            Err(err) => {
+                warn!(target_id = %self.id, error = %err, "Failed to register PostgreSQL target for TLS reload coordinator; falling back to inline fingerprint");
+            }
+        }
     }
 
     /// Sends a serialized event body to PostgreSQL using the configured format.
