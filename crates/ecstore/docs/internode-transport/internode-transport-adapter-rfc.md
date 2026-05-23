@@ -50,20 +50,15 @@ The OSS scope is:
   tooling;
 - document buffer ownership, fallback, and capability expectations for
   maintainable transport code;
-- avoid hardware-specific dependencies or backend implementations.
+- avoid adding dependencies or backend implementations.
 
 The OSS scope is not:
 
-- RDMA support;
-- DPU support;
-- DOCA support;
-- BlueField support;
-- RoCE/InfiniBand support;
-- hardware benchmark planning;
-- hardware-specific backend implementation.
-
-Hardware-specific transport experiments are outside the scope of this OSS
-document.
+- adding another transport backend;
+- replacing the gRPC control plane;
+- adding benchmark plans for another transport;
+- adding runtime plugin loading;
+- changing object correctness semantics.
 
 ## Goals
 
@@ -78,12 +73,11 @@ document.
 
 ## Non-Goals
 
-- Implement RDMA, RoCE, InfiniBand, DPU, DOCA, DPDK, SPDK, or SmartNIC support.
+- Implement another transport backend.
 - Replace `tonic` gRPC for control-plane RPCs.
 - Redesign erasure coding, quorum handling, disk health tracking, or object
   correctness semantics.
-- Require specialized hardware for default development, CI, or ordinary RustFS
-  deployments.
+- Change default development, CI, or ordinary RustFS deployment requirements.
 
 ## Current Internode Architecture
 
@@ -154,7 +148,7 @@ are the only reasonable first candidates for a pluggable transport.
 | P0 | `put_file_stream` | `RemoteDisk::create_file` and `RemoteDisk::append_file` | `handle_put_file` in `http_service.rs` | HTTP `PUT /rustfs/rpc/put_file_stream` with a streaming request body | Main remote disk write stream used by bitrot writers and erasure writes. |
 | P1 | `walk_dir` | `RemoteDisk::walk_dir` | `handle_walk_dir` in `http_service.rs` | HTTP `GET /rustfs/rpc/walk_dir` with a streamed metadata listing | Can be high-volume during scans/healing, but it is metadata-oriented rather than object byte data. |
 | P1 | `ReadAll` / `WriteAll` | `RemoteDisk::read_all` / `write_all` | gRPC unary disk handlers | gRPC unary `bytes` payload | Moves bytes today, but should be measured before treating it as a high-throughput data path. |
-| P2 | proto `WriteStream` / `ReadAt` | currently not used | currently returns unimplemented | gRPC streaming definitions exist but are not implemented | Possible future API shape, not a current production path. |
+| P2 | proto `WriteStream` / `ReadAt` | currently not used | currently returns unimplemented | gRPC streaming definitions exist but are not implemented | Declared proto shape, not a current production path. |
 
 ## P1 Data Path Inventory
 
@@ -425,19 +419,9 @@ Fallback rules:
   `tcp-http` and the `tcp` alias. Empty and unset values use `tcp-http`.
 - Invalid configured values fail closed with an error that includes the env var
   name and invalid value.
-- If a future non-default backend fails initialization, either fail fast with a
-  clear error or fall back to TCP only when the configured policy allows
-  fallback.
+- Unsupported configured backends fail closed during transport construction.
 - Runtime fallback must preserve object correctness and quorum semantics.
 - Fallback events must be logged and counted in metrics.
-- CI and local development must not require specialized transport hardware.
-
-Suggested future configuration shape:
-
-```text
-RUSTFS_INTERNODE_DATA_TRANSPORT=tcp-http
-RUSTFS_INTERNODE_DATA_TRANSPORT_FALLBACK=tcp
-```
 
 Do not add fallback settings until there is an implementation PR that uses them.
 
@@ -475,33 +459,25 @@ Expected artifacts:
 - `internode_metric_deltas.csv` when `--metrics-url` is provided
 
 The baseline validates the default TCP/HTTP path only. It must not be used to
-claim support or performance for any non-default transport backend.
+claim support or performance for any other transport.
 
-## Non-default Backend Boundary
+## Adapter Constraints
 
-A future non-default backend must be explicitly enabled and must not replace
-`tcp-http` silently. It should be designed as an optional data-plane backend,
-not as a replacement for the gRPC control plane.
+The current adapter boundary has these constraints:
 
-A future non-default backend would need an explicit design for:
-
-- peer capability discovery over the existing gRPC control plane;
-- connection management and health mapping into existing disk fault handling;
-- backend-specific buffer lifecycle and any staging or registration cache;
-- buffer ownership, alignment, and lifetime rules;
-- stable buffer behavior for erasure shards;
-- authentication and authorization for out-of-band data transfers;
-- encryption or an equivalent documented security boundary;
-- timeout, cancellation, retry, and fallback behavior;
-- metrics for transfer latency, bytes, queue depth, retries, fallback, and
-  errors.
+- `tcp-http` is the default and only OSS backend.
+- Backend selection is explicit and fail-closed.
+- The gRPC control plane remains responsible for metadata, health, locks, and
+  coordination.
+- Transport errors must preserve existing disk health, quorum, timeout, and
+  integrity semantics.
+- Metrics must identify the selected backend and operation without high-cardinality
+  labels.
 
 `walk_dir`, metadata RPCs, locks, admin RPCs, and bucket coordination remain
 outside the current data-plane boundary.
 
 ## Out of Scope
 
-Hardware-specific transport experiments are outside the scope of this OSS
-document. This RFC does not add a plugin system, split the adapter into a
-separate crate, add accepted backend values, or implement a new transport
-backend.
+This RFC does not add a plugin system, split the adapter into a separate crate,
+add accepted backend values, or implement a new transport backend.

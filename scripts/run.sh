@@ -66,7 +66,11 @@ export RUSTFS_REGION="${RUSTFS_REGION:-us-east-1}"
 export RUSTFS_CONSOLE_ENABLE="${RUSTFS_CONSOLE_ENABLE:-true}"
 export RUSTFS_CONSOLE_ADDRESS="${RUSTFS_CONSOLE_ADDRESS:-127.0.0.1:9001}"
 if [ -z "${RUSTFS_CORS_ALLOWED_ORIGINS+x}" ]; then
-    export RUSTFS_CORS_ALLOWED_ORIGINS="http://127.0.0.1:9001,http://localhost:9001,http://127.0.0.1:3000,http://localhost:3000"
+    console_port="${RUSTFS_CONSOLE_ADDRESS##*:}"
+    if [ -z "$console_port" ] || [ "$console_port" = "$RUSTFS_CONSOLE_ADDRESS" ]; then
+        console_port=9001
+    fi
+    export RUSTFS_CORS_ALLOWED_ORIGINS="http://127.0.0.1:${console_port},http://localhost:${console_port},http://127.0.0.1:3000,http://localhost:3000"
 fi
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS certificate directory
