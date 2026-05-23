@@ -56,7 +56,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, ErrorKind};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
@@ -1169,25 +1169,26 @@ impl LocalDisk {
             os::make_dir_all(parent, skip_parent).await?;
         }
 
-        let mut f = std::fs::OpenOptions::new()
+        let path = file_path.to_path_buf();
+        let data: Vec<u8> = match data {
+            InternalBuf::Ref(buf) => buf.to_vec(),
+            InternalBuf::Owned(buf) => buf.as_ref().to_vec(),
+        };
+
+        let mut f = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(file_path)
+            .open(path)
+            .await
             .map_err(to_file_error)?;
 
-        match data {
-            InternalBuf::Ref(buf) => {
-                std::io::Write::write_all(&mut f, buf).map_err(to_file_error)?;
-            }
-            InternalBuf::Owned(buf) => {
-                std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?;
-            }
+        f.write_all(data.as_ref())
+            .await
+            .map_err(to_file_error)?;
+        if sync {
+            f.sync_all().await.map_err(to_file_error)?;
         }
-
-        // Preserve the previous durability behavior: `sync` was accepted but
-        // did not call fsync/sync_all in this path.
-        let _ = sync;
 
         Ok(())
     }
