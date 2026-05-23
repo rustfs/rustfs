@@ -309,7 +309,7 @@ unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
 russh = { version = "0.60.3", git = "https://github.com/Eugeny/russh", rev = "fc6e3ab4cd4338e94ae64e17aeed2acee9335e6b" }
-russh-sftp = "2.2.2"
+russh-sftp = "2.3.0"
 
 # WebDAV
 dav-server = "0.11.0"
