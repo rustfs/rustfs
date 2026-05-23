@@ -17,8 +17,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadDetectMode {
     Poll,
-    Watch,
-    Hybrid,
+    Watch,  // TODO: implement fs::watch-based reload
+    Hybrid, // TODO: implement poll + fs::watch hybrid
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -156,3 +156,79 @@ pub struct TlsRuntimeServerSection {
 pub struct TlsRuntimeConsumerSection {
     pub stale_generation: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn make_published(generation: u64, fingerprint_bytes: &[u8]) -> Arc<TlsPublishedState<String>> {
+        Arc::new(TlsPublishedState {
+            generation: TlsGeneration(generation),
+            material: Arc::new("test".to_string()),
+            fingerprint: TlsFingerprint::from_optional_bytes(Some(fingerprint_bytes), None, None, None, None),
+            loaded_at_unix_ms: 0,
+        })
+    }
+
+    #[test]
+    fn runtime_state_tracks_generation_and_timestamps() {
+        let initial = make_published(1, b"aaa");
+        let state = TlsReloadRuntimeState::new(initial);
+
+        assert_eq!(state.current_generation(), TlsGeneration(1));
+        assert_eq!(state.bump_generation(), TlsGeneration(2));
+        assert_eq!(state.last_attempt_unix_ms(), 0);
+        assert_eq!(state.last_success_unix_ms(), 0);
+
+        state.mark_attempt(100);
+        assert_eq!(state.last_attempt_unix_ms(), 100);
+
+        state.mark_success(200);
+        assert_eq!(state.last_success_unix_ms(), 200);
+    }
+
+    #[test]
+    fn bump_generation_saturates_at_max() {
+        let initial = Arc::new(TlsPublishedState {
+            generation: TlsGeneration(u64::MAX),
+            material: Arc::new("max".to_string()),
+            fingerprint: TlsFingerprint::default(),
+            loaded_at_unix_ms: 0,
+        });
+        let state = TlsReloadRuntimeState::new(initial);
+        assert_eq!(state.bump_generation(), TlsGeneration(u64::MAX));
+    }
+
+    #[test]
+    fn status_snapshot_is_complete_with_outbound_roots() {
+        let snap = TlsRuntimeStatusSnapshot::from_outbound_only(OutboundOnlySnapshotArgs {
+            source_path: "/tmp".to_string(),
+            generation: 1,
+            reload_enabled: true,
+            detect_mode: "poll",
+            last_attempt_time: None,
+            last_success_time: None,
+            last_error: None,
+            has_roots: true,
+            has_mtls_identity: false,
+        });
+        assert!(snap.is_complete());
+    }
+
+    #[test]
+    fn status_snapshot_is_not_complete_when_empty() {
+        let snap = TlsRuntimeStatusSnapshot::from_outbound_only(OutboundOnlySnapshotArgs {
+            source_path: "/tmp".to_string(),
+            generation: 1,
+            reload_enabled: true,
+            detect_mode: "poll",
+            last_attempt_time: None,
+            last_success_time: None,
+            last_error: None,
+            has_roots: false,
+            has_mtls_identity: false,
+        });
+        assert!(!snap.is_complete());
+    }
+}

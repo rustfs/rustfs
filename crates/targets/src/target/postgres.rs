@@ -543,7 +543,8 @@ where
 {
     id: TargetID,
     args: PostgresArgs,
-    pool: Pool,
+    pool: Arc<parking_lot::Mutex<Pool>>,
+    tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
     namespace_sql: String,
     access_sql: String,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
@@ -559,7 +560,8 @@ where
         Box::new(PostgresTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
-            pool: self.pool.clone(),
+            pool: Arc::clone(&self.pool),
+            tls_state: Arc::clone(&self.tls_state),
             namespace_sql: self.namespace_sql.clone(),
             access_sql: self.access_sql.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
@@ -588,7 +590,8 @@ where
             namespace_sql: namespace_upsert_sql(&args.schema, &args.table),
             access_sql: access_insert_sql(&args.schema, &args.table),
             args,
-            pool,
+            pool: Arc::new(parking_lot::Mutex::new(pool)),
+            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,
@@ -600,8 +603,25 @@ where
     /// Identifier validation has already happened in `PostgresArgs::validate()`,
     /// so `qualified_table` cannot produce a malformed SQL string here.
     async fn send_body(&self, body: &[u8], event_id: &str, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
-        let client = self
-            .pool
+        let next_fingerprint = super::build_target_tls_fingerprint(
+            &self.args.tls_ca,
+            &self.args.tls_client_cert,
+            &self.args.tls_client_key,
+        )
+        .await?;
+        {
+            let mut tls_state_guard = self.tls_state.lock();
+            let pool = Arc::clone(&self.pool);
+            let args = self.args.clone();
+            super::refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint, || {
+                if let Ok(new_pool) = build_pool(&args) {
+                    *pool.lock() = new_pool;
+                }
+            });
+        }
+
+        let pool = self.pool.lock().clone();
+        let client = pool
             .get()
             .await
             .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed"))?;
@@ -634,8 +654,8 @@ where
     /// Probes the table from `init()`. Failure is non-fatal when a queue is
     /// configured: events buffer in the store until the schema is fixed.
     async fn probe_table(&self) -> Result<(), TargetError> {
-        let client = self
-            .pool
+        let pool = self.pool.lock().clone();
+        let client = pool
             .get()
             .await
             .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed during init probe"))?;
@@ -663,8 +683,8 @@ where
         }
 
         match tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let client = self
-                .pool
+            let pool = self.pool.lock().clone();
+            let client = pool
                 .get()
                 .await
                 .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed"))?;
@@ -717,7 +737,8 @@ where
     }
 
     async fn close(&self) -> Result<(), TargetError> {
-        self.pool.close();
+        self.pool.lock().close();
+        self.tls_state.lock().reset();
         info!(target_id = %self.id, "PostgreSQL target closed");
         Ok(())
     }

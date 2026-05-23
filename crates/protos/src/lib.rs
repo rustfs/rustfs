@@ -50,6 +50,7 @@ pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 /// It is used to identify HTTPS URLs.
 /// Default value: https://
 const RUSTFS_HTTPS_PREFIX: &str = "https://";
+const TLS_GENERATION_CACHE_MAX_SIZE: usize = 512;
 static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn internode_connect_timeout() -> Duration {
@@ -184,6 +185,9 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     }
     {
         let mut generation_cache = TLS_GENERATION_CACHE.lock().await;
+        if generation_cache.len() >= TLS_GENERATION_CACHE_MAX_SIZE && !generation_cache.contains_key(addr) {
+            generation_cache.retain(|_, g| *g == generation);
+        }
         generation_cache.insert(addr.to_string(), generation);
     }
     if stale_generation {

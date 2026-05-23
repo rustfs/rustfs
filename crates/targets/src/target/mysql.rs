@@ -479,6 +479,8 @@ where
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     /// Lazily-initialized MySQL connection pool
     pool: Arc<Mutex<Option<Pool>>>,
+    /// TLS fingerprint tracking for hot reload
+    tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
     /// Success/failure counters exposed via `delivery_snapshot`
     delivery_counters: Arc<TargetDeliveryCounters>,
     /// Zero-sized marker for the event type `E`
@@ -512,6 +514,7 @@ where
             store: queue_store,
             // Pool is lazily initialized on first use to avoid unnecessary connections at startup and allow for better error handling
             pool: Arc::new(Mutex::new(None)),
+            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
@@ -529,6 +532,21 @@ where
     /// | Existing table has incompatible schema | `Initialization` |
     /// | DSN parse failure / invalid config | `Configuration` |
     async fn get_or_init_pool(&self) -> Result<Pool, TargetError> {
+        let next_fingerprint = super::build_target_tls_fingerprint(
+            &self.args.tls_ca,
+            &self.args.tls_client_cert,
+            &self.args.tls_client_key,
+        )
+        .await?;
+        let tls_changed = {
+            let mut tls_state_guard = self.tls_state.lock();
+            tls_state_guard.refresh(next_fingerprint)
+        };
+        if tls_changed {
+            let mut guard = self.pool.lock().await;
+            *guard = None;
+        }
+
         {
             let guard = self.pool.lock().await;
             if let Some(pool) = guard.as_ref() {
@@ -660,6 +678,7 @@ where
             args: self.args.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             pool: Arc::clone(&self.pool),
+            tls_state: Arc::clone(&self.tls_state),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })
@@ -800,6 +819,7 @@ where
                 .map_err(|err| TargetError::Network(format!("Failed to disconnect MySQL pool: {err}")))?;
         }
 
+        self.tls_state.lock().reset();
         info!("MySQL target closed: {}", self.id);
         Ok(())
     }
