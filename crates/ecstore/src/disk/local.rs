@@ -24,7 +24,7 @@ use crate::disk::{
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
-    fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
+    fs::{O_APPEND, O_CREATE, O_RDONLY, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
     os,
     os::{check_path_length, is_empty_dir, is_root_disk, rename_all},
 };
@@ -56,7 +56,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, ErrorKind};
 use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
@@ -1163,30 +1163,31 @@ impl LocalDisk {
     }
     // write_all_internal do write file
     async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
-        let flags = O_CREATE | O_WRONLY | O_TRUNC;
+        if let Some(parent) = file_path.parent()
+            && parent != skip_parent
+        {
+            os::make_dir_all(parent, skip_parent).await?;
+        }
 
-        let mut f = {
-            if sync {
-                // TODO: support sync
-                self.open_file(file_path, flags, skip_parent).await?
-            } else {
-                self.open_file(file_path, flags, skip_parent).await?
-            }
-        };
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(file_path)
+            .map_err(to_file_error)?;
 
         match data {
             InternalBuf::Ref(buf) => {
-                f.write_all(buf).await.map_err(to_file_error)?;
+                std::io::Write::write_all(&mut f, buf).map_err(to_file_error)?;
             }
             InternalBuf::Owned(buf) => {
-                f.write_all(buf.as_ref()).await.map_err(to_file_error)?;
+                std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?;
             }
         }
 
-        // Ensure Tokio's file write is driven to completion before callers expose
-        // metadata paths to subsequent reads.
-        f.flush().await.map_err(to_file_error)?;
-        f.shutdown().await.map_err(to_file_error)?;
+        // Preserve the previous durability behavior: `sync` was accepted but
+        // did not call fsync/sync_all in this path.
+        let _ = sync;
 
         Ok(())
     }
