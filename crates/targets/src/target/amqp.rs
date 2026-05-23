@@ -416,7 +416,8 @@ where
     /// coordinator fails to register, the target falls back to inline
     /// fingerprint-based change detection.
     pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
-        let has_tls_config = !self.args.tls_ca.is_empty() || !self.args.tls_client_cert.is_empty() || !self.args.tls_client_key.is_empty();
+        let has_tls_config =
+            !self.args.tls_ca.is_empty() || !self.args.tls_client_cert.is_empty() || !self.args.tls_client_key.is_empty();
 
         if !has_tls_config {
             return;

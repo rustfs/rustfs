@@ -27,6 +27,7 @@ use crate::{
         persist_queued_payload_to_store,
     },
 };
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use hyper_rustls::ConfigBuilderExt;
 use rumqttc::{
@@ -41,7 +42,6 @@ use rustls::ClientConfig;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
-use arc_swap::ArcSwap;
 use std::{
     marker::PhantomData,
     path::Path,
@@ -795,11 +795,7 @@ where
     }
 
     async fn validate_tls_files(&self) -> Result<(), TargetError> {
-        validate_tls_material(
-            &self.args.tls.ca_path,
-            &self.args.tls.client_cert_path,
-            &self.args.tls.client_key_path,
-        )
+        validate_tls_material(&self.args.tls.ca_path, &self.args.tls.client_cert_path, &self.args.tls.client_key_path)
     }
 }
 

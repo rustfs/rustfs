@@ -17,8 +17,8 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     runtime::tls::{
-        ReloadableTargetTls, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState,
-        config::ReloadApplyMode, fingerprint::TargetTlsGeneration, validate::validate_tls_material,
+        ReloadableTargetTls, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState, config::ReloadApplyMode,
+        fingerprint::TargetTlsGeneration, validate::validate_tls_material,
     },
     store::{Key, Store},
     target::{
@@ -414,9 +414,8 @@ where
     ///
     /// This method is async and must be called from a tokio runtime context.
     pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
-        let has_tls_config = !self.args.client_ca.is_empty()
-            || !self.args.client_cert.is_empty()
-            || !self.args.client_key.is_empty();
+        let has_tls_config =
+            !self.args.client_ca.is_empty() || !self.args.client_cert.is_empty() || !self.args.client_key.is_empty();
 
         if !has_tls_config {
             return;
@@ -426,14 +425,12 @@ where
             id: self.id.clone(),
             args: self.args.clone(),
             health_check_url: self.health_check_url.clone(),
-            http_client: Arc::new(Mutex::new(
-                Self::build_http_client(&self.args).unwrap_or_else(|_| {
-                    Client::builder()
-                        .timeout(Duration::from_secs(30))
-                        .build()
-                        .expect("reqwest Client::builder defaults are infallible")
-                }),
-            )),
+            http_client: Arc::new(Mutex::new(Self::build_http_client(&self.args).unwrap_or_else(|_| {
+                Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .expect("reqwest Client::builder defaults are infallible")
+            }))),
             tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
             tls_runtime_state: None,
             store: None,

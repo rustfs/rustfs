@@ -393,9 +393,12 @@ where
         // Inline fingerprint fallback path (no coordinator).
         let secure_scheme = matches!(self.args.url.scheme(), "rediss" | "valkeys");
         if secure_scheme {
-            let next_fingerprint =
-                super::build_target_tls_fingerprint(&self.args.tls.ca_path, &self.args.tls.client_cert_path, &self.args.tls.client_key_path)
-                    .await?;
+            let next_fingerprint = super::build_target_tls_fingerprint(
+                &self.args.tls.ca_path,
+                &self.args.tls.client_cert_path,
+                &self.args.tls.client_key_path,
+            )
+            .await?;
             let tls_changed = {
                 let mut tls_state_guard = self.tls_state.lock();
                 tls_state_guard.refresh(next_fingerprint)

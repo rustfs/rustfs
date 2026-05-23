@@ -33,8 +33,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
 
