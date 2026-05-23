@@ -308,4 +308,43 @@ mod tests {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
         }
     }
+
+    #[test]
+    fn operation_metric_names_and_low_cardinality_values_are_stable() {
+        assert_eq!(INTERNODE_OPERATION_READ_FILE_STREAM, "read_file_stream");
+        assert_eq!(INTERNODE_OPERATION_PUT_FILE_STREAM, "put_file_stream");
+        assert_eq!(INTERNODE_OPERATION_WALK_DIR, "walk_dir");
+        assert_eq!(INTERNODE_OPERATION_GRPC_READ_ALL, "grpc_read_all");
+        assert_eq!(INTERNODE_OPERATION_GRPC_WRITE_ALL, "grpc_write_all");
+
+        assert_eq!(INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, "tcp-http");
+        assert_eq!(INTERNODE_TRANSPORT_BACKEND_GRPC, "grpc");
+        assert_eq!(INTERNODE_TRANSPORT_BACKEND_UNKNOWN, "unknown");
+
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS,
+            &[
+                InternodeOperationMetricDescriptor {
+                    name: "rustfs_system_network_internode_operation_sent_bytes_total",
+                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
+                },
+                InternodeOperationMetricDescriptor {
+                    name: "rustfs_system_network_internode_operation_recv_bytes_total",
+                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
+                },
+                InternodeOperationMetricDescriptor {
+                    name: "rustfs_system_network_internode_operation_requests_outgoing_total",
+                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
+                },
+                InternodeOperationMetricDescriptor {
+                    name: "rustfs_system_network_internode_operation_requests_incoming_total",
+                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
+                },
+                InternodeOperationMetricDescriptor {
+                    name: "rustfs_system_network_internode_operation_errors_total",
+                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
+                },
+            ]
+        );
+    }
 }
