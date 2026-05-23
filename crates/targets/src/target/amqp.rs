@@ -23,8 +23,8 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     runtime::tls::{
-        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState,
-        config::ReloadApplyMode, validate_tls_material,
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
     },
     store::{Key, Store},
     target::{
@@ -305,7 +305,7 @@ where
     connection: Arc<Mutex<Option<Arc<AMQPConnection>>>>,
     tls_state: Arc<Mutex<TargetTlsState>>,
     /// When set, the coordinator drives TLS reload; inline fingerprint check is skipped.
-    tls_runtime_state: Option<Arc<TargetTlsRuntimeState<AMQPConnection>>>,
+    tls_adapter: Option<TlsReloadAdapter<AMQPConnection>>,
     connect_lock: Arc<AsyncMutex<()>>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
@@ -322,7 +322,7 @@ where
             args: self.args.clone(),
             connection: Arc::clone(&self.connection),
             tls_state: Arc::clone(&self.tls_state),
-            tls_runtime_state: self.tls_runtime_state.clone(),
+            tls_adapter: self.tls_adapter.clone(),
             connect_lock: Arc::clone(&self.connect_lock),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             delivery_counters: Arc::clone(&self.delivery_counters),
@@ -348,7 +348,7 @@ where
             args,
             connection: Arc::new(Mutex::new(None)),
             tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
-            tls_runtime_state: None,
+            tls_adapter: None,
             connect_lock: Arc::new(AsyncMutex::new(())),
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
@@ -361,9 +361,15 @@ where
     }
 
     async fn get_or_connect(&self) -> Result<Arc<AMQPConnection>, TargetError> {
-        // When a TLS reload coordinator is attached, it drives connection rebuilds
+        // When a TLS reload adapter is attached, it drives connection rebuilds
         // in the background. The inline per-send fingerprint check is skipped.
-        if self.tls_runtime_state.is_none() {
+        if let Some(adapter) = &self.tls_adapter {
+            let material = adapter.current_material();
+            if material.connection.status().connected() && material.channel.status().connected() {
+                return Ok(material);
+            }
+            self.clear_connection_handle();
+        } else {
             let next_fingerprint =
                 build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
             let tls_changed = {
@@ -407,44 +413,6 @@ where
 
     fn clear_connection(&self) {
         self.clear_connection_cache();
-    }
-
-    /// Registers this target with a TLS reload coordinator.
-    ///
-    /// When TLS files are configured, the coordinator takes over certificate
-    /// hot-reload via background polling. When TLS is not configured or the
-    /// coordinator fails to register, the target falls back to inline
-    /// fingerprint-based change detection.
-    pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
-        let has_tls_config =
-            !self.args.tls_ca.is_empty() || !self.args.tls_client_cert.is_empty() || !self.args.tls_client_key.is_empty();
-
-        if !has_tls_config {
-            return;
-        }
-
-        let shell = Arc::new(Self {
-            id: self.id.clone(),
-            args: self.args.clone(),
-            connection: Arc::new(Mutex::new(None)),
-            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
-            tls_runtime_state: None,
-            connect_lock: Arc::new(AsyncMutex::new(())),
-            store: None,
-            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
-            _phantom: std::marker::PhantomData,
-        });
-
-        let options = rustfs_tls_runtime::config::TlsReloadOptions::default();
-        match coordinator.register(shell, options).await {
-            Ok(state) => {
-                info!(target_id = %self.id, "AMQP target registered with TLS reload coordinator");
-                self.tls_runtime_state = Some(state);
-            }
-            Err(err) => {
-                warn!(target_id = %self.id, error = %err, "Failed to register AMQP target with TLS reload coordinator; falling back to inline fingerprint");
-            }
-        }
     }
 
     async fn send_body(&self, body: &[u8]) -> Result<(), TargetError> {
@@ -580,10 +548,10 @@ where
                 .map_err(|e| map_lapin_error(e, "Failed to close AMQP connection"))?;
         }
         self.tls_state.lock().reset();
-        // If a coordinator runtime state is attached, reset its error tracking
+        // If a TLS reload adapter is attached, reset its error tracking
         // so that a future re-init does not inherit stale failure state.
-        if let Some(runtime_state) = &self.tls_runtime_state {
-            *runtime_state.last_error.write() = None;
+        if let Some(adapter) = &self.tls_adapter {
+            *adapter.runtime_state().last_error.write() = None;
         }
         info!(target_id = %self.id, "AMQP target closed");
         Ok(())

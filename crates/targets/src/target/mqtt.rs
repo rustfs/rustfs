@@ -17,8 +17,8 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     runtime::tls::{
-        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState,
-        TargetTlsState, config::ReloadApplyMode, validate_tls_material,
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsState, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
     },
     store::{Key, Store},
     target::{
@@ -495,10 +495,10 @@ where
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     connected: Arc<AtomicBool>,
     bg_task_manager: Arc<BgTaskManager>,
-    /// TLS fingerprint tracking for inline fallback path (new for MQTT).
+    /// TLS fingerprint tracking for inline fallback path.
     tls_state: Arc<parking_lot::Mutex<TargetTlsState>>,
     /// When set, the coordinator drives TLS reload; inline fingerprint check is skipped.
-    tls_runtime_state: Option<Arc<TargetTlsRuntimeState<MqttOptions>>>,
+    tls_adapter: Option<TlsReloadAdapter<MqttOptions>>,
     /// Updated MqttOptions from coordinator for use on next reconnection.
     pending_mqtt_options: Arc<ArcSwap<MqttOptions>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
@@ -550,7 +550,7 @@ where
             connected: Arc::new(AtomicBool::new(false)),
             bg_task_manager,
             tls_state: Arc::new(parking_lot::Mutex::new(TargetTlsState::default())),
-            tls_runtime_state: None,
+            tls_adapter: None,
             pending_mqtt_options: Arc::new(ArcSwap::from(Arc::new(initial_mqtt_options))),
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
@@ -683,68 +683,11 @@ where
             connected: self.connected.clone(),
             bg_task_manager: self.bg_task_manager.clone(),
             tls_state: Arc::clone(&self.tls_state),
-            tls_runtime_state: self.tls_runtime_state.clone(),
+            tls_adapter: self.tls_adapter.clone(),
             pending_mqtt_options: Arc::clone(&self.pending_mqtt_options),
             delivery_counters: self.delivery_counters.clone(),
             _phantom: PhantomData,
         })
-    }
-
-    /// Registers this target with a TLS reload coordinator.
-    ///
-    /// When TLS files are configured, the coordinator takes over certificate
-    /// hot-reload via background polling. The coordinator updates
-    /// `pending_mqtt_options` so the next reconnection picks up the new TLS
-    /// material. The running event loop is not interrupted.
-    pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
-        let has_tls_config = self.args.tls.policy.is_some()
-            || !self.args.tls.ca_path.is_empty()
-            || !self.args.tls.client_cert_path.is_empty()
-            || !self.args.tls.client_key_path.is_empty();
-
-        if !has_tls_config {
-            return;
-        }
-
-        let initial_mqtt_options = build_mqtt_options(
-            format!("rustfs_notify_{}", uuid::Uuid::new_v4()),
-            &self.args.broker,
-            Some(self.args.username.as_str()),
-            Some(self.args.password.as_str()),
-            &self.args.tls,
-            self.args.keep_alive,
-            Some(MAX_MQTT_PACKET_SIZE_BYTES),
-        )
-        .expect("build_mqtt_options should succeed (args already validated)");
-
-        let shell = Arc::new(Self {
-            id: self.id.clone(),
-            args: self.args.clone(),
-            client: Arc::new(Mutex::new(None)),
-            store: None,
-            connected: Arc::new(AtomicBool::new(false)),
-            bg_task_manager: Arc::new(BgTaskManager {
-                init_cell: OnceCell::new(),
-                cancel_tx: mpsc::channel(1).0,
-                initial_cancel_rx: Mutex::new(None),
-            }),
-            tls_state: Arc::new(parking_lot::Mutex::new(TargetTlsState::default())),
-            tls_runtime_state: None,
-            pending_mqtt_options: Arc::new(ArcSwap::from(Arc::new(initial_mqtt_options))),
-            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
-            _phantom: PhantomData,
-        });
-
-        let options = rustfs_tls_runtime::config::TlsReloadOptions::default();
-        match coordinator.register(shell, options).await {
-            Ok(state) => {
-                info!(target_id = %self.id, "MQTT target registered with TLS reload coordinator");
-                self.tls_runtime_state = Some(state);
-            }
-            Err(err) => {
-                warn!(target_id = %self.id, error = %err, "Failed to register MQTT target with TLS reload coordinator; falling back to inline fingerprint");
-            }
-        }
     }
 }
 
@@ -1100,10 +1043,10 @@ where
         }
 
         self.tls_state.lock().reset();
-        // If a coordinator runtime state is attached, reset its error tracking
+        // If a TLS reload adapter is attached, reset its error tracking
         // so that a future re-init does not inherit stale failure state.
-        if let Some(runtime_state) = &self.tls_runtime_state {
-            *runtime_state.last_error.write() = None;
+        if let Some(adapter) = &self.tls_adapter {
+            *adapter.runtime_state().last_error.write() = None;
         }
 
         self.connected.store(false, Ordering::SeqCst);

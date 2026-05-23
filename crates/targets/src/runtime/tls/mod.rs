@@ -23,6 +23,7 @@
 //! - The reload coordinator with background poll loops (`coordinator`)
 //! - Target-level reload metrics (`metrics`)
 
+pub mod adapter;
 pub mod config;
 pub mod coordinator;
 pub mod fingerprint;
@@ -31,10 +32,9 @@ pub mod state;
 pub mod r#trait;
 pub mod validate;
 
+pub use adapter::TlsReloadAdapter;
 pub use coordinator::TargetTlsReloadCoordinator;
-pub use fingerprint::{
-    TargetTlsFingerprint, TargetTlsGeneration, TargetTlsState, build_target_tls_fingerprint, refresh_tls_fingerprint_state,
-};
+pub use fingerprint::{TargetTlsFingerprint, TargetTlsGeneration, TargetTlsState, build_target_tls_fingerprint};
 pub use metrics::init_target_tls_metrics;
 pub use state::{TargetTlsInputSet, TargetTlsPublishedState, TargetTlsRuntimeState, TargetTlsStatusSnapshot};
 pub use r#trait::ReloadableTargetTls;

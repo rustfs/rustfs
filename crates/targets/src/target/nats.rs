@@ -17,8 +17,8 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     runtime::tls::{
-        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState,
-        config::ReloadApplyMode, validate_tls_material,
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
     },
     store::{Key, Store},
     target::{
@@ -176,9 +176,10 @@ where
     args: NATSArgs,
     client: Arc<Mutex<Option<async_nats::Client>>>,
     tls_state: Arc<parking_lot::Mutex<TargetTlsState>>,
-    /// Optional coordinated TLS reload runtime state. When present, the target
-    /// uses the coordinator's material directly instead of the inline fingerprint check.
-    tls_runtime_state: Option<Arc<TargetTlsRuntimeState<async_nats::Client>>>,
+    /// Adapter that bridges this target to the TLS reload coordinator.
+    /// When `Some`, the target uses coordinator-managed material; when `None`,
+    /// it falls back to inline fingerprint-based change detection.
+    tls_adapter: Option<TlsReloadAdapter<async_nats::Client>>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     connected: AtomicBool,
     delivery_counters: Arc<TargetDeliveryCounters>,
@@ -195,7 +196,7 @@ where
             args: self.args.clone(),
             client: Arc::clone(&self.client),
             tls_state: Arc::clone(&self.tls_state),
-            tls_runtime_state: self.tls_runtime_state.clone(),
+            tls_adapter: self.tls_adapter.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: AtomicBool::new(self.connected.load(Ordering::SeqCst)),
             delivery_counters: Arc::clone(&self.delivery_counters),
@@ -221,7 +222,7 @@ where
             args,
             client: Arc::new(Mutex::new(None)),
             tls_state: Arc::new(parking_lot::Mutex::new(TargetTlsState::default())),
-            tls_runtime_state: None,
+            tls_adapter: None,
             store: queue_store,
             connected: AtomicBool::new(false),
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
@@ -234,10 +235,9 @@ where
     }
 
     async fn get_or_connect(&self) -> Result<async_nats::Client, TargetError> {
-        // Coordinator-managed path: use the material directly from the runtime state.
-        if let Some(runtime_state) = &self.tls_runtime_state {
-            let published = runtime_state.current.load();
-            let client: async_nats::Client = (*published.material).clone();
+        // Adapter-managed path: use the material directly from the TLS reload adapter.
+        if let Some(adapter) = &self.tls_adapter {
+            let client: async_nats::Client = (*adapter.current_material()).clone();
 
             // Ensure the client is also stored locally so that close() can drain it.
             {
@@ -289,46 +289,6 @@ where
             .map_err(|e| TargetError::Request(format!("Failed to publish NATS message: {e}")))?;
         self.delivery_counters.record_success();
         Ok(())
-    }
-
-    /// Registers this target with a TLS reload coordinator.
-    ///
-    /// When TLS files are configured, the coordinator takes over certificate
-    /// hot-reload via background polling. When TLS is not configured or the
-    /// coordinator fails to register, the target falls back to inline
-    /// fingerprint-based change detection.
-    ///
-    /// This method is async and must be called from a tokio runtime context.
-    pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
-        let has_tls_config =
-            !self.args.tls_ca.is_empty() || !self.args.tls_client_cert.is_empty() || !self.args.tls_client_key.is_empty();
-
-        if !has_tls_config {
-            return;
-        }
-
-        let shell = Arc::new(Self {
-            id: self.id.clone(),
-            args: self.args.clone(),
-            client: Arc::new(Mutex::new(None)),
-            tls_state: Arc::new(parking_lot::Mutex::new(TargetTlsState::default())),
-            tls_runtime_state: None,
-            store: None,
-            connected: AtomicBool::new(false),
-            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
-            _phantom: std::marker::PhantomData,
-        });
-
-        let options = rustfs_tls_runtime::config::TlsReloadOptions::default();
-        match coordinator.register(shell, options).await {
-            Ok(state) => {
-                info!(target_id = %self.id.id, "NATS target registered with TLS reload coordinator");
-                self.tls_runtime_state = Some(state);
-            }
-            Err(err) => {
-                warn!(target_id = %self.id.id, error = %err, "Failed to register NATS target with TLS reload coordinator; falling back to inline fingerprint");
-            }
-        }
     }
 }
 
@@ -384,11 +344,6 @@ where
             guard.take()
         };
         self.tls_state.lock().reset();
-        // If a coordinator runtime state is attached, reset its error tracking
-        // so that a future re-init does not inherit stale failure state.
-        if let Some(runtime_state) = &self.tls_runtime_state {
-            *runtime_state.last_error.write() = None;
-        }
         self.connected.store(false, Ordering::SeqCst);
         if let Some(client) = client {
             client

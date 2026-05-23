@@ -17,8 +17,8 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     runtime::tls::{
-        ReloadableTargetTls, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState, config::ReloadApplyMode,
-        fingerprint::TargetTlsGeneration, validate::validate_tls_material,
+        ReloadableTargetTls, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode, fingerprint::TargetTlsGeneration,
+        validate::validate_tls_material,
     },
     store::{Key, Store},
     target::{
@@ -485,9 +485,9 @@ where
     pool: Arc<Mutex<Option<Pool>>>,
     /// TLS fingerprint tracking for hot reload (inline fallback path)
     tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
-    /// Optional coordinated TLS reload runtime state. When present, the target
-    /// uses the coordinator's material directly instead of the inline fingerprint check.
-    tls_runtime_state: Option<Arc<TargetTlsRuntimeState<Pool>>>,
+    /// When present, the adapter provides coordinator-managed TLS material;
+    /// otherwise the inline fingerprint path is used as a fallback.
+    tls_adapter: Option<TlsReloadAdapter<Pool>>,
     /// Success/failure counters exposed via `delivery_snapshot`
     delivery_counters: Arc<TargetDeliveryCounters>,
     /// Zero-sized marker for the event type `E`
@@ -500,9 +500,8 @@ where
 {
     /// Creates a new MySqlTarget.
     ///
-    /// The target starts without a TLS reload coordinator. Call
-    /// `register_tls_reload` after creation (from an async context) to
-    /// opt into coordinated TLS hot-reload.
+    /// The target starts without a TLS reload coordinator. Use
+    /// `TlsReloadAdapter::try_register` to opt into coordinated TLS hot-reload.
     pub fn new(id: String, args: MySqlArgs) -> Result<Self, TargetError> {
         args.validate()?;
 
@@ -526,55 +525,16 @@ where
             // Pool is lazily initialized on first use to avoid unnecessary connections at startup and allow for better error handling
             pool: Arc::new(Mutex::new(None)),
             tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
-            tls_runtime_state: None,
+            tls_adapter: None,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
     }
 
-    /// Registers this target with a TLS reload coordinator.
-    ///
-    /// When TLS files are configured, the coordinator takes over certificate
-    /// hot-reload via background polling. When TLS is not configured or the
-    /// coordinator fails to register, the target falls back to inline
-    /// fingerprint-based change detection.
-    ///
-    /// This method is async and must be called from a tokio runtime context.
-    pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
-        let has_tls_config =
-            !self.args.tls_ca.is_empty() || !self.args.tls_client_cert.is_empty() || !self.args.tls_client_key.is_empty();
-
-        if !has_tls_config {
-            return;
-        }
-
-        let shell = Arc::new(Self {
-            id: self.id.clone(),
-            args: self.args.clone(),
-            store: None,
-            pool: Arc::new(Mutex::new(None)),
-            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
-            tls_runtime_state: None,
-            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
-            _phantom: PhantomData,
-        });
-
-        let options = rustfs_tls_runtime::config::TlsReloadOptions::default();
-        match coordinator.register(shell, options).await {
-            Ok(state) => {
-                info!(target_id = %self.id.id, "MySQL target registered with TLS reload coordinator");
-                self.tls_runtime_state = Some(state);
-            }
-            Err(err) => {
-                warn!(target_id = %self.id.id, error = %err, "Failed to register MySQL target with TLS reload coordinator; falling back to inline fingerprint");
-            }
-        }
-    }
-
     /// Returns or lazily initializes the MySQL connection pool.
     ///
-    /// When `tls_runtime_state` is present (coordinator-managed), the pool
-    /// is sourced from the coordinator's published material via `ArcSwap`.
+    /// When `tls_adapter` is present (coordinator-managed), the pool
+    /// is sourced from the coordinator's published material.
     /// Otherwise, the inline fingerprint-based path is used as a fallback.
     ///
     /// # Errors
@@ -587,10 +547,9 @@ where
     /// | Existing table has incompatible schema | `Initialization` |
     /// | DSN parse failure / invalid config | `Configuration` |
     async fn get_or_init_pool(&self) -> Result<Pool, TargetError> {
-        // Coordinator-managed path: use the material directly from the runtime state.
-        if let Some(runtime_state) = &self.tls_runtime_state {
-            let published = runtime_state.current.load();
-            let pool: Pool = (*published.material).clone();
+        // Adapter-managed path: use the material directly from the coordinator.
+        if let Some(adapter) = &self.tls_adapter {
+            let pool: Pool = (*adapter.current_material()).clone();
 
             // Ensure the pool is also stored locally so that close() can drain it.
             {
@@ -677,7 +636,7 @@ where
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             pool: Arc::clone(&self.pool),
             tls_state: Arc::clone(&self.tls_state),
-            tls_runtime_state: self.tls_runtime_state.clone(),
+            tls_adapter: self.tls_adapter.clone(),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })
@@ -891,11 +850,7 @@ where
                 .map_err(|err| TargetError::Network(format!("Failed to disconnect MySQL pool: {err}")))?;
         }
 
-        self.tls_state.lock().reset();
-
-        // If coordinator-managed, the runtime state will be cleaned up by
-        // the coordinator itself (via unregister). We just clear our reference.
-        // No need to explicitly reset the ArcSwap here.
+        // Adapter cleanup is done by the coordinator; no local state to reset.
 
         info!("MySQL target closed: {}", self.id);
         Ok(())

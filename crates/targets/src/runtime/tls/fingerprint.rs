@@ -80,18 +80,6 @@ pub async fn build_target_tls_fingerprint(
     })
 }
 
-/// Convenience helper: refreshes `state` and calls `invalidate_cached_connection`
-/// only when the fingerprint actually changed.
-pub fn refresh_tls_fingerprint_state(
-    state: &mut TargetTlsState,
-    next_fingerprint: TargetTlsFingerprint,
-    invalidate_cached_connection: impl FnOnce(),
-) {
-    if state.refresh(next_fingerprint) {
-        invalidate_cached_connection();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{TargetTlsFingerprint, TargetTlsGeneration, TargetTlsState};

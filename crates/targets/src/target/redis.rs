@@ -17,8 +17,8 @@ use crate::{
     arn::TargetID,
     error::TargetError,
     runtime::tls::{
-        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState,
-        config::ReloadApplyMode, validate_tls_material,
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
     },
     store::{Key, Store},
     target::{
@@ -316,9 +316,10 @@ where
     connected: Arc<AtomicBool>,
     /// TLS fingerprint tracking for hot reload (inline fallback path).
     tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
-    /// Optional coordinated TLS reload runtime state. When present, the target
-    /// uses the coordinator's material directly instead of the inline fingerprint check.
-    tls_runtime_state: Option<Arc<TargetTlsRuntimeState<Client>>>,
+    /// Adapter that bridges this target to the TLS reload coordinator.
+    /// When `Some`, the target uses coordinator-managed material; when `None`,
+    /// it falls back to inline fingerprint-based change detection.
+    tls_adapter: Option<TlsReloadAdapter<Client>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: std::marker::PhantomData<E>,
 }
@@ -352,7 +353,7 @@ where
             store: queue_store,
             connected: Arc::new(AtomicBool::new(false)),
             tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
-            tls_runtime_state: None,
+            tls_adapter: None,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,
         })
@@ -367,17 +368,16 @@ where
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: Arc::clone(&self.connected),
             tls_state: Arc::clone(&self.tls_state),
-            tls_runtime_state: self.tls_runtime_state.clone(),
+            tls_adapter: self.tls_adapter.clone(),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: std::marker::PhantomData,
         })
     }
 
     async fn get_or_create_publisher(&self) -> Result<ConnectionManager, TargetError> {
-        // Coordinator-managed path: use the material directly from the runtime state.
-        if let Some(runtime_state) = &self.tls_runtime_state {
-            let published = runtime_state.current.load();
-            let client: Client = (*published.material).clone();
+        // Adapter-managed path: use the material directly from the TLS reload adapter.
+        if let Some(adapter) = &self.tls_adapter {
+            let client: Client = (*adapter.current_material()).clone();
 
             // Ensure the client is also stored locally so close() can drain it.
             *self.publisher_client.lock() = client.clone();
@@ -429,48 +429,6 @@ where
         // "recreate the publisher on the next attempt", not "this target is now definitively
         // inactive". That distinction preserves the business semantics of `is_active()`.
         *self.publisher.lock().await = None;
-    }
-
-    /// Registers this target with a TLS reload coordinator.
-    ///
-    /// When TLS files are configured, the coordinator takes over certificate
-    /// hot-reload via background polling. When TLS is not configured or the
-    /// coordinator fails to register, the target falls back to inline
-    /// fingerprint-based change detection.
-    ///
-    /// This method is async and must be called from a tokio runtime context.
-    pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
-        let has_tls_config = !self.args.tls.ca_path.is_empty()
-            || !self.args.tls.client_cert_path.is_empty()
-            || !self.args.tls.client_key_path.is_empty();
-
-        if !has_tls_config {
-            return;
-        }
-
-        let shell = Arc::new(Self {
-            id: self.id.clone(),
-            args: self.args.clone(),
-            publisher_client: Arc::new(parking_lot::Mutex::new(self.publisher_client.lock().clone())),
-            publisher: Arc::new(Mutex::new(None)),
-            store: None,
-            connected: Arc::new(AtomicBool::new(false)),
-            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
-            tls_runtime_state: None,
-            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
-            _phantom: std::marker::PhantomData,
-        });
-
-        let options = rustfs_tls_runtime::config::TlsReloadOptions::default();
-        match coordinator.register(shell, options).await {
-            Ok(state) => {
-                info!(target_id = %self.id, "Redis target registered with TLS reload coordinator");
-                self.tls_runtime_state = Some(state);
-            }
-            Err(err) => {
-                warn!(target_id = %self.id, error = %err, "Failed to register Redis target with TLS reload coordinator; falling back to inline fingerprint");
-            }
-        }
     }
 
     async fn ensure_publisher_ready(&self) -> Result<(), TargetError> {
