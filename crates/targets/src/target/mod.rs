@@ -37,37 +37,12 @@ pub mod pulsar;
 pub mod redis;
 pub mod webhook;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct TargetTlsFingerprintState {
-    pub ca_sha256: Option<[u8; 32]>,
-    pub client_cert_sha256: Option<[u8; 32]>,
-    pub client_key_sha256: Option<[u8; 32]>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TargetTlsGeneration(pub u64);
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct TargetTlsState {
-    pub generation: TargetTlsGeneration,
-    pub fingerprint: Option<TargetTlsFingerprintState>,
-}
-
-impl TargetTlsState {
-    pub(crate) fn refresh(&mut self, next_fingerprint: TargetTlsFingerprintState) -> bool {
-        if self.fingerprint.as_ref() == Some(&next_fingerprint) {
-            return false;
-        }
-
-        self.generation = TargetTlsGeneration(self.generation.0.saturating_add(1));
-        self.fingerprint = Some(next_fingerprint);
-        true
-    }
-
-    pub(crate) fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
+#[cfg(test)]
+pub(crate) use crate::runtime::tls::fingerprint::TargetTlsFingerprint as TargetTlsFingerprintState;
+#[cfg(test)]
+pub(crate) use crate::runtime::tls::fingerprint::TargetTlsGeneration;
+pub(crate) use crate::runtime::tls::fingerprint::TargetTlsState;
+pub(crate) use crate::runtime::tls::fingerprint::build_target_tls_fingerprint;
 
 /// A read-only snapshot of delivery counters for a target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -536,40 +511,6 @@ where
 pub(crate) fn mark_target_disconnected_on_connectivity_error(connected: &AtomicBool, err: &TargetError) {
     if is_connectivity_error(err) {
         connected.store(false, Ordering::SeqCst);
-    }
-}
-
-pub(crate) async fn build_target_tls_fingerprint(
-    ca_path: &str,
-    client_cert_path: &str,
-    client_key_path: &str,
-) -> Result<TargetTlsFingerprintState, TargetError> {
-    async fn load_optional_digest(path: &str) -> Result<Option<[u8; 32]>, TargetError> {
-        if path.is_empty() {
-            return Ok(None);
-        }
-
-        let bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| TargetError::Configuration(format!("Failed to read TLS material '{path}': {e}")))?;
-        let digest = rustfs_tls_runtime::TlsFingerprint::from_optional_bytes(Some(&bytes), None, None, None, None).server_sha256;
-        Ok(digest)
-    }
-
-    Ok(TargetTlsFingerprintState {
-        ca_sha256: load_optional_digest(ca_path).await?,
-        client_cert_sha256: load_optional_digest(client_cert_path).await?,
-        client_key_sha256: load_optional_digest(client_key_path).await?,
-    })
-}
-
-pub(crate) fn refresh_tls_fingerprint_state(
-    state: &mut TargetTlsState,
-    next_fingerprint: TargetTlsFingerprintState,
-    invalidate_cached_connection: impl FnOnce(),
-) {
-    if state.refresh(next_fingerprint) {
-        invalidate_cached_connection();
     }
 }
 

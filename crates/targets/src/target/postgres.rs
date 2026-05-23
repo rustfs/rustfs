@@ -29,6 +29,10 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsRuntimeState, config::ReloadApplyMode,
+        validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
@@ -537,6 +541,11 @@ fn resolve_payload_key(payload: &serde_json::Value, meta: &QueuedPayloadMeta) ->
 /// so that `clone_box` does not duplicate connection state. The optional
 /// `QueueStore` provides at-least-once delivery semantics consistent with the
 /// other built-in targets.
+///
+/// When `tls_runtime_state` is `Some`, the target participates in the
+/// coordinated TLS hot-reload system driven by `TargetTlsReloadCoordinator`,
+/// and the inline fingerprint check in `send_body` is skipped. When `None`,
+/// the legacy inline fingerprint check is used as a fallback.
 pub struct PostgresTarget<E>
 where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
@@ -545,6 +554,8 @@ where
     args: PostgresArgs,
     pool: Arc<parking_lot::Mutex<Pool>>,
     tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
+    /// When set, the coordinator drives TLS reload; inline fingerprint check is skipped.
+    tls_runtime_state: Option<Arc<TargetTlsRuntimeState<Pool>>>,
     namespace_sql: String,
     access_sql: String,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
@@ -562,6 +573,7 @@ where
             args: self.args.clone(),
             pool: Arc::clone(&self.pool),
             tls_state: Arc::clone(&self.tls_state),
+            tls_runtime_state: self.tls_runtime_state.clone(),
             namespace_sql: self.namespace_sql.clone(),
             access_sql: self.access_sql.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
@@ -592,10 +604,20 @@ where
             args,
             pool: Arc::new(parking_lot::Mutex::new(pool)),
             tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
+            tls_runtime_state: None,
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    /// Attaches a TLS reload coordinator runtime state to this target.
+    ///
+    /// When set, the coordinator drives TLS hot-reload in the background and
+    /// the inline fingerprint check in `send_body` is skipped. When absent,
+    /// the legacy per-send fingerprint check is used instead.
+    pub fn with_tls_coordinator(&mut self, state: Arc<TargetTlsRuntimeState<Pool>>) {
+        self.tls_runtime_state = Some(state);
     }
 
     /// Sends a serialized event body to PostgreSQL using the configured format.
@@ -603,21 +625,21 @@ where
     /// Identifier validation has already happened in `PostgresArgs::validate()`,
     /// so `qualified_table` cannot produce a malformed SQL string here.
     async fn send_body(&self, body: &[u8], event_id: &str, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
-        let next_fingerprint = super::build_target_tls_fingerprint(
-            &self.args.tls_ca,
-            &self.args.tls_client_cert,
-            &self.args.tls_client_key,
-        )
-        .await?;
-        {
-            let mut tls_state_guard = self.tls_state.lock();
-            let pool = Arc::clone(&self.pool);
-            let args = self.args.clone();
-            super::refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint, || {
-                if let Ok(new_pool) = build_pool(&args) {
-                    *pool.lock() = new_pool;
-                }
-            });
+        // When a TLS reload coordinator is attached, it drives pool rebuilds in
+        // the background. The inline per-send fingerprint check is skipped.
+        if self.tls_runtime_state.is_none() {
+            let next_fingerprint =
+                super::build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
+                    .await?;
+            let tls_changed = {
+                let tls_state_guard = self.tls_state.lock();
+                tls_state_guard.fingerprint.as_ref() != Some(&next_fingerprint)
+            };
+            if tls_changed {
+                let new_pool = build_pool(&self.args)?;
+                *self.pool.lock() = new_pool;
+                self.tls_state.lock().refresh(next_fingerprint);
+            }
         }
 
         let pool = self.pool.lock().clone();
@@ -665,6 +687,41 @@ where
             .await
             .map_err(|e| map_pg_error(&e, "PostgreSQL table probe failed"))?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<E> ReloadableTargetTls for PostgresTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Pool;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: self.args.tls_client_cert.clone(),
+            client_key_path: self.args.tls_client_key.clone(),
+            target_label: format!("postgres:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        build_pool(&self.args)
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        *self.pool.lock() = (*material).clone();
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
     }
 }
 
@@ -739,6 +796,11 @@ where
     async fn close(&self) -> Result<(), TargetError> {
         self.pool.lock().close();
         self.tls_state.lock().reset();
+        // If a coordinator runtime state is attached, reset its error tracking
+        // so that a future re-init does not inherit stale failure state.
+        if let Some(runtime_state) = &self.tls_runtime_state {
+            *runtime_state.last_error.write() = None;
+        }
         info!(target_id = %self.id, "PostgreSQL target closed");
         Ok(())
     }

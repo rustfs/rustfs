@@ -38,7 +38,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::{self, Sleep};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
-use tracing::error;
+use tracing::{error, warn};
 
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
@@ -77,9 +77,14 @@ async fn build_http_client(disable_proxy: bool, outbound_tls: &rustfs_tls_runtim
 
     if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
         let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
-        if let Ok(certs_der) = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader).collect::<Result<Vec<_>, _>>() {
-            let certs_der = certs_der.into_iter().map(|cert| cert.to_vec()).collect::<Vec<_>>();
-            builder = add_root_certificates_from_der(builder, &certs_der);
+        match rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader).collect::<Result<Vec<_>, _>>() {
+            Ok(certs_der) => {
+                let certs_der = certs_der.into_iter().map(|cert| cert.to_vec()).collect::<Vec<_>>();
+                builder = add_root_certificates_from_der(builder, &certs_der);
+            }
+            Err(err) => {
+                warn!("Failed to parse published outbound root CA PEM; falling back to default trust roots: {err}");
+            }
         }
     } else if let Some(tp) = get_env_opt_str("RUSTFS_TLS_PATH").and_then(|s| {
         if s.is_empty() {
@@ -90,9 +95,16 @@ async fn build_http_client(disable_proxy: bool, outbound_tls: &rustfs_tls_runtim
     }) {
         let ca_path = tp.join(rustfs_config::RUSTFS_CA_CERT);
         if ca_path.exists()
-            && let Ok(certs_der) = load_cert_bundle_der_bytes(ca_path.to_str().unwrap_or_default())
+            && let Some(ca_path_str) = ca_path.to_str()
         {
-            builder = add_root_certificates_from_der(builder, &certs_der);
+            match load_cert_bundle_der_bytes(ca_path_str) {
+                Ok(certs_der) => {
+                    builder = add_root_certificates_from_der(builder, &certs_der);
+                }
+                Err(err) => {
+                    warn!("Failed to parse fallback root CA bundle '{}': {}", ca_path.display(), err);
+                }
+            }
         }
     }
 

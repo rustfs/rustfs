@@ -49,6 +49,8 @@ mysql_async = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 hashbrown = { workspace = true }
+arc-swap = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

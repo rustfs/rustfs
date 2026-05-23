@@ -53,6 +53,19 @@ const RUSTFS_HTTPS_PREFIX: &str = "https://";
 const TLS_GENERATION_CACHE_MAX_SIZE: usize = 512;
 static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
+    if generation_cache.len() < TLS_GENERATION_CACHE_MAX_SIZE || generation_cache.contains_key(addr) {
+        return;
+    }
+
+    generation_cache.retain(|_, g| *g == generation);
+    if generation_cache.len() >= TLS_GENERATION_CACHE_MAX_SIZE
+        && let Some(victim) = generation_cache.keys().next().cloned()
+    {
+        generation_cache.remove(&victim);
+    }
+}
+
 fn internode_connect_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(
         rustfs_config::ENV_INTERNODE_CONNECT_TIMEOUT_SECS,
@@ -185,9 +198,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     }
     {
         let mut generation_cache = TLS_GENERATION_CACHE.lock().await;
-        if generation_cache.len() >= TLS_GENERATION_CACHE_MAX_SIZE && !generation_cache.contains_key(addr) {
-            generation_cache.retain(|_, g| *g == generation);
-        }
+        enforce_tls_generation_cache_bound(&mut generation_cache, generation, addr);
         generation_cache.insert(addr.to_string(), generation);
     }
     if stale_generation {
@@ -204,4 +215,20 @@ pub async fn evict_failed_connection(addr: &str) {
     warn!("Evicting failed gRPC connection: {}", addr);
     evict_connection(addr).await;
     TLS_GENERATION_CACHE.lock().await.remove(addr);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enforce_tls_generation_cache_bound_evicts_when_retained_entries_still_full() {
+        let mut cache = HashMap::new();
+        for i in 0..TLS_GENERATION_CACHE_MAX_SIZE {
+            cache.insert(format!("node-{i}"), 42);
+        }
+
+        enforce_tls_generation_cache_bound(&mut cache, 42, "new-node");
+        assert_eq!(cache.len(), TLS_GENERATION_CACHE_MAX_SIZE - 1);
+    }
 }

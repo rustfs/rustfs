@@ -20,7 +20,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store, refresh_tls_fingerprint_state,
+        persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -229,13 +229,22 @@ where
     async fn refresh_tls(&self) -> Result<(), TargetError> {
         let next_fingerprint =
             build_target_tls_fingerprint(&self.args.client_ca, &self.args.client_cert, &self.args.client_key).await?;
+        let tls_changed = {
+            let tls_state_guard = self.tls_state.lock();
+            tls_state_guard.fingerprint.as_ref() != Some(&next_fingerprint)
+        };
+        if !tls_changed {
+            return Ok(());
+        }
+
+        let new_client = Self::build_http_client(&self.args)?;
         {
             let mut tls_state_guard = self.tls_state.lock();
-            refresh_tls_fingerprint_state(&mut tls_state_guard, next_fingerprint, || {
-                if let Ok(new_client) = Self::build_http_client(&self.args) {
-                    *self.http_client.lock() = new_client;
-                }
-            });
+            if tls_state_guard.fingerprint.as_ref() == Some(&next_fingerprint) {
+                return Ok(());
+            }
+            *self.http_client.lock() = new_client;
+            tls_state_guard.refresh(next_fingerprint);
         }
         Ok(())
     }

@@ -10139,6 +10139,7 @@ dependencies = [
 name = "rustfs-targets"
 version = "1.0.0-beta.4"
 dependencies = [
+ "arc-swap",
  "async-nats",
  "async-trait",
  "chrono",
@@ -10149,6 +10150,7 @@ dependencies = [
  "hyper-rustls",
  "lapin",
  "libc",
+ "metrics",
  "mysql_async",
  "parking_lot 0.12.5",
  "pulsar",
