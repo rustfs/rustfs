@@ -14,17 +14,14 @@ The OSS scope is:
 - keep `tcp-http` as the default backend;
 - keep existing TCP/HTTP behavior unchanged;
 - document copy hotspots and ownership gaps for maintainable transport code;
-- avoid hardware-specific dependencies or backend implementations.
+- avoid adding dependencies or backend implementations.
 
 The OSS scope is not:
 
-- RDMA support;
-- DPU support;
-- DOCA support;
-- BlueField support;
-- RoCE/InfiniBand support;
-- hardware benchmark planning;
-- hardware-specific backend implementation.
+- adding another transport backend;
+- replacing the current TCP/HTTP path;
+- adding benchmark plans for another transport;
+- changing object correctness semantics.
 
 ## Scope
 
