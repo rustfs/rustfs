@@ -1218,6 +1218,7 @@ mod tests {
 
         let stored_key = target.store().unwrap().put_raw(&encoded).expect("put raw");
 
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
         let result = rt.block_on(target.send_raw_from_store(stored_key.clone(), body, meta));
 
         match result {
@@ -1241,26 +1242,23 @@ mod tests {
         let tmpdir = tempfile::TempDir::new().expect("temp dir");
         let queue_dir = tmpdir.path().to_str().expect("valid path").to_string();
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let target: MySqlTarget<serde_json::Value> = rt
-            .block_on(MySqlTarget::new(
-                "test-valid-replay".to_string(),
-                MySqlArgs {
-                    enable: false,
-                    dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
-                    table: "events".to_string(),
-                    format: "access".to_string(),
-                    tls_ca: String::new(),
-                    tls_client_cert: String::new(),
-                    tls_client_key: String::new(),
-                    queue_dir,
-                    queue_limit: 10,
-                    max_open_connections: 2,
-                    target_type: TargetType::NotifyEvent,
-                },
-                None,
-            ))
-            .expect("valid args");
+        let target: MySqlTarget<serde_json::Value> = MySqlTarget::new(
+            "test-valid-replay".to_string(),
+            MySqlArgs {
+                enable: false,
+                dsn_string: "rustfs:pass@tcp(127.0.0.1:3306)/db".to_string(),
+                table: "events".to_string(),
+                format: "access".to_string(),
+                tls_ca: String::new(),
+                tls_client_cert: String::new(),
+                tls_client_key: String::new(),
+                queue_dir,
+                queue_limit: 10,
+                max_open_connections: 2,
+                target_type: TargetType::NotifyEvent,
+            },
+        )
+        .expect("valid args");
 
         let body =
             br#"{"EventName":"s3:ObjectCreated:Put","Key":"bucket/obj.txt","Records":[{"eventTime":"2026-05-03T10:00:00Z"}]}"#
@@ -1283,6 +1281,7 @@ mod tests {
         // pool init. But send_raw_from_store validates event_time before
         // insert, so valid payloads pass the time check. We verify the
         // payload is NOT treated as corrupted.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
         let result = rt.block_on(target.send_raw_from_store(stored_key.clone(), body, meta));
 
         assert!(!matches!(result, Err(TargetError::Dropped(_))), "valid payload should not return Dropped");

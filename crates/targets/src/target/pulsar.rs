@@ -16,6 +16,10 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState,
+        config::ReloadApplyMode, validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
@@ -32,7 +36,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -168,6 +172,8 @@ where
     args: PulsarArgs,
     client: Mutex<Option<Pulsar<TokioExecutor>>>,
     tls_state: Mutex<TargetTlsState>,
+    /// When set, the coordinator drives TLS reload; inline fingerprint check is skipped.
+    tls_runtime_state: Option<Arc<TargetTlsRuntimeState<Pulsar<TokioExecutor>>>>,
     producer: AsyncMutex<Option<Producer<TokioExecutor>>>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     connected: AtomicBool,
@@ -185,6 +191,7 @@ where
             args: self.args.clone(),
             client: Mutex::new(self.client.lock().unwrap().clone()),
             tls_state: Mutex::new(self.tls_state.lock().unwrap().clone()),
+            tls_runtime_state: self.tls_runtime_state.clone(),
             producer: AsyncMutex::new(None),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: AtomicBool::new(self.connected.load(Ordering::SeqCst)),
@@ -211,6 +218,7 @@ where
             args,
             client: Mutex::new(None),
             tls_state: Mutex::new(TargetTlsState::default()),
+            tls_runtime_state: None,
             producer: AsyncMutex::new(None),
             store: queue_store,
             connected: AtomicBool::new(false),
@@ -229,13 +237,17 @@ where
     }
 
     async fn get_or_connect_client(&self) -> Result<Pulsar<TokioExecutor>, TargetError> {
-        let next_fingerprint = build_target_tls_fingerprint(&self.args.tls_ca, "", "").await?;
-        let tls_changed = {
-            let mut tls_state_guard = self.tls_state.lock().unwrap();
-            tls_state_guard.refresh(next_fingerprint)
-        };
-        if tls_changed {
-            self.clear_cached_client_connection();
+        // When a TLS reload coordinator is attached, it drives client rebuilds
+        // in the background. The inline per-send fingerprint check is skipped.
+        if self.tls_runtime_state.is_none() {
+            let next_fingerprint = build_target_tls_fingerprint(&self.args.tls_ca, "", "").await?;
+            let tls_changed = {
+                let mut tls_state_guard = self.tls_state.lock().unwrap();
+                tls_state_guard.refresh(next_fingerprint)
+            };
+            if tls_changed {
+                self.clear_cached_client_connection();
+            }
         }
 
         if let Some(client) = self.client.lock().unwrap().clone() {
@@ -289,6 +301,94 @@ where
             .map_err(|e| TargetError::Request(format!("Failed to receive Pulsar receipt: {e}")))?;
         self.delivery_counters.record_success();
         Ok(())
+    }
+
+    /// Registers this target with a TLS reload coordinator.
+    ///
+    /// When TLS files are configured, the coordinator takes over certificate
+    /// hot-reload via background polling. When TLS is not configured or the
+    /// coordinator fails to register, the target falls back to inline
+    /// fingerprint-based change detection.
+    pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
+        let has_tls_config = !self.args.tls_ca.is_empty();
+
+        if !has_tls_config {
+            return;
+        }
+
+        let shell = Arc::new(Self {
+            id: self.id.clone(),
+            args: self.args.clone(),
+            client: Mutex::new(None),
+            tls_state: Mutex::new(TargetTlsState::default()),
+            tls_runtime_state: None,
+            producer: AsyncMutex::new(None),
+            store: None,
+            connected: AtomicBool::new(false),
+            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
+            _phantom: std::marker::PhantomData,
+        });
+
+        let options = rustfs_tls_runtime::config::TlsReloadOptions::default();
+        match coordinator.register(shell, options).await {
+            Ok(state) => {
+                info!(target_id = %self.id, "Pulsar target registered with TLS reload coordinator");
+                self.tls_runtime_state = Some(state);
+            }
+            Err(err) => {
+                warn!(target_id = %self.id, error = %err, "Failed to register Pulsar target with TLS reload coordinator; falling back to inline fingerprint");
+            }
+        }
+    }
+}
+
+/// Coordinated TLS hot-reload implementation for Pulsar targets.
+///
+/// Pulsar only uses a CA certificate (no client cert/key).
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the client without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for PulsarTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Pulsar<TokioExecutor>;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
+            target_label: format!("pulsar:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        connect_pulsar(&self.args).await
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        // Pulsar client is Clone, so we clone from the Arc and store it.
+        {
+            let mut guard = self.client.lock().unwrap();
+            *guard = Some((*material).clone());
+        }
+        // Producer is bound to the old client; clear it so next send rebuilds.
+        {
+            let mut producer = self.producer.lock().await;
+            *producer = None;
+        }
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        // Pulsar only uses CA, no client cert/key.
+        validate_tls_material(&self.args.tls_ca, "", "")
     }
 }
 
@@ -353,6 +453,11 @@ where
         *producer = None;
         self.clear_cached_client();
         self.connected.store(false, Ordering::SeqCst);
+        // If a coordinator runtime state is attached, reset its error tracking
+        // so that a future re-init does not inherit stale failure state.
+        if let Some(runtime_state) = &self.tls_runtime_state {
+            *runtime_state.last_error.write() = None;
+        }
         info!(target_id = %self.id, "Pulsar target closed");
         Ok(())
     }

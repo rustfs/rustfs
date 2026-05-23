@@ -16,6 +16,10 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState,
+        config::ReloadApplyMode, fingerprint::TargetTlsGeneration, validate::validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
@@ -109,6 +113,9 @@ where
     health_check_url: Option<Url>,
     http_client: Arc<Mutex<Client>>,
     tls_state: Arc<Mutex<TargetTlsState>>,
+    /// Optional coordinated TLS reload runtime state. When present, the target
+    /// uses the coordinator's material directly instead of the inline fingerprint check.
+    tls_runtime_state: Option<Arc<TargetTlsRuntimeState<Client>>>,
     // Add Send + Sync constraints to ensure thread safety
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     initialized: AtomicBool,
@@ -129,6 +136,7 @@ where
             health_check_url: self.health_check_url.clone(),
             http_client: Arc::clone(&self.http_client),
             tls_state: Arc::clone(&self.tls_state),
+            tls_runtime_state: self.tls_runtime_state.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             initialized: AtomicBool::new(self.initialized.load(Ordering::SeqCst)),
             cancel_sender: self.cancel_sender.clone(),
@@ -171,6 +179,7 @@ where
             health_check_url,
             http_client,
             tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
+            tls_runtime_state: None,
             store: queue_store,
             initialized: AtomicBool::new(false),
             cancel_sender,
@@ -336,7 +345,11 @@ where
             "Sending webhook payload"
         );
 
-        self.refresh_tls().await?;
+        // When a TLS reload coordinator is attached, it drives client rebuilds in
+        // the background. The inline per-send fingerprint check is skipped.
+        if self.tls_runtime_state.is_none() {
+            self.refresh_tls().await?;
+        }
 
         let client = self.http_client.lock().clone();
         let mut req_builder = client
@@ -384,6 +397,61 @@ where
                 "{} returned '{}', please check your endpoint configuration",
                 self.args.endpoint, status
             )))
+        }
+    }
+}
+
+impl<E> WebhookTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    /// Registers this target with a TLS reload coordinator.
+    ///
+    /// When TLS files are configured, the coordinator takes over certificate
+    /// hot-reload via background polling. When TLS is not configured or the
+    /// coordinator fails to register, the target falls back to inline
+    /// fingerprint-based change detection.
+    ///
+    /// This method is async and must be called from a tokio runtime context.
+    pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
+        let has_tls_config = !self.args.client_ca.is_empty()
+            || !self.args.client_cert.is_empty()
+            || !self.args.client_key.is_empty();
+
+        if !has_tls_config {
+            return;
+        }
+
+        let shell = Arc::new(Self {
+            id: self.id.clone(),
+            args: self.args.clone(),
+            health_check_url: self.health_check_url.clone(),
+            http_client: Arc::new(Mutex::new(
+                Self::build_http_client(&self.args).unwrap_or_else(|_| {
+                    Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .build()
+                        .expect("reqwest Client::builder defaults are infallible")
+                }),
+            )),
+            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
+            tls_runtime_state: None,
+            store: None,
+            initialized: AtomicBool::new(false),
+            cancel_sender: self.cancel_sender.clone(),
+            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
+            _phantom: PhantomData,
+        });
+
+        let options = rustfs_tls_runtime::config::TlsReloadOptions::default();
+        match coordinator.register(shell, options).await {
+            Ok(state) => {
+                info!(target_id = %self.id.id, "Webhook target registered with TLS reload coordinator");
+                self.tls_runtime_state = Some(state);
+            }
+            Err(err) => {
+                warn!(target_id = %self.id.id, error = %err, "Failed to register Webhook target with TLS reload coordinator; falling back to inline fingerprint");
+            }
         }
     }
 }
@@ -465,6 +533,11 @@ where
         // Send cancel signal to background tasks
         let _ = self.cancel_sender.try_send(());
         self.tls_state.lock().reset();
+        // If a coordinator runtime state is attached, reset its error tracking
+        // so that a future re-init does not inherit stale failure state.
+        if let Some(runtime_state) = &self.tls_runtime_state {
+            *runtime_state.last_error.write() = None;
+        }
         info!("Webhook target closed: {}", self.id);
         Ok(())
     }
@@ -497,6 +570,48 @@ where
 
     fn record_final_failure(&self) {
         self.delivery_counters.record_final_failure();
+    }
+}
+
+/// Coordinated TLS hot-reload implementation for Webhook targets.
+///
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the HTTP client without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for WebhookTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Client;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.client_ca.clone(),
+            client_cert_path: self.args.client_cert.clone(),
+            client_key_path: self.args.client_key.clone(),
+            target_label: format!("webhook:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        // build_http_client is synchronous (reads files + configures reqwest).
+        // The coordinator already runs this in a background task, so the
+        // synchronous file I/O does not block the send path.
+        Self::build_http_client(&self.args)
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        *self.http_client.lock() = (*material).clone();
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.client_ca, &self.args.client_cert, &self.args.client_key)
     }
 }
 

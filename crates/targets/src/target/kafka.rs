@@ -16,6 +16,10 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsInputSet, TargetTlsReloadCoordinator, TargetTlsRuntimeState, config::ReloadApplyMode,
+        fingerprint::TargetTlsGeneration, validate::validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
@@ -106,6 +110,9 @@ where
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     producer: Arc<Mutex<Option<Arc<AsyncProducer>>>>,
     tls_state: Arc<Mutex<TargetTlsState>>,
+    /// Optional coordinated TLS reload runtime state. When present, the target
+    /// uses the coordinator's material directly instead of the inline fingerprint check.
+    tls_runtime_state: Option<Arc<TargetTlsRuntimeState<Arc<AsyncProducer>>>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: PhantomData<E>,
 }
@@ -147,6 +154,7 @@ where
             store: queue_store,
             producer: Arc::new(Mutex::new(None)),
             tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
+            tls_runtime_state: None,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
@@ -199,6 +207,20 @@ where
     }
 
     async fn get_or_build_producer(&self) -> Result<Arc<AsyncProducer>, TargetError> {
+        // Coordinator-managed path: use the material directly from the runtime state.
+        if let Some(runtime_state) = &self.tls_runtime_state {
+            let published = runtime_state.current.load();
+            let producer: Arc<AsyncProducer> = Arc::clone(&published.material);
+
+            // Ensure the producer is also stored locally so that close() can drain it.
+            {
+                let mut guard = self.producer.lock().await;
+                *guard = Some(Arc::clone(&producer));
+            }
+            return Ok(producer);
+        }
+
+        // Inline fingerprint fallback path (no coordinator).
         let next_fingerprint =
             build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
         let tls_changed = {
@@ -264,9 +286,49 @@ where
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             producer: Arc::clone(&self.producer),
             tls_state: Arc::clone(&self.tls_state),
+            tls_runtime_state: self.tls_runtime_state.clone(),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })
+    }
+
+    /// Registers this target with a TLS reload coordinator.
+    ///
+    /// When TLS files are configured, the coordinator takes over certificate
+    /// hot-reload via background polling. When TLS is not configured or the
+    /// coordinator fails to register, the target falls back to inline
+    /// fingerprint-based change detection.
+    ///
+    /// This method is async and must be called from a tokio runtime context.
+    pub async fn register_tls_reload(&mut self, coordinator: Arc<TargetTlsReloadCoordinator>) {
+        let has_tls_config =
+            !self.args.tls_ca.is_empty() || !self.args.tls_client_cert.is_empty() || !self.args.tls_client_key.is_empty();
+
+        if !has_tls_config {
+            return;
+        }
+
+        let shell = Arc::new(Self {
+            id: self.id.clone(),
+            args: self.args.clone(),
+            store: None,
+            producer: Arc::new(Mutex::new(None)),
+            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
+            tls_runtime_state: None,
+            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
+            _phantom: PhantomData,
+        });
+
+        let options = rustfs_tls_runtime::config::TlsReloadOptions::default();
+        match coordinator.register(shell, options).await {
+            Ok(state) => {
+                info!(target_id = %self.id.id, "Kafka target registered with TLS reload coordinator");
+                self.tls_runtime_state = Some(state);
+            }
+            Err(err) => {
+                warn!(target_id = %self.id.id, error = %err, "Failed to register Kafka target with TLS reload coordinator; falling back to inline fingerprint");
+            }
+        }
     }
 }
 
@@ -326,6 +388,17 @@ where
     }
 
     async fn close(&self) -> Result<(), TargetError> {
+        {
+            let mut guard = self.producer.lock().await;
+            *guard = None;
+        }
+
+        self.tls_state.lock().await.reset();
+
+        // If coordinator-managed, the runtime state will be cleaned up by
+        // the coordinator itself (via unregister). We just clear our reference.
+        // No need to explicitly reset the ArcSwap here.
+
         info!("Kafka target closed: {}", self.id);
         Ok(())
     }
@@ -349,6 +422,47 @@ where
 
     fn record_final_failure(&self) {
         self.delivery_counters.record_final_failure();
+    }
+}
+
+/// Coordinated TLS hot-reload implementation for Kafka targets.
+///
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the producer without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for KafkaTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Arc<AsyncProducer>;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: self.args.tls_client_cert.clone(),
+            client_key_path: self.args.tls_client_key.clone(),
+            target_label: format!("kafka:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        let producer = self.build_producer().await?;
+        Ok(Arc::new(producer))
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        let mut guard = self.producer.lock().await;
+        *guard = Some((*material).clone());
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
     }
 }
 

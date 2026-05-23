@@ -488,4 +488,154 @@ mod tests {
         assert!(snapshot.last_attempt_time.is_none());
         assert!(snapshot.last_error.is_none());
     }
+
+    #[tokio::test]
+    async fn apply_failure_preserves_old_generation() {
+        let target = MockTarget::new("test:webhook");
+        target.should_fail_apply.store(true, Ordering::SeqCst);
+
+        // Use a non-default fingerprint so reload detects a change
+        let initial_material = Arc::new("initial".to_string());
+        let initial_fingerprint = TargetTlsFingerprint {
+            ca_sha256: Some([42; 32]),
+            client_cert_sha256: None,
+            client_key_sha256: None,
+        };
+        let initial_state = Arc::new(TargetTlsPublishedState {
+            generation: TargetTlsGeneration(3),
+            fingerprint: initial_fingerprint,
+            material: initial_material,
+            loaded_at_unix_ms: 0,
+        });
+        let runtime_state = Arc::new(TargetTlsRuntimeState::new(initial_state, target.tls_input_set()));
+        let options = default_options();
+
+        let result = reload_target_once(&target, &runtime_state, &options).await;
+        assert!(result.is_err());
+        // Generation should remain at 3
+        assert_eq!(runtime_state.current_generation(), TargetTlsGeneration(3));
+        assert!(runtime_state.last_error.read().is_some());
+    }
+
+    #[tokio::test]
+    async fn validate_failure_prevents_build() {
+        let target = MockTarget::new("test:kafka");
+        target.should_fail_validate.store(true, Ordering::SeqCst);
+
+        // Non-default fingerprint to trigger reload
+        let initial_material = Arc::new("initial".to_string());
+        let initial_fingerprint = TargetTlsFingerprint {
+            ca_sha256: Some([99; 32]),
+            client_cert_sha256: None,
+            client_key_sha256: None,
+        };
+        let initial_state = Arc::new(TargetTlsPublishedState {
+            generation: TargetTlsGeneration(1),
+            fingerprint: initial_fingerprint,
+            material: initial_material,
+            loaded_at_unix_ms: 0,
+        });
+        let runtime_state = Arc::new(TargetTlsRuntimeState::new(initial_state, target.tls_input_set()));
+        let options = default_options();
+
+        let result = reload_target_once(&target, &runtime_state, &options).await;
+        assert!(result.is_err());
+        // Build should NOT have been called
+        assert_eq!(target.build_calls.load(Ordering::SeqCst), 0);
+        // Validate was called
+        assert!(target.validate_calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(runtime_state.current_generation(), TargetTlsGeneration(1));
+    }
+
+    #[tokio::test]
+    async fn error_is_cleared_on_successful_reload() {
+        let target = MockTarget::new("test:nats");
+
+        let initial_material = Arc::new("initial".to_string());
+        let initial_fingerprint = TargetTlsFingerprint {
+            ca_sha256: Some([1; 32]),
+            client_cert_sha256: None,
+            client_key_sha256: None,
+        };
+        let initial_state = Arc::new(TargetTlsPublishedState {
+            generation: TargetTlsGeneration(1),
+            fingerprint: initial_fingerprint,
+            material: initial_material,
+            loaded_at_unix_ms: 0,
+        });
+        let runtime_state = Arc::new(TargetTlsRuntimeState::new(initial_state, target.tls_input_set()));
+        let options = default_options();
+
+        // First: fail the reload
+        target.should_fail_build.store(true, Ordering::SeqCst);
+        let _ = reload_target_once(&target, &runtime_state, &options).await;
+        assert!(runtime_state.last_error.read().is_some());
+
+        // Now succeed (fingerprint still different from default)
+        target.should_fail_build.store(false, Ordering::SeqCst);
+        let result = reload_target_once(&target, &runtime_state, &options).await;
+        assert!(result.is_ok());
+        assert!(runtime_state.last_error.read().is_none());
+        assert!(runtime_state.last_success_unix_ms() > 0);
+    }
+
+    #[tokio::test]
+    async fn last_good_is_never_overwritten_by_failed_reload() {
+        let target = MockTarget::new("test:amqp");
+
+        let initial_material = Arc::new("good".to_string());
+        let initial_fingerprint = TargetTlsFingerprint {
+            ca_sha256: Some([5; 32]),
+            client_cert_sha256: None,
+            client_key_sha256: None,
+        };
+        let initial_state = Arc::new(TargetTlsPublishedState {
+            generation: TargetTlsGeneration(2),
+            fingerprint: initial_fingerprint.clone(),
+            material: initial_material.clone(),
+            loaded_at_unix_ms: 100,
+        });
+        let runtime_state = Arc::new(TargetTlsRuntimeState::new(initial_state, target.tls_input_set()));
+
+        // Verify last_good matches initial
+        let good = runtime_state.last_good.load();
+        assert_eq!(good.generation, TargetTlsGeneration(2));
+
+        // Fail a reload
+        target.should_fail_build.store(true, Ordering::SeqCst);
+        let _ = reload_target_once(&target, &runtime_state, &default_options()).await;
+
+        // last_good should still be the initial state
+        let good_after = runtime_state.last_good.load();
+        assert_eq!(good_after.generation, TargetTlsGeneration(2));
+        assert_eq!(good_after.fingerprint, initial_fingerprint);
+    }
+
+    #[tokio::test]
+    async fn unregister_stops_target_poll_loop() {
+        let coordinator = TargetTlsReloadCoordinator::new();
+        let target = Arc::new(MockTarget::new("test:pulsar"));
+
+        let _state = coordinator.register(target.clone(), default_options()).await.unwrap();
+        assert_eq!(coordinator.entries.read().await.len(), 1);
+
+        coordinator.unregister("test:pulsar").await.unwrap();
+        assert!(coordinator.entries.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bump_generation_saturates_at_max() {
+        let target = MockTarget::new("test:saturation");
+        let initial_material = Arc::new("initial".to_string());
+        let max_gen_state = Arc::new(TargetTlsPublishedState {
+            generation: TargetTlsGeneration(u64::MAX),
+            fingerprint: TargetTlsFingerprint::default(),
+            material: initial_material,
+            loaded_at_unix_ms: 0,
+        });
+        let runtime_state = Arc::new(TargetTlsRuntimeState::new(max_gen_state, target.tls_input_set()));
+
+        let bumped = runtime_state.bump_generation();
+        assert_eq!(bumped, TargetTlsGeneration(u64::MAX)); // saturating add
+    }
 }
