@@ -16,6 +16,10 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TargetTlsState, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
@@ -23,6 +27,7 @@ use crate::{
         persist_queued_payload_to_store,
     },
 };
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use hyper_rustls::ConfigBuilderExt;
 use rumqttc::{
@@ -32,6 +37,7 @@ use rumqttc::{
 use rustfs_config::{
     EnableState, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_WS_PATH_ALLOWLIST,
 };
+use rustfs_tls_runtime::{load_certs, load_private_key};
 use rustls::ClientConfig;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -185,8 +191,7 @@ fn validate_path_is_absolute(path: &str, field: &str) -> Result<(), TargetError>
 }
 
 fn build_root_store(ca_path: &str, trust_leaf_as_ca: bool) -> Result<rustls::RootCertStore, TargetError> {
-    let certs =
-        rustfs_utils::load_certs(ca_path).map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_ca: {e}")))?;
+    let certs = load_certs(ca_path).map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_ca: {e}")))?;
     let mut store = rustls::RootCertStore::empty();
 
     if trust_leaf_as_ca {
@@ -222,9 +227,9 @@ fn build_mqtt_tls_transport(broker: &Url, tls: &MQTTTlsConfig) -> Result<Transpo
             if tls.client_cert_path.is_empty() {
                 builder.with_no_client_auth()
             } else {
-                let certs = rustfs_utils::load_certs(&tls.client_cert_path)
+                let certs = load_certs(&tls.client_cert_path)
                     .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_cert: {e}")))?;
-                let key = rustfs_utils::load_private_key(&tls.client_key_path)
+                let key = load_private_key(&tls.client_key_path)
                     .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_key: {e}")))?;
                 builder
                     .with_client_auth_cert(certs, key)
@@ -237,9 +242,9 @@ fn build_mqtt_tls_transport(broker: &Url, tls: &MQTTTlsConfig) -> Result<Transpo
             if tls.client_cert_path.is_empty() {
                 builder.with_no_client_auth()
             } else {
-                let certs = rustfs_utils::load_certs(&tls.client_cert_path)
+                let certs = load_certs(&tls.client_cert_path)
                     .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_cert: {e}")))?;
-                let key = rustfs_utils::load_private_key(&tls.client_key_path)
+                let key = load_private_key(&tls.client_key_path)
                     .map_err(|e| TargetError::Configuration(format!("Failed to load MQTT tls_client_key: {e}")))?;
                 builder
                     .with_client_auth_cert(certs, key)
@@ -490,6 +495,12 @@ where
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     connected: Arc<AtomicBool>,
     bg_task_manager: Arc<BgTaskManager>,
+    /// TLS fingerprint tracking for inline fallback path.
+    tls_state: Arc<parking_lot::Mutex<TargetTlsState>>,
+    /// When set, the coordinator drives TLS reload; inline fingerprint check is skipped.
+    tls_adapter: Option<TlsReloadAdapter<MqttOptions>>,
+    /// Updated MqttOptions from coordinator for use on next reconnection.
+    pending_mqtt_options: Arc<ArcSwap<MqttOptions>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: PhantomData<E>,
 }
@@ -519,6 +530,17 @@ where
             initial_cancel_rx: Mutex::new(Some(cancel_rx)),
         });
 
+        // Build the initial MqttOptions for TLS reload support.
+        let initial_mqtt_options = build_mqtt_options(
+            format!("rustfs_notify_{}", uuid::Uuid::new_v4()),
+            &args.broker,
+            Some(args.username.as_str()),
+            Some(args.password.as_str()),
+            &args.tls,
+            args.keep_alive,
+            Some(MAX_MQTT_PACKET_SIZE_BYTES),
+        )?;
+
         info!(target_id = %target_id, "MQTT target created");
         Ok(MQTTTarget::<E> {
             id: target_id,
@@ -527,6 +549,9 @@ where
             store: queue_store,
             connected: Arc::new(AtomicBool::new(false)),
             bg_task_manager,
+            tls_state: Arc::new(parking_lot::Mutex::new(TargetTlsState::default())),
+            tls_adapter: None,
+            pending_mqtt_options: Arc::new(ArcSwap::from(Arc::new(initial_mqtt_options))),
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
@@ -544,20 +569,15 @@ where
         let connected_arc = Arc::clone(&self.connected);
         let target_id_clone = self.id.clone();
         let args_clone = self.args.clone();
+        let pending_mqtt_options = Arc::clone(&self.pending_mqtt_options);
 
         let _ = bg_task_manager
             .init_cell
             .get_or_try_init(|| async {
                 debug!(target_id = %target_id_clone, "Initializing MQTT background task.");
-                let mqtt_options = build_mqtt_options(
-                    format!("rustfs_notify_{}", uuid::Uuid::new_v4()),
-                    &args_clone.broker,
-                    Some(args_clone.username.as_str()),
-                    Some(args_clone.password.as_str()),
-                    &args_clone.tls,
-                    args_clone.keep_alive,
-                    Some(MAX_MQTT_PACKET_SIZE_BYTES),
-                )?;
+
+                // Use the latest MqttOptions (may have been updated by TLS reload coordinator).
+                let mqtt_options: MqttOptions = (**pending_mqtt_options.load()).clone();
 
                 let (new_client, eventloop) = AsyncClient::builder(mqtt_options).capacity(10).build();
 
@@ -662,9 +682,63 @@ where
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: self.connected.clone(),
             bg_task_manager: self.bg_task_manager.clone(),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
+            pending_mqtt_options: Arc::clone(&self.pending_mqtt_options),
             delivery_counters: self.delivery_counters.clone(),
             _phantom: PhantomData,
         })
+    }
+}
+
+/// Coordinated TLS hot-reload implementation for MQTT targets.
+///
+/// MQTT uses `MqttOptions` as the material type. The coordinator rebuilds
+/// `MqttOptions` on TLS file changes, and `apply_tls_material` stores it in
+/// an `ArcSwap` for use on the next reconnection. The running event loop is
+/// not interrupted; rumqttc handles reconnection internally.
+#[async_trait]
+impl<E> ReloadableTargetTls for MQTTTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = MqttOptions;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls.ca_path.clone(),
+            client_cert_path: self.args.tls.client_cert_path.clone(),
+            client_key_path: self.args.tls.client_key_path.clone(),
+            target_label: format!("mqtt:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        build_mqtt_options(
+            format!("rustfs_notify_{}", uuid::Uuid::new_v4()),
+            &self.args.broker,
+            Some(self.args.username.as_str()),
+            Some(self.args.password.as_str()),
+            &self.args.tls,
+            self.args.keep_alive,
+            Some(MAX_MQTT_PACKET_SIZE_BYTES),
+        )
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        // Store the new MqttOptions for use on next reconnection.
+        // The running event loop is not interrupted; rumqttc handles reconnection.
+        self.pending_mqtt_options.store(material);
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls.ca_path, &self.args.tls.client_cert_path, &self.args.tls.client_key_path)
     }
 }
 
@@ -966,6 +1040,13 @@ where
             if let Err(e) = client_instance.disconnect().await {
                 warn!(target_id = %self.id, error = %e, "Error during MQTT client disconnect.");
             }
+        }
+
+        self.tls_state.lock().reset();
+        // If a TLS reload adapter is attached, reset its error tracking
+        // so that a future re-init does not inherit stale failure state.
+        if let Some(adapter) = &self.tls_adapter {
+            *adapter.runtime_state().last_error.write() = None;
         }
 
         self.connected.store(false, Ordering::SeqCst);

@@ -37,6 +37,13 @@ pub mod pulsar;
 pub mod redis;
 pub mod webhook;
 
+#[cfg(test)]
+pub(crate) use crate::runtime::tls::fingerprint::TargetTlsFingerprint as TargetTlsFingerprintState;
+#[cfg(test)]
+pub(crate) use crate::runtime::tls::fingerprint::TargetTlsGeneration;
+pub(crate) use crate::runtime::tls::fingerprint::TargetTlsState;
+pub(crate) use crate::runtime::tls::fingerprint::build_target_tls_fingerprint;
+
 /// A read-only snapshot of delivery counters for a target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TargetDeliverySnapshot {
@@ -528,6 +535,48 @@ pub(crate) fn ensure_rustls_provider_installed() {
     }
     if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
         debug!("rustls provider already installed or unavailable: {err:?}");
+    }
+}
+
+#[cfg(test)]
+mod tls_state_tests {
+    use super::{TargetTlsFingerprintState, TargetTlsGeneration, TargetTlsState};
+
+    #[test]
+    fn refresh_increments_generation_only_when_fingerprint_changes() {
+        let mut state = TargetTlsState::default();
+        let first = TargetTlsFingerprintState {
+            ca_sha256: Some([1; 32]),
+            client_cert_sha256: None,
+            client_key_sha256: None,
+        };
+        let second = TargetTlsFingerprintState {
+            ca_sha256: Some([2; 32]),
+            client_cert_sha256: None,
+            client_key_sha256: None,
+        };
+
+        assert!(state.refresh(first.clone()));
+        assert_eq!(state.generation, TargetTlsGeneration(1));
+        assert!(!state.refresh(first));
+        assert_eq!(state.generation, TargetTlsGeneration(1));
+        assert!(state.refresh(second));
+        assert_eq!(state.generation, TargetTlsGeneration(2));
+    }
+
+    #[test]
+    fn reset_clears_generation_and_fingerprint() {
+        let mut state = TargetTlsState {
+            generation: TargetTlsGeneration(5),
+            fingerprint: Some(TargetTlsFingerprintState {
+                ca_sha256: Some([9; 32]),
+                client_cert_sha256: None,
+                client_key_sha256: None,
+            }),
+        };
+
+        state.reset();
+        assert_eq!(state, TargetTlsState::default());
     }
 }
 
