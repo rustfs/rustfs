@@ -1163,30 +1163,44 @@ impl LocalDisk {
     }
     // write_all_internal do write file
     async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
-        let flags = O_CREATE | O_WRONLY | O_TRUNC;
-
-        let mut f = {
-            if sync {
-                // TODO: support sync
-                self.open_file(file_path, flags, skip_parent).await?
-            } else {
-                self.open_file(file_path, flags, skip_parent).await?
-            }
+        let skip_parent = if skip_parent.as_os_str().is_empty() {
+            self.root.as_path()
+        } else {
+            skip_parent
         };
 
         match data {
             InternalBuf::Ref(buf) => {
+                let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
                 f.write_all(buf).await.map_err(to_file_error)?;
             }
             InternalBuf::Owned(buf) => {
-                f.write_all(buf.as_ref()).await.map_err(to_file_error)?;
+                let path = file_path.to_path_buf();
+                if let Some(parent) = path.parent()
+                    && parent != skip_parent
+                {
+                    os::make_dir_all(parent, skip_parent).await?;
+                }
+
+                tokio::task::spawn_blocking(move || {
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(path)
+                        .map_err(to_file_error)?;
+
+                    std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?;
+
+                    Ok::<(), std::io::Error>(())
+                })
+                .await
+                .map_err(DiskError::from)??;
             }
         }
 
-        // Ensure Tokio's file write is driven to completion before callers expose
-        // metadata paths to subsequent reads.
-        f.flush().await.map_err(to_file_error)?;
-        f.shutdown().await.map_err(to_file_error)?;
+        // Keep existing durability contract: this path intentionally ignores `sync`.
+        let _ = sync;
 
         Ok(())
     }

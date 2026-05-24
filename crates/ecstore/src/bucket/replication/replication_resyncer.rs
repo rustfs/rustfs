@@ -3742,7 +3742,7 @@ mod tests {
     }
 
     #[test]
-    fn test_heal_should_use_check_replicate_delete_pending_object_uses_object_path() {
+    fn test_heal_should_use_check_replicate_delete_pending_non_delete_marker_uses_must_replicate_path() {
         let oi = ObjectInfo {
             bucket: "b".to_string(),
             name: "obj".to_string(),
@@ -3752,7 +3752,7 @@ mod tests {
         };
         assert!(
             !heal_should_use_check_replicate_delete(&oi),
-            "Pending non-delete-marker objects must use object replication heal"
+            "Pending non-delete-marker object must use must_replicate path to evaluate current target set"
         );
     }
 
@@ -3772,7 +3772,7 @@ mod tests {
     }
 
     #[test]
-    fn test_heal_should_use_check_replicate_delete_version_purge() {
+    fn test_heal_should_use_check_replicate_delete_version_purge_status_uses_delete_path() {
         let oi = ObjectInfo {
             bucket: "b".to_string(),
             name: "obj".to_string(),
@@ -3780,7 +3780,25 @@ mod tests {
             version_purge_status: VersionPurgeStatusType::Pending,
             ..Default::default()
         };
-        assert!(heal_should_use_check_replicate_delete(&oi));
+        assert!(
+            heal_should_use_check_replicate_delete(&oi),
+            "Version purge entries must use check_replicate_delete path"
+        );
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_completed_non_delete_marker_uses_must_replicate_path() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+        assert!(
+            !heal_should_use_check_replicate_delete(&oi),
+            "Completed non-delete-marker object must use must_replicate path so new targets can be evaluated"
+        );
     }
 
     #[test]

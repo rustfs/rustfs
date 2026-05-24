@@ -1703,16 +1703,108 @@ impl DiskAPI for RemoteDisk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::TcpHttpInternodeDataTransport;
+    use crate::rpc::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
     use rustfs_common::GLOBAL_CONN_MAP;
-    use std::sync::Once;
-    use tokio::io::duplex;
+    use std::pin::Pin;
+    use std::sync::{Mutex as StdMutex, Once};
+    use std::task::{Context, Poll};
+    use tokio::io::{ReadBuf, duplex};
     use tokio::net::TcpListener;
     use tonic::transport::Endpoint as TonicEndpoint;
     use tracing::Level;
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    #[derive(Debug, Clone)]
+    enum RecordedTransportCall {
+        Read(ReadStreamRequest),
+        Write(WriteStreamRequest),
+        WalkDir(WalkDirStreamRequest),
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordingInternodeDataTransport {
+        calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
+    }
+
+    impl RecordingInternodeDataTransport {
+        fn calls(&self) -> Vec<RecordedTransportCall> {
+            self.calls.lock().expect("recorded transport calls lock poisoned").clone()
+        }
+
+        fn record(&self, call: RecordedTransportCall) {
+            self.calls.lock().expect("recorded transport calls lock poisoned").push(call);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct EmptyTestReader;
+
+    impl AsyncRead for EmptyTestReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct SinkTestWriter;
+
+    impl AsyncWrite for SinkTestWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for RecordingInternodeDataTransport {
+        async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            self.record(RecordedTransportCall::Read(request));
+            Ok(Box::new(EmptyTestReader))
+        }
+
+        async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
+            self.record(RecordedTransportCall::Write(request));
+            Ok(Box::new(SinkTestWriter))
+        }
+
+        async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
+            self.record(RecordedTransportCall::WalkDir(request));
+            Ok(Box::new(EmptyTestReader))
+        }
+
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    async fn new_remote_disk_with_transport(data_transport: Arc<dyn InternodeDataTransport>) -> RemoteDisk {
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://remote-node:9000/data/rustfs0").unwrap(),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        RemoteDisk::new(&endpoint, &disk_option, data_transport).await.unwrap()
+    }
 
     fn init_tracing(filter_level: Level) {
         INIT.call_once(|| {
@@ -1955,6 +2047,102 @@ mod tests {
         remote_disk.set_disk_id(Some(disk_id)).await.unwrap();
 
         assert_eq!(remote_disk.disk_ref().await, disk_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_read_file_stream_uses_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let expected_disk = remote_disk.disk_ref().await;
+
+        let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::Read(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.volume, "bucket");
+                assert_eq!(request.path, "object/part.1");
+                assert_eq!(request.offset, 7);
+                assert_eq!(request.length, 11);
+            }
+            other => panic!("expected read transport call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_create_and_append_file_use_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let expected_disk = remote_disk.disk_ref().await;
+
+        let _created = remote_disk
+            .create_file("orig-bucket", "bucket", "object/part.1", 4096)
+            .await
+            .unwrap();
+        let _appended = remote_disk.append_file("bucket", "object/part.2").await.unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2);
+
+        match &calls[0] {
+            RecordedTransportCall::Write(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.volume, "bucket");
+                assert_eq!(request.path, "object/part.1");
+                assert!(!request.append);
+                assert_eq!(request.size, 4096);
+            }
+            other => panic!("expected create write transport call, got {other:?}"),
+        }
+
+        match &calls[1] {
+            RecordedTransportCall::Write(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.volume, "bucket");
+                assert_eq!(request.path, "object/part.2");
+                assert!(request.append);
+                assert_eq!(request.size, 0);
+            }
+            other => panic!("expected append write transport call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_walk_dir_uses_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let expected_disk = remote_disk.disk_ref().await;
+        let opts = WalkDirOptions {
+            bucket: "bucket".to_string(),
+            base_dir: "prefix".to_string(),
+            recursive: true,
+            report_notfound: false,
+            filter_prefix: Some("part".to_string()),
+            forward_to: None,
+            limit: 10,
+            disk_id: String::new(),
+        };
+        let expected_body = serde_json::to_vec(&opts).unwrap();
+        let mut writer = Vec::new();
+
+        remote_disk.walk_dir(opts, &mut writer).await.unwrap();
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::WalkDir(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.body, expected_body);
+                assert_eq!(request.stall_timeout, Some(get_drive_walkdir_stall_timeout()));
+            }
+            other => panic!("expected walk-dir transport call, got {other:?}"),
+        }
     }
 
     #[tokio::test]
