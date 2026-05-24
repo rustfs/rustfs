@@ -221,18 +221,25 @@ async fn async_main() -> Result<()> {
         debug!("rustls crypto provider already installed, skipping aws-lc-rs default install");
     }
     // Initialize TLS outbound material (root CAs, mTLS identity) if configured.
-    // Server-side TLS acceptor is built separately inside start_http_server()
-    // using the same TlsMaterialSnapshot loading logic.
+    // Server-side TLS acceptor is built separately inside start_http_server().
+    // Single load via tls-runtime; outbound is enriched with platform CAs and
+    // published to the global state before any HTTP listener starts.
     if let Some(tls_path) = config.tls_path.as_deref().map(str::trim).filter(|path| !path.is_empty()) {
-        match rustfs::server::tls_material::TlsMaterialSnapshot::load(tls_path).await {
+        match rustfs::server::tls_material::load_tls_material(tls_path).await {
             Ok(snapshot) => {
-                snapshot.apply_outbound().await;
+                use rustfs_tls_runtime::{TlsGeneration, publish_global_outbound_tls_state, record_tls_generation};
+                let generation = TlsGeneration(rustfs_common::get_global_outbound_tls_generation().saturating_add(1));
+                publish_global_outbound_tls_state(generation, &snapshot.outbound).await;
+                record_tls_generation("rustfs_server_startup", generation.0);
                 info!(target: "rustfs::main", "TLS outbound material initialized from {}", tls_path);
             }
             Err(e) => {
                 error!("Failed to initialize TLS from {}: {}", tls_path, e);
                 return Err(Error::other(e.to_string()));
             }
+        }
+        if rustfs_obs::observability_metric_enabled() {
+            rustfs_tls_runtime::init_tls_metrics();
         }
     }
 

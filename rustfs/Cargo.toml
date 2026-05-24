@@ -85,6 +85,7 @@ rustfs-data-usage = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-tls-runtime = { workspace = true }
 rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
@@ -127,6 +128,7 @@ serde_urlencoded = { workspace = true }
 
 # Cryptography and Security
 rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 subtle = { workspace = true }
 jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
@@ -173,9 +175,7 @@ libsystemd.workspace = true
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
-libmimalloc-sys = { version = "0.1.48", features = ["extended"] }
-
-
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
 # Only enable pprof-based profiling on linux + gnu + x86_64.
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]

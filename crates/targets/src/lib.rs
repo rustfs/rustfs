@@ -20,6 +20,7 @@ pub mod control_plane;
 pub mod domain;
 pub mod error;
 pub mod manifest;
+mod net;
 pub mod plugin;
 pub mod runtime;
 pub mod store;
@@ -48,6 +49,7 @@ pub use manifest::{
     TargetPluginExternalRuntimeContract, TargetPluginManifest, TargetPluginMarketplaceManifest, TargetPluginPackaging,
     TargetPluginRuntimeTransport, builtin_target_marketplace_manifest, installable_target_marketplace_manifest,
 };
+pub use net::*;
 pub use plugin::{
     BuiltinTargetAdminDescriptor, BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetPluginRegistry,
     TargetRequestValidator, boxed_target,
