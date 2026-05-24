@@ -76,7 +76,7 @@ spec:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           env:
             - name: DRIVES_PER_NODE
-              value: {{ .Values.drivesPerNode | quote }}
+              value: {{ $drivesPerNode | quote }}
           command:
             - sh
             - -c
