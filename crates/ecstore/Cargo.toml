@@ -38,6 +38,7 @@ rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
 rustfs-signer.workspace = true
+rustfs-tls-runtime.workspace = true
 rustfs-checksums.workspace = true
 rustfs-config = { workspace = true, features = ["constants", "notify", "audit"] }
 rustfs-credentials = { workspace = true }
@@ -91,6 +92,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
+rustls-pki-types.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "signal","io-uring"] }
 tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }

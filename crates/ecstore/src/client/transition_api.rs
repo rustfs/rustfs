@@ -51,6 +51,7 @@ use md5::Md5;
 use rand::{Rng, RngExt};
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_rio::HashReader;
+use rustfs_tls_runtime::{load_global_outbound_tls_state, record_tls_generation};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
     net::get_endpoint_url,
@@ -58,6 +59,8 @@ use rustfs_utils::{
         DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
     },
 };
+use rustls_pki_types::PrivateKeyDer;
+use rustls_pki_types::pem::PemObject;
 use s3s::S3ErrorCode;
 use s3s::dto::Owner;
 use s3s::dto::ReplicationStatus;
@@ -152,24 +155,11 @@ pub enum BucketLookupType {
     BucketLookupPath,
 }
 
-fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
-    // Load the root certificate bundle from the path specified by the
-    // RUSTFS_TLS_PATH environment variable.
-    let tp = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
-    // If no TLS path is configured, do not fall back to a CA bundle in the current directory.
-    if tp.is_empty() {
-        return None;
-    }
-    let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
-    if !ca.exists() {
-        return None;
-    }
-
-    let der_list = rustfs_utils::load_cert_bundle_der_bytes(ca.to_str().unwrap_or_default()).ok()?;
+fn build_root_store_from_der_list(der_list: Vec<Vec<u8>>) -> Option<rustls::RootCertStore> {
     let mut store = rustls::RootCertStore::empty();
     for der in der_list {
         if let Err(e) = store.add(der.into()) {
-            warn!("Warning: failed to add certificate from '{}' to root store: {e}", ca.display());
+            warn!("Warning: failed to add certificate to root store: {e}");
         }
     }
     Some(store)
@@ -199,18 +189,38 @@ where
     })
 }
 
-fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
-    with_rustls_init_guard(|| {
-        let config = if let Some(store) = load_root_store_from_tls_path() {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(store)
-                .with_no_client_auth()
-        } else {
-            rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth()
-        };
+async fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
+    with_rustls_init_guard(|| Ok(()))?;
 
-        Ok(config)
-    })
+    let outbound_tls = load_global_outbound_tls_state().await;
+    record_tls_generation("ecstore_transition_client", outbound_tls.generation.0);
+    let builder = if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
+        let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
+        let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| std::io::Error::other(format!("failed to parse published root CA PEM: {e}")))?;
+
+        let root_store = build_root_store_from_der_list(certs_der.into_iter().map(|cert| cert.to_vec()).collect::<Vec<_>>())
+            .ok_or_else(|| std::io::Error::other("published outbound root CA material could not build root store"))?;
+        rustls::ClientConfig::builder().with_root_certificates(root_store)
+    } else {
+        rustls::ClientConfig::builder().with_native_roots()?
+    };
+
+    let config = if let Some(identity) = outbound_tls.mtls_identity.as_ref() {
+        let certs = rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(identity.cert_pem.as_slice()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| std::io::Error::other(format!("failed to parse published client cert PEM: {e}")))?;
+        let key = PrivateKeyDer::from_pem_reader(&mut std::io::BufReader::new(identity.key_pem.as_slice()))
+            .map_err(|e| std::io::Error::other(format!("failed to parse published client key PEM: {e}")))?;
+        builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| std::io::Error::other(format!("failed to build client mTLS identity: {e}")))?
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    Ok(config)
 }
 
 impl TransitionClient {
@@ -234,7 +244,7 @@ impl TransitionClient {
 
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        let tls = build_tls_config()?;
+        let tls = build_tls_config().await?;
 
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
@@ -1374,9 +1384,7 @@ pub struct CreateBucketConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_tls_config, load_root_store_from_tls_path, signer_error_to_io_error, validate_header_values, with_rustls_init_guard,
-    };
+    use super::{build_tls_config, signer_error_to_io_error, validate_header_values, with_rustls_init_guard};
     use http::{HeaderMap, HeaderValue};
 
     #[test]
@@ -1393,22 +1401,6 @@ mod tests {
     fn build_tls_config_returns_result_without_panicking() {
         let outcome = std::panic::catch_unwind(build_tls_config);
         assert!(outcome.is_ok(), "TLS config creation should not panic");
-    }
-
-    /// When RUSTFS_TLS_PATH is not set, `load_root_store_from_tls_path` must return `None`
-    /// (i.e. it must not silently look for a CA bundle in the current working directory).
-    #[test]
-    fn tls_path_unset_returns_none() {
-        let result = temp_env::with_var_unset(rustfs_config::ENV_RUSTFS_TLS_PATH, || load_root_store_from_tls_path());
-        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is unset, but got a root store");
-    }
-
-    /// When RUSTFS_TLS_PATH is set to an empty string, `load_root_store_from_tls_path` must
-    /// return `None` to avoid accidentally trusting a CA bundle in the current directory.
-    #[test]
-    fn tls_path_empty_returns_none() {
-        let result = temp_env::with_var(rustfs_config::ENV_RUSTFS_TLS_PATH, Some(""), || load_root_store_from_tls_path());
-        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is empty, but got a root store");
     }
 
     /// Installing the rustls crypto provider when one is already set must not panic or return

@@ -15,7 +15,7 @@
 use crate::admin::{
     handlers::{
         audit, bucket_meta, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools, profile_admin,
-        quota, rebalance, replication, site_replication, sts, system, tier, user,
+        quota, rebalance, replication, site_replication, sts, system, tier, tls_debug, user,
     },
     router::{AdminOperation, S3Router},
 };
@@ -59,6 +59,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     replication::register_replication_route(router).expect("register replication route");
     site_replication::register_site_replication_route(router).expect("register site replication route");
     profile_admin::register_profiling_route(router).expect("register profile route");
+    tls_debug::register_tls_debug_route(router).expect("register tls debug route");
     kms::register_kms_route(router).expect("register kms route");
     oidc::register_oidc_route(router).expect("register oidc route");
 }
@@ -157,6 +158,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/resync/op"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/state/edit"));
     assert_route(&router, Method::GET, &admin_path("/debug/pprof/profile"));
+    assert_route(&router, Method::GET, &admin_path("/debug/tls/status"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/kms/create-key"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/key/create"));

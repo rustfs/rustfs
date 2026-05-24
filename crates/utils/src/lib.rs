@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "tls")]
-pub mod certs;
 #[cfg(feature = "ip")]
 pub mod ip;
 #[cfg(feature = "net")]
@@ -52,9 +50,6 @@ pub mod compress;
 #[cfg(feature = "path")]
 pub mod dirs;
 
-#[cfg(feature = "tls")]
-pub use certs::*;
-
 #[cfg(feature = "hash")]
 pub use hash::*;
 
@@ -69,12 +64,6 @@ pub use crypto::*;
 
 #[cfg(feature = "compress")]
 pub use compress::*;
-
-#[cfg(feature = "notify")]
-mod notify;
-
-#[cfg(feature = "notify")]
-pub use notify::*;
 
 #[cfg(feature = "obj")]
 pub mod obj;
