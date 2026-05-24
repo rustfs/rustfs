@@ -527,6 +527,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_host_with_bracketed_ipv6_zone_and_port() {
+        let result = parse_host("[fe80::1%eth0]:9000");
+        assert!(result.is_ok());
+        let host = result.unwrap();
+        assert_eq!(host.name, "fe80::1%eth0");
+        assert_eq!(host.port, Some(9000));
+    }
+
+    #[test]
     fn parse_host_with_bracketed_ipv6_without_port() {
         let result = parse_host("[::1]");
         assert!(result.is_ok());
