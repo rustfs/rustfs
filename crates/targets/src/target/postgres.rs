@@ -29,6 +29,10 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
@@ -38,12 +42,10 @@ use crate::{
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rustfs_config::{POSTGRES_DSN_STRING, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY};
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustfs_tls_runtime::{load_certs, load_private_key};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_postgres::Config;
@@ -425,11 +427,9 @@ pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, Tar
             let _ = root_store.add(cert);
         }
     } else {
-        let pem = std::fs::read(&args.tls_ca)
-            .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CA}: {e}")))?;
-        let mut reader = BufReader::new(pem.as_slice());
-        for cert in CertificateDer::pem_reader_iter(&mut reader) {
-            let cert = cert.map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CA}: {e}")))?;
+        let certs =
+            load_certs(&args.tls_ca).map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CA}: {e}")))?;
+        for cert in certs {
             root_store
                 .add(cert)
                 .map_err(|e| TargetError::Configuration(format!("failed to add CA cert: {e}")))?;
@@ -439,16 +439,9 @@ pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, Tar
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
 
     let client_config = if !args.tls_client_cert.is_empty() && !args.tls_client_key.is_empty() {
-        let cert_pem = std::fs::read(&args.tls_client_cert)
-            .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CLIENT_CERT}: {e}")))?;
-        let key_pem = std::fs::read(&args.tls_client_key)
-            .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CLIENT_KEY}: {e}")))?;
-
-        let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut BufReader::new(cert_pem.as_slice()))
-            .collect::<Result<_, _>>()
+        let certs = load_certs(&args.tls_client_cert)
             .map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CLIENT_CERT}: {e}")))?;
-
-        let key = PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_pem.as_slice()))
+        let key = load_private_key(&args.tls_client_key)
             .map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CLIENT_KEY}: {e}")))?;
 
         builder
@@ -548,13 +541,22 @@ fn resolve_payload_key(payload: &serde_json::Value, meta: &QueuedPayloadMeta) ->
 /// so that `clone_box` does not duplicate connection state. The optional
 /// `QueueStore` provides at-least-once delivery semantics consistent with the
 /// other built-in targets.
+///
+/// When `tls_adapter` is `Some`, the target participates in the
+/// coordinated TLS hot-reload system driven by `TlsReloadAdapter`,
+/// and the inline fingerprint check in `send_body` is skipped. When `None`,
+/// the legacy inline fingerprint check is used as a fallback.
 pub struct PostgresTarget<E>
 where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
     id: TargetID,
     args: PostgresArgs,
-    pool: Pool,
+    pool: Arc<parking_lot::Mutex<Pool>>,
+    tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
+    /// When present, the adapter provides coordinator-managed TLS material;
+    /// otherwise the inline fingerprint path is used as a fallback.
+    tls_adapter: Option<TlsReloadAdapter<Pool>>,
     namespace_sql: String,
     access_sql: String,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
@@ -570,7 +572,9 @@ where
         Box::new(PostgresTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
-            pool: self.pool.clone(),
+            pool: Arc::clone(&self.pool),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
             namespace_sql: self.namespace_sql.clone(),
             access_sql: self.access_sql.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
@@ -599,7 +603,9 @@ where
             namespace_sql: namespace_upsert_sql(&args.schema, &args.table),
             access_sql: access_insert_sql(&args.schema, &args.table),
             args,
-            pool,
+            pool: Arc::new(parking_lot::Mutex::new(pool)),
+            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
+            tls_adapter: None,
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,
@@ -611,8 +617,25 @@ where
     /// Identifier validation has already happened in `PostgresArgs::validate()`,
     /// so `qualified_table` cannot produce a malformed SQL string here.
     async fn send_body(&self, body: &[u8], event_id: &str, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
-        let client = self
-            .pool
+        // When a TLS reload adapter is attached, it drives pool rebuilds in
+        // the background. The inline per-send fingerprint check is skipped.
+        if self.tls_adapter.is_none() {
+            let next_fingerprint =
+                super::build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
+                    .await?;
+            let tls_changed = {
+                let tls_state_guard = self.tls_state.lock();
+                tls_state_guard.fingerprint.as_ref() != Some(&next_fingerprint)
+            };
+            if tls_changed {
+                let new_pool = build_pool(&self.args)?;
+                *self.pool.lock() = new_pool;
+                self.tls_state.lock().refresh(next_fingerprint);
+            }
+        }
+
+        let pool = self.pool.lock().clone();
+        let client = pool
             .get()
             .await
             .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed"))?;
@@ -645,8 +668,8 @@ where
     /// Probes the table from `init()`. Failure is non-fatal when a queue is
     /// configured: events buffer in the store until the schema is fixed.
     async fn probe_table(&self) -> Result<(), TargetError> {
-        let client = self
-            .pool
+        let pool = self.pool.lock().clone();
+        let client = pool
             .get()
             .await
             .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed during init probe"))?;
@@ -656,6 +679,41 @@ where
             .await
             .map_err(|e| map_pg_error(&e, "PostgreSQL table probe failed"))?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<E> ReloadableTargetTls for PostgresTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Pool;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: self.args.tls_client_cert.clone(),
+            client_key_path: self.args.tls_client_key.clone(),
+            target_label: format!("postgres:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        build_pool(&self.args)
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        *self.pool.lock() = (*material).clone();
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
     }
 }
 
@@ -674,8 +732,8 @@ where
         }
 
         match tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let client = self
-                .pool
+            let pool = self.pool.lock().clone();
+            let client = pool
                 .get()
                 .await
                 .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed"))?;
@@ -728,7 +786,8 @@ where
     }
 
     async fn close(&self) -> Result<(), TargetError> {
-        self.pool.close();
+        self.pool.lock().close();
+        // Adapter cleanup is done by the coordinator; no local state to reset.
         info!(target_id = %self.id, "PostgreSQL target closed");
         Ok(())
     }

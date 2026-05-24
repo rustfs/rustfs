@@ -18,6 +18,7 @@
 
 use super::constants::{http_error_codes, s3_error_codes};
 use russh_sftp::protocol::{Status, StatusCode};
+use russh_sftp::server::StatusReply;
 use s3s::{S3Error, S3ErrorCode};
 use std::{any::Any, fmt::Display};
 
@@ -28,6 +29,12 @@ pub struct SftpError(pub(super) StatusCode);
 impl From<SftpError> for StatusCode {
     fn from(err: SftpError) -> Self {
         err.0
+    }
+}
+
+impl From<SftpError> for StatusReply {
+    fn from(err: SftpError) -> Self {
+        StatusReply::new(err.0)
     }
 }
 

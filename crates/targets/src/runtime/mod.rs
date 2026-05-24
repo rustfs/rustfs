@@ -15,6 +15,7 @@
 pub mod adapter;
 pub mod sidecar;
 pub mod sidecar_protocol;
+pub mod tls;
 
 use crate::Target;
 use crate::arn::TargetID;

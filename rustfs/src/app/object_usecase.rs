@@ -85,7 +85,10 @@ use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
-use rustfs_targets::EventName;
+use rustfs_targets::{
+    EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
+};
+use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
@@ -101,10 +104,6 @@ use rustfs_utils::http::{
     insert_str, remove_str,
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
-use rustfs_utils::{
-    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
-    get_request_user_agent,
-};
 use rustfs_zip::CompressionFormat;
 use s3s::dto::*;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};

@@ -18,12 +18,16 @@
 mod generated;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, evict_connection};
+use rustfs_common::{GLOBAL_CONN_MAP, evict_connection};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+use rustfs_tls_runtime::{load_global_outbound_tls_state, record_tls_consumer_stale_generation};
 use std::{
+    collections::HashMap,
     error::Error,
+    sync::LazyLock,
     time::{Duration, Instant},
 };
+use tokio::sync::Mutex;
 use tonic::{
     Request, Status,
     service::interceptor::InterceptedService,
@@ -46,6 +50,21 @@ pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 /// It is used to identify HTTPS URLs.
 /// Default value: https://
 const RUSTFS_HTTPS_PREFIX: &str = "https://";
+const TLS_GENERATION_CACHE_MAX_SIZE: usize = 512;
+static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
+    if generation_cache.len() < TLS_GENERATION_CACHE_MAX_SIZE || generation_cache.contains_key(addr) {
+        return;
+    }
+
+    generation_cache.retain(|_, g| *g == generation);
+    if generation_cache.len() >= TLS_GENERATION_CACHE_MAX_SIZE
+        && let Some(victim) = generation_cache.keys().next().cloned()
+    {
+        generation_cache.remove(&victim);
+    }
+}
 
 fn internode_connect_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(
@@ -114,14 +133,19 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         // Overall timeout for any RPC - fail fast on unresponsive peers
         .timeout(rpc_timeout);
 
-    let root_cert = GLOBAL_ROOT_CERT.read().await;
-    if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
-        if root_cert.is_none() {
-            debug!("No custom root certificate configured; using system roots for TLS: {}", addr);
-            // If no custom root cert is configured, try to use system roots.
-            connector = connector.tls_config(ClientTlsConfig::new())?;
+    let outbound_tls = load_global_outbound_tls_state().await;
+    let generation = outbound_tls.generation.0;
+    let mut stale_generation = false;
+    {
+        let generation_cache = TLS_GENERATION_CACHE.lock().await;
+        if let Some(cached_generation) = generation_cache.get(addr)
+            && *cached_generation != generation
+        {
+            stale_generation = true;
         }
-        if let Some(cert_pem) = root_cert.as_ref() {
+    }
+    if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
             let ca = Certificate::from_pem(cert_pem);
             // Derive the hostname from the HTTPS URL for TLS hostname verification.
             let domain = addr
@@ -134,8 +158,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
                 .unwrap_or("");
             let tls = if !domain.is_empty() {
                 let mut cfg = ClientTlsConfig::new().ca_certificate(ca).domain_name(domain);
-                let mtls_identity = GLOBAL_MTLS_IDENTITY.read().await;
-                if let Some(id) = mtls_identity.as_ref() {
+                if let Some(id) = outbound_tls.mtls_identity.as_ref() {
                     let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
                     cfg = cfg.identity(identity);
                 }
@@ -147,9 +170,10 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
             connector = connector.tls_config(tls)?;
             debug!("Configured TLS with custom root certificate for: {}", addr);
         } else {
-            return Err(std::io::Error::other(
-                "HTTPS requested but no trusted roots are configured. Provide tls/ca.crt (or enable system roots via RUSTFS_TRUST_SYSTEM_CA=true)."
-            ).into());
+            // No custom root CA published — fall back to system roots.
+            // This is the expected path when no TLS path is configured.
+            debug!("No custom root certificate configured; using system roots for TLS: {}", addr);
+            connector = connector.tls_config(ClientTlsConfig::new())?;
         }
     }
 
@@ -168,6 +192,14 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     {
         GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel.clone());
     }
+    {
+        let mut generation_cache = TLS_GENERATION_CACHE.lock().await;
+        enforce_tls_generation_cache_bound(&mut generation_cache, generation, addr);
+        generation_cache.insert(addr.to_string(), generation);
+    }
+    if stale_generation {
+        record_tls_consumer_stale_generation("protos_grpc_channel");
+    }
 
     debug!("Successfully created and cached gRPC channel to: {}", addr);
     Ok(channel)
@@ -178,4 +210,21 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 pub async fn evict_failed_connection(addr: &str) {
     warn!("Evicting failed gRPC connection: {}", addr);
     evict_connection(addr).await;
+    TLS_GENERATION_CACHE.lock().await.remove(addr);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enforce_tls_generation_cache_bound_evicts_when_retained_entries_still_full() {
+        let mut cache = HashMap::new();
+        for i in 0..TLS_GENERATION_CACHE_MAX_SIZE {
+            cache.insert(format!("node-{i}"), 42);
+        }
+
+        enforce_tls_generation_cache_bound(&mut cache, 42, "new-node");
+        assert_eq!(cache.len(), TLS_GENERATION_CACHE_MAX_SIZE - 1);
+    }
 }
