@@ -423,10 +423,14 @@ fn split_records_payload(bytes: Vec<u8>) -> Vec<Bytes> {
     if bytes.is_empty() {
         return Vec::new();
     }
+    let bytes = Bytes::from(bytes);
     if bytes.len() <= RECORDS_CHUNK_TARGET {
-        return vec![Bytes::from(bytes)];
+        return vec![bytes];
     }
-    bytes.chunks(RECORDS_CHUNK_TARGET).map(Bytes::copy_from_slice).collect()
+    (0..bytes.len())
+        .step_by(RECORDS_CHUNK_TARGET)
+        .map(|start| bytes.slice(start..(start + RECORDS_CHUNK_TARGET).min(bytes.len())))
+        .collect()
 }
 
 #[derive(Default)]

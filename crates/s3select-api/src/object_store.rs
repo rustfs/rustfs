@@ -556,9 +556,10 @@ impl ObjectStore for EcObjectStore {
 pin_project! {
     struct ConvertStream<R> {
         inner: R,
-        delimiter: Vec<u8>,
-        carry: Vec<u8>,
-        pending: VecDeque<u8>,
+        converter: DelimiterConverter,
+        read_buf: Vec<u8>,
+        pending: Vec<u8>,
+        pending_pos: usize,
         eof: bool,
     }
 }
@@ -567,9 +568,10 @@ impl<R> ConvertStream<R> {
     fn new(inner: R, delimiter: String) -> Self {
         ConvertStream {
             inner,
-            delimiter: delimiter.as_bytes().to_vec(),
-            carry: Vec::new(),
-            pending: VecDeque::new(),
+            converter: DelimiterConverter::new(delimiter.into_bytes()),
+            read_buf: vec![0; DEFAULT_READ_BUFFER_SIZE],
+            pending: Vec::new(),
+            pending_pos: 0,
             eof: false,
         }
     }
@@ -578,50 +580,108 @@ impl<R> ConvertStream<R> {
 impl<R: AsyncRead + Unpin> AsyncRead for ConvertStream<R> {
     #[tracing::instrument(level = "debug", skip_all)]
     fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let this = self.project();
         loop {
-            if drain_pending(this.pending, buf) || *this.eof {
+            if drain_pending(this.pending, this.pending_pos, buf) || *this.eof {
                 return Poll::Ready(Ok(()));
             }
 
-            let mut input = vec![0_u8; DEFAULT_READ_BUFFER_SIZE.min(buf.remaining().max(1))];
-            let mut read_buf = ReadBuf::new(&mut input);
-            ready!(Pin::new(&mut *this.inner).poll_read(cx, &mut read_buf))?;
-            let bytes = read_buf.filled();
-            if bytes.is_empty() {
+            let read_len = DEFAULT_READ_BUFFER_SIZE.min(buf.remaining().max(1));
+            let bytes_read = {
+                let mut read_buf = ReadBuf::new(&mut this.read_buf[..read_len]);
+                ready!(Pin::new(&mut *this.inner).poll_read(cx, &mut read_buf))?;
+                read_buf.filled().len()
+            };
+            if bytes_read == 0 {
                 *this.eof = true;
-                this.pending.extend(replace_symbol(this.delimiter, this.carry).into_iter());
-                this.carry.clear();
+                *this.pending = this.converter.finish();
+                *this.pending_pos = 0;
                 continue;
             }
 
-            let mut combined = Vec::with_capacity(this.carry.len() + bytes.len());
-            combined.extend_from_slice(this.carry);
-            combined.extend_from_slice(bytes);
-
-            let keep = this.delimiter.len().saturating_sub(1).min(combined.len());
-            let process_len = combined.len() - keep;
-            this.pending
-                .extend(replace_symbol(this.delimiter, &combined[..process_len]).into_iter());
-            this.carry.clear();
-            this.carry.extend_from_slice(&combined[process_len..]);
+            *this.pending = this.converter.convert_chunk(&this.read_buf[..bytes_read]);
+            *this.pending_pos = 0;
         }
     }
 }
 
-fn drain_pending(pending: &mut VecDeque<u8>, buf: &mut ReadBuf<'_>) -> bool {
-    let mut wrote = false;
-    while buf.remaining() > 0 {
-        let Some(byte) = pending.pop_front() else {
-            break;
-        };
-        buf.put_slice(&[byte]);
-        wrote = true;
+struct DelimiterConverter {
+    delimiter: Vec<u8>,
+    carry: Vec<u8>,
+}
+
+impl DelimiterConverter {
+    fn new(delimiter: Vec<u8>) -> Self {
+        Self {
+            delimiter,
+            carry: Vec::new(),
+        }
     }
-    wrote
+
+    fn convert_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.delimiter.is_empty() {
+            return chunk.to_vec();
+        }
+
+        let mut combined = Vec::with_capacity(self.carry.len() + chunk.len());
+        combined.extend_from_slice(&self.carry);
+        combined.extend_from_slice(chunk);
+
+        let safe_end = combined.len().saturating_sub(self.delimiter.len().saturating_sub(1));
+        let mut converted = Vec::with_capacity(combined.len());
+        let mut pos = 0;
+        while pos < safe_end {
+            if combined[pos..].starts_with(&self.delimiter) {
+                converted.push(DEFAULT_DELIMITER);
+                pos += self.delimiter.len();
+            } else {
+                converted.push(combined[pos]);
+                pos += 1;
+            }
+        }
+        self.carry.clear();
+        self.carry.extend_from_slice(&combined[pos..]);
+        converted
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        if self.delimiter.is_empty() {
+            return std::mem::take(&mut self.carry);
+        }
+        let converted = replace_symbol(&self.delimiter, &self.carry);
+        self.carry.clear();
+        converted
+    }
+}
+
+fn drain_pending(pending: &mut Vec<u8>, pending_pos: &mut usize, buf: &mut ReadBuf<'_>) -> bool {
+    if *pending_pos >= pending.len() {
+        pending.clear();
+        *pending_pos = 0;
+        return false;
+    }
+    if buf.remaining() == 0 {
+        return false;
+    }
+
+    let len = buf.remaining().min(pending.len() - *pending_pos);
+    buf.put_slice(&pending[*pending_pos..*pending_pos + len]);
+    *pending_pos += len;
+    if *pending_pos >= pending.len() {
+        pending.clear();
+        *pending_pos = 0;
+    }
+    true
 }
 
 fn replace_symbol(delimiter: &[u8], slice: &[u8]) -> Vec<u8> {
+    if delimiter.is_empty() {
+        return slice.to_vec();
+    }
+
     let mut result = Vec::with_capacity(slice.len());
     let mut i = 0;
     while i < slice.len() {
@@ -643,10 +703,23 @@ where
     let Some(delimiter) = delimiter else {
         return stream.boxed();
     };
-    let delimiter = delimiter.into_bytes();
-    stream
-        .map(move |result| result.map(|bytes| Bytes::from(replace_symbol(&delimiter, &bytes))))
-        .boxed()
+    AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
+        let mut converter = DelimiterConverter::new(delimiter.into_bytes());
+        pin_mut!(stream);
+        while let Some(result) = stream.next().await {
+            let bytes = result?;
+            let converted = converter.convert_chunk(&bytes);
+            if !converted.is_empty() {
+                y.yield_ok(Bytes::from(converted)).await;
+            }
+        }
+        let converted = converter.finish();
+        if !converted.is_empty() {
+            y.yield_ok(Bytes::from(converted)).await;
+        }
+        Ok(())
+    })
+    .boxed()
 }
 
 struct ScanRangeState<S> {
@@ -715,31 +788,52 @@ where
 
 impl<S> ScanRangeState<S> {
     fn push_chunk(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            if self.record.is_empty() {
-                self.record_start = self.offset;
-            }
-            self.record.push(*byte);
-            self.offset = self.offset.saturating_add(1);
-            if self.record.ends_with(&self.delimiter) {
-                self.finish_pending_record();
-            }
+        if bytes.is_empty() || self.done {
+            return;
         }
+        if self.record.is_empty() {
+            self.record_start = self.offset;
+        }
+        let search_start = self.record.len().saturating_sub(self.delimiter.len().saturating_sub(1));
+        self.record.extend_from_slice(bytes);
+        self.offset = self.offset.saturating_add(bytes.len() as u64);
+
+        let mut search_start = search_start;
+        while let Some(pos) = find_delimiter(&self.record[search_start..], &self.delimiter) {
+            let record_end = search_start + pos + self.delimiter.len();
+            self.finish_record(record_end);
+            if self.done {
+                break;
+            }
+            search_start = 0;
+        }
+    }
+
+    fn finish_record(&mut self, record_end: usize) {
+        let record = self.record.drain(..record_end).collect::<Vec<_>>();
+        let record_start = self.record_start;
+        self.record_start = self.record_start.saturating_add(record_end as u64);
+        self.push_record(record, record_start);
     }
 
     fn finish_pending_record(&mut self) {
         if self.record.is_empty() {
             return;
         }
-        let include_header = self.include_header && self.record_start == 0;
-        let include_record = self.record_start >= self.range.start && self.record_start <= self.range.end;
+        let record = std::mem::take(&mut self.record);
+        let record_start = self.record_start;
+        self.push_record(record, record_start);
+    }
+
+    fn push_record(&mut self, record: Vec<u8>, record_start: u64) {
+        let include_header = self.include_header && record_start == 0;
+        let include_record = record_start >= self.range.start && record_start <= self.range.end;
         if include_header || include_record {
-            self.pending.push_back(Bytes::from(std::mem::take(&mut self.record)));
+            self.pending.push_back(Bytes::from(record));
         } else {
-            if self.record_start > self.range.end {
+            if record_start > self.range.end {
                 self.done = true;
             }
-            self.record.clear();
         }
     }
 }
@@ -994,6 +1088,19 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_convert_stream_replaces_delimiter_at_stream_end() {
+        let chunks = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"a&")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"&")),
+        ]);
+        let reader = StreamReader::new(chunks);
+        let mut reader = ConvertStream::new(reader, "&&".to_string());
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"a,");
+    }
+
+    #[tokio::test]
     async fn test_scan_range_stream_keeps_header_and_selected_record() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"h1,h2\n1,a\n2,b\n3,c\n"))]);
         let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 10, end: 11 }, true, 0);
@@ -1035,6 +1142,21 @@ mod test {
             output.extend_from_slice(&bytes.unwrap());
         }
         assert_eq!(output, b"2,b\n");
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_stream_handles_delimiter_split_across_chunks() {
+        let chunks = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"h1,h2\r")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"\n1,a\r\n2,b\r")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"\n3,c\r\n")),
+        ]);
+        let mut stream = scan_range_stream(chunks, b"\r\n".to_vec(), SelectScanRange { start: 12, end: 14 }, true, 0);
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"h1,h2\r\n2,b\r\n");
     }
 
     #[test]
@@ -1119,6 +1241,34 @@ mod test {
             output.extend_from_slice(&bytes.unwrap());
         }
         assert_eq!(output, b"a,1\nb,2\n");
+    }
+
+    #[tokio::test]
+    async fn test_field_delimiter_stream_converts_delimiter_split_across_chunks() {
+        let chunks = stream::iter(vec![
+            Ok::<_, object_store::Error>(Bytes::from_static(b"a&")),
+            Ok::<_, object_store::Error>(Bytes::from_static(b"&1\nb&&2\n")),
+        ]);
+        let mut stream = convert_field_delimiter_stream(chunks, Some("&&".to_string()));
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"a,1\nb,2\n");
+    }
+
+    #[tokio::test]
+    async fn test_field_delimiter_stream_converts_delimiter_at_stream_end() {
+        let chunks = stream::iter(vec![
+            Ok::<_, object_store::Error>(Bytes::from_static(b"a&")),
+            Ok::<_, object_store::Error>(Bytes::from_static(b"&")),
+        ]);
+        let mut stream = convert_field_delimiter_stream(chunks, Some("&&".to_string()));
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"a,");
     }
 
     /// A JSON array is split into one NDJSON line per element.
