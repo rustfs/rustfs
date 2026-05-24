@@ -16,6 +16,10 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode, fingerprint::TargetTlsGeneration,
+        validate::validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
@@ -26,6 +30,7 @@ use crate::{
 use async_trait::async_trait;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, prelude::Queryable};
 use rustfs_config::{MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY};
+use rustfs_tls_runtime::{load_certs, load_private_key};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
@@ -478,6 +483,11 @@ where
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     /// Lazily-initialized MySQL connection pool
     pool: Arc<Mutex<Option<Pool>>>,
+    /// TLS fingerprint tracking for hot reload (inline fallback path)
+    tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
+    /// When present, the adapter provides coordinator-managed TLS material;
+    /// otherwise the inline fingerprint path is used as a fallback.
+    tls_adapter: Option<TlsReloadAdapter<Pool>>,
     /// Success/failure counters exposed via `delivery_snapshot`
     delivery_counters: Arc<TargetDeliveryCounters>,
     /// Zero-sized marker for the event type `E`
@@ -489,6 +499,9 @@ where
     E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
 {
     /// Creates a new MySqlTarget.
+    ///
+    /// The target starts without a TLS reload coordinator. Use
+    /// `TlsReloadAdapter::try_register` to opt into coordinated TLS hot-reload.
     pub fn new(id: String, args: MySqlArgs) -> Result<Self, TargetError> {
         args.validate()?;
 
@@ -511,12 +524,18 @@ where
             store: queue_store,
             // Pool is lazily initialized on first use to avoid unnecessary connections at startup and allow for better error handling
             pool: Arc::new(Mutex::new(None)),
+            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
+            tls_adapter: None,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
     }
 
     /// Returns or lazily initializes the MySQL connection pool.
+    ///
+    /// When `tls_adapter` is present (coordinator-managed), the pool
+    /// is sourced from the coordinator's published material.
+    /// Otherwise, the inline fingerprint-based path is used as a fallback.
     ///
     /// # Errors
     ///
@@ -528,6 +547,31 @@ where
     /// | Existing table has incompatible schema | `Initialization` |
     /// | DSN parse failure / invalid config | `Configuration` |
     async fn get_or_init_pool(&self) -> Result<Pool, TargetError> {
+        // Adapter-managed path: use the material directly from the coordinator.
+        if let Some(adapter) = &self.tls_adapter {
+            let pool: Pool = (*adapter.current_material()).clone();
+
+            // Ensure the pool is also stored locally so that close() can drain it.
+            {
+                let mut guard = self.pool.lock().await;
+                *guard = Some(pool.clone());
+            }
+            return Ok(pool);
+        }
+
+        // Inline fingerprint fallback path (no coordinator).
+        let next_fingerprint =
+            super::build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
+        let tls_changed = {
+            let tls_state_guard = self.tls_state.lock();
+            tls_state_guard.needs_update(&next_fingerprint)
+        };
+        if tls_changed {
+            let mut guard = self.pool.lock().await;
+            *guard = None;
+            self.tls_state.lock().refresh(next_fingerprint);
+        }
+
         {
             let guard = self.pool.lock().await;
             if let Some(pool) = guard.as_ref() {
@@ -535,68 +579,7 @@ where
             }
         }
 
-        let dsn = MySqlDsn::parse(&self.args.dsn_string)?;
-
-        let mut builder = OptsBuilder::default()
-            .user(Some(dsn.user.clone()))
-            .pass(Some(dsn.password.clone()))
-            .ip_or_hostname(dsn.host.clone())
-            .tcp_port(dsn.port)
-            .db_name(Some(dsn.database.clone()));
-
-        if dsn.tls {
-            super::ensure_rustls_provider_installed();
-            let mut ssl_opts = SslOpts::default();
-            if !self.args.tls_ca.is_empty() {
-                ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(self.args.tls_ca.clone()).into()]);
-            }
-            if !self.args.tls_client_cert.is_empty() && !self.args.tls_client_key.is_empty() {
-                let identity = mysql_async::ClientIdentity::new(
-                    PathBuf::from(self.args.tls_client_cert.clone()).into(),
-                    PathBuf::from(self.args.tls_client_key.clone()).into(),
-                );
-                ssl_opts = ssl_opts.with_client_identity(Some(identity));
-            }
-            builder = builder.ssl_opts(Some(ssl_opts));
-        } else {
-            warn!(
-                "MySQL target '{}' is configured without TLS. This is insecure and should not be used in production.",
-                self.id
-            );
-        }
-
-        // When max_open_connections is 0, no explicit upper bound is set —
-        // mysql_async uses its default pool constraints (10–100).
-        if self.args.max_open_connections > 0 {
-            let constraints = PoolConstraints::new(1, self.args.max_open_connections).ok_or_else(|| {
-                TargetError::Configuration(format!(
-                    "MySQL max_open_connections must be >= 1, got {}",
-                    self.args.max_open_connections
-                ))
-            })?;
-            builder = builder.pool_opts(PoolOpts::default().with_constraints(constraints));
-        }
-
-        let opts = Opts::from(builder);
-        let pool = Pool::new(opts);
-
-        // Uses a double-check pattern: the mutex guard is only held for
-        // short reads/writes to the pool cache. All I/O (connecting,
-        // DDL, schema validation) happens outside the lock so that
-        // concurrent callers are not blocked by a slow MySQL server.
-        let mut conn = pool.get_conn().await.map_err(|_| TargetError::NotConnected)?;
-
-        conn.query_drop("SELECT 1").await.map_err(|_| TargetError::NotConnected)?;
-
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {} (event_time DATETIME(6) NOT NULL, event_data JSON NOT NULL)",
-            quote_table_name(&self.args.table)?
-        );
-        conn.query_drop(ddl)
-            .await
-            .map_err(|e| TargetError::Initialization(format!("Failed to create MySQL table: {e}")))?;
-
-        validate_existing_schema(&mut conn, &self.args.table).await?;
+        let pool = build_mysql_pool_from_args(&self.args).await?;
 
         // Double-check: another caller may have initialized the pool
         // while we were doing I/O.
@@ -653,10 +636,85 @@ where
             args: self.args.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             pool: Arc::clone(&self.pool),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })
     }
+}
+
+/// Builds a MySQL connection pool from the given args, including TLS setup,
+/// DDL table creation, and schema validation.
+///
+/// This is a standalone function so it can be called both from
+/// `get_or_init_pool` (inline fallback) and from `build_tls_material`
+/// (coordinator path).
+async fn build_mysql_pool_from_args(args: &MySqlArgs) -> Result<Pool, TargetError> {
+    let dsn = MySqlDsn::parse(&args.dsn_string)?;
+
+    let mut builder = OptsBuilder::default()
+        .user(Some(dsn.user.clone()))
+        .pass(Some(dsn.password.clone()))
+        .ip_or_hostname(dsn.host.clone())
+        .tcp_port(dsn.port)
+        .db_name(Some(dsn.database.clone()));
+
+    if dsn.tls {
+        super::ensure_rustls_provider_installed();
+        let mut ssl_opts = SslOpts::default();
+        if !args.tls_ca.is_empty() {
+            let _ =
+                load_certs(&args.tls_ca).map_err(|e| TargetError::Configuration(format!("Failed to load MySQL tls_ca: {e}")))?;
+            ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(args.tls_ca.clone()).into()]);
+        }
+        if !args.tls_client_cert.is_empty() && !args.tls_client_key.is_empty() {
+            let _ = load_certs(&args.tls_client_cert)
+                .map_err(|e| TargetError::Configuration(format!("Failed to load MySQL tls_client_cert: {e}")))?;
+            let _ = load_private_key(&args.tls_client_key)
+                .map_err(|e| TargetError::Configuration(format!("Failed to load MySQL tls_client_key: {e}")))?;
+            let identity = mysql_async::ClientIdentity::new(
+                PathBuf::from(args.tls_client_cert.clone()).into(),
+                PathBuf::from(args.tls_client_key.clone()).into(),
+            );
+            ssl_opts = ssl_opts.with_client_identity(Some(identity));
+        }
+        builder = builder.ssl_opts(Some(ssl_opts));
+    } else {
+        warn!("MySQL target is configured without TLS. This is insecure and should not be used in production.");
+    }
+
+    // When max_open_connections is 0, no explicit upper bound is set —
+    // mysql_async uses its default pool constraints (10–100).
+    if args.max_open_connections > 0 {
+        let constraints = PoolConstraints::new(1, args.max_open_connections).ok_or_else(|| {
+            TargetError::Configuration(format!("MySQL max_open_connections must be >= 1, got {}", args.max_open_connections))
+        })?;
+        builder = builder.pool_opts(PoolOpts::default().with_constraints(constraints));
+    }
+
+    let opts = Opts::from(builder);
+    let pool = Pool::new(opts);
+
+    // Uses a double-check pattern: the mutex guard is only held for
+    // short reads/writes to the pool cache. All I/O (connecting,
+    // DDL, schema validation) happens outside the lock so that
+    // concurrent callers are not blocked by a slow MySQL server.
+    let mut conn = pool.get_conn().await.map_err(|_| TargetError::NotConnected)?;
+
+    conn.query_drop("SELECT 1").await.map_err(|_| TargetError::NotConnected)?;
+
+    let ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {} (event_time DATETIME(6) NOT NULL, event_data JSON NOT NULL)",
+        quote_table_name(&args.table)?
+    );
+    conn.query_drop(ddl)
+        .await
+        .map_err(|e| TargetError::Initialization(format!("Failed to create MySQL table: {e}")))?;
+
+    validate_existing_schema(&mut conn, &args.table).await?;
+
+    Ok(pool)
 }
 
 /// Maps a mysql_async error to `TargetError`:
@@ -793,6 +851,8 @@ where
                 .map_err(|err| TargetError::Network(format!("Failed to disconnect MySQL pool: {err}")))?;
         }
 
+        // Adapter cleanup is done by the coordinator; no local state to reset.
+
         info!("MySQL target closed: {}", self.id);
         Ok(())
     }
@@ -825,6 +885,46 @@ where
 
     fn record_final_failure(&self) {
         self.delivery_counters.record_final_failure();
+    }
+}
+
+/// Coordinated TLS hot-reload implementation for MySQL targets.
+///
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the connection pool without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for MySqlTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Pool;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: self.args.tls_client_cert.clone(),
+            client_key_path: self.args.tls_client_key.clone(),
+            target_label: format!("mysql:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        build_mysql_pool_from_args(&self.args).await
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        let mut guard = self.pool.lock().await;
+        *guard = Some((*material).clone());
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
     }
 }
 

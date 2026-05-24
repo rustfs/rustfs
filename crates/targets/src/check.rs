@@ -64,8 +64,8 @@ pub async fn check_mqtt_broker_available_with_tls(
     use crate::target::mqtt::build_mqtt_options;
     use rumqttc::{AsyncClient, QoS};
 
-    let url = rustfs_utils::parse_url(broker_url)
-        .map_err(|e| crate::TargetError::Configuration(format!("Broker URL parsing failed: {e}")))?;
+    let url =
+        crate::parse_url(broker_url).map_err(|e| crate::TargetError::Configuration(format!("Broker URL parsing failed: {e}")))?;
     let url = url.url();
 
     // build_mqtt_options returns TargetError directly; Configuration variants propagate as-is.

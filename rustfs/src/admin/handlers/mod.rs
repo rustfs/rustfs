@@ -45,6 +45,7 @@ pub mod sts;
 pub mod system;
 mod target_descriptor;
 pub mod tier;
+pub mod tls_debug;
 pub mod trace;
 pub mod user;
 pub mod user_iam;
@@ -75,6 +76,7 @@ mod tests {
         let _metrics_handler = metrics::MetricsHandler {};
         let _profile_handler = profile_admin::ProfileHandler {};
         let _profile_status_handler = profile_admin::ProfileStatusHandler {};
+        let _tls_status_handler = tls_debug::TlsStatusHandler {};
         let _heal_handler = heal::HealHandler {};
         let _bg_heal_handler = heal::BackgroundHealStatusHandler {};
         let _replication_metrics_handler = replication::GetReplicationMetricsHandler {};
