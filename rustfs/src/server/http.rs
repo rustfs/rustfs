@@ -25,7 +25,9 @@ use crate::server::{
         BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
         ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
     },
-    tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
+    tls_material::{
+        TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
+    },
 };
 use crate::storage;
 use crate::storage::rpc::InternodeRpcService;
@@ -217,33 +219,33 @@ pub async fn start_http_server(
 
     let tls_path = config.tls_path.as_deref().map(str::trim).unwrap_or_default();
     let tls_path_configured = !tls_path.is_empty();
-    // Load TLS materials and build server acceptor.
-    // Note: outbound material (root CAs, mTLS identity) is already applied in main.rs.
-    let tls_snapshot = TlsMaterialSnapshot::load(tls_path)
-        .await
-        .map_err(|e| Error::other(e.to_string()))?;
-
-    let tls_acceptor = tls_snapshot.build_tls_acceptor(tls_path).await.map_err(|e| {
-        if tls_path_configured {
+    // Load TLS materials and build server acceptor in a single pass.
+    // Outbound material (root CAs, mTLS identity) was already published in main.rs;
+    // this load is needed for the server-side TLS acceptor and reload loop.
+    let tls_acceptor = if tls_path_configured {
+        let snapshot = load_tls_material(tls_path).await.map_err(|e| {
             Error::other(format!(
                 "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but TLS acceptor initialization failed: {}",
                 tls_path, e
             ))
-        } else {
-            Error::other(e.to_string())
-        }
-    })?;
+        })?;
+        let acceptor = build_acceptor_from_loaded(snapshot.server, std::path::Path::new(tls_path))
+            .await
+            .map_err(|e| Error::other(e.to_string()))?;
 
-    // Fail closed: if TLS was explicitly configured but no server certificates
-    // were found, refuse to start rather than silently falling back to plain HTTP.
-    let tls_acceptor = match (tls_path_configured, tls_acceptor) {
-        (true, None) => {
-            return Err(Error::other(format!(
-                "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but no server certificates were found",
-                tls_path
-            )));
+        // Fail closed: if TLS was explicitly configured but no server certificates
+        // were found, refuse to start rather than silently falling back to plain HTTP.
+        match acceptor {
+            None => {
+                return Err(Error::other(format!(
+                    "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but no server certificates were found",
+                    tls_path
+                )));
+            }
+            Some(a) => Some(a),
         }
-        (_, acceptor) => acceptor,
+    } else {
+        None
     };
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };

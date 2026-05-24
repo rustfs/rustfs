@@ -12,28 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Unified TLS Material Snapshot
+//! TLS material loading, enrichment, and acceptor construction.
 //!
-//! Provides a single loading point for all TLS materials, eliminating duplicate
-//! directory scanning and PEM parsing between outbound and inbound paths.
-//!
-//! Usage:
-//! 1. Call `TlsMaterialSnapshot::load(tls_path)` once at startup.
-//! 2. Call `snapshot.apply_outbound()` to set global root CAs and mTLS identity.
-//! 3. TLS acceptor construction is handled internally during server startup.
+//! Single-load architecture: `rustfs_tls_runtime::TlsMaterialSnapshot` loads all
+//! TLS materials (server certs + outbound CAs + mTLS identity) from disk in one
+//! pass. This module enriches the outbound material with platform-specific CAs
+//! (system roots, leaf-as-CA, mTLS env-var path overrides) and builds the server
+//! TLS acceptor directly from the pre-loaded server material — no double reads.
 
 use rustfs_common::{MtlsIdentityPem, get_global_outbound_tls_generation};
 use rustfs_config::{
     DEFAULT_SERVER_MTLS_ENABLE, DEFAULT_TLS_KEYLOG, DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL,
     DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA, ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_SERVER_MTLS_ENABLE,
     ENV_TLS_KEYLOG, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL, ENV_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_SYSTEM_CA,
-    RUSTFS_CA_CERT, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME, RUSTFS_PUBLIC_CERT,
-    RUSTFS_TLS_CERT,
+    RUSTFS_CA_CERT, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CLIENT_CERT_FILENAME, RUSTFS_CLIENT_KEY_FILENAME, RUSTFS_TLS_CERT,
 };
 use rustfs_tls_runtime::{
-    OutboundTlsMaterial as RuntimeOutboundTlsMaterial, ServerTlsMaterial as RuntimeServerTlsMaterial, TlsGeneration, TlsSource,
-    WebPkiClientVerifierOptions, build_webpki_client_verifier, create_multi_cert_resolver, publish_global_outbound_tls_state,
-    record_tls_generation, record_tls_reload_result, record_tls_reload_skipped,
+    ServerTlsMaterial as RuntimeServerTlsMaterial, TlsGeneration, TlsSource, WebPkiClientVerifierOptions,
+    build_webpki_client_verifier, create_multi_cert_resolver, publish_global_outbound_tls_state, record_tls_generation,
+    record_tls_reload_result, record_tls_reload_skipped,
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -57,209 +54,86 @@ const SYSTEM_CA_PATHS: &[&str] = &[
     "/usr/share/pki/ca-trust-legacy/ca-bundle.legacy.crt", // RHEL legacy
 ];
 
-/// Outbound TLS material for client connections (inter-node RPC).
-#[derive(Debug, Clone)]
-pub struct OutboundTlsMaterial {
-    /// Concatenated PEM-encoded root CA certificates.
-    pub root_ca_pem: Vec<u8>,
-    /// Optional mTLS client identity.
-    pub mtls_identity: Option<MtlsIdentityPem>,
-}
+// ── Public API ──
 
-/// Complete TLS material snapshot loaded once at startup.
-#[derive(Debug)]
-pub struct TlsMaterialSnapshot {
-    /// Material for outbound client connections.
-    pub outbound: OutboundTlsMaterial,
-}
-
-impl TlsMaterialSnapshot {
-    /// Load all TLS materials from the given directory.
-    ///
-    /// This is the single entry point that replaces both the old
-    /// `cert.rs::init_cert()` and `http.rs::setup_tls_acceptor()` loading logic.
-    pub async fn load(tls_path: &str) -> Result<Self, TlsMaterialError> {
-        if tls_path.is_empty() {
-            info!("No TLS path configured; skipping TLS material loading");
-            return Ok(Self::empty());
-        }
-
-        let tls_dir = PathBuf::from(tls_path);
-
-        // Load outbound material (root CAs + mTLS identity)
-        let outbound = load_outbound_material(&tls_dir).await?;
-
-        Ok(Self { outbound })
-    }
-
-    /// Apply outbound material to global state (root CAs, mTLS identity).
-    pub async fn apply_outbound(&self) {
-        let next_generation = TlsGeneration(get_global_outbound_tls_generation().saturating_add(1));
-        self.apply_outbound_with_generation(next_generation).await;
-    }
-
-    pub async fn apply_outbound_with_generation(&self, generation: TlsGeneration) {
-        let outbound = RuntimeOutboundTlsMaterial {
-            root_ca_pem: self.outbound.root_ca_pem.clone(),
-            mtls_identity: self.outbound.mtls_identity.clone(),
-        };
-        publish_global_outbound_tls_state(generation, &outbound).await;
-        record_tls_generation("rustfs_server_reload_loop", generation.0);
-        if !self.outbound.root_ca_pem.is_empty() {
-            info!("Configured custom root certificates for inter-node communication");
-        }
-    }
-
-    /// Build a `TlsAcceptorHolder` from the loaded snapshot.
-    ///
-    /// This is the single place that constructs the server `ServerConfig`,
-    /// handling both multi-cert (SNI resolver) and single-cert fallback.
-    /// Returns `None` if no TLS certificates are available.
-    pub(crate) async fn build_tls_acceptor(&self, tls_path: &str) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
-        if tls_path.is_empty() {
-            return Ok(None);
-        }
-
-        let tls_source = TlsSource::from_directory(tls_path);
-        let tls_dir = tls_source.validate_directory().map_err(map_runtime_tls_error)?.to_path_buf();
-        let runtime_snapshot = rustfs_tls_runtime::TlsMaterialSnapshot::load(&tls_source)
-            .await
-            .map_err(map_runtime_tls_error)?;
-
-        let mtls_verifier = build_webpki_client_verifier(
-            WebPkiClientVerifierOptions::builder(&tls_dir, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CA_CERT)
-                .enabled(get_env_bool(ENV_SERVER_MTLS_ENABLE, DEFAULT_SERVER_MTLS_ENABLE))
-                .build(),
-        )
-        .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
-
-        match runtime_snapshot.server {
-            Some(RuntimeServerTlsMaterial::SingleCert { certs, key }) => {
-                let config = build_server_config(ServerCertSource::SingleCert { certs, key }, mtls_verifier)?;
-                info!("Created TLS acceptor with root single certificate");
-                let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
-                Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
-            }
-            Some(RuntimeServerTlsMaterial::MultiCert { cert_key_pairs }) => {
-                let resolver = create_multi_cert_resolver(cert_key_pairs)
-                    .map_err(|e| TlsMaterialError::Parse(format!("build multi-cert resolver: {e}")))?;
-                let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
-                info!("Created TLS acceptor with SNI resolver");
-                let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
-                Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn empty() -> Self {
-        Self {
-            outbound: OutboundTlsMaterial {
-                root_ca_pem: Vec::new(),
-                mtls_identity: None,
-            },
-        }
-    }
-}
-
-fn map_runtime_tls_error(err: rustfs_tls_runtime::TlsRuntimeError) -> TlsMaterialError {
-    match &err {
-        rustfs_tls_runtime::TlsRuntimeError::Material(msg) | rustfs_tls_runtime::TlsRuntimeError::Publication(msg) => {
-            TlsMaterialError::Parse(msg.clone())
-        }
-        _ => TlsMaterialError::Io(err.to_string()),
-    }
-}
-
-// ── Server Config Construction ──
-
-/// Certificate source for building a `ServerConfig`.
-enum ServerCertSource {
-    /// Pre-built SNI resolver from multi-cert directory.
-    Resolver(Arc<dyn rustls::server::ResolvesServerCert + Send + Sync>),
-    /// Single certificate/key pair.
-    SingleCert {
-        certs: Vec<CertificateDer<'static>>,
-        key: PrivateKeyDer<'static>,
-    },
-}
-
-/// Build a `ServerConfig` with standardized ALPN, session cache, and key log settings.
+/// Load all TLS materials from the given directory in a single pass.
 ///
-/// This is the single place for `ServerConfig` construction, used by both
-/// initial startup and hot-reload.
-fn build_server_config(
-    cert_source: ServerCertSource,
-    mtls_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
-) -> Result<rustls::ServerConfig, TlsMaterialError> {
-    let mut config = match cert_source {
-        ServerCertSource::Resolver(resolver) => {
-            if let Some(verifier) = mtls_verifier {
-                rustls::ServerConfig::builder()
-                    .with_client_cert_verifier(verifier)
-                    .with_cert_resolver(resolver)
-            } else {
-                rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(resolver)
-            }
-        }
-        ServerCertSource::SingleCert { certs, key } => {
-            if let Some(verifier) = mtls_verifier {
-                rustls::ServerConfig::builder()
-                    .with_client_cert_verifier(verifier)
-                    .with_single_cert(certs, key)
-                    .map_err(|e| TlsMaterialError::Io(format!("configure single cert with mTLS: {e}")))?
-            } else {
-                rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)
-                    .map_err(|e| TlsMaterialError::Io(format!("configure single cert: {e}")))?
-            }
-        }
-    };
-
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-    config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
-
-    if tls_key_log() {
-        config.key_log = Arc::new(rustls::KeyLogFile::new());
+/// Uses `rustfs_tls_runtime::TlsMaterialSnapshot` as the single disk-read point,
+/// then enriches the outbound material with platform-specific CAs that the runtime
+/// crate does not handle (system roots, leaf-as-CA, mTLS env-var path overrides).
+///
+/// Returns the fully enriched snapshot ready for both outbound publishing and
+/// acceptor construction.
+pub async fn load_tls_material(tls_path: &str) -> Result<rustfs_tls_runtime::TlsMaterialSnapshot, TlsMaterialError> {
+    if tls_path.is_empty() {
+        return Err(TlsMaterialError::Io("TLS path is empty".into()));
     }
 
-    Ok(config)
+    let tls_source = TlsSource::from_directory(tls_path);
+    let mut snapshot = rustfs_tls_runtime::TlsMaterialSnapshot::load(&tls_source)
+        .await
+        .map_err(map_runtime_tls_error)?;
+
+    enrich_outbound(&mut snapshot.outbound, &PathBuf::from(tls_path)).await?;
+
+    Ok(snapshot)
 }
 
-/// Checks if TLS key logging is enabled.
+/// Build a TLS acceptor from pre-loaded server material.
 ///
-/// # Returns
-/// * A boolean indicating whether TLS key logging is enabled based on the `RUSTFS_TLS_KEYLOG` environment variable.
-///
-fn tls_key_log() -> bool {
-    get_env_bool(ENV_TLS_KEYLOG, DEFAULT_TLS_KEYLOG)
+/// Takes the server material already loaded by `load_tls_material` and constructs
+/// the `rustls::ServerConfig` without any additional disk reads (except the mTLS
+/// client CA verifier, which reads the client CA cert from disk).
+pub(crate) async fn build_acceptor_from_loaded(
+    server: Option<RuntimeServerTlsMaterial>,
+    tls_dir: &Path,
+) -> Result<Option<Arc<TlsAcceptorHolder>>, TlsMaterialError> {
+    let mtls_verifier = build_webpki_client_verifier(
+        WebPkiClientVerifierOptions::builder(tls_dir, RUSTFS_CLIENT_CA_CERT_FILENAME, RUSTFS_CA_CERT)
+            .enabled(get_env_bool(ENV_SERVER_MTLS_ENABLE, DEFAULT_SERVER_MTLS_ENABLE))
+            .build(),
+    )
+    .map_err(|e| TlsMaterialError::Io(format!("build mTLS verifier: {e}")))?;
+
+    match server {
+        Some(RuntimeServerTlsMaterial::SingleCert { certs, key }) => {
+            let config = build_server_config(ServerCertSource::SingleCert { certs, key }, mtls_verifier)?;
+            info!("Created TLS acceptor with root single certificate");
+            let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
+            Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
+        }
+        Some(RuntimeServerTlsMaterial::MultiCert { cert_key_pairs }) => {
+            let resolver = create_multi_cert_resolver(cert_key_pairs)
+                .map_err(|e| TlsMaterialError::Parse(format!("build multi-cert resolver: {e}")))?;
+            let config = build_server_config(ServerCertSource::Resolver(Arc::new(resolver)), mtls_verifier)?;
+            info!("Created TLS acceptor with SNI resolver");
+            let acceptor = Arc::new(TlsAcceptor::from(Arc::new(config)));
+            Ok(Some(Arc::new(TlsAcceptorHolder::new(acceptor))))
+        }
+        None => Ok(None),
+    }
 }
 
-// ── Outbound Material Loading ──
+// ── Outbound Enrichment ──
 
-/// Load root CA certificates and mTLS identity for outbound connections.
-async fn load_outbound_material(tls_dir: &Path) -> Result<OutboundTlsMaterial, TlsMaterialError> {
-    let mut root_ca_pem = Vec::new();
-
+/// Enrich the outbound TLS material with platform-specific additions that the
+/// tls-runtime crate does not handle:
+/// 1. Optional: server leaf cert as root CA (`RUSTFS_TRUST_LEAF_CERT_AS_CA`)
+/// 2. Optional: system root CAs from platform paths (`RUSTFS_TRUST_SYSTEM_CA`)
+/// 3. Optional: mTLS identity from env-var-overridden paths
+async fn enrich_outbound(outbound: &mut rustfs_tls_runtime::OutboundTlsMaterial, tls_dir: &Path) -> Result<(), TlsMaterialError> {
     // 1. Optional: load leaf certs as root CAs
     if get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA)
-        && load_cert_file_by_name(tls_dir, RUSTFS_TLS_CERT, &mut root_ca_pem).await
+        && load_cert_file_by_name(tls_dir, RUSTFS_TLS_CERT, &mut outbound.root_ca_pem).await
     {
         info!("Loaded leaf certificate(s) as root CA as per RUSTFS_TRUST_LEAF_CERT_AS_CA");
     }
 
-    // 2. Load public.crt and ca.crt
-    load_cert_file(&tls_dir.join(RUSTFS_PUBLIC_CERT), &mut root_ca_pem, "CA certificate").await;
-    load_cert_file(&tls_dir.join(RUSTFS_CA_CERT), &mut root_ca_pem, "CA certificate").await;
-
-    // 3. Optional: load system root CAs
+    // 2. Optional: load system root CAs
     if get_env_bool(ENV_TRUST_SYSTEM_CA, DEFAULT_TRUST_SYSTEM_CA) {
         let mut system_loaded = false;
         for path in SYSTEM_CA_PATHS {
-            if load_cert_file(Path::new(path), &mut root_ca_pem, "system root certificates").await {
+            if load_cert_file(Path::new(path), &mut outbound.root_ca_pem, "system root certificates").await {
                 system_loaded = true;
                 info!("Loaded system root certificates from {}", path);
                 break;
@@ -272,23 +146,31 @@ async fn load_outbound_material(tls_dir: &Path) -> Result<OutboundTlsMaterial, T
         info!("Loading system root certificates disabled via RUSTFS_TRUST_SYSTEM_CA");
     }
 
-    // 4. Load optional mTLS identity
-    let mtls_identity = load_mtls_identity(tls_dir).await?;
+    // 3. Optional: override mTLS identity from env-var paths
+    let env_cert = get_env_opt_str(ENV_MTLS_CLIENT_CERT);
+    let env_key = get_env_opt_str(ENV_MTLS_CLIENT_KEY);
+    if (env_cert.is_some() || env_key.is_some())
+        && let Some(identity) = load_mtls_identity_from_overridden_paths(env_cert.as_deref(), env_key.as_deref(), tls_dir).await?
+    {
+        outbound.mtls_identity = Some(identity);
+    }
 
-    Ok(OutboundTlsMaterial {
-        root_ca_pem,
-        mtls_identity,
-    })
+    Ok(())
 }
 
-/// Load mTLS client identity from the TLS directory.
-async fn load_mtls_identity(tls_dir: &Path) -> Result<Option<MtlsIdentityPem>, TlsMaterialError> {
-    let client_cert_path = match get_env_opt_str(ENV_MTLS_CLIENT_CERT) {
+/// Load mTLS client identity when env-var path overrides are set.
+/// If neither env var is set, returns Ok(None) (the tls-runtime already loaded
+/// identity from the default path).
+async fn load_mtls_identity_from_overridden_paths(
+    env_cert: Option<&str>,
+    env_key: Option<&str>,
+    tls_dir: &Path,
+) -> Result<Option<MtlsIdentityPem>, TlsMaterialError> {
+    let client_cert_path = match env_cert {
         Some(p) => PathBuf::from(p),
         None => tls_dir.join(RUSTFS_CLIENT_CERT_FILENAME),
     };
-
-    let client_key_path = match get_env_opt_str(ENV_MTLS_CLIENT_KEY) {
+    let client_key_path = match env_key {
         Some(p) => PathBuf::from(p),
         None => tls_dir.join(RUSTFS_CLIENT_KEY_FILENAME),
     };
@@ -308,7 +190,6 @@ async fn load_mtls_identity(tls_dir: &Path) -> Result<Option<MtlsIdentityPem>, T
         .await
         .map_err(|e| TlsMaterialError::Io(format!("read client key {client_key_path:?}: {e}")))?;
 
-    // Validate parse-ability
     let mut reader = std::io::Cursor::new(&cert_pem);
     if CertificateDer::pem_reader_iter(&mut reader).next().is_none() {
         return Err(TlsMaterialError::Parse("no valid certificate in client cert PEM".into()));
@@ -318,6 +199,17 @@ async fn load_mtls_identity(tls_dir: &Path) -> Result<Option<MtlsIdentityPem>, T
 
     info!("Loaded mTLS client identity cert={:?} key={:?}", client_cert_path, client_key_path);
     Ok(Some(MtlsIdentityPem { cert_pem, key_pem }))
+}
+
+// ── Helpers ──
+
+fn map_runtime_tls_error(err: rustfs_tls_runtime::TlsRuntimeError) -> TlsMaterialError {
+    match &err {
+        rustfs_tls_runtime::TlsRuntimeError::Material(msg) | rustfs_tls_runtime::TlsRuntimeError::Publication(msg) => {
+            TlsMaterialError::Parse(msg.clone())
+        }
+        _ => TlsMaterialError::Io(err.to_string()),
+    }
 }
 
 /// Load a single certificate file and append PEM data.
@@ -359,17 +251,16 @@ async fn load_cert_file_by_name(dir: &Path, cert_name: &str, pem_data: &mut Vec<
             if fname == cert_name && load_cert_file(&entry.path(), pem_data, "certificate").await {
                 loaded = true;
             }
-        } else if ft.is_dir() {
-            // Only check direct subdirectories (one level deep)
-            if let Ok(mut sub_rd) = tokio::fs::read_dir(&entry.path()).await {
-                while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
-                    if let Ok(sub_ft) = sub_entry.file_type().await
-                        && sub_ft.is_file()
-                    {
-                        let fname = sub_entry.file_name().to_string_lossy().to_string();
-                        if fname == cert_name && load_cert_file(&sub_entry.path(), pem_data, "certificate").await {
-                            loaded = true;
-                        }
+        } else if ft.is_dir()
+            && let Ok(mut sub_rd) = tokio::fs::read_dir(&entry.path()).await
+        {
+            while let Ok(Some(sub_entry)) = sub_rd.next_entry().await {
+                if let Ok(sub_ft) = sub_entry.file_type().await
+                    && sub_ft.is_file()
+                {
+                    let fname = sub_entry.file_name().to_string_lossy().to_string();
+                    if fname == cert_name && load_cert_file(&sub_entry.path(), pem_data, "certificate").await {
+                        loaded = true;
                     }
                 }
             }
@@ -378,12 +269,66 @@ async fn load_cert_file_by_name(dir: &Path, cert_name: &str, pem_data: &mut Vec<
     loaded
 }
 
-/// Errors that can occur during TLS material loading.
+// ── Server Config Construction ──
+
+enum ServerCertSource {
+    Resolver(Arc<dyn rustls::server::ResolvesServerCert + Send + Sync>),
+    SingleCert {
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    },
+}
+
+fn build_server_config(
+    cert_source: ServerCertSource,
+    mtls_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<rustls::ServerConfig, TlsMaterialError> {
+    let mut config = match cert_source {
+        ServerCertSource::Resolver(resolver) => {
+            if let Some(verifier) = mtls_verifier {
+                rustls::ServerConfig::builder()
+                    .with_client_cert_verifier(verifier)
+                    .with_cert_resolver(resolver)
+            } else {
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(resolver)
+            }
+        }
+        ServerCertSource::SingleCert { certs, key } => {
+            if let Some(verifier) = mtls_verifier {
+                rustls::ServerConfig::builder()
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(certs, key)
+                    .map_err(|e| TlsMaterialError::Io(format!("configure single cert with mTLS: {e}")))?
+            } else {
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .map_err(|e| TlsMaterialError::Io(format!("configure single cert: {e}")))?
+            }
+        }
+    };
+
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
+
+    if tls_key_log() {
+        config.key_log = Arc::new(rustls::KeyLogFile::new());
+    }
+
+    Ok(config)
+}
+
+fn tls_key_log() -> bool {
+    get_env_bool(ENV_TLS_KEYLOG, DEFAULT_TLS_KEYLOG)
+}
+
+// ── Errors ──
+
 #[derive(Debug)]
 pub enum TlsMaterialError {
-    /// I/O error (file read, directory access).
     Io(String),
-    /// PEM parsing error.
     Parse(String),
 }
 
@@ -400,7 +345,6 @@ impl std::error::Error for TlsMaterialError {}
 
 // ── TLS Handshake Error Classification ──
 
-/// Structured classification of TLS handshake failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TlsHandshakeFailureKind {
     UnexpectedEof,
@@ -411,7 +355,6 @@ pub(crate) enum TlsHandshakeFailureKind {
 }
 
 impl TlsHandshakeFailureKind {
-    /// Classify a TLS accept error into a structured failure kind.
     pub(crate) fn classify(err_msg: &str) -> Self {
         if err_msg.contains("unexpected EOF") || err_msg.contains("handshake eof") {
             Self::UnexpectedEof
@@ -426,7 +369,6 @@ impl TlsHandshakeFailureKind {
         }
     }
 
-    /// Metric label string for Prometheus.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::UnexpectedEof => "UNEXPECTED_EOF",
@@ -440,10 +382,6 @@ impl TlsHandshakeFailureKind {
 
 // ── TLS Acceptor Holder (for hot reload) ──
 
-/// Holds the current TLS acceptor and supports atomic swap for certificate rotation.
-///
-/// Uses `RwLock` so that multiple readers (per-connection `get()` calls)
-/// do not block each other. The write lock is held only briefly during swap.
 pub(crate) struct TlsAcceptorHolder {
     current: RwLock<Arc<TlsAcceptor>>,
 }
@@ -455,7 +393,6 @@ impl TlsAcceptorHolder {
         }
     }
 
-    /// Get the current TLS acceptor for handling a new connection.
     #[inline]
     pub(crate) fn get(&self) -> Arc<TlsAcceptor> {
         match self.current.read() {
@@ -464,7 +401,6 @@ impl TlsAcceptorHolder {
         }
     }
 
-    /// Atomically replace the TLS acceptor with a new one.
     fn swap(&self, new_holder: &TlsAcceptorHolder) {
         let new_acceptor = new_holder.get();
         match self.current.write() {
@@ -477,7 +413,11 @@ impl TlsAcceptorHolder {
     }
 }
 
+// ── Reload Loop ──
+
 /// Spawn a background task that periodically checks for TLS certificate changes.
+/// Single load per tick: loads once via tls-runtime, enriches, publishes outbound,
+/// and builds acceptor — no double reads.
 pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>) {
     let enabled = get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE);
     if !enabled {
@@ -486,22 +426,32 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
     }
 
     let interval_secs = rustfs_utils::get_env_u64(ENV_TLS_RELOAD_INTERVAL, DEFAULT_TLS_RELOAD_INTERVAL).max(5);
+    let tls_source = TlsSource::from_directory(&tls_path);
 
     info!("TLS certificate hot reload enabled, checking every {}s", interval_secs);
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        let tls_dir = PathBuf::from(&tls_path);
         loop {
             interval.tick().await;
 
-            match TlsMaterialSnapshot::load(&tls_path).await {
-                Ok(snapshot) => {
-                    // Derive generation from the global counter on each tick so it
-                    // stays monotonic even if other code paths publish outbound TLS.
-                    let generation = get_global_outbound_tls_generation().saturating_add(1);
-                    snapshot.apply_outbound_with_generation(TlsGeneration(generation)).await;
+            match rustfs_tls_runtime::TlsMaterialSnapshot::load(&tls_source).await {
+                Ok(mut snapshot) => {
+                    if let Err(e) = enrich_outbound(&mut snapshot.outbound, &tls_dir).await {
+                        record_tls_reload_result("rustfs_server_reload_loop", "enrich_err", None, None);
+                        warn!("TLS outbound enrichment failed (will retry): {}", e);
+                        continue;
+                    }
 
-                    match snapshot.build_tls_acceptor(&tls_path).await {
+                    let generation = get_global_outbound_tls_generation().saturating_add(1);
+                    publish_global_outbound_tls_state(TlsGeneration(generation), &snapshot.outbound).await;
+                    record_tls_generation("rustfs_server_reload_loop", generation);
+                    if !snapshot.outbound.root_ca_pem.is_empty() {
+                        info!("Configured custom root certificates for inter-node communication");
+                    }
+
+                    match build_acceptor_from_loaded(snapshot.server, &tls_dir).await {
                         Ok(Some(new_holder)) => {
                             info!("TLS certificates reloaded successfully");
                             holder.swap(&new_holder);
@@ -550,16 +500,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_tls_acceptor_accepts_root_single_cert_with_trailing_slash() {
+    async fn build_acceptor_accepts_root_single_cert_with_trailing_slash() {
         ensure_rustls_crypto_provider();
         let temp_dir = TempDir::new().unwrap();
         write_test_cert_pair(temp_dir.path(), "localhost");
 
-        let snapshot = TlsMaterialSnapshot::load(&format!("{}/", temp_dir.path().display()))
+        let snapshot = load_tls_material(&format!("{}/", temp_dir.path().display()))
             .await
             .expect("TLS material load should succeed");
-        let acceptor = snapshot
-            .build_tls_acceptor(&format!("{}/", temp_dir.path().display()))
+        let acceptor = build_acceptor_from_loaded(snapshot.server, temp_dir.path())
             .await
             .expect("root single-cert TLS acceptor should build");
 
@@ -567,7 +516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_tls_acceptor_accepts_symlinked_root_single_cert_directory() {
+    async fn build_acceptor_accepts_symlinked_root_single_cert_directory() {
         ensure_rustls_crypto_provider();
         let temp_dir = TempDir::new().unwrap();
         let real_dir = temp_dir.path().join("tls-real");
@@ -580,11 +529,10 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&real_dir, &symlink_dir).unwrap();
 
-        let snapshot = TlsMaterialSnapshot::load(symlink_dir.to_str().unwrap())
+        let snapshot = load_tls_material(symlink_dir.to_str().unwrap())
             .await
             .expect("TLS material load through symlink should succeed");
-        let acceptor = snapshot
-            .build_tls_acceptor(symlink_dir.to_str().unwrap())
+        let acceptor = build_acceptor_from_loaded(snapshot.server, &symlink_dir)
             .await
             .expect("TLS acceptor should build through symlink");
 
@@ -592,61 +540,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_tls_acceptor_rejects_missing_tls_directory() {
+    async fn build_acceptor_rejects_missing_tls_directory() {
         let temp_dir = TempDir::new().unwrap();
         let missing_dir = temp_dir.path().join("missing");
-        let snapshot = TlsMaterialSnapshot::empty();
 
-        let err = match snapshot.build_tls_acceptor(missing_dir.to_str().unwrap()).await {
-            Ok(_) => panic!("missing TLS directory should fail"),
-            Err(err) => err,
-        };
+        let err = load_tls_material(missing_dir.to_str().unwrap())
+            .await
+            .expect_err("missing TLS directory should fail");
 
         assert!(err.to_string().contains("TLS directory does not exist"));
     }
 
     #[tokio::test]
-    async fn build_tls_acceptor_rejects_tls_path_that_is_not_directory() {
+    async fn build_acceptor_rejects_tls_path_that_is_not_directory() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("tls-file");
         fs::write(&file_path, "not-a-directory").unwrap();
-        let snapshot = TlsMaterialSnapshot::empty();
 
-        let err = match snapshot.build_tls_acceptor(file_path.to_str().unwrap()).await {
-            Ok(_) => panic!("regular file TLS path should fail"),
-            Err(err) => err,
-        };
+        let err = load_tls_material(file_path.to_str().unwrap())
+            .await
+            .expect_err("regular file TLS path should fail");
 
         assert!(err.to_string().contains("TLS path is not a directory"));
     }
 
     #[tokio::test]
-    async fn build_tls_acceptor_returns_none_for_empty_tls_directory() {
+    async fn build_acceptor_returns_none_for_empty_tls_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let snapshot = TlsMaterialSnapshot::load(temp_dir.path().to_str().unwrap())
+        let snapshot = load_tls_material(temp_dir.path().to_str().unwrap())
             .await
-            .expect("outbound TLS load for empty dir should succeed");
+            .expect("TLS material load for empty dir should succeed");
 
-        let acceptor = snapshot
-            .build_tls_acceptor(temp_dir.path().to_str().unwrap())
+        let acceptor = build_acceptor_from_loaded(snapshot.server, temp_dir.path())
             .await
             .expect("empty TLS directory should be treated as no acceptor");
         assert!(acceptor.is_none());
     }
 
     #[tokio::test]
-    async fn build_tls_acceptor_still_supports_multi_cert_directories() {
+    async fn build_acceptor_still_supports_multi_cert_directories() {
         ensure_rustls_crypto_provider();
         let temp_dir = TempDir::new().unwrap();
         let domain_dir = temp_dir.path().join("example.com");
         fs::create_dir(&domain_dir).unwrap();
         write_test_cert_pair(&domain_dir, "example.com");
 
-        let snapshot = TlsMaterialSnapshot::load(temp_dir.path().to_str().unwrap())
+        let snapshot = load_tls_material(temp_dir.path().to_str().unwrap())
             .await
             .expect("TLS material load for multi-cert dir should succeed");
-        let acceptor = snapshot
-            .build_tls_acceptor(temp_dir.path().to_str().unwrap())
+        let acceptor = build_acceptor_from_loaded(snapshot.server, temp_dir.path())
             .await
             .expect("multi-cert TLS acceptor should build");
 
@@ -654,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_tls_acceptor_prefers_multi_cert_when_root_and_domain_pairs_both_exist() {
+    async fn build_acceptor_prefers_multi_cert_when_root_and_domain_pairs_both_exist() {
         ensure_rustls_crypto_provider();
         let temp_dir = TempDir::new().unwrap();
         write_test_cert_pair(temp_dir.path(), "default.local");
@@ -663,11 +605,10 @@ mod tests {
         fs::create_dir(&domain_dir).unwrap();
         write_test_cert_pair(&domain_dir, "example.com");
 
-        let snapshot = TlsMaterialSnapshot::load(temp_dir.path().to_str().unwrap())
+        let snapshot = load_tls_material(temp_dir.path().to_str().unwrap())
             .await
             .expect("TLS material load for mixed root/domain layout should succeed");
-        let acceptor = snapshot
-            .build_tls_acceptor(temp_dir.path().to_str().unwrap())
+        let acceptor = build_acceptor_from_loaded(snapshot.server, temp_dir.path())
             .await
             .expect("multi-cert TLS acceptor should still build when root pair also exists");
 
