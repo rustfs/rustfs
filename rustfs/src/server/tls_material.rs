@@ -33,7 +33,7 @@ use rustfs_config::{
 use rustfs_tls_runtime::{
     OutboundTlsMaterial as RuntimeOutboundTlsMaterial, ServerTlsMaterial as RuntimeServerTlsMaterial, TlsGeneration, TlsSource,
     WebPkiClientVerifierOptions, build_webpki_client_verifier, create_multi_cert_resolver, publish_global_outbound_tls_state,
-    record_tls_generation, record_tls_publication_fail, record_tls_reload_result, record_tls_reload_skipped,
+    record_tls_generation, record_tls_reload_result, record_tls_reload_skipped,
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -512,13 +512,13 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                             warn!("TLS reload returned no acceptor despite configured TLS path; keeping previous acceptor")
                         }
                         Err(e) => {
-                            record_tls_publication_fail("rustfs_server_reload_loop");
+                            record_tls_reload_result("rustfs_server_reload_loop", "acceptor_err", None, Some(generation));
                             warn!("TLS certificate reload failed (will retry): {}", e)
                         }
                     }
                 }
                 Err(e) => {
-                    record_tls_publication_fail("rustfs_server_reload_loop");
+                    record_tls_reload_result("rustfs_server_reload_loop", "load_err", None, None);
                     warn!("TLS material reload failed (will retry): {}", e);
                 }
             }

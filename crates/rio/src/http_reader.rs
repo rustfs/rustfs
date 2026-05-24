@@ -86,7 +86,7 @@ async fn build_http_client(disable_proxy: bool, outbound_tls: &rustfs_tls_runtim
                 warn!("Failed to parse published outbound root CA PEM; falling back to default trust roots: {err}");
             }
         }
-    } else if let Some(tp) = get_env_opt_str("RUSTFS_TLS_PATH").and_then(|s| {
+    } else if let Some(tp) = get_env_opt_str(rustfs_config::ENV_RUSTFS_TLS_PATH).and_then(|s| {
         if s.is_empty() {
             None
         } else {

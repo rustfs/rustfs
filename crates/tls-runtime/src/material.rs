@@ -154,15 +154,11 @@ fn path_to_utf8_str<'a>(path: &'a Path, description: &str) -> Result<&'a str, Tl
 fn combine_optional_pem(primary: Option<&[u8]>, fallback: Option<&[u8]>) -> Vec<u8> {
     let mut combined = Vec::new();
 
-    if let Some(primary) = primary {
-        combined.extend_from_slice(primary);
-        if !combined.ends_with(b"\n") {
-            combined.push(b'\n');
+    for pem in [primary, fallback].into_iter().flatten() {
+        if pem.iter().all(|&b| b.is_ascii_whitespace()) {
+            continue;
         }
-    }
-
-    if let Some(fallback) = fallback {
-        combined.extend_from_slice(fallback);
+        combined.extend_from_slice(pem);
         if !combined.ends_with(b"\n") {
             combined.push(b'\n');
         }
