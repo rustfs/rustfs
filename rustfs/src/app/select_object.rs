@@ -9,7 +9,7 @@ use datafusion::arrow::{
     record_batch::RecordBatch,
 };
 use futures::StreamExt;
-use http::header::RANGE;
+use http::{StatusCode, header::RANGE};
 use rustfs_ecstore::store_api::ObjectOperations;
 use rustfs_s3select_api::{
     QueryError,
@@ -26,6 +26,8 @@ use tracing::info;
 
 const MAX_SELECT_EXPRESSION_BYTES: usize = 256 * 1024;
 const RECORDS_CHUNK_TARGET: usize = 128 * 1024;
+const PARSE_SELECT_FAILURE_CODE: &str = "ParseSelectFailure";
+const EMPTY_SELECT_EXPRESSION_MESSAGE: &str = "empty SQL expression";
 
 #[derive(Clone, Debug)]
 struct SelectValidation {
@@ -145,6 +147,9 @@ fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectCo
     validate_scan_range(&input.request)?;
 
     let output_format = normalize_output_serialization(&mut input.request.output_serialization)?;
+    if input.request.expression.trim().is_empty() {
+        return Err(parse_select_failure(EMPTY_SELECT_EXPRESSION_MESSAGE));
+    }
     let progress_enabled = input
         .request
         .request_progress
@@ -259,6 +264,12 @@ fn validate_scan_range_for_object_size(request: &SelectObjectContentRequest, obj
 
 fn invalid_scan_range_error() -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidRequestParameter, INVALID_SCAN_RANGE_MESSAGE.to_string())
+}
+
+fn parse_select_failure(message: impl Into<String>) -> S3Error {
+    let mut err = S3Error::with_message(S3ErrorCode::Custom(PARSE_SELECT_FAILURE_CODE.into()), message.into());
+    err.set_status_code(StatusCode::BAD_REQUEST);
+    err
 }
 
 fn validate_single_byte(value: Option<&str>, code: S3ErrorCode) -> S3Result<()> {
@@ -452,7 +463,7 @@ fn clamp_i64(value: u64) -> i64 {
 fn map_query_error_to_s3(err: QueryError) -> S3Error {
     let message = err.to_string();
     match err {
-        QueryError::Parser { .. } => S3Error::with_message(S3ErrorCode::UnsupportedSyntax, message),
+        QueryError::Parser { .. } => parse_select_failure(message),
         QueryError::MultiStatement { .. } => S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message),
         QueryError::NotImplemented { .. } => S3Error::with_message(S3ErrorCode::NotImplemented, message),
         QueryError::Datafusion { .. } if looks_like_invalid_scan_range(&message) => {
@@ -511,6 +522,7 @@ fn is_json_document(json: &JSONInput) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::sql::sqlparser::parser::ParserError;
     use http::HeaderMap;
 
     fn base_input() -> SelectObjectContentInput {
@@ -547,6 +559,29 @@ mod tests {
         headers.insert(RANGE, "bytes=0-1".parse().unwrap());
         let err = validate_select_request(&headers, &mut input).unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::UnsupportedRangeHeader);
+    }
+
+    #[test]
+    fn validate_rejects_empty_select_expression_as_parse_failure() {
+        for expression in ["", " \t\n"] {
+            let mut input = base_input();
+            input.request.expression = expression.to_string();
+
+            let err = validate_select_request(&HeaderMap::new(), &mut input).unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::Custom("ParseSelectFailure".into()));
+            assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        }
+    }
+
+    #[test]
+    fn map_parser_error_to_parse_select_failure() {
+        let err = map_query_error_to_s3(QueryError::Parser {
+            source: ParserError::ParserError("syntax error".to_string()),
+        });
+
+        assert_eq!(err.code(), &S3ErrorCode::Custom("ParseSelectFailure".into()));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(err.message(), Some("sql parser error: syntax error"));
     }
 
     #[test]
