@@ -143,7 +143,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 tokio-stream = { version = "0.1.18" }
 tokio-test = "0.4.5"
 tokio-util = { version = "0.7.18", features = ["io", "compat"] }
-tonic = { version = "0.14.6", features = ["gzip"] }
+tonic = { version = "0.14.6", features = ["gzip", "deflate"] }
 tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3", features = ["timeout"] }

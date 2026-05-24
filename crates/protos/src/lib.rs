@@ -145,11 +145,6 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         }
     }
     if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
-        if outbound_tls.root_ca_pem.is_none() {
-            debug!("No custom root certificate configured; using system roots for TLS: {}", addr);
-            // If no custom root cert is configured, try to use system roots.
-            connector = connector.tls_config(ClientTlsConfig::new())?;
-        }
         if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
             let ca = Certificate::from_pem(cert_pem);
             // Derive the hostname from the HTTPS URL for TLS hostname verification.
@@ -175,9 +170,10 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
             connector = connector.tls_config(tls)?;
             debug!("Configured TLS with custom root certificate for: {}", addr);
         } else {
-            return Err(std::io::Error::other(
-                "HTTPS requested but no trusted roots are configured. Provide tls/ca.crt (or enable system roots via RUSTFS_TRUST_SYSTEM_CA=true)."
-            ).into());
+            // No custom root CA published — fall back to system roots.
+            // This is the expected path when no TLS path is configured.
+            debug!("No custom root certificate configured; using system roots for TLS: {}", addr);
+            connector = connector.tls_config(ClientTlsConfig::new())?;
         }
     }
 

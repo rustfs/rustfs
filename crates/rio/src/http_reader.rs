@@ -22,7 +22,10 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
     INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
-use rustfs_tls_runtime::{load_cert_bundle_der_bytes, load_global_outbound_tls_state, record_tls_consumer_stale_generation};
+use rustfs_tls_runtime::{
+    load_cert_bundle_der_bytes, load_global_outbound_tls_generation, load_global_outbound_tls_state,
+    record_tls_consumer_stale_generation,
+};
 use rustfs_utils::get_env_opt_str;
 use rustls_pki_types::pem::PemObject;
 use std::io::IoSlice;
@@ -141,8 +144,10 @@ async fn get_http_client(url: &str) -> Client {
     // Reuse HTTP connection pools while keeping loopback traffic away from
     // system proxies so local RPC/tests do not leak to proxy listeners.
     let disable_proxy = should_bypass_proxy_for_url(url);
-    let outbound_tls = load_global_outbound_tls_state().await;
-    let generation = outbound_tls.generation.0;
+
+    // Fast path: check generation first (cheap atomic read) to avoid cloning
+    // the full PEM + identity bytes when the TLS state hasn't changed.
+    let generation = load_global_outbound_tls_generation().0;
 
     let guard = CLIENT_CACHE.lock().await;
     if let Some(cached) = guard.as_ref() {
@@ -156,6 +161,9 @@ async fn get_http_client(url: &str) -> Client {
         record_tls_consumer_stale_generation("rio_http_reader");
     }
     drop(guard);
+
+    // Cache miss or stale generation — load full outbound TLS state.
+    let outbound_tls = load_global_outbound_tls_state().await;
 
     let client = build_http_client(false, &outbound_tls).await;
     let local_client = build_http_client(true, &outbound_tls).await;
