@@ -340,6 +340,9 @@ impl ECStore {
                 ..Default::default()
             });
 
+        // err=None means gather_results filled its limit → disk has more data
+        let disk_has_more = list_result.err.is_none();
+
         if let Some(err) = list_result.err.take()
             && err != rustfs_filemeta::Error::Unexpected
         {
@@ -371,7 +374,7 @@ impl ECStore {
             get_objects.truncate(max_keys as usize);
         }
 
-        let next_marker = {
+        let mut next_marker = {
             if is_truncated {
                 get_objects.last().map(|last| last.name.clone())
             } else {
@@ -395,6 +398,27 @@ impl ECStore {
                 }
             } else {
                 objects.push(obj);
+            }
+        }
+
+        // After delimiter collapse, re-evaluate is_truncated based on visible results.
+        // No delimiter: reduction is from skipped entries → disk_has_more && non-empty.
+        // With delimiter: reduction may be from collapse → only when visible >= max_keys.
+        if !is_truncated && disk_has_more {
+            let visible_count = objects.len() + prefixes.len();
+            let should_truncate = if delimiter.is_none() {
+                visible_count > 0
+            } else {
+                visible_count >= max_keys as usize
+            };
+            if should_truncate {
+                is_truncated = true;
+                // Compute next_marker from visible results since get_objects was consumed.
+                // Prefer last object name; fall back to last prefix for marker.
+                next_marker = objects
+                    .last()
+                    .map(|last| last.name.clone())
+                    .or_else(|| prefixes.last().cloned());
             }
         }
 
@@ -453,6 +477,9 @@ impl ECStore {
                 ..Default::default()
             });
 
+        // err=None means gather_results filled its limit → disk has more data
+        let disk_has_more = list_result.err.is_none();
+
         if let Some(err) = list_result.err.take()
             && err != rustfs_filemeta::Error::Unexpected
         {
@@ -483,22 +510,13 @@ impl ECStore {
             get_objects.truncate(max_keys as usize);
         }
 
-        let (next_marker, next_version_idmarker) = {
-            if is_truncated {
-                get_objects
-                    .last()
-                    .map(|last| {
-                        (
-                            Some(last.name.clone()),
-                            // AWS S3 API returns "null" for non-versioned objects
-                            Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
-                        )
-                    })
-                    .unwrap_or_default()
-            } else {
-                (None, None)
-            }
-        };
+        let mut next_marker: Option<String> = None;
+        let mut next_version_idmarker: Option<String> = None;
+        if is_truncated && let Some(last) = get_objects.last() {
+            next_marker = Some(last.name.clone());
+            // AWS S3 API returns "null" for non-versioned objects
+            next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
+        }
 
         let mut prefixes: Vec<String> = Vec::new();
         let mut prefix_set: HashSet<String> = HashSet::new();
@@ -516,6 +534,30 @@ impl ECStore {
                 }
             } else {
                 objects.push(obj);
+            }
+        }
+
+        // After delimiter collapse, re-evaluate is_truncated based on visible results.
+        // Two distinct scenarios (see list_objects_generic for detailed rationale):
+        // 1. No delimiter: reduction from skipped entries → disk_has_more && non-empty
+        // 2. With delimiter: reduction from collapse → only when visible >= max_keys
+        if !is_truncated && disk_has_more {
+            let visible_count = objects.len() + prefixes.len();
+            let should_truncate = if delimiter.is_none() {
+                visible_count > 0
+            } else {
+                visible_count >= max_keys as usize
+            };
+            if should_truncate {
+                is_truncated = true;
+                // Compute markers from visible results since get_objects was consumed.
+                if let Some(last) = objects.last() {
+                    next_marker = Some(last.name.clone());
+                    next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
+                } else if let Some(last_prefix) = prefixes.last().cloned() {
+                    next_marker = Some(last_prefix);
+                    next_version_idmarker = None;
+                }
             }
         }
 
