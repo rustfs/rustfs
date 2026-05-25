@@ -402,19 +402,24 @@ impl ECStore {
         }
 
         // After delimiter collapse, re-evaluate is_truncated based on visible results.
-        // Multiple raw entries may collapse into one CommonPrefix, so the original
-        // get_objects-based truncation can be inaccurate.
-        // Only set is_truncated when visible results reached max_keys — if they
-        // didn't, there are genuinely no more visible results even though the disk
-        // had more raw entries (they all collapsed into already-seen prefixes).
-        if !is_truncated && disk_has_more && (objects.len() + prefixes.len() >= max_keys as usize) {
-            is_truncated = true;
-            // Compute next_marker from visible results since get_objects was consumed.
-            // Prefer last object name; fall back to last prefix for marker.
-            next_marker = objects
-                .last()
-                .map(|last| last.name.clone())
-                .or_else(|| prefixes.last().cloned());
+        // No delimiter: reduction is from skipped entries → disk_has_more && non-empty.
+        // With delimiter: reduction may be from collapse → only when visible >= max_keys.
+        if !is_truncated && disk_has_more {
+            let visible_count = objects.len() + prefixes.len();
+            let should_truncate = if delimiter.is_none() {
+                visible_count > 0
+            } else {
+                visible_count >= max_keys as usize
+            };
+            if should_truncate {
+                is_truncated = true;
+                // Compute next_marker from visible results since get_objects was consumed.
+                // Prefer last object name; fall back to last prefix for marker.
+                next_marker = objects
+                    .last()
+                    .map(|last| last.name.clone())
+                    .or_else(|| prefixes.last().cloned());
+            }
         }
 
         Ok(ListObjectsInfo {
@@ -533,20 +538,26 @@ impl ECStore {
         }
 
         // After delimiter collapse, re-evaluate is_truncated based on visible results.
-        // Multiple raw entries may collapse into one CommonPrefix, so the original
-        // get_objects-based truncation can be inaccurate.
-        // Only set is_truncated when visible results reached max_keys — if they
-        // didn't, there are genuinely no more visible results even though the disk
-        // had more raw entries (they all collapsed into already-seen prefixes).
-        if !is_truncated && disk_has_more && (objects.len() + prefixes.len() >= max_keys as usize) {
-            is_truncated = true;
-            // Compute markers from visible results since get_objects was consumed.
-            if let Some(last) = objects.last() {
-                next_marker = Some(last.name.clone());
-                next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-            } else if let Some(last_prefix) = prefixes.last().cloned() {
-                next_marker = Some(last_prefix);
-                next_version_idmarker = None;
+        // Two distinct scenarios (see list_objects_generic for detailed rationale):
+        // 1. No delimiter: reduction from skipped entries → disk_has_more && non-empty
+        // 2. With delimiter: reduction from collapse → only when visible >= max_keys
+        if !is_truncated && disk_has_more {
+            let visible_count = objects.len() + prefixes.len();
+            let should_truncate = if delimiter.is_none() {
+                visible_count > 0
+            } else {
+                visible_count >= max_keys as usize
+            };
+            if should_truncate {
+                is_truncated = true;
+                // Compute markers from visible results since get_objects was consumed.
+                if let Some(last) = objects.last() {
+                    next_marker = Some(last.name.clone());
+                    next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
+                } else if let Some(last_prefix) = prefixes.last().cloned() {
+                    next_marker = Some(last_prefix);
+                    next_version_idmarker = None;
+                }
             }
         }
 
