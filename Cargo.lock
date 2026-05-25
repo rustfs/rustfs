@@ -178,9 +178,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "amq-protocol"
-version = "10.3.2"
+version = "10.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46b92ce9a8b7d332c4b54ef7ea1b00570692bd94fe225901eab63bd12930c63f"
+checksum = "81833d7f9d250dda1ca55020d6dad20f5a242ad917dd6edd7c21f626424653a5"
 dependencies = [
  "amq-protocol-tcp",
  "amq-protocol-types",
@@ -192,9 +192,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-tcp"
-version = "10.3.2"
+version = "10.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06f3177d5d2aff2ec51e1d77ac433fcd1b297ea2bb97c2089152a7d2a58a7e3f"
+checksum = "889012b5e973bffd57bd668a9b184c2713754024ff1719164788e61ecb4450b5"
 dependencies = [
  "amq-protocol-uri",
  "async-rs",
@@ -205,9 +205,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-types"
-version = "10.3.2"
+version = "10.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b9f2a0015cd0471a2b823060f3424760a7a84787ee89edd1039ca8d715f6de0"
+checksum = "356da5abbf8f1ad806d6eb77161ad2c878d892d74f756021c5002973303abb05"
 dependencies = [
  "cookie-factory",
  "nom 8.0.0",
@@ -217,9 +217,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-uri"
-version = "10.3.2"
+version = "10.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f66f887c5445e087e811794d7e5d071145c81e83568f77529e2f1203b68202"
+checksum = "e6c4982c5c729761a6e9c1464c2da53094c07e9cf45aa3daceb2620e17b1fce9"
 dependencies = [
  "amq-protocol-types",
  "percent-encoding",
@@ -761,9 +761,9 @@ dependencies = [
 
 [[package]]
 name = "async-rs"
-version = "0.8.8"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d096d3e7d6c2cd3ff2bebba9273fef6e0c129ee04ec6c16a8023c19958b2cc90"
+checksum = "3cd5147201b63ba6883ffabca3a153822f71541748d7108e3e799beaeb283131"
 dependencies = [
  "async-compat",
  "async-global-executor",
@@ -5682,16 +5682,16 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "lapin"
-version = "4.7.4"
+version = "4.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f296d806dbacc044135c9686a0d3e78b5122907d4d6604c72a825316139e9f2d"
+checksum = "0fd20e01fd92597ca352ca7ceed3c589851ebad279dfcada48aa4d24fd3a7caa"
 dependencies = [
  "amq-protocol",
  "async-rs",
  "async-trait",
- "atomic-waker",
  "backon",
  "cfg-if",
+ "event-listener",
  "flume",
  "futures-core",
  "futures-io",
@@ -6384,9 +6384,9 @@ dependencies = [
 
 [[package]]
 name = "mqttbytes-core-next"
-version = "0.33.1"
+version = "0.33.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "199b7cddf2d1bba6248d9dbaf1e58c91cd3ab05f52559b566c9d75ff303f887b"
+checksum = "6d9e8f1593f6a8affb39a2df042cc28df033ba18907858cde71993e5780d29a3"
 dependencies = [
  "bytes",
  "thiserror 2.0.18",
@@ -6812,7 +6812,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.0",
@@ -8957,9 +8957,9 @@ dependencies = [
 
 [[package]]
 name = "rumqttc-core-next"
-version = "0.33.1"
+version = "0.33.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "660f3b3e2dc9e138e53c4db7f0ec42fe3386c751ccdff2fbd1d075a4149254cd"
+checksum = "eaa975ffc1af5aac70a0e139491a1fc553ab48f378f909dad5d43fd4b2ad28db"
 dependencies = [
  "async-tungstenite",
  "futures-io",
@@ -8975,18 +8975,18 @@ dependencies = [
 
 [[package]]
 name = "rumqttc-next"
-version = "0.33.1"
+version = "0.33.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e101c834b5ad0c5c82c5bcc7ac0b0dca70baba92fe7b903f441b87bef1f45387"
+checksum = "df63fbd71ba5830b5bd0952ae37761e3af64aeae8f6213eb6d31d6e72a16d71e"
 dependencies = [
  "rumqttc-v5-next",
 ]
 
 [[package]]
 name = "rumqttc-v5-next"
-version = "0.33.1"
+version = "0.33.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d965c65b95e12ed1cb564c2fa5fd70e3f3885b812f7429de6e5ff22f090e27f1"
+checksum = "6417b354aa28ad72b271e6a5cea7fdb1594d18cb040ebed35fa87bb683cf364f"
 dependencies = [
  "async-tungstenite",
  "bytes",
@@ -9402,9 +9402,11 @@ name = "rustfs-credentials"
 version = "1.0.0-beta.4"
 dependencies = [
  "base64-simd",
+ "hmac 0.13.0",
  "rand 0.10.1",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "time",
 ]
 
@@ -9608,7 +9610,6 @@ dependencies = [
  "moka",
  "openidconnect",
  "pollster",
- "rand 0.10.1",
  "reqwest",
  "rustfs-config",
  "rustfs-credentials",
@@ -10359,9 +10360,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-connector"
-version = "0.23.3"
+version = "0.23.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1869b2b1c5adf03c1025b23d8c23c36903a6bdd40a92332bfd8f309db5a460a1"
+checksum = "b7664e32b0ffbec386bdf1d7cbca51a89551a90d3278f135186cd6cb3cfa889c"
 dependencies = [
  "futures-io",
  "futures-rustls",
@@ -11519,9 +11520,9 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tcp-stream"
-version = "0.34.11"
+version = "0.34.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04a6c48788336a4223ddc6e4d4f2d623f4e5865058c0999d1502a8994816ec4f"
+checksum = "300d0735de48a565461c2ea14cc75b80ee5b6be3b4f5aeabe3553e4c2df8d23d"
 dependencies = [
  "async-rs",
  "cfg-if",

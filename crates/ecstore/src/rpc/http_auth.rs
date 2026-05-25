@@ -72,7 +72,7 @@ fn signature_payload(url: &str, method: &Method, timestamp: i64) -> String {
 /// Generate HMAC-SHA256 signature for the given data
 fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) -> String {
     let data = signature_payload(url, method, timestamp);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
     general_purpose::STANDARD.encode(result.into_bytes())
@@ -84,7 +84,7 @@ fn verify_signature(secret: &str, url: &str, method: &Method, timestamp: i64, si
     };
 
     let data = signature_payload(url, method, timestamp);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     mac.verify_slice(&signature).is_ok()
 }
