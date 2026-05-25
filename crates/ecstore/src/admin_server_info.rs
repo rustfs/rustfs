@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::{
     disk::endpoint::Endpoint,
-    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints},
+    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints, get_global_deployment_id},
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     store_api::StorageAPI,
@@ -291,7 +291,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         domain: None,
         region: None,
         sqs_arn: None,
-        deployment_id: None,
+        deployment_id: get_global_deployment_id(),
         buckets: Some(buckets),
         objects: Some(objects),
         versions: Some(versions),
@@ -392,4 +392,27 @@ pub fn get_commit_id() -> String {
     };
 
     format!("{}@{}", build::COMMIT_DATE_3339, ver)
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use crate::global::{get_global_deployment_id, set_global_deployment_id};
+
+    use super::get_server_info;
+
+    #[tokio::test]
+    async fn server_info_includes_global_deployment_id() {
+        let expected_deployment_id = get_global_deployment_id().unwrap_or_else(|| {
+            let deployment_id = Uuid::from_u128(0x12345678123456781234567812345678);
+            let deployment_id_string = deployment_id.to_string();
+            set_global_deployment_id(deployment_id);
+            deployment_id_string
+        });
+
+        let info = get_server_info(false).await;
+
+        assert_eq!(info.deployment_id.as_deref(), Some(expected_deployment_id.as_str()));
+    }
 }
