@@ -72,6 +72,7 @@ pub use global::*;
 pub use metrics::schema::*;
 pub use metrics::{init_metrics_collectors, init_metrics_runtime};
 pub use telemetry::{OtelGuard, Recorder};
+pub use global::get_global_metrics_recorder;
 
 // Dial9 Tokio runtime telemetry
 // Re-export dial9 types at crate root level for easier access

@@ -125,6 +125,7 @@ pub struct Recorder {
     cached_counters: Arc<RwLock<HashMap<Key, Counter>>>,
     cached_gauges: Arc<RwLock<HashMap<Key, Gauge>>>,
     cached_histograms: Arc<RwLock<HashMap<Key, Histogram>>>,
+    metric_snapshots: Arc<RwLock<HashMap<Key, MetricSnapshot>>>,
 }
 
 impl Recorder {
@@ -144,6 +145,7 @@ impl Recorder {
             cached_counters: Default::default(),
             cached_gauges: Default::default(),
             cached_histograms: Default::default(),
+            metric_snapshots: Default::default(),
         }
     }
 
@@ -194,6 +196,152 @@ impl Recorder {
     fn get_metadata_for_builder(&self, key_name: &str) -> Option<MetricMetadata> {
         self.with_metadata_lock(|metadata| metadata.remove(key_name))
     }
+
+    fn snapshot_write_lock(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<Key, MetricSnapshot>> {
+        self.metric_snapshots.write().unwrap_or_else(|e| {
+            error!("metric_snapshots write lock poisoned: {}", e);
+            e.into_inner()
+        })
+    }
+
+    fn snapshot_read_lock(&self) -> std::sync::RwLockReadGuard<'_, HashMap<Key, MetricSnapshot>> {
+        self.metric_snapshots.read().unwrap_or_else(|e| {
+            error!("metric_snapshots read lock poisoned: {}", e);
+            e.into_inner()
+        })
+    }
+
+    fn ensure_counter_snapshot(
+        &self,
+        key: &Key,
+        value: Arc<AtomicU64>,
+        description: Option<SharedString>,
+        _unit: Option<Unit>,
+    ) {
+        let mut snapshots = self.snapshot_write_lock();
+        snapshots.entry(key.clone()).or_insert_with(|| {
+            MetricSnapshot::Counter(CounterSnapshot {
+                value,
+                description: description.as_deref().unwrap_or_default().to_string(),
+            })
+        });
+    }
+
+    fn ensure_gauge_snapshot(
+        &self,
+        key: &Key,
+        value: Arc<AtomicU64>,
+        description: Option<SharedString>,
+        _unit: Option<Unit>,
+    ) {
+        let mut snapshots = self.snapshot_write_lock();
+        snapshots.entry(key.clone()).or_insert_with(|| {
+            MetricSnapshot::Gauge(GaugeSnapshot {
+                value,
+                description: description.as_deref().unwrap_or_default().to_string(),
+            })
+        });
+    }
+
+    fn ensure_histogram_snapshot(
+        &self,
+        key: &Key,
+        count: Arc<AtomicU64>,
+        sum_bits: Arc<AtomicU64>,
+        description: Option<SharedString>,
+        _unit: Option<Unit>,
+    ) {
+        let mut snapshots = self.snapshot_write_lock();
+        snapshots.entry(key.clone()).or_insert_with(|| {
+            MetricSnapshot::Histogram(HistogramSnapshot {
+                count,
+                sum_bits,
+                description: description.as_deref().unwrap_or_default().to_string(),
+            })
+        });
+    }
+
+    pub fn render_prometheus_text(&self) -> String {
+        let snapshots = self.snapshot_read_lock();
+        let mut families: std::collections::BTreeMap<String, MetricFamily> = std::collections::BTreeMap::new();
+
+        for (key, snapshot) in snapshots.iter() {
+            let metric_name = sanitize_prometheus_metric_name(key.name());
+            let labels = format_prometheus_labels(key);
+            match snapshot {
+                MetricSnapshot::Counter(counter) => {
+                    let help = counter.description_or_name(&metric_name);
+                    let value = counter.value.load(Ordering::Relaxed);
+                    append_family_sample(
+                        &mut families,
+                        &metric_name,
+                        "counter",
+                        help.to_string(),
+                        format!("{metric_name}{labels} {value}"),
+                    );
+                }
+                MetricSnapshot::Gauge(gauge) => {
+                    let help = gauge.description_or_name(&metric_name);
+                    let value = f64::from_bits(gauge.value.load(Ordering::Relaxed));
+                    append_family_sample(
+                        &mut families,
+                        &metric_name,
+                        "gauge",
+                        help.to_string(),
+                        format!("{metric_name}{labels} {}", format_prometheus_float(value)),
+                    );
+                }
+                MetricSnapshot::Histogram(histogram) => {
+                    let help = histogram.description_or_name(&metric_name);
+                    let count = histogram.count.load(Ordering::Relaxed);
+                    let sum = f64::from_bits(histogram.sum_bits.load(Ordering::Relaxed));
+                    append_family_sample(
+                        &mut families,
+                        &metric_name,
+                        "histogram",
+                        help.to_string(),
+                        format!(
+                            "{metric_name}_bucket{} {}",
+                            labels_with_extra(&labels, "le", "+Inf"),
+                            count
+                        ),
+                    );
+                    append_family_sample(
+                        &mut families,
+                        &metric_name,
+                        "histogram",
+                        help.to_string(),
+                        format!("{metric_name}_sum{labels} {}", format_prometheus_float(sum)),
+                    );
+                    append_family_sample(
+                        &mut families,
+                        &metric_name,
+                        "histogram",
+                        help.to_string(),
+                        format!("{metric_name}_count{labels} {count}"),
+                    );
+                }
+            }
+        }
+
+        if families.is_empty() {
+            return String::new();
+        }
+
+        let mut lines = Vec::new();
+        for (metric_name, family) in families {
+            lines.push(format!("# HELP {metric_name} {}", escape_prometheus_help(&family.help)));
+            lines.push(format!("# TYPE {metric_name} {}", family.metric_type));
+            lines.extend(family.samples);
+        }
+
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    pub fn metric_count(&self) -> usize {
+        self.snapshot_read_lock().len()
+    }
 }
 
 impl Deref for Recorder {
@@ -224,6 +372,8 @@ impl metrics::Recorder for Recorder {
 
         let builder = self.meter.u64_counter(key.name().to_owned());
         let metadata = self.get_metadata_for_builder(key.name());
+        let meta_description = metadata.as_ref().map(|m| m.description.clone());
+        let meta_unit = metadata.as_ref().and_then(|m| m.unit.clone());
         let builder = configure_builder!(builder, metadata);
 
         let counter = builder.build();
@@ -232,12 +382,14 @@ impl metrics::Recorder for Recorder {
             .map(|label| KeyValue::new(label.key().to_owned(), label.value().to_owned()))
             .collect();
 
+        let value = Arc::new(AtomicU64::new(0));
         let handle = Counter::from_arc(Arc::new(WrappedCounter {
             counter,
             labels,
-            value: AtomicU64::new(0),
+            value: Arc::clone(&value),
         }));
 
+        self.ensure_counter_snapshot(key, value, meta_description, meta_unit);
         Self::insert_cached_metric(&self.cached_counters, key.clone(), handle, "counter")
     }
 
@@ -248,6 +400,8 @@ impl metrics::Recorder for Recorder {
 
         let builder = self.meter.f64_gauge(key.name().to_owned());
         let metadata = self.get_metadata_for_builder(key.name());
+        let meta_description = metadata.as_ref().map(|m| m.description.clone());
+        let meta_unit = metadata.as_ref().and_then(|m| m.unit.clone());
         let builder = configure_builder!(builder, metadata);
 
         let gauge = builder.build();
@@ -256,12 +410,14 @@ impl metrics::Recorder for Recorder {
             .map(|label| KeyValue::new(label.key().to_owned(), label.value().to_owned()))
             .collect();
 
+        let value = Arc::new(AtomicU64::new(0));
         let handle = Gauge::from_arc(Arc::new(WrappedGauge {
             gauge,
             labels,
-            value: AtomicU64::new(0),
+            value: Arc::clone(&value),
         }));
 
+        self.ensure_gauge_snapshot(key, value, meta_description, meta_unit);
         Self::insert_cached_metric(&self.cached_gauges, key.clone(), handle, "gauge")
     }
 
@@ -272,6 +428,8 @@ impl metrics::Recorder for Recorder {
 
         let builder = self.meter.f64_histogram(key.name().to_owned());
         let metadata = self.get_metadata_for_builder(key.name());
+        let meta_description = metadata.as_ref().map(|m| m.description.clone());
+        let meta_unit = metadata.as_ref().and_then(|m| m.unit.clone());
         let builder = configure_builder!(builder, metadata);
 
         let histogram = builder.build();
@@ -280,8 +438,16 @@ impl metrics::Recorder for Recorder {
             .map(|label| KeyValue::new(label.key().to_owned(), label.value().to_owned()))
             .collect();
 
-        let handle = Histogram::from_arc(Arc::new(WrappedHistogram { histogram, labels }));
+        let count = Arc::new(AtomicU64::new(0));
+        let sum_bits = Arc::new(AtomicU64::new(0f64.to_bits()));
+        let handle = Histogram::from_arc(Arc::new(WrappedHistogram {
+            histogram,
+            labels,
+            count: Arc::clone(&count),
+            sum_bits: Arc::clone(&sum_bits),
+        }));
 
+        self.ensure_histogram_snapshot(key, count, sum_bits, meta_description, meta_unit);
         Self::insert_cached_metric(&self.cached_histograms, key.clone(), handle, "histogram")
     }
 }
@@ -289,7 +455,7 @@ impl metrics::Recorder for Recorder {
 struct WrappedCounter {
     counter: opentelemetry::metrics::Counter<u64>,
     labels: Vec<KeyValue>,
-    value: AtomicU64,
+    value: Arc<AtomicU64>,
 }
 
 impl CounterFn for WrappedCounter {
@@ -308,7 +474,7 @@ impl CounterFn for WrappedCounter {
 struct WrappedGauge {
     gauge: opentelemetry::metrics::Gauge<f64>,
     labels: Vec<KeyValue>,
-    value: AtomicU64,
+    value: Arc<AtomicU64>,
 }
 
 impl GaugeFn for WrappedGauge {
@@ -349,17 +515,224 @@ impl GaugeFn for WrappedGauge {
 struct WrappedHistogram {
     histogram: opentelemetry::metrics::Histogram<f64>,
     labels: Vec<KeyValue>,
+    count: Arc<AtomicU64>,
+    sum_bits: Arc<AtomicU64>,
 }
 
 impl HistogramFn for WrappedHistogram {
     fn record(&self, value: f64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let mut current = self.sum_bits.load(Ordering::Relaxed);
+        loop {
+            let next = f64::from_bits(current) + value;
+            match self
+                .sum_bits
+                .compare_exchange(current, next.to_bits(), Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         self.histogram.record(value, &self.labels);
     }
 
     fn record_many(&self, value: f64, count: usize) {
+        let count = count as u64;
+        self.count.fetch_add(count, Ordering::Relaxed);
+        let increment = value * count as f64;
+        let mut current = self.sum_bits.load(Ordering::Relaxed);
+        loop {
+            let next = f64::from_bits(current) + increment;
+            match self
+                .sum_bits
+                .compare_exchange(current, next.to_bits(), Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+
         for _ in 0..count {
             self.histogram.record(value, &self.labels);
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum MetricSnapshot {
+    Counter(CounterSnapshot),
+    Gauge(GaugeSnapshot),
+    Histogram(HistogramSnapshot),
+}
+
+#[derive(Debug, Clone)]
+struct MetricFamily {
+    metric_type: &'static str,
+    help: String,
+    samples: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CounterSnapshot {
+    value: Arc<AtomicU64>,
+    description: String,
+}
+
+impl CounterSnapshot {
+    fn description_or_name<'a>(&'a self, metric_name: &'a str) -> &'a str {
+        if self.description.is_empty() { metric_name } else { &self.description }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GaugeSnapshot {
+    value: Arc<AtomicU64>,
+    description: String,
+}
+
+impl GaugeSnapshot {
+    fn description_or_name<'a>(&'a self, metric_name: &'a str) -> &'a str {
+        if self.description.is_empty() { metric_name } else { &self.description }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistogramSnapshot {
+    count: Arc<AtomicU64>,
+    sum_bits: Arc<AtomicU64>,
+    description: String,
+}
+
+impl HistogramSnapshot {
+    fn description_or_name<'a>(&'a self, metric_name: &'a str) -> &'a str {
+        if self.description.is_empty() { metric_name } else { &self.description }
+    }
+}
+
+fn append_family_sample(
+    families: &mut std::collections::BTreeMap<String, MetricFamily>,
+    metric_name: &str,
+    metric_type: &'static str,
+    help: String,
+    sample: String,
+) {
+    use std::collections::btree_map::Entry;
+
+    match families.entry(metric_name.to_string()) {
+        Entry::Vacant(v) => {
+            v.insert(MetricFamily {
+                metric_type,
+                help,
+                samples: vec![sample],
+            });
+        }
+        Entry::Occupied(mut o) => {
+            let family = o.get_mut();
+            if family.metric_type != metric_type {
+                error!(
+                    metric_name,
+                    existing_type = family.metric_type,
+                    requested_type = metric_type,
+                    "conflicting metric type for prometheus family; dropping sample"
+                );
+                return;
+            }
+
+            if family.help.is_empty() && !help.is_empty() {
+                family.help = help;
+            }
+            family.samples.push(sample);
+        }
+    }
+}
+
+fn sanitize_prometheus_metric_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (idx, ch) in name.chars().enumerate() {
+        let valid = ch.is_ascii_alphanumeric() || ch == '_';
+        let first_valid = ch.is_ascii_alphabetic() || ch == '_';
+        if (idx == 0 && !first_valid) || !valid {
+            out.push('_');
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+fn format_prometheus_labels(key: &Key) -> String {
+    let mut labels = Vec::new();
+    for label in key.labels() {
+        labels.push(format!(
+            "{}=\"{}\"",
+            sanitize_prometheus_label_name(label.key()),
+            escape_prometheus_label_value(label.value())
+        ));
+    }
+
+    if labels.is_empty() {
+        String::new()
+    } else {
+        format!("{{{}}}", labels.join(","))
+    }
+}
+
+fn labels_with_extra(labels: &str, key: &str, value: &str) -> String {
+    if labels.is_empty() {
+        format!("{{{}=\"{}\"}}", sanitize_prometheus_label_name(key), escape_prometheus_label_value(value))
+    } else {
+        let inner = labels.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or(labels);
+        format!(
+            "{{{},{}=\"{}\"}}",
+            inner,
+            sanitize_prometheus_label_name(key),
+            escape_prometheus_label_value(value)
+        )
+    }
+}
+
+fn sanitize_prometheus_label_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (idx, ch) in name.chars().enumerate() {
+        let valid = ch.is_ascii_alphanumeric() || ch == '_';
+        let first_valid = ch.is_ascii_alphabetic() || ch == '_';
+        if (idx == 0 && !first_valid) || !valid {
+            out.push('_');
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+fn escape_prometheus_help(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+fn escape_prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+fn format_prometheus_float(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_string()
+    } else if value.is_infinite() {
+        if value.is_sign_negative() {
+            "-Inf".to_string()
+        } else {
+            "+Inf".to_string()
+        }
+    } else {
+        value.to_string()
     }
 }
 
@@ -468,5 +841,38 @@ mod tests {
 
         let cache = shared.cached_counters.read().unwrap();
         assert_eq!(cache.len(), 1, "concurrent registrations should produce exactly one cache entry");
+    }
+
+    #[test]
+    fn render_prometheus_text_includes_counter_gauge_and_histogram_samples() {
+        let recorder = test_recorder();
+        let meta = test_metadata();
+
+        let counter_key = Key::from_name("requests_total");
+        let counter = recorder.register_counter(&counter_key, &meta);
+        counter.increment(3);
+
+        let gauge_key = Key::from_name("queue_depth");
+        let gauge = recorder.register_gauge(&gauge_key, &meta);
+        gauge.set(7.5);
+
+        let histogram_key = Key::from_name("request_latency_seconds");
+        let histogram = recorder.register_histogram(&histogram_key, &meta);
+        histogram.record(0.5);
+        histogram.record_many(1.0, 2);
+
+        let text = recorder.render_prometheus_text();
+
+        assert!(text.contains("# TYPE requests_total counter"));
+        assert!(text.contains("requests_total 3"));
+
+        assert!(text.contains("# TYPE queue_depth gauge"));
+        assert!(text.contains("queue_depth 7.5"));
+
+        assert!(text.contains("# TYPE request_latency_seconds histogram"));
+        assert!(text.contains("request_latency_seconds_bucket{le=\"+Inf\"} 3"));
+        assert!(text.contains("request_latency_seconds_sum 2.5"));
+        assert!(text.contains("request_latency_seconds_count 3"));
+        assert_eq!(text.matches("# TYPE request_latency_seconds histogram").count(), 1);
     }
 }

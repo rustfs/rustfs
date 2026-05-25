@@ -31,6 +31,9 @@ pub(crate) const HEALTH_PREFIX: &str = "/health";
 /// This path is used to check dependency readiness and may return 503.
 pub(crate) const HEALTH_READY_PATH: &str = "/health/ready";
 
+/// Predefined Prometheus metrics exposition path for RustFS server.
+pub(crate) const METRICS_PATH: &str = "/metrics";
+
 /// Predefined administrative prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle administrative tasks
 /// such as configuration, monitoring, and management.

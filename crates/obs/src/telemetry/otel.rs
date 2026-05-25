@@ -38,7 +38,7 @@
 
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
-use crate::global::set_observability_metric_enabled;
+use crate::global::{set_global_metrics_recorder, set_observability_metric_enabled};
 use crate::telemetry::filter::build_env_filter;
 use crate::telemetry::guard::OtelGuard;
 use crate::telemetry::local::spawn_cleanup_task;
@@ -443,7 +443,8 @@ fn build_meter_provider(
         .build();
 
     global::set_meter_provider(provider.clone());
-    metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
+    metrics::set_global_recorder(recorder.clone()).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
+    set_global_metrics_recorder(recorder);
     set_observability_metric_enabled(true);
     Ok(Some(provider))
 }

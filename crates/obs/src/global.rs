@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AppConfig, GlobalError, OtelConfig, OtelGuard, telemetry::init_telemetry};
+use crate::{AppConfig, GlobalError, OtelConfig, OtelGuard, Recorder, telemetry::init_telemetry};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 /// Global guard for OpenTelemetry tracing
 static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
+/// Global handle to the metrics recorder when observability metrics are enabled.
+static GLOBAL_METRICS_RECORDER: OnceCell<Recorder> = OnceCell::const_new();
 
 /// Flag indicating if observability metric is enabled
 pub(crate) static OBSERVABILITY_METRIC_ENABLED: OnceCell<bool> = OnceCell::const_new();
@@ -38,6 +40,18 @@ pub(crate) const METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES: &str = "rustfs_log_c
 /// Check whether Observability metric is enabled
 pub fn observability_metric_enabled() -> bool {
     OBSERVABILITY_METRIC_ENABLED.get().copied().unwrap_or(false)
+}
+
+/// Store the global metrics recorder once so other modules can export snapshots.
+pub(crate) fn set_global_metrics_recorder(recorder: Recorder) {
+    if GLOBAL_METRICS_RECORDER.set(recorder).is_err() {
+        warn!("GLOBAL_METRICS_RECORDER was already initialized; keeping original recorder");
+    }
+}
+
+/// Get the global metrics recorder if observability metrics are enabled.
+pub fn get_global_metrics_recorder() -> Option<Recorder> {
+    GLOBAL_METRICS_RECORDER.get().cloned()
 }
 
 /// Set the global observability metrics flag once.

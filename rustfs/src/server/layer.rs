@@ -18,8 +18,8 @@ use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
-    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX,
-    RUSTFS_ADMIN_PREFIX,
+    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, METRICS_PATH, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX,
+    PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
@@ -631,6 +631,32 @@ fn is_public_health_endpoint_request(method: &Method, path: &str) -> bool {
         && health_endpoint_enabled()
 }
 
+fn is_public_metrics_endpoint_request(method: &Method, path: &str) -> bool {
+    (method == Method::GET || method == Method::HEAD) && path == METRICS_PATH
+}
+
+fn build_public_metrics_http_response<RestBody, GrpcBody>(method: Method) -> Response<HybridBody<RestBody, GrpcBody>>
+where
+    RestBody: From<Bytes>,
+{
+    let body = if method == Method::HEAD {
+        Bytes::new()
+    } else {
+        let metrics = rustfs_obs::get_global_metrics_recorder()
+            .map(|recorder| recorder.render_prometheus_text())
+            .unwrap_or_default();
+        Bytes::from(metrics)
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+        .body(HybridBody::Rest {
+            rest_body: RestBody::from(body),
+        })
+        .expect("failed to build metrics response")
+}
+
 async fn build_public_health_http_response<RestBody, GrpcBody>(
     method: Method,
     path: String,
@@ -681,6 +707,11 @@ where
             let method = method.clone();
             let path = path.to_owned();
             return Box::pin(async move { Ok(build_public_health_http_response(method, path).await) });
+        }
+
+        if is_public_metrics_endpoint_request(method, path) {
+            let method = method.clone();
+            return Box::pin(async move { Ok(build_public_metrics_http_response(method)) });
         }
 
         let mut inner = self.inner.clone();
@@ -818,7 +849,8 @@ impl ConditionalCorsLayer {
     }
 
     /// Exact paths that should be excluded from being treated as S3 paths.
-    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &["/health", "/health/ready", "/profile/cpu", "/profile/memory"];
+    const EXCLUDED_EXACT_PATHS: &'static [&'static str] =
+        &[HEALTH_PREFIX, HEALTH_READY_PATH, METRICS_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH];
 
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
@@ -1253,6 +1285,57 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn public_health_endpoint_layer_handles_metrics_before_inner_service() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = PublicHealthEndpointLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(METRICS_PATH)
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("metrics response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_health_endpoint_layer_handles_metrics_head_before_inner_service() {
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = PublicHealthEndpointLayer.layer(inner);
+
+        let response = service
+            .call(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(METRICS_PATH)
+                    .body(Full::<Bytes>::from(Bytes::new()))
+                    .expect("request"),
+            )
+            .await
+            .expect("metrics response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+        assert!(body.is_empty());
+    }
+
     #[test]
     fn admin_chunked_put_without_content_length_is_normalized() {
         let request = Request::builder()
@@ -1605,6 +1688,7 @@ mod tests {
         assert!(!ConditionalCorsLayer::is_s3_path("/minio/admin/v3/info"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health/ready"));
+        assert!(!ConditionalCorsLayer::is_s3_path("/metrics"));
     }
 
     #[test]

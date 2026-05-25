@@ -715,7 +715,7 @@ fn process_connection(
         // 17. RedirectLayer                          — console redirect (conditional)
         // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
         // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 20. PublicHealthEndpointLayer              — handles public health before s3s host parsing
+        // 20. PublicHealthEndpointLayer              — handles public health/metrics before s3s host parsing
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -902,9 +902,9 @@ fn process_connection(
             // HEAD responses must not send body bytes even when the inner S3 layer
             // serializes an XML error payload.
             .layer(HeadRequestBodyFixLayer)
-            // Health probes are public admin routes, but s3s parses virtual-host
+            // Health probes and /metrics are public routes, but s3s parses virtual-host
             // buckets before custom routes. Handle them here so SERVER_DOMAINS
-            // cannot turn /health into an S3 bucket request.
+            // cannot turn these probe paths into S3 bucket requests.
             .layer(PublicHealthEndpointLayer)
             .service(service);
 

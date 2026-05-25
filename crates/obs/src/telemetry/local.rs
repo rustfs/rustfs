@@ -31,14 +31,20 @@
 //! construction while still allowing periodic housekeeping in the background.
 
 use super::guard::OtelGuard;
+use super::recorder::Recorder;
 use crate::TelemetryError;
 use crate::cleaner::LogCleaner;
 use crate::cleaner::types::{CompressionAlgorithm, FileMatchMode};
 use crate::config::OtelConfig;
-use crate::global::{METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL, METRIC_LOG_CLEANER_RUNS_TOTAL, set_observability_metric_enabled};
+use crate::global::{
+    METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL, METRIC_LOG_CLEANER_RUNS_TOTAL, set_global_metrics_recorder,
+    set_observability_metric_enabled,
+};
 use crate::telemetry::filter::build_env_filter;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 use metrics::counter;
+use opentelemetry::global;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rustfs_config::observability::{
     DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES, DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS,
     DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_DELETE_EMPTY_FILES, DEFAULT_OBS_LOG_DRY_RUN,
@@ -118,10 +124,10 @@ pub(super) fn init_local_logging(
 /// identifiers, file/line information, and span context.
 ///
 /// # Arguments
-/// * `_config` - Unused at the moment; reserved for future configuration.
+/// * `config` - Observability configuration (service name is used for metrics scope).
 /// * `logger_level` - Effective log level string.
 /// * `is_production` - Controls span event verbosity.
-fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
+fn init_stdout_only(config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
     let env_filter = build_env_filter(logger_level, None);
     let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
 
@@ -147,13 +153,14 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         .with(fmt_layer)
         .init();
 
-    set_observability_metric_enabled(false);
+    let meter_provider = init_local_metrics_recorder(config.service_name.as_deref().unwrap_or(APP_NAME));
+    set_observability_metric_enabled(meter_provider.is_some());
     counter!("rustfs_start_total").increment(1);
     info!("Init stdout logging (level: {})", logger_level);
 
     OtelGuard {
         tracer_provider: None,
-        meter_provider: None,
+        meter_provider,
         logger_provider: None,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         profiling_agent: None,
@@ -275,7 +282,8 @@ fn init_file_logging_internal(
         .with(stdout_layer)
         .init();
 
-    set_observability_metric_enabled(false);
+    let meter_provider = init_local_metrics_recorder(service_name);
+    set_observability_metric_enabled(meter_provider.is_some());
 
     // ── 5. Start background cleanup task ─────────────────────────────────────
     let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
@@ -287,7 +295,7 @@ fn init_file_logging_internal(
 
     Ok(OtelGuard {
         tracer_provider: None,
-        meter_provider: None,
+        meter_provider,
         logger_provider: None,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         profiling_agent: None,
@@ -295,6 +303,22 @@ fn init_file_logging_internal(
         stdout_guard,
         cleanup_handle: Some(cleanup_handle),
     })
+}
+
+fn init_local_metrics_recorder(service_name: &str) -> Option<SdkMeterProvider> {
+    let (provider, recorder) = Recorder::builder(service_name.to_string()).build();
+
+    match metrics::set_global_recorder(recorder.clone()) {
+        Ok(_) => {
+            global::set_meter_provider(provider.clone());
+            set_global_metrics_recorder(recorder);
+            Some(provider)
+        }
+        Err(err) => {
+            tracing::warn!("Failed to install local metrics recorder: {}", err);
+            None
+        }
+    }
 }
 
 // ─── Directory permissions (Unix) ─────────────────────────────────────────────
