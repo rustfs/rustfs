@@ -37,7 +37,7 @@ pub const RPC_SECRET_REQUIRED_MESSAGE: &str = "RPC authentication secret is not 
 
 /// Operator-facing guidance for configuring RPC authentication safely.
 pub const RPC_SECRET_REQUIRED_OPERATOR_MESSAGE: &str =
-    "RUSTFS_RPC_SECRET can be set explicitly; otherwise the RPC secret is derived from non-default active access/secret keys";
+    "RUSTFS_RPC_SECRET can be set explicitly; otherwise the RPC secret is derived from the active access/secret key pair";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -559,10 +559,24 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_rpc_secret_rejects_default_credentials_for_derivation() {
+    fn test_gen_access_key_length_and_charset() {
+        let err = gen_access_key(2).expect_err("length below 3 should fail");
+        assert_eq!(err.to_string(), "access key length is too short");
+
+        let key = gen_access_key(20).expect("access key should generate");
+        assert_eq!(key.len(), 20);
+        assert!(key.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_resolve_rpc_secret_allows_default_credentials_for_derivation() {
         assert!(resolve_rpc_secret(None, None, None).is_none());
-        assert!(resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).is_none());
-        assert!(derive_rpc_secret(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY).is_none());
+
+        let expected = derive_rpc_secret(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY).expect("secret should derive");
+        assert_eq!(
+            resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).as_deref(),
+            Some(expected.as_str())
+        );
 
         assert!(resolve_rpc_secret(Some(DEFAULT_SECRET_KEY), Some("custom-access"), Some("custom-global-secret")).is_none());
     }
@@ -598,7 +612,6 @@ mod tests {
     #[test]
     fn test_resolve_rpc_secret_trims_and_falls_back_from_blank_env() {
         let expected = derive_rpc_secret("custom-access", "custom-global-secret").expect("secret should derive");
-        let expected_trimmed = derive_rpc_secret("custom-access", "custom-global-secret").expect("secret should derive");
         assert_eq!(
             resolve_rpc_secret(Some("  custom-rpc-secret  "), None, None).as_deref(),
             Some("custom-rpc-secret")
@@ -609,7 +622,7 @@ mod tests {
         );
         assert_eq!(
             resolve_rpc_secret(Some("  "), Some("  custom-access  "), Some("  custom-global-secret  ")).as_deref(),
-            Some(expected_trimmed.as_str())
+            Some(expected.as_str())
         );
         assert_eq!(
             resolve_rpc_secret(Some("  "), Some("custom-access"), Some("custom-global-secret")).as_deref(),
