@@ -396,23 +396,18 @@ pub fn get_commit_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use uuid::Uuid;
+    use serial_test::serial;
 
-    use crate::global::{get_global_deployment_id, set_global_deployment_id};
+    use crate::global::get_global_deployment_id;
 
     use super::get_server_info;
 
+    #[serial]
     #[tokio::test]
     async fn server_info_includes_global_deployment_id() {
-        let expected_deployment_id = get_global_deployment_id().unwrap_or_else(|| {
-            let deployment_id = Uuid::from_u128(0x12345678123456781234567812345678);
-            let deployment_id_string = deployment_id.to_string();
-            set_global_deployment_id(deployment_id);
-            deployment_id_string
-        });
-
+        let expected_deployment_id = get_global_deployment_id();
         let info = get_server_info(false).await;
 
-        assert_eq!(info.deployment_id.as_deref(), Some(expected_deployment_id.as_str()));
+        assert_eq!(info.deployment_id, expected_deployment_id);
     }
 }
