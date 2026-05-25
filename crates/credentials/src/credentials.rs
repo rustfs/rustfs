@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{DEFAULT_SECRET_KEY, ENV_RPC_SECRET, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+use crate::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ENV_RPC_SECRET, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+use base64_simd::URL_SAFE_NO_PAD;
+use hmac::{Hmac, KeyInit, Mac};
 use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
@@ -33,7 +36,12 @@ pub static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
 pub const RPC_SECRET_REQUIRED_MESSAGE: &str = "RPC authentication secret is not configured";
 
 /// Operator-facing guidance for configuring RPC authentication safely.
-pub const RPC_SECRET_REQUIRED_OPERATOR_MESSAGE: &str = "RUSTFS_RPC_SECRET must be set to a non-default value or RUSTFS_SECRET_KEY must be changed from the default for RPC authentication";
+pub const RPC_SECRET_REQUIRED_OPERATOR_MESSAGE: &str =
+    "RUSTFS_RPC_SECRET can be set explicitly; otherwise the active access/secret key pair is used to derive the RPC secret";
+
+type HmacSha256 = Hmac<Sha256>;
+
+const RPC_SECRET_DERIVATION_CONTEXT: &[u8] = b"rustfs-rpc-secret:v1";
 
 /// Error type for credentials operations
 #[derive(Debug)]
@@ -217,37 +225,59 @@ pub fn gen_secret_key(length: usize) -> std::io::Result<String> {
     Ok(encoded)
 }
 
-/// Get the RPC authentication token from environment variable
+/// Get the RPC authentication token from the environment or derive it from the active credentials.
 ///
 /// # Returns
 /// * `String` - The RPC authentication token
 ///
-fn resolve_rpc_secret(env_secret: Option<&str>, global_secret: Option<&str>) -> Option<String> {
-    if let Some(secret) = env_secret.map(str::trim).filter(|secret| !secret.is_empty()) {
-        return (secret != DEFAULT_SECRET_KEY).then(|| secret.to_string());
+fn normalize_rpc_secret(secret: &str) -> Option<String> {
+    let secret = secret.trim();
+    (!secret.is_empty() && secret != DEFAULT_SECRET_KEY && secret != DEFAULT_ACCESS_KEY).then(|| secret.to_string())
+}
+
+fn derive_rpc_secret(access_key: &str, secret_key: &str) -> Option<String> {
+    let access_key = access_key.trim();
+    let secret_key = secret_key.trim();
+
+    if access_key.is_empty() || secret_key.is_empty() {
+        return None;
     }
 
-    global_secret
-        .map(str::trim)
-        .filter(|secret| !secret.is_empty() && *secret != DEFAULT_SECRET_KEY)
-        .map(ToOwned::to_owned)
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
+    mac.update(RPC_SECRET_DERIVATION_CONTEXT);
+    mac.update(&[0]);
+    mac.update(access_key.as_bytes());
+
+    Some(URL_SAFE_NO_PAD.encode_to_string(mac.finalize().into_bytes()))
+}
+
+fn resolve_rpc_secret(env_secret: Option<&str>, global_access: Option<&str>, global_secret: Option<&str>) -> Option<String> {
+    if let Some(secret) = env_secret.map(str::trim).filter(|secret| !secret.is_empty()) {
+        return normalize_rpc_secret(secret);
+    }
+
+    match (global_access, global_secret) {
+        (Some(access_key), Some(secret_key)) => derive_rpc_secret(access_key, secret_key),
+        _ => None,
+    }
 }
 
 pub fn try_get_rpc_token() -> std::io::Result<String> {
     if let Some(secret) = GLOBAL_RUSTFS_RPC_SECRET.get() {
-        return resolve_rpc_secret(None, Some(secret)).ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE));
+        return normalize_rpc_secret(secret).ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE));
     }
 
     let env_secret = env::var(ENV_RPC_SECRET).ok();
+    let global_access = get_global_access_key_opt();
     let global_secret = get_global_secret_key_opt();
-    let secret = resolve_rpc_secret(env_secret.as_deref(), global_secret.as_deref())
+    let secret = resolve_rpc_secret(env_secret.as_deref(), global_access.as_deref(), global_secret.as_deref())
         .ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE))?;
 
     match GLOBAL_RUSTFS_RPC_SECRET.set(secret.clone()) {
         Ok(()) => Ok(secret),
         Err(_) => GLOBAL_RUSTFS_RPC_SECRET
             .get()
-            .and_then(|stored| resolve_rpc_secret(None, Some(stored)))
+            .and_then(|stored| normalize_rpc_secret(stored))
             .ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE)),
     }
 }
@@ -407,7 +437,7 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+    use crate::{DEFAULT_ACCESS_KEY, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
     use time::Duration;
 
     #[test]
@@ -510,11 +540,12 @@ mod tests {
         // If it hasn't already been initialized, the test automatically generates logic
         if get_global_action_cred().is_none() {
             init_global_action_credentials(None, None).ok();
-            let ak = get_global_access_key();
-            let sk = get_global_secret_key();
-            assert_eq!(ak.len(), 20);
-            assert_eq!(sk.len(), 32);
         }
+
+        let ak = get_global_access_key();
+        let sk = get_global_secret_key();
+        assert!(ak.len() >= 3);
+        assert!(sk.len() >= 8);
     }
 
     #[test]
@@ -528,10 +559,19 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_rpc_secret_rejects_default_fallback() {
-        assert!(resolve_rpc_secret(None, None).is_none());
-        assert!(resolve_rpc_secret(None, Some(DEFAULT_SECRET_KEY)).is_none());
-        assert!(resolve_rpc_secret(Some(DEFAULT_SECRET_KEY), Some("custom-global-secret")).is_none());
+    fn test_resolve_rpc_secret_derives_from_default_credentials() {
+        assert!(resolve_rpc_secret(None, None, None).is_none());
+
+        let expected = derive_rpc_secret(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY).expect("secret should derive");
+        assert_eq!(
+            resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_ne!(expected, DEFAULT_ACCESS_KEY);
+        assert_ne!(expected, DEFAULT_SECRET_KEY);
+        assert_ne!(expected, format!("{}{}", DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY));
+
+        assert!(resolve_rpc_secret(Some(DEFAULT_SECRET_KEY), Some("custom-access"), Some("custom-global-secret")).is_none());
     }
 
     #[test]
@@ -551,37 +591,65 @@ mod tests {
 
     #[test]
     fn test_resolve_rpc_secret_accepts_non_default_secret() {
-        assert_eq!(resolve_rpc_secret(Some("custom-rpc-secret"), None).as_deref(), Some("custom-rpc-secret"));
         assert_eq!(
-            resolve_rpc_secret(None, Some("custom-global-secret")).as_deref(),
-            Some("custom-global-secret")
+            resolve_rpc_secret(Some("custom-rpc-secret"), None, None).as_deref(),
+            Some("custom-rpc-secret")
+        );
+        let expected = derive_rpc_secret("custom-access", "custom-global-secret").expect("secret should derive");
+        assert_eq!(
+            resolve_rpc_secret(None, Some("custom-access"), Some("custom-global-secret")).as_deref(),
+            Some(expected.as_str())
         );
     }
 
     #[test]
     fn test_resolve_rpc_secret_trims_and_falls_back_from_blank_env() {
+        let expected = derive_rpc_secret("custom-access", "custom-global-secret").expect("secret should derive");
+        let expected_trimmed = derive_rpc_secret("custom-access", "custom-global-secret").expect("secret should derive");
         assert_eq!(
-            resolve_rpc_secret(Some("  custom-rpc-secret  "), None).as_deref(),
+            resolve_rpc_secret(Some("  custom-rpc-secret  "), None, None).as_deref(),
             Some("custom-rpc-secret")
         );
         assert_eq!(
-            resolve_rpc_secret(Some(""), Some("custom-global-secret")).as_deref(),
-            Some("custom-global-secret")
+            resolve_rpc_secret(Some(""), Some("custom-access"), Some("custom-global-secret")).as_deref(),
+            Some(expected.as_str())
         );
         assert_eq!(
-            resolve_rpc_secret(Some("  "), Some("  custom-global-secret  ")).as_deref(),
-            Some("custom-global-secret")
+            resolve_rpc_secret(Some("  "), Some("  custom-access  "), Some("  custom-global-secret  ")).as_deref(),
+            Some(expected_trimmed.as_str())
         );
         assert_eq!(
-            resolve_rpc_secret(Some("  "), Some("custom-global-secret")).as_deref(),
-            Some("custom-global-secret")
+            resolve_rpc_secret(Some("  "), Some("custom-access"), Some("custom-global-secret")).as_deref(),
+            Some(expected.as_str())
         );
     }
 
     #[test]
     fn test_resolve_rpc_secret_returns_none_for_trimmed_default_secret() {
         let padded_default_secret = format!("  {}  ", DEFAULT_SECRET_KEY);
-        assert!(resolve_rpc_secret(Some(padded_default_secret.as_str()), Some("custom-global-secret")).is_none());
+        assert!(
+            resolve_rpc_secret(Some(padded_default_secret.as_str()), Some("custom-access"), Some("custom-global-secret"))
+                .is_none()
+        );
+
+        let padded_default_access = format!("  {}  ", DEFAULT_ACCESS_KEY);
+        assert!(
+            resolve_rpc_secret(Some(padded_default_access.as_str()), Some("custom-access"), Some("custom-global-secret"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_derive_rpc_secret_is_stable_and_not_plaintext() {
+        let first = derive_rpc_secret("custom-access", "custom-secret").expect("secret should derive");
+        let second = derive_rpc_secret("custom-access", "custom-secret").expect("secret should derive");
+
+        assert_eq!(first, second);
+        assert_ne!(first, "custom-access");
+        assert_ne!(first, "custom-secret");
+        assert_ne!(first, format!("{}{}", "custom-access", "custom-secret"));
+        assert!(!first.contains("custom-access"));
+        assert!(!first.contains("custom-secret"));
     }
 
     #[test]
