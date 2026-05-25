@@ -24,6 +24,7 @@
 /// "ef51" => "EXT2OLD",
 /// "2fc12fc1" => "zfs",
 /// "53464846" => "wslfs",
+#[allow(dead_code)]
 pub(crate) fn get_fs_type(fs_type: u64) -> &'static str {
     // Magic numbers for various filesystems.
     match fs_type {

@@ -21,7 +21,7 @@ mod integration_tests {
     };
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput, JSONType,
-        OutputSerialization, SelectObjectContentInput, SelectObjectContentRequest,
+        OutputSerialization, ParquetInput, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use std::sync::Arc;
 
@@ -71,6 +71,31 @@ mod integration_tests {
                     json: Some(JSONInput {
                         type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
                     }),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    json: Some(JSONOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        }
+    }
+
+    fn create_test_parquet_input(sql: &str) -> SelectObjectContentInput {
+        SelectObjectContentInput {
+            bucket: "test-bucket".to_string(),
+            expected_bucket_owner: None,
+            key: "test.parquet".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: sql.to_string(),
+                expression_type: ExpressionType::from_static("SQL"),
+                input_serialization: InputSerialization {
+                    parquet: Some(ParquetInput {}),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
@@ -288,6 +313,21 @@ mod integration_tests {
         let query_handle = result.unwrap();
         let output = query_handle.result().chunk_result().await;
         assert!(output.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_simple_select_query_parquet() {
+        let sql = "SELECT name, age FROM S3Object WHERE age > 25";
+        let input = create_test_parquet_input(sql);
+        let db = get_global_db(input.clone(), true).await.unwrap();
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap().result().chunk_result().await.unwrap();
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 3);
     }
 
     #[tokio::test]

@@ -178,15 +178,10 @@ mod error_handling_tests {
             let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
             let result = db.execute(&query).await;
-            // Empty queries might be handled differently by the parser
-            match result {
-                Ok(_) => {
-                    // Some parsers might accept empty queries
-                }
-                Err(_) => {
-                    // Expected to fail for empty SQL
-                }
-            }
+            assert!(
+                matches!(result, Err(QueryError::Parser { .. })),
+                "Expected parser error for empty SQL: {sql:?}"
+            );
         }
     }
 
