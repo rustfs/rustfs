@@ -42,7 +42,6 @@ thiserror.workspace = true
 arc-swap = { workspace = true }
 rustfs-crypto = { workspace = true }
 futures.workspace = true
-rand.workspace = true
 base64-simd = { workspace = true }
 jsonwebtoken = { workspace = true }
 tracing.workspace = true

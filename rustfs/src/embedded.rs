@@ -50,6 +50,7 @@ use crate::app::context::{AppContext, init_global_app_context};
 use crate::config::Config;
 use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
 use crate::server::{init_event_notifier, shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system};
+use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS;
 use rustfs_credentials::init_global_action_credentials;
@@ -350,6 +351,7 @@ impl RustFSServerBuilder {
         let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_addr_str.as_str(), config.volumes.clone())
             .await
             .map_err(|e| ServerError::Init(format!("endpoints: {e}")))?;
+        enforce_unsupported_fs_policy(&endpoint_pools).map_err(|e| ServerError::Init(format!("unsupported fs guard: {e}")))?;
 
         set_global_endpoints(endpoint_pools.as_ref().clone());
         update_erasure_type(setup_type).await;

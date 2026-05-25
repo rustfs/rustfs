@@ -41,23 +41,29 @@ fn unsupported_transport_message(transport: &str) -> String {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct InternodeDataTransportCapabilities {
-    pub stream_read: bool,
-    pub stream_write: bool,
-    pub walk_dir: bool,
-    pub registered_memory: bool,
-    pub scatter_gather: bool,
-    pub zero_copy_receive: bool,
+    /// Backend can open a streaming remote disk reader.
+    pub streaming_read: bool,
+    /// Backend can open a streaming remote disk writer.
+    pub streaming_write: bool,
+    /// Backend can stream walk-dir responses.
+    pub streaming_walk_dir: bool,
+    /// Backend preserves in-order delivery for each opened transfer.
+    pub ordered_delivery: bool,
+    /// Largest payload the backend accepts for one transfer, or no RustFS-level cap.
+    pub max_transfer_size: Option<usize>,
+    /// Backend can participate in the behavior-preserving TCP fallback path.
+    pub fallback_supported: bool,
 }
 
 impl InternodeDataTransportCapabilities {
     pub const fn tcp_http() -> Self {
         Self {
-            stream_read: true,
-            stream_write: true,
-            walk_dir: true,
-            registered_memory: false,
-            scatter_gather: false,
-            zero_copy_receive: false,
+            streaming_read: true,
+            streaming_write: true,
+            streaming_walk_dir: true,
+            ordered_delivery: true,
+            max_transfer_size: None,
+            fallback_supported: true,
         }
     }
 }
@@ -95,6 +101,9 @@ pub struct WalkDirStreamRequest {
 /// This boundary is limited to remote disk streams that can move large payloads.
 /// Internode metadata, lock, health, and administrative calls remain on the
 /// existing gRPC control plane.
+///
+/// Buffer ownership, backend selection, and fallback expectations are documented
+/// in `crates/ecstore/docs/internode-transport/`.
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;
@@ -223,14 +232,23 @@ mod tests {
         assert_eq!(
             transport.capabilities(),
             InternodeDataTransportCapabilities {
-                stream_read: true,
-                stream_write: true,
-                walk_dir: true,
-                registered_memory: false,
-                scatter_gather: false,
-                zero_copy_receive: false,
+                streaming_read: true,
+                streaming_write: true,
+                streaming_walk_dir: true,
+                ordered_delivery: true,
+                max_transfer_size: None,
+                fallback_supported: true,
             }
         );
+    }
+
+    #[test]
+    fn tcp_http_capabilities_are_conservative() {
+        let capabilities = TcpHttpInternodeDataTransport.capabilities();
+
+        assert!(capabilities.ordered_delivery);
+        assert_eq!(capabilities.max_transfer_size, None);
+        assert!(capabilities.fallback_supported);
     }
 
     #[test]
@@ -311,19 +329,35 @@ mod tests {
     }
 
     #[test]
+    fn transport_config_known_backends_are_current_oss_values() {
+        assert_eq!(
+            KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
+            &[DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP]
+        );
+
+        for configured in KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS {
+            let transport = build_internode_data_transport(Some(configured)).unwrap();
+
+            assert_eq!(transport.name(), DEFAULT_INTERNODE_DATA_TRANSPORT);
+        }
+    }
+
+    #[test]
     fn transport_config_rejects_unknown_backend() {
-        let err = build_internode_data_transport(Some("rdma")).expect_err("unknown backend should fail closed");
+        let err = build_internode_data_transport(Some("unsupported-backend")).expect_err("unknown backend should fail closed");
 
         assert!(err.to_string().contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
-        assert!(err.to_string().contains("rdma"));
+        assert!(err.to_string().contains("unsupported-backend"));
+        assert!(err.to_string().contains("supported values: tcp-http, tcp"));
     }
 
     #[test]
     fn cached_transport_config_error_uses_raw_message() {
-        let err = build_internode_data_transport_result(Some("rdma")).expect_err("unknown backend should fail closed");
+        let err =
+            build_internode_data_transport_result(Some("unsupported-backend")).expect_err("unknown backend should fail closed");
 
         assert!(!err.starts_with("io error "));
         assert!(err.contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
-        assert!(err.contains("rdma"));
+        assert!(err.contains("unsupported-backend"));
     }
 }

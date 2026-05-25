@@ -18,30 +18,34 @@ use chrono::Utc;
 use futures::pin_mut;
 use futures::{Stream, StreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue, header::HeaderName};
 use object_store::{
-    Attributes, CopyOptions, Error as o_Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
+    Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
+use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use rustfs_ecstore::store::ECStore;
-use rustfs_ecstore::store_api::ObjectIO;
-use rustfs_ecstore::store_api::ObjectOptions;
+use rustfs_ecstore::store_api::{GetObjectReader, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectOptions};
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
+use s3s::header::{
+    X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
+    X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+};
 use s3s::s3_error;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 use std::task::ready;
-use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
-use tracing::info;
 use transform_stream::AsyncTryStream;
 
 /// Maximum allowed object size for JSON DOCUMENT mode.
@@ -58,6 +62,8 @@ use transform_stream::AsyncTryStream;
 /// Default: 128 MiB.  This matches the AWS S3 Select limit for JSON DOCUMENT
 /// inputs.
 pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
+pub const INVALID_SCAN_RANGE_MESSAGE: &str =
+    "The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.";
 
 #[derive(Debug)]
 pub struct EcObjectStore {
@@ -75,6 +81,16 @@ pub struct EcObjectStore {
 
     store: Arc<ECStore>,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct SelectScanRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InvalidScanRange;
+
 impl EcObjectStore {
     pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
         let Some(store) = new_object_layer_fn() else {
@@ -123,6 +139,97 @@ impl EcObjectStore {
             store,
         })
     }
+
+    fn object_options(&self, options: &GetOptions) -> ObjectOptions {
+        ObjectOptions {
+            version_id: options.version.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn read_headers(&self) -> HeaderMap {
+        select_read_headers(&self.input)
+    }
+
+    fn scan_range(&self, object_size: u64) -> Result<Option<SelectScanRange>> {
+        let Some(scan_range) = self.input.request.scan_range.as_ref() else {
+            return Ok(None);
+        };
+        scan_range_from_bounds(scan_range.start, scan_range.end, object_size)
+    }
+
+    fn record_delimiter(&self) -> Vec<u8> {
+        self.input
+            .request
+            .input_serialization
+            .csv
+            .as_ref()
+            .and_then(|csv| csv.record_delimiter.as_ref())
+            .map(|delimiter| delimiter.as_bytes().to_vec())
+            .unwrap_or_else(|| b"\n".to_vec())
+    }
+
+    fn csv_has_header(&self) -> bool {
+        self.input
+            .request
+            .input_serialization
+            .csv
+            .as_ref()
+            .and_then(|csv| csv.file_header_info.as_ref())
+            .is_some_and(|info| matches!(info.as_str(), "USE" | "IGNORE"))
+    }
+
+    async fn object_info(&self, opts: &ObjectOptions) -> Result<rustfs_ecstore::store_api::ObjectInfo> {
+        self.store
+            .get_object_info(&self.input.bucket, &self.input.key, opts)
+            .await
+            .map_err(|err| map_storage_error(&self.input.bucket, &self.input.key, err))
+    }
+
+    async fn object_reader(&self, range: Option<HTTPRangeSpec>, opts: &ObjectOptions) -> Result<GetObjectReader> {
+        let h = self.read_headers();
+        self.store
+            .get_object_reader(&self.input.bucket, &self.input.key, range, h, opts)
+            .await
+            .map_err(|err| map_storage_error(&self.input.bucket, &self.input.key, err))
+    }
+
+    async fn read_raw_range_with_opts(&self, range: Range<u64>, opts: &ObjectOptions) -> Result<Bytes> {
+        if range.is_empty() {
+            return Ok(Bytes::new());
+        }
+        let reader = self.object_reader(Some(http_range_spec_from_range(range)), opts).await?;
+        let mut reader = reader.stream;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.map_err(|err| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(err),
+        })?;
+        Ok(Bytes::from(bytes))
+    }
+
+    async fn read_raw_range(&self, range: Range<u64>) -> Result<Bytes> {
+        self.read_raw_range_with_opts(range, &self.object_options(&GetOptions::new()))
+            .await
+    }
+
+    async fn read_header_record(&self, object_size: u64, delimiter: &[u8], opts: &ObjectOptions) -> Result<Bytes> {
+        if object_size == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let mut end = (DEFAULT_READ_BUFFER_SIZE as u64).min(object_size);
+        loop {
+            let bytes = self.read_raw_range_with_opts(0..end, opts).await?;
+            if let Some(pos) = find_delimiter(&bytes, delimiter) {
+                return Ok(bytes.slice(0..pos + delimiter.len()));
+            }
+            if end == object_size {
+                return Ok(bytes);
+            }
+            end = end.saturating_mul(2).min(object_size);
+        }
+    }
 }
 
 impl std::fmt::Display for EcObjectStore {
@@ -141,6 +248,150 @@ fn unsupported_store_error(op: &str) -> o_Error {
     }
 }
 
+fn insert_header(headers: &mut HeaderMap, name: HeaderName, value: Option<&str>) {
+    if let Some(value) = value
+        && let Ok(value) = HeaderValue::from_str(value)
+    {
+        headers.insert(name, value);
+    }
+}
+
+fn select_read_headers(input: &SelectObjectContentInput) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    insert_header(
+        &mut headers,
+        X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM,
+        input.sse_customer_algorithm.as_deref(),
+    );
+    insert_header(&mut headers, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY, input.sse_customer_key.as_deref());
+    insert_header(
+        &mut headers,
+        X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+        input.sse_customer_key_md5.as_deref(),
+    );
+    headers
+}
+
+fn http_range_spec_from_get_range(range: &GetRange) -> HTTPRangeSpec {
+    match range {
+        GetRange::Bounded(range) => http_range_spec_from_range(range.clone()),
+        GetRange::Offset(start) => HTTPRangeSpec {
+            is_suffix_length: false,
+            start: *start as i64,
+            end: -1,
+        },
+        GetRange::Suffix(length) => HTTPRangeSpec {
+            is_suffix_length: true,
+            start: *length as i64,
+            end: -1,
+        },
+    }
+}
+
+fn http_range_spec_from_range(range: Range<u64>) -> HTTPRangeSpec {
+    HTTPRangeSpec {
+        is_suffix_length: false,
+        start: range.start as i64,
+        end: range.end.saturating_sub(1) as i64,
+    }
+}
+
+fn http_range_spec_from_start(start: u64) -> HTTPRangeSpec {
+    HTTPRangeSpec {
+        is_suffix_length: false,
+        start: start as i64,
+        end: -1,
+    }
+}
+
+fn scan_range_read_start(scan_range: SelectScanRange, delimiter: &[u8]) -> u64 {
+    scan_range.start.saturating_sub(delimiter.len() as u64)
+}
+
+fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
+    if delimiter.is_empty() {
+        return None;
+    }
+    bytes.windows(delimiter.len()).position(|window| window == delimiter)
+}
+
+fn map_storage_error(bucket: &str, object: &str, err: StorageError) -> o_Error {
+    if is_err_bucket_not_found(&err) || is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+        return o_Error::NotFound {
+            path: format!("{bucket}/{object}"),
+            source: err.to_string().into(),
+        };
+    }
+    o_Error::Generic {
+        store: "EcObjectStore",
+        source: Box::new(err),
+    }
+}
+
+fn scan_range_from_bounds(start: Option<i64>, end: Option<i64>, object_size: u64) -> Result<Option<SelectScanRange>> {
+    parse_scan_range_from_bounds(start, end, object_size).map_err(|_| invalid_scan_range_store_error())
+}
+
+pub fn validate_scan_range_bounds(
+    start: Option<i64>,
+    end: Option<i64>,
+    object_size: u64,
+) -> std::result::Result<(), InvalidScanRange> {
+    parse_scan_range_from_bounds(start, end, object_size).map(|_| ())
+}
+
+fn parse_scan_range_from_bounds(
+    start: Option<i64>,
+    end: Option<i64>,
+    object_size: u64,
+) -> std::result::Result<Option<SelectScanRange>, InvalidScanRange> {
+    if start.is_none() && end.is_none() {
+        return Ok(None);
+    }
+    if start.is_some_and(|value| value < 0) || end.is_some_and(|value| value < 0) {
+        return Err(InvalidScanRange);
+    }
+    if let (Some(start), Some(end)) = (start, end)
+        && start > end
+    {
+        return Err(InvalidScanRange);
+    }
+    if let Some(start) = start {
+        let start = start as u64;
+        if object_size == 0 {
+            if start > 0 {
+                return Err(InvalidScanRange);
+            }
+            return Ok(Some(SelectScanRange { start: 0, end: 0 }));
+        }
+        if start >= object_size {
+            return Err(InvalidScanRange);
+        }
+    }
+    if object_size == 0 {
+        return Ok(Some(SelectScanRange { start: 0, end: 0 }));
+    }
+
+    let last_byte = object_size - 1;
+    let (start, end) = match (start, end) {
+        (Some(start), Some(end)) => (start as u64, (end as u64).min(last_byte)),
+        (Some(start), None) => (start as u64, last_byte),
+        (None, Some(suffix_len)) => {
+            let suffix_len = suffix_len as u64;
+            (object_size.saturating_sub(suffix_len), last_byte)
+        }
+        (None, None) => return Ok(None),
+    };
+    Ok(Some(SelectScanRange { start, end }))
+}
+
+fn invalid_scan_range_store_error() -> o_Error {
+    o_Error::Generic {
+        store: "EcObjectStore",
+        source: format!("ScanRange: {INVALID_SCAN_RANGE_MESSAGE}").into(),
+    }
+}
+
 #[async_trait]
 impl ObjectStore for EcObjectStore {
     async fn put_opts(&self, _location: &Path, _payload: PutPayload, _opts: PutOptions) -> Result<PutResult> {
@@ -151,24 +402,50 @@ impl ObjectStore for EcObjectStore {
         Err(unsupported_store_error("put_multipart_opts"))
     }
 
-    async fn get_opts(&self, location: &Path, _options: GetOptions) -> Result<GetResult> {
-        info!("{:?}", location);
-        let opts = ObjectOptions::default();
-        let h = HeaderMap::new();
-        let reader = self
-            .store
-            .get_object_reader(&self.input.bucket, &self.input.key, None, h, &opts)
-            .await
-            .map_err(|_| o_Error::NotFound {
-                path: format!("{}/{}", self.input.bucket, self.input.key),
-                source: "can not get object info".into(),
-            })?;
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        let opts = self.object_options(&options);
+        let needs_scan_context = options.range.is_none() && !options.head && self.input.request.scan_range.is_some();
+        let source_size = if needs_scan_context {
+            Some(self.object_info(&opts).await?.size as u64)
+        } else {
+            None
+        };
+        let scan_context = if needs_scan_context {
+            let original_size = source_size.expect("source size is loaded when scan range is present");
+            self.scan_range(original_size)?.map(|scan_range| (original_size, scan_range))
+        } else {
+            None
+        };
 
-        let original_size = reader.object_info.size as u64;
+        let range = options.range.as_ref().map(http_range_spec_from_get_range);
+        let reader = if let Some((original_size, scan_range)) = scan_context.as_ref() {
+            let delimiter = self.record_delimiter();
+            let read_start = scan_range_read_start(*scan_range, &delimiter);
+            let range = (*original_size > 0).then(|| http_range_spec_from_start(read_start));
+            self.object_reader(range, &opts).await?
+        } else {
+            self.object_reader(range, &opts).await?
+        };
+
+        let original_size = source_size.unwrap_or(reader.object_info.size as u64);
         let etag = reader.object_info.etag;
+        let version = reader.object_info.version_id.map(|version| version.to_string());
         let attributes = Attributes::default();
+        let result_range = match options.range.as_ref() {
+            Some(range) => range.as_range(original_size).map_err(|err| o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(err),
+            })?,
+            None => 0..original_size,
+        };
 
-        let (payload, size) = if self.is_json_document {
+        let payload = if options.head {
+            GetResultPayload::Stream(stream::empty().boxed())
+        } else if options.range.is_some() {
+            let size = (result_range.end - result_range.start) as usize;
+            let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE), size).boxed();
+            GetResultPayload::Stream(stream)
+        } else if self.is_json_document {
             // JSON DOCUMENT mode: gate on object size before doing any I/O.
             //
             // Small files (<= MAX_JSON_DOCUMENT_BYTES): build a lazy stream
@@ -195,41 +472,68 @@ impl ObjectStore for EcObjectStore {
                 });
             }
             let stream = json_document_ndjson_stream(reader.stream, original_size, self.json_sub_path.clone());
-            (object_store::GetResultPayload::Stream(stream), original_size)
+            GetResultPayload::Stream(stream)
+        } else if let Some((_, scan_range)) = scan_context {
+            let delimiter = self.record_delimiter();
+            let include_header = self.csv_has_header();
+            let read_start = scan_range_read_start(scan_range, &delimiter);
+            let header = if include_header && scan_range.start > 0 {
+                Some(self.read_header_record(original_size, &delimiter, &opts).await?)
+            } else {
+                None
+            };
+            let stream = scan_range_stream(
+                ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
+                delimiter,
+                scan_range,
+                include_header && header.is_none(),
+                read_start,
+            )
+            .boxed();
+            let stream = if let Some(header) = header {
+                stream::once(ready(Ok(header))).chain(stream).boxed()
+            } else {
+                stream
+            };
+            GetResultPayload::Stream(convert_field_delimiter_stream(stream, self.need_convert.then(|| self.delimiter.clone())))
         } else if self.need_convert {
             let stream = bytes_stream(
                 ReaderStream::with_capacity(ConvertStream::new(reader.stream, self.delimiter.clone()), DEFAULT_READ_BUFFER_SIZE),
                 original_size as usize,
             )
             .boxed();
-            (object_store::GetResultPayload::Stream(stream), original_size)
+            GetResultPayload::Stream(stream)
         } else {
             let stream = bytes_stream(
                 ReaderStream::with_capacity(reader.stream, DEFAULT_READ_BUFFER_SIZE),
                 original_size as usize,
             )
             .boxed();
-            (object_store::GetResultPayload::Stream(stream), original_size)
+            GetResultPayload::Stream(stream)
         };
 
         let meta = ObjectMeta {
             location: location.clone(),
             last_modified: Utc::now(),
-            size,
+            size: original_size,
             e_tag: etag,
-            version: None,
+            version,
         };
 
         Ok(GetResult {
             payload,
             meta,
-            range: 0..size,
+            range: result_range,
             attributes,
         })
     }
 
-    async fn get_ranges(&self, _location: &Path, _ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        Err(unsupported_store_error("get_ranges"))
+    async fn get_ranges(&self, _location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        let mut out = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            out.push(self.read_raw_range(range.clone()).await?);
+        }
+        Ok(out)
     }
 
     fn delete_stream(&self, _locations: BoxStream<'static, Result<Path>>) -> BoxStream<'static, Result<Path>> {
@@ -252,7 +556,11 @@ impl ObjectStore for EcObjectStore {
 pin_project! {
     struct ConvertStream<R> {
         inner: R,
-        delimiter: Vec<u8>,
+        converter: DelimiterConverter,
+        read_buf: Vec<u8>,
+        pending: Vec<u8>,
+        pending_pos: usize,
+        eof: bool,
     }
 }
 
@@ -260,29 +568,120 @@ impl<R> ConvertStream<R> {
     fn new(inner: R, delimiter: String) -> Self {
         ConvertStream {
             inner,
-            delimiter: delimiter.as_bytes().to_vec(),
+            converter: DelimiterConverter::new(delimiter.into_bytes()),
+            read_buf: vec![0; DEFAULT_READ_BUFFER_SIZE],
+            pending: Vec::new(),
+            pending_pos: 0,
+            eof: false,
         }
     }
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for ConvertStream<R> {
     #[tracing::instrument(level = "debug", skip_all)]
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let me = self.project();
-        ready!(Pin::new(&mut *me.inner).poll_read(cx, buf))?;
-        let bytes = buf.filled();
-        let replaced = replace_symbol(me.delimiter, bytes);
-        buf.clear();
-        buf.put_slice(&replaced);
-        Poll::Ready(Ok(()))
+    fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let this = self.project();
+        loop {
+            if drain_pending(this.pending, this.pending_pos, buf) || *this.eof {
+                return Poll::Ready(Ok(()));
+            }
+
+            let read_len = DEFAULT_READ_BUFFER_SIZE.min(buf.remaining().max(1));
+            let bytes_read = {
+                let mut read_buf = ReadBuf::new(&mut this.read_buf[..read_len]);
+                ready!(Pin::new(&mut *this.inner).poll_read(cx, &mut read_buf))?;
+                read_buf.filled().len()
+            };
+            if bytes_read == 0 {
+                *this.eof = true;
+                *this.pending = this.converter.finish();
+                *this.pending_pos = 0;
+                continue;
+            }
+
+            *this.pending = this.converter.convert_chunk(&this.read_buf[..bytes_read]);
+            *this.pending_pos = 0;
+        }
     }
 }
 
+struct DelimiterConverter {
+    delimiter: Vec<u8>,
+    carry: Vec<u8>,
+}
+
+impl DelimiterConverter {
+    fn new(delimiter: Vec<u8>) -> Self {
+        Self {
+            delimiter,
+            carry: Vec::new(),
+        }
+    }
+
+    fn convert_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.delimiter.is_empty() {
+            return chunk.to_vec();
+        }
+
+        let mut combined = Vec::with_capacity(self.carry.len() + chunk.len());
+        combined.extend_from_slice(&self.carry);
+        combined.extend_from_slice(chunk);
+
+        let safe_end = combined.len().saturating_sub(self.delimiter.len().saturating_sub(1));
+        let mut converted = Vec::with_capacity(combined.len());
+        let mut pos = 0;
+        while pos < safe_end {
+            if combined[pos..].starts_with(&self.delimiter) {
+                converted.push(DEFAULT_DELIMITER);
+                pos += self.delimiter.len();
+            } else {
+                converted.push(combined[pos]);
+                pos += 1;
+            }
+        }
+        self.carry.clear();
+        self.carry.extend_from_slice(&combined[pos..]);
+        converted
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        if self.delimiter.is_empty() {
+            return std::mem::take(&mut self.carry);
+        }
+        let converted = replace_symbol(&self.delimiter, &self.carry);
+        self.carry.clear();
+        converted
+    }
+}
+
+fn drain_pending(pending: &mut Vec<u8>, pending_pos: &mut usize, buf: &mut ReadBuf<'_>) -> bool {
+    if *pending_pos >= pending.len() {
+        pending.clear();
+        *pending_pos = 0;
+        return false;
+    }
+    if buf.remaining() == 0 {
+        return false;
+    }
+
+    let len = buf.remaining().min(pending.len() - *pending_pos);
+    buf.put_slice(&pending[*pending_pos..*pending_pos + len]);
+    *pending_pos += len;
+    if *pending_pos >= pending.len() {
+        pending.clear();
+        *pending_pos = 0;
+    }
+    true
+}
+
 fn replace_symbol(delimiter: &[u8], slice: &[u8]) -> Vec<u8> {
+    if delimiter.is_empty() {
+        return slice.to_vec();
+    }
+
     let mut result = Vec::with_capacity(slice.len());
     let mut i = 0;
     while i < slice.len() {
@@ -295,6 +694,148 @@ fn replace_symbol(delimiter: &[u8], slice: &[u8]) -> Vec<u8> {
         }
     }
     result
+}
+
+fn convert_field_delimiter_stream<S>(stream: S, delimiter: Option<String>) -> BoxStream<'static, Result<Bytes>>
+where
+    S: Stream<Item = Result<Bytes>> + Send + 'static,
+{
+    let Some(delimiter) = delimiter else {
+        return stream.boxed();
+    };
+    AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
+        let mut converter = DelimiterConverter::new(delimiter.into_bytes());
+        pin_mut!(stream);
+        while let Some(result) = stream.next().await {
+            let bytes = result?;
+            let converted = converter.convert_chunk(&bytes);
+            if !converted.is_empty() {
+                y.yield_ok(Bytes::from(converted)).await;
+            }
+        }
+        let converted = converter.finish();
+        if !converted.is_empty() {
+            y.yield_ok(Bytes::from(converted)).await;
+        }
+        Ok(())
+    })
+    .boxed()
+}
+
+struct ScanRangeState<S> {
+    stream: S,
+    delimiter: Vec<u8>,
+    range: SelectScanRange,
+    include_header: bool,
+    offset: u64,
+    record_start: u64,
+    record: Vec<u8>,
+    pending: VecDeque<Bytes>,
+    done: bool,
+}
+
+fn scan_range_stream<S>(
+    stream: S,
+    delimiter: Vec<u8>,
+    range: SelectScanRange,
+    include_header: bool,
+    base_offset: u64,
+) -> BoxStream<'static, Result<Bytes>>
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Send + Unpin + 'static,
+{
+    let state = ScanRangeState {
+        stream,
+        delimiter,
+        range,
+        include_header,
+        offset: base_offset,
+        record_start: base_offset,
+        record: Vec::new(),
+        pending: VecDeque::new(),
+        done: false,
+    };
+
+    stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(bytes) = state.pending.pop_front() {
+                return Some((Ok(bytes), state));
+            }
+            if state.done {
+                return None;
+            }
+            match state.stream.next().await {
+                Some(Ok(bytes)) => state.push_chunk(&bytes),
+                Some(Err(err)) => {
+                    state.done = true;
+                    return Some((
+                        Err(o_Error::Generic {
+                            store: "EcObjectStore",
+                            source: Box::new(err),
+                        }),
+                        state,
+                    ));
+                }
+                None => {
+                    state.finish_pending_record();
+                    state.done = true;
+                }
+            }
+        }
+    })
+    .boxed()
+}
+
+impl<S> ScanRangeState<S> {
+    fn push_chunk(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() || self.done {
+            return;
+        }
+        if self.record.is_empty() {
+            self.record_start = self.offset;
+        }
+        let search_start = self.record.len().saturating_sub(self.delimiter.len().saturating_sub(1));
+        self.record.extend_from_slice(bytes);
+        self.offset = self.offset.saturating_add(bytes.len() as u64);
+
+        let mut search_start = search_start;
+        while let Some(pos) = find_delimiter(&self.record[search_start..], &self.delimiter) {
+            let record_end = search_start + pos + self.delimiter.len();
+            self.finish_record(record_end);
+            if self.done {
+                break;
+            }
+            search_start = 0;
+        }
+    }
+
+    fn finish_record(&mut self, record_end: usize) {
+        let record = self.record.drain(..record_end).collect::<Vec<_>>();
+        let record_start = self.record_start;
+        self.record_start = self.record_start.saturating_add(record_end as u64);
+        self.push_record(record, record_start);
+    }
+
+    fn finish_pending_record(&mut self) {
+        if self.record.is_empty() {
+            return;
+        }
+        let record = std::mem::take(&mut self.record);
+        let record_start = self.record_start;
+        self.push_record(record, record_start);
+    }
+
+    fn push_record(&mut self, record: Vec<u8>, record_start: u64) {
+        let include_header = self.include_header && record_start == 0;
+        let include_record = record_start >= self.range.start && record_start <= self.range.end;
+        if include_header || include_record {
+            self.pending.push_back(Bytes::from(record));
+        } else {
+            if record_start > self.range.end {
+                self.done = true;
+            }
+        }
+    }
 }
 
 /// Extract the JSON sub-path from a SQL expression's FROM clause.
@@ -508,19 +1049,226 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::{extract_json_sub_path_from_expression, flatten_json_document_to_ndjson, replace_symbol};
+    use super::{
+        ConvertStream, SelectScanRange, convert_field_delimiter_stream, extract_json_sub_path_from_expression, find_delimiter,
+        flatten_json_document_to_ndjson, http_range_spec_from_get_range, replace_symbol, scan_range_from_bounds,
+        scan_range_read_start, scan_range_stream, select_read_headers,
+    };
+    use bytes::Bytes;
+    use futures::{StreamExt, stream};
+    use object_store::GetRange;
+    use s3s::dto::{
+        CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
+        SelectObjectContentRequest,
+    };
+    use s3s::header::{
+        X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
+        X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+    };
+    use tokio::io::AsyncReadExt;
+    use tokio_util::io::StreamReader;
 
     #[test]
     fn test_replace() {
-        let ss = String::from("dandan&&is&&best");
-        let slice = ss.as_bytes();
-        let delimiter = b"&&";
-        println!("len: {}", "╦".len());
-        let result = replace_symbol(delimiter, slice);
-        match String::from_utf8(result) {
-            Ok(s) => println!("slice: {s}"),
-            Err(e) => eprintln!("Error converting to string: {e}"),
+        let result = replace_symbol(b"&&", b"dandan&&is&&best");
+        assert_eq!(result, b"dandan,is,best");
+    }
+
+    #[tokio::test]
+    async fn test_convert_stream_replaces_delimiter_across_chunks() {
+        let chunks = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"a&")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"&b&&c")),
+        ]);
+        let reader = StreamReader::new(chunks);
+        let mut reader = ConvertStream::new(reader, "&&".to_string());
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"a,b,c");
+    }
+
+    #[tokio::test]
+    async fn test_convert_stream_replaces_delimiter_at_stream_end() {
+        let chunks = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"a&")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"&")),
+        ]);
+        let reader = StreamReader::new(chunks);
+        let mut reader = ConvertStream::new(reader, "&&".to_string());
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"a,");
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_stream_keeps_header_and_selected_record() {
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"h1,h2\n1,a\n2,b\n3,c\n"))]);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 10, end: 11 }, true, 0);
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
         }
+        assert_eq!(output, b"h1,h2\n2,b\n");
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_stream_skips_record_when_start_is_in_middle() {
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"1,a\n2,b\n3,c\n"))]);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 2, end: 7 }, false, 0);
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"2,b\n");
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_stream_keeps_record_when_end_is_in_middle() {
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"1,a\n2,b\n3,c\n"))]);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 0, end: 5 }, false, 0);
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"1,a\n2,b\n");
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_stream_uses_base_offset_for_range_reader() {
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"\n2,b\n3,c\n"))]);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 4, end: 7 }, false, 3);
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"2,b\n");
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_stream_handles_delimiter_split_across_chunks() {
+        let chunks = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"h1,h2\r")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"\n1,a\r\n2,b\r")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"\n3,c\r\n")),
+        ]);
+        let mut stream = scan_range_stream(chunks, b"\r\n".to_vec(), SelectScanRange { start: 12, end: 14 }, true, 0);
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"h1,h2\r\n2,b\r\n");
+    }
+
+    #[test]
+    fn test_scan_range_read_start_keeps_full_delimiter_boundary() {
+        let range = SelectScanRange { start: 10, end: 20 };
+        assert_eq!(scan_range_read_start(range, b"\n"), 9);
+        assert_eq!(scan_range_read_start(range, b"\r\n"), 8);
+        assert_eq!(scan_range_read_start(range, b"abcdef"), 4);
+    }
+
+    #[test]
+    fn test_find_delimiter_handles_multi_byte_delimiter() {
+        assert_eq!(find_delimiter(b"one\r\ntwo", b"\r\n"), Some(3));
+        assert_eq!(find_delimiter(b"one\ntwo", b"\r\n"), None);
+    }
+
+    #[test]
+    fn test_scan_range_end_only_uses_aws_suffix_semantics() {
+        let range = scan_range_from_bounds(None, Some(35), 100).unwrap().unwrap();
+        assert_eq!(range.start, 65);
+        assert_eq!(range.end, 99);
+    }
+
+    #[test]
+    fn test_scan_range_start_after_object_is_rejected_before_reader() {
+        let err = scan_range_from_bounds(Some(100), None, 100).unwrap_err();
+        assert!(err.to_string().contains("ScanRange"));
+    }
+
+    #[test]
+    fn test_scan_range_start_after_end_is_rejected() {
+        let err = scan_range_from_bounds(Some(20), Some(10), 100).unwrap_err();
+        assert!(err.to_string().contains("ScanRange"));
+    }
+
+    #[test]
+    fn test_get_range_conversion_for_parquet_bounded_ranges() {
+        let range = http_range_spec_from_get_range(&GetRange::Bounded(10..20));
+        assert!(!range.is_suffix_length);
+        assert_eq!(range.start, 10);
+        assert_eq!(range.end, 19);
+    }
+
+    #[test]
+    fn test_select_read_headers_preserves_ssec_context() {
+        let input = SelectObjectContentInput {
+            bucket: "bucket".to_string(),
+            expected_bucket_owner: None,
+            key: "object.csv".to_string(),
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some("customer-key".to_string()),
+            sse_customer_key_md5: Some("customer-key-md5".to_string()),
+            request: SelectObjectContentRequest {
+                expression: "SELECT * FROM s3object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput::default()),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        };
+
+        let headers = select_read_headers(&input);
+        assert_eq!(headers.get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM).unwrap(), "AES256");
+        assert_eq!(headers.get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY).unwrap(), "customer-key");
+        assert_eq!(headers.get(X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5).unwrap(), "customer-key-md5");
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_output_can_convert_field_delimiter() {
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"a&&1\nb&&2\n"))]);
+        let stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 0, end: 10 }, false, 0);
+        let mut stream = convert_field_delimiter_stream(stream, Some("&&".to_string()));
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"a,1\nb,2\n");
+    }
+
+    #[tokio::test]
+    async fn test_field_delimiter_stream_converts_delimiter_split_across_chunks() {
+        let chunks = stream::iter(vec![
+            Ok::<_, object_store::Error>(Bytes::from_static(b"a&")),
+            Ok::<_, object_store::Error>(Bytes::from_static(b"&1\nb&&2\n")),
+        ]);
+        let mut stream = convert_field_delimiter_stream(chunks, Some("&&".to_string()));
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"a,1\nb,2\n");
+    }
+
+    #[tokio::test]
+    async fn test_field_delimiter_stream_converts_delimiter_at_stream_end() {
+        let chunks = stream::iter(vec![
+            Ok::<_, object_store::Error>(Bytes::from_static(b"a&")),
+            Ok::<_, object_store::Error>(Bytes::from_static(b"&")),
+        ]);
+        let mut stream = convert_field_delimiter_stream(chunks, Some("&&".to_string()));
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, b"a,");
     }
 
     /// A JSON array is split into one NDJSON line per element.

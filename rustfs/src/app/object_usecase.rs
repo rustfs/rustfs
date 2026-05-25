@@ -35,9 +35,6 @@ use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_
 use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use crate::storage::*;
 use bytes::Bytes;
-use datafusion::arrow::{
-    csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
-};
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
@@ -87,12 +84,11 @@ use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
-use rustfs_s3select_api::{
-    object_store::bytes_stream,
-    query::{Context, Query},
+use rustfs_s3select_api::object_store::bytes_stream;
+use rustfs_targets::{
+    EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
-use rustfs_s3select_query::get_global_db;
-use rustfs_targets::EventName;
+use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
@@ -108,10 +104,6 @@ use rustfs_utils::http::{
     insert_str, remove_str,
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
-use rustfs_utils::{
-    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
-    get_request_user_agent,
-};
 use rustfs_zip::CompressionFormat;
 use s3s::dto::*;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
@@ -127,8 +119,6 @@ use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
@@ -1801,14 +1791,18 @@ impl DefaultObjectUsecase {
         let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => {
+                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                Some(existing_obj_info.size.max(0) as u64)
+            }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
+                None
             }
-        }
+        };
 
         let actual_size = size;
 
@@ -1923,8 +1917,13 @@ impl DefaultObjectUsecase {
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
-        // Fast in-memory update for immediate quota consistency
-        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+        // Fast in-memory update for immediate quota and admin usage consistency
+        rustfs_ecstore::data_usage::record_bucket_object_write_memory(
+            &bucket,
+            previous_current_size,
+            obj_info.size.max(0) as u64,
+        )
+        .await;
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -2665,14 +2664,18 @@ impl DefaultObjectUsecase {
         let current_opts: ObjectOptions = get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => {
+                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                Some(existing_obj_info.size.max(0) as u64)
+            }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
+                None
             }
-        }
+        };
 
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         let mut effective_sse = requested_sse.or_else(|| {
@@ -2845,7 +2848,8 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
+            rustfs_ecstore::data_usage::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64)
+                .await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3101,10 +3105,13 @@ impl DefaultObjectUsecase {
                     existing_object_infos[i].as_ref(),
                 )
                 .await;
-                let size = object_sizes[i];
-                if size > 0 {
-                    rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
-                }
+                let size = object_sizes[i].max(0) as u64;
+                rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
+                    &bucket,
+                    size,
+                    existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
+                )
+                .await;
                 continue;
             }
 
@@ -3319,8 +3326,13 @@ impl DefaultObjectUsecase {
 
         enqueue_transitioned_delete_cleanup(&bucket, &key, &opts, existing_object_info.as_ref()).await;
 
-        // Fast in-memory update for immediate quota consistency
-        rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+        // Fast in-memory update for immediate quota and admin usage consistency
+        rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
+            &bucket,
+            obj_info.size.max(0) as u64,
+            opts.version_id.is_none(),
+        )
+        .await;
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {
@@ -3950,74 +3962,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        info!("handle select_object_content");
-
-        let input = Arc::new(req.input);
-        info!("{:?}", input);
-
-        let db = get_global_db((*input).clone(), false).await.map_err(|e| {
-            error!("get global db failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
-        let result = db
-            .execute(&query)
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
-
-        let results = result
-            .result()
-            .chunk_result()
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?
-            .to_vec();
-
-        let mut buffer = Vec::new();
-        if input.request.output_serialization.csv.is_some() {
-            let mut csv_writer = CsvWriterBuilder::new().with_header(false).build(&mut buffer);
-            for batch in results {
-                csv_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to csv. e: {}", e.to_string()))?;
-            }
-        } else if input.request.output_serialization.json.is_some() {
-            let mut json_writer = JsonWriterBuilder::new()
-                .with_explicit_nulls(true)
-                .build::<_, JsonArray>(&mut buffer);
-            for batch in results {
-                json_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to json. e: {}", e.to_string()))?;
-            }
-            json_writer
-                .finish()
-                .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
-        } else {
-            return Err(s3_error!(
-                InvalidArgument,
-                "Unsupported output format. Supported formats are CSV and JSON"
-            ));
-        }
-
-        let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
-        let stream = ReceiverStream::new(rx);
-        spawn_traced(async move {
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
-                .await;
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Records(RecordsEvent {
-                    payload: Some(Bytes::from(buffer)),
-                })))
-                .await;
-            let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
-
-            drop(tx);
-        });
-
-        Ok(S3Response::new(SelectObjectContentOutput {
-            payload: Some(SelectObjectContentEventStream::new(stream)),
-        }))
+        crate::app::select_object::execute_select_object_content(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]

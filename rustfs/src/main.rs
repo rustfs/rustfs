@@ -33,6 +33,7 @@ use rustfs::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
+use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS;
 use rustfs_credentials::init_global_action_credentials;
@@ -220,18 +221,25 @@ async fn async_main() -> Result<()> {
         debug!("rustls crypto provider already installed, skipping aws-lc-rs default install");
     }
     // Initialize TLS outbound material (root CAs, mTLS identity) if configured.
-    // Server-side TLS acceptor is built separately inside start_http_server()
-    // using the same TlsMaterialSnapshot loading logic.
+    // Server-side TLS acceptor is built separately inside start_http_server().
+    // Single load via tls-runtime; outbound is enriched with platform CAs and
+    // published to the global state before any HTTP listener starts.
     if let Some(tls_path) = config.tls_path.as_deref().map(str::trim).filter(|path| !path.is_empty()) {
-        match rustfs::server::tls_material::TlsMaterialSnapshot::load(tls_path).await {
+        match rustfs::server::tls_material::load_tls_material(tls_path).await {
             Ok(snapshot) => {
-                snapshot.apply_outbound().await;
+                use rustfs_tls_runtime::{TlsGeneration, publish_global_outbound_tls_state, record_tls_generation};
+                let generation = TlsGeneration(rustfs_common::get_global_outbound_tls_generation().saturating_add(1));
+                publish_global_outbound_tls_state(generation, &snapshot.outbound).await;
+                record_tls_generation("rustfs_server_startup", generation.0);
                 info!(target: "rustfs::main", "TLS outbound material initialized from {}", tls_path);
             }
             Err(e) => {
                 error!("Failed to initialize TLS from {}: {}", tls_path, e);
                 return Err(Error::other(e.to_string()));
             }
+        }
+        if rustfs_obs::observability_metric_enabled() {
+            rustfs_tls_runtime::init_tls_metrics();
         }
     }
 
@@ -301,6 +309,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), config.volumes.clone())
         .await
         .map_err(Error::other)?;
+    enforce_unsupported_fs_policy(&endpoint_pools)?;
 
     set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;
@@ -572,10 +581,6 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         init_heal_manager(heal_storage, None).await?;
     }
 
-    if enable_scanner {
-        init_data_scanner(ctx.clone(), store.clone()).await;
-    }
-
     if !enable_heal && !enable_scanner {
         info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
@@ -609,6 +614,10 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     rustfs_common::set_global_init_time_now().await;
     // Publish ready only after all critical bootstrap metadata is in place
     state_manager.update(ServiceState::Ready);
+
+    if enable_scanner {
+        init_data_scanner(ctx.clone(), store.clone()).await;
+    }
 
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;

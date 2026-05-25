@@ -929,7 +929,7 @@ impl ReplicationResyncer {
 }
 
 fn heal_should_use_check_replicate_delete(oi: &ObjectInfo) -> bool {
-    oi.delete_marker || (!oi.replication_status.is_empty() && oi.replication_status != ReplicationStatusType::Failed)
+    oi.delete_marker || !oi.version_purge_status.is_empty()
 }
 
 pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationConfig) -> ReplicateObjectInfo {
@@ -939,8 +939,8 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
     if let Some(rc) = rcfg.config.as_ref()
         && !rc.role.is_empty()
     {
-        if !oi.replication_status.is_empty() {
-            oi.replication_status_internal = Some(format!("{}={};", rc.role, oi.replication_status.as_str()));
+        if !oi.version_purge_status.is_empty() {
+            oi.version_purge_status_internal = Some(format!("{}={};", rc.role, oi.version_purge_status.as_str()));
         }
 
         if !oi.replication_status.is_empty() {
@@ -3742,7 +3742,7 @@ mod tests {
     }
 
     #[test]
-    fn test_heal_should_use_check_replicate_delete_pending_uses_delete_path() {
+    fn test_heal_should_use_check_replicate_delete_pending_non_delete_marker_uses_must_replicate_path() {
         let oi = ObjectInfo {
             bucket: "b".to_string(),
             name: "obj".to_string(),
@@ -3751,8 +3751,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            heal_should_use_check_replicate_delete(&oi),
-            "Pending (non-Failed) status with non-empty replication uses check_replicate_delete path"
+            !heal_should_use_check_replicate_delete(&oi),
+            "Pending non-delete-marker object must use must_replicate path to evaluate current target set"
         );
     }
 
@@ -3768,6 +3768,36 @@ mod tests {
         assert!(
             heal_should_use_check_replicate_delete(&oi),
             "Delete marker always uses check_replicate_delete path"
+        );
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_version_purge_status_uses_delete_path() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: false,
+            version_purge_status: VersionPurgeStatusType::Pending,
+            ..Default::default()
+        };
+        assert!(
+            heal_should_use_check_replicate_delete(&oi),
+            "Version purge entries must use check_replicate_delete path"
+        );
+    }
+
+    #[test]
+    fn test_heal_should_use_check_replicate_delete_completed_non_delete_marker_uses_must_replicate_path() {
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+        assert!(
+            !heal_should_use_check_replicate_delete(&oi),
+            "Completed non-delete-marker object must use must_replicate path so new targets can be evaluated"
         );
     }
 
@@ -4049,6 +4079,32 @@ mod tests {
             roi.dsc.replicate_any() || roi.dsc.targets_map.is_empty(),
             "With no replication config, dsc may be empty; with config, replicate_any() would be true and queueing would occur"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_heal_replicate_object_info_maps_version_purge_status_for_role() {
+        let role = "arn:rustfs:replication::target:bucket";
+        let oi = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "key".to_string(),
+            delete_marker: false,
+            version_purge_status: VersionPurgeStatusType::Pending,
+            version_id: Some(Uuid::nil()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let rcfg = ReplicationConfig::new(
+            Some(ReplicationConfiguration {
+                role: role.to_string(),
+                rules: vec![],
+            }),
+            None,
+        );
+        let roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+
+        assert_eq!(roi.replication_status_internal, None);
+        assert_eq!(roi.version_purge_status_internal.as_deref(), Some(format!("{role}=PENDING;").as_str()));
+        assert_eq!(roi.target_purge_statuses.get(role), Some(&VersionPurgeStatusType::Pending));
     }
 
     #[tokio::test]

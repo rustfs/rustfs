@@ -69,9 +69,13 @@ const ENV_FAILED_OBJECTS_MAX: &str = "RUSTFS_DATA_USAGE_FAILED_OBJECTS_MAX";
 const DEFAULT_FAILED_OBJECT_TTL_SECS: u32 = 86_400;
 const DEFAULT_FAILED_OBJECTS_MAX: u32 = 10_000;
 const METRIC_SCANNER_INLINE_HEAL_TOTAL: &str = "rustfs_scanner_inline_heal_total";
+const METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL: &str = "rustfs_scanner_excess_object_versions_total";
+const METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL: &str = "rustfs_scanner_excess_object_version_size_total";
+const METRIC_SCANNER_EXCESS_FOLDERS_TOTAL: &str = "rustfs_scanner_excess_folders_total";
 
 static SCANNER_INLINE_HEAL_WARN_ONCE: Once = Once::new();
 static SCANNER_INLINE_HEAL_METRICS_ONCE: Once = Once::new();
+static SCANNER_ALERT_METRICS_ONCE: Once = Once::new();
 
 pub fn data_usage_update_dir_cycles() -> u32 {
     rustfs_utils::get_env_u32(ENV_DATA_USAGE_UPDATE_DIR_CYCLES, DATA_USAGE_UPDATE_DIR_CYCLES)
@@ -100,6 +104,50 @@ fn ensure_scanner_inline_heal_metric_registered() {
         );
         counter!(METRIC_SCANNER_INLINE_HEAL_TOTAL).increment(0);
     });
+}
+
+fn ensure_scanner_alert_metrics_registered() {
+    SCANNER_ALERT_METRICS_ONCE.call_once(|| {
+        describe_counter!(
+            METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL,
+            "Total scanner alerts for objects with too many retained versions."
+        );
+        describe_counter!(
+            METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL,
+            "Total scanner alerts for objects whose retained versions exceed the cumulative size threshold."
+        );
+        describe_counter!(
+            METRIC_SCANNER_EXCESS_FOLDERS_TOTAL,
+            "Total scanner alerts for folders with too many direct subfolders."
+        );
+    });
+}
+
+fn scanner_excess_versions_threshold() -> u64 {
+    rustfs_utils::get_env_u64(
+        rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSIONS,
+        rustfs_config::DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS,
+    )
+}
+
+fn scanner_excess_version_size_threshold() -> u64 {
+    rustfs_utils::get_env_u64(
+        rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE,
+        rustfs_config::DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE,
+    )
+}
+
+fn scanner_excess_folders_threshold() -> u64 {
+    rustfs_utils::get_env_u64(
+        rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS,
+        rustfs_config::DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS,
+    )
+}
+
+fn should_alert_excessive_versions(remaining_versions: usize, cumulative_size: i64) -> (bool, bool) {
+    let too_many_versions = remaining_versions as u64 >= scanner_excess_versions_threshold();
+    let too_large_versions = cumulative_size > 0 && cumulative_size as u64 >= scanner_excess_version_size_threshold();
+    (too_many_versions, too_large_versions)
 }
 
 fn warn_inline_heal_compat_requested() {
@@ -503,7 +551,7 @@ impl ScannerItem {
         };
 
         let roi = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
-        if oi.delete_marker || oi.version_purge_status.is_empty() {
+        if !Self::should_account_replication_stats(oi) {
             return;
         }
 
@@ -543,6 +591,10 @@ impl ScannerItem {
             size_summary.replica_size += roi.size;
             size_summary.replica_count += 1;
         }
+    }
+
+    fn should_account_replication_stats(oi: &ObjectInfo) -> bool {
+        !oi.delete_marker && oi.version_purge_status.is_empty()
     }
 
     async fn enqueue_heal(&mut self, oi: &ObjectInfo) {
@@ -588,8 +640,38 @@ impl ScannerItem {
         done_heal();
     }
 
-    fn alert_excessive_versions(&self, _object_infos_length: usize, _cumulative_size: i64) {
-        // TODO: Implement alerting for excessive versions
+    fn alert_excessive_versions(&self, remaining_versions: usize, cumulative_size: i64) {
+        ensure_scanner_alert_metrics_registered();
+        let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
+        if too_many_versions {
+            counter!(
+                METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL,
+                "bucket" => self.bucket.clone()
+            )
+            .increment(1);
+            warn!(
+                bucket = %self.bucket,
+                object = %self.object_path(),
+                versions = remaining_versions,
+                threshold = scanner_excess_versions_threshold(),
+                "scanner detected object with excessive retained versions"
+            );
+        }
+        if too_large_versions {
+            counter!(
+                METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL,
+                "bucket" => self.bucket.clone()
+            )
+            .increment(1);
+            warn!(
+                bucket = %self.bucket,
+                object = %self.object_path(),
+                versions = remaining_versions,
+                cumulative_size,
+                threshold = scanner_excess_version_size_threshold(),
+                "scanner detected object with excessive retained version size"
+            );
+        }
     }
 }
 
@@ -692,6 +774,27 @@ impl FolderScanner {
         for (key, _) in entries.into_iter().take(remove_count) {
             failed.remove(&key);
         }
+    }
+
+    fn alert_excessive_folders(&self, folder: &str, total_folders: usize) {
+        let threshold = scanner_excess_folders_threshold();
+        if total_folders as u64 <= threshold {
+            return;
+        }
+
+        ensure_scanner_alert_metrics_registered();
+        counter!(
+            METRIC_SCANNER_EXCESS_FOLDERS_TOTAL,
+            "root" => self.root.clone()
+        )
+        .increment(1);
+        warn!(
+            root = %self.root,
+            folder,
+            folders = total_folders,
+            threshold,
+            "scanner detected folder with excessive direct subfolders"
+        );
     }
 
     pub async fn should_heal(&self) -> bool {
@@ -1011,7 +1114,8 @@ impl FolderScanner {
                 && existing_folders.len() + new_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS)
                 || existing_folders.len() + new_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS;
 
-            // TODO: Check for excess folders and send events
+            let total_folders = existing_folders.len() + new_folders.len();
+            self.alert_excessive_folders(&folder.name, total_folders);
 
             if !into.compacted && should_compact {
                 into.compacted = true;
@@ -1557,10 +1661,12 @@ mod tests {
 
     use super::*;
     use rustfs_ecstore::disk::{DiskOption, endpoint::Endpoint, new_disk};
+    use rustfs_filemeta::VersionPurgeStatusType;
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::AtomicBool;
+    use temp_env::with_var;
     use uuid::Uuid;
 
     async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
@@ -1661,6 +1767,45 @@ mod tests {
         let now = FolderScanner::now_secs();
         scanner.new_cache.info.failed_objects.insert("path2".to_string(), now);
         assert!(!scanner.should_skip_failed("path2"));
+    }
+
+    #[test]
+    fn test_should_account_replication_stats_only_for_live_object_versions() {
+        let live = ObjectInfo::default();
+        assert!(ScannerItem::should_account_replication_stats(&live));
+
+        let delete_marker = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert!(!ScannerItem::should_account_replication_stats(&delete_marker));
+
+        let purge_version = ObjectInfo {
+            version_purge_status: VersionPurgeStatusType::Pending,
+            ..Default::default()
+        };
+        assert!(!ScannerItem::should_account_replication_stats(&purge_version));
+    }
+
+    #[test]
+    #[serial]
+    fn test_excessive_version_alert_thresholds_use_env() {
+        with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSIONS, Some("3"), || {
+            with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, Some("100"), || {
+                assert_eq!(should_alert_excessive_versions(2, 99), (false, false));
+                assert_eq!(should_alert_excessive_versions(3, 99), (true, false));
+                assert_eq!(should_alert_excessive_versions(2, 100), (false, true));
+                assert_eq!(should_alert_excessive_versions(3, 100), (true, true));
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_excessive_folders_threshold_uses_env() {
+        with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, Some("3"), || {
+            assert_eq!(scanner_excess_folders_threshold(), 3);
+        });
     }
 
     #[tokio::test]

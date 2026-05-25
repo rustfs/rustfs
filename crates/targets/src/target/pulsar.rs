@@ -16,14 +16,20 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload_with_records, open_target_queue_store, persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, open_target_queue_store,
+        persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
 use pulsar::{Authentication, Producer, Pulsar, TokioExecutor};
+use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::path::Path;
@@ -136,6 +142,13 @@ pub async fn connect_pulsar(args: &PulsarArgs) -> Result<Pulsar<TokioExecutor>, 
     }
 
     if !args.tls_ca.is_empty() {
+        let certs = load_cert_bundle_der_bytes(&args.tls_ca)
+            .map_err(|e| TargetError::Configuration(format!("Failed to parse Pulsar tls_ca: {e}")))?;
+        if certs.is_empty() {
+            return Err(TargetError::Configuration(
+                "Pulsar tls_ca did not contain any parsable certificates".to_string(),
+            ));
+        }
         builder = builder
             .with_certificate_chain_file(&args.tls_ca)
             .map_err(|e| TargetError::Configuration(format!("Failed to load Pulsar tls_ca: {e}")))?;
@@ -158,6 +171,9 @@ where
     id: TargetID,
     args: PulsarArgs,
     client: Mutex<Option<Pulsar<TokioExecutor>>>,
+    tls_state: Mutex<TargetTlsState>,
+    /// When set, the coordinator drives TLS reload; inline fingerprint check is skipped.
+    tls_adapter: Option<TlsReloadAdapter<Pulsar<TokioExecutor>>>,
     producer: AsyncMutex<Option<Producer<TokioExecutor>>>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     connected: AtomicBool,
@@ -174,6 +190,8 @@ where
             id: self.id.clone(),
             args: self.args.clone(),
             client: Mutex::new(self.client.lock().unwrap().clone()),
+            tls_state: Mutex::new(self.tls_state.lock().unwrap().clone()),
+            tls_adapter: self.tls_adapter.clone(),
             producer: AsyncMutex::new(None),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: AtomicBool::new(self.connected.load(Ordering::SeqCst)),
@@ -199,6 +217,8 @@ where
             id: target_id,
             args,
             client: Mutex::new(None),
+            tls_state: Mutex::new(TargetTlsState::default()),
+            tls_adapter: None,
             producer: AsyncMutex::new(None),
             store: queue_store,
             connected: AtomicBool::new(false),
@@ -207,7 +227,36 @@ where
         })
     }
 
+    fn clear_cached_client_connection(&self) {
+        self.client.lock().unwrap().take();
+    }
+
+    fn clear_cached_client(&self) {
+        self.clear_cached_client_connection();
+        self.tls_state.lock().unwrap().reset();
+    }
+
     async fn get_or_connect_client(&self) -> Result<Pulsar<TokioExecutor>, TargetError> {
+        // When a TLS reload adapter is attached, it drives client rebuilds
+        // in the background. The inline per-send fingerprint check is skipped.
+        if let Some(adapter) = &self.tls_adapter {
+            let material = adapter.current_material();
+            {
+                let mut guard = self.client.lock().unwrap();
+                *guard = Some((*material).clone());
+            }
+        } else {
+            let next_fingerprint = build_target_tls_fingerprint(&self.args.tls_ca, "", "").await?;
+            let tls_changed = {
+                let tls_state_guard = self.tls_state.lock().unwrap();
+                tls_state_guard.needs_update(&next_fingerprint)
+            };
+            if tls_changed {
+                self.clear_cached_client_connection();
+                self.tls_state.lock().unwrap().refresh(next_fingerprint);
+            }
+        }
+
         if let Some(client) = self.client.lock().unwrap().clone() {
             return Ok(client);
         }
@@ -259,6 +308,56 @@ where
             .map_err(|e| TargetError::Request(format!("Failed to receive Pulsar receipt: {e}")))?;
         self.delivery_counters.record_success();
         Ok(())
+    }
+}
+
+/// Coordinated TLS hot-reload implementation for Pulsar targets.
+///
+/// Pulsar only uses a CA certificate (no client cert/key).
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the client without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for PulsarTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Pulsar<TokioExecutor>;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
+            target_label: format!("pulsar:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        connect_pulsar(&self.args).await
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        // Pulsar client is Clone, so we clone from the Arc and store it.
+        {
+            let mut guard = self.client.lock().unwrap();
+            *guard = Some((*material).clone());
+        }
+        // Producer is bound to the old client; clear it so next send rebuilds.
+        {
+            let mut producer = self.producer.lock().await;
+            *producer = None;
+        }
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        // Pulsar only uses CA, no client cert/key.
+        validate_tls_material(&self.args.tls_ca, "", "")
     }
 }
 
@@ -321,8 +420,13 @@ where
                 .map_err(|e| TargetError::Network(format!("Failed to close Pulsar producer: {e}")))?;
         }
         *producer = None;
-        self.client.lock().unwrap().take();
+        self.clear_cached_client();
         self.connected.store(false, Ordering::SeqCst);
+        // If a TLS reload adapter is attached, reset its error tracking
+        // so that a future re-init does not inherit stale failure state.
+        if let Some(adapter) = &self.tls_adapter {
+            *adapter.runtime_state().last_error.write() = None;
+        }
         info!(target_id = %self.id, "Pulsar target closed");
         Ok(())
     }
@@ -353,5 +457,47 @@ where
 
     fn record_final_failure(&self) {
         self.delivery_counters.record_final_failure();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args() -> PulsarArgs {
+        PulsarArgs {
+            enable: true,
+            broker: "pulsar://127.0.0.1:6650".to_string(),
+            topic: "persistent://public/default/rustfs-events".to_string(),
+            auth_token: String::new(),
+            username: String::new(),
+            password: String::new(),
+            tls_ca: String::new(),
+            tls_allow_insecure: false,
+            tls_hostname_verification: true,
+            queue_dir: String::new(),
+            queue_limit: 0,
+            target_type: TargetType::NotifyEvent,
+        }
+    }
+
+    #[test]
+    fn validate_pulsar_rejects_mixed_auth_methods() {
+        let args = PulsarArgs {
+            auth_token: "token".to_string(),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            ..base_args()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn validate_pulsar_rejects_relative_queue_dir() {
+        let args = PulsarArgs {
+            queue_dir: "relative/path".to_string(),
+            ..base_args()
+        };
+        assert!(args.validate().is_err());
     }
 }

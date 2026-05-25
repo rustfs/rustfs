@@ -56,13 +56,16 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
-    AMZ_CHECKSUM_TYPE, get_source_scheme,
+    AMZ_CHECKSUM_TYPE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, get_source_scheme,
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING},
+    insert_str,
 };
 use s3s::dto::*;
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -336,14 +339,18 @@ impl DefaultMultipartUsecase {
         let current_opts = get_opts(&bucket, &key, None, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => {
+                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                Some(existing_obj_info.size.max(0) as u64)
+            }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
+                None
             }
-        }
+        };
 
         let multipart_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
@@ -392,7 +399,12 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+                    rustfs_ecstore::data_usage::record_bucket_object_write_memory(
+                        &bucket,
+                        previous_current_size,
+                        obj_info.size.max(0) as u64,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
@@ -454,7 +466,7 @@ impl DefaultMultipartUsecase {
             version_id: mpu_version,
             ..Default::default()
         };
-        let mt2 = HashMap::new();
+        let mt2 = obj_info.user_defined.clone();
         let replicate_options =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
         let dsc = must_replicate(&bucket, &key, replicate_options).await;
@@ -574,9 +586,22 @@ impl DefaultMultipartUsecase {
             );
         }
 
+        let mt2 = metadata.clone();
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
+
+        let replicate_options =
+            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
+        let dsc = must_replicate(&bucket, &key, replicate_options).await;
+        if dsc.replicate_any() {
+            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_REPLICATION_STATUS,
+                dsc.pending_status().unwrap_or_default(),
+            );
+        }
 
         let current_opts: ObjectOptions = get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
             .await

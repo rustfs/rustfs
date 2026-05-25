@@ -29,10 +29,7 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_config::{
-    DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_RUSTFS_TLS_PATH, ENV_TRUST_LEAF_CERT_AS_CA,
-    MAX_ADMIN_REQUEST_BODY_SIZE, RUSTFS_CA_CERT, RUSTFS_TLS_CERT,
-};
+use rustfs_config::{DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_TLS_PATH, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -67,7 +64,9 @@ use rustfs_policy::policy::{
 };
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
+use rustfs_tls_runtime::load_global_outbound_tls_state;
 use rustfs_utils::http::get_source_scheme;
+use rustls_pki_types::pem::PemObject;
 use s3s::dto::{
     BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus,
     Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule,
@@ -80,9 +79,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+use tokio::sync::OnceCell;
 use tracing::warn;
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
@@ -103,7 +102,7 @@ const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
 const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
-static SITE_REPLICATION_PEER_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+static SITE_REPLICATION_PEER_CLIENT: OnceCell<Result<reqwest::Client, String>> = OnceCell::const_new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SiteReplicationState {
@@ -448,56 +447,32 @@ async fn persist_site_replication_state(state: &SiteReplicationState) -> S3Resul
     }
 }
 
-fn add_root_certificates_from_file(
-    mut builder: reqwest::ClientBuilder,
-    cert_path: &std::path::Path,
-    description: &str,
-) -> S3Result<reqwest::ClientBuilder> {
-    if !cert_path.exists() {
-        return Ok(builder);
-    }
-
-    std::fs::read(cert_path).map_err(|e| {
-        S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("failed to read {description} {}: {e}", cert_path.display()),
-        )
-    })?;
-
-    let certs_der = rustfs_utils::load_cert_bundle_der_bytes(cert_path.to_string_lossy().as_ref()).map_err(|e| {
-        S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("failed to parse {description} {}: {e}", cert_path.display()),
-        )
-    })?;
-
-    for cert_der in certs_der {
-        let cert = reqwest::Certificate::from_der(&cert_der).map_err(|e| {
-            S3Error::with_message(
-                S3ErrorCode::InternalError,
-                format!("failed to load {description} {}: {e}", cert_path.display()),
-            )
-        })?;
-        builder = builder.add_root_certificate(cert);
-    }
-
-    Ok(builder)
-}
-
-fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
+async fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
         .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
         .pool_idle_timeout(Some(Duration::from_secs(60)));
 
-    let tls_path = rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH);
-    if !tls_path.is_empty() {
-        let tls_dir = std::path::Path::new(&tls_path);
-        builder = add_root_certificates_from_file(builder, &tls_dir.join(RUSTFS_CA_CERT), "site-replication CA cert")?;
+    let outbound_tls = load_global_outbound_tls_state().await;
+    if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
+        let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
+        let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to parse published site-replication CA certs: {e}"),
+                )
+            })?;
 
-        if rustfs_utils::get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA) {
-            builder =
-                add_root_certificates_from_file(builder, &tls_dir.join(RUSTFS_TLS_CERT), "site-replication leaf cert as CA")?;
+        for cert_der in certs_der {
+            let cert = reqwest::Certificate::from_der(cert_der.as_ref()).map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to load published site-replication CA cert: {e}"),
+                )
+            })?;
+            builder = builder.add_root_certificate(cert);
         }
     }
 
@@ -506,8 +481,10 @@ fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build site replication peer client failed: {e}")))
 }
 
-fn site_replication_peer_client() -> S3Result<&'static reqwest::Client> {
-    let result = SITE_REPLICATION_PEER_CLIENT.get_or_init(|| build_site_replication_peer_client().map_err(|e| e.to_string()));
+async fn site_replication_peer_client() -> S3Result<&'static reqwest::Client> {
+    let result = SITE_REPLICATION_PEER_CLIENT
+        .get_or_init(|| async { build_site_replication_peer_client().await.map_err(|e| e.to_string()) })
+        .await;
     result.as_ref().map_err(|err| {
         S3Error::with_message(
             S3ErrorCode::InternalError,
@@ -969,7 +946,7 @@ async fn send_peer_admin_request<T: Serialize>(
             .unwrap_or("us-east-1"),
     );
 
-    let mut req = site_replication_peer_client()?.request(reqwest::Method::PUT, &url);
+    let mut req = site_replication_peer_client().await?.request(reqwest::Method::PUT, &url);
     for (name, value) in signed.headers() {
         req = req.header(name, value);
     }
