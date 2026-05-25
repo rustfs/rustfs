@@ -37,7 +37,7 @@ pub const RPC_SECRET_REQUIRED_MESSAGE: &str = "RPC authentication secret is not 
 
 /// Operator-facing guidance for configuring RPC authentication safely.
 pub const RPC_SECRET_REQUIRED_OPERATOR_MESSAGE: &str =
-    "RUSTFS_RPC_SECRET can be set explicitly; otherwise the active access/secret key pair is used to derive the RPC secret";
+    "RUSTFS_RPC_SECRET can be set explicitly; otherwise the RPC secret is derived from non-default active access/secret keys";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -559,17 +559,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_rpc_secret_derives_from_default_credentials() {
+    fn test_resolve_rpc_secret_rejects_default_credentials_for_derivation() {
         assert!(resolve_rpc_secret(None, None, None).is_none());
-
-        let expected = derive_rpc_secret(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY).expect("secret should derive");
-        assert_eq!(
-            resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).as_deref(),
-            Some(expected.as_str())
-        );
-        assert_ne!(expected, DEFAULT_ACCESS_KEY);
-        assert_ne!(expected, DEFAULT_SECRET_KEY);
-        assert_ne!(expected, format!("{}{}", DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY));
+        assert!(resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).is_none());
+        assert!(derive_rpc_secret(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY).is_none());
 
         assert!(resolve_rpc_secret(Some(DEFAULT_SECRET_KEY), Some("custom-access"), Some("custom-global-secret")).is_none());
     }
