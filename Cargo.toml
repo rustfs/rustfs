@@ -252,7 +252,7 @@ pretty_assertions = "1.4.1"
 rand = { version = "0.10.1", features = ["serde"] }
 ratelimit = "0.10.1"
 rayon = "1.12.0"
-reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
+reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"], path = "../reed-solomon-erasure" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.12.3" }
 rumqttc = { package = "rumqttc-next", version = "0.33.2", features = ["websocket"] }
