@@ -663,6 +663,41 @@ mod tests {
     }
 
     #[test]
+    fn test_heal_channel_request_preserves_admin_heal_options() {
+        let hip = HealInitParams {
+            bucket: "bucket".to_string(),
+            obj_prefix: "prefix".to_string(),
+            hs: HealOpts {
+                recursive: true,
+                dry_run: true,
+                remove: true,
+                recreate: true,
+                scan_mode: HealScanMode::Deep,
+                update_parity: true,
+                pool: Some(1),
+                set: Some(2),
+                ..Default::default()
+            },
+            force_start: true,
+            ..Default::default()
+        };
+
+        let request = build_heal_channel_request(&hip);
+
+        assert_eq!(request.bucket, "bucket");
+        assert_eq!(request.object_prefix.as_deref(), Some("prefix"));
+        assert!(request.force_start);
+        assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(request.recursive, Some(true));
+        assert_eq!(request.dry_run, Some(true));
+        assert_eq!(request.remove_corrupted, Some(true));
+        assert_eq!(request.recreate_missing, Some(true));
+        assert_eq!(request.update_parity, Some(true));
+        assert_eq!(request.pool_index, Some(1));
+        assert_eq!(request.set_index, Some(2));
+    }
+
+    #[test]
     fn test_extract_heal_init_params_allows_root_heal_target() {
         let uri: Uri = "/rustfs/admin/v3/heal/".parse().expect("uri should parse");
         let heal_opts = json!({

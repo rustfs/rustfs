@@ -35,6 +35,7 @@ pub struct ErasureSetHealer {
     progress: Arc<RwLock<HealProgress>>,
     cancel_token: tokio_util::sync::CancellationToken,
     disk: DiskStore,
+    heal_opts: HealOpts,
 }
 
 impl ErasureSetHealer {
@@ -66,12 +67,14 @@ impl ErasureSetHealer {
         progress: Arc<RwLock<HealProgress>>,
         cancel_token: tokio_util::sync::CancellationToken,
         disk: DiskStore,
+        heal_opts: HealOpts,
     ) -> Self {
         Self {
             storage,
             progress,
             cancel_token,
             disk,
+            heal_opts,
         }
     }
 
@@ -325,6 +328,7 @@ impl ErasureSetHealer {
                 let cancel_token = self.cancel_token.clone();
                 let in_flight = in_flight.clone();
                 let set_label = set_disk_id.to_string();
+                let heal_opts = self.heal_opts;
                 let permit = semaphore
                     .clone()
                     .acquire_owned()
@@ -375,12 +379,6 @@ impl ErasureSetHealer {
                         if !object_exists {
                             Ok(false)
                         } else {
-                            let heal_opts = HealOpts {
-                                scan_mode: HealScanMode::Normal,
-                                remove: true,
-                                recreate: true,
-                                ..Default::default()
-                            };
                             match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
                                 Ok((_result, None)) => Ok(true),
                                 Ok((_, Some(err))) => Err(Error::other(err)),

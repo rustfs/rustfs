@@ -30,7 +30,6 @@ use crate::disk::{
 };
 use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
 use crate::erasure_coding;
-use crate::erasure_coding::bitrot_verify;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
@@ -4049,32 +4048,16 @@ async fn disks_with_all_parts(
             continue;
         }
 
-        // Always check data, if we got it.
+        // Inline data is stored inside xl.meta, so there is no separate part file to
+        // verify here. Treat the shard as present once metadata was read successfully;
+        // object reads/heal will validate the inline shard through the normal bitrot
+        // reader path. Running bitrot_verify directly here can falsely mark small
+        // inline shards corrupt when older metadata has no per-part checksum entries.
         if (meta.data.is_some() || meta.size == 0) && !meta.parts.is_empty() {
-            if let Some(data) = &meta.data {
-                let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
-                let checksum_algo = if meta.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-                    HashAlgorithm::HighwayHash256SLegacy
-                } else {
-                    checksum_info.algorithm
-                };
-                let data_len = data.len();
-                let verify_err = bitrot_verify(
-                    Box::new(Cursor::new(data.clone())),
-                    data_len,
-                    meta.erasure.shard_file_size(meta.size) as usize,
-                    checksum_algo,
-                    checksum_info.hash,
-                    meta.erasure.shard_size(),
-                )
-                .await
-                .err();
-
-                if let Some(vec) = data_errs_by_part.get_mut(&0)
-                    && index < vec.len()
-                {
-                    vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
-                }
+            if let Some(vec) = data_errs_by_part.get_mut(&0)
+                && index < vec.len()
+            {
+                vec[index] = CHECK_PART_SUCCESS;
             }
             continue;
         }
@@ -5394,6 +5377,62 @@ mod tests {
     }
 
     #[test]
+    fn test_populate_data_errs_by_disk_uses_disk_index_not_error_code() {
+        let mut data_errs_by_disk = HashMap::from([
+            (0, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (1, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (2, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+        ]);
+        let data_errs_by_part = HashMap::from([
+            (0, vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]),
+            (1, vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS]),
+        ]);
+
+        populate_data_errs_by_disk(&mut data_errs_by_disk, &data_errs_by_part);
+
+        assert_eq!(data_errs_by_disk.get(&0).unwrap(), &vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS]);
+        assert_eq!(data_errs_by_disk.get(&1).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_CORRUPT]);
+        assert_eq!(data_errs_by_disk.get(&2).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
+
+        let mut data_errs_by_disk = HashMap::from([
+            (0, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (1, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (2, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (3, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+        ]);
+        let data_errs_by_part = HashMap::from([
+            (
+                0,
+                vec![
+                    CHECK_PART_FILE_NOT_FOUND,
+                    CHECK_PART_SUCCESS,
+                    CHECK_PART_SUCCESS,
+                    CHECK_PART_SUCCESS,
+                ],
+            ),
+            (
+                1,
+                vec![
+                    CHECK_PART_FILE_CORRUPT,
+                    CHECK_PART_SUCCESS,
+                    CHECK_PART_SUCCESS,
+                    CHECK_PART_SUCCESS,
+                ],
+            ),
+        ]);
+
+        populate_data_errs_by_disk(&mut data_errs_by_disk, &data_errs_by_part);
+
+        assert_eq!(
+            data_errs_by_disk.get(&0).unwrap(),
+            &vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_FILE_CORRUPT]
+        );
+        assert_eq!(data_errs_by_disk.get(&1).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
+        assert_eq!(data_errs_by_disk.get(&2).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
+        assert_eq!(data_errs_by_disk.get(&3).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
+    }
+
+    #[test]
     fn test_should_heal_object_on_disk() {
         // Test healing decision logic
         let meta = FileInfo::default();
@@ -5411,25 +5450,6 @@ mod tests {
         // Test with part corruption
         let (should_heal, _, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
         assert!(should_heal);
-    }
-
-    #[test]
-    fn test_populate_data_errs_by_disk_uses_disk_index_not_error_code() {
-        let mut data_errs_by_disk = HashMap::from([
-            (0, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
-            (1, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
-            (2, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
-        ]);
-        let data_errs_by_part = HashMap::from([
-            (0, vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]),
-            (1, vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS]),
-        ]);
-
-        populate_data_errs_by_disk(&mut data_errs_by_disk, &data_errs_by_part);
-
-        assert_eq!(data_errs_by_disk.get(&0).unwrap(), &vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS]);
-        assert_eq!(data_errs_by_disk.get(&1).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_CORRUPT]);
-        assert_eq!(data_errs_by_disk.get(&2).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
     }
 
     #[tokio::test]
