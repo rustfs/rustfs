@@ -1131,17 +1131,35 @@ impl HealTask {
 
         // Step 3: Heal bucket structure
         // Check control flags before each iteration to ensure timely cancellation.
-        // Each heal_bucket call may handle timeout/cancellation internally, see its implementation for details.
+        let bucket_heal_opts = HealOpts {
+            recursive: false,
+            dry_run: self.options.dry_run,
+            remove: false,
+            recreate: self.options.recreate_missing,
+            scan_mode: self.options.scan_mode,
+            update_parity: self.options.update_parity,
+            no_lock: false,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+
         for bucket in buckets.iter() {
             // Check control flags before starting each bucket heal
             self.check_control_flags().await?;
-            // heal_bucket internally uses await_with_control for timeout/cancellation handling
-            if let Err(err) = self.heal_bucket(bucket).await {
-                // Check if error is due to cancellation or timeout
-                if matches!(err, Error::TaskCancelled | Error::TaskTimeout) {
-                    return Err(err);
+            let heal_result = self
+                .await_with_control(self.storage.heal_bucket(bucket, &bucket_heal_opts))
+                .await;
+            match heal_result {
+                Ok(result) => {
+                    self.record_result_item(result).await;
                 }
-                info!("Bucket heal failed: {}", err.to_string());
+                Err(err) => {
+                    // Check if error is due to cancellation or timeout
+                    if matches!(err, Error::TaskCancelled | Error::TaskTimeout) {
+                        return Err(err);
+                    }
+                    info!("Bucket heal failed: {}", err.to_string());
+                }
             }
         }
 

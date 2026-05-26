@@ -70,6 +70,10 @@ impl ErasureSetHealer {
         }
     }
 
+    fn is_object_not_found_message(message: &str) -> bool {
+        message.contains("File not found") || message.contains("not found")
+    }
+
     pub fn new(
         storage: Arc<dyn HealStorageAPI>,
         progress: Arc<RwLock<HealProgress>>,
@@ -358,6 +362,27 @@ impl ErasureSetHealer {
 
                     let result = if cancel_token.is_cancelled() {
                         Err(Error::TaskCancelled)
+                    } else if matches!(self.heal_opts.scan_mode, HealScanMode::Deep) {
+                        let heal_opts = self.heal_opts;
+                        match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
+                            Ok((_result, None)) => Ok(true),
+                            Ok((_, Some(err))) => {
+                                let err_msg = err.to_string();
+                                if Self::is_object_not_found_message(&err_msg) {
+                                    Ok(false)
+                                } else {
+                                    Err(Error::other(err))
+                                }
+                            }
+                            Err(err) => {
+                                let err_msg = err.to_string();
+                                if Self::is_object_not_found_message(&err_msg) {
+                                    Ok(false)
+                                } else {
+                                    Err(err)
+                                }
+                            }
+                        }
                     } else {
                         let object_exists = match storage.object_exists(&bucket_name, &object_name).await {
                             Ok(exists) => exists,
