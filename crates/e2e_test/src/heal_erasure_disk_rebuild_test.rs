@@ -24,18 +24,23 @@ mod tests {
     use tokio::time::{Duration, sleep};
     use tracing::info;
 
-    fn count_files_under(path: &Path) -> usize {
+    fn has_file_under(path: &Path) -> bool {
         let Ok(entries) = std::fs::read_dir(path) else {
-            return 0;
+            return false;
         };
 
-        entries
-            .filter_map(Result::ok)
-            .map(|entry| {
-                let path = entry.path();
-                if path.is_dir() { count_files_under(&path) } else { 1 }
-            })
-            .sum()
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                if has_file_under(&path) {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn object_metadata_exists_on_disk(disk: &Path, bucket: &str, key: &str) -> bool {
@@ -147,12 +152,12 @@ mod tests {
                 .expect("PUT should succeed");
         }
 
-        assert!(count_files_under(&disk0) > 0, "disk0 should contain object shards before wipe");
+        assert!(has_file_under(&disk0), "disk0 should contain object shards before wipe");
         env.stop_server();
 
         std::fs::remove_dir_all(&disk0).expect("disk0 wipe should succeed");
         std::fs::create_dir_all(&disk0).expect("disk0 should be recreated empty");
-        assert_eq!(count_files_under(&disk0), 0, "disk0 must be empty before restart");
+        assert!(!has_file_under(&disk0), "disk0 must be empty before restart");
 
         env.start_rustfs_server_with_env(
             vec![disk0_arg.as_str(), disk1_arg.as_str(), disk2_arg.as_str()],
