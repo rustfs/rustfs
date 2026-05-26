@@ -26,6 +26,8 @@ mod runtime;
 mod service_state;
 pub mod tls_material;
 
+use tracing::warn;
+
 // Items used by main.rs (binary crate) and/or embedded.rs — must be fully pub.
 pub use audit::{is_audit_module_enabled, refresh_audit_module_enabled, start_audit_system, stop_audit_system};
 pub use event::{init_event_notifier, is_notify_module_enabled, refresh_notify_module_enabled, shutdown_event_notifier};
@@ -55,3 +57,44 @@ pub use readiness::publish_ready_when_runtime_ready;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RemoteAddr(pub std::net::SocketAddr);
+
+pub struct ShutdownHandle {
+    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ShutdownHandle {
+    pub fn new(shutdown_tx: tokio::sync::broadcast::Sender<()>, task_handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            shutdown_tx: Some(shutdown_tx),
+            task_handle: Some(task_handle),
+        }
+    }
+
+    pub fn signal(&self) {
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(());
+        }
+    }
+
+    pub async fn shutdown(self) {
+        self.signal();
+        self.wait().await;
+    }
+
+    pub async fn wait(mut self) {
+        if let Some(task_handle) = self.task_handle.take()
+            && let Err(err) = task_handle.await
+        {
+            warn!(?err, "Server task join failed during shutdown");
+        }
+    }
+}
+
+impl Drop for ShutdownHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(());
+        }
+    }
+}

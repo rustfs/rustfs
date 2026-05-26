@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::server::ShutdownHandle;
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
 use rustfs_config::{
@@ -496,7 +497,7 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
 /// This function initializes the FTP server (non-encrypted) if enabled in the configuration.
 #[cfg(feature = "ftps")]
 #[instrument(skip_all)]
-pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_ftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{DEFAULT_FTP_ADDRESS, ENV_FTP_ADDRESS, ENV_FTP_ENABLE, ENV_FTP_EXTERNAL_IP, ENV_FTP_PASSIVE_PORTS};
@@ -547,7 +548,7 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
         // Start FTP server in background task with proper shutdown support
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
                 error!("FTP server error: {}", e);
             }
@@ -555,7 +556,7 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
         });
 
         info!("FTP system initialized successfully");
-        Ok(Some(shutdown_tx))
+        Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }
 
@@ -566,7 +567,7 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
 /// the server in a background task.
 #[cfg(feature = "ftps")]
 #[instrument(skip_all)]
-pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_ftps_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
@@ -623,7 +624,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
         // Start FTPS server in background task with proper shutdown support
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
                 error!("FTPS server error: {}", e);
             }
@@ -631,7 +632,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
         });
 
         info!("FTPS system initialized successfully");
-        Ok(Some(shutdown_tx))
+        Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }
 
@@ -642,8 +643,7 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
 /// the server in a background task.
 #[cfg(feature = "webdav")]
 #[instrument(skip_all)]
-pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>>
-{
+pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
@@ -693,7 +693,7 @@ pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sende
         // Start WebDAV server in background task with proper shutdown support
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
                 error!("WebDAV server error: {}", e);
             }
@@ -701,7 +701,7 @@ pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sende
         });
 
         info!("WebDAV system initialized successfully");
-        Ok(Some(shutdown_tx))
+        Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }
 
@@ -710,7 +710,7 @@ pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sende
 /// and spawns the listener task.
 #[cfg(feature = "sftp")]
 #[instrument(skip_all)]
-pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
@@ -777,7 +777,7 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
         // Start SFTP server in background task
-        tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
                 error!("SFTP server error: {}", e);
             }
@@ -785,6 +785,6 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
         });
 
         info!("SFTP system initialized successfully");
-        Ok(Some(shutdown_tx))
+        Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }

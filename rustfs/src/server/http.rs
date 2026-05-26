@@ -18,7 +18,7 @@ use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
 use crate::server::{
-    ReadinessGateLayer, RemoteAddr,
+    ReadinessGateLayer, RemoteAddr, ShutdownHandle,
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
@@ -128,10 +128,7 @@ pub(crate) fn active_http_requests() -> u64 {
     ACTIVE_HTTP_REQUESTS.load(Ordering::Relaxed)
 }
 
-pub async fn start_http_server(
-    config: &config::Config,
-    readiness: Arc<GlobalReadiness>,
-) -> Result<(tokio::sync::broadcast::Sender<()>, SocketAddr)> {
+pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalReadiness>) -> Result<(ShutdownHandle, SocketAddr)> {
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
 
     // The listening address and port are obtained from the parameters
@@ -343,7 +340,7 @@ pub async fn start_http_server(
     }
 
     let is_console = config.console_enable;
-    tokio::spawn(async move {
+    let task_handle = tokio::spawn(async move {
         // Note: CORS layer is removed from global middleware stack
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
         // - Console CORS is handled by its own cors_layer in setup_console_middleware_stack()
@@ -516,7 +513,7 @@ pub async fn start_http_server(
         }
     });
 
-    Ok((shutdown_tx, local_addr))
+    Ok((ShutdownHandle::new(shutdown_tx, task_handle), local_addr))
 }
 
 #[derive(Clone)]
