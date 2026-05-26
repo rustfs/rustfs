@@ -1157,8 +1157,8 @@ impl HealTask {
             set: self.options.set_index,
         };
 
-        // Step 3: Create erasure set healer with resume support
-        info!("Step 3: Creating erasure set healer with resume support");
+        // Create erasure set healer with resume support
+        info!("Creating erasure set healer with resume support");
         let erasure_healer =
             ErasureSetHealer::new(self.storage.clone(), self.progress.clone(), self.cancel_token.clone(), disk, heal_opts);
 
