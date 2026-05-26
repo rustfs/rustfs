@@ -674,9 +674,9 @@ mod tests {
                 recreate: true,
                 scan_mode: HealScanMode::Deep,
                 update_parity: true,
-                no_lock: false,
                 pool: Some(1),
                 set: Some(2),
+                ..Default::default()
             },
             force_start: true,
             ..Default::default()

@@ -19,6 +19,7 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, execute_awscurl, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
     use serial_test::serial;
+    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use tokio::time::{Duration, sleep};
     use tracing::info;
@@ -39,10 +40,6 @@ mod tests {
 
     fn object_metadata_exists_on_disk(disk: &Path, bucket: &str, key: &str) -> bool {
         disk.join(bucket).join(key).join("xl.meta").is_file()
-    }
-
-    fn all_object_metadata_exists_on_disk(disk: &Path, bucket: &str, keys: &[String]) -> bool {
-        keys.iter().all(|key| object_metadata_exists_on_disk(disk, bucket, key))
     }
 
     async fn assert_object_body(env: &RustFSTestEnvironment, bucket: &str, key: &str, expected: &[u8]) {
@@ -130,6 +127,8 @@ mod tests {
         }
 
         let object_keys = objects.iter().map(|(key, _, _)| key.clone()).collect::<Vec<_>>();
+        let mut remaining_keys = VecDeque::from(object_keys.clone());
+        let metadata_check_batch_size = 16;
 
         client
             .create_bucket()
@@ -174,7 +173,17 @@ mod tests {
             .expect("admin deep heal should be accepted");
 
         for _ in 0..heal_timeout_secs {
-            if all_object_metadata_exists_on_disk(&disk0, bucket, &object_keys) {
+            let mut checks_remaining = metadata_check_batch_size.min(remaining_keys.len());
+            while checks_remaining > 0 {
+                if let Some(key) = remaining_keys.pop_front() {
+                    if !object_metadata_exists_on_disk(&disk0, bucket, &key) {
+                        remaining_keys.push_back(key);
+                    }
+                }
+                checks_remaining -= 1;
+            }
+
+            if remaining_keys.is_empty() {
                 for (key, body, _) in &objects {
                     assert_object_body(&env, bucket, key, body).await;
                 }

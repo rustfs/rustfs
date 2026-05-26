@@ -25,7 +25,7 @@ use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::{
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -46,8 +46,8 @@ struct PriorityHealQueue {
     heap: BinaryHeap<PriorityQueueItem>,
     /// Sequence counter for FIFO ordering within same priority
     sequence: u64,
-    /// Set of request keys to prevent duplicates
-    dedup_keys: HashSet<String>,
+    /// Deduplication key reference counts for queued requests
+    dedup_keys: HashMap<String, usize>,
 }
 
 /// Wrapper for heap items to implement proper ordering
@@ -110,7 +110,7 @@ impl PriorityHealQueue {
         Self {
             heap: BinaryHeap::new(),
             sequence: 0,
-            dedup_keys: HashSet::new(),
+            dedup_keys: HashMap::new(),
         }
     }
 
@@ -121,7 +121,7 @@ impl PriorityHealQueue {
     fn pop_next(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
             let key = Self::make_dedup_key(&item.request);
-            self.dedup_keys.remove(&key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
             item.request
         })
     }
@@ -135,11 +135,11 @@ impl PriorityHealQueue {
 
         // Check for duplicates unless the caller explicitly forces admission.
         if !request.force_start {
-            if self.dedup_keys.contains(&key) {
+            if self.dedup_keys.contains_key(&key) {
                 return QueuePushOutcome::Merged;
             }
-            self.dedup_keys.insert(key);
         }
+        *self.dedup_keys.entry(key).or_insert(0) += 1;
         self.sequence += 1;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
@@ -162,7 +162,7 @@ impl PriorityHealQueue {
     fn pop(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
             let key = Self::make_dedup_key(&item.request);
-            self.dedup_keys.remove(&key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
             item.request
         })
     }
@@ -202,7 +202,7 @@ impl PriorityHealQueue {
         (
             selected.map(|item| {
                 let key = Self::make_dedup_key(&item.request);
-                self.dedup_keys.remove(&key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
                 item.request
             }),
             skipped,
@@ -240,10 +240,16 @@ impl PriorityHealQueue {
             }
         };
 
-        if request.force_start {
-            format!("force:{}:{key}", request.id)
-        } else {
-            key
+        key
+    }
+
+    fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, usize>, key: &str) {
+        if let Some(count) = dedup_keys.get_mut(key) {
+            if *count <= 1 {
+                dedup_keys.remove(key);
+            } else {
+                *count -= 1;
+            }
         }
     }
 
@@ -251,13 +257,13 @@ impl PriorityHealQueue {
     #[allow(dead_code)]
     fn contains_key(&self, request: &HealRequest) -> bool {
         let key = Self::make_dedup_key(request);
-        self.dedup_keys.contains(&key)
+        self.dedup_keys.contains_key(&key)
     }
 
     /// Check if an erasure set heal request for a specific set_disk_id exists
     fn contains_erasure_set(&self, set_disk_id: &str) -> bool {
         let key = format!("erasure_set:{set_disk_id}");
-        self.dedup_keys.contains(&key)
+        self.dedup_keys.contains_key(&key)
     }
 
     fn contains_request_id(&self, request_id: &str) -> bool {
@@ -284,7 +290,7 @@ impl PriorityHealQueue {
         while let Some(item) = self.heap.pop() {
             if removed.is_none() && item.request.id == request_id {
                 let key = Self::make_dedup_key(&item.request);
-                self.dedup_keys.remove(&key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
                 removed = Some(item.request);
             } else {
                 retained.push(item);
@@ -305,7 +311,7 @@ impl PriorityHealQueue {
         while let Some(item) = self.heap.pop() {
             if should_remove(&item.request) {
                 let key = Self::make_dedup_key(&item.request);
-                self.dedup_keys.remove(&key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
                 removed_count += 1;
             } else {
                 retained.push(item);
@@ -2150,8 +2156,22 @@ mod tests {
             HealOptions::default(),
             HealPriority::Low,
         );
-        let mut forced_duplicate = normal.clone();
+        let mut forced_duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
         forced_duplicate.force_start = true;
+
+        let subsequent_duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
 
         assert_eq!(
             manager
@@ -2166,6 +2186,13 @@ mod tests {
                 .await
                 .expect("force start should bypass duplicate/full policy"),
             HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(subsequent_duplicate)
+                .await
+                .expect("subsequent non-force duplicate should be merged"),
+            HealAdmissionResult::Merged
         );
     }
 
