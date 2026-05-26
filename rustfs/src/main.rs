@@ -30,8 +30,8 @@ use rustfs::init::init_sftp_system;
 use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::license::{current_license, init_license, license_status};
 use rustfs::server::{
-    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
-    start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, publish_ready_when_runtime_ready,
+    shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
@@ -73,7 +73,6 @@ const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
-
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -607,13 +606,10 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         &server_address,
         jiff::Zoned::now()
     );
-    // 4. Mark as Full Ready now that critical components are warm
-    readiness.mark_stage(SystemStage::FullReady);
+    publish_ready_when_runtime_ready(readiness.as_ref(), Some(&state_manager)).await?;
 
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
-    // Publish ready only after all critical bootstrap metadata is in place
-    state_manager.update(ServiceState::Ready);
 
     if enable_scanner {
         init_data_scanner(ctx.clone(), store.clone()).await;
@@ -622,11 +618,13 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
     // listen to the shutdown signal
-    match wait_for_shutdown().await {
+    let shutdown_signal = wait_for_shutdown().await;
+    match shutdown_signal {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
             handle_shutdown(
                 &state_manager,
+                shutdown_signal,
                 s3_shutdown_tx,
                 console_shutdown_tx,
                 ProtocolShutdownSenders {
@@ -643,6 +641,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         ShutdownSignal::CtrlC => {
             handle_shutdown(
                 &state_manager,
+                shutdown_signal,
                 s3_shutdown_tx,
                 console_shutdown_tx,
                 ProtocolShutdownSenders {
@@ -673,6 +672,7 @@ struct ProtocolShutdownSenders {
 /// Handles the shutdown process of the server
 async fn handle_shutdown(
     state_manager: &ServiceStateManager,
+    shutdown_signal: ShutdownSignal,
     s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     protocols: ProtocolShutdownSenders,
@@ -688,6 +688,7 @@ async fn handle_shutdown(
 
     info!(
         target: "rustfs::main::handle_shutdown",
+        signal = shutdown_signal.log_label(),
         "Shutdown signal received in main thread"
     );
     // update the status to stopping first

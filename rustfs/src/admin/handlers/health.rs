@@ -14,8 +14,10 @@
 
 use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::admin_usecase::DefaultAdminUsecase;
-use crate::server::{HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
+use crate::server::{
+    HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
+    collect_dependency_readiness as collect_runtime_dependency_readiness,
+};
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -56,8 +58,7 @@ pub(crate) enum HealthProbe {
 }
 
 pub(crate) async fn collect_dependency_readiness() -> (bool, bool) {
-    let usecase = DefaultAdminUsecase::from_global();
-    let readiness = usecase.execute_collect_dependency_readiness().await;
+    let readiness = collect_runtime_dependency_readiness().await;
     (readiness.storage_ready, readiness.iam_ready)
 }
 

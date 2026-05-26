@@ -37,7 +37,7 @@ use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as ConnBuilder,
-    server::graceful::GracefulShutdown,
+    server::graceful::{GracefulShutdown, Watcher},
     service::TowerToHyperService,
 };
 use metrics::{counter, gauge, histogram};
@@ -331,8 +331,6 @@ pub async fn start_http_server(
 
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
-    let shutdown_tx_clone = shutdown_tx.clone();
-
     // Create compression configuration from environment variables
     let compression_config = CompressionConfig::from_env();
     if compression_config.enabled {
@@ -350,15 +348,6 @@ pub async fn start_http_server(
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
         // - Console CORS is handled by its own cors_layer in setup_console_middleware_stack()
         // This ensures S3 API CORS behavior matches AWS S3 specification
-
-        #[cfg(unix)]
-        let (mut sigterm_inner, mut sigint_inner) = {
-            use tokio::signal::unix::{SignalKind, signal};
-            // Unix platform specific code
-            let sigterm_inner = signal(SignalKind::terminate()).expect("Failed to create SIGTERM signal handler");
-            let sigint_inner = signal(SignalKind::interrupt()).expect("Failed to create SIGINT signal handler");
-            (sigterm_inner, sigint_inner)
-        };
 
         // ── HTTP Transport Tuning (configurable via env vars) ──
         // Read all transport parameters from environment, falling back to defaults.
@@ -433,8 +422,7 @@ pub async fn start_http_server(
             .keep_alive_timeout(Duration::from_secs(h2_keep_alive_timeout));
 
         let http_server = Arc::new(conn_builder);
-        let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
-        let graceful = Arc::new(GracefulShutdown::new());
+        let graceful = GracefulShutdown::new();
         debug!("graceful initiated");
 
         loop {
@@ -450,21 +438,6 @@ pub async fn start_http_server(
                                 continue;
                             }
                         },
-                        _ = ctrl_c.as_mut() => {
-                            info!("Ctrl-C received in worker thread");
-                            let _ = shutdown_tx_clone.send(());
-                            break;
-                        },
-                       Some(_) = sigint_inner.recv() => {
-                           info!("SIGINT received in worker thread");
-                           let _ = shutdown_tx_clone.send(());
-                           break;
-                       },
-                       Some(_) = sigterm_inner.recv() => {
-                           info!("SIGTERM received in worker thread");
-                           let _ = shutdown_tx_clone.send(());
-                           break;
-                       },
                         _ = shutdown_rx.recv() => {
                             info!("Shutdown signal received in worker thread");
                             break;
@@ -480,11 +453,6 @@ pub async fn start_http_server(
                                 error!("error accepting connection: {err}");
                                 continue;
                             }
-                        },
-                        _ = ctrl_c.as_mut() => {
-                            info!("Ctrl-C received in worker thread");
-                            let _ = shutdown_tx_clone.send(());
-                            break;
                         },
                         _ = shutdown_rx.recv() => {
                             info!("Shutdown signal received in worker thread");
@@ -531,24 +499,19 @@ pub async fn start_http_server(
                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
             };
 
-            process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
+            process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.watcher());
         }
 
-        match Arc::try_unwrap(graceful) {
-            Ok(g) => {
-                tokio::select! {
-                    () = g.shutdown() => {
-                        debug!("Gracefully shutdown!");
-                    },
-                    () = tokio::time::sleep(Duration::from_secs(10)) => {
-                        debug!("Waited 10 seconds for graceful shutdown, aborting...");
-                    }
-                }
-            }
-            Err(arc_graceful) => {
-                error!("Cannot perform graceful shutdown, other references exist err: {:?}", arc_graceful);
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                debug!("Timeout reached, forcing shutdown");
+        let active_connections = graceful.count();
+        if active_connections > 0 {
+            info!(active_connections, "Draining active HTTP connections before shutdown");
+        }
+        tokio::select! {
+            () = graceful.shutdown() => {
+                debug!("Gracefully shutdown!");
+            },
+            () = tokio::time::sleep(Duration::from_secs(10)) => {
+                warn!(active_connections, "Timed out waiting for HTTP connections to drain during shutdown");
             }
         }
     });
@@ -655,7 +618,7 @@ fn process_connection(
     socket: TcpStream,
     tls_acceptor: Option<Arc<TlsAcceptorHolder>>,
     context: ConnectionContext,
-    graceful: Arc<GracefulShutdown>,
+    graceful: Watcher,
 ) {
     tokio::spawn(async move {
         let ConnectionContext {

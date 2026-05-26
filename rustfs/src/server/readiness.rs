@@ -12,18 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::admin_usecase::DependencyReadiness;
+use crate::server::{ServiceState, ServiceStateManager};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use rustfs_common::GlobalReadiness;
+use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::store_api::StorageAPI;
+use rustfs_iam::get_global_iam_sys;
+use rustfs_madmin::{Disk, StorageInfo};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::OnceLock,
+    time::Instant,
+};
+use tokio::sync::Mutex;
 use tower::{Layer, Service};
-use tracing::debug;
+use tracing::{debug, info};
+
+pub const STARTUP_RUNTIME_READINESS_MAX_WAIT: Duration = Duration::from_secs(30);
+pub const STARTUP_RUNTIME_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// ReadinessGateLayer ensures that the system components (IAM, Storage)
 /// are fully initialized before allowing any request to proceed.
@@ -131,5 +147,384 @@ where
             let body: BoxBody = body.map_err(Into::into).boxed_unsync();
             Ok(Response::from_parts(parts, body))
         })
+    }
+}
+
+pub async fn publish_ready_when_runtime_ready(
+    readiness: &GlobalReadiness,
+    state_manager: Option<&ServiceStateManager>,
+) -> Result<(), std::io::Error> {
+    wait_for_runtime_readiness_with(
+        STARTUP_RUNTIME_READINESS_MAX_WAIT,
+        STARTUP_RUNTIME_READINESS_POLL_INTERVAL,
+        collect_dependency_readiness,
+        |dependency_readiness| {
+            readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+            if let Some(state_manager) = state_manager {
+                state_manager.update(ServiceState::Ready);
+            }
+            info!(
+                target: "rustfs::server::readiness",
+                storage_ready = dependency_readiness.storage_ready,
+                iam_ready = dependency_readiness.iam_ready,
+                "Runtime readiness reached write quorum; publishing ready state"
+            );
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StorageReadinessCacheEntry {
+    captured_at: Instant,
+    storage_ready: bool,
+}
+
+const DISK_STATE_OK: &str = "ok";
+const DISK_STATE_UNFORMATTED: &str = "unformatted";
+const RUNTIME_STATE_RETURNING: &str = "returning";
+
+fn health_readiness_cache_ttl() -> Duration {
+    Duration::from_millis(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS,
+        rustfs_config::DEFAULT_HEALTH_READINESS_CACHE_TTL_MS,
+    ))
+}
+
+fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<StorageReadinessCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+async fn load_cached_storage_readiness() -> Option<bool> {
+    let ttl = health_readiness_cache_ttl();
+    if ttl.is_zero() {
+        return None;
+    }
+
+    let cache = storage_readiness_cache().lock().await;
+    let entry = cache.as_ref()?;
+    if entry.captured_at.elapsed() <= ttl {
+        return Some(entry.storage_ready);
+    }
+
+    None
+}
+
+async fn update_storage_readiness_cache(storage_ready: bool) {
+    if health_readiness_cache_ttl().is_zero() {
+        return;
+    }
+
+    let mut cache = storage_readiness_cache().lock().await;
+    *cache = Some(StorageReadinessCacheEntry {
+        captured_at: Instant::now(),
+        storage_ready,
+    });
+}
+
+fn disk_is_online_for_readiness(disk: &Disk) -> bool {
+    let state_is_acceptable = disk.state.eq_ignore_ascii_case(DISK_STATE_OK)
+        || disk.state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
+        || disk.state.eq_ignore_ascii_case(DISK_STATE_UNFORMATTED);
+
+    if let Some(runtime_state) = disk.runtime_state.as_deref() {
+        let runtime_state_is_acceptable = runtime_state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
+            || runtime_state.eq_ignore_ascii_case(RUNTIME_STATE_RETURNING);
+        return runtime_state_is_acceptable && state_is_acceptable;
+    }
+
+    state_is_acceptable
+}
+
+fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> usize {
+    if set_drive_count == 0 {
+        return 1;
+    }
+
+    let data_drives = info
+        .backend
+        .standard_sc_data
+        .get(pool_idx)
+        .copied()
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| (set_drive_count / 2).max(1));
+
+    let parity_drives = if let Some(drives_per_set) = info.backend.drives_per_set.get(pool_idx).copied() {
+        drives_per_set.saturating_sub(data_drives)
+    } else if let Some(parity) = info.backend.standard_sc_parities.get(pool_idx).copied() {
+        parity
+    } else if let Some(parity) = info.backend.standard_sc_parity {
+        parity
+    } else {
+        set_drive_count.saturating_sub(data_drives)
+    };
+
+    let mut write_quorum = data_drives;
+    if data_drives == parity_drives {
+        write_quorum += 1;
+    }
+    write_quorum.max(1)
+}
+
+fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
+    if info.disks.is_empty() {
+        return false;
+    }
+
+    let mut total_online = 0usize;
+    let mut set_online_counts: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut set_drive_counts: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut seen_disks: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
+
+    for disk in &info.disks {
+        if disk.pool_index < 0 || disk.set_index < 0 {
+            continue;
+        }
+
+        let dedup_key = (
+            disk.endpoint.clone(),
+            disk.drive_path.clone(),
+            disk.pool_index,
+            disk.set_index,
+            disk.disk_index,
+        );
+        if !seen_disks.insert(dedup_key) {
+            continue;
+        }
+
+        let pool_idx = disk.pool_index as usize;
+        let set_idx = disk.set_index as usize;
+        let key = (pool_idx, set_idx);
+        *set_drive_counts.entry(key).or_default() += 1;
+
+        if disk_is_online_for_readiness(disk) {
+            total_online += 1;
+            *set_online_counts.entry(key).or_default() += 1;
+        }
+    }
+
+    if total_online == 0 || set_drive_counts.is_empty() {
+        return false;
+    }
+
+    set_drive_counts.into_iter().all(|((pool_idx, set_idx), set_drive_count)| {
+        let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
+        let write_quorum = pool_write_quorum(info, pool_idx, set_drive_count);
+        online >= write_quorum
+    })
+}
+
+pub async fn collect_dependency_readiness() -> DependencyReadiness {
+    let iam_ready = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
+    let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
+        cached
+    } else {
+        let computed = if let Some(store) = new_object_layer_fn() {
+            let storage_info = store.storage_info().await;
+            storage_ready_from_runtime_state(&storage_info)
+        } else {
+            false
+        };
+        update_storage_readiness_cache(computed).await;
+        computed
+    };
+
+    DependencyReadiness {
+        storage_ready,
+        iam_ready: iam_ready && storage_ready,
+    }
+}
+
+pub async fn wait_for_runtime_readiness_with<F, Fut, ReadyFn>(
+    max_wait: Duration,
+    poll_interval: Duration,
+    mut load_readiness: F,
+    mut on_ready: ReadyFn,
+) -> Result<(), std::io::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = DependencyReadiness>,
+    ReadyFn: FnMut(DependencyReadiness),
+{
+    let startup_deadline = tokio::time::Instant::now() + max_wait;
+
+    loop {
+        let readiness = load_readiness().await;
+        if readiness.storage_ready && readiness.iam_ready {
+            on_ready(readiness);
+            return Ok(());
+        }
+
+        if tokio::time::Instant::now() >= startup_deadline {
+            let reason = format!(
+                "startup readiness timed out after {}s: storage_ready={}, iam_ready={}",
+                max_wait.as_secs(),
+                readiness.storage_ready,
+                readiness.iam_ready
+            );
+            return Err(std::io::Error::other(reason));
+        }
+
+        info!(
+            target: "rustfs::server::readiness",
+            storage_ready = readiness.storage_ready,
+            iam_ready = readiness.iam_ready,
+            "Runtime readiness has not reached write quorum yet; delaying ready state publication"
+        );
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_madmin::{BackendInfo, Disk};
+    use std::future;
+
+    #[test]
+    fn startup_runtime_readiness_wait_constants_are_ordered() {
+        assert!(STARTUP_RUNTIME_READINESS_MAX_WAIT > STARTUP_RUNTIME_READINESS_POLL_INTERVAL);
+        assert_eq!(STARTUP_RUNTIME_READINESS_MAX_WAIT.as_secs(), 30);
+        assert_eq!(STARTUP_RUNTIME_READINESS_POLL_INTERVAL.as_secs(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_runtime_readiness_with_does_not_publish_ready_when_runtime_readiness_is_not_reached() {
+        let readiness = GlobalReadiness::new();
+        let state_manager = ServiceStateManager::new();
+
+        let err = wait_for_runtime_readiness_with(
+            Duration::ZERO,
+            Duration::from_millis(1),
+            || {
+                future::ready(DependencyReadiness {
+                    storage_ready: false,
+                    iam_ready: false,
+                })
+            },
+            |_| {
+                readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+                state_manager.update(ServiceState::Ready);
+            },
+        )
+        .await
+        .expect_err("unready startup should time out");
+
+        assert!(err.to_string().contains("startup readiness timed out"));
+        assert!(!readiness.is_ready());
+        assert_eq!(state_manager.current_state(), ServiceState::Starting);
+    }
+
+    #[test]
+    fn storage_ready_from_runtime_state_returns_false_when_all_disks_faulty() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![1],
+                drives_per_set: vec![1],
+                ..Default::default()
+            },
+            disks: vec![Disk {
+                pool_index: 0,
+                set_index: 0,
+                state: "offline".to_string(),
+                runtime_state: Some("offline".to_string()),
+                ..Default::default()
+            }],
+        };
+
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn storage_ready_from_runtime_state_returns_true_when_set_meets_write_quorum() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![1],
+                drives_per_set: vec![1],
+                ..Default::default()
+            },
+            disks: vec![Disk {
+                pool_index: 0,
+                set_index: 0,
+                state: "ok".to_string(),
+                runtime_state: Some("online".to_string()),
+                ..Default::default()
+            }],
+        };
+
+        assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn storage_ready_from_runtime_state_deduplicates_duplicate_disk_rows() {
+        let duplicate_disk = Disk {
+            endpoint: "127.0.0.1:9000".to_string(),
+            drive_path: "/data0".to_string(),
+            pool_index: 0,
+            set_index: 0,
+            disk_index: 0,
+            state: "ok".to_string(),
+            runtime_state: Some("online".to_string()),
+            ..Default::default()
+        };
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: vec![duplicate_disk.clone(), duplicate_disk],
+        };
+
+        assert!(!storage_ready_from_runtime_state(&info), "duplicate rows must not satisfy write quorum");
+    }
+
+    #[test]
+    fn disk_online_for_readiness_requires_runtime_and_state_both_acceptable() {
+        let disk = Disk {
+            state: "disk io error".to_string(),
+            runtime_state: Some("online".to_string()),
+            ..Default::default()
+        };
+        assert!(!disk_is_online_for_readiness(&disk));
+    }
+
+    #[test]
+    fn storage_ready_from_runtime_state_requires_all_sets_meet_quorum() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![1],
+                drives_per_set: vec![2],
+                ..Default::default()
+            },
+            disks: vec![
+                Disk {
+                    endpoint: "127.0.0.1:9000".to_string(),
+                    drive_path: "/set0d0".to_string(),
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index: 0,
+                    state: "ok".to_string(),
+                    runtime_state: Some("online".to_string()),
+                    ..Default::default()
+                },
+                Disk {
+                    endpoint: "127.0.0.1:9000".to_string(),
+                    drive_path: "/set1d0".to_string(),
+                    pool_index: 0,
+                    set_index: 1,
+                    disk_index: 0,
+                    state: "offline".to_string(),
+                    runtime_state: Some("offline".to_string()),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        assert!(
+            !storage_ready_from_runtime_state(&info),
+            "if any set fails write quorum, readiness must be false"
+        );
     }
 }
