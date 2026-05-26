@@ -340,7 +340,10 @@ impl ErasureSetHealer {
                 let cancel_token = self.cancel_token.clone();
                 let in_flight = in_flight.clone();
                 let set_label = set_disk_id.to_string();
+                let heal_opts = self.heal_opts;
+                let deep_scan = matches!(heal_opts.scan_mode, HealScanMode::Deep);
                 let semaphore = semaphore.clone();
+
                 page_tasks.push(async move {
                     let permit = semaphore
                         .clone()
@@ -362,8 +365,7 @@ impl ErasureSetHealer {
 
                     let result = if cancel_token.is_cancelled() {
                         Err(Error::TaskCancelled)
-                    } else if matches!(self.heal_opts.scan_mode, HealScanMode::Deep) {
-                        let heal_opts = self.heal_opts;
+                    } else if deep_scan {
                         match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
                             Ok((_result, None)) => Ok(true),
                             Ok((_, Some(err))) => {
@@ -416,7 +418,6 @@ impl ErasureSetHealer {
                         if !object_exists {
                             Ok(false)
                         } else {
-                            let heal_opts = self.heal_opts;
                             match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
                                 Ok((_result, None)) => Ok(true),
                                 Ok((_, Some(err))) => Err(Error::other(err)),

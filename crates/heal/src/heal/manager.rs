@@ -25,7 +25,7 @@ use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::{
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -46,8 +46,8 @@ struct PriorityHealQueue {
     heap: BinaryHeap<PriorityQueueItem>,
     /// Sequence counter for FIFO ordering within same priority
     sequence: u64,
-    /// Set of request keys to prevent duplicates
-    dedup_keys: HashSet<String>,
+    /// Deduplication key reference counts for queued requests
+    dedup_keys: HashMap<String, usize>,
 }
 
 /// Wrapper for heap items to implement proper ordering
@@ -110,7 +110,7 @@ impl PriorityHealQueue {
         Self {
             heap: BinaryHeap::new(),
             sequence: 0,
-            dedup_keys: HashSet::new(),
+            dedup_keys: HashMap::new(),
         }
     }
 
@@ -121,7 +121,7 @@ impl PriorityHealQueue {
     fn pop_next(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
             let key = Self::make_dedup_key(&item.request);
-            self.dedup_keys.remove(&key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
             item.request
         })
     }
@@ -133,12 +133,13 @@ impl PriorityHealQueue {
     fn push(&mut self, request: HealRequest) -> QueuePushOutcome {
         let key = Self::make_dedup_key(&request);
 
-        // Check for duplicates
-        if self.dedup_keys.contains(&key) {
+        // Check for duplicates unless the caller explicitly forces admission.
+        if self.dedup_keys.contains_key(&key) && !request.force_start {
             return QueuePushOutcome::Merged;
         }
-
-        self.dedup_keys.insert(key);
+        // Track dedup keys for both normal and forced requests so queued forced work
+        // also reserves the dedup key for later non-forced duplicates.
+        *self.dedup_keys.entry(key).or_insert(0) += 1;
         self.sequence += 1;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
@@ -161,7 +162,7 @@ impl PriorityHealQueue {
     fn pop(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
             let key = Self::make_dedup_key(&item.request);
-            self.dedup_keys.remove(&key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
             item.request
         })
     }
@@ -201,7 +202,7 @@ impl PriorityHealQueue {
         (
             selected.map(|item| {
                 let key = Self::make_dedup_key(&item.request);
-                self.dedup_keys.remove(&key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
                 item.request
             }),
             skipped,
@@ -240,17 +241,27 @@ impl PriorityHealQueue {
         }
     }
 
+    fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, usize>, key: &str) {
+        if let Some(count) = dedup_keys.get_mut(key) {
+            if *count <= 1 {
+                dedup_keys.remove(key);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+
     /// Check if a request with the same key already exists in the queue
     #[allow(dead_code)]
     fn contains_key(&self, request: &HealRequest) -> bool {
         let key = Self::make_dedup_key(request);
-        self.dedup_keys.contains(&key)
+        self.dedup_keys.contains_key(&key)
     }
 
     /// Check if an erasure set heal request for a specific set_disk_id exists
     fn contains_erasure_set(&self, set_disk_id: &str) -> bool {
         let key = format!("erasure_set:{set_disk_id}");
-        self.dedup_keys.contains(&key)
+        self.dedup_keys.contains_key(&key)
     }
 
     fn contains_request_id(&self, request_id: &str) -> bool {
@@ -277,7 +288,7 @@ impl PriorityHealQueue {
         while let Some(item) = self.heap.pop() {
             if removed.is_none() && item.request.id == request_id {
                 let key = Self::make_dedup_key(&item.request);
-                self.dedup_keys.remove(&key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
                 removed = Some(item.request);
             } else {
                 retained.push(item);
@@ -298,7 +309,7 @@ impl PriorityHealQueue {
         while let Some(item) = self.heap.pop() {
             if should_remove(&item.request) {
                 let key = Self::make_dedup_key(&item.request);
-                self.dedup_keys.remove(&key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
                 removed_count += 1;
             } else {
                 retained.push(item);
@@ -541,7 +552,7 @@ impl HealManager {
         publish_heal_queue_length(&queue);
         let queue_capacity = config.queue_size;
 
-        if queue.contains_key(&request) {
+        if !request.force_start && queue.contains_key(&request) {
             let admission = if request.priority == HealPriority::Low && !config.low_priority_merge_enable {
                 HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)
             } else {
@@ -566,7 +577,7 @@ impl HealManager {
             return Ok(admission);
         }
 
-        if queue_len >= queue_capacity {
+        if queue_len >= queue_capacity && !request.force_start {
             let admission = Self::classify_full_admission(&request, &config);
             match admission {
                 HealAdmissionResult::Dropped(reason) => {
@@ -2121,6 +2132,122 @@ mod tests {
                 .await
                 .expect("low priority request should be dropped with explicit admission result"),
             HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_start_bypasses_duplicate_and_full_admission() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                low_priority_drop_when_full: true,
+                ..HealConfig::default()
+            }),
+        );
+
+        let normal = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let mut forced_duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        forced_duplicate.force_start = true;
+
+        let subsequent_duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(normal)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(forced_duplicate)
+                .await
+                .expect("force start should bypass duplicate/full policy"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(subsequent_duplicate)
+                .await
+                .expect("subsequent non-force duplicate should be merged"),
+            HealAdmissionResult::Merged
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_start_marks_dedup_key_for_future_duplicates() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        );
+
+        let normal = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let mut forced = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        forced.force_start = true;
+        let duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(normal)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(forced)
+                .await
+                .expect("forced request should bypass duplicate/full admission"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(duplicate)
+                .await
+                .expect("non-forced duplicate should merge while forced request is queued"),
+            HealAdmissionResult::Merged
         );
     }
 

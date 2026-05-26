@@ -1660,9 +1660,11 @@ mod test {
     }
 
     #[test]
-    fn walk_result_from_set_errors_returns_volume_not_found_when_all_sets_report_missing_volume() {
-        walk_result_from_set_errors(&[Some(StorageError::VolumeNotFound), Some(StorageError::VolumeNotFound)])
-            .expect_err("all volume-not-found set errors should stay fatal for generic walk callers");
+    fn walk_result_from_set_errors_preserves_volume_not_found() {
+        let err = walk_result_from_set_errors(&[Some(StorageError::VolumeNotFound), Some(StorageError::VolumeNotFound)])
+            .expect_err("all volume-not-found set errors should remain visible");
+
+        assert_eq!(err, StorageError::VolumeNotFound);
     }
 
     #[test]

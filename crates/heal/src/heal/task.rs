@@ -133,6 +133,8 @@ pub struct HealRequest {
     pub options: HealOptions,
     /// Priority
     pub priority: HealPriority,
+    /// Whether this request should bypass queue admission dedup/full policies.
+    pub force_start: bool,
     /// Created time
     pub created_at: SystemTime,
     /// Queue admission time used for scheduler delay metrics
@@ -147,6 +149,7 @@ impl HealRequest {
             heal_type,
             options,
             priority,
+            force_start: false,
             created_at: now,
             enqueued_at: now,
         }
@@ -1163,8 +1166,10 @@ impl HealTask {
             }
         }
 
+        // Create erasure set healer with resume support
+        info!("Creating erasure set healer with resume support");
         let heal_opts = HealOpts {
-            recursive: true,
+            recursive: self.options.recursive,
             dry_run: self.options.dry_run,
             remove: self.options.remove_corrupted,
             recreate: self.options.recreate_missing,
@@ -1174,9 +1179,6 @@ impl HealTask {
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
-
-        // Create erasure set healer with resume support
-        info!("Creating erasure set healer with resume support");
         let erasure_healer =
             ErasureSetHealer::new(self.storage.clone(), self.progress.clone(), self.cancel_token.clone(), disk, heal_opts);
 
