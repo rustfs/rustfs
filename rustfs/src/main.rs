@@ -618,42 +618,20 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // listen to the shutdown signal
     let shutdown_signal = wait_for_shutdown().await;
-    match shutdown_signal {
-        #[cfg(unix)]
-        ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(
-                &state_manager,
-                shutdown_signal,
-                s3_shutdown_tx,
-                console_shutdown_tx,
-                ProtocolShutdownSenders {
-                    ftp: ftp_shutdown_tx,
-                    ftps: ftps_shutdown_tx,
-                    webdav: webdav_shutdown_tx,
-                    sftp: sftp_shutdown_tx,
-                },
-                ctx.clone(),
-            )
-            .await;
-        }
-        #[cfg(not(unix))]
-        ShutdownSignal::CtrlC => {
-            handle_shutdown(
-                &state_manager,
-                shutdown_signal,
-                s3_shutdown_tx,
-                console_shutdown_tx,
-                ProtocolShutdownSenders {
-                    ftp: ftp_shutdown_tx,
-                    ftps: ftps_shutdown_tx,
-                    webdav: webdav_shutdown_tx,
-                    sftp: sftp_shutdown_tx,
-                },
-                ctx.clone(),
-            )
-            .await;
-        }
-    }
+    handle_shutdown(
+        &state_manager,
+        shutdown_signal,
+        s3_shutdown_tx,
+        console_shutdown_tx,
+        ProtocolShutdownSenders {
+            ftp: ftp_shutdown_tx,
+            ftps: ftps_shutdown_tx,
+            webdav: webdav_shutdown_tx,
+            sftp: sftp_shutdown_tx,
+        },
+        ctx.clone(),
+    )
+    .await;
 
     info!(target: "rustfs::main::run","server is stopped state: {:?}", state_manager.current_state());
     Ok(())

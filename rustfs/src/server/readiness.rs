@@ -162,7 +162,7 @@ pub async fn publish_ready_when_runtime_ready(
     wait_for_runtime_readiness_with(
         STARTUP_RUNTIME_READINESS_MAX_WAIT,
         STARTUP_RUNTIME_READINESS_POLL_INTERVAL,
-        collect_dependency_readiness,
+        collect_dependency_readiness_uncached,
         |dependency_readiness| {
             readiness.mark_stage(rustfs_common::SystemStage::FullReady);
             if let Some(state_manager) = state_manager {
@@ -325,12 +325,7 @@ pub async fn collect_dependency_readiness() -> DependencyReadiness {
     let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
         cached
     } else {
-        let computed = if let Some(store) = new_object_layer_fn() {
-            let storage_info = store.storage_info().await;
-            storage_ready_from_runtime_state(&storage_info)
-        } else {
-            false
-        };
+        let computed = collect_storage_readiness_uncached().await;
         update_storage_readiness_cache(computed).await;
         computed
     };
@@ -338,6 +333,25 @@ pub async fn collect_dependency_readiness() -> DependencyReadiness {
     DependencyReadiness {
         storage_ready,
         iam_ready: iam_ready && storage_ready,
+    }
+}
+
+async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
+    let iam_ready = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
+    let storage_ready = collect_storage_readiness_uncached().await;
+
+    DependencyReadiness {
+        storage_ready,
+        iam_ready: iam_ready && storage_ready,
+    }
+}
+
+async fn collect_storage_readiness_uncached() -> bool {
+    if let Some(store) = new_object_layer_fn() {
+        let storage_info = store.storage_info().await;
+        storage_ready_from_runtime_state(&storage_info)
+    } else {
+        false
     }
 }
 
