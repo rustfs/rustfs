@@ -403,6 +403,8 @@ pub async fn store_data_usage_in_backend(
         // Save main configuration
         if let Err(e) = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await {
             error!("Failed to save data usage info to {}: {e}", DATA_USAGE_OBJ_NAME_PATH.as_str());
+        } else {
+            rustfs_ecstore::data_usage::replace_bucket_usage_memory_from_info(&data_usage_info).await;
         }
 
         attempts += 1;

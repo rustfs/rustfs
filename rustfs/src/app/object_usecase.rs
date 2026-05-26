@@ -1791,14 +1791,18 @@ impl DefaultObjectUsecase {
         let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => {
+                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                Some(existing_obj_info.size.max(0) as u64)
+            }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
+                None
             }
-        }
+        };
 
         let actual_size = size;
 
@@ -1913,8 +1917,13 @@ impl DefaultObjectUsecase {
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
-        // Fast in-memory update for immediate quota consistency
-        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+        // Fast in-memory update for immediate quota and admin usage consistency
+        rustfs_ecstore::data_usage::record_bucket_object_write_memory(
+            &bucket,
+            previous_current_size,
+            obj_info.size.max(0) as u64,
+        )
+        .await;
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -2655,14 +2664,18 @@ impl DefaultObjectUsecase {
         let current_opts: ObjectOptions = get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => {
+                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                Some(existing_obj_info.size.max(0) as u64)
+            }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
+                None
             }
-        }
+        };
 
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         let mut effective_sse = requested_sse.or_else(|| {
@@ -2835,7 +2848,8 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
+            rustfs_ecstore::data_usage::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64)
+                .await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3091,10 +3105,13 @@ impl DefaultObjectUsecase {
                     existing_object_infos[i].as_ref(),
                 )
                 .await;
-                let size = object_sizes[i];
-                if size > 0 {
-                    rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
-                }
+                let size = object_sizes[i].max(0) as u64;
+                rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
+                    &bucket,
+                    size,
+                    existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
+                )
+                .await;
                 continue;
             }
 
@@ -3309,8 +3326,13 @@ impl DefaultObjectUsecase {
 
         enqueue_transitioned_delete_cleanup(&bucket, &key, &opts, existing_object_info.as_ref()).await;
 
-        // Fast in-memory update for immediate quota consistency
-        rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+        // Fast in-memory update for immediate quota and admin usage consistency
+        rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
+            &bucket,
+            obj_info.size.max(0) as u64,
+            opts.version_id.is_none(),
+        )
+        .await;
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {

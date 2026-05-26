@@ -19,7 +19,7 @@ use crate::capacity::resolve_admin_used_capacity;
 use crate::error::ApiError;
 use rustfs_data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
-use rustfs_ecstore::data_usage::load_data_usage_from_backend;
+use rustfs_ecstore::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
 use rustfs_ecstore::endpoints::EndpointServerPools;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
@@ -154,6 +154,7 @@ impl DefaultAdminUsecase {
             error!("load_data_usage_from_backend failed {:?}", e);
             Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed")
         })?;
+        apply_bucket_usage_memory_overlay(&mut info).await;
 
         let storage_info = store.storage_info().await;
 

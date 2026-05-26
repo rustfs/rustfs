@@ -9402,9 +9402,11 @@ name = "rustfs-credentials"
 version = "1.0.0-beta.4"
 dependencies = [
  "base64-simd",
+ "hmac 0.13.0",
  "rand 0.10.1",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "time",
 ]
 
@@ -9608,7 +9610,6 @@ dependencies = [
  "moka",
  "openidconnect",
  "pollster",
- "rand 0.10.1",
  "reqwest",
  "rustfs-config",
  "rustfs-credentials",

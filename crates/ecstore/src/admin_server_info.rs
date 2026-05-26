@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::{
     disk::endpoint::Endpoint,
-    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints},
+    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints, get_global_deployment_id},
     new_object_layer_fn,
     notification_sys::get_global_notification_sys,
     store_api::StorageAPI,
@@ -291,7 +291,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         domain: None,
         region: None,
         sqs_arn: None,
-        deployment_id: None,
+        deployment_id: get_global_deployment_id(),
         buckets: Some(buckets),
         objects: Some(objects),
         versions: Some(versions),
@@ -392,4 +392,22 @@ pub fn get_commit_id() -> String {
     };
 
     format!("{}@{}", build::COMMIT_DATE_3339, ver)
+}
+
+#[cfg(test)]
+mod tests {
+    use serial_test::serial;
+
+    use crate::global::get_global_deployment_id;
+
+    use super::get_server_info;
+
+    #[serial]
+    #[tokio::test]
+    async fn server_info_includes_global_deployment_id() {
+        let expected_deployment_id = get_global_deployment_id();
+        let info = get_server_info(false).await;
+
+        assert_eq!(info.deployment_id, expected_deployment_id);
+    }
 }
