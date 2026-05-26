@@ -133,12 +133,13 @@ impl PriorityHealQueue {
     fn push(&mut self, request: HealRequest) -> QueuePushOutcome {
         let key = Self::make_dedup_key(&request);
 
-        // Check for duplicates
-        if self.dedup_keys.contains(&key) {
-            return QueuePushOutcome::Merged;
+        // Check for duplicates unless the caller explicitly forces admission.
+        if !request.force_start {
+            if self.dedup_keys.contains(&key) {
+                return QueuePushOutcome::Merged;
+            }
+            self.dedup_keys.insert(key);
         }
-
-        self.dedup_keys.insert(key);
         self.sequence += 1;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
@@ -210,7 +211,7 @@ impl PriorityHealQueue {
 
     /// Create a deduplication key from a heal request
     fn make_dedup_key(request: &HealRequest) -> String {
-        match &request.heal_type {
+        let key = match &request.heal_type {
             HealType::Object {
                 bucket,
                 object,
@@ -237,6 +238,12 @@ impl PriorityHealQueue {
             } => {
                 format!("ecdecode:{}:{}:{}", bucket, object, version_id.as_deref().unwrap_or(""))
             }
+        };
+
+        if request.force_start {
+            format!("force:{}:{key}", request.id)
+        } else {
+            key
         }
     }
 
@@ -541,7 +548,7 @@ impl HealManager {
         publish_heal_queue_length(&queue);
         let queue_capacity = config.queue_size;
 
-        if queue.contains_key(&request) {
+        if !request.force_start && queue.contains_key(&request) {
             let admission = if request.priority == HealPriority::Low && !config.low_priority_merge_enable {
                 HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)
             } else {
@@ -566,7 +573,7 @@ impl HealManager {
             return Ok(admission);
         }
 
-        if queue_len >= queue_capacity {
+        if queue_len >= queue_capacity && !request.force_start {
             let admission = Self::classify_full_admission(&request, &config);
             match admission {
                 HealAdmissionResult::Dropped(reason) => {
@@ -2121,6 +2128,44 @@ mod tests {
                 .await
                 .expect("low priority request should be dropped with explicit admission result"),
             HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_start_bypasses_duplicate_and_full_admission() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                low_priority_drop_when_full: true,
+                ..HealConfig::default()
+            }),
+        );
+
+        let normal = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let mut forced_duplicate = normal.clone();
+        forced_duplicate.force_start = true;
+
+        assert_eq!(
+            manager
+                .submit_heal_request(normal)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(forced_duplicate)
+                .await
+                .expect("force start should bypass duplicate/full policy"),
+            HealAdmissionResult::Accepted
         );
     }
 

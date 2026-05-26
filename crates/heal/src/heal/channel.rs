@@ -343,14 +343,13 @@ impl HealChannelProcessor {
             set_index: request.set_index,
         };
 
+        let mut heal_request = HealRequest::new(heal_type, options, priority);
+        heal_request.id = request.id;
         // force_start controls admission/queue semantics only. Do not reinterpret it as
         // destructive heal options: admin clients commonly pass forceStart=true together
         // with remove=false, and turning that into remove_corrupted=true can delete the
         // remaining healthy bucket volumes before object shards are rebuilt.
-        let _ = request.force_start;
-
-        let mut heal_request = HealRequest::new(heal_type, options, priority);
-        heal_request.id = request.id;
+        heal_request.force_start = request.force_start;
         Ok(heal_request)
     }
 
@@ -667,6 +666,7 @@ mod tests {
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+        assert!(heal_request.force_start);
         assert!(!heal_request.options.remove_corrupted);
         assert!(!heal_request.options.recreate_missing);
         assert!(!heal_request.options.update_parity);

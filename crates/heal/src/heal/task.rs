@@ -133,6 +133,8 @@ pub struct HealRequest {
     pub options: HealOptions,
     /// Priority
     pub priority: HealPriority,
+    /// Whether this request should bypass queue admission dedup/full policies.
+    pub force_start: bool,
     /// Created time
     pub created_at: SystemTime,
     /// Queue admission time used for scheduler delay metrics
@@ -147,6 +149,7 @@ impl HealRequest {
             heal_type,
             options,
             priority,
+            force_start: false,
             created_at: now,
             enqueued_at: now,
         }
