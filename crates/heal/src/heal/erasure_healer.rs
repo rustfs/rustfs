@@ -62,6 +62,18 @@ impl ErasureSetHealer {
         }
     }
 
+    fn effective_heal_page_object_concurrency_for_scan_mode(scan_mode: HealScanMode) -> usize {
+        if matches!(scan_mode, HealScanMode::Deep) {
+            1
+        } else {
+            Self::effective_heal_page_object_concurrency()
+        }
+    }
+
+    fn is_object_not_found_message(message: &str) -> bool {
+        message.contains("File not found") || message.contains("not found")
+    }
+
     pub fn new(
         storage: Arc<dyn HealStorageAPI>,
         progress: Arc<RwLock<HealProgress>>,
@@ -292,7 +304,7 @@ impl ErasureSetHealer {
         // 2. process objects with pagination to avoid loading all objects into memory
         let mut continuation_token: Option<String> = None;
         let mut global_obj_idx = 0usize;
-        let page_concurrency_limit = Self::effective_heal_page_object_concurrency();
+        let page_concurrency_limit = Self::effective_heal_page_object_concurrency_for_scan_mode(self.heal_opts.scan_mode);
         let in_flight = Arc::new(AtomicUsize::new(0));
 
         loop {
@@ -329,23 +341,50 @@ impl ErasureSetHealer {
                 let in_flight = in_flight.clone();
                 let set_label = set_disk_id.to_string();
                 let heal_opts = self.heal_opts;
-                let permit = semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| Error::other(format!("Failed to acquire page concurrency permit: {e}")))?;
-
-                let current_in_flight = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                gauge!(
-                    "rustfs_heal_page_concurrency_current",
-                    "set" => set_label.clone()
-                )
-                .set(current_in_flight as f64);
+                let deep_scan = matches!(heal_opts.scan_mode, HealScanMode::Deep);
+                let semaphore = semaphore.clone();
 
                 page_tasks.push(async move {
-                    let _permit = permit;
+                    let permit = semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| Error::other(format!("Failed to acquire page concurrency permit: {e}")));
+
+                    let _permit = match permit {
+                        Ok(permit) => permit,
+                        Err(err) => return (object_name, Err(err)),
+                    };
+
+                    let current_in_flight = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    gauge!(
+                        "rustfs_heal_page_concurrency_current",
+                        "set" => set_label.clone()
+                    )
+                    .set(current_in_flight as f64);
+
                     let result = if cancel_token.is_cancelled() {
                         Err(Error::TaskCancelled)
+                    } else if deep_scan {
+                        match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
+                            Ok((_result, None)) => Ok(true),
+                            Ok((_, Some(err))) => {
+                                let err_msg = err.to_string();
+                                if Self::is_object_not_found_message(&err_msg) {
+                                    Ok(false)
+                                } else {
+                                    Err(Error::other(err))
+                                }
+                            }
+                            Err(err) => {
+                                let err_msg = err.to_string();
+                                if Self::is_object_not_found_message(&err_msg) {
+                                    Ok(false)
+                                } else {
+                                    Err(err)
+                                }
+                            }
+                        }
                     } else {
                         let object_exists = match storage.object_exists(&bucket_name, &object_name).await {
                             Ok(exists) => exists,
@@ -676,6 +715,7 @@ impl ErasureSetHealer {
 #[cfg(test)]
 mod tests {
     use super::ErasureSetHealer;
+    use rustfs_common::heal_channel::HealScanMode;
 
     #[test]
     fn heal_page_object_concurrency_uses_default_when_env_is_unset() {
@@ -700,6 +740,26 @@ mod tests {
             temp_env::with_var(rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("11"), || {
                 assert_eq!(ErasureSetHealer::effective_heal_page_object_concurrency(), 1);
             });
+        });
+    }
+
+    #[test]
+    fn deep_scan_heal_page_object_concurrency_is_serial() {
+        temp_env::with_var(rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("11"), || {
+            assert_eq!(
+                ErasureSetHealer::effective_heal_page_object_concurrency_for_scan_mode(HealScanMode::Deep),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn normal_scan_heal_page_object_concurrency_uses_effective_limit() {
+        temp_env::with_var(rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("11"), || {
+            assert_eq!(
+                ErasureSetHealer::effective_heal_page_object_concurrency_for_scan_mode(HealScanMode::Normal),
+                11
+            );
         });
     }
 }
