@@ -48,6 +48,7 @@ pub(crate) use prefix::{
     ADMIN_PREFIX, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TONIC_PREFIX, VERSION,
 };
+pub use readiness::DependencyReadiness;
 pub(crate) use readiness::ReadinessGateLayer;
 pub(crate) use readiness::collect_dependency_readiness;
 pub use readiness::publish_ready_when_runtime_ready;

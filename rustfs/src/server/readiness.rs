@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::admin_usecase::DependencyReadiness;
 use crate::server::{ServiceState, ServiceStateManager};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
@@ -40,6 +39,12 @@ use tracing::{debug, info};
 
 pub const STARTUP_RUNTIME_READINESS_MAX_WAIT: Duration = Duration::from_secs(30);
 pub const STARTUP_RUNTIME_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DependencyReadiness {
+    pub storage_ready: bool,
+    pub iam_ready: bool,
+}
 
 /// ReadinessGateLayer ensures that the system components (IAM, Storage)
 /// are fully initialized before allowing any request to proceed.

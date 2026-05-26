@@ -17,7 +17,7 @@
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::capacity::resolve_admin_used_capacity;
 use crate::error::ApiError;
-use crate::server::collect_dependency_readiness as collect_runtime_dependency_readiness;
+use crate::server::{DependencyReadiness, collect_dependency_readiness as collect_runtime_dependency_readiness};
 use rustfs_data_usage::DataUsageInfo;
 use rustfs_ecstore::admin_server_info::get_server_info;
 use rustfs_ecstore::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
@@ -45,12 +45,6 @@ impl std::fmt::Debug for QueryServerInfoResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryServerInfoResponse").finish_non_exhaustive()
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DependencyReadiness {
-    pub storage_ready: bool,
-    pub iam_ready: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -311,7 +305,6 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
-        let _ = &self.context;
         collect_runtime_dependency_readiness().await
     }
 }
