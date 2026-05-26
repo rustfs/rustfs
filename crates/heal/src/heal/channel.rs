@@ -331,7 +331,7 @@ impl HealChannelProcessor {
         };
 
         // Build HealOptions with all available fields
-        let mut options = HealOptions {
+        let options = HealOptions {
             scan_mode: request.scan_mode.unwrap_or(HealScanMode::Normal),
             remove_corrupted: request.remove_corrupted.unwrap_or(false),
             recreate_missing: request.recreate_missing.unwrap_or(true),
@@ -343,15 +343,13 @@ impl HealChannelProcessor {
             set_index: request.set_index,
         };
 
-        // Apply force_start overrides
-        if request.force_start {
-            options.remove_corrupted = true;
-            options.recreate_missing = true;
-            options.update_parity = true;
-        }
-
         let mut heal_request = HealRequest::new(heal_type, options, priority);
         heal_request.id = request.id;
+        // force_start controls admission/queue semantics only. Do not reinterpret it as
+        // destructive heal options: admin clients commonly pass forceStart=true together
+        // with remove=false, and turning that into remove_corrupted=true can delete the
+        // remaining healthy bucket volumes before object shards are rebuilt.
+        heal_request.force_start = request.force_start;
         Ok(heal_request)
     }
 
@@ -664,13 +662,14 @@ mod tests {
             timeout_seconds: None,
             pool_index: None,
             set_index: None,
-            force_start: true, // Should override the above false values
+            force_start: true, // Admission force only; must not override explicit heal options.
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
-        assert!(heal_request.options.remove_corrupted);
-        assert!(heal_request.options.recreate_missing);
-        assert!(heal_request.options.update_parity);
+        assert!(heal_request.force_start);
+        assert!(!heal_request.options.remove_corrupted);
+        assert!(!heal_request.options.recreate_missing);
+        assert!(!heal_request.options.update_parity);
     }
 
     #[tokio::test]
