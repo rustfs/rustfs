@@ -162,6 +162,10 @@ mod tests {
         )
         .await
         .expect("Failed to restart 4-disk RustFS after disk wipe");
+        // The helper's Drop cleanup removes env.temp_dir. Reset it to the parent
+        // directory after server startup so all four disk directories are cleaned
+        // without manually deleting a path Drop will also try to remove.
+        env.temp_dir = root.to_string_lossy().to_string();
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
         let heal_url = format!("{}/rustfs/admin/v3/heal/{}?forceStart=true", env.url, bucket);
@@ -170,11 +174,11 @@ mod tests {
             .expect("admin deep heal should be accepted");
 
         for _ in 0..heal_timeout_secs {
-            for (key, body, _) in &objects {
-                assert_object_body(&env, bucket, key, body).await;
-            }
-
             if all_object_metadata_exists_on_disk(&disk0, bucket, &object_keys) {
+                for (key, body, _) in &objects {
+                    assert_object_body(&env, bucket, key, body).await;
+                }
+
                 env.stop_server();
                 for key in &object_keys {
                     assert!(
@@ -182,7 +186,6 @@ mod tests {
                         "wiped disk should contain rebuilt xl.meta for {key}"
                     );
                 }
-                let _ = std::fs::remove_dir_all(&root);
                 return;
             }
 
