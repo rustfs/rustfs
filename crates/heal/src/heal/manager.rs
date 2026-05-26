@@ -134,11 +134,11 @@ impl PriorityHealQueue {
         let key = Self::make_dedup_key(&request);
 
         // Check for duplicates unless the caller explicitly forces admission.
-        if !request.force_start {
-            if self.dedup_keys.contains_key(&key) {
-                return QueuePushOutcome::Merged;
-            }
+        if self.dedup_keys.contains_key(&key) && !request.force_start {
+            return QueuePushOutcome::Merged;
         }
+        // Track dedup keys for both normal and forced requests so queued forced work
+        // also reserves the dedup key for later non-forced duplicates.
         *self.dedup_keys.entry(key).or_insert(0) += 1;
         self.sequence += 1;
         self.heap.push(PriorityQueueItem {
@@ -2192,6 +2192,63 @@ mod tests {
                 .submit_heal_request(subsequent_duplicate)
                 .await
                 .expect("subsequent non-force duplicate should be merged"),
+            HealAdmissionResult::Merged
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_start_marks_dedup_key_for_future_duplicates() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        );
+
+        let normal = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let mut forced = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        forced.force_start = true;
+        let duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(normal)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(forced)
+                .await
+                .expect("forced request should bypass duplicate/full admission"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(duplicate)
+                .await
+                .expect("non-forced duplicate should merge while forced request is queued"),
             HealAdmissionResult::Merged
         );
     }

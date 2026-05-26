@@ -19,7 +19,7 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, execute_awscurl, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
     use serial_test::serial;
-    use std::collections::VecDeque;
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use tokio::time::{Duration, sleep};
     use tracing::info;
@@ -127,8 +127,7 @@ mod tests {
         }
 
         let object_keys = objects.iter().map(|(key, _, _)| key.clone()).collect::<Vec<_>>();
-        let mut remaining_keys = VecDeque::from(object_keys.clone());
-        let metadata_check_batch_size = 16;
+        let mut remaining_rebuild_keys: HashSet<String> = object_keys.iter().cloned().collect();
 
         client
             .create_bucket()
@@ -173,17 +172,19 @@ mod tests {
             .expect("admin deep heal should be accepted");
 
         for _ in 0..heal_timeout_secs {
-            let mut checks_remaining = metadata_check_batch_size.min(remaining_keys.len());
-            while checks_remaining > 0 {
-                if let Some(key) = remaining_keys.pop_front() {
-                    if !object_metadata_exists_on_disk(&disk0, bucket, &key) {
-                        remaining_keys.push_back(key);
+            if !remaining_rebuild_keys.is_empty() {
+                let mut rebuilt = Vec::new();
+                for key in &remaining_rebuild_keys {
+                    if object_metadata_exists_on_disk(&disk0, bucket, key) {
+                        rebuilt.push(key.clone());
                     }
                 }
-                checks_remaining -= 1;
+                for key in rebuilt {
+                    let _ = remaining_rebuild_keys.remove(&key);
+                }
             }
 
-            if remaining_keys.is_empty() {
+            if remaining_rebuild_keys.is_empty() {
                 for (key, body, _) in &objects {
                     assert_object_body(&env, bucket, key, body).await;
                 }
