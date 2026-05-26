@@ -659,7 +659,11 @@ impl HealTask {
         let heal_opts = HealOpts {
             recursive: self.options.recursive,
             dry_run: self.options.dry_run,
-            remove: self.options.remove_corrupted,
+            remove: if self.options.recursive {
+                false
+            } else {
+                self.options.remove_corrupted
+            },
             recreate: self.options.recreate_missing,
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
@@ -1141,9 +1145,22 @@ impl HealTask {
             }
         }
 
+        let heal_opts = HealOpts {
+            recursive: true,
+            dry_run: self.options.dry_run,
+            remove: self.options.remove_corrupted,
+            recreate: self.options.recreate_missing,
+            scan_mode: self.options.scan_mode,
+            update_parity: self.options.update_parity,
+            no_lock: false,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+
         // Step 3: Create erasure set healer with resume support
         info!("Step 3: Creating erasure set healer with resume support");
-        let erasure_healer = ErasureSetHealer::new(self.storage.clone(), self.progress.clone(), self.cancel_token.clone(), disk);
+        let erasure_healer =
+            ErasureSetHealer::new(self.storage.clone(), self.progress.clone(), self.cancel_token.clone(), disk, heal_opts);
 
         {
             let mut progress = self.progress.write().await;
@@ -1202,6 +1219,8 @@ mod tests {
     struct MockStorage {
         listed: Mutex<bool>,
         healed_objects: Mutex<Vec<String>>,
+        bucket_heal_opts: Mutex<Vec<HealOpts>>,
+        object_heal_opts: Mutex<Vec<HealOpts>>,
     }
 
     #[async_trait::async_trait]
@@ -1270,9 +1289,10 @@ mod tests {
             _bucket: &str,
             object: &str,
             _version_id: Option<&str>,
-            _opts: &HealOpts,
+            opts: &HealOpts,
         ) -> Result<(HealResultItem, Option<Error>)> {
             self.healed_objects.lock().unwrap().push(object.to_string());
+            self.object_heal_opts.lock().unwrap().push(*opts);
             Ok((
                 HealResultItem {
                     object_size: 1,
@@ -1282,7 +1302,8 @@ mod tests {
             ))
         }
 
-        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
+        async fn heal_bucket(&self, _bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+            self.bucket_heal_opts.lock().unwrap().push(*opts);
             Ok(HealResultItem::default())
         }
 
@@ -1344,5 +1365,41 @@ mod tests {
         let result_items = task.get_result_items().await;
         assert_eq!(result_items.len(), 3);
         assert_eq!(result_items.iter().filter(|item| item.object_size == 1).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_recursive_bucket_heal_does_not_remove_bucket_metadata() {
+        let storage = Arc::new(MockStorage::default());
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                remove_corrupted: true,
+                recreate_missing: true,
+                scan_mode: HealScanMode::Deep,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.heal_bucket("bucket-a")
+            .await
+            .expect("recursive bucket heal should succeed");
+
+        let bucket_opts = storage.bucket_heal_opts.lock().unwrap();
+        assert_eq!(bucket_opts.len(), 1);
+        assert!(!bucket_opts[0].remove);
+        assert!(bucket_opts[0].recreate);
+        assert_eq!(bucket_opts[0].scan_mode, HealScanMode::Deep);
+
+        let object_opts = storage.object_heal_opts.lock().unwrap();
+        assert_eq!(object_opts.len(), 2);
+        assert!(object_opts.iter().all(|opts| opts.remove));
+        assert!(object_opts.iter().all(|opts| opts.recreate));
+        assert!(object_opts.iter().all(|opts| opts.scan_mode == HealScanMode::Deep));
     }
 }

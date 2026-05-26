@@ -70,7 +70,7 @@ fn ensure_non_empty_listing_disks(bucket: &str, path: &str, disks: &[DiskStore])
 fn walk_result_from_set_errors(errs: &[Option<Error>]) -> Result<()> {
     if is_all_not_found(errs) {
         if is_all_volume_not_found(errs) {
-            return Err(StorageError::VolumeNotFound);
+            warn!(?errs, "treating all-volume-not-found listing result as empty during walk");
         }
 
         return Ok(());
@@ -1660,11 +1660,9 @@ mod test {
     }
 
     #[test]
-    fn walk_result_from_set_errors_preserves_volume_not_found() {
-        let err = walk_result_from_set_errors(&[Some(StorageError::VolumeNotFound), Some(StorageError::VolumeNotFound)])
-            .expect_err("all volume-not-found set errors should remain visible");
-
-        assert_eq!(err, StorageError::VolumeNotFound);
+    fn walk_result_from_set_errors_treats_all_volume_not_found_as_empty_listing() {
+        walk_result_from_set_errors(&[Some(StorageError::VolumeNotFound), Some(StorageError::VolumeNotFound)])
+            .expect("all volume-not-found set errors should be treated as an empty listing");
     }
 
     #[test]
