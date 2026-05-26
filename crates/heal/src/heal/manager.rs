@@ -211,7 +211,7 @@ impl PriorityHealQueue {
 
     /// Create a deduplication key from a heal request
     fn make_dedup_key(request: &HealRequest) -> String {
-        let key = match &request.heal_type {
+        match &request.heal_type {
             HealType::Object {
                 bucket,
                 object,
@@ -238,9 +238,7 @@ impl PriorityHealQueue {
             } => {
                 format!("ecdecode:{}:{}:{}", bucket, object, version_id.as_deref().unwrap_or(""))
             }
-        };
-
-        key
+        }
     }
 
     fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, usize>, key: &str) {
