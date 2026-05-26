@@ -115,6 +115,9 @@ mod head_object_range_test;
 mod head_object_consistency_test;
 
 #[cfg(test)]
+mod heal_erasure_disk_rebuild_test;
+
+#[cfg(test)]
 mod copy_object_metadata_test;
 
 // S3 dummy-compat bucket API tests
