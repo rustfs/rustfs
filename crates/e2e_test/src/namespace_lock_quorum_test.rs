@@ -117,6 +117,6 @@ async fn test_concurrent_cluster_overwrites_do_not_fail_namespace_lock_quorum() 
         "final object body should be one of the successful overwrite payloads, got {body:?}"
     );
 
-    clients[0].delete_object().bucket(BUCKET).key(KEY).send().await.ok();
+    clients[0].delete_object().bucket(BUCKET).key(KEY).send().await?;
     Ok(())
 }
