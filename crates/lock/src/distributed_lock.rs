@@ -30,6 +30,8 @@ use uuid::Uuid;
 
 const UNLOCK_RETRY_ATTEMPTS: usize = 3;
 const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const LOCK_ACQUIRE_RETRY_ATTEMPTS: usize = 3;
+const LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Generate a new aggregate lock ID for multiple client locks
 fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
@@ -185,7 +187,7 @@ impl DistributedLock {
         }
 
         let required_quorum = self.required_quorum(request.lock_type);
-        let (resp, individual_locks) = self.acquire_lock_quorum(request).await?;
+        let (resp, individual_locks) = self.acquire_lock_quorum_with_retry(request).await?;
         if resp.success {
             // Use aggregate lock_id from LockResponse's LockInfo
             // The aggregate id is what we expose to callers; individual_locks carries
@@ -285,6 +287,26 @@ impl DistributedLock {
             pending.spawn(async move { (idx, client.acquire_lock(&request).await) });
         }
         pending
+    }
+
+    fn lock_acquire_retry_backoff(attempt: usize) -> Duration {
+        LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF * attempt as u32
+    }
+
+    fn lock_acquire_attempt_timeout(total_timeout: Duration, remaining: Duration) -> Duration {
+        let divided = total_timeout / LOCK_ACQUIRE_RETRY_ATTEMPTS as u32;
+        let per_attempt = divided.max(Duration::from_millis(1));
+        per_attempt.min(remaining)
+    }
+
+    fn is_retryable_lock_failure(resp: &LockResponse) -> bool {
+        resp.error
+            .as_deref()
+            .map(|error| {
+                let error = error.to_ascii_lowercase();
+                error.contains("timeout") || error.contains("rpc failed")
+            })
+            .unwrap_or(false)
     }
 
     async fn release_entries(entries: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
@@ -408,14 +430,59 @@ impl DistributedLock {
         }
     }
 
+    async fn acquire_lock_quorum_with_retry(
+        &self,
+        request: &LockRequest,
+    ) -> Result<(LockResponse, Vec<(LockId, Arc<dyn LockClient>)>)> {
+        let start = std::time::Instant::now();
+        let mut attempt = 1;
+        let mut last_result = None;
+
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= request.acquire_timeout {
+                break;
+            }
+
+            let remaining = request.acquire_timeout - elapsed;
+            let mut attempt_request = request.clone();
+            attempt_request.acquire_timeout = Self::lock_acquire_attempt_timeout(request.acquire_timeout, remaining);
+
+            let result = self.acquire_lock_quorum_once(&attempt_request).await?;
+            if result.0.success
+                || !result.1.is_empty()
+                || !Self::is_retryable_lock_failure(&result.0)
+                || attempt >= LOCK_ACQUIRE_RETRY_ATTEMPTS
+            {
+                return Ok(result);
+            }
+
+            last_result = Some(result);
+            let backoff = Self::lock_acquire_retry_backoff(attempt);
+            if start.elapsed().saturating_add(backoff) >= request.acquire_timeout {
+                break;
+            }
+
+            tokio::time::sleep(backoff).await;
+            attempt += 1;
+        }
+
+        Ok(last_result
+            .unwrap_or_else(|| (LockResponse::failure("Lock acquisition timeout", request.acquire_timeout), Vec::new())))
+    }
+
     /// Quorum-based lock acquisition: success if at least the required quorum succeeds.
     /// Collects all individual lock_ids from successful clients and creates an aggregate lock_id.
     /// Returns the LockResponse with aggregate lock_id and individual lock mappings.
-    async fn acquire_lock_quorum(&self, request: &LockRequest) -> Result<(LockResponse, Vec<(LockId, Arc<dyn LockClient>)>)> {
+    async fn acquire_lock_quorum_once(
+        &self,
+        request: &LockRequest,
+    ) -> Result<(LockResponse, Vec<(LockId, Arc<dyn LockClient>)>)> {
         let required_quorum = self.required_quorum(request.lock_type);
         let mut pending = self.spawn_lock_requests(request);
         let mut individual_locks: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
         let fallback_lock_id = request.lock_id.clone();
+        let mut last_failure = None;
 
         while let Some(join_result) = pending.join_next().await {
             match join_result {
@@ -434,14 +501,17 @@ impl DistributedLock {
                         }
                     } else {
                         let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
-                        self.log_failed_lock_response(request, idx, error);
+                        self.log_failed_lock_response(request, idx, error.clone());
+                        last_failure = Some(error);
                     }
                 }
                 Ok((idx, Err(err))) => {
                     tracing::warn!("Failed to acquire lock on client {}: {}", idx, err);
+                    last_failure = Some(err.to_string());
                 }
                 Err(err) => {
                     tracing::warn!("Lock acquisition task join failed: {}", err);
+                    last_failure = Some(err.to_string());
                 }
             }
 
@@ -494,20 +564,24 @@ impl DistributedLock {
                     );
                 }
 
-                let resp = LockResponse::failure(
-                    format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required"),
-                    Duration::ZERO,
-                );
+                let mut error = format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required");
+                if let Some(last_failure) = last_failure {
+                    error.push_str("; last failure: ");
+                    error.push_str(&last_failure);
+                }
+                let resp = LockResponse::failure(error, Duration::ZERO);
                 return Ok((resp, individual_locks));
             }
         }
 
         let rollback_count = individual_locks.len();
         Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
-        let resp = LockResponse::failure(
-            format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required"),
-            Duration::ZERO,
-        );
+        let mut error = format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required");
+        if let Some(last_failure) = last_failure {
+            error.push_str("; last failure: ");
+            error.push_str(&last_failure);
+        }
+        let resp = LockResponse::failure(error, Duration::ZERO);
         Ok((resp, individual_locks))
     }
 }
