@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crate::admin::console::is_console_path;
-use crate::admin::handlers::health::{build_health_payload, collect_dependency_readiness, health_check_state, probe_from_path};
+use crate::admin::handlers::health::{build_health_payload, health_check_state, probe_from_path};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX,
-    RUSTFS_ADMIN_PREFIX,
+    RUSTFS_ADMIN_PREFIX, collect_dependency_readiness_report,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
