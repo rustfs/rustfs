@@ -46,6 +46,12 @@ fn is_remote_lock_rpc_failure(error: &str) -> bool {
     error.to_lowercase().contains("remote lock rpc failed")
 }
 
+fn checked_deadline_from_now(timeout: Duration) -> crate::error::Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| LockError::configuration("acquire timeout exceeds system deadline"))
+}
+
 /// A RAII guard for distributed locks that releases the lock asynchronously when dropped.
 #[derive(Debug)]
 pub struct DistributedLockGuard {
@@ -192,18 +198,7 @@ impl DistributedLock {
         }
 
         let required_quorum = self.required_quorum(request.lock_type);
-        let deadline = match Instant::now().checked_add(request.acquire_timeout) {
-            Some(deadline) => deadline,
-            None => {
-                warn!(
-                    resource = %request.resource,
-                    owner = %request.owner,
-                    request_timeout_ms = request.acquire_timeout.as_millis(),
-                    "acquire_lock_quorum request timeout overflow, failing fast"
-                );
-                return Ok(None);
-            }
-        };
+        let deadline = checked_deadline_from_now(request.acquire_timeout)?;
         let mut attempt = 0u32;
 
         loop {
@@ -261,7 +256,7 @@ impl DistributedLock {
                 let backoff = (QUORUM_RETRY_BACKOFF_MIN * attempt).min(QUORUM_RETRY_BACKOFF_MAX);
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining <= backoff {
-                    break;
+                    return Ok(None);
                 }
                 tokio::time::sleep(backoff).await;
                 continue;
@@ -581,6 +576,7 @@ fn record_lock_held_release(lock_type: LockType) {
 #[cfg(test)]
 mod tests {
     use super::is_remote_lock_rpc_failure;
+    use std::time::Duration;
 
     #[test]
     fn test_is_remote_lock_rpc_failure() {
@@ -588,5 +584,13 @@ mod tests {
         assert!(is_remote_lock_rpc_failure("remote lock rpc failed: temporary network issue"));
         assert!(!is_remote_lock_rpc_failure("Lock is already held"));
         assert!(!is_remote_lock_rpc_failure("acquired lock failed for other reason"));
+    }
+
+    #[test]
+    fn test_checked_deadline_from_now_overflow_protected() {
+        assert!(
+            super::checked_deadline_from_now(Duration::MAX).is_err(),
+            "checked_deadline_from_now should reject overflowing durations"
+        );
     }
 }
