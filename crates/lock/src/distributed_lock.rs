@@ -33,6 +33,7 @@ const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const LOCK_ACQUIRE_RETRY_ATTEMPTS: usize = 3;
 const LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const REMOTE_LOCK_RPC_FAILED_PREFIX: &str = "remote lock rpc failed:";
+const REMOTE_LOCK_RPC_TIMED_OUT_PREFIX: &str = "remote lock rpc timed out:";
 const UNRECOVERABLE_QUORUM_FAILURE_PREFIX: &str = "unrecoverable quorum failure";
 
 #[derive(Debug)]
@@ -51,9 +52,14 @@ fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
 }
 
 fn is_remote_lock_rpc_failure(error: &str) -> bool {
+    has_case_insensitive_prefix(error, REMOTE_LOCK_RPC_FAILED_PREFIX)
+        || has_case_insensitive_prefix(error, REMOTE_LOCK_RPC_TIMED_OUT_PREFIX)
+}
+
+fn has_case_insensitive_prefix(error: &str, expected_prefix: &str) -> bool {
     error
-        .get(0..REMOTE_LOCK_RPC_FAILED_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REMOTE_LOCK_RPC_FAILED_PREFIX))
+        .get(0..expected_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected_prefix))
 }
 
 fn is_unrecoverable_quorum_error(error: &str) -> bool {
@@ -787,6 +793,7 @@ mod tests {
     fn test_is_remote_lock_rpc_failure() {
         assert!(is_remote_lock_rpc_failure("Remote lock RPC failed: backend unreachable"));
         assert!(is_remote_lock_rpc_failure("remote lock rpc failed: temporary network issue"));
+        assert!(is_remote_lock_rpc_failure("Remote lock RPC timed out: RPC timed out after 50ms"));
         assert!(!is_remote_lock_rpc_failure("Lock is already held"));
         assert!(!is_remote_lock_rpc_failure("acquired lock failed for other reason"));
     }
@@ -800,6 +807,44 @@ mod tests {
                 .into_client(),
             ResponseClient::new(LockResponse::failure("Remote lock RPC failed: connection refused", Duration::ZERO))
                 .into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_millis(50))
+                .into_client(),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(1));
+
+        let result = lock.acquire_guard(&request).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(LockError::QuorumNotReached {
+                    required: 3,
+                    achieved: 0
+                })
+            ),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_returns_quorum_error_when_rpc_timeouts_make_quorum_impossible() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            ResponseClient::new(LockResponse::failure(
+                "Remote lock RPC timed out: RPC timed out after 50ms",
+                Duration::ZERO,
+            ))
+            .into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_millis(50))
+                .into_client(),
+            ResponseClient::new(LockResponse::failure(
+                "Remote lock RPC timed out: RPC timed out after 50ms",
+                Duration::ZERO,
+            ))
+            .into_client(),
             ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
                 .with_delay(Duration::from_millis(50))
                 .into_client(),
