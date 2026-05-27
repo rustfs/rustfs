@@ -42,6 +42,10 @@ fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
     }
 }
 
+fn is_remote_lock_rpc_failure(error: &str) -> bool {
+    error.to_lowercase().contains("remote lock rpc failed")
+}
+
 /// A RAII guard for distributed locks that releases the lock asynchronously when dropped.
 #[derive(Debug)]
 pub struct DistributedLockGuard {
@@ -473,6 +477,9 @@ impl DistributedLock {
                         }
                     } else {
                         let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
+                        if is_remote_lock_rpc_failure(&error) {
+                            hard_failures += 1;
+                        }
                         self.log_failed_lock_response(request, idx, error);
                     }
                 }
@@ -568,5 +575,18 @@ fn record_lock_held_release(lock_type: LockType) {
     match lock_type {
         LockType::Shared => record_read_lock_held_release(),
         LockType::Exclusive => record_write_lock_held_release(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_remote_lock_rpc_failure;
+
+    #[test]
+    fn test_is_remote_lock_rpc_failure() {
+        assert!(is_remote_lock_rpc_failure("Remote lock RPC failed: backend unreachable"));
+        assert!(is_remote_lock_rpc_failure("remote lock rpc failed: temporary network issue"));
+        assert!(!is_remote_lock_rpc_failure("Lock is already held"));
+        assert!(!is_remote_lock_rpc_failure("acquired lock failed for other reason"));
     }
 }
