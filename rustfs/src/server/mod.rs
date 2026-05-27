@@ -51,8 +51,11 @@ pub(crate) use prefix::{
     MINIO_ADMIN_V3_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TONIC_PREFIX, VERSION,
 };
 pub(crate) use readiness::DependencyReadiness;
+pub(crate) use readiness::DependencyReadinessReport;
+pub(crate) use readiness::ReadinessDegradedReason;
 pub(crate) use readiness::ReadinessGateLayer;
 pub(crate) use readiness::collect_dependency_readiness;
+pub(crate) use readiness::collect_dependency_readiness_report;
 pub use readiness::publish_ready_when_runtime_ready;
 
 #[derive(Clone, Copy, Debug)]
