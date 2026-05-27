@@ -110,7 +110,7 @@ use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::ops::Add;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -775,16 +775,36 @@ fn snowball_meta_flag(headers: &HeaderMap, exact_keys: &[&str], suffix_lower: &s
     snowball_meta_value(headers, exact_keys, suffix_lower).is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-fn normalize_snowball_prefix(prefix: &str) -> Option<String> {
-    let normalized = prefix.trim().trim_matches('/');
-    if normalized.is_empty() {
-        return None;
-    }
-
-    Some(normalized.to_string())
+fn contains_parent_dir_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|component| component == "..")
 }
 
-fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> String {
+fn validate_extract_relative_path(path: &str) -> S3Result<()> {
+    let path = Path::new(path);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir | Component::ParentDir))
+        || contains_parent_dir_component(path.to_string_lossy().as_ref())
+    {
+        return Err(s3_error!(InvalidArgument, "archive entry path must stay within the target bucket"));
+    }
+
+    Ok(())
+}
+
+fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
+    let normalized = prefix.trim().trim_matches('/');
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+
+    validate_extract_relative_path(normalized)?;
+
+    Ok(Some(normalized.to_string()))
+}
+
+fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
+    validate_extract_relative_path(path)?;
     let path = path.trim_matches('/');
     let mut key = match prefix {
         Some(prefix) if !path.is_empty() => format!("{prefix}/{path}"),
@@ -796,7 +816,9 @@ fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -
         key.push('/');
     }
 
-    key
+    validate_extract_relative_path(&key)?;
+
+    Ok(key)
 }
 
 fn map_extract_archive_error(err: impl std::fmt::Display) -> S3Error {
@@ -992,17 +1014,19 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
-fn resolve_put_object_extract_options(headers: &HeaderMap) -> PutObjectExtractOptions {
+fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
     let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
-        .and_then(|value| normalize_snowball_prefix(&value));
+        .map(|value| normalize_snowball_prefix(&value))
+        .transpose()?
+        .flatten();
     let ignore_dirs = snowball_meta_flag(headers, SNOWBALL_IGNORE_DIRS_HEADER_KEYS, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER);
     let ignore_errors = snowball_meta_flag(headers, SNOWBALL_IGNORE_ERRORS_HEADER_KEYS, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER);
 
-    PutObjectExtractOptions {
+    Ok(PutObjectExtractOptions {
         prefix,
         ignore_dirs,
         ignore_errors,
-    }
+    })
 }
 
 fn is_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
@@ -4126,7 +4150,7 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let extract_options = resolve_put_object_extract_options(&req.headers);
+        let extract_options = resolve_put_object_extract_options(&req.headers)?;
         let version_id = match event_version_id {
             Some(v) => v.to_string(),
             None => String::new(),
@@ -4167,7 +4191,16 @@ impl DefaultObjectUsecase {
             };
 
             let is_dir = f.header().entry_type().is_dir();
-            let fpath = normalize_extract_entry_key(&fpath.to_string_lossy(), extract_options.prefix.as_deref(), is_dir);
+            let fpath = match normalize_extract_entry_key(&fpath.to_string_lossy(), extract_options.prefix.as_deref(), is_dir) {
+                Ok(fpath) => fpath,
+                Err(err) => {
+                    if extract_options.ignore_errors {
+                        warn!("Skipping archive entry because path is unsafe and ignore-errors is enabled: {err}");
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
 
             let mut auth_req = S3Request {
                 input: PutObjectInput::default(),
@@ -4464,18 +4497,39 @@ mod tests {
 
     #[test]
     fn normalize_snowball_prefix_trims_slashes_and_whitespace() {
-        assert_eq!(normalize_snowball_prefix(" /batch/incoming/ "), Some("batch/incoming".to_string()));
-        assert_eq!(normalize_snowball_prefix("///"), None);
+        assert_eq!(
+            normalize_snowball_prefix(" /batch/incoming/ ").unwrap(),
+            Some("batch/incoming".to_string())
+        );
+        assert_eq!(normalize_snowball_prefix("///").unwrap(), None);
+    }
+
+    #[test]
+    fn normalize_snowball_prefix_rejects_parent_dir_components() {
+        assert!(normalize_snowball_prefix("../victim-bucket").is_err());
+        assert!(normalize_snowball_prefix("safe/../../victim-bucket").is_err());
+        assert!(normalize_snowball_prefix("safe\\..\\victim-bucket").is_err());
     }
 
     #[test]
     fn normalize_extract_entry_key_applies_prefix_and_directory_suffix() {
         assert_eq!(
-            normalize_extract_entry_key("nested/path.txt", Some("imports"), false),
+            normalize_extract_entry_key("nested/path.txt", Some("imports"), false).unwrap(),
             "imports/nested/path.txt"
         );
-        assert_eq!(normalize_extract_entry_key("nested/dir/", Some("imports"), true), "imports/nested/dir/");
-        assert_eq!(normalize_extract_entry_key("top-level", None, false), "top-level");
+        assert_eq!(
+            normalize_extract_entry_key("nested/dir/", Some("imports"), true).unwrap(),
+            "imports/nested/dir/"
+        );
+        assert_eq!(normalize_extract_entry_key("top-level", None, false).unwrap(), "top-level");
+    }
+
+    #[test]
+    fn normalize_extract_entry_key_rejects_bucket_escape_paths() {
+        assert!(normalize_extract_entry_key("../victim-bucket/evil.txt", None, false).is_err());
+        assert!(normalize_extract_entry_key("safe/../../victim-bucket/evil.txt", None, false).is_err());
+        assert!(normalize_extract_entry_key("safe\\..\\victim-bucket\\evil.txt", None, false).is_err());
+        assert!(normalize_extract_entry_key("evil.txt", Some("../victim-bucket"), false).is_err());
     }
 
     #[test]
@@ -4700,7 +4754,7 @@ mod tests {
     #[test]
     fn resolve_put_object_extract_options_defaults_when_headers_missing() {
         let headers = HeaderMap::new();
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(
             options,
             PutObjectExtractOptions {
@@ -4718,7 +4772,7 @@ mod tests {
         headers.insert(AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL, HeaderValue::from_static("true"));
         headers.insert(AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL, HeaderValue::from_static("TRUE"));
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(options.prefix.as_deref(), Some("internal/prefix"));
         assert!(options.ignore_dirs);
         assert!(options.ignore_errors);
@@ -4731,7 +4785,7 @@ mod tests {
         headers.insert(AMZ_SNOWBALL_IGNORE_DIRS, HeaderValue::from_static(" true "));
         headers.insert(AMZ_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("TRUE"));
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(options.prefix.as_deref(), Some("standard/prefix"));
         assert!(options.ignore_dirs);
         assert!(options.ignore_errors);
@@ -4753,7 +4807,7 @@ mod tests {
             HeaderValue::from_static("TRUE"),
         );
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(options.prefix.as_deref(), Some("partner/import"));
         assert!(options.ignore_dirs);
         assert!(options.ignore_errors);
@@ -4767,7 +4821,7 @@ mod tests {
         headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static("/standard/prefix/"));
         headers.insert(AMZ_MINIO_SNOWBALL_PREFIX, HeaderValue::from_static("/minio/prefix/"));
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(options.prefix.as_deref(), Some("minio/prefix"));
     }
 
@@ -4779,9 +4833,17 @@ mod tests {
         headers.insert(AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("false"));
         headers.insert("x-amz-meta-acme-snowball-ignore-errors", HeaderValue::from_static("true"));
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert!(!options.ignore_dirs);
         assert!(!options.ignore_errors);
+    }
+
+    #[test]
+    fn resolve_put_object_extract_options_rejects_unsafe_prefix_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static("../victim-bucket"));
+
+        assert!(resolve_put_object_extract_options(&headers).is_err());
     }
 
     #[tokio::test]
