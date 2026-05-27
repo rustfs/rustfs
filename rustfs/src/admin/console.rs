@@ -526,7 +526,8 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     let readiness_report = collect_dependency_readiness().await;
     let storage_ready = readiness_report.readiness.storage_ready;
     let iam_ready = readiness_report.readiness.iam_ready;
-    let health = health_check_state(storage_ready, iam_ready, probe);
+    let lock_quorum_ready = readiness_report.readiness.lock_quorum_ready;
+    let health = health_check_state(storage_ready, iam_ready, lock_quorum_ready, probe);
 
     let builder = Response::builder()
         .status(health.status_code)
@@ -543,6 +544,7 @@ async fn health_check(method: Method, uri: Uri) -> Response {
                 health,
                 storage_ready,
                 iam_ready,
+                lock_quorum_ready,
                 &readiness_report.degraded_reasons,
                 "rustfs-console",
                 Some(uptime),

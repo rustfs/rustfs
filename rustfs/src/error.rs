@@ -217,6 +217,7 @@ impl From<StorageError> for ApiError {
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
+            StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             StorageError::DecommissionNotStarted => S3ErrorCode::InvalidRequest,
             StorageError::DecommissionAlreadyRunning => S3ErrorCode::InvalidRequest,
             StorageError::RebalanceAlreadyRunning => S3ErrorCode::InvalidRequest,
@@ -413,6 +414,16 @@ mod tests {
             (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
+            (
+                StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "write",
+                    bucket: "bucket".into(),
+                    object: "object".into(),
+                    required: 3,
+                    achieved: 2,
+                },
+                S3ErrorCode::ServiceUnavailable,
+            ),
             (StorageError::DecommissionNotStarted, S3ErrorCode::InvalidRequest),
             (StorageError::DecommissionAlreadyRunning, S3ErrorCode::InvalidRequest),
             (StorageError::RebalanceAlreadyRunning, S3ErrorCode::InvalidRequest),
@@ -458,6 +469,23 @@ mod tests {
         assert_eq!(*s3_error.code(), S3ErrorCode::NoSuchBucket);
         assert!(s3_error.message().unwrap_or("").contains("Bucket not found"));
         assert!(s3_error.source().is_some());
+    }
+
+    #[test]
+    fn test_namespace_lock_quorum_failure_maps_to_service_unavailable_status() {
+        let api_error: ApiError = StorageError::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: "bucket".into(),
+            object: "object".into(),
+            required: 3,
+            achieved: 2,
+        }
+        .into();
+
+        let s3_error: S3Error = api_error.into();
+
+        assert_eq!(*s3_error.code(), S3ErrorCode::ServiceUnavailable);
+        assert_eq!(s3_error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
     }
 
     #[test]

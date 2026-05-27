@@ -160,6 +160,14 @@ pub enum StorageError {
     NotModified,
     #[error("Invalid range specified: {0}")]
     InvalidRangeSpec(String),
+    #[error("Namespace lock quorum unavailable for {mode} lock on {bucket}/{object}: required {required}, achieved {achieved}")]
+    NamespaceLockQuorumUnavailable {
+        mode: &'static str,
+        bucket: String,
+        object: String,
+        required: usize,
+        achieved: usize,
+    },
 
     // ── Generic ──────────────────────────────────────────────────────
     #[error("Unexpected error")]
@@ -204,6 +212,7 @@ impl StorageError {
                 | StorageError::ErasureWriteQuorum
                 | StorageError::InsufficientReadQuorum(_, _)
                 | StorageError::InsufficientWriteQuorum(_, _)
+                | StorageError::NamespaceLockQuorumUnavailable { .. }
         )
     }
 }
@@ -433,6 +442,19 @@ impl Clone for StorageError {
             StorageError::NotModified => StorageError::NotModified,
             StorageError::InvalidPartNumber(a) => StorageError::InvalidPartNumber(*a),
             StorageError::InvalidRangeSpec(a) => StorageError::InvalidRangeSpec(a.clone()),
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode,
+                bucket,
+                object,
+                required,
+                achieved,
+            } => StorageError::NamespaceLockQuorumUnavailable {
+                mode,
+                bucket: bucket.clone(),
+                object: object.clone(),
+                required: *required,
+                achieved: *achieved,
+            },
         }
     }
 }
@@ -505,6 +527,7 @@ impl StorageError {
             StorageError::InvalidRangeSpec(_) => 0x3D,
             StorageError::NotModified => 0x3E,
             StorageError::InvalidPartNumber(_) => 0x3F,
+            StorageError::NamespaceLockQuorumUnavailable { .. } => 0x42,
         }
     }
 
