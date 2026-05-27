@@ -643,7 +643,7 @@ impl DistributedLock {
                 });
             }
 
-            if !individual_locks.is_empty() && individual_locks.len() + pending.len() < required_quorum {
+            if individual_locks.len() + pending.len() < required_quorum {
                 let rollback_count = individual_locks.len();
                 Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
                 let pending_cleanup_spawned = !pending.is_empty();
@@ -864,6 +864,32 @@ mod tests {
                 })
             ),
             "unexpected result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_returns_timeout_when_zero_locks_make_quorum_impossible_for_attempt() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_secs(1))
+                .into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_secs(1))
+                .into_client(),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(2));
+
+        let started = tokio::time::Instant::now();
+        let result = lock.acquire_guard(&request).await;
+
+        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "acquire should fail this attempt before waiting for delayed impossible-quorum tasks"
         );
     }
 
