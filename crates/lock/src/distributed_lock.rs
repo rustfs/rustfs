@@ -33,6 +33,7 @@ const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const QUORUM_RETRY_BACKOFF_MIN: Duration = Duration::from_millis(5);
 const QUORUM_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(50);
 const QUORUM_ATTEMPT_TIMEOUT_MAX: Duration = Duration::from_millis(250);
+const REMOTE_LOCK_RPC_FAILURE_PREFIX: &str = "Remote lock RPC failed:";
 
 /// Generate a new aggregate lock ID for multiple client locks
 fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
@@ -43,7 +44,9 @@ fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
 }
 
 fn is_remote_lock_rpc_failure(error: &str) -> bool {
-    error.to_lowercase().contains("remote lock rpc failed")
+    error
+        .get(..REMOTE_LOCK_RPC_FAILURE_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REMOTE_LOCK_RPC_FAILURE_PREFIX))
 }
 
 fn checked_deadline_from_now(timeout: Duration) -> crate::error::Result<Instant> {
@@ -224,14 +227,26 @@ impl DistributedLock {
             }
 
             let error_msg = resp.error.unwrap_or_default();
-            if request.suppress_contention_logs {
-                tracing::debug!(
-                    resource = %request.resource,
-                    owner = %request.owner,
-                    attempt,
-                    "acquire_lock_quorum contention: {}",
-                    error_msg
-                );
+            let is_quorum_miss = error_msg.to_lowercase().contains("quorum");
+
+            if request.suppress_contention_logs || is_quorum_miss {
+                if is_quorum_miss {
+                    debug!(
+                        resource = %request.resource,
+                        owner = %request.owner,
+                        attempt,
+                        "acquire_lock_quorum contention: {}",
+                        error_msg
+                    );
+                } else {
+                    tracing::debug!(
+                        resource = %request.resource,
+                        owner = %request.owner,
+                        attempt,
+                        "acquire_lock_quorum error: {}",
+                        error_msg
+                    );
+                }
             } else {
                 warn!(
                     resource = %request.resource,
@@ -241,7 +256,6 @@ impl DistributedLock {
                     error_msg
                 );
             }
-
             let error_msg_lower = error_msg.to_lowercase();
             if error_msg_lower.contains("unrecoverable quorum failure") {
                 return Err(LockError::QuorumNotReached {
@@ -486,6 +500,25 @@ impl DistributedLock {
                     hard_failures += 1;
                     tracing::warn!("Lock acquisition task join failed: {}", err);
                 }
+            }
+
+            if individual_locks.len() + pending.len() < required_quorum {
+                let rollback_count = individual_locks.len();
+                Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
+                if !pending.is_empty() {
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_failure_cleanup",
+                    );
+                }
+
+                let resp = LockResponse::failure(
+                    format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required"),
+                    Duration::ZERO,
+                );
+                return Ok((resp, individual_locks));
             }
 
             if individual_locks.len() >= required_quorum {
