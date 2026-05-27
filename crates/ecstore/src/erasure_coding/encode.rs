@@ -226,7 +226,11 @@ impl Erasure {
                 match rustfs_utils::read_full(&mut reader, &mut buf).await {
                     Ok(n) if n > 0 => {
                         total += n;
-                        let res = self.encode_data(&buf[..n])?;
+                        let erasure = self.clone();
+                        let block = buf[..n].to_vec();
+                        let res = tokio::task::spawn_blocking(move || erasure.encode_data(&block))
+                            .await
+                            .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))??;
                         let queued_bytes = queued_block_bytes(&res);
                         rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
                         if let Err(err) = tx.send(res).await {
