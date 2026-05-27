@@ -70,9 +70,10 @@ in
       KillMode = "control-group";
       SendSIGKILL = true;
 
-      # Avoid pinning the service above all other workloads unless there is a
-      # host-level policy reason to prefer RustFS during OOM conditions.
-      OOMScoreAdjust = -500;
+      # Keep the example neutral by default. If your deployment explicitly
+      # wants RustFS to outlive other workloads during OOM, tune this in your
+      # local NixOS configuration.
+      OOMScoreAdjust = 0;
 
       NoNewPrivileges = true;
       PrivateTmp = true;

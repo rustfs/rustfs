@@ -103,4 +103,10 @@ Look for the point where RustFS reports that startup is complete and `systemd` t
 
 ## 8. Validation note
 
-This repository currently includes the example file, but local Nix parsing was not verified in the current Codex environment because `nix-instantiate` was not available at generation time.
+If your deployment depends on this example directly, validate the final module in your own NixOS environment before rollout. A common check is:
+
+```bash
+nix-instantiate --parse /path/to/your/module.nix
+```
+
+If you integrate the example into a host configuration or flake, prefer validating it through your normal `nixos-rebuild`, flake check, or CI pipeline as well.
