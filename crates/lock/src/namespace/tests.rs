@@ -65,6 +65,50 @@ impl crate::client::LockClient for FailingClient {
 }
 
 #[derive(Debug)]
+struct FailureResponseClient {
+    error: &'static str,
+}
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for FailureResponseClient {
+    async fn acquire_lock(&self, _request: &LockRequest) -> crate::Result<LockResponse> {
+        Ok(LockResponse::failure(self.error, Duration::ZERO))
+    }
+
+    async fn release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn force_release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        Ok(None)
+    }
+
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        Ok(LockStats::default())
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn is_online(&self) -> bool {
+        true
+    }
+
+    async fn is_local(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
 struct DelayedClient {
     inner: Arc<dyn crate::client::LockClient>,
     delay: Duration,
@@ -633,10 +677,10 @@ async fn test_namespace_lock_distributed_eight_node_write_releases_all_nodes() {
         .get_write_lock(resource.clone(), "owner-b", Duration::from_millis(100))
         .await
         .expect_err("owner-b should not acquire while owner-a holds all node locks");
-    let err_str = err.to_string();
+    let err_str = err.to_string().to_lowercase();
     assert!(
-        err_str.contains("required 5") && err_str.contains("achieved"),
-        "expected 8-node quorum failure below required write quorum, got: {err}"
+        err_str.contains("timeout"),
+        "expected owner-b contention to exhaust acquire timeout, got: {err}"
     );
 
     assert!(guard.release(), "distributed guard should enqueue release");
@@ -742,6 +786,68 @@ async fn test_namespace_lock_distributed_write_lock_fails_with_two_nodes_one_off
     assert!(
         err_str.contains("quorum") || err_str.contains("not reached"),
         "expected quorum error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_remote_rpc_failures_are_hard_quorum_failures() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let client_ok: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+    let client_rpc_failed: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Remote lock RPC failed: connection refused",
+    });
+    let client_rpc_timed_out: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Remote lock RPC timed out: RPC timed out after 50ms",
+    });
+    let client_rpc_failed_2: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Remote lock RPC failed: transport error",
+    });
+    let clients: Vec<Arc<dyn LockClient>> = vec![client_ok, client_rpc_failed, client_rpc_timed_out, client_rpc_failed_2];
+    let lock = NamespaceLock::with_clients("remote-rpc-hard-failure".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object-rpc-hard-failure");
+
+    let started = tokio::time::Instant::now();
+    let err = lock
+        .get_write_lock(resource, "owner-a", Duration::from_secs(1))
+        .await
+        .expect_err("write lock should fail as soon as remote RPC failures make quorum impossible");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "remote RPC failures should not retry until the full acquire timeout"
+    );
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "expected hard quorum failure, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_contention_quorum_miss_times_out() {
+    let client_timeout_1: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Lock acquisition timeout",
+    });
+    let client_timeout_2: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Lock acquisition timeout",
+    });
+    let client_timeout_3: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Lock acquisition timeout",
+    });
+    let clients: Vec<Arc<dyn LockClient>> = vec![client_timeout_1, client_timeout_2, client_timeout_3];
+    let lock = NamespaceLock::with_clients("contention-timeout".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object-contention-timeout");
+
+    let err = lock
+        .get_write_lock(resource, "owner-a", Duration::from_millis(40))
+        .await
+        .expect_err("ordinary contention should exhaust acquire timeout");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(err_str.contains("timeout"), "expected timeout after contention retries, got: {err}");
+    assert!(
+        !err_str.contains("quorum not reached"),
+        "ordinary contention should not surface as quorum loss: {err}"
     );
 }
 

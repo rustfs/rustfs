@@ -27,6 +27,8 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tracing::{info, warn};
 
+const REMOTE_LOCK_RPC_TIMEOUT_GRACE: Duration = Duration::from_millis(500);
+
 /// Remote lock client implementation
 #[derive(Debug, Clone)]
 pub struct RemoteClient {
@@ -82,6 +84,10 @@ impl RemoteClient {
         }
     }
 
+    fn rpc_deadline(timeout_duration: Duration) -> Duration {
+        Self::rpc_timeout(timeout_duration).saturating_add(REMOTE_LOCK_RPC_TIMEOUT_GRACE)
+    }
+
     async fn execute_rpc<T, F>(
         &self,
         op: &'static str,
@@ -91,8 +97,9 @@ impl RemoteClient {
     where
         F: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     {
-        let timeout_duration = Self::rpc_timeout(timeout_duration);
-        match timeout(timeout_duration, future).await {
+        let lock_timeout = Self::rpc_timeout(timeout_duration);
+        let rpc_deadline = Self::rpc_deadline(timeout_duration);
+        match timeout(rpc_deadline, future).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => {
                 let reason = err.to_string();
@@ -100,29 +107,32 @@ impl RemoteClient {
                 Err(LockError::internal(format!("{op} RPC failed: {reason}")))
             }
             Err(_) => {
-                let reason = format!("RPC timed out after {:?}", timeout_duration);
+                let reason = format!("RPC timed out after {:?}", rpc_deadline);
                 self.evict_connection(op, &reason).await;
-                Err(LockError::timeout(format!("remote lock RPC {op} on {}", self.addr), timeout_duration))
+                Err(LockError::timeout(format!("remote lock RPC {op} on {}", self.addr), lock_timeout))
             }
         }
     }
 
-    fn timeout_failure_response(request: &LockRequest) -> LockResponse {
-        LockResponse::failure("Lock acquisition timeout", request.acquire_timeout)
+    fn rpc_timeout_failure_response(request: &LockRequest, err: &LockError) -> LockResponse {
+        LockResponse::failure(format!("Remote lock RPC timed out: {err}"), request.acquire_timeout)
     }
 
     fn rpc_failure_response(_request: &LockRequest, err: &LockError) -> LockResponse {
         LockResponse::failure(format!("Remote lock RPC failed: {err}"), Duration::ZERO)
     }
 
-    fn timeout_failure_batch(requests: &[LockRequest]) -> Vec<LockResponse> {
-        requests.iter().map(Self::timeout_failure_response).collect()
-    }
-
     fn rpc_failure_batch(requests: &[LockRequest], err: &LockError) -> Vec<LockResponse> {
         requests
             .iter()
             .map(|request| Self::rpc_failure_response(request, err))
+            .collect()
+    }
+
+    fn rpc_timeout_failure_batch(requests: &[LockRequest], err: &LockError) -> Vec<LockResponse> {
+        requests
+            .iter()
+            .map(|request| Self::rpc_timeout_failure_response(request, err))
             .collect()
     }
 
@@ -186,7 +196,7 @@ impl LockClient for RemoteClient {
 
         let resp = match self.execute_rpc("lock", request.acquire_timeout, client.lock(req)).await {
             Ok(resp) => resp.into_inner(),
-            Err(LockError::Timeout { .. }) => return Ok(Self::timeout_failure_response(request)),
+            Err(err @ LockError::Timeout { .. }) => return Ok(Self::rpc_timeout_failure_response(request, &err)),
             Err(err) => return Ok(Self::rpc_failure_response(request, &err)),
         };
 
@@ -226,7 +236,7 @@ impl LockClient for RemoteClient {
             .await
         {
             Ok(resp) => resp.into_inner(),
-            Err(LockError::Timeout { .. }) => return Ok(Self::timeout_failure_batch(requests)),
+            Err(err @ LockError::Timeout { .. }) => return Ok(Self::rpc_timeout_failure_batch(requests, &err)),
             Err(err) => return Ok(Self::rpc_failure_batch(requests, &err)),
         };
 
@@ -511,7 +521,14 @@ mod tests {
             "remote lock RPC should honor request timeout"
         );
         assert!(!response.success, "timed out lock acquisition should fail");
-        assert_eq!(response.error.as_deref(), Some("Lock acquisition timeout"));
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Remote lock RPC timed out")),
+            "expected remote RPC timeout marker, got {:?}",
+            response.error
+        );
         assert!(
             !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
             "timeout should evict cached connection"
@@ -539,7 +556,14 @@ mod tests {
         );
         assert_eq!(responses.len(), 1);
         assert!(!responses[0].success, "timed out batch lock acquisition should fail");
-        assert_eq!(responses[0].error.as_deref(), Some("Lock acquisition timeout"));
+        assert!(
+            responses[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Remote lock RPC timed out")),
+            "expected remote RPC timeout marker, got {:?}",
+            responses[0].error
+        );
         assert!(
             !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
             "batch timeout should evict cached connection"

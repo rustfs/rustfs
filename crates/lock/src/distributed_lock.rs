@@ -34,18 +34,25 @@ const QUORUM_RETRY_BACKOFF_MIN: Duration = Duration::from_millis(5);
 const QUORUM_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(50);
 const QUORUM_ATTEMPT_TIMEOUT_MAX: Duration = Duration::from_millis(250);
 const REMOTE_LOCK_RPC_FAILURE_PREFIX: &str = "Remote lock RPC failed:";
+const REMOTE_LOCK_RPC_TIMEOUT_PREFIX: &str = "Remote lock RPC timed out:";
 
 /// Generate a new aggregate lock ID for multiple client locks
 fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
     LockId {
         resource: resource.clone(),
-        uuid: Uuid::new_v4().to_string(),
+        uuid: format!("aggregate-{}", Uuid::new_v4()),
     }
 }
 
+fn has_case_insensitive_prefix(error: &str, prefix: &str) -> bool {
+    error
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
 fn is_remote_lock_rpc_failure(error: &str) -> bool {
-    const REMOTE_LOCK_RPC_FAILED_PREFIX: &str = "Remote lock RPC failed:";
-    error.starts_with(REMOTE_LOCK_RPC_FAILED_PREFIX) || error.starts_with("remote lock rpc failed:")
+    has_case_insensitive_prefix(error, REMOTE_LOCK_RPC_FAILURE_PREFIX)
+        || has_case_insensitive_prefix(error, REMOTE_LOCK_RPC_TIMEOUT_PREFIX)
 }
 
 fn checked_deadline_from_now(timeout: Duration) -> crate::error::Result<Instant> {
@@ -515,6 +522,27 @@ impl DistributedLock {
                 }
             }
 
+            if self.clients.len().saturating_sub(hard_failures) < required_quorum {
+                let rollback_count = individual_locks.len();
+                Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
+                if !pending.is_empty() {
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_failure_cleanup",
+                    );
+                }
+
+                let resp = LockResponse::failure(
+                    format!(
+                        "Unrecoverable quorum failure: {rollback_count}/{required_quorum} required; {hard_failures} clients failed"
+                    ),
+                    Duration::ZERO,
+                );
+                return Ok((resp, individual_locks));
+            }
+
             if individual_locks.len() + pending.len() < required_quorum {
                 let rollback_count = individual_locks.len();
                 Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
@@ -566,27 +594,6 @@ impl DistributedLock {
                         priority: request.priority,
                         wait_start_time: None,
                     },
-                    Duration::ZERO,
-                );
-                return Ok((resp, individual_locks));
-            }
-
-            if self.clients.len().saturating_sub(hard_failures) < required_quorum {
-                let rollback_count = individual_locks.len();
-                Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
-                if !pending.is_empty() {
-                    Self::spawn_pending_cleanup(
-                        pending,
-                        self.clients.clone(),
-                        fallback_lock_id.clone(),
-                        "distributed_lock_failure_cleanup",
-                    );
-                }
-
-                let resp = LockResponse::failure(
-                    format!(
-                        "Unrecoverable quorum failure: {rollback_count}/{required_quorum} required; {hard_failures} clients failed"
-                    ),
                     Duration::ZERO,
                 );
                 return Ok((resp, individual_locks));

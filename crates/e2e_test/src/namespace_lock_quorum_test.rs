@@ -57,6 +57,9 @@ async fn test_concurrent_cluster_overwrites_do_not_fail_namespace_lock_quorum() 
     info!("Starting namespace lock quorum regression test with auto cluster");
 
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+    // Keep the regression focused on false quorum-loss errors, not ordinary lock
+    // wait exhaustion under a heavily contended same-key overwrite workload.
+    cluster.set_env("RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT", "20");
     cluster.start().await?;
     cluster.create_test_bucket(BUCKET).await?;
 
