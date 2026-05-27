@@ -133,6 +133,12 @@ pub struct DistributedLock {
 
 type LockAcquireTaskResult = (usize, Result<LockResponse>);
 
+struct LockAcquireQuorumResult {
+    response: LockResponse,
+    individual_locks: Vec<(LockId, Arc<dyn LockClient>)>,
+    pending_cleanup_spawned: bool,
+}
+
 impl DistributedLock {
     /// Create new distributed lock
     pub fn new(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
@@ -187,7 +193,11 @@ impl DistributedLock {
         }
 
         let required_quorum = self.required_quorum(request.lock_type);
-        let (resp, individual_locks) = self.acquire_lock_quorum_with_retry(request).await?;
+        let LockAcquireQuorumResult {
+            response: resp,
+            individual_locks,
+            ..
+        } = self.acquire_lock_quorum_with_retry(request).await?;
         if resp.success {
             // Use aggregate lock_id from LockResponse's LockInfo
             // The aggregate id is what we expose to callers; individual_locks carries
@@ -430,10 +440,7 @@ impl DistributedLock {
         }
     }
 
-    async fn acquire_lock_quorum_with_retry(
-        &self,
-        request: &LockRequest,
-    ) -> Result<(LockResponse, Vec<(LockId, Arc<dyn LockClient>)>)> {
+    async fn acquire_lock_quorum_with_retry(&self, request: &LockRequest) -> Result<LockAcquireQuorumResult> {
         let start = std::time::Instant::now();
         let mut attempt = 1;
         let mut last_result = None;
@@ -449,9 +456,10 @@ impl DistributedLock {
             attempt_request.acquire_timeout = Self::lock_acquire_attempt_timeout(request.acquire_timeout, remaining);
 
             let result = self.acquire_lock_quorum_once(&attempt_request).await?;
-            if result.0.success
-                || !result.1.is_empty()
-                || !Self::is_retryable_lock_failure(&result.0)
+            if result.response.success
+                || !result.individual_locks.is_empty()
+                || result.pending_cleanup_spawned
+                || !Self::is_retryable_lock_failure(&result.response)
                 || attempt >= LOCK_ACQUIRE_RETRY_ATTEMPTS
             {
                 return Ok(result);
@@ -467,17 +475,17 @@ impl DistributedLock {
             attempt += 1;
         }
 
-        Ok(last_result
-            .unwrap_or_else(|| (LockResponse::failure("Lock acquisition timeout", request.acquire_timeout), Vec::new())))
+        Ok(last_result.unwrap_or_else(|| LockAcquireQuorumResult {
+            response: LockResponse::failure("Lock acquisition timeout", request.acquire_timeout),
+            individual_locks: Vec::new(),
+            pending_cleanup_spawned: false,
+        }))
     }
 
     /// Quorum-based lock acquisition: success if at least the required quorum succeeds.
     /// Collects all individual lock_ids from successful clients and creates an aggregate lock_id.
     /// Returns the LockResponse with aggregate lock_id and individual lock mappings.
-    async fn acquire_lock_quorum_once(
-        &self,
-        request: &LockRequest,
-    ) -> Result<(LockResponse, Vec<(LockId, Arc<dyn LockClient>)>)> {
+    async fn acquire_lock_quorum_once(&self, request: &LockRequest) -> Result<LockAcquireQuorumResult> {
         let required_quorum = self.required_quorum(request.lock_type);
         let mut pending = self.spawn_lock_requests(request);
         let mut individual_locks: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
@@ -516,6 +524,7 @@ impl DistributedLock {
             }
 
             if individual_locks.len() >= required_quorum {
+                let pending_cleanup_spawned = !pending.is_empty();
                 if !pending.is_empty() {
                     Self::spawn_pending_cleanup(
                         pending,
@@ -549,12 +558,17 @@ impl DistributedLock {
                     },
                     Duration::ZERO,
                 );
-                return Ok((resp, individual_locks));
+                return Ok(LockAcquireQuorumResult {
+                    response: resp,
+                    individual_locks,
+                    pending_cleanup_spawned,
+                });
             }
 
-            if individual_locks.len() + pending.len() < required_quorum {
+            if !individual_locks.is_empty() && individual_locks.len() + pending.len() < required_quorum {
                 let rollback_count = individual_locks.len();
                 Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
+                let pending_cleanup_spawned = !pending.is_empty();
                 if !pending.is_empty() {
                     Self::spawn_pending_cleanup(
                         pending,
@@ -570,7 +584,11 @@ impl DistributedLock {
                     error.push_str(&last_failure);
                 }
                 let resp = LockResponse::failure(error, Duration::ZERO);
-                return Ok((resp, individual_locks));
+                return Ok(LockAcquireQuorumResult {
+                    response: resp,
+                    individual_locks,
+                    pending_cleanup_spawned,
+                });
             }
         }
 
@@ -582,7 +600,11 @@ impl DistributedLock {
             error.push_str(&last_failure);
         }
         let resp = LockResponse::failure(error, Duration::ZERO);
-        Ok((resp, individual_locks))
+        Ok(LockAcquireQuorumResult {
+            response: resp,
+            individual_locks,
+            pending_cleanup_spawned: false,
+        })
     }
 }
 
