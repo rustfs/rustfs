@@ -769,6 +769,41 @@ async fn test_namespace_lock_distributed_retries_transient_acquire_timeout() {
     drop(guard);
 }
 
+#[tokio::test]
+async fn test_namespace_lock_distributed_waits_full_timeout_for_late_release() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let clients = managers
+        .iter()
+        .map(|manager| Arc::new(LocalClient::with_manager(manager.clone())) as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+
+    let lock = Arc::new(NamespaceLock::with_clients("late-release".to_string(), clients));
+    let resource = create_test_object_key("bucket", "object-late-release");
+
+    let guard_a = lock
+        .get_write_lock(resource.clone(), "owner-a", Duration::from_secs(1))
+        .await
+        .expect("owner-a should acquire the initial distributed lock");
+
+    let lock_for_owner_b = lock.clone();
+    let resource_for_owner_b = resource.clone();
+    let waiter = tokio::spawn(async move {
+        lock_for_owner_b
+            .get_write_lock(resource_for_owner_b, "owner-b", Duration::from_secs(1))
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(950)).await;
+    drop(guard_a);
+
+    let guard_b = waiter
+        .await
+        .expect("owner-b wait task should complete")
+        .expect("owner-b should acquire after a late release within the original timeout");
+
+    drop(guard_b);
+}
+
 #[test]
 fn test_namespace_lock_distributed_drop_without_runtime_does_not_panic() {
     let (manager, resource, guard) = {

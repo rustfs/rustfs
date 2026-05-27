@@ -303,12 +303,6 @@ impl DistributedLock {
         LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF * attempt as u32
     }
 
-    fn lock_acquire_attempt_timeout(total_timeout: Duration, remaining: Duration) -> Duration {
-        let divided = total_timeout / LOCK_ACQUIRE_RETRY_ATTEMPTS as u32;
-        let per_attempt = divided.max(Duration::from_millis(1));
-        per_attempt.min(remaining)
-    }
-
     fn is_retryable_lock_failure(resp: &LockResponse) -> bool {
         resp.error
             .as_deref()
@@ -453,7 +447,7 @@ impl DistributedLock {
 
             let remaining = request.acquire_timeout - elapsed;
             let mut attempt_request = request.clone();
-            attempt_request.acquire_timeout = Self::lock_acquire_attempt_timeout(request.acquire_timeout, remaining);
+            attempt_request.acquire_timeout = remaining;
 
             let result = self.acquire_lock_quorum_once(&attempt_request).await?;
             if result.response.success
