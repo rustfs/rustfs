@@ -346,8 +346,8 @@ fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
     })
 }
 
-fn degraded_reasons(storage_ready: bool, iam_ready: bool) -> Vec<ReadinessDegradedReason> {
-    match (storage_ready, iam_ready) {
+fn degraded_reasons(storage_ready: bool, iam_ready_raw: bool) -> Vec<ReadinessDegradedReason> {
+    match (storage_ready, iam_ready_raw) {
         (true, true) => Vec::new(),
         (false, false) => vec![ReadinessDegradedReason::StorageAndIamUnavailable],
         (false, true) => vec![ReadinessDegradedReason::StorageQuorumUnavailable],
@@ -368,7 +368,7 @@ pub async fn collect_dependency_readiness() -> DependencyReadiness {
 }
 
 pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport {
-    let iam_ready = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
+    let iam_ready_raw = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
     let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
         cached
     } else {
@@ -379,10 +379,10 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
 
     let readiness = DependencyReadiness {
         storage_ready,
-        iam_ready: iam_ready && storage_ready,
+        iam_ready: iam_ready_raw,
     };
     let report = DependencyReadinessReport {
-        degraded_reasons: degraded_reasons(readiness.storage_ready, readiness.iam_ready),
+        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw),
         readiness,
     };
     record_readiness_report(&report);
@@ -390,15 +390,15 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
 }
 
 async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
-    let iam_ready = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
+    let iam_ready_raw = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
     let storage_ready = collect_storage_readiness_uncached().await;
 
     let readiness = DependencyReadiness {
         storage_ready,
-        iam_ready: iam_ready && storage_ready,
+        iam_ready: iam_ready_raw,
     };
     let report = DependencyReadinessReport {
-        degraded_reasons: degraded_reasons(readiness.storage_ready, readiness.iam_ready),
+        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw),
         readiness,
     };
     record_readiness_report(&report);
