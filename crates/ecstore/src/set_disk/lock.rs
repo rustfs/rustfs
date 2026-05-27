@@ -50,6 +50,30 @@ impl SetDisks {
         }
     }
 
+    pub(super) fn map_namespace_lock_error(
+        &self,
+        bucket: &str,
+        object: &str,
+        mode: &'static str,
+        err: rustfs_lock::error::LockError,
+    ) -> StorageError {
+        match err {
+            rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
+                StorageError::NamespaceLockQuorumUnavailable {
+                    mode,
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required,
+                    achieved,
+                }
+            }
+            other => StorageError::other(format!(
+                "Failed to acquire {mode} lock: {}",
+                self.format_lock_error_from_error(bucket, object, mode, &other)
+            )),
+        }
+    }
+
     pub(super) async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
         let rl = self.disks.read().await;
 
