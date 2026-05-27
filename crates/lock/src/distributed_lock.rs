@@ -44,9 +44,8 @@ fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
 }
 
 fn is_remote_lock_rpc_failure(error: &str) -> bool {
-    error
-        .get(..REMOTE_LOCK_RPC_FAILURE_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REMOTE_LOCK_RPC_FAILURE_PREFIX))
+    const REMOTE_LOCK_RPC_FAILED_PREFIX: &str = "Remote lock RPC failed:";
+    error.starts_with(REMOTE_LOCK_RPC_FAILED_PREFIX) || error.starts_with("remote lock rpc failed:")
 }
 
 fn checked_deadline_from_now(timeout: Duration) -> crate::error::Result<Instant> {
@@ -227,26 +226,25 @@ impl DistributedLock {
             }
 
             let error_msg = resp.error.unwrap_or_default();
-            let is_quorum_miss = error_msg.to_lowercase().contains("quorum");
-
-            if request.suppress_contention_logs || is_quorum_miss {
-                if is_quorum_miss {
-                    debug!(
-                        resource = %request.resource,
-                        owner = %request.owner,
-                        attempt,
-                        "acquire_lock_quorum contention: {}",
-                        error_msg
-                    );
-                } else {
-                    tracing::debug!(
-                        resource = %request.resource,
-                        owner = %request.owner,
-                        attempt,
-                        "acquire_lock_quorum error: {}",
-                        error_msg
-                    );
-                }
+            let error_msg_lower = error_msg.to_lowercase();
+            let is_unrecoverable_quorum_failure = error_msg_lower.contains("unrecoverable quorum failure");
+            let is_quorum_contention = error_msg_lower.contains("quorum") && !is_unrecoverable_quorum_failure;
+            if is_unrecoverable_quorum_failure {
+                warn!(
+                    resource = %request.resource,
+                    owner = %request.owner,
+                    attempt,
+                    "acquire_lock_quorum unrecoverable failure: {}",
+                    error_msg
+                );
+            } else if is_quorum_contention || request.suppress_contention_logs {
+                tracing::debug!(
+                    resource = %request.resource,
+                    owner = %request.owner,
+                    attempt,
+                    "acquire_lock_quorum contention: {}",
+                    error_msg
+                );
             } else {
                 warn!(
                     resource = %request.resource,
@@ -256,27 +254,42 @@ impl DistributedLock {
                     error_msg
                 );
             }
-            let error_msg_lower = error_msg.to_lowercase();
-            if error_msg_lower.contains("unrecoverable quorum failure") {
+            if is_unrecoverable_quorum_failure {
                 return Err(LockError::QuorumNotReached {
                     required: required_quorum,
                     achieved: individual_locks.len(),
                 });
             }
-
-            if error_msg_lower.contains("quorum") {
+            if is_quorum_contention {
                 attempt += 1;
 
                 let backoff = (QUORUM_RETRY_BACKOFF_MIN * attempt).min(QUORUM_RETRY_BACKOFF_MAX);
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining <= backoff {
+                    if is_quorum_contention || request.suppress_contention_logs {
+                        tracing::debug!(
+                            resource = %request.resource,
+                            owner = %request.owner,
+                            attempt,
+                            "acquire_lock_quorum contention timed out after retries: {}",
+                            error_msg
+                        );
+                    } else {
+                        warn!(
+                            resource = %request.resource,
+                            owner = %request.owner,
+                            attempt,
+                            "acquire_lock_quorum contention timed out after retries: {}",
+                            error_msg
+                        );
+                    }
                     return Ok(None);
                 }
                 tokio::time::sleep(backoff).await;
                 continue;
             }
 
-            if error_msg.contains("timeout") || resp.wait_time >= attempt_request.acquire_timeout {
+            if error_msg_lower.contains("timeout") || resp.wait_time >= attempt_request.acquire_timeout {
                 return Ok(None);
             }
 
