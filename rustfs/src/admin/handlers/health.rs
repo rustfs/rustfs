@@ -61,8 +61,13 @@ pub(crate) async fn collect_dependency_readiness() -> crate::server::DependencyR
     collect_runtime_dependency_readiness_report().await
 }
 
-pub(crate) fn health_check_state(storage_ready: bool, iam_ready: bool, probe: HealthProbe) -> HealthCheckState {
-    let ready = storage_ready && iam_ready;
+pub(crate) fn health_check_state(
+    storage_ready: bool,
+    iam_ready: bool,
+    lock_quorum_ready: bool,
+    probe: HealthProbe,
+) -> HealthCheckState {
+    let ready = storage_ready && iam_ready && lock_quorum_ready;
     let status = if ready { "ok" } else { "degraded" };
 
     let status_code = match probe {
@@ -85,7 +90,7 @@ pub(crate) fn health_minimal_response_enabled() -> bool {
     )
 }
 
-pub(crate) fn build_component_details(storage_ready: bool, iam_ready: bool) -> Value {
+pub(crate) fn build_component_details(storage_ready: bool, iam_ready: bool, lock_quorum_ready: bool) -> Value {
     json!({
         "storage": {
             "status": if storage_ready { "connected" } else { "disconnected" },
@@ -94,6 +99,10 @@ pub(crate) fn build_component_details(storage_ready: bool, iam_ready: bool) -> V
         "iam": {
             "status": if iam_ready { "connected" } else { "disconnected" },
             "ready": iam_ready,
+        },
+        "lock": {
+            "status": if lock_quorum_ready { "connected" } else { "disconnected" },
+            "ready": lock_quorum_ready,
         }
     })
 }
@@ -119,6 +128,7 @@ pub(crate) fn build_health_payload(
     health: HealthCheckState,
     storage_ready: bool,
     iam_ready: bool,
+    lock_quorum_ready: bool,
     degraded_reasons: &[crate::server::ReadinessDegradedReason],
     service: &str,
     uptime: Option<u64>,
@@ -136,7 +146,7 @@ pub(crate) fn build_health_payload(
         "service": service,
         "timestamp": jiff::Zoned::now().to_string(),
         "version": env!("CARGO_PKG_VERSION"),
-        "details": build_component_details(storage_ready, iam_ready),
+        "details": build_component_details(storage_ready, iam_ready, lock_quorum_ready),
         "degradedReasons": build_degraded_reasons(degraded_reasons),
     });
 
@@ -152,10 +162,19 @@ pub(crate) fn build_health_response(
     probe: HealthProbe,
     storage_ready: bool,
     iam_ready: bool,
+    lock_quorum_ready: bool,
     degraded_reasons: &[crate::server::ReadinessDegradedReason],
 ) -> S3Response<(StatusCode, Body)> {
-    let health = health_check_state(storage_ready, iam_ready, probe);
-    let health_info = build_health_payload(health, storage_ready, iam_ready, degraded_reasons, "rustfs-endpoint", None);
+    let health = health_check_state(storage_ready, iam_ready, lock_quorum_ready, probe);
+    let health_info = build_health_payload(
+        health,
+        storage_ready,
+        iam_ready,
+        lock_quorum_ready,
+        degraded_reasons,
+        "rustfs-endpoint",
+        None,
+    );
 
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -195,6 +214,7 @@ impl Operation for HealthCheckHandler {
             probe,
             readiness_report.readiness.storage_ready,
             readiness_report.readiness.iam_ready,
+            readiness_report.readiness.lock_quorum_ready,
             &readiness_report.degraded_reasons,
         ))
     }
@@ -207,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_readiness_state_ready() {
-        let state = health_check_state(true, true, HealthProbe::Readiness);
+        let state = health_check_state(true, true, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::OK);
         assert_eq!(state.status, "ok");
         assert!(state.ready);
@@ -215,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_readiness_state_storage_not_ready() {
-        let state = health_check_state(false, true, HealthProbe::Readiness);
+        let state = health_check_state(false, true, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -223,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_liveness_state_iam_not_ready() {
-        let state = health_check_state(true, false, HealthProbe::Liveness);
+        let state = health_check_state(true, false, true, HealthProbe::Liveness);
         assert_eq!(state.status_code, StatusCode::OK);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -231,7 +251,15 @@ mod tests {
 
     #[test]
     fn test_readiness_state_iam_not_ready() {
-        let state = health_check_state(true, false, HealthProbe::Readiness);
+        let state = health_check_state(true, false, true, HealthProbe::Readiness);
+        assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.status, "degraded");
+        assert!(!state.ready);
+    }
+
+    #[test]
+    fn test_readiness_state_lock_not_ready() {
+        let state = health_check_state(true, true, false, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -239,12 +267,14 @@ mod tests {
 
     #[test]
     fn test_health_check_component_details() {
-        let details = build_component_details(true, false);
+        let details = build_component_details(true, false, false);
 
         assert_eq!(details["storage"]["status"], "connected");
         assert_eq!(details["storage"]["ready"], true);
         assert_eq!(details["iam"]["status"], "disconnected");
         assert_eq!(details["iam"]["ready"], false);
+        assert_eq!(details["lock"]["status"], "disconnected");
+        assert_eq!(details["lock"]["ready"], false);
     }
 
     #[test]
@@ -265,6 +295,7 @@ mod tests {
             HealthProbe::Readiness,
             false,
             true,
+            true,
             &[crate::server::ReadinessDegradedReason::StorageQuorumUnavailable],
         );
         assert_eq!(resp.output.0, StatusCode::SERVICE_UNAVAILABLE);
@@ -272,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_build_health_response_readiness_returns_200_when_deps_ready() {
-        let resp = build_health_response(Method::GET, HealthProbe::Readiness, true, true, &[]);
+        let resp = build_health_response(Method::GET, HealthProbe::Readiness, true, true, true, &[]);
         assert_eq!(resp.output.0, StatusCode::OK);
     }
 
@@ -281,6 +312,7 @@ mod tests {
         let resp = build_health_response(
             Method::GET,
             HealthProbe::Liveness,
+            false,
             false,
             false,
             &[crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
@@ -295,6 +327,7 @@ mod tests {
             HealthProbe::Readiness,
             false,
             false,
+            false,
             &[crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
         );
         assert_eq!(resp.output.0, StatusCode::SERVICE_UNAVAILABLE);
@@ -302,12 +335,13 @@ mod tests {
 
     #[test]
     fn test_build_health_payload_minimal_mode_returns_status_and_ready_only() {
-        let health = health_check_state(true, false, HealthProbe::Readiness);
+        let health = health_check_state(true, false, true, HealthProbe::Readiness);
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("true"), || {
             let payload = build_health_payload(
                 health,
                 true,
                 false,
+                true,
                 &[crate::server::ReadinessDegradedReason::IamNotReady],
                 "rustfs-endpoint",
                 Some(123),
@@ -323,9 +357,10 @@ mod tests {
 
     #[test]
     fn test_build_health_payload_includes_degraded_reasons() {
-        let health = health_check_state(false, false, HealthProbe::Readiness);
+        let health = health_check_state(false, false, false, HealthProbe::Readiness);
         let payload = build_health_payload(
             health,
+            false,
             false,
             false,
             &[crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
