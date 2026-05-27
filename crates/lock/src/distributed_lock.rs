@@ -192,10 +192,19 @@ impl DistributedLock {
         }
 
         let required_quorum = self.required_quorum(request.lock_type);
-        let deadline = Instant::now() + request.acquire_timeout;
+        let deadline = match Instant::now().checked_add(request.acquire_timeout) {
+            Some(deadline) => deadline,
+            None => {
+                warn!(
+                    resource = %request.resource,
+                    owner = %request.owner,
+                    request_timeout_ms = request.acquire_timeout.as_millis(),
+                    "acquire_lock_quorum request timeout overflow, failing fast"
+                );
+                return Ok(None);
+            }
+        };
         let mut attempt = 0u32;
-        let mut best_achieved = 0usize;
-        let mut last_quorum_error = false;
 
         loop {
             let mut attempt_request = request.clone();
@@ -239,7 +248,7 @@ impl DistributedLock {
             }
 
             let error_msg_lower = error_msg.to_lowercase();
-            if error_msg_lower.contains("unrecoverable") {
+            if error_msg_lower.contains("unrecoverable quorum failure") {
                 return Err(LockError::QuorumNotReached {
                     required: required_quorum,
                     achieved: individual_locks.len(),
@@ -247,8 +256,6 @@ impl DistributedLock {
             }
 
             if error_msg_lower.contains("quorum") {
-                last_quorum_error = true;
-                best_achieved = best_achieved.max(individual_locks.len());
                 attempt += 1;
 
                 let backoff = (QUORUM_RETRY_BACKOFF_MIN * attempt).min(QUORUM_RETRY_BACKOFF_MAX);
@@ -267,14 +274,7 @@ impl DistributedLock {
             return Ok(None);
         }
 
-        if last_quorum_error {
-            Err(LockError::QuorumNotReached {
-                required: required_quorum,
-                achieved: best_achieved,
-            })
-        } else {
-            Ok(None)
-        }
+        Ok(None)
     }
 
     /// Convenience: acquire exclusive lock as a guard
@@ -532,7 +532,7 @@ impl DistributedLock {
 
             if self.clients.len().saturating_sub(hard_failures) < required_quorum {
                 let rollback_count = individual_locks.len();
-                Self::release_entries(individual_locks.clone(), "distributed_lock_quorum_rollback").await;
+                Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
                 if !pending.is_empty() {
                     Self::spawn_pending_cleanup(
                         pending,
@@ -553,7 +553,7 @@ impl DistributedLock {
         }
 
         let rollback_count = individual_locks.len();
-        Self::release_entries(individual_locks.clone(), "distributed_lock_quorum_rollback").await;
+        Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
         let resp = LockResponse::failure(
             format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required"),
             Duration::ZERO,
