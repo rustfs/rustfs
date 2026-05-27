@@ -111,6 +111,75 @@ impl crate::client::LockClient for DelayedClient {
 }
 
 #[derive(Debug)]
+struct FlakyAcquireClient {
+    inner: LocalClient,
+    failed_acquires_remaining: AtomicUsize,
+    acquire_attempts: AtomicUsize,
+}
+
+impl FlakyAcquireClient {
+    fn new(manager: Arc<GlobalLockManager>, failed_acquires: usize) -> Self {
+        Self {
+            inner: LocalClient::with_manager(manager),
+            failed_acquires_remaining: AtomicUsize::new(failed_acquires),
+            acquire_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn acquire_attempts(&self) -> usize {
+        self.acquire_attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for FlakyAcquireClient {
+    async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+        self.acquire_attempts.fetch_add(1, Ordering::SeqCst);
+        if self
+            .failed_acquires_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+        {
+            return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
+        }
+
+        self.inner.acquire_lock(request).await
+    }
+
+    async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.release(lock_id).await
+    }
+
+    async fn refresh(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.refresh(lock_id).await
+    }
+
+    async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.force_release(lock_id).await
+    }
+
+    async fn check_status(&self, lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        self.inner.check_status(lock_id).await
+    }
+
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        self.inner.get_stats().await
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        self.inner.close().await
+    }
+
+    async fn is_online(&self) -> bool {
+        self.inner.is_online().await
+    }
+
+    async fn is_local(&self) -> bool {
+        self.inner.is_local().await
+    }
+}
+
+#[derive(Debug)]
 struct FlakyReleaseClient {
     inner: LocalClient,
     failed_releases_remaining: AtomicUsize,
@@ -670,6 +739,69 @@ async fn test_namespace_lock_distributed_unlock_retries_release_false() {
         flaky_clients.iter().all(|client| client.release_attempts() >= 2),
         "each simulated node should be retried after an initial false release"
     );
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_retries_transient_acquire_timeout() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| Arc::new(FlakyAcquireClient::new(manager.clone(), 1)))
+        .collect::<Vec<_>>();
+    let clients = flaky_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+
+    let lock = NamespaceLock::with_clients("flaky-acquire".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object-flaky-acquire");
+
+    let guard = lock
+        .get_write_lock(resource, "owner-a", Duration::from_secs(1))
+        .await
+        .expect("transient timeout should be retried before the acquire budget expires");
+
+    assert!(
+        flaky_clients.iter().all(|client| client.acquire_attempts() >= 2),
+        "each simulated node should be retried after an initial timeout"
+    );
+
+    drop(guard);
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_waits_full_timeout_for_late_release() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let clients = managers
+        .iter()
+        .map(|manager| Arc::new(LocalClient::with_manager(manager.clone())) as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+
+    let lock = Arc::new(NamespaceLock::with_clients("late-release".to_string(), clients));
+    let resource = create_test_object_key("bucket", "object-late-release");
+
+    let guard_a = lock
+        .get_write_lock(resource.clone(), "owner-a", Duration::from_secs(1))
+        .await
+        .expect("owner-a should acquire the initial distributed lock");
+
+    let lock_for_owner_b = lock.clone();
+    let resource_for_owner_b = resource.clone();
+    let waiter = tokio::spawn(async move {
+        lock_for_owner_b
+            .get_write_lock(resource_for_owner_b, "owner-b", Duration::from_secs(1))
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(950)).await;
+    drop(guard_a);
+
+    let guard_b = waiter
+        .await
+        .expect("owner-b wait task should complete")
+        .expect("owner-b should acquire after a late release within the original timeout");
+
+    drop(guard_b);
 }
 
 #[test]
