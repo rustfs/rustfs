@@ -639,12 +639,21 @@ where
     RestBody: From<Bytes>,
 {
     let probe = probe_from_path(&path);
-    let (storage_ready, iam_ready) = collect_dependency_readiness().await;
+    let readiness_report = collect_dependency_readiness_report().await;
+    let storage_ready = readiness_report.readiness.storage_ready;
+    let iam_ready = readiness_report.readiness.iam_ready;
     let health = health_check_state(storage_ready, iam_ready, probe);
     let body = if method == Method::HEAD {
         Bytes::new()
     } else {
-        let payload = build_health_payload(health, storage_ready, iam_ready, "rustfs-endpoint", None);
+        let payload = build_health_payload(
+            health,
+            storage_ready,
+            iam_ready,
+            &readiness_report.degraded_reasons,
+            "rustfs-endpoint",
+            None,
+        );
         Bytes::from(serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec()))
     };
 

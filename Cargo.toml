@@ -117,11 +117,11 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.4" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
-mysql_async = { version = "0.36.1", default-features = false, features = ["default-rustls", "tracing"], git = "https://github.com/blackbeam/mysql_async", rev = "2bad388283bc3ce48801fc2ffcd22445eb6f3d24" }
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls", "tracing"] }
 async-compression = { version = "0.4.42" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
-async-nats = "0.48.0"
+async-nats = "0.49.0"
 axum = "0.8.9"
 futures = "0.3.32"
 futures-core = "0.3.32"
@@ -132,10 +132,10 @@ lapin = { version = "4.10.0", default-features = false, features = ["tokio", "ru
 hyper = { version = "1.9.0", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "server-graceful", "tracing"] }
-http = "1.4.0"
+http = "1.4.1"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
 rustfs-kafka-async = { version = "1.2.0" }
 socket2 = { version = "0.6.3", features = ["all"] }
 tokio = { version = "1.52.3", features = ["fs", "rt-multi-thread"] }
@@ -164,7 +164,7 @@ serde_json = { version = "1.0.150", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
 
 # Cryptography and Security
-aes-gcm = { version = "0.11.0-rc.3", features = ["rand_core"] }
+aes-gcm = { version = "0.11.0-rc.4", features = ["rand_core"] }
 argon2 = { version = "0.6.0-rc.8" }
 blake2 = "0.11.0-rc.6"
 chacha20poly1305 = { version = "0.11.0-rc.3" }
@@ -185,7 +185,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # Time and Date
 chrono = { version = "0.4.44", features = ["serde"] }
 humantime = "2.3.0"
-jiff = { version = "0.2.24", features = ["serde"] }
+jiff = { version = "0.2.27", features = ["serde"] }
 time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Database
@@ -298,7 +298,7 @@ dial9-tokio-telemetry = "0.3"
 opentelemetry = { version = "0.32.0" }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["experimental_span_attributes", "experimental_metadata_attributes"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["gzip-http", "reqwest-rustls"] }
-opentelemetry_sdk = { version = "0.32.0", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 opentelemetry-semantic-conventions = { version = "0.32.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.32.0" }
 pyroscope = { version = "2.0.4", features = ["backend-pprof-rs"] }
@@ -308,7 +308,7 @@ libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
-russh = { version = "0.60.3", git = "https://github.com/Eugeny/russh", rev = "fc6e3ab4cd4338e94ae64e17aeed2acee9335e6b" }
+russh = { version = "0.61.1",features = ["serde"] }
 russh-sftp = "2.3.0"
 
 # WebDAV

@@ -18,6 +18,7 @@ use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use metrics::{counter, gauge};
 use rustfs_common::GlobalReadiness;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::StorageAPI;
@@ -39,11 +40,36 @@ use tracing::{debug, info};
 
 pub const STARTUP_RUNTIME_READINESS_MAX_WAIT: Duration = Duration::from_secs(30);
 pub const STARTUP_RUNTIME_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const METRIC_RUNTIME_READINESS_READY: &str = "rustfs_runtime_readiness_ready";
+const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_degraded_total";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DependencyReadiness {
     pub storage_ready: bool,
     pub iam_ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessDegradedReason {
+    StorageQuorumUnavailable,
+    IamNotReady,
+    StorageAndIamUnavailable,
+}
+
+impl ReadinessDegradedReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReadinessDegradedReason::StorageQuorumUnavailable => "storage_quorum_unavailable",
+            ReadinessDegradedReason::IamNotReady => "iam_not_ready",
+            ReadinessDegradedReason::StorageAndIamUnavailable => "storage_and_iam_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DependencyReadinessReport {
+    pub readiness: DependencyReadiness,
+    pub degraded_reasons: Vec<ReadinessDegradedReason>,
 }
 
 /// ReadinessGateLayer ensures that the system components (IAM, Storage)
@@ -320,7 +346,28 @@ fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
     })
 }
 
+fn degraded_reasons(storage_ready: bool, iam_ready: bool) -> Vec<ReadinessDegradedReason> {
+    match (storage_ready, iam_ready) {
+        (true, true) => Vec::new(),
+        (false, false) => vec![ReadinessDegradedReason::StorageAndIamUnavailable],
+        (false, true) => vec![ReadinessDegradedReason::StorageQuorumUnavailable],
+        (true, false) => vec![ReadinessDegradedReason::IamNotReady],
+    }
+}
+
+fn record_readiness_report(report: &DependencyReadinessReport) {
+    let ready = report.readiness.storage_ready && report.readiness.iam_ready;
+    gauge!(METRIC_RUNTIME_READINESS_READY).set(if ready { 1.0 } else { 0.0 });
+    for reason in &report.degraded_reasons {
+        counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
+    }
+}
+
 pub async fn collect_dependency_readiness() -> DependencyReadiness {
+    collect_dependency_readiness_report().await.readiness
+}
+
+pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport {
     let iam_ready = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
     let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
         cached
@@ -330,20 +377,32 @@ pub async fn collect_dependency_readiness() -> DependencyReadiness {
         computed
     };
 
-    DependencyReadiness {
+    let readiness = DependencyReadiness {
         storage_ready,
         iam_ready: iam_ready && storage_ready,
-    }
+    };
+    let report = DependencyReadinessReport {
+        degraded_reasons: degraded_reasons(readiness.storage_ready, readiness.iam_ready),
+        readiness,
+    };
+    record_readiness_report(&report);
+    report
 }
 
 async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
     let iam_ready = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
     let storage_ready = collect_storage_readiness_uncached().await;
 
-    DependencyReadiness {
+    let readiness = DependencyReadiness {
         storage_ready,
         iam_ready: iam_ready && storage_ready,
-    }
+    };
+    let report = DependencyReadinessReport {
+        degraded_reasons: degraded_reasons(readiness.storage_ready, readiness.iam_ready),
+        readiness,
+    };
+    record_readiness_report(&report);
+    report.readiness
 }
 
 async fn collect_storage_readiness_uncached() -> bool {
