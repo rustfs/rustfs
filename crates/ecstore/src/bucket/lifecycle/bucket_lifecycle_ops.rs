@@ -48,8 +48,8 @@ use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-    DEFAULT_TRANSITION_WORKERS_CAP, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, ENV_TRANSITION_QUEUE_CAPACITY,
-    ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
+    DEFAULT_TRANSITION_WORKERS_CAP, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS,
+    ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
@@ -145,7 +145,7 @@ fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
 
 #[cfg(any(test, debug_assertions))]
 fn should_force_immediate_transition_enqueue_timeout() -> bool {
-    env::var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT)
+    env::var(rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT)
         .ok()
         .is_some_and(|value| value == "1")
 }

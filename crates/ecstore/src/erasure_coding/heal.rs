@@ -49,6 +49,10 @@ impl super::Erasure {
             end_block += 1;
         }
 
+        let available_writers = writers.iter().filter(|w| w.is_some()).count();
+        let write_quorum = available_writers.max(1);
+        let mut writers = MultiWriter::new(writers, write_quorum);
+
         for _ in start_block..end_block {
             let (mut shards, errs) = reader.read().await;
 
@@ -63,7 +67,7 @@ impl super::Erasure {
             }
 
             if self.parity_shards > 0 {
-                self.decode_data(&mut shards)?;
+                self.decode_data_and_parity(&mut shards)?;
             }
 
             let shards = shards
@@ -71,15 +75,122 @@ impl super::Erasure {
                 .map(|s| Bytes::from(s.unwrap_or_default()))
                 .collect::<Vec<_>>();
 
-            // Calculate proper write quorum for heal operation
-            // For heal, we only write to disks that need healing, so write quorum should be
-            // the number of available writers (disks that need healing)
-            let available_writers = writers.iter().filter(|w| w.is_some()).count();
-            let write_quorum = available_writers.max(1); // At least 1 writer must succeed
-            let mut writers = MultiWriter::new(writers, write_quorum);
             writers.write(shards).await?;
         }
 
+        writers.shutdown().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::erasure_coding::{CustomWriter, Erasure};
+    use rustfs_utils::HashAlgorithm;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn heal_reconstructs_missing_parity_shard() {
+        let erasure = Erasure::new(2, 2, 64);
+        let data = b"heal should write a rebuilt parity shard";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+        let missing_parity = erasure.data_shards;
+
+        let readers = encoded
+            .iter()
+            .enumerate()
+            .map(|(index, shard)| {
+                if index == missing_parity {
+                    None
+                } else {
+                    Some(BitrotReader::new(
+                        Cursor::new(shard.to_vec()),
+                        erasure.shard_size(),
+                        HashAlgorithm::None,
+                        false,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut writers = (0..erasure.total_shard_count())
+            .map(|index| {
+                if index == missing_parity {
+                    Some(BitrotWriterWrapper::new(
+                        CustomWriter::new_inline_buffer(),
+                        erasure.shard_size(),
+                        HashAlgorithm::None,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        erasure
+            .heal(&mut writers, readers, data.len(), &[])
+            .await
+            .expect("heal should rebuild parity");
+
+        let healed = writers[missing_parity]
+            .take()
+            .expect("parity writer should remain")
+            .into_inline_data()
+            .expect("inline writer should retain data");
+        assert_eq!(healed, encoded[missing_parity].to_vec());
+    }
+
+    #[tokio::test]
+    async fn heal_reconstructs_missing_data_shard_across_multiple_blocks() {
+        let erasure = Erasure::new(3, 2, 96);
+        let data = (0..erasure.block_size * 2 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let encoded = erasure.encode_data(&data).expect("encode should succeed");
+        let missing_data = 1;
+
+        let readers = encoded
+            .iter()
+            .enumerate()
+            .map(|(index, shard)| {
+                if index == missing_data {
+                    None
+                } else {
+                    Some(BitrotReader::new(
+                        Cursor::new(shard.to_vec()),
+                        erasure.shard_size(),
+                        HashAlgorithm::None,
+                        false,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut writers = (0..erasure.total_shard_count())
+            .map(|index| {
+                if index == missing_data {
+                    Some(BitrotWriterWrapper::new(
+                        CustomWriter::new_inline_buffer(),
+                        erasure.shard_size(),
+                        HashAlgorithm::None,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        erasure
+            .heal(&mut writers, readers, data.len(), &[])
+            .await
+            .expect("heal should rebuild data");
+
+        let healed = writers[missing_data]
+            .take()
+            .expect("data writer should remain")
+            .into_inline_data()
+            .expect("inline writer should retain data");
+        assert_eq!(healed, encoded[missing_data].to_vec());
     }
 }
