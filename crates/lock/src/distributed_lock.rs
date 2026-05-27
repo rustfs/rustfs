@@ -678,7 +678,7 @@ impl DistributedLock {
         let mut error = format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required");
         if let Some(last_failure) = &last_failure {
             error.push_str("; last failure: ");
-            error.push_str(&last_failure);
+            error.push_str(last_failure);
         }
         let resp = LockResponse::failure(error, Duration::ZERO);
         Ok(LockAcquireQuorumResult {
