@@ -602,6 +602,13 @@ impl StorageError {
             0x3D => Some(StorageError::InvalidRangeSpec(Default::default())),
             0x3E => Some(StorageError::NotModified),
             0x3F => Some(StorageError::InvalidPartNumber(Default::default())),
+            0x42 => Some(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: Default::default(),
+                object: Default::default(),
+                required: Default::default(),
+                achieved: Default::default(),
+            }),
             _ => None,
         }
     }
@@ -1007,6 +1014,17 @@ mod tests {
         assert_eq!(StorageError::DecommissionAlreadyRunning.to_u32(), 0x30);
         assert_eq!(StorageError::RebalanceAlreadyRunning.to_u32(), 0x40);
         assert_eq!(StorageError::OperationCanceled.to_u32(), 0x41);
+        assert_eq!(
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: "bucket".into(),
+                object: "object".into(),
+                required: 3,
+                achieved: 2,
+            }
+            .to_u32(),
+            0x42
+        );
     }
 
     #[test]
@@ -1021,6 +1039,10 @@ mod tests {
         assert!(matches!(StorageError::from_u32(0x30), Some(StorageError::DecommissionAlreadyRunning)));
         assert!(matches!(StorageError::from_u32(0x40), Some(StorageError::RebalanceAlreadyRunning)));
         assert!(matches!(StorageError::from_u32(0x41), Some(StorageError::OperationCanceled)));
+        assert!(matches!(
+            StorageError::from_u32(0x42),
+            Some(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
 
         // Test invalid code returns None
         assert!(StorageError::from_u32(0xFF).is_none());
