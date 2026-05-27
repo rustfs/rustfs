@@ -159,10 +159,15 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
+    if let rustfs::config::CommandResult::Tls(opts) = &command_result {
+        rustfs::tls::execute_tls(opts)?;
+        return Ok(());
+    }
+
     // Get config for server command
     let config = match command_result {
         rustfs::config::CommandResult::Server(cfg) => cfg,
-        rustfs::config::CommandResult::Info(_) => unreachable!(),
+        rustfs::config::CommandResult::Info(_) | rustfs::config::CommandResult::Tls(_) => unreachable!(),
     };
 
     // Initialize the global config snapshot for info command
