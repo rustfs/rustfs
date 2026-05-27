@@ -35,6 +35,18 @@ pub enum ShutdownSignal {
     Sigint,
 }
 
+impl ShutdownSignal {
+    pub fn log_label(&self) -> &'static str {
+        match self {
+            ShutdownSignal::CtrlC => "Ctrl-C",
+            #[cfg(unix)]
+            ShutdownSignal::Sigterm => "SIGTERM",
+            #[cfg(unix)]
+            ShutdownSignal::Sigint => "SIGINT",
+        }
+    }
+}
+
 #[atomic_enum]
 #[derive(PartialEq)]
 pub enum ServiceState {
@@ -233,5 +245,15 @@ mod tests {
     #[test]
     fn test_ready_maps_to_running_status() {
         assert_eq!(systemd_status_text(ServiceState::Ready), SERVICE_STATUS_RUNNING);
+    }
+
+    #[test]
+    fn shutdown_signal_log_label_matches_variants() {
+        assert_eq!(ShutdownSignal::CtrlC.log_label(), "Ctrl-C");
+        #[cfg(unix)]
+        {
+            assert_eq!(ShutdownSignal::Sigterm.log_label(), "SIGTERM");
+            assert_eq!(ShutdownSignal::Sigint.log_label(), "SIGINT");
+        }
     }
 }

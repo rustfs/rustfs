@@ -27,11 +27,12 @@ use rustfs::init::init_webdav_system;
 #[cfg(feature = "sftp")]
 use rustfs::init::init_sftp_system;
 
+use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::license::{current_license, init_license, license_status};
 use rustfs::server::{
-    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
-    start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
+    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, publish_ready_when_runtime_ready,
+    shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
@@ -73,7 +74,6 @@ const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
-
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -159,10 +159,15 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
+    if let rustfs::config::CommandResult::Tls(opts) = &command_result {
+        rustfs::tls::execute_tls(opts)?;
+        return Ok(());
+    }
+
     // Get config for server command
     let config = match command_result {
         rustfs::config::CommandResult::Server(cfg) => cfg,
-        rustfs::config::CommandResult::Info(_) => unreachable!(),
+        rustfs::config::CommandResult::Info(_) | rustfs::config::CommandResult::Tls(_) => unreachable!(),
     };
 
     // Initialize the global config snapshot for info command
@@ -423,7 +428,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     };
 
     #[cfg(not(feature = "ftps"))]
-    let ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+    let ftp_shutdown_tx: Option<ShutdownHandle> = None;
 
     // Initialize FTPS system if enabled
     #[cfg(feature = "ftps")]
@@ -443,7 +448,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     };
 
     #[cfg(not(feature = "ftps"))]
-    let ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+    let ftps_shutdown_tx: Option<ShutdownHandle> = None;
 
     // Initialize WebDAV system if enabled
     #[cfg(feature = "webdav")]
@@ -463,7 +468,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     };
 
     #[cfg(not(feature = "webdav"))]
-    let webdav_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+    let webdav_shutdown_tx: Option<ShutdownHandle> = None;
 
     // Initialize SFTP system if enabled
     #[cfg(feature = "sftp")]
@@ -483,7 +488,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     };
 
     #[cfg(not(feature = "sftp"))]
-    let sftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+    let sftp_shutdown_tx: Option<ShutdownHandle> = None;
 
     // Initialize buffer profiling system
     init_buffer_profile_system(&config);
@@ -607,55 +612,31 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         &server_address,
         jiff::Zoned::now()
     );
-    // 4. Mark as Full Ready now that critical components are warm
-    readiness.mark_stage(SystemStage::FullReady);
+    publish_ready_when_runtime_ready(readiness.as_ref(), Some(&state_manager)).await?;
 
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
-    // Publish ready only after all critical bootstrap metadata is in place
-    state_manager.update(ServiceState::Ready);
 
     if enable_scanner {
         init_data_scanner(ctx.clone(), store.clone()).await;
     }
 
-    // Perform hibernation for 1 second
-    tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
     // listen to the shutdown signal
-    match wait_for_shutdown().await {
-        #[cfg(unix)]
-        ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(
-                &state_manager,
-                s3_shutdown_tx,
-                console_shutdown_tx,
-                ProtocolShutdownSenders {
-                    ftp: ftp_shutdown_tx,
-                    ftps: ftps_shutdown_tx,
-                    webdav: webdav_shutdown_tx,
-                    sftp: sftp_shutdown_tx,
-                },
-                ctx.clone(),
-            )
-            .await;
-        }
-        #[cfg(not(unix))]
-        ShutdownSignal::CtrlC => {
-            handle_shutdown(
-                &state_manager,
-                s3_shutdown_tx,
-                console_shutdown_tx,
-                ProtocolShutdownSenders {
-                    ftp: ftp_shutdown_tx,
-                    ftps: ftps_shutdown_tx,
-                    webdav: webdav_shutdown_tx,
-                    sftp: sftp_shutdown_tx,
-                },
-                ctx.clone(),
-            )
-            .await;
-        }
-    }
+    let shutdown_signal = wait_for_shutdown().await;
+    handle_shutdown(
+        &state_manager,
+        shutdown_signal,
+        s3_shutdown_tx,
+        console_shutdown_tx,
+        ProtocolShutdownSenders {
+            ftp: ftp_shutdown_tx,
+            ftps: ftps_shutdown_tx,
+            webdav: webdav_shutdown_tx,
+            sftp: sftp_shutdown_tx,
+        },
+        ctx.clone(),
+    )
+    .await;
 
     info!(target: "rustfs::main::run","server is stopped state: {:?}", state_manager.current_state());
     Ok(())
@@ -664,17 +645,18 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 /// Shutdown channels for every protocol server. None means the protocol was
 /// disabled at startup.
 struct ProtocolShutdownSenders {
-    ftp: Option<tokio::sync::broadcast::Sender<()>>,
-    ftps: Option<tokio::sync::broadcast::Sender<()>>,
-    webdav: Option<tokio::sync::broadcast::Sender<()>>,
-    sftp: Option<tokio::sync::broadcast::Sender<()>>,
+    ftp: Option<ShutdownHandle>,
+    ftps: Option<ShutdownHandle>,
+    webdav: Option<ShutdownHandle>,
+    sftp: Option<ShutdownHandle>,
 }
 
 /// Handles the shutdown process of the server
 async fn handle_shutdown(
     state_manager: &ServiceStateManager,
-    s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
-    console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    shutdown_signal: ShutdownSignal,
+    s3_shutdown_handle: Option<ShutdownHandle>,
+    console_shutdown_handle: Option<ShutdownHandle>,
     protocols: ProtocolShutdownSenders,
     ctx: CancellationToken,
 ) {
@@ -688,6 +670,7 @@ async fn handle_shutdown(
 
     info!(
         target: "rustfs::main::handle_shutdown",
+        signal = shutdown_signal.log_label(),
         "Shutdown signal received in main thread"
     );
     // update the status to stopping first
@@ -722,12 +705,13 @@ async fn handle_shutdown(
     }
 
     // Shutdown FTP and FTPS servers
+    let mut protocol_shutdowns = Vec::new();
     if let Some(ftp_shutdown_tx) = ftp_shutdown_tx {
         info!(
             target: "rustfs::main::handle_shutdown",
             "Shutting down FTP server..."
         );
-        let _ = ftp_shutdown_tx.send(());
+        protocol_shutdowns.push(ftp_shutdown_tx.shutdown());
     }
 
     if let Some(ftps_shutdown_tx) = ftps_shutdown_tx {
@@ -735,7 +719,7 @@ async fn handle_shutdown(
             target: "rustfs::main::handle_shutdown",
             "Shutting down FTPS server..."
         );
-        let _ = ftps_shutdown_tx.send(());
+        protocol_shutdowns.push(ftps_shutdown_tx.shutdown());
     }
 
     // Shutdown WebDAV server
@@ -744,7 +728,7 @@ async fn handle_shutdown(
             target: "rustfs::main::handle_shutdown",
             "Shutting down WebDAV server..."
         );
-        let _ = webdav_shutdown_tx.send(());
+        protocol_shutdowns.push(webdav_shutdown_tx.shutdown());
     }
 
     // Shutdown SFTP server
@@ -753,7 +737,7 @@ async fn handle_shutdown(
             target: "rustfs::main::handle_shutdown",
             "Shutting down SFTP server..."
         );
-        let _ = sftp_shutdown_tx.send(());
+        protocol_shutdowns.push(sftp_shutdown_tx.shutdown());
     }
 
     // Stop the notification system
@@ -784,15 +768,13 @@ async fn handle_shutdown(
         target: "rustfs::main::handle_shutdown",
         "Server is stopping..."
     );
-    if let Some(s3_shutdown_tx) = s3_shutdown_tx {
-        let _ = s3_shutdown_tx.send(());
+    if let Some(s3_shutdown_handle) = s3_shutdown_handle {
+        s3_shutdown_handle.shutdown().await;
     }
-    if let Some(console_shutdown_tx) = console_shutdown_tx {
-        let _ = console_shutdown_tx.send(());
+    if let Some(console_shutdown_handle) = console_shutdown_handle {
+        console_shutdown_handle.shutdown().await;
     }
-
-    // Wait for the worker thread to complete the cleaning work
-    tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+    join_all(protocol_shutdowns).await;
 
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);

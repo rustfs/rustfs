@@ -350,15 +350,6 @@ impl SetDisks {
 
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
-                                let checksum_info = erasure_info.get_checksum_info(part.number);
-                                let checksum_algo = if latest_meta.uses_legacy_checksum
-                                    && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
-                                {
-                                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                                } else {
-                                    checksum_info.algorithm
-                                };
-
                                 // Read zero-copy configuration from environment variable
                                 // Default: enabled (true) for performance
                                 let use_zero_copy =
@@ -382,6 +373,15 @@ impl SetDisks {
                                     }
 
                                     if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
+                                        let checksum_info = metadata.erasure.get_checksum_info(part.number);
+                                        let checksum_algo = if metadata.uses_legacy_checksum
+                                            && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
+                                        {
+                                            rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                                        } else {
+                                            checksum_info.algorithm
+                                        };
+
                                         match create_bitrot_reader(
                                             metadata.data.as_deref(),
                                             Some(disk),

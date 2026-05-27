@@ -523,7 +523,9 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     } else {
         HealthProbe::Liveness
     };
-    let (storage_ready, iam_ready) = collect_dependency_readiness().await;
+    let readiness_report = collect_dependency_readiness().await;
+    let storage_ready = readiness_report.readiness.storage_ready;
+    let iam_ready = readiness_report.readiness.iam_ready;
     let health = health_check_state(storage_ready, iam_ready, probe);
 
     let builder = Response::builder()
@@ -537,7 +539,14 @@ async fn health_check(method: Method, uri: Uri) -> Response {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let body_json = build_health_payload(health, storage_ready, iam_ready, "rustfs-console", Some(uptime));
+            let body_json = build_health_payload(
+                health,
+                storage_ready,
+                iam_ready,
+                &readiness_report.degraded_reasons,
+                "rustfs-console",
+                Some(uptime),
+            );
 
             // Return a minimal JSON when serialization fails to avoid panic
             let body_str = serde_json::to_string(&body_json).unwrap_or_else(|e| {
