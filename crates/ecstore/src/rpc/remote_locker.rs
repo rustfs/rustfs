@@ -27,8 +27,6 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tracing::{info, warn};
 
-const REMOTE_LOCK_RPC_TIMEOUT_GRACE: Duration = Duration::from_millis(500);
-
 /// Remote lock client implementation
 #[derive(Debug, Clone)]
 pub struct RemoteClient {
@@ -84,10 +82,6 @@ impl RemoteClient {
         }
     }
 
-    fn rpc_deadline(timeout_duration: Duration) -> Duration {
-        Self::rpc_timeout(timeout_duration).saturating_add(REMOTE_LOCK_RPC_TIMEOUT_GRACE)
-    }
-
     async fn execute_rpc<T, F>(
         &self,
         op: &'static str,
@@ -98,8 +92,7 @@ impl RemoteClient {
         F: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     {
         let lock_timeout = Self::rpc_timeout(timeout_duration);
-        let rpc_deadline = Self::rpc_deadline(timeout_duration);
-        match timeout(rpc_deadline, future).await {
+        match timeout(lock_timeout, future).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => {
                 let reason = err.to_string();
@@ -107,7 +100,7 @@ impl RemoteClient {
                 Err(LockError::internal(format!("{op} RPC failed: {reason}")))
             }
             Err(_) => {
-                let reason = format!("RPC timed out after {:?}", rpc_deadline);
+                let reason = format!("RPC timed out after {:?}", lock_timeout);
                 self.evict_connection(op, &reason).await;
                 Err(LockError::timeout(format!("remote lock RPC {op} on {}", self.addr), lock_timeout))
             }
