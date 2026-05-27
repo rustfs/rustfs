@@ -127,7 +127,7 @@ futures = "0.3.32"
 futures-core = "0.3.32"
 futures-util = "0.3.32"
 pollster = "0.4.0"
-pulsar = { version = "6.7.2", default-features = false, features = ["tokio-rustls-runtime"] }
+pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime"] }
 lapin = { version = "4.10.0", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 hyper = { version = "1.9.0", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
@@ -301,7 +301,7 @@ opentelemetry-otlp = { version = "0.32.0", features = ["gzip-http", "reqwest-rus
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 opentelemetry-semantic-conventions = { version = "0.32.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.32.0" }
-pyroscope = { version = "2.0.4", features = ["backend-pprof-rs"] }
+pyroscope = { version = "2.0.5", features = ["backend-pprof-rs"] }
 
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
