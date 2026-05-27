@@ -362,6 +362,7 @@ impl ObjectStore {
         let (tx, mut rx) = mpsc::channel::<ObjectInfoOrErr>(100);
 
         let path = prefix.to_owned();
+        let sender_on_error = sender.clone();
         tokio::spawn(async move {
             if let Err(err) = store
                 .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, WalkOptions::default())
@@ -378,6 +379,12 @@ impl ObjectStore {
                     error = %err,
                     "system path walk failed"
                 );
+                let _ = sender_on_error
+                    .send(StringOrErr {
+                        item: None,
+                        err: Some(err.into()),
+                    })
+                    .await;
             }
         });
 
@@ -1018,6 +1025,9 @@ impl Store for ObjectStore {
     }
 
     async fn load_all(&self, cache: &Cache) -> Result<()> {
+        let users_snapshot = cache.users.load();
+        let sts_accounts_snapshot = cache.sts_accounts.load();
+        let sts_policies_snapshot = cache.sts_policies.load();
         let listed_config_items = self.list_all_iamconfig_items().await?;
 
         let mut policy_docs_cache = CacheEntity::new(get_default_policyes());
@@ -1245,9 +1255,19 @@ impl Store for ObjectStore {
             }
         }
 
-        cache.users.store(Arc::new(user_items_cache.update_load_time()));
-        cache.sts_accounts.store(Arc::new(sts_items_cache.update_load_time()));
-        cache.sts_policies.store(Arc::new(sts_policies_cache.update_load_time()));
+        let users_current = cache.users.load();
+        let sts_accounts_current = cache.sts_accounts.load();
+        let sts_policies_current = cache.sts_policies.load();
+
+        if Cache::ptr_eq(&*users_snapshot, &*users_current)
+            && Cache::ptr_eq(&*sts_accounts_snapshot, &*sts_accounts_current)
+            && Cache::ptr_eq(&*sts_policies_snapshot, &*sts_policies_current)
+        {
+            cache.users.store(Arc::new(user_items_cache.update_load_time()));
+            cache.sts_accounts.store(Arc::new(sts_items_cache.update_load_time()));
+            cache.sts_policies.store(Arc::new(sts_policies_cache.update_load_time()));
+            cache.build_user_group_memberships();
+        }
 
         Ok(())
     }
