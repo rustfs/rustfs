@@ -88,6 +88,20 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_tls_inspect_subcommand_parses_tls_path_alias() {
+        let result =
+            Opt::parse_command(["rustfs", "tls", "inspect", "--tls-path", "/tmp/certs"]).expect("tls inspect alias should parse");
+
+        match result {
+            CommandResult::Tls(opts) => match opts.command {
+                TlsCommands::Inspect(inspect) => assert_eq!(inspect.path, "/tmp/certs"),
+            },
+            _ => panic!("expected TLS command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
     fn test_default_console_configuration() {
         // Test that default console configuration is correct
         let args = vec!["rustfs", "/test/volume"];
