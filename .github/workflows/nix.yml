@@ -44,20 +44,23 @@ jobs:
     name: Nix Build & Check
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: DeterminateSystems/determinate-nix-action@v3.21.0
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-          extra_nix_config: |
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
             experimental-features = nix-command flakes
             max-jobs = 1
 
       - name: Cache Nix
-        uses: DeterminateSystems/magic-nix-cache-action@v13
+        uses: DeterminateSystems/flakehub-cache-action@v3.21.0
 
       - name: Check Nix Flake Inputs
         uses: DeterminateSystems/flake-checker-action@v12
