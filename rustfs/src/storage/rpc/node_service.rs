@@ -107,11 +107,15 @@ impl Node for NodeService {
         debug!("PING");
 
         let ping_req = request.into_inner();
-        let ping_body = flatbuffers::root::<PingBody>(&ping_req.body);
-        if let Err(e) = ping_body {
-            error!("{}", e);
+        if ping_req.body.is_empty() {
+            debug!("ping_req received empty body; treating request as liveness probe");
         } else {
-            info!("ping_req:body(flatbuffer): {:?}", ping_body);
+            let ping_body = flatbuffers::root::<PingBody>(&ping_req.body);
+            if let Err(e) = ping_body {
+                warn!("invalid ping request body: {}", e);
+            } else {
+                info!("ping_req:body(flatbuffer): {:?}", ping_body);
+            }
         }
 
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
@@ -986,6 +990,23 @@ mod tests {
 
         let response = service.ping(request).await;
         assert!(response.is_ok()); // Should still succeed but log error
+
+        let ping_response = response.unwrap().into_inner();
+        assert_eq!(ping_response.version, 1);
+        assert!(!ping_response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ping_with_empty_body() {
+        let service = create_test_node_service();
+
+        let request = Request::new(PingRequest {
+            version: 1,
+            body: Bytes::new(),
+        });
+
+        let response = service.ping(request).await;
+        assert!(response.is_ok());
 
         let ping_response = response.unwrap().into_inner();
         assert_eq!(ping_response.version, 1);

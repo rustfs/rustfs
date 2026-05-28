@@ -501,7 +501,11 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                error!("list_path_raw producer err {:?}", err);
+                if matches!(err, DiskError::FileNotFound | DiskError::VolumeNotFound) {
+                    warn!("list_path_raw producer missing path {:?}", err);
+                } else {
+                    error!("list_path_raw producer err {:?}", err);
+                }
                 job_errs.push(err);
             }
             Err(err) => {
