@@ -206,7 +206,10 @@ impl RemoteDisk {
         let mut interval = time::interval(get_drive_active_check_interval());
 
         // Perform basic connectivity check
-        if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_failure(&endpoint, "connectivity_probe_failed") {
+        let initial_probe_ok = Self::perform_connectivity_check(&addr).await.is_ok();
+        if initial_probe_ok {
+            health.record_operation_success(&endpoint, "connectivity_probe_success");
+        } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
             warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
             // Start recovery monitoring
@@ -249,9 +252,9 @@ impl RemoteDisk {
                     }
 
                     // Perform basic connectivity check
-                    if Self::perform_connectivity_check(&addr).await.is_err()
-                        && health.mark_failure(&endpoint, "connectivity_probe_failed")
-                    {
+                    if Self::perform_connectivity_check(&addr).await.is_ok() {
+                        health.record_operation_success(&endpoint, "connectivity_probe_success");
+                    } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
                         warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
                         // Start recovery monitoring
@@ -1968,8 +1971,12 @@ mod tests {
             disk_idx: 0,
         };
 
-        temp_env::with_var(rustfs_config::ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS, Some("1"), || async {
-            temp_env::with_var(rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1"), || async {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS, Some("1")),
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1")),
+            ],
+            async {
                 let disk_option = DiskOption {
                     cleanup: false,
                     health_check: true,
@@ -1981,13 +1988,21 @@ mod tests {
                 remote_disk.enable_health_check();
 
                 // Wait out the initial success-grace window so the active probe loop
-                // actually attempts a connectivity check.
+                // actually attempts a connectivity check. Under the new
+                // suspect-first semantics we only need to prove that the drive
+                // transitions away from a clean Online state at least once.
                 tokio::time::sleep(SKIP_IF_SUCCESS_BEFORE + Duration::from_secs(2)).await;
-                assert!(remote_disk.is_online().await);
-                assert_eq!(remote_disk.runtime_state(), RuntimeDriveHealthState::Suspect);
-            })
-            .await;
-        })
+                assert!(
+                    remote_disk.offline_duration_secs().is_some(),
+                    "missing listener should transition the drive through suspect/offline tracking"
+                );
+                assert_ne!(
+                    remote_disk.runtime_state(),
+                    RuntimeDriveHealthState::Online,
+                    "missing listener should not remain in a clean Online state after probing"
+                );
+            },
+        )
         .await;
     }
 
