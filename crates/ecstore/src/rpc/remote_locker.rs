@@ -25,7 +25,7 @@ use tokio::time::timeout;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Remote lock client implementation
 #[derive(Debug, Clone)]
@@ -64,14 +64,42 @@ impl RemoteClient {
             .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))
     }
 
-    async fn evict_connection(&self, op: &'static str, reason: &str) {
-        warn!(
-            addr = %self.addr,
-            op,
-            reason,
-            "Evicting cached remote lock connection after RPC failure"
-        );
+    fn is_scanner_leader_lock(resource_summary: &str) -> bool {
+        resource_summary == ".rustfs.sys/leader.lock@latest"
+    }
+
+    async fn evict_connection(&self, op: &'static str, reason: &str, resource_summary: &str) {
+        if Self::is_scanner_leader_lock(resource_summary) {
+            debug!(
+                addr = %self.addr,
+                op,
+                reason,
+                resource_summary,
+                "Evicting cached remote lock connection for scanner leader-lock RPC failure"
+            );
+        } else {
+            warn!(
+                addr = %self.addr,
+                op,
+                reason,
+                resource_summary,
+                "Evicting cached remote lock connection after RPC failure"
+            );
+        }
         evict_failed_connection(&self.addr).await;
+    }
+
+    fn summarize_resources(requests: &[LockRequest]) -> String {
+        const LIMIT: usize = 3;
+        let mut resources = requests
+            .iter()
+            .take(LIMIT)
+            .map(|request| request.resource.to_string())
+            .collect::<Vec<_>>();
+        if requests.len() > LIMIT {
+            resources.push(format!("... (+{} more)", requests.len() - LIMIT));
+        }
+        resources.join(", ")
     }
 
     fn rpc_timeout(timeout_duration: Duration) -> Duration {
@@ -86,6 +114,7 @@ impl RemoteClient {
         &self,
         op: &'static str,
         timeout_duration: Duration,
+        resource_summary: &str,
         future: F,
     ) -> std::result::Result<T, LockError>
     where
@@ -96,12 +125,50 @@ impl RemoteClient {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => {
                 let reason = err.to_string();
-                self.evict_connection(op, &reason).await;
+                if Self::is_scanner_leader_lock(resource_summary) {
+                    debug!(
+                        addr = %self.addr,
+                        op,
+                        timeout_ms = lock_timeout.as_millis(),
+                        resource_summary,
+                        tonic_code = ?err.code(),
+                        tonic_message = err.message(),
+                        "Remote lock RPC returned tonic error for scanner leader lock"
+                    );
+                } else {
+                    warn!(
+                        addr = %self.addr,
+                        op,
+                        timeout_ms = lock_timeout.as_millis(),
+                        resource_summary,
+                        tonic_code = ?err.code(),
+                        tonic_message = err.message(),
+                        "Remote lock RPC returned tonic error"
+                    );
+                }
+                self.evict_connection(op, &reason, resource_summary).await;
                 Err(LockError::internal(format!("{op} RPC failed: {reason}")))
             }
             Err(_) => {
                 let reason = format!("RPC timed out after {:?}", lock_timeout);
-                self.evict_connection(op, &reason).await;
+                if Self::is_scanner_leader_lock(resource_summary) {
+                    debug!(
+                        addr = %self.addr,
+                        op,
+                        timeout_ms = lock_timeout.as_millis(),
+                        resource_summary,
+                        "Remote lock RPC timed out for scanner leader lock"
+                    );
+                } else {
+                    warn!(
+                        addr = %self.addr,
+                        op,
+                        timeout_ms = lock_timeout.as_millis(),
+                        resource_summary,
+                        "Remote lock RPC timed out"
+                    );
+                }
+                self.evict_connection(op, &reason, resource_summary).await;
                 Err(LockError::timeout(format!("remote lock RPC {op} on {}", self.addr), lock_timeout))
             }
         }
@@ -182,12 +249,16 @@ impl LockClient for RemoteClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
         info!("remote acquire_exclusive for {}", request.resource);
         let mut client = self.get_client().await?;
+        let resource_summary = request.resource.to_string();
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
 
-        let resp = match self.execute_rpc("lock", request.acquire_timeout, client.lock(req)).await {
+        let resp = match self
+            .execute_rpc("lock", request.acquire_timeout, &resource_summary, client.lock(req))
+            .await
+        {
             Ok(resp) => resp.into_inner(),
             Err(err @ LockError::Timeout { .. }) => return Ok(Self::rpc_timeout_failure_response(request, &err)),
             Err(err) => return Ok(Self::rpc_failure_response(request, &err)),
@@ -215,6 +286,7 @@ impl LockClient for RemoteClient {
         }
 
         let mut client = self.get_client().await?;
+        let resource_summary = Self::summarize_resources(requests);
         let req = Request::new(BatchGenerallyLockRequest {
             args: requests
                 .iter()
@@ -225,7 +297,7 @@ impl LockClient for RemoteClient {
         });
 
         let resp = match self
-            .execute_rpc("lock_batch", Self::batch_rpc_timeout(requests), client.lock_batch(req))
+            .execute_rpc("lock_batch", Self::batch_rpc_timeout(requests), &resource_summary, client.lock_batch(req))
             .await
         {
             Ok(resp) => resp.into_inner(),
