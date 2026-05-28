@@ -48,27 +48,31 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       NIX_CURL_FLAGS: "--user-agent rustfs-nix-ci/1.0 (+https://github.com/rustfs/rustfs)"
+      CARGO_HTTP_USER_AGENT: "cargo/rustfs-nix-ci"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@v31
+      - name: Check Nix Flake Inputs
+        uses: DeterminateSystems/flake-checker-action@v12
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-          extra_nix_config: |
+          fail-mode: true
+          ignore-missing-flake-lock: false
+
+      - name: Install Determinate Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
             experimental-features = nix-command flakes
             max-jobs = 1
-
-      - name: Setup Flake Checker
-        uses: DeterminateSystems/flake-checker-action@v12
 
       - name: Verify Flake
         run: |
           echo "Checking flake structure and evaluation..."
           nix flake show
           for attempt in 1 2 3; do
-            if nix flake check --print-build-logs --fallback; then
+            if nix flake check --print-build-logs --fallback --option fallback true; then
               break
             fi
             if [ "$attempt" -eq 3 ]; then
@@ -82,7 +86,7 @@ jobs:
         run: |
           echo "Building the default package..."
           for attempt in 1 2 3; do
-            if nix build .#default --print-build-logs --fallback; then
+            if nix build .#default --print-build-logs --fallback --option fallback true; then
               break
             fi
             if [ "$attempt" -eq 3 ]; then
