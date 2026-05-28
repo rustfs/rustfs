@@ -54,7 +54,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Determinate Nix
-        uses: DeterminateSystems/determinate-nix-action@main
+        uses: DeterminateSystems/determinate-nix-action@v3
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           extra-conf: |
@@ -66,7 +66,7 @@ jobs:
         uses: DeterminateSystems/flakehub-cache-action@v3.20.0
 
       - name: Check Nix Flake Inputs
-        uses: DeterminateSystems/flake-checker-action@main
+        uses: DeterminateSystems/flake-checker-action@v12
         with:
           fail-mode: true
           ignore-missing-flake-lock: false
