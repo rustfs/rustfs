@@ -38,6 +38,7 @@ concurrency:
   cancel-in-progress: true
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   nix-validation:
@@ -59,6 +60,8 @@ jobs:
 
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@v13
+        with:
+          use-flakehub: false
 
       - name: Setup Flake Checker
         uses: DeterminateSystems/flake-checker-action@v12
@@ -67,12 +70,30 @@ jobs:
         run: |
           echo "Checking flake structure and evaluation..."
           nix flake show
-          nix flake check --print-build-logs
+          for attempt in 1 2 3; do
+            if nix flake check --print-build-logs; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "nix flake check failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
 
       - name: Build RustFS
         run: |
           echo "Building the default package..."
-          nix build .#default --print-build-logs
+          for attempt in 1 2 3; do
+            if nix build .#default --print-build-logs; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "nix build failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
 
       - name: Test Binary
         run: |
