@@ -57,11 +57,7 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           extra_nix_config: |
             experimental-features = nix-command flakes
-
-      - name: Setup Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@v13
-        with:
-          use-flakehub: false
+            max-jobs = 1
 
       - name: Setup Flake Checker
         uses: DeterminateSystems/flake-checker-action@v12
@@ -71,7 +67,7 @@ jobs:
           echo "Checking flake structure and evaluation..."
           nix flake show
           for attempt in 1 2 3; do
-            if nix flake check --print-build-logs; then
+            if nix flake check --print-build-logs --fallback; then
               break
             fi
             if [ "$attempt" -eq 3 ]; then
@@ -85,7 +81,7 @@ jobs:
         run: |
           echo "Building the default package..."
           for attempt in 1 2 3; do
-            if nix build .#default --print-build-logs; then
+            if nix build .#default --print-build-logs --fallback; then
               break
             fi
             if [ "$attempt" -eq 3 ]; then
