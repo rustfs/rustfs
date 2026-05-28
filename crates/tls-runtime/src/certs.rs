@@ -20,7 +20,7 @@ use rustls::sign::CertifiedKey;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::HashMap;
 use std::io::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io};
 use tracing::{debug, warn};
@@ -224,8 +224,116 @@ pub fn certs_error(err: String) -> Error {
     Error::other(err)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsCertPairStatus {
+    MissingBoth,
+    MissingCert,
+    MissingKey,
+    Valid,
+    Invalid { error: String },
+}
+
+impl TlsCertPairStatus {
+    pub fn is_valid(&self) -> bool {
+        matches!(self, Self::Valid)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsCertPairInspection {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub status: TlsCertPairStatus,
+}
+
+impl TlsCertPairInspection {
+    pub fn is_valid(&self) -> bool {
+        self.status.is_valid()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsDomainInspection {
+    pub domain_name: String,
+    pub pair: TlsCertPairInspection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsDirectoryInspection {
+    pub directory: PathBuf,
+    pub canonical_directory: Option<PathBuf>,
+    pub root_pair: TlsCertPairInspection,
+    pub domain_pairs: Vec<TlsDomainInspection>,
+    pub skipped_directory_names: Vec<String>,
+}
+
+impl TlsDirectoryInspection {
+    pub fn valid_domain_names(&self) -> Vec<&str> {
+        self.domain_pairs
+            .iter()
+            .filter(|entry| entry.pair.is_valid())
+            .map(|entry| entry.domain_name.as_str())
+            .collect()
+    }
+
+    pub fn has_valid_root_pair(&self) -> bool {
+        self.root_pair.is_valid()
+    }
+}
+
 fn is_discoverable_cert_domain_dir(domain_name: &str) -> bool {
     !domain_name.starts_with('.')
+}
+
+pub fn inspect_cert_directory(options: CertDirectoryLoadOptions) -> io::Result<TlsDirectoryInspection> {
+    options.validate()?;
+
+    let dir = options.dir_path.as_path();
+    if !dir.exists() || !dir.is_dir() {
+        return Err(certs_error(format!(
+            "The certificate directory does not exist or is not a directory: {}",
+            dir.display()
+        )));
+    }
+
+    let root_pair = inspect_cert_key_pair(dir, &options.cert_filename, &options.key_filename);
+    let canonical_directory = fs::canonicalize(dir).ok();
+    let mut domain_pairs = Vec::new();
+    let mut skipped_directory_names = Vec::new();
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        let domain_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| certs_error(format!("invalid domain name directory:{path:?}")))?;
+        if !is_discoverable_cert_domain_dir(domain_name) {
+            skipped_directory_names.push(domain_name.to_string());
+            continue;
+        }
+
+        domain_pairs.push(TlsDomainInspection {
+            domain_name: domain_name.to_string(),
+            pair: inspect_cert_key_pair(&path, &options.cert_filename, &options.key_filename),
+        });
+    }
+
+    domain_pairs.sort_by(|left, right| left.domain_name.cmp(&right.domain_name));
+    skipped_directory_names.sort();
+
+    Ok(TlsDirectoryInspection {
+        directory: dir.to_path_buf(),
+        canonical_directory,
+        root_pair,
+        domain_pairs,
+        skipped_directory_names,
+    })
 }
 
 pub fn load_all_certs_from_directory(
@@ -325,6 +433,42 @@ fn load_cert_key_pair(cert_path: &str, key_path: &str) -> io::Result<(Vec<Certif
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
     Ok((certs, key))
+}
+
+fn inspect_cert_key_pair(dir: &Path, cert_filename: &str, key_filename: &str) -> TlsCertPairInspection {
+    let cert_path = dir.join(cert_filename);
+    let key_path = dir.join(key_filename);
+    let cert_exists = cert_path.exists();
+    let key_exists = key_path.exists();
+
+    let status = match (cert_exists, key_exists) {
+        (false, false) => TlsCertPairStatus::MissingBoth,
+        (false, true) => TlsCertPairStatus::MissingCert,
+        (true, false) => TlsCertPairStatus::MissingKey,
+        (true, true) => match cert_key_pair_utf8_paths(&cert_path, &key_path) {
+            Ok((cert_path, key_path)) => match load_cert_key_pair(cert_path, key_path) {
+                Ok(_) => TlsCertPairStatus::Valid,
+                Err(err) => TlsCertPairStatus::Invalid { error: err.to_string() },
+            },
+            Err(err) => TlsCertPairStatus::Invalid { error: err.to_string() },
+        },
+    };
+
+    TlsCertPairInspection {
+        cert_path,
+        key_path,
+        status,
+    }
+}
+
+fn cert_key_pair_utf8_paths<'a>(cert_path: &'a Path, key_path: &'a Path) -> io::Result<(&'a str, &'a str)> {
+    let cert_path = cert_path
+        .to_str()
+        .ok_or_else(|| certs_error(format!("Invalid UTF-8 in certificate path: {cert_path:?}")))?;
+    let key_path = key_path
+        .to_str()
+        .ok_or_else(|| certs_error(format!("Invalid UTF-8 in key path: {key_path:?}")))?;
+    Ok((cert_path, key_path))
 }
 
 pub fn create_multi_cert_resolver(
@@ -447,5 +591,37 @@ mod tests {
         assert!(certs.contains_key("example.com"));
         assert!(!certs.contains_key("..data"));
         assert_eq!(certs.len(), 2);
+    }
+
+    #[test]
+    fn test_inspect_cert_directory_reports_valid_root_and_domain_pairs() {
+        let temp_dir = TempDir::new().expect("tempdir should create");
+        write_test_cert_pair(temp_dir.path());
+
+        let domain_dir = temp_dir.path().join("example.com");
+        fs::create_dir(&domain_dir).expect("domain dir should create");
+        write_test_cert_pair(&domain_dir);
+
+        let inspection = inspect_cert_directory(default_load_options(temp_dir.path())).expect("inspection should succeed");
+        assert!(inspection.has_valid_root_pair());
+        assert_eq!(inspection.valid_domain_names(), vec!["example.com"]);
+        assert_eq!(inspection.domain_pairs.len(), 1);
+        assert!(inspection.domain_pairs[0].pair.is_valid());
+    }
+
+    #[test]
+    fn test_inspect_cert_directory_reports_invalid_and_missing_pairs() {
+        let temp_dir = TempDir::new().expect("tempdir should create");
+        fs::write(temp_dir.path().join("rustfs_cert.pem"), "invalid certificate").expect("invalid cert should write");
+        fs::write(temp_dir.path().join("rustfs_key.pem"), "invalid key").expect("invalid key should write");
+
+        let domain_dir = temp_dir.path().join("broken.example.com");
+        fs::create_dir(&domain_dir).expect("domain dir should create");
+        fs::write(domain_dir.join("rustfs_cert.pem"), "invalid certificate").expect("invalid cert should write");
+
+        let inspection = inspect_cert_directory(default_load_options(temp_dir.path())).expect("inspection should succeed");
+        assert!(matches!(inspection.root_pair.status, TlsCertPairStatus::Invalid { .. }));
+        assert_eq!(inspection.domain_pairs.len(), 1);
+        assert_eq!(inspection.domain_pairs[0].pair.status, TlsCertPairStatus::MissingKey);
     }
 }

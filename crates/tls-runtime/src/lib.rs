@@ -26,7 +26,8 @@ pub mod source;
 pub mod state;
 
 pub use certs::{
-    CertDirectoryLoadOptions, WebPkiClientVerifierOptions, build_webpki_client_verifier, create_multi_cert_resolver,
+    CertDirectoryLoadOptions, TlsCertPairInspection, TlsCertPairStatus, TlsDirectoryInspection, TlsDomainInspection,
+    WebPkiClientVerifierOptions, build_webpki_client_verifier, create_multi_cert_resolver, inspect_cert_directory,
     load_all_certs_from_directory, load_cert_bundle_der_bytes, load_certs, load_private_key,
 };
 pub use config::{ReloadApplyHint, ReloadDetectMode, TlsReloadOptions};
