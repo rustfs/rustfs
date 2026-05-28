@@ -976,7 +976,7 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
     }
 
     tokio::spawn(async move {
-        let mut timer = tokio::time::interval(refresh_interval);
+        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + refresh_interval, refresh_interval);
 
         loop {
             timer.tick().await;
@@ -1002,7 +1002,7 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
     });
 
     tokio::spawn(async move {
-        let mut timer = tokio::time::interval(metrics_interval);
+        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + metrics_interval, metrics_interval);
         loop {
             timer.tick().await;
             manager_for_metrics.log_runtime_summary().await;
