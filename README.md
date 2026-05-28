@@ -7,6 +7,7 @@
   <a href="https://github.com/rustfs/rustfs/actions/workflows/docker.yml"><img alt="Build and Push Docker Images" src="https://github.com/rustfs/rustfs/actions/workflows/docker.yml/badge.svg" /></a>
   <img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/rustfs/rustfs"/>
   <img alt="Github Last Commit" src="https://img.shields.io/github/last-commit/rustfs/rustfs"/>
+  <a href="https://discord.gg/NcKBCEJp6P"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join%20Chat-5865F2?logo=discord&logoColor=white" /></a>
   <a href="https://hellogithub.com/repository/rustfs/rustfs" target="_blank"><img src="https://abroad.hellogithub.com/v1/widgets/recommend.svg?rid=b95bcb72bdc340b68f16fdf6790b7d5b&claim_uid=MsbvjYeLDKAH457&theme=small" alt="Featured｜HelloGitHub" /></a>
 </p>
 
@@ -295,6 +296,7 @@ If you have any questions or need assistance:
 - [Documentation](https://docs.rustfs.com) - The manual you should read
 - [Changelog](https://github.com/rustfs/rustfs/releases) - What we broke and fixed
 - [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) - Where the community lives
+- [Discord](https://discord.gg/NcKBCEJp6P) - Chat with the RustFS community
 
 ## Contact
 
