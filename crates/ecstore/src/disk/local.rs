@@ -57,14 +57,15 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
-use tokio::sync::RwLock;
-use tokio::time::interval;
+use tokio::sync::{Notify, RwLock};
+use tokio::time::{Instant, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
+const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -331,6 +332,8 @@ pub struct LocalDisk {
     // pub format_data: Mutex<Vec<u8>>,
     // pub format_file_info: Mutex<Option<Metadata>>,
     // pub format_last_check: Mutex<Option<OffsetDateTime>>,
+    startup_cleanup_ready: Arc<AtomicU32>,
+    startup_cleanup_notify: Arc<Notify>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
@@ -370,7 +373,15 @@ impl LocalDisk {
 
         ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
 
-        if cleanup && let Err(err) = Self::cleanup_tmp_on_startup(&root).await {
+        let startup_cleanup_ready = Arc::new(AtomicU32::new(u32::from(!cleanup)));
+        let startup_cleanup_notify = Arc::new(Notify::new());
+
+        if cleanup
+            && let Err(err) =
+                Self::cleanup_tmp_on_startup(&root, startup_cleanup_ready.clone(), startup_cleanup_notify.clone()).await
+        {
+            startup_cleanup_ready.store(1, Ordering::Release);
+            startup_cleanup_notify.notify_waiters();
             warn!(root = ?root, error = ?err, "failed to cleanup temporary data during disk startup");
         }
 
@@ -466,6 +477,8 @@ impl LocalDisk {
             // format_last_check: Mutex::new(format_last_check),
             path_cache: Arc::new(ParkingLotRwLock::new(HashMap::with_capacity(2048))),
             current_dir: Arc::new(OnceLock::new()),
+            startup_cleanup_ready,
+            startup_cleanup_notify,
             exit_signal: None,
         };
         let (info, _root) = get_disk_info(root).await?;
@@ -497,7 +510,8 @@ impl LocalDisk {
     }
 
     async fn cleanup_deleted_objects_loop(root: PathBuf, mut exit_rx: tokio::sync::broadcast::Receiver<()>) {
-        let mut interval = interval(DELETED_OBJECTS_CLEANUP_INTERVAL);
+        let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
+        let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -525,11 +539,17 @@ impl LocalDisk {
         root.join(meta_path)
     }
 
-    async fn cleanup_tmp_on_startup(root: &Path) -> Result<()> {
+    async fn cleanup_tmp_on_startup(
+        root: &Path,
+        startup_cleanup_ready: Arc<AtomicU32>,
+        startup_cleanup_notify: Arc<Notify>,
+    ) -> Result<()> {
         let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
         let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
 
         rename_all(&tmp_path, &tmp_old_path, root).await?;
+
+        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
 
         let tmp_old_root = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET);
         tokio::spawn(async move {
@@ -538,10 +558,33 @@ impl LocalDisk {
             {
                 warn!(path = ?tmp_old_root, error = ?err, "failed to remove old temporary data");
             }
+            startup_cleanup_ready.store(1, Ordering::Release);
+            startup_cleanup_notify.notify_waiters();
         });
 
-        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
         Ok(())
+    }
+
+    async fn wait_for_startup_cleanup(&self) {
+        if self.startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+            return;
+        }
+
+        if wait_for_startup_cleanup_signal(
+            self.startup_cleanup_ready.as_ref(),
+            self.startup_cleanup_notify.as_ref(),
+            STARTUP_CLEANUP_WAIT_TIMEOUT,
+        )
+        .await
+        {
+            debug!(disk = %self.endpoint, "startup cleanup barrier released before walk_dir");
+        } else {
+            warn!(
+                disk = %self.endpoint,
+                timeout_ms = STARTUP_CLEANUP_WAIT_TIMEOUT.as_millis(),
+                "startup cleanup barrier timed out; continuing walk_dir"
+            );
+        }
     }
 
     async fn cleanup_stale_tmp_objects(root: PathBuf) -> Result<()> {
@@ -2375,6 +2418,8 @@ impl DiskAPI for LocalDisk {
     // FIXME: TODO: io.writer TODO cancel
     #[tracing::instrument(level = "debug", skip(self, wr))]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        self.wait_for_startup_cleanup().await;
+
         let volume_dir = self.get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket)
@@ -3105,6 +3150,31 @@ impl DiskAPI for LocalDisk {
     }
 }
 
+async fn wait_for_startup_cleanup_signal(
+    startup_cleanup_ready: &AtomicU32,
+    startup_cleanup_notify: &Notify,
+    wait_timeout: Duration,
+) -> bool {
+    if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+
+    timeout(wait_timeout, async {
+        loop {
+            if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            let notified = startup_cleanup_notify.notified();
+            if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 #[tracing::instrument]
 async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
@@ -3157,7 +3227,9 @@ mod test {
         fs::create_dir_all(leftover.parent().unwrap()).await.unwrap();
         fs::write(&leftover, b"temporary").await.unwrap();
 
-        LocalDisk::cleanup_tmp_on_startup(dir.path()).await.unwrap();
+        LocalDisk::cleanup_tmp_on_startup(dir.path(), Arc::new(AtomicU32::new(0)), Arc::new(Notify::new()))
+            .await
+            .unwrap();
 
         assert!(!tmp.join("leftover").exists());
         assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
@@ -3211,6 +3283,54 @@ mod test {
 
         let mut entries = fs::read_dir(&trash).await.unwrap();
         assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_loop_interval_does_not_tick_immediately() {
+        let start_at = tokio::time::Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
+        let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
+
+        assert!(tokio::time::timeout(Duration::from_secs(1), interval.tick()).await.is_err());
+
+        tokio::time::advance(DELETED_OBJECTS_CLEANUP_INTERVAL).await;
+        interval.tick().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_cleanup_barrier_waits_for_notification() {
+        let ready = Arc::new(AtomicU32::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let wait = tokio::spawn({
+            let ready = ready.clone();
+            let notify = notify.clone();
+            async move { wait_for_startup_cleanup_signal(ready.as_ref(), notify.as_ref(), Duration::from_secs(2)).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+
+        ready.store(1, Ordering::Release);
+        notify.notify_waiters();
+
+        assert!(wait.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_cleanup_barrier_times_out() {
+        let ready = Arc::new(AtomicU32::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let wait = tokio::spawn({
+            let ready = ready.clone();
+            let notify = notify.clone();
+            async move { wait_for_startup_cleanup_signal(ready.as_ref(), notify.as_ref(), Duration::from_secs(2)).await }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        assert!(!wait.await.unwrap());
     }
 
     #[tokio::test]
