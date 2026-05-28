@@ -3029,7 +3029,8 @@ impl Operation for SRStateEditHandler {
 mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue, Uri};
-    use rustfs_common::set_global_outbound_tls_generation;
+    use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
+    use serial_test::serial;
     use temp_env::with_var;
 
     fn peer(name: &str, endpoint: &str) -> PeerInfo {
@@ -3792,10 +3793,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_site_replication_peer_client_rebuilds_when_generation_changes() {
-        let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
-        *cache = None;
-        drop(cache);
+        let previous_generation = get_global_outbound_tls_generation();
+        let previous_cache = {
+            let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
+            let snapshot = cache.clone();
+            *cache = None;
+            snapshot
+        };
 
         set_global_outbound_tls_generation(101);
         site_replication_peer_client()
@@ -3815,6 +3821,11 @@ mod tests {
         let cached = cache.as_ref().expect("cache should be populated");
         assert_eq!(cached.generation, 102);
         assert!(matches!(cached.entry, SiteReplicationPeerClientCacheEntry::Ready(_)));
+
+        drop(cache);
+        set_global_outbound_tls_generation(previous_generation);
+        let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
+        *cache = previous_cache;
     }
 
     #[test]
