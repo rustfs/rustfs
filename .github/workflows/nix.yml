@@ -38,7 +38,6 @@ concurrency:
   cancel-in-progress: true
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   nix-validation:
@@ -47,26 +46,20 @@ jobs:
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      NIX_CURL_FLAGS: "--user-agent rustfs-nix-ci/1.0 (+https://github.com/rustfs/rustfs)"
-      CARGO_HTTP_USER_AGENT: "cargo/rustfs-nix-ci"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Install Determinate Nix
-        uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          extra-conf: |
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
             experimental-features = nix-command flakes
             max-jobs = 1
-            user-agent-suffix = rustfs-ci-nix
 
       - name: Cache Nix
         uses: DeterminateSystems/magic-nix-cache-action@v13
-        with:
-          use-flakehub: false
-          use-gha-cache: true
 
       - name: Check Nix Flake Inputs
         uses: DeterminateSystems/flake-checker-action@v12
