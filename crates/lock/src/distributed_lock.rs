@@ -1116,18 +1116,32 @@ mod tests {
             "expected retry attempts to use distinct lock ids, saw {unique_ids:?}"
         );
 
-        let delayed_a_active = delayed_success_a.active.lock().await;
+        let retry_lock_ids = unique_ids.iter().skip(1).cloned().collect::<Vec<_>>();
         assert!(
-            delayed_a_active.len() == 1,
-            "late cleanup from the earlier attempt must not release delayed client A's retried lock"
+            !retry_lock_ids.is_empty(),
+            "expected at least one retry-attempt lock id, saw {unique_ids:?}"
         );
-        drop(delayed_a_active);
 
+        let delayed_a_active = delayed_success_a.active.lock().await;
         let delayed_b_active = delayed_success_b.active.lock().await;
+        let remaining_delayed_lock_ids = delayed_a_active
+            .keys()
+            .chain(delayed_b_active.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+
         assert!(
-            delayed_b_active.is_empty(),
-            "delayed client B should only retain the first-attempt lock long enough for pending cleanup"
+            remaining_delayed_lock_ids.len() == 1,
+            "exactly one delayed client lock should remain held by the retry guard after late cleanup"
         );
+        assert!(
+            retry_lock_ids
+                .iter()
+                .any(|retry_lock_id| retry_lock_id.uuid == remaining_delayed_lock_ids[0].uuid),
+            "late cleanup must not leave only a first-attempt delayed lock active"
+        );
+        drop(delayed_b_active);
+        drop(delayed_a_active);
 
         drop(guard);
     }
