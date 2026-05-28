@@ -3189,6 +3189,76 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn repeated_upload_part_overwrites_previous_part_state() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("multipart-overwrite-{}", Uuid::new_v4().simple());
+        let object = "overwrite/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        let mut first = PutObjReader::from_vec(vec![1, 2, 3]);
+        let first_part = ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut first, &ObjectOptions::default())
+            .await
+            .expect("first multipart part should be uploaded");
+
+        let mut second = PutObjReader::from_vec(vec![4, 5, 6, 7]);
+        let second_part = ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut second, &ObjectOptions::default())
+            .await
+            .expect("second multipart part should overwrite the previous part");
+
+        assert_ne!(
+            first_part.etag, second_part.etag,
+            "the overwrite path should persist the latest part metadata rather than reusing stale state"
+        );
+
+        let parts = ecstore
+            .list_object_parts(
+                &bucket,
+                object,
+                &upload.upload_id,
+                None,
+                crate::set_disk::MAX_PARTS_COUNT,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("multipart parts should be readable after overwrite");
+
+        assert_eq!(parts.parts.len(), 1, "only the latest version of part 1 should remain visible");
+        assert_eq!(parts.parts[0].part_num, 1);
+        assert_eq!(parts.parts[0].etag, second_part.etag);
+        assert_eq!(parts.parts[0].size, second_part.size);
+        assert_eq!(parts.parts[0].actual_size, second_part.actual_size);
+
+        let completed = ecstore
+            .complete_multipart_upload(
+                &bucket,
+                object,
+                &upload.upload_id,
+                vec![crate::store_api::CompletePart {
+                    part_num: 1,
+                    etag: second_part.etag.clone(),
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    checksum_crc64nvme: None,
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete multipart upload should succeed with the latest overwritten part");
+
+        assert_eq!(completed.size, second_part.size as i64);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn cleanup_removes_empty_multipart_sha_dirs() {
         let (paths, ecstore) = setup_test_env().await;
         let bucket = format!("stale-empty-sha-{}", Uuid::new_v4().simple());
