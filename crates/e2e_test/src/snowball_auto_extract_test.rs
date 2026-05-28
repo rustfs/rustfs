@@ -95,7 +95,7 @@ mod tests {
         archive.extend_from_slice(&header);
         archive.extend_from_slice(data);
         let padding = (512 - (data.len() % 512)) % 512;
-        archive.extend(std::iter::repeat(0).take(padding));
+        archive.extend(std::iter::repeat_n(0, padding));
         archive.extend_from_slice(&[0u8; 1024]);
         archive
     }
