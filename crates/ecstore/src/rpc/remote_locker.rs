@@ -102,12 +102,6 @@ impl RemoteClient {
             Err(_) => {
                 let reason = format!("RPC timed out after {:?}", lock_timeout);
                 self.evict_connection(op, &reason).await;
-                warn!(
-                    addr = %self.addr,
-                    op,
-                    reason,
-                    "Remote lock RPC timed out and evicted cached connection"
-                );
                 Err(LockError::timeout(format!("remote lock RPC {op} on {}", self.addr), lock_timeout))
             }
         }
