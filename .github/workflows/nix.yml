@@ -47,6 +47,7 @@ jobs:
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      NIX_CURL_FLAGS: "--user-agent rustfs-nix-ci/1.0 (+https://github.com/rustfs/rustfs)"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
