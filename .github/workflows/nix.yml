@@ -55,9 +55,6 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             max-jobs = 1
-            trusted-users = root runner
-            substituters = http://127.0.0.1:37515 https://cache.nixos.org
-            trusted-substituters = http://127.0.0.1:37515
 
       - name: Cache Nix
         uses: DeterminateSystems/magic-nix-cache-action@v13
