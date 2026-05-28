@@ -712,7 +712,11 @@ fn record_lock_held_release(lock_type: LockType) {
 mod tests {
     use super::{DistributedLock, is_remote_lock_rpc_failure};
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
-    use std::{collections::{HashMap, VecDeque}, sync::{Arc, Mutex}, time::Duration};
+    use std::{
+        collections::{HashMap, VecDeque},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     #[derive(Debug)]
     struct ResponseClient {
@@ -835,10 +839,7 @@ mod tests {
                         wait_start_time: None,
                     };
 
-                    self.active
-                        .lock()
-                        .await
-                        .insert(request.lock_id.clone(), lock_info.clone());
+                    self.active.lock().await.insert(request.lock_id.clone(), lock_info.clone());
 
                     Ok(LockResponse::success(lock_info, Duration::ZERO))
                 }
@@ -1052,9 +1053,7 @@ mod tests {
                 AcquirePlan::Success {
                     delay: Duration::from_millis(400),
                 },
-                AcquirePlan::Success {
-                    delay: Duration::ZERO,
-                },
+                AcquirePlan::Success { delay: Duration::ZERO },
             ],
             seen_ids.clone(),
         ));
@@ -1063,9 +1062,7 @@ mod tests {
                 AcquirePlan::Success {
                     delay: Duration::from_millis(400),
                 },
-                AcquirePlan::Success {
-                    delay: Duration::ZERO,
-                },
+                AcquirePlan::Success { delay: Duration::ZERO },
             ],
             seen_ids.clone(),
         ));
@@ -1077,9 +1074,7 @@ mod tests {
                         error: "Lock acquisition timeout",
                         delay: Duration::ZERO,
                     },
-                    AcquirePlan::Success {
-                        delay: Duration::ZERO,
-                    },
+                    AcquirePlan::Success { delay: Duration::ZERO },
                 ],
                 seen_ids.clone(),
             )),
@@ -1089,9 +1084,7 @@ mod tests {
                         error: "Lock acquisition timeout",
                         delay: Duration::ZERO,
                     },
-                    AcquirePlan::Success {
-                        delay: Duration::ZERO,
-                    },
+                    AcquirePlan::Success { delay: Duration::ZERO },
                 ],
                 seen_ids.clone(),
             )),
