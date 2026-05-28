@@ -91,8 +91,8 @@ impl RemoteClient {
     where
         F: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     {
-        let timeout_duration = Self::rpc_timeout(timeout_duration);
-        match timeout(timeout_duration, future).await {
+        let lock_timeout = Self::rpc_timeout(timeout_duration);
+        match timeout(lock_timeout, future).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => {
                 let reason = err.to_string();
@@ -100,34 +100,32 @@ impl RemoteClient {
                 Err(LockError::internal(format!("{op} RPC failed: {reason}")))
             }
             Err(_) => {
-                let reason = format!("RPC timed out after {:?}", timeout_duration);
-                warn!(
-                    addr = %self.addr,
-                    op,
-                    reason,
-                    "Remote lock RPC timed out without evicting cached connection"
-                );
-                Err(LockError::timeout(format!("remote lock RPC {op} on {}", self.addr), timeout_duration))
+                let reason = format!("RPC timed out after {:?}", lock_timeout);
+                self.evict_connection(op, &reason).await;
+                Err(LockError::timeout(format!("remote lock RPC {op} on {}", self.addr), lock_timeout))
             }
         }
     }
 
-    fn timeout_failure_response(request: &LockRequest) -> LockResponse {
-        LockResponse::failure("Lock acquisition timeout", request.acquire_timeout)
+    fn rpc_timeout_failure_response(request: &LockRequest, err: &LockError) -> LockResponse {
+        LockResponse::failure(format!("Remote lock RPC timed out: {err}"), request.acquire_timeout)
     }
 
     fn rpc_failure_response(_request: &LockRequest, err: &LockError) -> LockResponse {
         LockResponse::failure(format!("Remote lock RPC failed: {err}"), Duration::ZERO)
     }
 
-    fn timeout_failure_batch(requests: &[LockRequest]) -> Vec<LockResponse> {
-        requests.iter().map(Self::timeout_failure_response).collect()
-    }
-
     fn rpc_failure_batch(requests: &[LockRequest], err: &LockError) -> Vec<LockResponse> {
         requests
             .iter()
             .map(|request| Self::rpc_failure_response(request, err))
+            .collect()
+    }
+
+    fn rpc_timeout_failure_batch(requests: &[LockRequest], err: &LockError) -> Vec<LockResponse> {
+        requests
+            .iter()
+            .map(|request| Self::rpc_timeout_failure_response(request, err))
             .collect()
     }
 
@@ -191,7 +189,7 @@ impl LockClient for RemoteClient {
 
         let resp = match self.execute_rpc("lock", request.acquire_timeout, client.lock(req)).await {
             Ok(resp) => resp.into_inner(),
-            Err(LockError::Timeout { .. }) => return Ok(Self::timeout_failure_response(request)),
+            Err(err @ LockError::Timeout { .. }) => return Ok(Self::rpc_timeout_failure_response(request, &err)),
             Err(err) => return Ok(Self::rpc_failure_response(request, &err)),
         };
 
@@ -231,7 +229,7 @@ impl LockClient for RemoteClient {
             .await
         {
             Ok(resp) => resp.into_inner(),
-            Err(LockError::Timeout { .. }) => return Ok(Self::timeout_failure_batch(requests)),
+            Err(err @ LockError::Timeout { .. }) => return Ok(Self::rpc_timeout_failure_batch(requests, &err)),
             Err(err) => return Ok(Self::rpc_failure_batch(requests, &err)),
         };
 
@@ -499,7 +497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remote_client_acquire_lock_respects_request_timeout_without_evicting_connection() {
+    async fn test_remote_client_acquire_lock_respects_request_timeout_and_evicts_connection() {
         ensure_test_rpc_secret();
         let (addr, accept_task) = spawn_hanging_listener().await;
         cache_lazy_channel(&addr).await;
@@ -516,17 +514,24 @@ mod tests {
             "remote lock RPC should honor request timeout"
         );
         assert!(!response.success, "timed out lock acquisition should fail");
-        assert_eq!(response.error.as_deref(), Some("Lock acquisition timeout"));
         assert!(
-            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
-            "local timeout should keep cached connection"
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Remote lock RPC timed out")),
+            "expected remote RPC timeout marker, got {:?}",
+            response.error
+        );
+        assert!(
+            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "timeout should evict cached connection"
         );
 
         accept_task.abort();
     }
 
     #[tokio::test]
-    async fn test_remote_client_acquire_locks_batch_respects_request_timeout_without_evicting_connection() {
+    async fn test_remote_client_acquire_locks_batch_respects_request_timeout_and_evicts_connection() {
         ensure_test_rpc_secret();
         let (addr, accept_task) = spawn_hanging_listener().await;
         cache_lazy_channel(&addr).await;
@@ -544,33 +549,20 @@ mod tests {
         );
         assert_eq!(responses.len(), 1);
         assert!(!responses[0].success, "timed out batch lock acquisition should fail");
-        assert_eq!(responses[0].error.as_deref(), Some("Lock acquisition timeout"));
         assert!(
-            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
-            "local batch timeout should keep cached connection"
+            responses[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Remote lock RPC timed out")),
+            "expected remote RPC timeout marker, got {:?}",
+            responses[0].error
+        );
+        assert!(
+            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            "batch timeout should evict cached connection"
         );
 
         accept_task.abort();
-    }
-
-    #[tokio::test]
-    async fn test_remote_client_rpc_status_error_evicts_connection() {
-        let addr = "http://127.0.0.1:1".to_string();
-        cache_lazy_channel(&addr).await;
-        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
-
-        let client = RemoteClient::new(addr.clone());
-        let result = client
-            .execute_rpc("lock", Duration::from_millis(50), async {
-                Err::<(), _>(tonic::Status::unavailable("connection unavailable"))
-            })
-            .await;
-
-        assert!(result.is_err(), "RPC status errors should be returned");
-        assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
-            "RPC status errors should evict cached connection"
-        );
     }
 
     #[test]

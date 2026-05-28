@@ -32,6 +32,16 @@ const UNLOCK_RETRY_ATTEMPTS: usize = 3;
 const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const LOCK_ACQUIRE_RETRY_ATTEMPTS: usize = 3;
 const LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const REMOTE_LOCK_RPC_FAILED_PREFIX: &str = "remote lock rpc failed:";
+const REMOTE_LOCK_RPC_TIMED_OUT_PREFIX: &str = "remote lock rpc timed out:";
+const UNRECOVERABLE_QUORUM_FAILURE_PREFIX: &str = "unrecoverable quorum failure";
+
+#[derive(Debug)]
+enum LockAcquireFailureKind {
+    NonRetryable,
+    RetryableContention,
+    UnrecoverableQuorum,
+}
 
 /// Generate a new aggregate lock ID for multiple client locks
 fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
@@ -39,6 +49,35 @@ fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
         resource: resource.clone(),
         uuid: Uuid::new_v4().to_string(),
     }
+}
+
+fn is_remote_lock_rpc_failure(error: &str) -> bool {
+    has_case_insensitive_prefix(error, REMOTE_LOCK_RPC_FAILED_PREFIX)
+        || has_case_insensitive_prefix(error, REMOTE_LOCK_RPC_TIMED_OUT_PREFIX)
+}
+
+fn has_case_insensitive_prefix(error: &str, expected_prefix: &str) -> bool {
+    error
+        .get(0..expected_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected_prefix))
+}
+
+fn is_unrecoverable_quorum_error(error: &str) -> bool {
+    error
+        .get(0..UNRECOVERABLE_QUORUM_FAILURE_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(UNRECOVERABLE_QUORUM_FAILURE_PREFIX))
+}
+
+fn classify_lock_failure(error: &str) -> LockAcquireFailureKind {
+    if is_unrecoverable_quorum_error(error) {
+        return LockAcquireFailureKind::UnrecoverableQuorum;
+    }
+
+    if error.to_ascii_lowercase().contains("timeout") || is_remote_lock_rpc_failure(error) {
+        return LockAcquireFailureKind::RetryableContention;
+    }
+
+    LockAcquireFailureKind::NonRetryable
 }
 
 /// A RAII guard for distributed locks that releases the lock asynchronously when dropped.
@@ -136,7 +175,7 @@ type LockAcquireTaskResult = (usize, Result<LockResponse>);
 struct LockAcquireQuorumResult {
     response: LockResponse,
     individual_locks: Vec<(LockId, Arc<dyn LockClient>)>,
-    pending_cleanup_spawned: bool,
+    failure_kind: Option<LockAcquireFailureKind>,
 }
 
 impl DistributedLock {
@@ -196,6 +235,7 @@ impl DistributedLock {
         let LockAcquireQuorumResult {
             response: resp,
             individual_locks,
+            failure_kind,
             ..
         } = self.acquire_lock_quorum_with_retry(request).await?;
         if resp.success {
@@ -219,26 +259,36 @@ impl DistributedLock {
                         "acquire_lock_quorum contention: {}",
                         error_msg
                     );
-                } else {
+                } else if matches!(failure_kind, Some(LockAcquireFailureKind::NonRetryable)) {
                     warn!(
                         resource = %request.resource,
                         owner = %request.owner,
                         "acquire_lock_quorum error: {}",
                         error_msg
                     );
+                } else if matches!(failure_kind, Some(LockAcquireFailureKind::RetryableContention)) {
+                    debug!(
+                        resource = %request.resource,
+                        owner = %request.owner,
+                        "acquire_lock_quorum contention: {}",
+                        error_msg
+                    );
+                } else {
+                    debug!(
+                        resource = %request.resource,
+                        owner = %request.owner,
+                        "acquire_lock_quorum final failure: {}",
+                        error_msg
+                    );
                 }
-                if error_msg.contains("quorum") {
-                    // This is a quorum failure - return appropriate error
+
+                if matches!(failure_kind, Some(LockAcquireFailureKind::UnrecoverableQuorum)) {
                     let achieved = individual_locks.len();
                     Err(LockError::QuorumNotReached {
                         required: required_quorum,
                         achieved,
                     })
-                } else if error_msg.contains("timeout") || resp.wait_time >= request.acquire_timeout {
-                    // This is a timeout - return None so caller can convert to timeout error
-                    Ok(None)
                 } else {
-                    // Other failure - return None for backward compatibility
                     Ok(None)
                 }
             } else {
@@ -306,11 +356,7 @@ impl DistributedLock {
     fn is_retryable_lock_failure(resp: &LockResponse) -> bool {
         resp.error
             .as_deref()
-            .map(|error| {
-                let error = error.to_ascii_lowercase();
-                error.contains("timeout") || error.contains("rpc failed")
-            })
-            .unwrap_or(false)
+            .is_some_and(|error| matches!(classify_lock_failure(error), LockAcquireFailureKind::RetryableContention))
     }
 
     async fn release_entries(entries: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
@@ -452,7 +498,6 @@ impl DistributedLock {
             let result = self.acquire_lock_quorum_once(&attempt_request).await?;
             if result.response.success
                 || !result.individual_locks.is_empty()
-                || result.pending_cleanup_spawned
                 || !Self::is_retryable_lock_failure(&result.response)
                 || attempt >= LOCK_ACQUIRE_RETRY_ATTEMPTS
             {
@@ -472,7 +517,7 @@ impl DistributedLock {
         Ok(last_result.unwrap_or_else(|| LockAcquireQuorumResult {
             response: LockResponse::failure("Lock acquisition timeout", request.acquire_timeout),
             individual_locks: Vec::new(),
-            pending_cleanup_spawned: false,
+            failure_kind: Some(LockAcquireFailureKind::RetryableContention),
         }))
     }
 
@@ -485,6 +530,7 @@ impl DistributedLock {
         let mut individual_locks: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
         let fallback_lock_id = request.lock_id.clone();
         let mut last_failure = None;
+        let mut hard_failures = 0usize;
 
         while let Some(join_result) = pending.join_next().await {
             match join_result {
@@ -503,22 +549,53 @@ impl DistributedLock {
                         }
                     } else {
                         let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
+                        if is_remote_lock_rpc_failure(&error) {
+                            hard_failures += 1;
+                        }
                         self.log_failed_lock_response(request, idx, error.clone());
                         last_failure = Some(error);
                     }
                 }
                 Ok((idx, Err(err))) => {
+                    hard_failures += 1;
                     tracing::warn!("Failed to acquire lock on client {}: {}", idx, err);
                     last_failure = Some(err.to_string());
                 }
                 Err(err) => {
+                    hard_failures += 1;
                     tracing::warn!("Lock acquisition task join failed: {}", err);
                     last_failure = Some(err.to_string());
                 }
             }
 
+            if self.clients.len().saturating_sub(hard_failures) < required_quorum {
+                let rollback_count = individual_locks.len();
+                Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
+                if !pending.is_empty() {
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_failure_cleanup",
+                    );
+                }
+
+                let mut error = format!(
+                    "Unrecoverable quorum failure: {rollback_count}/{required_quorum} required; {hard_failures} clients failed"
+                );
+                if let Some(last_failure) = last_failure {
+                    error.push_str("; last failure: ");
+                    error.push_str(&last_failure);
+                }
+                let resp = LockResponse::failure(error, Duration::ZERO);
+                return Ok(LockAcquireQuorumResult {
+                    response: resp,
+                    individual_locks,
+                    failure_kind: Some(LockAcquireFailureKind::UnrecoverableQuorum),
+                });
+            }
+
             if individual_locks.len() >= required_quorum {
-                let pending_cleanup_spawned = !pending.is_empty();
                 if !pending.is_empty() {
                     Self::spawn_pending_cleanup(
                         pending,
@@ -555,14 +632,13 @@ impl DistributedLock {
                 return Ok(LockAcquireQuorumResult {
                     response: resp,
                     individual_locks,
-                    pending_cleanup_spawned,
+                    failure_kind: None,
                 });
             }
 
-            if !individual_locks.is_empty() && individual_locks.len() + pending.len() < required_quorum {
+            if individual_locks.len() + pending.len() < required_quorum {
                 let rollback_count = individual_locks.len();
                 Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
-                let pending_cleanup_spawned = !pending.is_empty();
                 if !pending.is_empty() {
                     Self::spawn_pending_cleanup(
                         pending,
@@ -573,6 +649,14 @@ impl DistributedLock {
                 }
 
                 let mut error = format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required");
+                let failure_kind = if hard_failures > 0 {
+                    error = format!(
+                        "Unrecoverable quorum failure: {rollback_count}/{required_quorum} required; {hard_failures} clients failed; {error}"
+                    );
+                    LockAcquireFailureKind::UnrecoverableQuorum
+                } else {
+                    LockAcquireFailureKind::RetryableContention
+                };
                 if let Some(last_failure) = last_failure {
                     error.push_str("; last failure: ");
                     error.push_str(&last_failure);
@@ -581,7 +665,7 @@ impl DistributedLock {
                 return Ok(LockAcquireQuorumResult {
                     response: resp,
                     individual_locks,
-                    pending_cleanup_spawned,
+                    failure_kind: Some(failure_kind),
                 });
             }
         }
@@ -589,15 +673,20 @@ impl DistributedLock {
         let rollback_count = individual_locks.len();
         Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
         let mut error = format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required");
-        if let Some(last_failure) = last_failure {
+        if let Some(last_failure) = &last_failure {
             error.push_str("; last failure: ");
-            error.push_str(&last_failure);
+            error.push_str(last_failure);
         }
         let resp = LockResponse::failure(error, Duration::ZERO);
         Ok(LockAcquireQuorumResult {
             response: resp,
             individual_locks,
-            pending_cleanup_spawned: false,
+            failure_kind: Some(if hard_failures > 0 {
+                LockAcquireFailureKind::UnrecoverableQuorum
+            } else {
+                let fallback_kind = last_failure.as_deref().map(classify_lock_failure);
+                fallback_kind.unwrap_or(LockAcquireFailureKind::RetryableContention)
+            }),
         })
     }
 }
@@ -615,5 +704,238 @@ fn record_lock_held_release(lock_type: LockType) {
     match lock_type {
         LockType::Shared => record_read_lock_held_release(),
         LockType::Exclusive => record_write_lock_held_release(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DistributedLock, is_remote_lock_rpc_failure};
+    use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
+    use std::{sync::Arc, time::Duration};
+
+    #[derive(Debug)]
+    struct ResponseClient {
+        response: LockResponse,
+        delay: Duration,
+    }
+
+    impl ResponseClient {
+        fn new(response: LockResponse) -> Self {
+            Self {
+                response,
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
+        }
+
+        fn into_client(self) -> Arc<dyn LockClient> {
+            Arc::new(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for ResponseClient {
+        async fn acquire_lock(&self, _request: &LockRequest) -> crate::Result<LockResponse> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok(self.response.clone())
+        }
+
+        async fn release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        async fn force_release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> crate::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            true
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_is_remote_lock_rpc_failure() {
+        assert!(is_remote_lock_rpc_failure("Remote lock RPC failed: backend unreachable"));
+        assert!(is_remote_lock_rpc_failure("remote lock rpc failed: temporary network issue"));
+        assert!(is_remote_lock_rpc_failure("Remote lock RPC timed out: RPC timed out after 50ms"));
+        assert!(!is_remote_lock_rpc_failure("Lock is already held"));
+        assert!(!is_remote_lock_rpc_failure("acquired lock failed for other reason"));
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_returns_quorum_error_when_rpc_failures_make_quorum_impossible() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            ResponseClient::new(LockResponse::failure("Remote lock RPC failed: node unavailable", Duration::ZERO)).into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_millis(50))
+                .into_client(),
+            ResponseClient::new(LockResponse::failure("Remote lock RPC failed: connection refused", Duration::ZERO))
+                .into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_millis(50))
+                .into_client(),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(1));
+
+        let result = lock.acquire_guard(&request).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(LockError::QuorumNotReached {
+                    required: 3,
+                    achieved: 0
+                })
+            ),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_returns_quorum_error_when_rpc_timeouts_make_quorum_impossible() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            ResponseClient::new(LockResponse::failure(
+                "Remote lock RPC timed out: RPC timed out after 50ms",
+                Duration::ZERO,
+            ))
+            .into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_millis(50))
+                .into_client(),
+            ResponseClient::new(LockResponse::failure(
+                "Remote lock RPC timed out: RPC timed out after 50ms",
+                Duration::ZERO,
+            ))
+            .into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_millis(50))
+                .into_client(),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(1));
+
+        let result = lock.acquire_guard(&request).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(LockError::QuorumNotReached {
+                    required: 3,
+                    achieved: 0
+                })
+            ),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_returns_timeout_when_zero_locks_make_quorum_impossible_for_attempt() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_secs(1))
+                .into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_secs(1))
+                .into_client(),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(2));
+
+        let started = tokio::time::Instant::now();
+        let result = lock.acquire_guard(&request).await;
+
+        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "acquire should fail this attempt before waiting for delayed impossible-quorum tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_retries_transient_timeout_before_quorum() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            ResponseClient::new(LockResponse::failure(
+                "Timeout { resource: \"bucket/object-flaky-acquire@latest\", timeout: 1s }",
+                Duration::ZERO,
+            ))
+            .into_client(),
+            ResponseClient::new(LockResponse::failure(
+                "Timeout { resource: \"bucket/object-flaky-acquire@latest\", timeout: 1s }",
+                Duration::ZERO,
+            ))
+            .into_client(),
+            ResponseClient::new(LockResponse::failure(
+                "Timeout { resource: \"bucket/object-flaky-acquire@latest\", timeout: 1s }",
+                Duration::ZERO,
+            ))
+            .into_client(),
+            ResponseClient::new(LockResponse::failure(
+                "Timeout { resource: \"bucket/object-flaky-acquire@latest\", timeout: 1s }",
+                Duration::ZERO,
+            ))
+            .into_client(),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(900));
+
+        let started = tokio::time::Instant::now();
+        let result = lock.acquire_guard(&request).await;
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "expected at least one retry attempt for transient timeout, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_returns_timeout_when_quorum_remains_contended() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(120));
+
+        let result = lock.acquire_guard(&request).await;
+
+        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
     }
 }
