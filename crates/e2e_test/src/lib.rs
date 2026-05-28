@@ -142,4 +142,7 @@ mod replication_extension_test;
 #[cfg(test)]
 mod snowball_auto_extract_test;
 
+#[cfg(test)]
+mod namespace_lock_quorum_test;
+
 pub mod tls_gen;
