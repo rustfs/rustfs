@@ -262,6 +262,11 @@ impl SetDisks {
         let dst_bucket = Arc::new(dst_bucket.to_string());
         let dst_object = Arc::new(dst_object.to_string());
 
+        // Match MinIO's multipart overwrite semantics: clear any stale destination
+        // part payload and metadata before the new per-disk rename fan-out begins.
+        self.cleanup_multipart_path(&[dst_object.to_string(), format!("{dst_object}.meta")])
+            .await;
+
         let mut errs = Vec::with_capacity(disks.len());
 
         let futures = disks.iter().map(|disk| {

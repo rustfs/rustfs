@@ -274,10 +274,10 @@ mod tests {
         assert!(successes.len() >= 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_batch_processor_quorum_returns_before_slow_tail() {
         let processor = AsyncBatchProcessor::new(4);
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
 
         let tasks: Vec<_> = [(10_u64, Ok(1_i32)), (15, Ok(2)), (250, Ok(3))]
             .into_iter()
@@ -295,10 +295,10 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_batch_processor_quorum_fails_once_quorum_becomes_impossible() {
         let processor = AsyncBatchProcessor::new(4);
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
 
         let tasks: Vec<_> = vec![
             (10_u64, Ok(1_i32)),

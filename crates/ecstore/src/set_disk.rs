@@ -622,12 +622,7 @@ impl ObjectIO for SetDisks {
                 .await?
                 .get_read_lock(get_lock_acquire_timeout())
                 .await
-                .map_err(|e| {
-                    Error::other(format!(
-                        "Failed to acquire read lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "read", &e)
-                    ))
-                })?;
+                .map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?;
 
             // Record lock acquisition for deadlock detection
             let _lock_id = record_lock_acquire(bucket, object, "read");
@@ -756,12 +751,12 @@ impl ObjectIO for SetDisks {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                    StorageError::other(format!(
-                        "Failed to acquire write lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "write", &e)
-                    ))
-                })?);
+                object_lock_guard = Some(
+                    ns_lock
+                        .get_write_lock(get_lock_acquire_timeout())
+                        .await
+                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                );
             }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -975,12 +970,12 @@ impl ObjectIO for SetDisks {
 
             if !opts.no_lock && object_lock_guard.is_none() {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                    StorageError::other(format!(
-                        "Failed to acquire write lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "write", &e)
-                    ))
-                })?);
+                object_lock_guard = Some(
+                    ns_lock
+                        .get_write_lock(get_lock_acquire_timeout())
+                        .await
+                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                );
             }
 
             let (online_disks, _, op_old_dir) = Self::rename_data(
@@ -1398,12 +1393,7 @@ impl ObjectOperations for SetDisks {
             .await?
             .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(|e| {
-                Error::other(format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(src_bucket, src_object, "write", &e)
-                ))
-            })?;
+            .map_err(|e| self.map_namespace_lock_error(src_bucket, src_object, "write", e))?;
 
         let disks = self.get_disks_internal().await;
 
@@ -1785,12 +1775,7 @@ impl ObjectOperations for SetDisks {
                     .await?
                     .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire write lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "write", &e)
-                        ))
-                    })?,
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
             )
         } else {
             None
@@ -1931,12 +1916,7 @@ impl ObjectOperations for SetDisks {
                     .await?
                     .get_read_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire read lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "read", &e)
-                        ))
-                    })?,
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?,
             )
         } else {
             None
@@ -1990,12 +1970,7 @@ impl ObjectOperations for SetDisks {
                     .await?
                     .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire write lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "write", &e)
-                        ))
-                    })?,
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
             )
         } else {
             None
@@ -2527,12 +2502,7 @@ impl SetDisks {
                     .await?
                     .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire write lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "write", &e)
-                        ))
-                    })?,
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
             )
         } else {
             None
@@ -3067,12 +3037,12 @@ impl MultipartOperations for SetDisks {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             let object_lock_guard = if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                    StorageError::other(format!(
-                        "Failed to acquire write lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "write", &e)
-                    ))
-                })?)
+                Some(
+                    ns_lock
+                        .get_write_lock(get_lock_acquire_timeout())
+                        .await
+                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                )
             } else {
                 None
             };
@@ -3249,12 +3219,12 @@ impl MultipartOperations for SetDisks {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                    StorageError::other(format!(
-                        "Failed to acquire write lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "write", &e)
-                    ))
-                })?);
+                object_lock_guard = Some(
+                    ns_lock
+                        .get_write_lock(get_lock_acquire_timeout())
+                        .await
+                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                );
             }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -3599,12 +3569,12 @@ impl MultipartOperations for SetDisks {
 
         if !opts.no_lock && object_lock_guard.is_none() {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                StorageError::other(format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(bucket, object, "write", &e)
-                ))
-            })?);
+            object_lock_guard = Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+            );
         }
 
         self.cleanup_multipart_path(&parts).await;
@@ -3685,12 +3655,12 @@ impl HealOperations for SetDisks {
     ) -> Result<(HealResultItem, Option<Error>)> {
         let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                StorageError::other(format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(bucket, object, "write", &e)
-                ))
-            })?)
+            Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+            )
         } else {
             None
         };

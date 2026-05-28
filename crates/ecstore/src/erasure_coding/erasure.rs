@@ -587,7 +587,21 @@ impl Erasure {
                 Ok(n) if n > 0 => {
                     warn!("encode_stream_callback_async read n={}", n);
                     total += n;
-                    let res = self.encode_data(&buf[..n]);
+                    let erasure = self.clone();
+                    let encode_buf = std::mem::take(&mut buf);
+                    let (res, returned_buf) = match tokio::task::spawn_blocking(move || {
+                        let res = erasure.encode_data(&encode_buf[..n]);
+                        (res, encode_buf)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            on_block(Err(std::io::Error::other(format!("EC encode task failed: {err}")))).await?;
+                            break;
+                        }
+                    };
+                    buf = returned_buf;
                     on_block(res).await?
                 }
                 Ok(_) => {

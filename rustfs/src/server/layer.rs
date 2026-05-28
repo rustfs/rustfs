@@ -642,7 +642,8 @@ where
     let readiness_report = collect_dependency_readiness_report().await;
     let storage_ready = readiness_report.readiness.storage_ready;
     let iam_ready = readiness_report.readiness.iam_ready;
-    let health = health_check_state(storage_ready, iam_ready, probe);
+    let lock_quorum_ready = readiness_report.readiness.lock_quorum_ready;
+    let health = health_check_state(storage_ready, iam_ready, lock_quorum_ready, probe);
     let body = if method == Method::HEAD {
         Bytes::new()
     } else {
@@ -650,6 +651,7 @@ where
             health,
             storage_ready,
             iam_ready,
+            lock_quorum_ready,
             &readiness_report.degraded_reasons,
             "rustfs-endpoint",
             None,
