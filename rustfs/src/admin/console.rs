@@ -28,7 +28,6 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
 use serde::Serialize;
-use serde_json::json;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::OnceLock,
@@ -283,7 +282,7 @@ async fn version_handler() -> impl IntoResponse {
             .header("content-type", "application/json")
             .status(StatusCode::OK)
             .body(Body::from(
-                json!({
+                serde_json::json!({
                     "version": cfg.release.version,
                     "version_info": cfg.version_info(),
                     "date": cfg.release.date,
