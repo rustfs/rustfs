@@ -51,6 +51,18 @@ spec:
   sessionAffinityConfig:
     clientIP:
       timeoutSeconds: 10800
+  {{- else if eq $serviceType "LoadBalancer" }}
+  type: LoadBalancer
+  {{- with .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
   ports:
     - name: endpoint

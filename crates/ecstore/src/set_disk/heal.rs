@@ -39,12 +39,12 @@ impl SetDisks {
 
         let write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                StorageError::other(format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(bucket, object, "write", &e)
-                ))
-            })?)
+            Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+            )
         } else {
             None
         };
@@ -713,13 +713,7 @@ impl SetDisks {
             .await?
             .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(|e| {
-                let message = format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(bucket, object, "write", &e)
-                );
-                DiskError::other(message)
-            })?;
+            .map_err(|e| DiskError::other(self.map_namespace_lock_error(bucket, object, "write", e).to_string()))?;
 
         self.heal_object_dir_locked(bucket, object, dry_run, remove).await
     }
