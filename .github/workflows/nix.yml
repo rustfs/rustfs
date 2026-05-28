@@ -53,20 +53,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Check Nix Flake Inputs
-        uses: DeterminateSystems/flake-checker-action@v12
-        with:
-          fail-mode: true
-          ignore-missing-flake-lock: false
-
       - name: Install Determinate Nix
-        uses: DeterminateSystems/determinate-nix-action@v3
+        uses: DeterminateSystems/determinate-nix-action@main
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           extra-conf: |
             experimental-features = nix-command flakes
             max-jobs = 1
-            user-agent-suffix = rustfs-ci-pr3104
+            user-agent-suffix = rustfs-ci-nix
+
+      - name: Cache Nix
+        uses: DeterminateSystems/flakehub-cache-action@v3.20.0
+
+      - name: Check Nix Flake Inputs
+        uses: DeterminateSystems/flake-checker-action@main
+        with:
+          fail-mode: true
+          ignore-missing-flake-lock: false
 
       - name: Verify Flake
         run: |
