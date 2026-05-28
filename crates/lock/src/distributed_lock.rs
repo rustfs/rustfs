@@ -175,7 +175,6 @@ type LockAcquireTaskResult = (usize, Result<LockResponse>);
 struct LockAcquireQuorumResult {
     response: LockResponse,
     individual_locks: Vec<(LockId, Arc<dyn LockClient>)>,
-    pending_cleanup_spawned: bool,
     failure_kind: Option<LockAcquireFailureKind>,
 }
 
@@ -499,7 +498,6 @@ impl DistributedLock {
             let result = self.acquire_lock_quorum_once(&attempt_request).await?;
             if result.response.success
                 || !result.individual_locks.is_empty()
-                || result.pending_cleanup_spawned
                 || !Self::is_retryable_lock_failure(&result.response)
                 || attempt >= LOCK_ACQUIRE_RETRY_ATTEMPTS
             {
@@ -519,7 +517,6 @@ impl DistributedLock {
         Ok(last_result.unwrap_or_else(|| LockAcquireQuorumResult {
             response: LockResponse::failure("Lock acquisition timeout", request.acquire_timeout),
             individual_locks: Vec::new(),
-            pending_cleanup_spawned: false,
             failure_kind: Some(LockAcquireFailureKind::RetryableContention),
         }))
     }
@@ -574,7 +571,6 @@ impl DistributedLock {
             if self.clients.len().saturating_sub(hard_failures) < required_quorum {
                 let rollback_count = individual_locks.len();
                 Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
-                let pending_cleanup_spawned = !pending.is_empty();
                 if !pending.is_empty() {
                     Self::spawn_pending_cleanup(
                         pending,
@@ -595,13 +591,11 @@ impl DistributedLock {
                 return Ok(LockAcquireQuorumResult {
                     response: resp,
                     individual_locks,
-                    pending_cleanup_spawned,
                     failure_kind: Some(LockAcquireFailureKind::UnrecoverableQuorum),
                 });
             }
 
             if individual_locks.len() >= required_quorum {
-                let pending_cleanup_spawned = !pending.is_empty();
                 if !pending.is_empty() {
                     Self::spawn_pending_cleanup(
                         pending,
@@ -638,7 +632,6 @@ impl DistributedLock {
                 return Ok(LockAcquireQuorumResult {
                     response: resp,
                     individual_locks,
-                    pending_cleanup_spawned,
                     failure_kind: None,
                 });
             }
@@ -646,7 +639,6 @@ impl DistributedLock {
             if individual_locks.len() + pending.len() < required_quorum {
                 let rollback_count = individual_locks.len();
                 Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_quorum_rollback");
-                let pending_cleanup_spawned = !pending.is_empty();
                 if !pending.is_empty() {
                     Self::spawn_pending_cleanup(
                         pending,
@@ -673,7 +665,6 @@ impl DistributedLock {
                 return Ok(LockAcquireQuorumResult {
                     response: resp,
                     individual_locks,
-                    pending_cleanup_spawned,
                     failure_kind: Some(failure_kind),
                 });
             }
@@ -690,7 +681,6 @@ impl DistributedLock {
         Ok(LockAcquireQuorumResult {
             response: resp,
             individual_locks,
-            pending_cleanup_spawned: false,
             failure_kind: Some(if hard_failures > 0 {
                 LockAcquireFailureKind::UnrecoverableQuorum
             } else {
@@ -890,6 +880,45 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "acquire should fail this attempt before waiting for delayed impossible-quorum tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_retries_transient_timeout_before_quorum() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            ResponseClient::new(LockResponse::failure(
+                "Timeout { resource: \"bucket/object-flaky-acquire@latest\", timeout: 1s }",
+                Duration::ZERO,
+            ))
+            .into_client(),
+            ResponseClient::new(LockResponse::failure(
+                "Timeout { resource: \"bucket/object-flaky-acquire@latest\", timeout: 1s }",
+                Duration::ZERO,
+            ))
+            .into_client(),
+            ResponseClient::new(LockResponse::failure(
+                "Timeout { resource: \"bucket/object-flaky-acquire@latest\", timeout: 1s }",
+                Duration::ZERO,
+            ))
+            .into_client(),
+            ResponseClient::new(LockResponse::failure(
+                "Timeout { resource: \"bucket/object-flaky-acquire@latest\", timeout: 1s }",
+                Duration::ZERO,
+            ))
+            .into_client(),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(900));
+
+        let started = tokio::time::Instant::now();
+        let result = lock.acquire_guard(&request).await;
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "expected at least one retry attempt for transient timeout, got {elapsed:?}"
         );
     }
 
