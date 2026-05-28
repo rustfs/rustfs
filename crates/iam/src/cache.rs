@@ -68,7 +68,7 @@ impl Cache {
         ptr::eq(a, b)
     }
 
-    pub fn with_write_lock<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
+    pub(crate) fn with_write_lock<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
         let _guard = self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         f(self)
     }
@@ -138,7 +138,7 @@ impl Cache {
             }
         }
         self.user_group_memberships
-            .store(Arc::new(CacheEntity::new(user_group_memberships)));
+            .store(Arc::new(CacheEntity::new(user_group_memberships).update_load_time()));
     }
 }
 
