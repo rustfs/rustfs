@@ -63,7 +63,10 @@ jobs:
             user-agent-suffix = rustfs-ci-nix
 
       - name: Cache Nix
-        uses: DeterminateSystems/flakehub-cache-action@v3.20.0
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+        with:
+          use-flakehub: false
+          use-gha-cache: true
 
       - name: Check Nix Flake Inputs
         uses: DeterminateSystems/flake-checker-action@v12
