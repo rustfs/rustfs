@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arc_swap::{ArcSwap, AsRaw, Guard};
+use arc_swap::{ArcSwap, Guard};
 use rustfs_policy::{
     auth::UserIdentity,
     policy::{Args, PolicyDoc},
@@ -29,105 +29,300 @@ use tracing::warn;
 
 use crate::store::{GroupInfo, MappedPolicy};
 
+/// Immutable IAM cache snapshot published atomically by [`Cache`].
+///
+/// Readers should load one `CacheState` and read all related maps from it. Writers
+/// must go through `Cache`/`LockedCache` so multi-map updates publish as one state.
+#[derive(Clone)]
+pub struct CacheState {
+    pub policy_docs: Arc<CacheEntity<PolicyDoc>>,
+    pub users: Arc<CacheEntity<UserIdentity>>,
+    pub user_policies: Arc<CacheEntity<MappedPolicy>>,
+    pub sts_accounts: Arc<CacheEntity<UserIdentity>>,
+    pub sts_policies: Arc<CacheEntity<MappedPolicy>>,
+    pub groups: Arc<CacheEntity<GroupInfo>>,
+    pub user_group_memberships: Arc<CacheEntity<HashSet<String>>>,
+    pub group_policies: Arc<CacheEntity<MappedPolicy>>,
+}
+
+impl Default for CacheState {
+    fn default() -> Self {
+        Self {
+            policy_docs: Arc::new(CacheEntity::default()),
+            users: Arc::new(CacheEntity::default()),
+            user_policies: Arc::new(CacheEntity::default()),
+            sts_accounts: Arc::new(CacheEntity::default()),
+            sts_policies: Arc::new(CacheEntity::default()),
+            groups: Arc::new(CacheEntity::default()),
+            user_group_memberships: Arc::new(CacheEntity::default()),
+            group_policies: Arc::new(CacheEntity::default()),
+        }
+    }
+}
+
 pub struct Cache {
-    pub policy_docs: ArcSwap<CacheEntity<PolicyDoc>>,
-    pub users: ArcSwap<CacheEntity<UserIdentity>>,
-    pub user_policies: ArcSwap<CacheEntity<MappedPolicy>>,
-    pub sts_accounts: ArcSwap<CacheEntity<UserIdentity>>,
-    pub sts_policies: ArcSwap<CacheEntity<MappedPolicy>>,
-    pub groups: ArcSwap<CacheEntity<GroupInfo>>,
-    pub user_group_memberships: ArcSwap<CacheEntity<HashSet<String>>>,
-    pub group_policies: ArcSwap<CacheEntity<MappedPolicy>>,
+    state: ArcSwap<CacheState>,
     write_lock: Mutex<()>,
 }
 
 impl Default for Cache {
     fn default() -> Self {
         Self {
-            policy_docs: ArcSwap::new(Arc::new(CacheEntity::default())),
-            users: ArcSwap::new(Arc::new(CacheEntity::default())),
-            user_policies: ArcSwap::new(Arc::new(CacheEntity::default())),
-            sts_accounts: ArcSwap::new(Arc::new(CacheEntity::default())),
-            sts_policies: ArcSwap::new(Arc::new(CacheEntity::default())),
-            groups: ArcSwap::new(Arc::new(CacheEntity::default())),
-            user_group_memberships: ArcSwap::new(Arc::new(CacheEntity::default())),
-            group_policies: ArcSwap::new(Arc::new(CacheEntity::default())),
+            state: ArcSwap::new(Arc::new(CacheState::default())),
             write_lock: Mutex::new(()),
         }
     }
 }
 
+pub type CacheSnapshot = Guard<Arc<CacheState>>;
+
 impl Cache {
-    pub fn ptr_eq<Base, A, B>(a: A, b: B) -> bool
-    where
-        A: AsRaw<Base>,
-        B: AsRaw<Base>,
-    {
-        let a = a.as_raw();
-        let b = b.as_raw();
-        ptr::eq(a, b)
+    pub fn snapshot(&self) -> CacheSnapshot {
+        self.state.load()
     }
 
-    pub(crate) fn with_write_lock<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
+    pub(crate) fn with_write_lock<R>(&self, f: impl FnOnce(&mut LockedCache) -> R) -> R {
         let _guard = self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(self)
-    }
-
-    fn exec_unlocked<T: Clone>(target: &ArcSwap<CacheEntity<T>>, t: OffsetDateTime, mut op: impl FnMut(&mut CacheEntity<T>)) {
-        let mut cur = target.load();
-        loop {
-            // If the current update time is later than the execution time,
-            // the background task is loaded and the current operation does not need to be performed.
-            if cur.load_time >= t {
-                return;
-            }
-
-            let mut new = CacheEntity::clone(&cur);
-            op(&mut new);
-
-            // Replace content with CAS atoms
-            let prev = target.compare_and_swap(&*cur, Arc::new(new));
-            let swapped = Self::ptr_eq(&*cur, &*prev);
-            if swapped {
-                return;
-            } else {
-                cur = prev;
-            }
+        let current = self.state.load_full();
+        let mut locked = LockedCache {
+            state: CacheState::clone(&current),
+            current_ptr: Arc::as_ptr(&current),
+            dirty: false,
+        };
+        let ret = f(&mut locked);
+        if locked.dirty {
+            self.state.store(Arc::new(locked.state));
         }
-    }
-
-    pub fn add_or_update<T: Clone>(&self, target: &ArcSwap<CacheEntity<T>>, key: &str, value: &T, t: OffsetDateTime) {
-        self.with_write_lock(|cache| cache.add_or_update_unlocked(target, key, value, t));
-    }
-
-    pub(crate) fn add_or_update_unlocked<T: Clone>(
-        &self,
-        target: &ArcSwap<CacheEntity<T>>,
-        key: &str,
-        value: &T,
-        t: OffsetDateTime,
-    ) {
-        Self::exec_unlocked(target, t, |map: &mut CacheEntity<T>| {
-            map.insert(key.to_string(), value.clone());
-        })
-    }
-
-    pub fn delete<T: Clone>(&self, target: &ArcSwap<CacheEntity<T>>, key: &str, t: OffsetDateTime) {
-        self.with_write_lock(|cache| cache.delete_unlocked(target, key, t));
-    }
-
-    pub(crate) fn delete_unlocked<T: Clone>(&self, target: &ArcSwap<CacheEntity<T>>, key: &str, t: OffsetDateTime) {
-        Self::exec_unlocked(target, t, |map: &mut CacheEntity<T>| {
-            map.remove(key);
-        })
+        ret
     }
 
     pub fn build_user_group_memberships(&self) {
-        self.with_write_lock(|cache| cache.build_user_group_memberships_unlocked());
+        self.with_write_lock(|cache| cache.build_user_group_memberships());
     }
 
-    pub(crate) fn build_user_group_memberships_unlocked(&self) {
-        let groups = self.groups.load();
+    pub fn add_or_update_policy_doc(&self, key: &str, value: &PolicyDoc, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.add_or_update_policy_doc(key, value, t));
+    }
+
+    pub fn add_or_update_user(&self, key: &str, value: &UserIdentity, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.add_or_update_user(key, value, t));
+    }
+
+    pub fn add_or_update_user_policy(&self, key: &str, value: &MappedPolicy, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.add_or_update_user_policy(key, value, t));
+    }
+
+    pub fn add_or_update_sts_account(&self, key: &str, value: &UserIdentity, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.add_or_update_sts_account(key, value, t));
+    }
+
+    pub fn add_or_update_sts_policy(&self, key: &str, value: &MappedPolicy, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.add_or_update_sts_policy(key, value, t));
+    }
+
+    pub fn add_or_update_group(&self, key: &str, value: &GroupInfo, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.add_or_update_group(key, value, t));
+    }
+
+    pub fn add_or_update_user_group_membership(&self, key: &str, value: &HashSet<String>, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.add_or_update_user_group_membership(key, value, t));
+    }
+
+    pub fn add_or_update_group_policy(&self, key: &str, value: &MappedPolicy, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.add_or_update_group_policy(key, value, t));
+    }
+
+    pub fn delete_policy_doc(&self, key: &str, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.delete_policy_doc(key, t));
+    }
+
+    pub fn delete_user(&self, key: &str, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.delete_user(key, t));
+    }
+
+    pub fn delete_user_policy(&self, key: &str, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.delete_user_policy(key, t));
+    }
+
+    pub fn delete_sts_account(&self, key: &str, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.delete_sts_account(key, t));
+    }
+
+    pub fn delete_sts_policy(&self, key: &str, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.delete_sts_policy(key, t));
+    }
+
+    pub fn delete_group(&self, key: &str, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.delete_group(key, t));
+    }
+
+    pub fn delete_group_policy(&self, key: &str, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.delete_group_policy(key, t));
+    }
+}
+
+pub(crate) struct LockedCache {
+    state: CacheState,
+    current_ptr: *const CacheState,
+    dirty: bool,
+}
+
+impl LockedCache {
+    pub(crate) fn state(&self) -> &CacheState {
+        &self.state
+    }
+
+    pub(crate) fn matches_snapshot(&self, snapshot: &CacheSnapshot) -> bool {
+        ptr::eq(self.current_ptr, Arc::as_ptr(snapshot))
+    }
+
+    fn exec<T: Clone>(target: &mut Arc<CacheEntity<T>>, t: OffsetDateTime, mut op: impl FnMut(&mut CacheEntity<T>)) -> bool {
+        if target.load_time >= t {
+            return false;
+        }
+
+        let mut new = CacheEntity::clone(target);
+        op(&mut new);
+        *target = Arc::new(new);
+        true
+    }
+
+    fn replaced<T>(value: CacheEntity<T>) -> Arc<CacheEntity<T>> {
+        Arc::new(value.update_load_time())
+    }
+
+    pub(crate) fn replace_policy_docs(&mut self, value: CacheEntity<PolicyDoc>) {
+        self.state.policy_docs = Self::replaced(value);
+        self.dirty = true;
+    }
+
+    pub(crate) fn replace_users(&mut self, value: CacheEntity<UserIdentity>) {
+        self.state.users = Self::replaced(value);
+        self.dirty = true;
+    }
+
+    pub(crate) fn replace_user_policies(&mut self, value: CacheEntity<MappedPolicy>) {
+        self.state.user_policies = Self::replaced(value);
+        self.dirty = true;
+    }
+
+    pub(crate) fn replace_sts_accounts(&mut self, value: CacheEntity<UserIdentity>) {
+        self.state.sts_accounts = Self::replaced(value);
+        self.dirty = true;
+    }
+
+    pub(crate) fn replace_sts_policies(&mut self, value: CacheEntity<MappedPolicy>) {
+        self.state.sts_policies = Self::replaced(value);
+        self.dirty = true;
+    }
+
+    pub(crate) fn replace_groups(&mut self, value: CacheEntity<GroupInfo>) {
+        self.state.groups = Self::replaced(value);
+        self.dirty = true;
+    }
+
+    pub(crate) fn replace_group_policies(&mut self, value: CacheEntity<MappedPolicy>) {
+        self.state.group_policies = Self::replaced(value);
+        self.dirty = true;
+    }
+
+    pub(crate) fn replace_user_group_memberships(&mut self, value: CacheEntity<HashSet<String>>) {
+        self.state.user_group_memberships = Self::replaced(value);
+        self.dirty = true;
+    }
+
+    pub(crate) fn add_or_update_policy_doc(&mut self, key: &str, value: &PolicyDoc, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.policy_docs, t, |map| {
+            map.insert(key.to_string(), value.clone());
+        });
+    }
+
+    pub(crate) fn add_or_update_user(&mut self, key: &str, value: &UserIdentity, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.users, t, |map| {
+            map.insert(key.to_string(), value.clone());
+        });
+    }
+
+    pub(crate) fn add_or_update_user_policy(&mut self, key: &str, value: &MappedPolicy, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.user_policies, t, |map| {
+            map.insert(key.to_string(), value.clone());
+        });
+    }
+
+    pub(crate) fn add_or_update_sts_account(&mut self, key: &str, value: &UserIdentity, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.sts_accounts, t, |map| {
+            map.insert(key.to_string(), value.clone());
+        });
+    }
+
+    pub(crate) fn add_or_update_sts_policy(&mut self, key: &str, value: &MappedPolicy, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.sts_policies, t, |map| {
+            map.insert(key.to_string(), value.clone());
+        });
+    }
+
+    pub(crate) fn add_or_update_group(&mut self, key: &str, value: &GroupInfo, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.groups, t, |map| {
+            map.insert(key.to_string(), value.clone());
+        });
+    }
+
+    pub(crate) fn add_or_update_user_group_membership(&mut self, key: &str, value: &HashSet<String>, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.user_group_memberships, t, |map| {
+            map.insert(key.to_string(), value.clone());
+        });
+    }
+
+    pub(crate) fn add_or_update_group_policy(&mut self, key: &str, value: &MappedPolicy, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.group_policies, t, |map| {
+            map.insert(key.to_string(), value.clone());
+        });
+    }
+
+    pub(crate) fn delete_policy_doc(&mut self, key: &str, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.policy_docs, t, |map| {
+            map.remove(key);
+        });
+    }
+
+    pub(crate) fn delete_user(&mut self, key: &str, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.users, t, |map| {
+            map.remove(key);
+        });
+    }
+
+    pub(crate) fn delete_user_policy(&mut self, key: &str, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.user_policies, t, |map| {
+            map.remove(key);
+        });
+    }
+
+    pub(crate) fn delete_sts_account(&mut self, key: &str, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.sts_accounts, t, |map| {
+            map.remove(key);
+        });
+    }
+
+    pub(crate) fn delete_sts_policy(&mut self, key: &str, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.sts_policies, t, |map| {
+            map.remove(key);
+        });
+    }
+
+    pub(crate) fn delete_group(&mut self, key: &str, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.groups, t, |map| {
+            map.remove(key);
+        });
+    }
+
+    pub(crate) fn delete_group_policy(&mut self, key: &str, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.group_policies, t, |map| {
+            map.remove(key);
+        });
+    }
+
+    pub(crate) fn build_user_group_memberships(&mut self) {
+        let groups = Arc::clone(&self.state.groups);
         let mut user_group_memberships = HashMap::new();
         for (group_name, group) in groups.iter() {
             for user_name in &group.members {
@@ -137,48 +332,18 @@ impl Cache {
                     .insert(group_name.clone());
             }
         }
-        self.user_group_memberships
-            .store(Arc::new(CacheEntity::new(user_group_memberships).update_load_time()));
+        self.replace_user_group_memberships(CacheEntity::new(user_group_memberships));
     }
 }
 
 impl CacheInner {
     #[inline]
     pub fn get_user(&self, user_name: &str) -> Option<&UserIdentity> {
-        self.users.get(user_name).or_else(|| self.sts_accounts.get(user_name))
+        self.snapshot
+            .users
+            .get(user_name)
+            .or_else(|| self.snapshot.sts_accounts.get(user_name))
     }
-
-    // fn get_policy(&self, _name: &str, _groups: &[String]) -> crate::Result<Vec<Policy>> {
-    //     todo!()
-    // }
-
-    // /// Return Ok(Some(parent_name)) when the user is temporary.
-    // /// Return Ok(None) for non-temporary users.
-    // fn is_temp_user(&self, user_name: &str) -> crate::Result<Option<&str>> {
-    //     let user = self
-    //         .get_user(user_name)
-    //         .ok_or_else(|| Error::NoSuchUser(user_name.to_owned()))?;
-
-    //     if user.credentials.is_temp() {
-    //         Ok(Some(&user.credentials.parent_user))
-    //     } else {
-    //         Ok(None)
-    //     }
-    // }
-
-    // /// Return Ok(Some(parent_name)) when the user is a temporary identity.
-    // /// Return Ok(None) when the user is not temporary.
-    // fn is_service_account(&self, user_name: &str) -> crate::Result<Option<&str>> {
-    //     let user = self
-    //         .get_user(user_name)
-    //         .ok_or_else(|| Error::NoSuchUser(user_name.to_owned()))?;
-
-    //     if user.credentials.is_service_account() {
-    //         Ok(Some(&user.credentials.parent_user))
-    //     } else {
-    //         Ok(None)
-    //     }
-    // }
 
     // todo
     pub fn is_allowed_sts(&self, _args: &Args, _parent: &str) -> bool {
@@ -248,30 +413,14 @@ impl<T> CacheEntity<T> {
     }
 }
 
-pub type G<T> = Guard<Arc<CacheEntity<T>>>;
-
 pub struct CacheInner {
-    pub policy_docs: G<PolicyDoc>,
-    pub users: G<UserIdentity>,
-    pub user_policies: G<MappedPolicy>,
-    pub sts_accounts: G<UserIdentity>,
-    pub sts_policies: G<MappedPolicy>,
-    pub groups: G<GroupInfo>,
-    pub user_group_memberships: G<HashSet<String>>,
-    pub group_policies: G<MappedPolicy>,
+    snapshot: CacheSnapshot,
 }
 
 impl From<&Cache> for CacheInner {
     fn from(value: &Cache) -> Self {
         Self {
-            policy_docs: value.policy_docs.load(),
-            users: value.users.load(),
-            user_policies: value.user_policies.load(),
-            sts_accounts: value.sts_accounts.load(),
-            sts_policies: value.sts_policies.load(),
-            groups: value.groups.load(),
-            user_group_memberships: value.user_group_memberships.load(),
-            group_policies: value.group_policies.load(),
+            snapshot: value.snapshot(),
         }
     }
 }
@@ -280,106 +429,139 @@ impl From<&Cache> for CacheInner {
 mod tests {
     use std::sync::Arc;
 
-    use arc_swap::ArcSwap;
     use futures::future::join_all;
+    use rustfs_policy::auth::UserIdentity;
     use time::OffsetDateTime;
 
-    use super::CacheEntity;
     use crate::cache::Cache;
+    use crate::store::MappedPolicy;
 
     #[tokio::test]
     async fn test_cache_entity_add() {
         let owner = Arc::new(Cache::default());
-        let cache = ArcSwap::new(Arc::new(CacheEntity::<usize>::default()));
 
         let mut f = vec![];
 
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
             let owner = Arc::clone(&owner);
-            let c = &cache;
             f.push(async move {
-                owner.add_or_update(c, &key, &index, OffsetDateTime::now_utc());
+                let user = UserIdentity {
+                    version: index as i64,
+                    ..Default::default()
+                };
+                owner.add_or_update_user(&key, &user, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
 
-        let cache = cache.load();
+        let cache = owner.snapshot();
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
-            assert_eq!(cache.get(&key), Some(&index));
+            assert_eq!(cache.users.get(&key).map(|user| user.version), Some(index as i64));
         }
     }
 
     #[tokio::test]
     async fn test_cache_entity_update() {
         let owner = Arc::new(Cache::default());
-        let cache = ArcSwap::new(Arc::new(CacheEntity::<usize>::default()));
 
         let mut f = vec![];
 
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
             let owner = Arc::clone(&owner);
-            let c = &cache;
             f.push(async move {
-                owner.add_or_update(c, &key, &index, OffsetDateTime::now_utc());
+                let user = UserIdentity {
+                    version: index as i64,
+                    ..Default::default()
+                };
+                owner.add_or_update_user(&key, &user, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
 
-        let cache_load = cache.load();
+        let cache_load = owner.snapshot();
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
-            assert_eq!(cache_load.get(&key), Some(&index));
+            assert_eq!(cache_load.users.get(&key).map(|user| user.version), Some(index as i64));
         }
 
         let mut f = vec![];
 
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
             let owner = Arc::clone(&owner);
-            let c = &cache;
             f.push(async move {
-                owner.add_or_update(c, &key, &(index * 1000), OffsetDateTime::now_utc());
+                let user = UserIdentity {
+                    version: (index * 1000) as i64,
+                    ..Default::default()
+                };
+                owner.add_or_update_user(&key, &user, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
 
-        let cache_load = cache.load();
+        let cache_load = owner.snapshot();
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
-            assert_eq!(cache_load.get(&key), Some(&(index * 1000)));
+            assert_eq!(cache_load.users.get(&key).map(|user| user.version), Some((index * 1000) as i64));
         }
     }
 
     #[tokio::test]
     async fn test_cache_entity_delete() {
         let owner = Arc::new(Cache::default());
-        let cache = ArcSwap::new(Arc::new(CacheEntity::<usize>::default()));
 
         let mut f = vec![];
 
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
             let owner = Arc::clone(&owner);
-            let c = &cache;
             f.push(async move {
-                owner.add_or_update(c, &key, &index, OffsetDateTime::now_utc());
+                let user = UserIdentity {
+                    version: index as i64,
+                    ..Default::default()
+                };
+                owner.add_or_update_user(&key, &user, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
 
-        let cache_load = cache.load();
+        let cache_load = owner.snapshot();
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
-            assert_eq!(cache_load.get(&key), Some(&index));
+            assert_eq!(cache_load.users.get(&key).map(|user| user.version), Some(index as i64));
         }
+        drop(cache_load);
 
         let mut f = vec![];
 
         for key in (0..100).map(|x| x.to_string()) {
             let owner = Arc::clone(&owner);
-            let c = &cache;
             f.push(async move {
-                owner.delete(c, &key, OffsetDateTime::now_utc());
+                owner.delete_user(&key, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
 
-        let cache_load = cache.load();
-        assert!(cache_load.is_empty());
+        let cache_load = owner.snapshot();
+        assert!(cache_load.users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cache_snapshot_reads_one_published_state() {
+        let cache = Cache::default();
+        let before = cache.snapshot();
+        let user = UserIdentity {
+            version: 7,
+            ..Default::default()
+        };
+        let policy = MappedPolicy::new("readwrite");
+
+        cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            cache.add_or_update_user("snapshot-user", &user, now);
+            cache.add_or_update_user_policy("snapshot-user", &policy, now);
+        });
+
+        assert!(!before.users.contains_key("snapshot-user"));
+        assert!(!before.user_policies.contains_key("snapshot-user"));
+
+        let after = cache.snapshot();
+        assert!(after.users.contains_key("snapshot-user"));
+        assert!(after.user_policies.contains_key("snapshot-user"));
     }
 }

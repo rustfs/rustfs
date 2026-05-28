@@ -1542,18 +1542,14 @@ mod tests {
                 users.insert(PARENT_USER.to_string(), parent_identity);
 
                 cache.with_write_lock(|cache| {
-                    cache
-                        .policy_docs
-                        .store(Arc::new(CacheEntity::new(policy_docs).update_load_time()));
-                    cache.users.store(Arc::new(CacheEntity::new(users).update_load_time()));
-                    cache.groups.store(Arc::new(CacheEntity::default().update_load_time()));
-                    cache
-                        .group_policies
-                        .store(Arc::new(CacheEntity::default().update_load_time()));
-                    cache.user_policies.store(Arc::new(CacheEntity::default().update_load_time()));
-                    cache.sts_accounts.store(Arc::new(CacheEntity::default().update_load_time()));
-                    cache.sts_policies.store(Arc::new(CacheEntity::default().update_load_time()));
-                    cache.build_user_group_memberships_unlocked();
+                    cache.replace_policy_docs(CacheEntity::new(policy_docs));
+                    cache.replace_users(CacheEntity::new(users));
+                    cache.replace_groups(CacheEntity::default());
+                    cache.replace_group_policies(CacheEntity::default());
+                    cache.replace_user_policies(CacheEntity::default());
+                    cache.replace_sts_accounts(CacheEntity::default());
+                    cache.replace_sts_policies(CacheEntity::default());
+                    cache.build_user_group_memberships();
                 });
                 return Ok(());
             }
@@ -1590,18 +1586,14 @@ mod tests {
             group_policies.insert(GROUP_NAME.to_string(), group_policy);
 
             cache.with_write_lock(|cache| {
-                cache
-                    .policy_docs
-                    .store(Arc::new(CacheEntity::new(policy_docs).update_load_time()));
-                cache.users.store(Arc::new(CacheEntity::new(users).update_load_time()));
-                cache.groups.store(Arc::new(CacheEntity::new(groups).update_load_time()));
-                cache
-                    .group_policies
-                    .store(Arc::new(CacheEntity::new(group_policies).update_load_time()));
-                cache.user_policies.store(Arc::new(CacheEntity::default().update_load_time()));
-                cache.sts_accounts.store(Arc::new(CacheEntity::default().update_load_time()));
-                cache.sts_policies.store(Arc::new(CacheEntity::default().update_load_time()));
-                cache.build_user_group_memberships_unlocked();
+                cache.replace_policy_docs(CacheEntity::new(policy_docs));
+                cache.replace_users(CacheEntity::new(users));
+                cache.replace_groups(CacheEntity::new(groups));
+                cache.replace_group_policies(CacheEntity::new(group_policies));
+                cache.replace_user_policies(CacheEntity::default());
+                cache.replace_sts_accounts(CacheEntity::default());
+                cache.replace_sts_policies(CacheEntity::default());
+                cache.build_user_group_memberships();
             });
 
             Ok(())
@@ -1963,12 +1955,10 @@ mod tests {
             parent_user: parent_user.to_string(),
             ..Default::default()
         });
-        iam_sys.store.cache.add_or_update(
-            &iam_sys.store.cache.sts_accounts,
-            sts_access_key,
-            &sts_user,
-            OffsetDateTime::now_utc(),
-        );
+        iam_sys
+            .store
+            .cache
+            .add_or_update_sts_account(sts_access_key, &sts_user, OffsetDateTime::now_utc());
 
         let mut claims = HashMap::new();
         claims.insert(POLICYNAME.to_string(), Value::String(CUSTOM_STS_CLAIM_POLICY.to_string()));
@@ -2009,12 +1999,10 @@ mod tests {
             parent_user: parent_user.to_string(),
             ..Default::default()
         });
-        iam_sys.store.cache.add_or_update(
-            &iam_sys.store.cache.sts_accounts,
-            sts_access_key,
-            &sts_user,
-            OffsetDateTime::now_utc(),
-        );
+        iam_sys
+            .store
+            .cache
+            .add_or_update_sts_account(sts_access_key, &sts_user, OffsetDateTime::now_utc());
 
         let mut claims = HashMap::new();
         claims.insert(
@@ -2058,12 +2046,10 @@ mod tests {
             parent_user: parent_user.to_string(),
             ..Default::default()
         });
-        iam_sys.store.cache.add_or_update(
-            &iam_sys.store.cache.sts_accounts,
-            sts_access_key,
-            &sts_user,
-            OffsetDateTime::now_utc(),
-        );
+        iam_sys
+            .store
+            .cache
+            .add_or_update_sts_account(sts_access_key, &sts_user, OffsetDateTime::now_utc());
 
         let mut claims = HashMap::new();
         claims.insert(POLICYNAME.to_string(), Value::String(CUSTOM_STS_CLAIM_POLICY.to_string()));
@@ -2262,14 +2248,13 @@ mod tests {
         let iam_sys = IamSys::new(cache_manager);
 
         iam_sys.store.cache.with_write_lock(|cache| {
-            cache
-                .user_group_memberships
-                .store(Arc::new(CacheEntity::default().update_load_time()));
+            cache.replace_user_group_memberships(CacheEntity::default());
         });
 
         iam_sys.load_group("notify-group").await.unwrap();
 
-        let memberships = iam_sys.store.cache.user_group_memberships.load();
+        let cache = iam_sys.store.cache.snapshot();
+        let memberships = &cache.user_group_memberships;
         assert!(
             memberships
                 .get("notify-user")
@@ -2289,7 +2274,8 @@ mod tests {
             .await
             .unwrap();
 
-        let sts_policies = iam_sys.store.cache.sts_policies.load();
+        let cache = iam_sys.store.cache.snapshot();
+        let sts_policies = &cache.sts_policies;
         assert!(
             sts_policies.contains_key("notify-sts-parent"),
             "STS policy mapping notifications must update sts_policies instead of deleting them"
@@ -2350,12 +2336,10 @@ mod tests {
             parent_user: "sts-empty-parent-policy-test".to_string(),
             ..Default::default()
         });
-        iam_sys.store.cache.add_or_update(
-            &iam_sys.store.cache.sts_accounts,
-            sts_access_key,
-            &sts_user,
-            OffsetDateTime::now_utc(),
-        );
+        iam_sys
+            .store
+            .cache
+            .add_or_update_sts_account(sts_access_key, &sts_user, OffsetDateTime::now_utc());
 
         let mut claims = HashMap::new();
         claims.insert(
@@ -2469,12 +2453,10 @@ mod tests {
             parent_user: "sts-empty-parent-policy-test".to_string(),
             ..Default::default()
         });
-        iam_sys.store.cache.add_or_update(
-            &iam_sys.store.cache.sts_accounts,
-            sts_access_key,
-            &sts_user,
-            OffsetDateTime::now_utc(),
-        );
+        iam_sys
+            .store
+            .cache
+            .add_or_update_sts_account(sts_access_key, &sts_user, OffsetDateTime::now_utc());
 
         let session_policy_json = r#"{
   "Version":"2012-10-17",
@@ -2524,12 +2506,10 @@ mod tests {
             claims: Some(service_account_claims),
             ..Default::default()
         });
-        iam_sys.store.cache.add_or_update(
-            &iam_sys.store.cache.users,
-            service_account_access_key,
-            &service_identity,
-            OffsetDateTime::now_utc(),
-        );
+        iam_sys
+            .store
+            .cache
+            .add_or_update_user(service_account_access_key, &service_identity, OffsetDateTime::now_utc());
 
         let mut request_claims = HashMap::new();
         request_claims.insert("parent".to_string(), Value::String(parent_user.to_string()));
