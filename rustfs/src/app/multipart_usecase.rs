@@ -26,7 +26,7 @@ use crate::storage::options::{
 };
 use crate::storage::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
-    parse_list_multipart_uploads_params, parse_list_parts_params,
+    parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
 };
 use crate::storage::sse::{build_ssec_read_headers, encryption_material_to_metadata, map_get_object_reader_error};
 use crate::storage::*;
@@ -668,7 +668,7 @@ impl DefaultMultipartUsecase {
             ..
         } = input;
 
-        let part_id = part_number as usize;
+        let part_id = parse_upload_part_number(part_number)?;
 
         let mut size = content_length;
         let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
@@ -1006,7 +1006,7 @@ impl DefaultMultipartUsecase {
             None
         };
 
-        let part_id = part_number as usize;
+        let part_id = parse_upload_part_number(part_number)?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1726,6 +1726,29 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
+    #[tokio::test]
+    async fn execute_upload_part_copy_rejects_invalid_part_number_before_store_lookup() {
+        for part_number in [-1, 0, 10001] {
+            let input = UploadPartCopyInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .copy_source(CopySource::Bucket {
+                    bucket: "src-bucket".into(),
+                    key: "src-object".into(),
+                    version_id: None,
+                })
+                .part_number(part_number)
+                .upload_id("upload-id".to_string())
+                .build()
+                .unwrap();
+            let req = build_request(input, Method::PUT);
+
+            let err = Box::pin(make_usecase().execute_upload_part_copy(req)).await.unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
+        }
+    }
+
     #[test]
     fn test_validate_copy_source_range_not_exceeds_returns_invalid_range_when_range_exceeds() {
         use super::validate_copy_source_range_not_exceeds;
@@ -1777,5 +1800,23 @@ mod tests {
 
         let err = make_usecase().execute_upload_part(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn execute_upload_part_rejects_invalid_part_number_before_body_lookup() {
+        for part_number in [-1, 0, 10001] {
+            let input = UploadPartInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .part_number(part_number)
+                .build()
+                .unwrap();
+            let req = build_request(input, Method::PUT);
+
+            let err = make_usecase().execute_upload_part(req).await.unwrap_err();
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
+        }
     }
 }
