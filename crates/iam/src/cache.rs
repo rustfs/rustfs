@@ -16,7 +16,7 @@ use std::{
     collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
     ptr,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use arc_swap::{ArcSwap, AsRaw, Guard};
@@ -38,6 +38,7 @@ pub struct Cache {
     pub groups: ArcSwap<CacheEntity<GroupInfo>>,
     pub user_group_memberships: ArcSwap<CacheEntity<HashSet<String>>>,
     pub group_policies: ArcSwap<CacheEntity<MappedPolicy>>,
+    write_lock: Mutex<()>,
 }
 
 impl Default for Cache {
@@ -51,6 +52,7 @@ impl Default for Cache {
             groups: ArcSwap::new(Arc::new(CacheEntity::default())),
             user_group_memberships: ArcSwap::new(Arc::new(CacheEntity::default())),
             group_policies: ArcSwap::new(Arc::new(CacheEntity::default())),
+            write_lock: Mutex::new(()),
         }
     }
 }
@@ -66,7 +68,12 @@ impl Cache {
         ptr::eq(a, b)
     }
 
-    fn exec<T: Clone>(target: &ArcSwap<CacheEntity<T>>, t: OffsetDateTime, mut op: impl FnMut(&mut CacheEntity<T>)) {
+    pub fn with_write_lock<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
+        let _guard = self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(self)
+    }
+
+    fn exec_unlocked<T: Clone>(target: &ArcSwap<CacheEntity<T>>, t: OffsetDateTime, mut op: impl FnMut(&mut CacheEntity<T>)) {
         let mut cur = target.load();
         loop {
             // If the current update time is later than the execution time,
@@ -89,19 +96,37 @@ impl Cache {
         }
     }
 
-    pub fn add_or_update<T: Clone>(target: &ArcSwap<CacheEntity<T>>, key: &str, value: &T, t: OffsetDateTime) {
-        Self::exec(target, t, |map: &mut CacheEntity<T>| {
+    pub fn add_or_update<T: Clone>(&self, target: &ArcSwap<CacheEntity<T>>, key: &str, value: &T, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.add_or_update_unlocked(target, key, value, t));
+    }
+
+    pub(crate) fn add_or_update_unlocked<T: Clone>(
+        &self,
+        target: &ArcSwap<CacheEntity<T>>,
+        key: &str,
+        value: &T,
+        t: OffsetDateTime,
+    ) {
+        Self::exec_unlocked(target, t, |map: &mut CacheEntity<T>| {
             map.insert(key.to_string(), value.clone());
         })
     }
 
-    pub fn delete<T: Clone>(target: &ArcSwap<CacheEntity<T>>, key: &str, t: OffsetDateTime) {
-        Self::exec(target, t, |map: &mut CacheEntity<T>| {
+    pub fn delete<T: Clone>(&self, target: &ArcSwap<CacheEntity<T>>, key: &str, t: OffsetDateTime) {
+        self.with_write_lock(|cache| cache.delete_unlocked(target, key, t));
+    }
+
+    pub(crate) fn delete_unlocked<T: Clone>(&self, target: &ArcSwap<CacheEntity<T>>, key: &str, t: OffsetDateTime) {
+        Self::exec_unlocked(target, t, |map: &mut CacheEntity<T>| {
             map.remove(key);
         })
     }
 
     pub fn build_user_group_memberships(&self) {
+        self.with_write_lock(|cache| cache.build_user_group_memberships_unlocked());
+    }
+
+    pub(crate) fn build_user_group_memberships_unlocked(&self) {
         let groups = self.groups.load();
         let mut user_group_memberships = HashMap::new();
         for (group_name, group) in groups.iter() {
@@ -264,14 +289,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_entity_add() {
+        let owner = Arc::new(Cache::default());
         let cache = ArcSwap::new(Arc::new(CacheEntity::<usize>::default()));
 
         let mut f = vec![];
 
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
+            let owner = Arc::clone(&owner);
             let c = &cache;
             f.push(async move {
-                Cache::add_or_update(c, &key, &index, OffsetDateTime::now_utc());
+                owner.add_or_update(c, &key, &index, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
@@ -284,14 +311,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_entity_update() {
+        let owner = Arc::new(Cache::default());
         let cache = ArcSwap::new(Arc::new(CacheEntity::<usize>::default()));
 
         let mut f = vec![];
 
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
+            let owner = Arc::clone(&owner);
             let c = &cache;
             f.push(async move {
-                Cache::add_or_update(c, &key, &index, OffsetDateTime::now_utc());
+                owner.add_or_update(c, &key, &index, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
@@ -304,9 +333,10 @@ mod tests {
         let mut f = vec![];
 
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
+            let owner = Arc::clone(&owner);
             let c = &cache;
             f.push(async move {
-                Cache::add_or_update(c, &key, &(index * 1000), OffsetDateTime::now_utc());
+                owner.add_or_update(c, &key, &(index * 1000), OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
@@ -319,14 +349,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_entity_delete() {
+        let owner = Arc::new(Cache::default());
         let cache = ArcSwap::new(Arc::new(CacheEntity::<usize>::default()));
 
         let mut f = vec![];
 
         for (index, key) in (0..100).map(|x| x.to_string()).enumerate() {
+            let owner = Arc::clone(&owner);
             let c = &cache;
             f.push(async move {
-                Cache::add_or_update(c, &key, &index, OffsetDateTime::now_utc());
+                owner.add_or_update(c, &key, &index, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;
@@ -339,9 +371,10 @@ mod tests {
         let mut f = vec![];
 
         for key in (0..100).map(|x| x.to_string()) {
+            let owner = Arc::clone(&owner);
             let c = &cache;
             f.push(async move {
-                Cache::delete(c, &key, OffsetDateTime::now_utc());
+                owner.delete(c, &key, OffsetDateTime::now_utc());
             });
         }
         join_all(f).await;

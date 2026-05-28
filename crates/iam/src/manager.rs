@@ -305,27 +305,23 @@ where
 
             let has_sts_user = sts_users_map.get(access_key);
 
-            let sts_parent = has_sts_user.map(|sts| sts.credentials.parent_user.clone());
-            if let Some(parent) = sts_parent {
+            if let Some(parent) = has_sts_user.map(|sts| sts.credentials.parent_user.clone()) {
                 let _ = self
                     .api
                     .load_mapped_policy(&parent, UserType::Sts, false, &mut sts_policy_map)
                     .await;
-            }
 
-            let sts_user = has_sts_user.map(|sts| sts.credentials.access_key.clone());
-            if let Some(ref sts) = sts_user
-                && let Some(plc) = sts_policy_map.get(sts)
-            {
-                for p in plc.to_slice().iter() {
-                    if !policy_docs_map.contains_key(p) {
-                        let _ = self.api.load_policy_doc(p, &mut policy_docs_map).await;
+                if let Some(plc) = sts_policy_map.get(&parent) {
+                    for p in plc.to_slice().iter() {
+                        if !policy_docs_map.contains_key(p) {
+                            let _ = self.api.load_policy_doc(p, &mut policy_docs_map).await;
+                        }
                     }
                 }
             }
         }
 
-        if let Some(plc) = user_policy_map.get(access_key) {
+        for plc in user_policy_map.values() {
             for p in plc.to_slice().iter() {
                 if !policy_docs_map.contains_key(p) {
                     let _ = self.api.load_policy_doc(p, &mut policy_docs_map).await;
@@ -333,21 +329,24 @@ where
             }
         }
 
-        if let Some(user) = users_map.get(access_key) {
-            Cache::add_or_update(&self.cache.users, access_key, user, OffsetDateTime::now_utc());
-        }
-        if let Some(user_policy) = user_policy_map.get(access_key) {
-            Cache::add_or_update(&self.cache.user_policies, access_key, user_policy, OffsetDateTime::now_utc());
-        }
-        if let Some(sts_user) = sts_users_map.get(access_key) {
-            Cache::add_or_update(&self.cache.sts_accounts, access_key, sts_user, OffsetDateTime::now_utc());
-        }
-        if let Some(sts_policy) = sts_policy_map.get(access_key) {
-            Cache::add_or_update(&self.cache.sts_policies, access_key, sts_policy, OffsetDateTime::now_utc());
-        }
-        if let Some(policy_doc) = policy_docs_map.get(access_key) {
-            Cache::add_or_update(&self.cache.policy_docs, access_key, policy_doc, OffsetDateTime::now_utc());
-        }
+        self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            for (key, user) in users_map.iter() {
+                cache.add_or_update_unlocked(&cache.users, key, user, now);
+            }
+            for (key, user_policy) in user_policy_map.iter() {
+                cache.add_or_update_unlocked(&cache.user_policies, key, user_policy, now);
+            }
+            for (key, sts_user) in sts_users_map.iter() {
+                cache.add_or_update_unlocked(&cache.sts_accounts, key, sts_user, now);
+            }
+            for (key, sts_policy) in sts_policy_map.iter() {
+                cache.add_or_update_unlocked(&cache.sts_policies, key, sts_policy, now);
+            }
+            for (key, policy_doc) in policy_docs_map.iter() {
+                cache.add_or_update_unlocked(&cache.policy_docs, key, policy_doc, now);
+            }
+        });
 
         Ok(())
     }
@@ -445,9 +444,10 @@ where
             let users_cache = self.cache.users.load();
 
             let mut users = Vec::new();
+            let mut stale_user_policies = Vec::new();
             user_policy_cache.iter().for_each(|(k, v)| {
                 if !users_cache.contains_key(k) {
-                    Cache::delete(&self.cache.user_policies, k, OffsetDateTime::now_utc());
+                    stale_user_policies.push(k.to_owned());
                     return;
                 }
 
@@ -463,13 +463,22 @@ where
                 }
             });
 
+            if !stale_user_policies.is_empty() {
+                self.cache.with_write_lock(|cache| {
+                    let now = OffsetDateTime::now_utc();
+                    for user in stale_user_policies.iter() {
+                        cache.delete_unlocked(&cache.user_policies, user, now);
+                    }
+                });
+            }
+
             if !users.is_empty() || !groups.is_empty() {
                 return Err(Error::PolicyInUse);
             }
 
             if let Err(err) = self.api.delete_policy_doc(name).await {
                 if !is_err_no_such_policy(&err) {
-                    Cache::delete(&self.cache.policy_docs, name, OffsetDateTime::now_utc());
+                    self.cache.delete(&self.cache.policy_docs, name, OffsetDateTime::now_utc());
                     return Ok(());
                 }
 
@@ -477,7 +486,7 @@ where
             }
         }
 
-        Cache::delete(&self.cache.policy_docs, name, OffsetDateTime::now_utc());
+        self.cache.delete(&self.cache.policy_docs, name, OffsetDateTime::now_utc());
 
         Ok(())
     }
@@ -503,7 +512,7 @@ where
 
         let now = OffsetDateTime::now_utc();
 
-        Cache::add_or_update(&self.cache.policy_docs, name, &policy_doc, now);
+        self.cache.add_or_update(&self.cache.policy_docs, name, &policy_doc, now);
 
         Ok(now)
     }
@@ -514,9 +523,10 @@ where
         self.api.load_policy_docs(&mut m).await?;
         set_default_canned_policies(&mut m);
 
-        let cache = CacheEntity::new(m.clone()).update_load_time();
+        let policy_docs_cache = CacheEntity::new(m.clone()).update_load_time();
 
-        self.cache.policy_docs.store(Arc::new(cache));
+        self.cache
+            .with_write_lock(|cache| cache.policy_docs.store(Arc::new(policy_docs_cache)));
 
         let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.policy)).collect();
 
@@ -563,12 +573,14 @@ where
                 let _ = self.api.load_policy_doc(&policy, &mut m).await;
             }
 
-            for (k, v) in m.iter() {
-                Cache::add_or_update(&self.cache.policy_docs, k, v, OffsetDateTime::now_utc());
-
-                policies.push(k.clone());
-                to_merge.push(v.policy.clone());
-            }
+            self.cache.with_write_lock(|cache| {
+                let now = OffsetDateTime::now_utc();
+                for (k, v) in m.iter() {
+                    cache.add_or_update_unlocked(&cache.policy_docs, k, v, now);
+                    policies.push(k.clone());
+                    to_merge.push(v.policy.clone());
+                }
+            });
         }
 
         (policies.join(","), Policy::merge_policies(to_merge))
@@ -580,9 +592,10 @@ where
         self.api.load_policy_docs(&mut m).await?;
         set_default_canned_policies(&mut m);
 
-        let cache = CacheEntity::new(m.clone()).update_load_time();
+        let policy_docs_cache = CacheEntity::new(m.clone()).update_load_time();
 
-        self.cache.policy_docs.store(Arc::new(cache));
+        self.cache
+            .with_write_lock(|cache| cache.policy_docs.store(Arc::new(policy_docs_cache)));
 
         let items: Vec<_> = m.into_iter().collect();
 
@@ -876,7 +889,8 @@ where
                     let mut m = HashMap::new();
                     self.api.load_group(name, &mut m).await?;
                     if let Some(p) = m.get(name) {
-                        Cache::add_or_update(&self.cache.groups, name, p, OffsetDateTime::now_utc());
+                        self.cache
+                            .add_or_update(&self.cache.groups, name, p, OffsetDateTime::now_utc());
                     }
 
                     m.get(name).cloned().ok_or_else(|| Error::NoSuchGroup(name.to_string()))?
@@ -899,7 +913,8 @@ where
                     return Err(err);
                 }
                 if let Some(p) = m.get(name) {
-                    Cache::add_or_update(&self.cache.group_policies, name, p, OffsetDateTime::now_utc());
+                    self.cache
+                        .add_or_update(&self.cache.group_policies, name, p, OffsetDateTime::now_utc());
                     return Ok((p.to_slice(), p.update_at));
                 }
 
@@ -925,7 +940,8 @@ where
                     return Err(err);
                 }
                 if let Some(p) = m.get(name) {
-                    Cache::add_or_update(&self.cache.user_policies, name, p, OffsetDateTime::now_utc());
+                    self.cache
+                        .add_or_update(&self.cache.user_policies, name, p, OffsetDateTime::now_utc());
                     p.clone()
                 } else {
                     match self.cache.sts_policies.load().get(name) {
@@ -938,7 +954,8 @@ where
                                 return Err(err);
                             }
                             if let Some(p) = m.get(name) {
-                                Cache::add_or_update(&self.cache.sts_policies, name, p, OffsetDateTime::now_utc());
+                                self.cache
+                                    .add_or_update(&self.cache.sts_policies, name, p, OffsetDateTime::now_utc());
                                 p.clone()
                             } else {
                                 MappedPolicy::default()
@@ -974,7 +991,8 @@ where
                             return Err(err);
                         }
                         if let Some(p) = m.get(group) {
-                            Cache::add_or_update(&self.cache.group_policies, group, p, OffsetDateTime::now_utc());
+                            self.cache
+                                .add_or_update(&self.cache.group_policies, group, p, OffsetDateTime::now_utc());
                             p.clone()
                         } else {
                             MappedPolicy::default()
@@ -1020,7 +1038,8 @@ where
                         return Err(err);
                     }
                     if let Some(p) = m.get(group) {
-                        Cache::add_or_update(&self.cache.group_policies, group, p, OffsetDateTime::now_utc());
+                        self.cache
+                            .add_or_update(&self.cache.group_policies, group, p, OffsetDateTime::now_utc());
                         p.clone()
                     } else {
                         MappedPolicy::default()
@@ -1048,11 +1067,11 @@ where
             }
 
             if is_group {
-                Cache::delete(&self.cache.group_policies, name, OffsetDateTime::now_utc());
+                self.cache.delete(&self.cache.group_policies, name, OffsetDateTime::now_utc());
             } else if user_type == UserType::Sts {
-                Cache::delete(&self.cache.sts_policies, name, OffsetDateTime::now_utc());
+                self.cache.delete(&self.cache.sts_policies, name, OffsetDateTime::now_utc());
             } else {
-                Cache::delete(&self.cache.user_policies, name, OffsetDateTime::now_utc());
+                self.cache.delete(&self.cache.user_policies, name, OffsetDateTime::now_utc());
             }
 
             return Ok(OffsetDateTime::now_utc());
@@ -1072,11 +1091,14 @@ where
             .await?;
 
         if is_group {
-            Cache::add_or_update(&self.cache.group_policies, name, &mp, OffsetDateTime::now_utc());
+            self.cache
+                .add_or_update(&self.cache.group_policies, name, &mp, OffsetDateTime::now_utc());
         } else if user_type == UserType::Sts {
-            Cache::add_or_update(&self.cache.sts_policies, name, &mp, OffsetDateTime::now_utc());
+            self.cache
+                .add_or_update(&self.cache.sts_policies, name, &mp, OffsetDateTime::now_utc());
         } else {
-            Cache::add_or_update(&self.cache.user_policies, name, &mp, OffsetDateTime::now_utc());
+            self.cache
+                .add_or_update(&self.cache.user_policies, name, &mp, OffsetDateTime::now_utc());
         }
 
         Ok(OffsetDateTime::now_utc())
@@ -1094,7 +1116,7 @@ where
             return Err(Error::InvalidArgument);
         }
 
-        if let Some(policy) = policy_name {
+        let sts_policy_update = if let Some(policy) = policy_name {
             let mp = MappedPolicy::new(policy);
             let (_, combined_policy_stmt) = filter_policies(&self.cache, &mp.policies, "temp");
             if combined_policy_stmt.is_empty() {
@@ -1105,17 +1127,26 @@ where
                 .save_mapped_policy(&cred.parent_user, UserType::Sts, false, mp.clone(), None)
                 .await?;
 
-            Cache::add_or_update(&self.cache.sts_policies, &cred.parent_user, &mp, OffsetDateTime::now_utc());
-        }
+            Some(mp)
+        } else {
+            None
+        };
 
         let u = UserIdentity::new(cred.clone());
         self.api
             .save_user_identity(access_key, UserType::Sts, u.clone(), None)
             .await?;
 
-        Cache::add_or_update(&self.cache.sts_accounts, access_key, &u, OffsetDateTime::now_utc());
+        let now = self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            if let Some(mp) = &sts_policy_update {
+                cache.add_or_update_unlocked(&cache.sts_policies, &cred.parent_user, mp, now);
+            }
+            cache.add_or_update_unlocked(&cache.sts_accounts, access_key, &u, now);
+            now
+        });
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(now)
     }
 
     pub async fn get_user_info(&self, name: &str) -> Result<rustfs_madmin::UserInfo> {
@@ -1301,28 +1332,50 @@ where
                 }
             }
 
-            let users_cache = self.cache.users.load();
-
-            for (_, v) in users_cache.iter() {
+            let mut service_accounts_to_delete = Vec::new();
+            let mut temp_accounts_to_delete = HashSet::new();
+            for (_, v) in self.cache.users.load().iter() {
                 let u = &v.credentials;
                 if u.parent_user.as_str() == access_key {
                     if u.is_service_account() {
-                        let _ = self.api.delete_user_identity(&u.access_key, UserType::Svc).await;
-                        Cache::delete(&self.cache.users, &u.access_key, OffsetDateTime::now_utc());
+                        service_accounts_to_delete.push(u.access_key.clone());
                     }
 
                     if u.is_temp() {
-                        let _ = self.api.delete_user_identity(&u.access_key, UserType::Sts).await;
-                        Cache::delete(&self.cache.sts_accounts, &u.access_key, OffsetDateTime::now_utc());
-                        Cache::delete(&self.cache.users, &u.access_key, OffsetDateTime::now_utc());
+                        temp_accounts_to_delete.insert(u.access_key.clone());
                     }
                 }
             }
+            for (_, v) in self.cache.sts_accounts.load().iter() {
+                let u = &v.credentials;
+                if u.parent_user.as_str() == access_key {
+                    temp_accounts_to_delete.insert(u.access_key.clone());
+                }
+            }
+
+            for access_key in service_accounts_to_delete.iter() {
+                let _ = self.api.delete_user_identity(access_key, UserType::Svc).await;
+            }
+            for access_key in temp_accounts_to_delete.iter() {
+                let _ = self.api.delete_user_identity(access_key, UserType::Sts).await;
+            }
+
+            self.cache.with_write_lock(|cache| {
+                let now = OffsetDateTime::now_utc();
+                for access_key in service_accounts_to_delete.iter() {
+                    cache.delete_unlocked(&cache.users, access_key, now);
+                }
+                for access_key in temp_accounts_to_delete.iter() {
+                    cache.delete_unlocked(&cache.sts_accounts, access_key, now);
+                    cache.delete_unlocked(&cache.users, access_key, now);
+                }
+            });
         }
 
         let _ = self.api.delete_mapped_policy(access_key, utype, false).await;
 
-        Cache::delete(&self.cache.user_policies, access_key, OffsetDateTime::now_utc());
+        self.cache
+            .delete(&self.cache.user_policies, access_key, OffsetDateTime::now_utc());
 
         if let Err(err) = self.api.delete_user_identity(access_key, utype).await
             && !is_err_no_such_user(&err)
@@ -1330,11 +1383,13 @@ where
             return Err(err);
         }
 
-        if utype == UserType::Sts {
-            Cache::delete(&self.cache.sts_accounts, access_key, OffsetDateTime::now_utc());
-        }
-
-        Cache::delete(&self.cache.users, access_key, OffsetDateTime::now_utc());
+        self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            if utype == UserType::Sts {
+                cache.delete_unlocked(&cache.sts_accounts, access_key, now);
+            }
+            cache.delete_unlocked(&cache.users, access_key, now);
+        });
 
         Ok(())
     }
@@ -1437,9 +1492,10 @@ where
         }
 
         if u.credentials.is_temp() && !u.credentials.is_service_account() {
-            Cache::add_or_update(&self.cache.sts_accounts, k, &u, OffsetDateTime::now_utc());
+            self.cache
+                .add_or_update(&self.cache.sts_accounts, k, &u, OffsetDateTime::now_utc());
         } else {
-            Cache::add_or_update(&self.cache.users, k, &u, OffsetDateTime::now_utc());
+            self.cache.add_or_update(&self.cache.users, k, &u, OffsetDateTime::now_utc());
         }
 
         Ok(())
@@ -1490,16 +1546,20 @@ where
 
         self.api.save_group_info(group, gi.clone()).await?;
 
-        Cache::add_or_update(&self.cache.groups, group, &gi, OffsetDateTime::now_utc());
+        let now = self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            cache.add_or_update_unlocked(&cache.groups, group, &gi, now);
 
-        let user_group_memberships = self.cache.user_group_memberships.load();
-        members.iter().for_each(|member| {
-            let mut m = user_group_memberships.get(member).cloned().unwrap_or_default();
-            m.insert(group.to_string());
-            Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
+            let user_group_memberships = cache.user_group_memberships.load();
+            members.iter().for_each(|member| {
+                let mut m = user_group_memberships.get(member).cloned().unwrap_or_default();
+                m.insert(group.to_string());
+                cache.add_or_update_unlocked(&cache.user_group_memberships, member, &m, now);
+            });
+            now
         });
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(now)
     }
 
     pub async fn set_group_status(&self, name: &str, enable: bool) -> Result<OffsetDateTime> {
@@ -1521,7 +1581,8 @@ where
 
         self.api.save_group_info(name, gi.clone()).await?;
 
-        Cache::add_or_update(&self.cache.groups, name, &gi, OffsetDateTime::now_utc());
+        self.cache
+            .add_or_update(&self.cache.groups, name, &gi, OffsetDateTime::now_utc());
 
         Ok(OffsetDateTime::now_utc())
     }
@@ -1546,7 +1607,8 @@ where
             }
 
             if let Some(policy) = policies.get(name).cloned() {
-                Cache::add_or_update(&self.cache.group_policies, name, &policy, OffsetDateTime::now_utc());
+                self.cache
+                    .add_or_update(&self.cache.group_policies, name, &policy, OffsetDateTime::now_utc());
                 Some(policy)
             } else {
                 None
@@ -1562,20 +1624,25 @@ where
 
     pub async fn update_groups(&self) -> Result<Vec<String>> {
         let mut groups_set = HashSet::new();
-        let mut m = HashMap::new();
-        self.api.load_groups(&mut m).await?;
-        for (group, gi) in m.iter() {
-            Cache::add_or_update(&self.cache.groups, group, gi, OffsetDateTime::now_utc());
-            groups_set.insert(group.to_string());
-        }
+        let mut groups = HashMap::new();
+        self.api.load_groups(&mut groups).await?;
 
-        let mut m = HashMap::new();
+        let mut group_policies = HashMap::new();
 
-        self.api.load_mapped_policies(UserType::Reg, true, &mut m).await?;
-        for (group, gi) in m.iter() {
-            Cache::add_or_update(&self.cache.group_policies, group, gi, OffsetDateTime::now_utc());
-            groups_set.insert(group.to_string());
-        }
+        self.api
+            .load_mapped_policies(UserType::Reg, true, &mut group_policies)
+            .await?;
+        self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            for (group, gi) in groups.iter() {
+                cache.add_or_update_unlocked(&cache.groups, group, gi, now);
+                groups_set.insert(group.to_string());
+            }
+            for (group, gi) in group_policies.iter() {
+                cache.add_or_update_unlocked(&cache.group_policies, group, gi, now);
+                groups_set.insert(group.to_string());
+            }
+        });
 
         Ok(groups_set.into_iter().collect())
     }
@@ -1602,18 +1669,22 @@ where
             self.api.save_group_info(name, gi.clone()).await?;
         }
 
-        Cache::add_or_update(&self.cache.groups, name, &gi, OffsetDateTime::now_utc());
+        let now = self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            cache.add_or_update_unlocked(&cache.groups, name, &gi, now);
 
-        let user_group_memberships = self.cache.user_group_memberships.load();
-        members.iter().for_each(|member| {
-            if let Some(m) = user_group_memberships.get(member) {
-                let mut m = m.clone();
-                m.remove(name);
-                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
-            }
+            let user_group_memberships = cache.user_group_memberships.load();
+            members.iter().for_each(|member| {
+                if let Some(m) = user_group_memberships.get(member) {
+                    let mut m = m.clone();
+                    m.remove(name);
+                    cache.add_or_update_unlocked(&cache.user_group_memberships, member, &m, now);
+                }
+            });
+            now
         });
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(now)
     }
 
     pub async fn remove_users_from_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
@@ -1664,34 +1735,37 @@ where
                 return Err(err);
             }
 
-            Cache::delete(&self.cache.groups, group, OffsetDateTime::now_utc());
-            Cache::delete(&self.cache.group_policies, group, OffsetDateTime::now_utc());
+            let now = self.cache.with_write_lock(|cache| {
+                let now = OffsetDateTime::now_utc();
+                self.remove_group_from_memberships_map_unlocked(cache, group, now);
+                cache.delete_unlocked(&cache.groups, group, now);
+                cache.delete_unlocked(&cache.group_policies, group, now);
+                now
+            });
 
-            return Ok(OffsetDateTime::now_utc());
+            return Ok(now);
         }
 
         self.remove_members_from_group(group, members, false).await
     }
 
-    fn remove_group_from_memberships_map(&self, group: &str) {
-        let user_group_memberships = self.cache.user_group_memberships.load();
+    fn remove_group_from_memberships_map_unlocked(&self, cache: &Cache, group: &str, now: OffsetDateTime) {
+        let user_group_memberships = cache.user_group_memberships.load();
         for (k, v) in user_group_memberships.iter() {
             if v.contains(group) {
                 let mut m = v.clone();
                 m.remove(group);
-                Cache::add_or_update(&self.cache.user_group_memberships, k, &m, OffsetDateTime::now_utc());
+                cache.add_or_update_unlocked(&cache.user_group_memberships, k, &m, now);
             }
         }
     }
 
-    fn update_group_memberships_map(&self, group: &str, gi: &GroupInfo) {
-        let user_group_memberships = self.cache.user_group_memberships.load();
+    fn update_group_memberships_map_unlocked(&self, cache: &Cache, group: &str, gi: &GroupInfo, now: OffsetDateTime) {
+        let user_group_memberships = cache.user_group_memberships.load();
         for member in gi.members.iter() {
-            if let Some(m) = user_group_memberships.get(member) {
-                let mut m = m.clone();
-                m.insert(group.to_string());
-                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
-            }
+            let mut m = user_group_memberships.get(member).cloned().unwrap_or_default();
+            m.insert(group.to_string());
+            cache.add_or_update_unlocked(&cache.user_group_memberships, member, &m, now);
         }
     }
 
@@ -1702,19 +1776,24 @@ where
                 return Err(err);
             }
 
-            self.remove_group_from_memberships_map(group);
-            Cache::delete(&self.cache.groups, group, OffsetDateTime::now_utc());
-            Cache::delete(&self.cache.group_policies, group, OffsetDateTime::now_utc());
+            self.cache.with_write_lock(|cache| {
+                let now = OffsetDateTime::now_utc();
+                self.remove_group_from_memberships_map_unlocked(cache, group, now);
+                cache.delete_unlocked(&cache.groups, group, now);
+                cache.delete_unlocked(&cache.group_policies, group, now);
+            });
 
             return Ok(());
         }
 
         let gi = m[group].clone();
 
-        Cache::add_or_update(&self.cache.groups, group, &gi, OffsetDateTime::now_utc());
-
-        self.remove_group_from_memberships_map(group);
-        self.update_group_memberships_map(group, &gi);
+        self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            cache.add_or_update_unlocked(&cache.groups, group, &gi, now);
+            self.remove_group_from_memberships_map_unlocked(cache, group, now);
+            self.update_group_memberships_map_unlocked(cache, group, &gi, now);
+        });
 
         Ok(())
     }
@@ -1726,41 +1805,46 @@ where
                 return Err(err);
             }
 
-            Cache::delete(&self.cache.policy_docs, policy, OffsetDateTime::now_utc());
+            self.cache.with_write_lock(|cache| {
+                let now = OffsetDateTime::now_utc();
+                cache.delete_unlocked(&cache.policy_docs, policy, now);
 
-            let user_policy_cache = self.cache.user_policies.load();
-            let users_cache = self.cache.users.load();
-            for (k, v) in user_policy_cache.iter() {
-                let mut set = v.policy_set();
-                if set.contains(policy) {
-                    if !users_cache.contains_key(k) {
-                        Cache::delete(&self.cache.user_policies, k, OffsetDateTime::now_utc());
-                        continue;
+                let user_policy_cache = cache.user_policies.load();
+                let users_cache = cache.users.load();
+                for (k, v) in user_policy_cache.iter() {
+                    let mut set = v.policy_set();
+                    if set.contains(policy) {
+                        if !users_cache.contains_key(k) {
+                            cache.delete_unlocked(&cache.user_policies, k, now);
+                            continue;
+                        }
+
+                        set.remove(policy);
+
+                        let mp = MappedPolicy::new(&set.iter().cloned().collect::<Vec<_>>().join(","));
+
+                        cache.add_or_update_unlocked(&cache.user_policies, k, &mp, now);
                     }
-
-                    set.remove(policy);
-
-                    let mp = MappedPolicy::new(&set.iter().cloned().collect::<Vec<_>>().join(","));
-
-                    Cache::add_or_update(&self.cache.user_policies, k, &mp, OffsetDateTime::now_utc());
                 }
-            }
 
-            let group_policy_cache = self.cache.group_policies.load();
-            for (k, v) in group_policy_cache.iter() {
-                let mut set = v.policy_set();
-                if set.contains(policy) {
-                    set.remove(policy);
+                let group_policy_cache = cache.group_policies.load();
+                for (k, v) in group_policy_cache.iter() {
+                    let mut set = v.policy_set();
+                    if set.contains(policy) {
+                        set.remove(policy);
 
-                    let mp = MappedPolicy::new(&set.iter().cloned().collect::<Vec<_>>().join(","));
-                    Cache::add_or_update(&self.cache.group_policies, k, &mp, OffsetDateTime::now_utc());
+                        let mp = MappedPolicy::new(&set.iter().cloned().collect::<Vec<_>>().join(","));
+                        cache.add_or_update_unlocked(&cache.group_policies, k, &mp, now);
+                    }
                 }
-            }
+            });
 
             return Ok(());
         }
 
-        Cache::add_or_update(&self.cache.policy_docs, policy, &m[policy], OffsetDateTime::now_utc());
+        self.cache.with_write_lock(|cache| {
+            cache.add_or_update_unlocked(&cache.policy_docs, policy, &m[policy], OffsetDateTime::now_utc());
+        });
 
         Ok(())
     }
@@ -1772,26 +1856,32 @@ where
                 return Err(err);
             }
 
-            if is_group {
-                Cache::delete(&self.cache.group_policies, name, OffsetDateTime::now_utc());
-            } else if user_type == UserType::Sts {
-                Cache::delete(&self.cache.sts_policies, name, OffsetDateTime::now_utc());
-            } else {
-                Cache::delete(&self.cache.user_policies, name, OffsetDateTime::now_utc());
-            }
+            self.cache.with_write_lock(|cache| {
+                let now = OffsetDateTime::now_utc();
+                if is_group {
+                    cache.delete_unlocked(&cache.group_policies, name, now);
+                } else if user_type == UserType::Sts {
+                    cache.delete_unlocked(&cache.sts_policies, name, now);
+                } else {
+                    cache.delete_unlocked(&cache.user_policies, name, now);
+                }
+            });
 
             return Ok(());
         }
 
         let mp = m[name].clone();
 
-        if is_group {
-            Cache::add_or_update(&self.cache.group_policies, name, &mp, OffsetDateTime::now_utc());
-        } else if user_type == UserType::Sts {
-            Cache::delete(&self.cache.sts_policies, name, OffsetDateTime::now_utc());
-        } else {
-            Cache::add_or_update(&self.cache.user_policies, name, &mp, OffsetDateTime::now_utc());
-        }
+        self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            if is_group {
+                cache.add_or_update_unlocked(&cache.group_policies, name, &mp, now);
+            } else if user_type == UserType::Sts {
+                cache.add_or_update_unlocked(&cache.sts_policies, name, &mp, now);
+            } else {
+                cache.add_or_update_unlocked(&cache.user_policies, name, &mp, now);
+            }
+        });
 
         Ok(())
     }
@@ -1803,9 +1893,9 @@ where
             }
 
             if user_type == UserType::Sts {
-                Cache::delete(&self.cache.sts_accounts, name, OffsetDateTime::now_utc());
+                self.cache.delete(&self.cache.sts_accounts, name, OffsetDateTime::now_utc());
             } else {
-                Cache::delete(&self.cache.users, name, OffsetDateTime::now_utc());
+                self.cache.delete(&self.cache.users, name, OffsetDateTime::now_utc());
             }
 
             let member_of = self.cache.user_group_memberships.load();
@@ -1820,111 +1910,134 @@ where
             }
 
             if user_type == UserType::Reg {
-                let users_cache = self.cache.users.load();
-                for (_, v) in users_cache.iter() {
+                let mut service_accounts_to_delete = Vec::new();
+                let mut temp_accounts_to_delete = HashSet::new();
+                for (_, v) in self.cache.users.load().iter() {
                     let u = &v.credentials;
                     if u.parent_user.as_str() == name && u.is_service_account() {
-                        let _ = self.api.delete_user_identity(&u.access_key, UserType::Svc).await;
-                        Cache::delete(&self.cache.users, &u.access_key, OffsetDateTime::now_utc());
+                        service_accounts_to_delete.push(u.access_key.clone());
                     }
                 }
 
-                let sts_accounts = self.cache.sts_accounts.load();
-                if let Some(u) = sts_accounts.get(name) {
+                for (_, u) in self.cache.sts_accounts.load().iter() {
                     let u = &u.credentials;
                     if u.parent_user.as_str() == name {
-                        let _ = self.api.delete_user_identity(&u.access_key, UserType::Sts).await;
-                        Cache::delete(&self.cache.sts_accounts, &u.access_key, OffsetDateTime::now_utc());
+                        temp_accounts_to_delete.insert(u.access_key.clone());
                     }
                 }
+
+                for access_key in service_accounts_to_delete.iter() {
+                    let _ = self.api.delete_user_identity(access_key, UserType::Svc).await;
+                }
+                for access_key in temp_accounts_to_delete.iter() {
+                    let _ = self.api.delete_user_identity(access_key, UserType::Sts).await;
+                }
+
+                self.cache.with_write_lock(|cache| {
+                    let now = OffsetDateTime::now_utc();
+                    for access_key in service_accounts_to_delete.iter() {
+                        cache.delete_unlocked(&cache.users, access_key, now);
+                    }
+                    for access_key in temp_accounts_to_delete.iter() {
+                        cache.delete_unlocked(&cache.sts_accounts, access_key, now);
+                    }
+                });
             }
 
-            Cache::delete(&self.cache.user_policies, name, OffsetDateTime::now_utc());
+            self.cache.delete(&self.cache.user_policies, name, OffsetDateTime::now_utc());
 
             return Ok(());
         }
 
         let u = m[name].clone();
-        match user_type {
-            UserType::Sts => {
-                Cache::add_or_update(&self.cache.sts_accounts, name, &u, OffsetDateTime::now_utc());
-            }
-            UserType::Reg | UserType::Svc => {
-                Cache::add_or_update(&self.cache.users, name, &u, OffsetDateTime::now_utc());
-            }
-            UserType::None => {}
-        }
+        let mut user_policy_update = None;
+        let mut sts_policy_update = None;
 
         match user_type {
             UserType::Sts => {
-                let name = u.credentials.parent_user;
-                let mut m = HashMap::new();
-                if let Err(err) = self.api.load_mapped_policy(&name, user_type, false, &mut m).await {
+                let parent_user = u.credentials.parent_user.clone();
+                let mut policies = HashMap::new();
+                if let Err(err) = self
+                    .api
+                    .load_mapped_policy(&parent_user, user_type, false, &mut policies)
+                    .await
+                {
                     if !is_err_no_such_policy(&err) {
                         return Err(err);
                     }
-
-                    return Ok(());
+                } else if let Some(policy) = policies.get(&parent_user).cloned() {
+                    sts_policy_update = Some((parent_user, policy));
                 }
-
-                Cache::add_or_update(&self.cache.sts_policies, &name, &m[&name], OffsetDateTime::now_utc());
             }
             UserType::Reg => {
-                let mut m = HashMap::new();
-                if let Err(err) = self.api.load_mapped_policy(name, user_type, false, &mut m).await {
+                let mut policies = HashMap::new();
+                if let Err(err) = self.api.load_mapped_policy(name, user_type, false, &mut policies).await {
                     if !is_err_no_such_policy(&err) {
                         return Err(err);
                     }
-                    return Ok(());
+                } else if let Some(policy) = policies.get(name).cloned() {
+                    user_policy_update = Some((name.to_string(), policy));
                 }
-
-                Cache::add_or_update(&self.cache.user_policies, name, &m[name], OffsetDateTime::now_utc());
             }
 
             UserType::Svc => {
-                let users_cache = self.cache.users.load();
-                if let Some(u) = users_cache.get(&u.credentials.parent_user) {
-                    let mut m = HashMap::new();
-                    if let Err(err) = self
-                        .api
-                        .load_mapped_policy(&u.credentials.parent_user, UserType::Reg, false, &mut m)
-                        .await
-                    {
-                        if !is_err_no_such_policy(&err) {
-                            return Err(err);
-                        }
-                        return Ok(());
-                    }
-
-                    Cache::add_or_update(
-                        &self.cache.user_policies,
-                        &u.credentials.parent_user,
-                        &m[&u.credentials.parent_user],
-                        OffsetDateTime::now_utc(),
-                    );
+                let parent_user = u.credentials.parent_user.clone();
+                let parent_user_type = if self.cache.users.load().contains_key(&parent_user) {
+                    UserType::Reg
                 } else {
-                    let mut m = HashMap::new();
+                    UserType::Sts
+                };
+
+                if parent_user_type == UserType::Reg {
+                    let mut policies = HashMap::new();
                     if let Err(err) = self
                         .api
-                        .load_mapped_policy(&u.credentials.parent_user, UserType::Sts, false, &mut m)
+                        .load_mapped_policy(&parent_user, UserType::Reg, false, &mut policies)
                         .await
                     {
                         if !is_err_no_such_policy(&err) {
                             return Err(err);
                         }
-                        return Ok(());
+                    } else if let Some(policy) = policies.get(&parent_user).cloned() {
+                        user_policy_update = Some((parent_user, policy));
                     }
-
-                    Cache::add_or_update(
-                        &self.cache.sts_policies,
-                        &u.credentials.parent_user,
-                        &m[&u.credentials.parent_user],
-                        OffsetDateTime::now_utc(),
-                    );
+                } else {
+                    let mut policies = HashMap::new();
+                    if let Err(err) = self
+                        .api
+                        .load_mapped_policy(&parent_user, UserType::Sts, false, &mut policies)
+                        .await
+                    {
+                        if !is_err_no_such_policy(&err) {
+                            return Err(err);
+                        }
+                    } else if let Some(policy) = policies.get(&parent_user).cloned() {
+                        sts_policy_update = Some((parent_user, policy));
+                    }
                 }
             }
             UserType::None => {}
         }
+
+        self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            match user_type {
+                UserType::Sts => {
+                    cache.add_or_update_unlocked(&cache.sts_accounts, name, &u, now);
+                }
+                UserType::Reg | UserType::Svc => {
+                    cache.add_or_update_unlocked(&cache.users, name, &u, now);
+                }
+                UserType::None => {}
+            }
+
+            if let Some((name, policy)) = &user_policy_update {
+                cache.add_or_update_unlocked(&cache.user_policies, name, policy, now);
+            }
+            if let Some((name, policy)) = &sts_policy_update {
+                cache.add_or_update_unlocked(&cache.sts_policies, name, policy, now);
+            }
+        });
 
         Ok(())
     }
