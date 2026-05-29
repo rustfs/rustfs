@@ -192,6 +192,10 @@ where
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(crate::get_user_agent(crate::ServiceType::Basis));
+        #[cfg(test)]
+        {
+            client_builder = client_builder.no_proxy();
+        }
 
         // 1. Configure server certificate verification
         if args.skip_tls_verify {
@@ -560,7 +564,6 @@ mod tests {
     use super::{WebhookArgs, WebhookTarget};
     use crate::target::{Target, TargetType, decode_object_name};
     use tokio::net::TcpListener;
-    use tokio::sync::mpsc;
     use url::Url;
     use url::form_urlencoded;
 
@@ -679,43 +682,37 @@ mod tests {
     async fn test_is_active_uses_origin_reachability_for_path_endpoints() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (path_tx, mut path_rx) = mpsc::channel(1);
-        let accept_task = tokio::spawn(async move {
+        let server = async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
             loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let path_tx = path_tx.clone();
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-                    let mut request = Vec::new();
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        let read = stream.read(&mut buf).await.unwrap();
-                        if read == 0 {
-                            break;
-                        }
-                        request.extend_from_slice(&buf[..read]);
-                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-
-                    let request_line = request
-                        .split(|byte| *byte == b'\n')
-                        .next()
-                        .and_then(|line| std::str::from_utf8(line).ok())
-                        .unwrap_or_default()
-                        .trim();
-                    let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
-                    let _ = path_tx.send(path.clone()).await;
-
-                    if path == "/" {
-                        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                        let _ = stream.write_all(response).await;
-                    }
-                });
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
             }
-        });
+
+            let request_line = request
+                .split(|byte| *byte == b'\n')
+                .next()
+                .and_then(|line| std::str::from_utf8(line).ok())
+                .unwrap_or_default()
+                .trim();
+            let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
+
+            if path == "/" {
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response).await;
+            }
+            path
+        };
 
         let args = WebhookArgs {
             endpoint: Url::parse(&format!("http://{address}/hook")).unwrap(),
@@ -723,8 +720,8 @@ mod tests {
         };
         let target = WebhookTarget::<serde_json::Value>::new("path-probe".to_string(), args).unwrap();
 
-        assert!(target.is_active().await.unwrap());
-        assert_eq!(path_rx.recv().await.unwrap(), "/");
-        accept_task.abort();
+        let (is_active, path) = tokio::join!(target.is_active(), server);
+        assert!(is_active.unwrap());
+        assert_eq!(path, "/");
     }
 }
