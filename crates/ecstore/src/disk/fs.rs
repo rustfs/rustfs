@@ -163,31 +163,36 @@ pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
 
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
-    let meta = fs::metadata(path.as_ref()).await?;
-    if meta.is_dir() {
-        fs::remove_dir(path.as_ref()).await
-    } else {
-        fs::remove_file(path.as_ref()).await
+    // Try remove_file first; fall back to remove_dir if it's a directory
+    match fs::remove_file(path.as_ref()).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EISDIR) || e.kind() == io::ErrorKind::IsADirectory => {
+            fs::remove_dir(path.as_ref()).await
+        }
+        Err(e) => Err(e),
     }
 }
 
 pub async fn remove_all(path: impl AsRef<Path>) -> io::Result<()> {
-    let meta = fs::metadata(path.as_ref()).await?;
-    if meta.is_dir() {
-        fs::remove_dir_all(path.as_ref()).await
-    } else {
-        fs::remove_file(path.as_ref()).await
+    // Try remove_file first; fall back to remove_dir_all if it's a directory
+    match fs::remove_file(path.as_ref()).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EISDIR) || e.kind() == io::ErrorKind::IsADirectory => {
+            fs::remove_dir_all(path.as_ref()).await
+        }
+        Err(e) => Err(e),
     }
 }
 
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn remove_std(path: impl AsRef<Path>) -> io::Result<()> {
-    let path = path.as_ref();
-    let meta = std::fs::metadata(path)?;
-    if meta.is_dir() {
-        std::fs::remove_dir(path)
-    } else {
-        std::fs::remove_file(path)
+    // Try remove_file first; fall back to remove_dir if it's a directory
+    match std::fs::remove_file(path.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EISDIR) || e.kind() == io::ErrorKind::IsADirectory => {
+            std::fs::remove_dir(path.as_ref())
+        }
+        Err(e) => Err(e),
     }
 }
 

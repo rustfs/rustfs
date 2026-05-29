@@ -294,6 +294,33 @@ impl Erasure {
         writers.shutdown().await?;
         Ok((reader, total))
     }
+
+    /// Fast path for small inline objects: skip tokio::spawn + mpsc channel.
+    /// Reads all data, encodes directly, writes shards sequentially.
+    pub async fn encode_inline_small<R>(
+        self: Arc<Self>,
+        mut reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::with_capacity(self.block_size);
+        let total = reader.read_to_end(&mut buf).await?;
+
+        if total == 0 {
+            return Ok((reader, 0));
+        }
+
+        let shards = self.encode_data(&buf)?;
+        let mut mw = MultiWriter::new(writers, quorum);
+        mw.write(shards).await?;
+        mw.shutdown().await?;
+        Ok((reader, total))
+    }
 }
 
 #[cfg(test)]
