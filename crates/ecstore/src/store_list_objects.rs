@@ -208,6 +208,22 @@ fn parse_version_marker(marker: String) -> Result<VersionMarker> {
     }
 }
 
+fn version_marker_for_entries(
+    entries: Option<&MetaCacheEntriesSorted>,
+    key_marker: Option<&str>,
+    version_marker: Option<VersionMarker>,
+) -> Option<VersionMarker> {
+    let marker = version_marker?;
+    let Some(key_marker) = key_marker else {
+        return Some(marker);
+    };
+
+    entries
+        .and_then(|entries| entries.entries().first().map(|entry| entry.name.as_str() == key_marker))
+        .unwrap_or_default()
+        .then_some(marker)
+}
+
 impl ListPathOptions {
     pub fn set_filter(&mut self) {
         if METACACHE_SHARE_PREFIX {
@@ -548,8 +564,10 @@ impl ECStore {
         if let Some(result) = list_result.entries.as_mut()
             && !has_version_marker
         {
-            result.forward_past(opts.marker);
+            result.forward_past(opts.marker.clone());
         }
+
+        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
         let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
@@ -1537,10 +1555,11 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod test {
     use super::{
         ENV_API_LIST_QUORUM, ListPathOptions, MAX_OBJECT_LIST, VersionMarker, gather_results, list_metadata_resolution_params,
-        list_quorum_from_env, max_keys_plus_one, normalize_list_quorum, parse_version_marker, walk_result_from_set_errors,
+        list_quorum_from_env, max_keys_plus_one, normalize_list_quorum, parse_version_marker, version_marker_for_entries,
+        walk_result_from_set_errors,
     };
     use crate::error::StorageError;
-    use rustfs_filemeta::MetaCacheEntry;
+    use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
@@ -1550,6 +1569,13 @@ mod test {
     fn test_meta_entry(name: &str) -> MetaCacheEntry {
         MetaCacheEntry {
             name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn sorted_entries(names: &[&str]) -> MetaCacheEntriesSorted {
+        MetaCacheEntriesSorted {
+            o: MetaCacheEntries(names.iter().map(|name| Some(test_meta_entry(name))).collect()),
             ..Default::default()
         }
     }
@@ -1627,6 +1653,23 @@ mod test {
             .expect("gather_results should finish after sending a limited result")
             .expect("gather_results task should not panic")
             .expect("gather_results should succeed");
+    }
+
+    #[test]
+    fn version_marker_is_applied_only_when_key_marker_entry_is_present() {
+        let version_marker = Some(VersionMarker::Null);
+
+        let listed_after_deleted_marker = sorted_entries(&["obj-b", "obj-c"]);
+        assert_eq!(
+            version_marker_for_entries(Some(&listed_after_deleted_marker), Some("obj-a"), version_marker),
+            None
+        );
+
+        let listed_with_marker = sorted_entries(&["obj-a", "obj-b"]);
+        assert_eq!(
+            version_marker_for_entries(Some(&listed_with_marker), Some("obj-a"), version_marker),
+            version_marker
+        );
     }
 
     #[tokio::test]
