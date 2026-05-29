@@ -26,3 +26,20 @@ pub const DEFAULT_HEALTH_READINESS_CACHE_TTL_MS: u64 = 1000;
 /// When enabled, only `status` and `ready` fields are returned.
 pub const ENV_HEALTH_MINIMAL_RESPONSE_ENABLE: &str = "RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE";
 pub const DEFAULT_HEALTH_MINIMAL_RESPONSE_ENABLE: bool = false;
+
+/// Enable busy protection for health probes.
+/// When enabled with a positive request threshold, alias health probes may
+/// return 429 when active HTTP requests exceed the threshold.
+pub const ENV_HEALTH_COMPAT_BUSY_CHECK_ENABLE: &str = "RUSTFS_HEALTH_COMPAT_BUSY_CHECK_ENABLE";
+pub const DEFAULT_HEALTH_COMPAT_BUSY_CHECK_ENABLE: bool = false;
+
+/// Max active HTTP requests before alias health probes report busy (429).
+/// Set to 0 to disable thresholding even when busy protection is enabled.
+pub const ENV_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS: &str = "RUSTFS_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS";
+pub const DEFAULT_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS: usize = 0;
+
+/// Enable KMS readiness check for alias readiness probes.
+/// When enabled, `/health/ready` additionally requires KMS service to be
+/// in running state if a global KMS manager exists.
+pub const ENV_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE: &str = "RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE";
+pub const DEFAULT_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE: bool = false;

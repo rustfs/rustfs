@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::admin::console::is_console_path;
-use crate::admin::handlers::health::{build_health_payload, health_check_state, probe_from_path};
+use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, probe_from_path};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
-    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX,
-    RUSTFS_ADMIN_PREFIX, collect_dependency_readiness_report,
+    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
+    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests,
+    collect_dependency_readiness_report,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
@@ -625,10 +626,58 @@ fn health_endpoint_enabled() -> bool {
     rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE)
 }
 
+fn health_compat_busy_check_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_HEALTH_COMPAT_BUSY_CHECK_ENABLE,
+        rustfs_config::DEFAULT_HEALTH_COMPAT_BUSY_CHECK_ENABLE,
+    )
+}
+
+fn health_compat_busy_max_active_requests() -> u64 {
+    rustfs_utils::get_env_usize(
+        rustfs_config::ENV_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS,
+        rustfs_config::DEFAULT_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS,
+    ) as u64
+}
+
+fn health_compat_kms_ready_check_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE,
+        rustfs_config::DEFAULT_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE,
+    )
+}
+
+fn resolve_public_health_probe(method: &Method, path: &str) -> Option<HealthProbe> {
+    if (method != Method::GET && method != Method::HEAD) || !health_endpoint_enabled() {
+        return None;
+    }
+
+    match path {
+        HEALTH_PREFIX | HEALTH_COMPAT_LIVE_PATH => Some(HealthProbe::Liveness),
+        HEALTH_READY_PATH => Some(HealthProbe::Readiness),
+        _ => None,
+    }
+}
+
+fn alias_busy_threshold_exceeded(active_requests: u64) -> bool {
+    if !health_compat_busy_check_enabled() {
+        return false;
+    }
+
+    let max_active_requests = health_compat_busy_max_active_requests();
+    max_active_requests > 0 && active_requests > max_active_requests
+}
+
 fn is_public_health_endpoint_request(method: &Method, path: &str) -> bool {
-    (method == Method::GET || method == Method::HEAD)
-        && (path == HEALTH_PREFIX || path == HEALTH_READY_PATH)
-        && health_endpoint_enabled()
+    resolve_public_health_probe(method, path).is_some()
+}
+
+async fn health_kms_ready() -> bool {
+    let Some(service_manager) = rustfs_kms::get_global_kms_service_manager() else {
+        return true;
+    };
+
+    matches!(service_manager.get_status().await, rustfs_kms::KmsServiceStatus::Running)
 }
 
 async fn build_public_health_http_response<RestBody, GrpcBody>(
@@ -638,29 +687,50 @@ async fn build_public_health_http_response<RestBody, GrpcBody>(
 where
     RestBody: From<Bytes>,
 {
-    let probe = probe_from_path(&path);
-    let readiness_report = collect_dependency_readiness_report().await;
-    let storage_ready = readiness_report.readiness.storage_ready;
-    let iam_ready = readiness_report.readiness.iam_ready;
-    let lock_quorum_ready = readiness_report.readiness.lock_quorum_ready;
-    let health = health_check_state(storage_ready, iam_ready, lock_quorum_ready, probe);
-    let body = if method == Method::HEAD {
-        Bytes::new()
-    } else {
-        let payload = build_health_payload(
-            health,
-            storage_ready,
-            iam_ready,
-            lock_quorum_ready,
-            &readiness_report.degraded_reasons,
-            "rustfs-endpoint",
-            None,
-        );
-        Bytes::from(serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec()))
-    };
+    let probe = resolve_public_health_probe(&method, path.as_str())
+        .unwrap_or(probe_from_path(path.as_str()));
+
+    if probe == HealthProbe::Readiness && alias_busy_threshold_exceeded(active_http_requests()) {
+        let retry_after = HeaderValue::from_static("5");
+        let body_bytes = Bytes::from_static(b"{\"status\":\"busy\",\"ready\":false}");
+        let mut builder = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::RETRY_AFTER, retry_after);
+        if let Ok(val) = HeaderValue::from_str(&body_bytes.len().to_string()) {
+            builder = builder.header(http::header::CONTENT_LENGTH, val);
+        }
+        return builder
+            .body(HybridBody::Rest {
+                rest_body: RestBody::from(body_bytes),
+            })
+            .expect("failed to build health busy response");
+    }
+
+    let mut readiness_report = collect_dependency_readiness_report().await;
+    if probe == HealthProbe::Readiness
+        && health_compat_kms_ready_check_enabled()
+        && !health_kms_ready().await
+    {
+        readiness_report.readiness.lock_quorum_ready = false;
+        if !readiness_report
+            .degraded_reasons
+            .contains(&crate::server::ReadinessDegradedReason::KmsNotReady)
+        {
+            readiness_report
+                .degraded_reasons
+                .push(crate::server::ReadinessDegradedReason::KmsNotReady);
+        }
+    }
+
+    let response_parts = build_health_response_parts(method, probe, &readiness_report, "rustfs-endpoint", None);
+    let body = response_parts
+        .payload
+        .map(|payload| Bytes::from(serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec())))
+        .unwrap_or_default();
 
     Response::builder()
-        .status(health.status_code)
+        .status(response_parts.status_code)
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(HybridBody::Rest {
             rest_body: RestBody::from(body),
@@ -829,7 +899,7 @@ impl ConditionalCorsLayer {
     }
 
     /// Exact paths that should be excluded from being treated as S3 paths.
-    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &["/health", "/health/ready", "/profile/cpu", "/profile/memory"];
+    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &["/health", "/health/live", "/health/ready", "/profile/cpu", "/profile/memory"];
 
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
@@ -1216,6 +1286,72 @@ mod tests {
             assert!(body.is_empty());
         })
         .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_handles_health_live_path() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(HEALTH_COMPAT_LIVE_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_forwards_unknown_health_path_when_endpoint_disabled() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/health/live")
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("inner response");
+
+            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
+    }
+
+    #[test]
+    fn alias_busy_threshold_exceeded_requires_switch_and_positive_threshold() {
+        with_var(rustfs_config::ENV_HEALTH_COMPAT_BUSY_CHECK_ENABLE, Some("true"), || {
+            with_var(rustfs_config::ENV_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS, Some("2"), || {
+                assert!(!alias_busy_threshold_exceeded(2));
+                assert!(alias_busy_threshold_exceeded(3));
+            });
+        });
+
+        with_var(rustfs_config::ENV_HEALTH_COMPAT_BUSY_CHECK_ENABLE, Some("false"), || {
+            with_var(rustfs_config::ENV_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS, Some("1"), || {
+                assert!(!alias_busy_threshold_exceeded(100));
+            });
+        });
     }
 
     #[tokio::test]
