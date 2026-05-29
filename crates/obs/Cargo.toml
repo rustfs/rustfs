@@ -28,6 +28,7 @@ documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 [features]
 default = []
 gpu = ["dep:nvml-wrapper"]
+pyroscope = ["dep:pyroscope"]
 
 [lints]
 workspace = true
@@ -72,7 +73,7 @@ sysinfo = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
+pyroscope = { workspace = true, features = ["backend-pprof-rs"], optional = true }
 
 
 [dev-dependencies]

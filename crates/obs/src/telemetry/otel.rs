@@ -40,7 +40,7 @@ use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::build_env_filter;
-use crate::telemetry::guard::OtelGuard;
+use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
 use crate::telemetry::local::spawn_cleanup_task;
 use crate::telemetry::recorder::Recorder;
 use crate::telemetry::resource::build_resource;
@@ -164,7 +164,6 @@ pub(super) fn init_observability_http(
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let profiling_agent = init_profiler(config);
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
@@ -314,7 +313,6 @@ pub(super) fn init_observability_http(
         tracer_provider,
         meter_provider,
         logger_provider,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         profiling_agent,
         tracing_guard,
         stdout_guard,
@@ -491,8 +489,8 @@ fn build_logger_provider(
 /// Returns `None` when profiling export is disabled, when no usable
 /// profiling endpoint is configured, or when building or starting the agent
 /// fails.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
+#[cfg(all(feature = "pyroscope", any(target_os = "linux", target_os = "macos")))]
+fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
@@ -527,6 +525,11 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
             None
         }
     }
+}
+
+#[cfg(not(all(feature = "pyroscope", any(target_os = "linux", target_os = "macos"))))]
+fn init_profiler(_config: &OtelConfig) -> Option<ProfilingAgent> {
+    None
 }
 
 /// Create a stdout periodic metrics reader for the given interval.
