@@ -159,18 +159,12 @@ pub(crate) fn parse_list_objects_v2_params(
     let response_start_after = start_after.clone();
     let start_after_for_query = start_after.filter(|v| !v.is_empty());
 
-    if continuation_token.as_deref() == Some("") {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidArgument,
-            "Invalid continuation token".to_string(),
-        ));
-    }
-
     // Save original continuation_token for response (per S3 API spec, must echo back if provided)
     let response_continuation_token = continuation_token.clone();
 
     // Decode continuation_token from base64 for internal use
     let decoded_continuation_token = continuation_token
+        .filter(|token| !token.is_empty())
         .map(|token| {
             base64_simd::STANDARD
                 .decode_to_vec(token.as_bytes())
@@ -653,11 +647,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_list_objects_v2_params_rejects_empty_continuation_token() {
-        let err = parse_list_objects_v2_params(None, None, Some(1000), Some(String::new()), None)
-            .expect_err("empty continuation token should be rejected");
+    fn test_parse_list_objects_v2_params_preserves_empty_continuation_token() {
+        let parsed = parse_list_objects_v2_params(None, None, Some(1000), Some(String::new()), None)
+            .expect("empty continuation token should be accepted");
 
-        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+        assert_eq!(parsed.response_continuation_token, Some(String::new()));
+        assert_eq!(parsed.decoded_continuation_token, None);
     }
 
     #[test]
