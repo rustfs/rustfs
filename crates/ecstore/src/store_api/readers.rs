@@ -42,6 +42,8 @@ const MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER: &str = "X-Minio-Internal-Se
 #[cfg(feature = "rio-v2")]
 const MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Context";
 #[cfg(feature = "rio-v2")]
+const MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Sealed-Key";
+#[cfg(feature = "rio-v2")]
 const MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM: &str = "DAREv2-HMAC-SHA256";
 #[cfg(feature = "rio-v2")]
 const DARE_VERSION_20: u8 = 0x20;
@@ -1153,6 +1155,8 @@ fn managed_sse_domain(metadata: &HashMap<String, String>) -> &'static str {
         || matches!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"))
     {
         "SSE-KMS"
+    } else if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER) {
+        "SSE-C"
     } else {
         "SSE-S3"
     }
@@ -1222,7 +1226,8 @@ fn try_unseal_minio_object_key(
 
     let sealed_key_b64 = metadata
         .get(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
-        .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER));
+        .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
+        .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER));
     let Some(sealed_key_b64) = sealed_key_b64 else {
         return Ok(None);
     };
@@ -1295,6 +1300,15 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
         .ok_or_else(|| Error::other("missing stored SSE-C key md5"))?;
     if stored_md5 != &expected_md5 {
         return Err(Error::other("SSE-C key does not match object metadata"));
+    }
+
+    #[cfg(feature = "rio-v2")]
+    if let Some(object_key) = try_unseal_minio_object_key(&oi.user_defined, &oi.bucket, &oi.name, key_bytes)? {
+        return Ok(EncryptionMaterial {
+            key_bytes: object_key,
+            base_nonce: [0u8; 12],
+            key_kind: EncryptionKeyKind::Object,
+        });
     }
 
     Ok(EncryptionMaterial {
@@ -1633,6 +1647,40 @@ mod tests {
             HeaderValue::from_str(&BASE64_STANDARD.encode(md5_bytes(key_bytes))).expect("valid md5 header"),
         );
         headers
+    }
+
+    #[cfg(feature = "rio-v2")]
+    fn seal_ssec_object_key_for_test(
+        bucket: &str,
+        object: &str,
+        customer_key: [u8; 32],
+        object_key: [u8; 32],
+    ) -> ([u8; 32], Vec<u8>) {
+        let iv = [0x23u8; SEALED_KEY_IV_SIZE];
+        let sealing_key = derive_sealing_key(customer_key, iv, "SSE-C", bucket, object);
+        let cipher = Aes256Gcm::new_from_slice(&sealing_key).expect("valid sealing key");
+
+        let mut header = [0u8; DARE_HEADER_SIZE];
+        header[0] = DARE_VERSION_20;
+        header[1] = DARE_CIPHER_AES_256_GCM;
+        header[2..4].copy_from_slice(&31u16.to_le_bytes());
+        header[4] = 0x80;
+        header[5..16].copy_from_slice(&[0x45u8; 11]);
+
+        let nonce = Nonce::try_from(&header[4..16]).expect("valid nonce");
+        let mut sealed = header.to_vec();
+        sealed.extend_from_slice(
+            &cipher
+                .encrypt(
+                    &nonce,
+                    aes_gcm::aead::Payload {
+                        msg: &object_key,
+                        aad: &header[..4],
+                    },
+                )
+                .expect("seal object key"),
+        );
+        (iv, sealed)
     }
 
     #[tokio::test]
@@ -2500,6 +2548,71 @@ mod tests {
 
         let mut actual = Vec::new();
         reader.read_to_end(&mut actual).await.expect("read decrypted ssec object");
+
+        assert_eq!(offset, 0);
+        assert_eq!(length, encrypted.len() as i64);
+        assert_eq!(reader.object_info.size, plaintext.len() as i64);
+        assert_eq!(actual, plaintext);
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn test_get_object_reader_decrypts_ssec_sealed_object_key_full_object() {
+        let plaintext = b"ecstore-rio-v2-ssec-sealed-object-key".repeat(4096);
+        let customer_key = [0x31; 32];
+        let object_key = [0x67; 32];
+        let bucket = "bucket";
+        let object = "sealed-object";
+        let (sealing_iv, sealed_key) = seal_ssec_object_key_for_test(bucket, object, customer_key, object_key);
+
+        let mut encrypted = Vec::new();
+        crate::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypt object with rio-v2 object key");
+
+        let object_info = ObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            size: encrypted.len() as i64,
+            user_defined: HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5".to_string(),
+                    BASE64_STANDARD.encode(md5_bytes(customer_key)),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-original-size".to_string(),
+                    plaintext.len().to_string(),
+                ),
+                (
+                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+                ),
+                (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
+                (
+                    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
+                    BASE64_STANDARD.encode(sealed_key),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let (mut reader, offset, length) = GetObjectReader::new(
+            Box::new(Cursor::new(encrypted.clone())),
+            None,
+            &object_info,
+            &ObjectOptions::default(),
+            &ssec_headers_from_key(customer_key),
+        )
+        .await
+        .expect("rio-v2 ssec sealed-object-key read should be supported");
+
+        let mut actual = Vec::new();
+        reader
+            .read_to_end(&mut actual)
+            .await
+            .expect("read decrypted rio-v2 ssec object");
 
         assert_eq!(offset, 0);
         assert_eq!(length, encrypted.len() as i64);

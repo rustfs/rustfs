@@ -71,32 +71,7 @@ impl KmsManager {
 
     /// Generate a data encryption key
     pub async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
-        // Check cache first if enabled
-        if self.config.enable_cache {
-            let cache = self.cache.read().await;
-            if let Some(cached_key) = cache.get_data_key(&request.key_id).await
-                && cached_key.key_spec == request.key_spec
-            {
-                return Ok(GenerateDataKeyResponse {
-                    key_id: request.key_id.clone(),
-                    plaintext_key: cached_key.plaintext.clone(),
-                    ciphertext_blob: cached_key.ciphertext,
-                });
-            }
-        }
-
-        // Generate new data key from backend
-        let response = self.backend.generate_data_key(request).await?;
-
-        // Cache the data key if enabled
-        if self.config.enable_cache {
-            let mut cache = self.cache.write().await;
-            cache
-                .put_data_key(&response.key_id, &response.plaintext_key, &response.ciphertext_blob)
-                .await;
-        }
-
-        Ok(response)
+        self.backend.generate_data_key(request).await
     }
 
     /// Describe a key
@@ -156,7 +131,6 @@ impl KmsManager {
         if self.config.enable_cache {
             let mut cache = self.cache.write().await;
             cache.remove_key_metadata(&response.key_id).await;
-            cache.remove_data_key(&response.key_id).await;
         }
 
         Ok(response)
@@ -186,6 +160,7 @@ mod tests {
     use super::*;
     use crate::backends::local::LocalKmsBackend;
     use crate::types::{KeySpec, KeyState, KeyUsage};
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -236,5 +211,63 @@ mod tests {
         // Test health check
         let health = manager.health_check().await.expect("Health check failed");
         assert!(health);
+    }
+
+    #[tokio::test]
+    async fn generate_data_key_does_not_reuse_context_bound_ciphertext() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config = KmsConfig::local(temp_dir.path().to_path_buf());
+
+        let backend = Arc::new(LocalKmsBackend::new(config.clone()).await.expect("Failed to create backend"));
+        let manager = KmsManager::new(backend, config);
+
+        let create_response = manager
+            .create_key(CreateKeyRequest {
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: Some("Context-bound data key test".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to create key");
+
+        let first_context = HashMap::from([
+            ("bucket".to_string(), "sse-smoke".to_string()),
+            ("object".to_string(), "first.bin".to_string()),
+        ]);
+        let second_context = HashMap::from([
+            ("bucket".to_string(), "sse-smoke".to_string()),
+            ("object".to_string(), "second.bin".to_string()),
+        ]);
+
+        let first = manager
+            .generate_data_key(GenerateDataKeyRequest {
+                key_id: create_response.key_id.clone(),
+                key_spec: KeySpec::Aes256,
+                encryption_context: first_context.clone(),
+            })
+            .await
+            .expect("Failed to generate first data key");
+        let second = manager
+            .generate_data_key(GenerateDataKeyRequest {
+                key_id: create_response.key_id.clone(),
+                key_spec: KeySpec::Aes256,
+                encryption_context: second_context.clone(),
+            })
+            .await
+            .expect("Failed to generate second data key");
+
+        assert_ne!(
+            first.ciphertext_blob, second.ciphertext_blob,
+            "data keys must not be cached only by KMS key id because ciphertext is bound to object context"
+        );
+
+        manager
+            .decrypt(DecryptRequest {
+                ciphertext: second.ciphertext_blob,
+                encryption_context: second_context,
+                grant_tokens: Vec::new(),
+            })
+            .await
+            .expect("second data key should decrypt with its own context");
     }
 }
