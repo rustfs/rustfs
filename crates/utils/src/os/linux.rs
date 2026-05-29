@@ -447,9 +447,10 @@ mod tests {
         let bsize = 4_096_u64;
 
         let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, Path::new("/data")).unwrap();
-        assert_eq!(total, blocks * bsize);
+        let reserved = bfree - bavail;
+        assert_eq!(total, (blocks - reserved) * bsize);
         assert_eq!(free, bavail * bsize);
-        assert_eq!(used, (blocks - bavail) * bsize);
+        assert_eq!(used, total - free);
     }
 
     #[test]
