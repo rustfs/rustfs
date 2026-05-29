@@ -125,7 +125,7 @@ async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, fil
             &manifest.bucket,
             &path,
             0,
-            part.size as usize,
+            part.size,
             file_info.erasure.shard_size(),
             checksum_info.algorithm.clone(),
             false,
