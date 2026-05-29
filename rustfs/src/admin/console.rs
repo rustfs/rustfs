@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::health::{HealthProbe, build_health_payload, collect_dependency_readiness, health_check_state};
+use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
 use crate::license::has_valid_license;
 use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, RUSTFS_ADMIN_PREFIX, VERSION};
 use crate::version::build;
@@ -465,12 +465,20 @@ fn setup_console_middleware_stack(
     if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
         app = app
             .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
+            .route(
+                &format!("{CONSOLE_PREFIX}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
+                get(health_check).head(health_check),
+            )
             .route(&format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"), get(health_check).head(health_check));
     } else {
         // Keep disabled health probes from falling through to the SPA fallback.
         app = app
             .route(
                 &format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+                get(health_route_disabled).head(health_route_disabled),
+            )
+            .route(
+                &format!("{CONSOLE_PREFIX}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
                 get(health_route_disabled).head(health_route_disabled),
             )
             .route(
@@ -523,31 +531,26 @@ async fn health_check(method: Method, uri: Uri) -> Response {
         HealthProbe::Liveness
     };
     let readiness_report = collect_dependency_readiness().await;
-    let storage_ready = readiness_report.readiness.storage_ready;
-    let iam_ready = readiness_report.readiness.iam_ready;
-    let lock_quorum_ready = readiness_report.readiness.lock_quorum_ready;
-    let health = health_check_state(storage_ready, iam_ready, lock_quorum_ready, probe);
+    let uptime = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let response_parts =
+        build_health_response_parts(method.clone(), probe, &readiness_report, "rustfs-console", Some(uptime), None);
 
     let builder = Response::builder()
-        .status(health.status_code)
+        .status(response_parts.status_code)
         .header("content-type", "application/json");
 
     match method {
         // GET: Returns complete JSON
         Method::GET => {
-            let uptime = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let body_json = build_health_payload(
-                health,
-                storage_ready,
-                iam_ready,
-                lock_quorum_ready,
-                &readiness_report.degraded_reasons,
-                "rustfs-console",
-                Some(uptime),
-            );
+            let body_json = response_parts.payload.unwrap_or_else(|| {
+                serde_json::json!({
+                    "status": "error",
+                    "service": "rustfs-console",
+                })
+            });
 
             // Return a minimal JSON when serialization fails to avoid panic
             let body_str = serde_json::to_string(&body_json).unwrap_or_else(|e| {
