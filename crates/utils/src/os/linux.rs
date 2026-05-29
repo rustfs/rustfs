@@ -67,15 +67,18 @@ fn calculate_space_usage(
     bsize: u64,
     path_display: &str,
 ) -> std::io::Result<(u64, u64, u64)> {
-    let reserved = bfree.saturating_sub(bavail);
-    if bfree < bavail {
+    let available = if bfree < bavail {
         warn!(
             path = %path_display,
             f_bfree = bfree,
             f_bavail = bavail,
-            "detected f_bavail greater than f_bfree, treating reserved blocks as 0 for compatibility"
+            "detected f_bavail greater than f_bfree, capping available blocks to f_bfree for compatibility"
         );
-    }
+        bfree
+    } else {
+        bavail
+    };
+    let reserved = bfree - available;
 
     let total = match blocks.checked_sub(reserved) {
         Some(total) => total * bsize,
@@ -86,7 +89,7 @@ fn calculate_space_usage(
         }
     };
 
-    let free = bavail * bsize;
+    let free = available * bsize;
     let used = match total.checked_sub(free) {
         Some(used) => used,
         None => {
@@ -430,13 +433,13 @@ mod tests {
 
         let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, "/data").unwrap();
         assert_eq!(total, blocks * bsize);
-        assert_eq!(free, bavail * bsize);
+        assert_eq!(free, bfree * bsize);
         assert_eq!(used, total - free);
     }
 
     #[test]
     fn calculate_space_usage_rejects_free_greater_than_total() {
-        let err = calculate_space_usage(100, 100, 200, 4_096, "/data").unwrap_err();
+        let err = calculate_space_usage(100, 120, 120, 4_096, "/data").unwrap_err();
         assert!(err.to_string().contains("detected free space"));
     }
 }
