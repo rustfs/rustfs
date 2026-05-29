@@ -14,12 +14,15 @@
 
 use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use async_trait::async_trait;
+use bytes::Bytes;
 use rustfs_lock::{
     LockClient, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
     types::{LockId, LockMetadata, LockPriority},
 };
 use rustfs_protos::proto_gen::node_service::{BatchGenerallyLockRequest, GenerallyLockRequest, PingRequest};
-use rustfs_protos::{evict_failed_connection, proto_gen::node_service::node_service_client::NodeServiceClient};
+use rustfs_protos::{
+    evict_failed_connection, models::PingBodyBuilder, proto_gen::node_service::node_service_client::NodeServiceClient,
+};
 use std::time::Duration;
 use tokio::time::timeout;
 use tonic::Request;
@@ -40,6 +43,20 @@ impl RemoteClient {
 
     pub fn from_url(url: url::Url) -> Self {
         Self { addr: url.to_string() }
+    }
+
+    fn build_ping_request() -> PingRequest {
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let payload = fbb.create_vector(b"health-check");
+        let mut builder = PingBodyBuilder::new(&mut fbb);
+        builder.add_payload(payload);
+        let root = builder.finish();
+        fbb.finish(root, None);
+
+        PingRequest {
+            version: 1,
+            body: Bytes::copy_from_slice(fbb.finished_data()),
+        }
     }
 
     /// Create a minimal LockRequest for unlock operations using only lock_id
@@ -510,10 +527,7 @@ impl LockClient for RemoteClient {
             }
         };
 
-        let ping_req = Request::new(PingRequest {
-            version: 1,
-            body: bytes::Bytes::new(),
-        });
+        let ping_req = Request::new(Self::build_ping_request());
 
         match client.ping(ping_req).await {
             Ok(_) => {

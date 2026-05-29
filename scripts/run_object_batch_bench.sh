@@ -108,12 +108,28 @@ print_dry_run_command() {
 
 normalize_warp_host() {
   local raw="$1"
-  raw="${raw#http://}"
-  raw="${raw#https://}"
-  raw="${raw%%/*}"
-  raw="${raw%%\?*}"
-  raw="${raw%%\#*}"
-  echo "$raw"
+  local item normalized
+  local -a parts
+  local -a hosts=()
+
+  IFS=',' read -r -a parts <<< "$raw"
+  for item in "${parts[@]}"; do
+    item="$(echo "$item" | xargs)"
+    [[ -z "$item" ]] && continue
+    item="${item#http://}"
+    item="${item#https://}"
+    item="${item%%/*}"
+    item="${item%%\?*}"
+    item="${item%%\#*}"
+    [[ -n "$item" ]] && hosts+=("$item")
+  done
+
+  if [[ ${#hosts[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  normalized="$(IFS=','; echo "${hosts[*]}")"
+  echo "$normalized"
 }
 
 parse_args() {
