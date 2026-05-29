@@ -30,6 +30,7 @@ harness = false
 
 [dependencies]
 metrics = { workspace = true }
+rustfs-s3-ops = { workspace = true }
 num_cpus = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync","rt"] }

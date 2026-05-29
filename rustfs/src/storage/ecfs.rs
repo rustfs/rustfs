@@ -41,7 +41,8 @@ use rustfs_ecstore::{
     new_object_layer_fn,
     store_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations, ObjectOptions},
 };
-use rustfs_s3_common::{S3Operation, record_s3_op};
+use rustfs_io_metrics::record_s3_op;
+use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -71,7 +72,7 @@ impl Default for FS {
 
 impl FS {
     pub fn new() -> Self {
-        rustfs_s3_common::init_s3_metrics();
+        rustfs_io_metrics::init_s3_metrics();
         Self {}
     }
 

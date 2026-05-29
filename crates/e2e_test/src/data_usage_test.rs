@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use aws_sdk_s3::primitives::ByteStream;
-use rustfs_common::data_usage::DataUsageInfo;
+use rustfs_data_usage::DataUsageInfo;
 use serial_test::serial;
 
 use crate::common::{RustFSTestEnvironment, TEST_BUCKET, awscurl_get, init_logging};

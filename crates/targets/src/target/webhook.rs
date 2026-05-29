@@ -16,14 +16,21 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode, fingerprint::TargetTlsGeneration,
+        validate::validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, open_target_queue_store, persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, open_target_queue_store,
+        persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use reqwest::{Client, StatusCode, Url};
+use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{
@@ -104,7 +111,11 @@ where
     id: TargetID,
     args: WebhookArgs,
     health_check_url: Option<Url>,
-    http_client: Arc<Client>,
+    http_client: Arc<Mutex<Client>>,
+    tls_state: Arc<Mutex<TargetTlsState>>,
+    /// When present, the adapter provides coordinator-managed TLS material;
+    /// otherwise the inline fingerprint path is used as a fallback.
+    tls_adapter: Option<TlsReloadAdapter<Client>>,
     // Add Send + Sync constraints to ensure thread safety
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     initialized: AtomicBool,
@@ -124,6 +135,8 @@ where
             args: self.args.clone(),
             health_check_url: self.health_check_url.clone(),
             http_client: Arc::clone(&self.http_client),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             initialized: AtomicBool::new(self.initialized.load(Ordering::SeqCst)),
             cancel_sender: self.cancel_sender.clone(),
@@ -146,7 +159,7 @@ where
         };
 
         // Build HTTP client using the helper function
-        let http_client = Arc::new(Self::build_http_client(&args)?);
+        let http_client = Arc::new(Mutex::new(Self::build_http_client(&args)?));
 
         let queue_store = open_target_queue_store(
             &args.queue_dir,
@@ -165,6 +178,8 @@ where
             args,
             health_check_url,
             http_client,
+            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
+            tls_adapter: None,
             store: queue_store,
             initialized: AtomicBool::new(false),
             cancel_sender,
@@ -188,11 +203,18 @@ where
             );
         } else if !args.client_ca.is_empty() {
             // Use user-provided custom CA certificate
-            let ca_cert_pem = std::fs::read(&args.client_ca)
-                .map_err(|e| TargetError::Configuration(format!("Failed to read root CA cert: {e}")))?;
-            let ca_cert = reqwest::Certificate::from_pem(&ca_cert_pem)
+            let certs_der = load_cert_bundle_der_bytes(&args.client_ca)
                 .map_err(|e| TargetError::Configuration(format!("Failed to parse root CA cert: {e}")))?;
-            client_builder = client_builder.add_root_certificate(ca_cert);
+            if certs_der.is_empty() {
+                return Err(TargetError::Configuration(
+                    "Webhook client_ca did not contain any parsable certificates".to_string(),
+                ));
+            }
+            for cert_der in certs_der {
+                let ca_cert = reqwest::Certificate::from_der(&cert_der)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to load root CA cert: {e}")))?;
+                client_builder = client_builder.add_root_certificate(ca_cert);
+            }
         }
         // If neither is set, use the system's default trust store
 
@@ -213,6 +235,29 @@ where
             .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {e}")))
     }
 
+    async fn refresh_tls(&self) -> Result<(), TargetError> {
+        let next_fingerprint =
+            build_target_tls_fingerprint(&self.args.client_ca, &self.args.client_cert, &self.args.client_key).await?;
+        let tls_changed = {
+            let tls_state_guard = self.tls_state.lock();
+            tls_state_guard.fingerprint.as_ref() != Some(&next_fingerprint)
+        };
+        if !tls_changed {
+            return Ok(());
+        }
+
+        let new_client = Self::build_http_client(&self.args)?;
+        {
+            let mut tls_state_guard = self.tls_state.lock();
+            if tls_state_guard.fingerprint.as_ref() == Some(&next_fingerprint) {
+                return Ok(());
+            }
+            *self.http_client.lock() = new_client;
+            tls_state_guard.refresh(next_fingerprint);
+        }
+        Ok(())
+    }
+
     fn health_check_url(endpoint: &Url) -> Result<Url, TargetError> {
         endpoint
             .host()
@@ -230,7 +275,8 @@ where
             return Ok(false);
         };
 
-        match tokio::time::timeout(Duration::from_secs(5), self.http_client.head(health_check_url.as_str()).send()).await {
+        let client = self.http_client.lock().clone();
+        match tokio::time::timeout(Duration::from_secs(5), client.head(health_check_url.as_str()).send()).await {
             Ok(Ok(resp)) => {
                 debug!(
                     target = %self.id,
@@ -299,8 +345,14 @@ where
             "Sending webhook payload"
         );
 
-        let mut req_builder = self
-            .http_client
+        // When a TLS reload adapter is attached, it drives client rebuilds in
+        // the background. The inline per-send fingerprint check is skipped.
+        if self.tls_adapter.is_none() {
+            self.refresh_tls().await?;
+        }
+
+        let client = self.http_client.lock().clone();
+        let mut req_builder = client
             .post(self.args.endpoint.as_str())
             .header("Content-Type", meta.content_type.as_str());
 
@@ -425,6 +477,7 @@ where
     async fn close(&self) -> Result<(), TargetError> {
         // Send cancel signal to background tasks
         let _ = self.cancel_sender.try_send(());
+        // Adapter cleanup is done by the coordinator; no local state to reset.
         info!("Webhook target closed: {}", self.id);
         Ok(())
     }
@@ -457,6 +510,48 @@ where
 
     fn record_final_failure(&self) {
         self.delivery_counters.record_final_failure();
+    }
+}
+
+/// Coordinated TLS hot-reload implementation for Webhook targets.
+///
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the HTTP client without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for WebhookTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Client;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.client_ca.clone(),
+            client_cert_path: self.args.client_cert.clone(),
+            client_key_path: self.args.client_key.clone(),
+            target_label: format!("webhook:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        // build_http_client is synchronous (reads files + configures reqwest).
+        // The coordinator already runs this in a background task, so the
+        // synchronous file I/O does not block the send path.
+        Self::build_http_client(&self.args)
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        *self.http_client.lock() = (*material).clone();
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.client_ca, &self.args.client_cert, &self.args.client_key)
     }
 }
 

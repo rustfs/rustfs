@@ -39,12 +39,12 @@ impl SetDisks {
 
         let write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                StorageError::other(format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(bucket, object, "write", &e)
-                ))
-            })?)
+            Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+            )
         } else {
             None
         };
@@ -350,15 +350,6 @@ impl SetDisks {
 
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
-                                let checksum_info = erasure_info.get_checksum_info(part.number);
-                                let checksum_algo = if latest_meta.uses_legacy_checksum
-                                    && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
-                                {
-                                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                                } else {
-                                    checksum_info.algorithm
-                                };
-
                                 // Read zero-copy configuration from environment variable
                                 // Default: enabled (true) for performance
                                 let use_zero_copy =
@@ -382,6 +373,15 @@ impl SetDisks {
                                     }
 
                                     if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
+                                        let checksum_info = metadata.erasure.get_checksum_info(part.number);
+                                        let checksum_algo = if metadata.uses_legacy_checksum
+                                            && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
+                                        {
+                                            rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                                        } else {
+                                            checksum_info.algorithm
+                                        };
+
                                         match create_bitrot_reader(
                                             metadata.data.as_deref(),
                                             Some(disk),
@@ -713,13 +713,7 @@ impl SetDisks {
             .await?
             .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(|e| {
-                let message = format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(bucket, object, "write", &e)
-                );
-                DiskError::other(message)
-            })?;
+            .map_err(|e| DiskError::other(self.map_namespace_lock_error(bucket, object, "write", e).to_string()))?;
 
         self.heal_object_dir_locked(bucket, object, dry_run, remove).await
     }

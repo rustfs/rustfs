@@ -16,9 +16,10 @@
 //!
 //! This module contains the command-line interface definitions including:
 //! - `Cli`: Main CLI parser
-//! - `Commands`: Subcommands (Server, Info)
+//! - `Commands`: Subcommands (Server, Info, Tls)
 //! - `ServerOpts`: Server subcommand options
 //! - `InfoOpts`: Info subcommand options
+//! - `TlsOpts`: TLS diagnostic subcommand options
 //! - `InfoType`: Information type enum
 //! - `CommandResult`: Result of parsing command line arguments
 
@@ -55,7 +56,7 @@ pub(super) const LONG_VERSION: &str = concat!(
 );
 
 /// Known subcommands. When the first arg matches one of these, it is treated as a subcommand.
-pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info"];
+pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls"];
 
 /// Preprocess argv for legacy compatibility: `rustfs <volume>` and `rustfs --address ...` are
 /// treated as `rustfs server <volume>` and `rustfs server --address ...` respectively.
@@ -102,6 +103,8 @@ pub enum Commands {
     Server(Box<ServerOpts>),
     /// Display system information
     Info(InfoOpts),
+    /// Inspect TLS certificate directory layout and parsing status
+    Tls(TlsOpts),
 }
 
 /// Information type to display
@@ -133,6 +136,28 @@ pub struct InfoOpts {
     /// Type of information to display
     #[arg(value_enum, conflicts_with = "all")]
     pub info_type: Option<InfoType>,
+}
+
+/// TLS diagnostic subcommand options
+#[derive(Args, Clone)]
+pub struct TlsOpts {
+    #[command(subcommand)]
+    pub command: TlsCommands,
+}
+
+/// TLS diagnostic subcommands
+#[derive(Subcommand, Clone)]
+pub enum TlsCommands {
+    /// Inspect a TLS certificate directory
+    Inspect(TlsInspectOpts),
+}
+
+/// TLS inspect options
+#[derive(Args, Clone)]
+pub struct TlsInspectOpts {
+    /// TLS directory to inspect
+    #[arg(long = "path", alias = "tls-path", value_parser = NonEmptyStringValueParser::new())]
+    pub path: String,
 }
 
 /// Server subcommand options
@@ -196,7 +221,10 @@ pub struct ServerOpts {
     )]
     pub console_address: String,
 
-    /// Observability endpoint for trace, metrics and logs,only support grpc mode.
+    /// Root OTLP endpoint for traces, metrics, and logs.
+    /// For the current observability pipeline this should be an OTLP/HTTP base
+    /// URL such as `http://otel-collector:4318` or
+    /// `http://host.docker.internal:4318`.
     #[arg(
         long,
         default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(),
@@ -260,6 +288,8 @@ pub enum CommandResult {
     Server(Box<super::Config>),
     /// Info command with options
     Info(InfoOpts),
+    /// TLS command with options
+    Tls(TlsOpts),
 }
 
 /// Create default ServerOpts from environment variables

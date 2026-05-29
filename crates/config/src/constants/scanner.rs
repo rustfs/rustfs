@@ -40,6 +40,37 @@ pub const ENV_SCANNER_SPEED: &str = "RUSTFS_SCANNER_SPEED";
 /// Default scanner speed preset.
 pub const DEFAULT_SCANNER_SPEED: &str = "default";
 
+/// Environment variable that specifies the periodic bitrot scan cycle in seconds.
+/// When set to `0`, `true`, `on`, or `yes`, every scanner cycle runs in deep mode.
+/// When set to `false`, `off`, `no`, or `disabled`, periodic deep scans are disabled.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_BITROT_CYCLE_SECS=2592000` (30 days)
+pub const ENV_SCANNER_BITROT_CYCLE_SECS: &str = "RUSTFS_SCANNER_BITROT_CYCLE_SECS";
+
+/// Default bitrot scan cycle used by the scanner.
+pub const DEFAULT_SCANNER_BITROT_CYCLE_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Environment variable that controls how many object versions trigger scanner alerts.
+/// - Example: `export RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS=100`
+pub const ENV_SCANNER_ALERT_EXCESS_VERSIONS: &str = "RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS";
+
+/// Default object version count that triggers scanner alerts.
+pub const DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS: u64 = 100;
+
+/// Environment variable that controls how many cumulative bytes across object versions trigger scanner alerts.
+/// - Example: `export RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE=1099511627776`
+pub const ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE: &str = "RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE";
+
+/// Default cumulative object version bytes that trigger scanner alerts.
+pub const DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
+
+/// Environment variable that controls how many subfolders trigger scanner alerts.
+/// - Example: `export RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS=50000`
+pub const ENV_SCANNER_ALERT_EXCESS_FOLDERS: &str = "RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS";
+
+/// Default subfolder count that triggers scanner alerts.
+pub const DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS: u64 = 50_000;
+
 /// Environment variable that controls whether the scanner sleeps between operations.
 /// When `true` (default), the scanner throttles itself. When `false`, it runs at full speed.
 /// - Example: `export RUSTFS_SCANNER_IDLE_MODE=false`

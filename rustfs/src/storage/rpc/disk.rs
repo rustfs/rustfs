@@ -13,6 +13,10 @@
 // limitations under the License.
 
 use super::*;
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    global_internode_metrics,
+};
 use serde::de::DeserializeOwned;
 use std::io::Cursor;
 
@@ -929,18 +933,36 @@ impl NodeService {
 
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
         let request = request.into_inner();
+        let data_len = request.data.len();
+        global_internode_metrics().record_incoming_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
+        global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_WRITE_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            data_len,
+        );
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.write_all(&request.volume, &request.path, request.data).await {
                 Ok(_) => Ok(Response::new(WriteAllResponse {
                     success: true,
                     error: None,
                 })),
-                Err(err) => Ok(Response::new(WriteAllResponse {
-                    success: false,
-                    error: Some(err.into()),
-                })),
+                Err(err) => {
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_WRITE_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
+                    Ok(Response::new(WriteAllResponse {
+                        success: false,
+                        error: Some(err.into()),
+                    }))
+                }
             }
         } else {
+            global_internode_metrics()
+                .record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
             Ok(Response::new(WriteAllResponse {
                 success: false,
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
@@ -952,20 +974,39 @@ impl NodeService {
         debug!("read all");
 
         let request = request.into_inner();
+        global_internode_metrics().record_incoming_request_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_READ_ALL,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+        );
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.read_all(&request.volume, &request.path).await {
-                Ok(data) => Ok(Response::new(ReadAllResponse {
-                    success: true,
-                    data,
-                    error: None,
-                })),
-                Err(err) => Ok(Response::new(ReadAllResponse {
-                    success: false,
-                    data: Bytes::new(),
-                    error: Some(err.into()),
-                })),
+                Ok(data) => {
+                    global_internode_metrics().record_sent_bytes_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_READ_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                        data.len(),
+                    );
+                    Ok(Response::new(ReadAllResponse {
+                        success: true,
+                        data,
+                        error: None,
+                    }))
+                }
+                Err(err) => {
+                    global_internode_metrics().record_error_for_operation_and_backend(
+                        INTERNODE_OPERATION_GRPC_READ_ALL,
+                        INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    );
+                    Ok(Response::new(ReadAllResponse {
+                        success: false,
+                        data: Bytes::new(),
+                        error: Some(err.into()),
+                    }))
+                }
             }
         } else {
+            global_internode_metrics()
+                .record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
             Ok(Response::new(ReadAllResponse {
                 success: false,
                 data: Bytes::new(),

@@ -18,7 +18,7 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use rustfs_common::data_usage::TierStats;
+use rustfs_data_usage::TierStats;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::ops::Sub;

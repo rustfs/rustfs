@@ -22,11 +22,15 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload_with_records, is_connectivity_error, open_target_queue_store,
-        persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
+        open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -37,6 +41,7 @@ use lapin::{
 };
 use parking_lot::Mutex;
 use rustfs_config::{AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY};
+use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
@@ -196,16 +201,24 @@ async fn build_tls_config(args: &AMQPArgs) -> Result<OwnedTLSConfig, TargetError
     let cert_chain = if args.tls_ca.is_empty() {
         None
     } else {
-        Some(
-            tokio::fs::read_to_string(&args.tls_ca)
-                .await
-                .map_err(|e| TargetError::Configuration(format!("Failed to read {AMQP_TLS_CA}: {e}")))?,
-        )
+        let certs_der = load_cert_bundle_der_bytes(&args.tls_ca)
+            .map_err(|e| TargetError::Configuration(format!("Failed to parse {AMQP_TLS_CA}: {e}")))?;
+        if certs_der.is_empty() {
+            return Err(TargetError::Configuration(format!(
+                "{AMQP_TLS_CA} did not contain any parsable certificates"
+            )));
+        }
+        let pem = tokio::fs::read_to_string(&args.tls_ca)
+            .await
+            .map_err(|e| TargetError::Configuration(format!("Failed to read {AMQP_TLS_CA}: {e}")))?;
+        Some(pem)
     };
 
     let identity = if args.tls_client_cert.is_empty() {
         None
     } else {
+        let _ = load_cert_bundle_der_bytes(&args.tls_client_cert)
+            .map_err(|e| TargetError::Configuration(format!("Failed to parse {AMQP_TLS_CLIENT_CERT}: {e}")))?;
         let pem = tokio::fs::read(&args.tls_client_cert)
             .await
             .map_err(|e| TargetError::Configuration(format!("Failed to read {AMQP_TLS_CLIENT_CERT}: {e}")))?;
@@ -290,6 +303,9 @@ where
     id: TargetID,
     args: AMQPArgs,
     connection: Arc<Mutex<Option<Arc<AMQPConnection>>>>,
+    tls_state: Arc<Mutex<TargetTlsState>>,
+    /// When set, the coordinator drives TLS reload; inline fingerprint check is skipped.
+    tls_adapter: Option<TlsReloadAdapter<AMQPConnection>>,
     connect_lock: Arc<AsyncMutex<()>>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
@@ -305,6 +321,8 @@ where
             id: self.id.clone(),
             args: self.args.clone(),
             connection: Arc::clone(&self.connection),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
             connect_lock: Arc::clone(&self.connect_lock),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             delivery_counters: Arc::clone(&self.delivery_counters),
@@ -329,6 +347,8 @@ where
             id: target_id,
             args,
             connection: Arc::new(Mutex::new(None)),
+            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
+            tls_adapter: None,
             connect_lock: Arc::new(AsyncMutex::new(())),
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
@@ -341,6 +361,27 @@ where
     }
 
     async fn get_or_connect(&self) -> Result<Arc<AMQPConnection>, TargetError> {
+        // When a TLS reload adapter is attached, it drives connection rebuilds
+        // in the background. The inline per-send fingerprint check is skipped.
+        if let Some(adapter) = &self.tls_adapter {
+            let material = adapter.current_material();
+            if material.connection.status().connected() && material.channel.status().connected() {
+                return Ok(material);
+            }
+            self.clear_connection_handle();
+        } else {
+            let next_fingerprint =
+                build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
+            let tls_changed = {
+                let tls_state_guard = self.tls_state.lock();
+                tls_state_guard.needs_update(&next_fingerprint)
+            };
+            if tls_changed {
+                self.clear_connection_handle();
+                self.tls_state.lock().refresh(next_fingerprint);
+            }
+        }
+
         if let Some(connection) = self.connection.lock().clone()
             && connection.connection.status().connected()
             && connection.channel.status().connected()
@@ -362,8 +403,17 @@ where
         Ok(connection)
     }
 
-    fn clear_connection(&self) {
+    fn clear_connection_handle(&self) {
         *self.connection.lock() = None;
+    }
+
+    fn clear_connection_cache(&self) {
+        self.clear_connection_handle();
+        self.tls_state.lock().reset();
+    }
+
+    fn clear_connection(&self) {
+        self.clear_connection_cache();
     }
 
     async fn send_body(&self, body: &[u8]) -> Result<(), TargetError> {
@@ -404,6 +454,46 @@ where
                 Err(map_lapin_error(err, "Failed to confirm AMQP publish"))
             }
         }
+    }
+}
+
+/// Coordinated TLS hot-reload implementation for AMQP targets.
+///
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the connection without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for AMQPTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = AMQPConnection;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: self.args.tls_client_cert.clone(),
+            client_key_path: self.args.tls_client_key.clone(),
+            target_label: format!("amqp:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        connect_amqp(&self.args).await
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        let mut guard = self.connection.lock();
+        *guard = Some(material);
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
     }
 }
 
@@ -458,6 +548,12 @@ where
                 .await
                 .map_err(|e| map_lapin_error(e, "Failed to close AMQP connection"))?;
         }
+        self.tls_state.lock().reset();
+        // If a TLS reload adapter is attached, reset its error tracking
+        // so that a future re-init does not inherit stale failure state.
+        if let Some(adapter) = &self.tls_adapter {
+            *adapter.runtime_state().last_error.write() = None;
+        }
         info!(target_id = %self.id, "AMQP target closed");
         Ok(())
     }
@@ -501,7 +597,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_s3_common::EventName;
+    use rustfs_s3_types::EventName;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;

@@ -105,7 +105,7 @@ pub type NotifyEventBridge = NotifyPipeline;
 mod tests {
     use super::{LiveEventHistory, NotifyPipeline};
     use crate::{Event, integration::NotificationMetrics, notifier::EventNotifier, rule_engine::NotifyRuleEngine};
-    use rustfs_s3_common::EventName;
+    use rustfs_s3_types::EventName;
     use std::sync::Arc;
     use tokio::sync::{RwLock, broadcast};
 

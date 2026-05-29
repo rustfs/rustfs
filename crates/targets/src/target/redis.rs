@@ -16,6 +16,10 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
@@ -31,9 +35,12 @@ use redis::{
     io::tcp::{TcpSettings, socket2},
 };
 use rustfs_config::{REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -297,7 +304,8 @@ where
 {
     id: TargetID,
     args: RedisArgs,
-    publisher_client: Client,
+    /// Redis client, wrapped in a lock so TLS hot-reload can atomically replace it.
+    publisher_client: Arc<parking_lot::Mutex<Client>>,
     publisher: Arc<Mutex<Option<ConnectionManager>>>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     /// Business-level liveness flag.
@@ -306,6 +314,12 @@ where
     /// publish exhausted retries, or the target was explicitly closed). Temporary reconnectable
     /// errors only invalidate the cached publisher so that a later request can lazily rebuild it.
     connected: Arc<AtomicBool>,
+    /// TLS fingerprint tracking for hot reload (inline fallback path).
+    tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
+    /// Adapter that bridges this target to the TLS reload coordinator.
+    /// When `Some`, the target uses coordinator-managed material; when `None`,
+    /// it falls back to inline fingerprint-based change detection.
+    tls_adapter: Option<TlsReloadAdapter<Client>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: std::marker::PhantomData<E>,
 }
@@ -334,10 +348,12 @@ where
         Ok(Self {
             id: target_id,
             args,
-            publisher_client,
+            publisher_client: Arc::new(parking_lot::Mutex::new(publisher_client)),
             publisher: Arc::new(Mutex::new(None)),
             store: queue_store,
             connected: Arc::new(AtomicBool::new(false)),
+            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
+            tls_adapter: None,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,
         })
@@ -347,23 +363,61 @@ where
         Box::new(Self {
             id: self.id.clone(),
             args: self.args.clone(),
-            publisher_client: self.publisher_client.clone(),
+            publisher_client: Arc::clone(&self.publisher_client),
             publisher: Arc::clone(&self.publisher),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: Arc::clone(&self.connected),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: std::marker::PhantomData,
         })
     }
 
     async fn get_or_create_publisher(&self) -> Result<ConnectionManager, TargetError> {
+        // Adapter-managed path: use the material directly from the TLS reload adapter.
+        if let Some(adapter) = &self.tls_adapter {
+            let client: Client = (*adapter.current_material()).clone();
+
+            // Ensure the client is also stored locally so close() can drain it.
+            *self.publisher_client.lock() = client.clone();
+
+            let manager = client
+                .get_connection_manager_lazy(build_redis_connection_manager_config(&self.args))
+                .map_err(map_redis_error)?;
+
+            *self.publisher.lock().await = Some(manager.clone());
+            return Ok(manager);
+        }
+
+        // Inline fingerprint fallback path (no coordinator).
+        let secure_scheme = matches!(self.args.url.scheme(), "rediss" | "valkeys");
+        if secure_scheme {
+            let next_fingerprint = super::build_target_tls_fingerprint(
+                &self.args.tls.ca_path,
+                &self.args.tls.client_cert_path,
+                &self.args.tls.client_key_path,
+            )
+            .await?;
+            let tls_changed = {
+                let tls_state_guard = self.tls_state.lock();
+                tls_state_guard.needs_update(&next_fingerprint)
+            };
+            if tls_changed {
+                let new_client = build_redis_client(&self.args)?;
+                *self.publisher_client.lock() = new_client;
+                self.invalidate_cached_publisher().await;
+                self.tls_state.lock().refresh(next_fingerprint);
+            }
+        }
+
         let mut guard = self.publisher.lock().await;
         if let Some(manager) = guard.clone() {
             return Ok(manager);
         }
 
-        let manager = self
-            .publisher_client
+        let client = self.publisher_client.lock().clone();
+        let manager = client
             .get_connection_manager_lazy(build_redis_connection_manager_config(&self.args))
             .map_err(map_redis_error)?;
 
@@ -475,7 +529,8 @@ where
             return Ok(false);
         }
 
-        match tokio::time::timeout(Duration::from_secs(5), ping_redis_server(&self.publisher_client, &self.args)).await {
+        let client = self.publisher_client.lock().clone();
+        match tokio::time::timeout(Duration::from_secs(5), ping_redis_server(&client, &self.args)).await {
             Ok(Ok(())) => {
                 self.connected.store(true, Ordering::SeqCst);
                 Ok(true)
@@ -557,6 +612,7 @@ where
 
     async fn close(&self) -> Result<(), TargetError> {
         self.invalidate_cached_publisher().await;
+        self.tls_state.lock().reset();
         self.connected.store(false, Ordering::SeqCst);
         info!(target_id = %self.id, "Redis target closed");
         Ok(())
@@ -696,9 +752,20 @@ fn read_root_cert(tls: &RedisTlsConfig) -> Result<Option<Vec<u8>>, TargetError> 
         return Ok(None);
     }
 
-    std::fs::read(&tls.ca_path)
-        .map(Some)
-        .map_err(|e| TargetError::Configuration(format!("Failed to read Redis root CA cert: {e}")))
+    let pem =
+        std::fs::read(&tls.ca_path).map_err(|e| TargetError::Configuration(format!("Failed to read Redis root CA cert: {e}")))?;
+    let mut reader = BufReader::new(pem.as_slice());
+    let certs_der = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TargetError::Configuration(format!("Failed to parse Redis root CA cert: {e}")))?;
+
+    if certs_der.is_empty() {
+        return Err(TargetError::Configuration(
+            "Redis root CA cert did not contain any parsable certificates".to_string(),
+        ));
+    }
+
+    Ok(Some(pem))
 }
 
 fn map_redis_error(err: RedisError) -> TargetError {
@@ -720,6 +787,46 @@ fn compute_retry_delay(attempt: usize, min_delay: Duration, max_delay: Duration)
     let shift = attempt.saturating_sub(1).min(16) as u32;
     let factor = 1u32 << shift;
     min_delay.saturating_mul(factor).min(max_delay)
+}
+
+/// Coordinated TLS hot-reload implementation for Redis targets.
+///
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the Redis client without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for RedisTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Client;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls.ca_path.clone(),
+            client_cert_path: self.args.tls.client_cert_path.clone(),
+            client_key_path: self.args.tls.client_key_path.clone(),
+            target_label: format!("redis:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        build_redis_client(&self.args)
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        *self.publisher_client.lock() = (*material).clone();
+        self.invalidate_cached_publisher().await;
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls.ca_path, &self.args.tls.client_cert_path, &self.args.tls.client_key_path)
+    }
 }
 
 #[cfg(test)]
@@ -969,7 +1076,7 @@ mod tests {
         let payload = build_queued_payload(&EntityTarget {
             object_name: "greeting+file+%282%29.csv".to_string(),
             bucket_name: "bucket".to_string(),
-            event_name: rustfs_s3_common::EventName::ObjectCreatedPut,
+            event_name: rustfs_s3_types::EventName::ObjectCreatedPut,
             data: "payload-data".to_string(),
         })
         .expect("payload should build");
@@ -1071,7 +1178,7 @@ mod tests {
 
         let target = RedisTarget::<String>::new("redis:test".to_string(), args).expect("target should build");
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket".to_string(),
             "object".to_string(),
             "application/json",
@@ -1110,7 +1217,7 @@ mod tests {
 
         let target = RedisTarget::<String>::new("redis:test".to_string(), args).expect("target should build");
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket".to_string(),
             "object".to_string(),
             "application/json",
@@ -1149,7 +1256,7 @@ mod tests {
 
         let target = RedisTarget::<String>::new("redis:test".to_string(), args).expect("target should build");
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket".to_string(),
             "object".to_string(),
             "application/json",

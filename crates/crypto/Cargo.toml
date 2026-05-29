@@ -33,8 +33,11 @@ aes-gcm = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
+base64-simd = { workspace = true }
 pbkdf2 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+rsa = { workspace = true, features = ["sha2"] }
+serde = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 serde_json.workspace = true

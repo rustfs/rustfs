@@ -22,7 +22,6 @@
 
 pub mod data_usage_define;
 pub mod error;
-pub mod last_minute;
 pub mod scanner;
 pub mod scanner_folder;
 pub mod scanner_io;
@@ -30,6 +29,7 @@ pub mod sleeper;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
+pub use rustfs_common::last_minute;
 pub use scanner::init_data_scanner;
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};

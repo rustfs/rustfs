@@ -500,6 +500,22 @@ where
     Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+fn parse_service_account_expiration(expiration: &str) -> Result<OffsetDateTime, time::Error> {
+    const LEGACY_SERVICE_ACCOUNT_EXPIRATION_FORMAT: &[time::format_description::BorrowedFormatItem<'_>] = time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond] [offset_hour sign:mandatory]:[offset_minute]:[offset_second]"
+    );
+
+    OffsetDateTime::parse(expiration, &Rfc3339)
+        .or_else(|_| OffsetDateTime::parse(expiration, LEGACY_SERVICE_ACCOUNT_EXPIRATION_FORMAT).map_err(Into::into))
+}
+
+fn serialize_optional_service_account_expiration<S>(expiration: &Option<OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    time::serde::rfc3339::option::serialize(expiration, serializer)
+}
+
 fn deserialize_optional_service_account_expiration<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
 where
     D: Deserializer<'de>,
@@ -513,7 +529,7 @@ where
         return Ok(None);
     }
 
-    let expiration = OffsetDateTime::parse(expiration, &Rfc3339).map_err(D::Error::custom)?;
+    let expiration = parse_service_account_expiration(expiration).map_err(D::Error::custom)?;
     if expiration.unix_timestamp() == 0 {
         return Ok(None);
     }
@@ -549,6 +565,7 @@ pub struct SRSvcAccCreate {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_service_account_expiration",
         deserialize_with = "deserialize_optional_service_account_expiration"
     )]
     pub expiration: Option<OffsetDateTime>,
@@ -706,6 +723,7 @@ mod tests {
     use super::*;
     use serde_json;
     use time::OffsetDateTime;
+    use time::macros::datetime;
 
     #[test]
     fn test_account_status_default() {
@@ -1294,5 +1312,51 @@ mod tests {
 
         let svc: SRSvcAccCreate = serde_json::from_str(payload).unwrap();
         assert!(svc.expiration.is_none());
+    }
+
+    #[test]
+    fn test_sr_svc_acc_create_serializes_expiration_as_rfc3339() {
+        let svc = SRSvcAccCreate {
+            parent: "useralpha".to_string(),
+            access_key: "svcalpha".to_string(),
+            secret_key: "svcAlphaSecret123".to_string(),
+            groups: Vec::new(),
+            claims: HashMap::new(),
+            session_policy: SRSessionPolicy::default(),
+            status: "on".to_string(),
+            name: "uploaderKey".to_string(),
+            description: "alpha upload key".to_string(),
+            expiration: Some(datetime!(9999-01-01 00:00:00 UTC)),
+            api_version: None,
+        };
+
+        let json = serde_json::to_string(&svc).unwrap();
+        assert!(
+            json.contains(r#""expiration":"9999-01-01T00:00:00Z""#),
+            "service account export expiration should be RFC3339; got: {json}"
+        );
+        assert!(!json.contains("+00:00:00"), "export must not use the legacy offset format: {json}");
+
+        let decoded: SRSvcAccCreate = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.expiration, svc.expiration);
+    }
+
+    #[test]
+    fn test_sr_svc_acc_create_deserializes_legacy_exported_expiration() {
+        let payload = r#"{
+            "parent": "useralpha",
+            "accessKey": "svcalpha",
+            "secretKey": "svcAlphaSecret123",
+            "groups": [],
+            "claims": {},
+            "sessionPolicy": null,
+            "status": "on",
+            "name": "uploaderKey",
+            "description": "alpha upload key",
+            "expiration": "9999-01-01 00:00:00.0 +00:00:00"
+        }"#;
+
+        let svc: SRSvcAccCreate = serde_json::from_str(payload).unwrap();
+        assert_eq!(svc.expiration, Some(datetime!(9999-01-01 00:00:00 UTC)));
     }
 }

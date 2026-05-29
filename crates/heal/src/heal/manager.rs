@@ -23,8 +23,9 @@ use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
+use rustfs_madmin::heal_commands::HealResultItem;
 use std::{
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -35,6 +36,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
+
 /// Priority queue wrapper for heal requests
 /// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
 #[derive(Debug)]
@@ -43,8 +46,8 @@ struct PriorityHealQueue {
     heap: BinaryHeap<PriorityQueueItem>,
     /// Sequence counter for FIFO ordering within same priority
     sequence: u64,
-    /// Set of request keys to prevent duplicates
-    dedup_keys: HashSet<String>,
+    /// Deduplication key reference counts for queued requests
+    dedup_keys: HashMap<String, usize>,
 }
 
 /// Wrapper for heap items to implement proper ordering
@@ -88,12 +91,26 @@ enum QueuePushOutcome {
     Merged,
 }
 
+#[derive(Debug, Clone)]
+struct CompletedHealStatus {
+    heal_type: HealType,
+    status: HealTaskStatus,
+    result_items: Vec<HealResultItem>,
+    completed_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealTaskReport {
+    pub status: HealTaskStatus,
+    pub result_items: Vec<HealResultItem>,
+}
+
 impl PriorityHealQueue {
     fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
             sequence: 0,
-            dedup_keys: HashSet::new(),
+            dedup_keys: HashMap::new(),
         }
     }
 
@@ -104,7 +121,7 @@ impl PriorityHealQueue {
     fn pop_next(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
             let key = Self::make_dedup_key(&item.request);
-            self.dedup_keys.remove(&key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
             item.request
         })
     }
@@ -116,12 +133,13 @@ impl PriorityHealQueue {
     fn push(&mut self, request: HealRequest) -> QueuePushOutcome {
         let key = Self::make_dedup_key(&request);
 
-        // Check for duplicates
-        if self.dedup_keys.contains(&key) {
+        // Check for duplicates unless the caller explicitly forces admission.
+        if self.dedup_keys.contains_key(&key) && !request.force_start {
             return QueuePushOutcome::Merged;
         }
-
-        self.dedup_keys.insert(key);
+        // Track dedup keys for both normal and forced requests so queued forced work
+        // also reserves the dedup key for later non-forced duplicates.
+        *self.dedup_keys.entry(key).or_insert(0) += 1;
         self.sequence += 1;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
@@ -144,7 +162,7 @@ impl PriorityHealQueue {
     fn pop(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
             let key = Self::make_dedup_key(&item.request);
-            self.dedup_keys.remove(&key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
             item.request
         })
     }
@@ -184,7 +202,7 @@ impl PriorityHealQueue {
         (
             selected.map(|item| {
                 let key = Self::make_dedup_key(&item.request);
-                self.dedup_keys.remove(&key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
                 item.request
             }),
             skipped,
@@ -223,17 +241,99 @@ impl PriorityHealQueue {
         }
     }
 
+    fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, usize>, key: &str) {
+        if let Some(count) = dedup_keys.get_mut(key) {
+            if *count <= 1 {
+                dedup_keys.remove(key);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+
     /// Check if a request with the same key already exists in the queue
     #[allow(dead_code)]
     fn contains_key(&self, request: &HealRequest) -> bool {
         let key = Self::make_dedup_key(request);
-        self.dedup_keys.contains(&key)
+        self.dedup_keys.contains_key(&key)
     }
 
     /// Check if an erasure set heal request for a specific set_disk_id exists
     fn contains_erasure_set(&self, set_disk_id: &str) -> bool {
         let key = format!("erasure_set:{set_disk_id}");
-        self.dedup_keys.contains(&key)
+        self.dedup_keys.contains_key(&key)
+    }
+
+    fn contains_request_id(&self, request_id: &str) -> bool {
+        self.heap.iter().any(|item| item.request.id == request_id)
+    }
+
+    fn contains_request_id_matching_path(&self, request_id: &str, heal_path: &str) -> bool {
+        self.heap
+            .iter()
+            .any(|item| item.request.id == request_id && heal_type_matches_path(&item.request.heal_type, heal_path))
+    }
+
+    fn contains_matching<F>(&self, mut matches: F) -> bool
+    where
+        F: FnMut(&HealRequest) -> bool,
+    {
+        self.heap.iter().any(|item| matches(&item.request))
+    }
+
+    fn remove_request_id(&mut self, request_id: &str) -> Option<HealRequest> {
+        let mut retained = BinaryHeap::new();
+        let mut removed = None;
+
+        while let Some(item) = self.heap.pop() {
+            if removed.is_none() && item.request.id == request_id {
+                let key = Self::make_dedup_key(&item.request);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                removed = Some(item.request);
+            } else {
+                retained.push(item);
+            }
+        }
+
+        self.heap = retained;
+        removed
+    }
+
+    fn remove_matching<F>(&mut self, mut should_remove: F) -> usize
+    where
+        F: FnMut(&HealRequest) -> bool,
+    {
+        let mut retained = BinaryHeap::new();
+        let mut removed_count = 0;
+
+        while let Some(item) = self.heap.pop() {
+            if should_remove(&item.request) {
+                let key = Self::make_dedup_key(&item.request);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                removed_count += 1;
+            } else {
+                retained.push(item);
+            }
+        }
+
+        self.heap = retained;
+        removed_count
+    }
+}
+
+fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
+    let heal_path = heal_path.trim_matches('/');
+    if heal_path.is_empty() {
+        return false;
+    }
+
+    match heal_type {
+        HealType::Object { bucket, object, .. }
+        | HealType::Metadata { bucket, object }
+        | HealType::ECDecode { bucket, object, .. } => heal_path == bucket || heal_path == format!("{bucket}/{object}"),
+        HealType::Bucket { bucket } => heal_path == bucket,
+        HealType::ErasureSet { set_disk_id, .. } => heal_path == set_disk_id,
+        HealType::MRF { meta_path } => heal_path == meta_path.trim_matches('/'),
     }
 }
 
@@ -357,6 +457,8 @@ pub struct HealManager {
     active_heals: Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
     /// Heal queue (priority-based)
     heal_queue: Arc<Mutex<PriorityHealQueue>>,
+    /// Recently completed heal statuses retained for status queries.
+    completed_heals: Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
     /// Storage layer interface
     storage: Arc<dyn HealStorageAPI>,
     /// Cancel token
@@ -384,6 +486,7 @@ impl HealManager {
             state: Arc::new(RwLock::new(HealState::default())),
             active_heals: Arc::new(Mutex::new(HashMap::new())),
             heal_queue: Arc::new(Mutex::new(PriorityHealQueue::new())),
+            completed_heals: Arc::new(Mutex::new(HashMap::new())),
             storage,
             cancel_token: CancellationToken::new(),
             statistics: Arc::new(RwLock::new(HealStatistics::new())),
@@ -429,6 +532,7 @@ impl HealManager {
         }
         active_heals.clear();
         publish_active_heal_count(&active_heals);
+        self.completed_heals.lock().await.clear();
         crate::set_heal_queue_length(0);
 
         // update state
@@ -448,7 +552,7 @@ impl HealManager {
         publish_heal_queue_length(&queue);
         let queue_capacity = config.queue_size;
 
-        if queue.contains_key(&request) {
+        if !request.force_start && queue.contains_key(&request) {
             let admission = if request.priority == HealPriority::Low && !config.low_priority_merge_enable {
                 HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)
             } else {
@@ -473,7 +577,7 @@ impl HealManager {
             return Ok(admission);
         }
 
-        if queue_len >= queue_capacity {
+        if queue_len >= queue_capacity && !request.force_start {
             let admission = Self::classify_full_admission(&request, &config);
             match admission {
                 HealAdmissionResult::Dropped(reason) => {
@@ -544,14 +648,139 @@ impl HealManager {
 
     /// Get task status
     pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
-        let active_heals = self.active_heals.lock().await;
-        if let Some(task) = active_heals.get(task_id) {
-            Ok(task.get_status().await)
-        } else {
-            Err(Error::TaskNotFound {
-                task_id: task_id.to_string(),
-            })
+        {
+            let active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(task_id) {
+                return Ok(task.get_status().await);
+            }
         }
+
+        let queue = self.heal_queue.lock().await;
+        if queue.contains_request_id(task_id) {
+            return Ok(HealTaskStatus::Pending);
+        }
+        drop(queue);
+
+        let mut completed_heals = self.completed_heals.lock().await;
+        prune_completed_heal_statuses(&mut completed_heals);
+        if let Some(completed) = completed_heals.get(task_id) {
+            return Ok(completed.status.clone());
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    pub async fn get_task_report_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskReport> {
+        {
+            let active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(task_id)
+                && heal_type_matches_path(&task.heal_type, heal_path)
+            {
+                return Ok(HealTaskReport {
+                    status: task.get_status().await,
+                    result_items: task.get_result_items().await,
+                });
+            }
+        }
+
+        {
+            let queue = self.heal_queue.lock().await;
+            if queue.contains_request_id_matching_path(task_id, heal_path) {
+                return Ok(HealTaskReport {
+                    status: HealTaskStatus::Pending,
+                    result_items: Vec::new(),
+                });
+            }
+        }
+
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(task_id)
+                && heal_type_matches_path(&completed.heal_type, heal_path)
+            {
+                return Ok(HealTaskReport {
+                    status: completed.status.clone(),
+                    result_items: completed.result_items.clone(),
+                });
+            }
+        }
+
+        if self.path_has_task(heal_path).await {
+            return Err(Error::InvalidClientToken);
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    /// Get task status for a path-bound client token.
+    ///
+    /// If the token is unknown but no task remains for the path, the caller can
+    /// treat it as an already-finished sequence. If the path still has a live or
+    /// recently completed task, a different token is invalid for that path.
+    pub async fn get_task_status_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskStatus> {
+        {
+            let active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(task_id)
+                && heal_type_matches_path(&task.heal_type, heal_path)
+            {
+                return Ok(task.get_status().await);
+            }
+        }
+
+        {
+            let queue = self.heal_queue.lock().await;
+            if queue.contains_request_id_matching_path(task_id, heal_path) {
+                return Ok(HealTaskStatus::Pending);
+            }
+        }
+
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(task_id)
+                && heal_type_matches_path(&completed.heal_type, heal_path)
+            {
+                return Ok(completed.status.clone());
+            }
+        }
+
+        if self.path_has_task(heal_path).await {
+            return Err(Error::InvalidClientToken);
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    async fn path_has_task(&self, heal_path: &str) -> bool {
+        {
+            let active_heals = self.active_heals.lock().await;
+            if active_heals
+                .values()
+                .any(|task| heal_type_matches_path(&task.heal_type, heal_path))
+            {
+                return true;
+            }
+        }
+
+        {
+            let queue = self.heal_queue.lock().await;
+            if queue.contains_matching(|request| heal_type_matches_path(&request.heal_type, heal_path)) {
+                return true;
+            }
+        }
+
+        let mut completed_heals = self.completed_heals.lock().await;
+        prune_completed_heal_statuses(&mut completed_heals);
+        completed_heals
+            .values()
+            .any(|completed| heal_type_matches_path(&completed.heal_type, heal_path))
     }
 
     /// Get task progress
@@ -574,18 +803,68 @@ impl HealManager {
 
     /// Cancel task
     pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
-        let mut active_heals = self.active_heals.lock().await;
-        if let Some(task) = active_heals.get(task_id) {
-            task.cancel().await?;
-            active_heals.remove(task_id);
-            publish_active_heal_count(&active_heals);
-            info!("Cancelled heal task: {}", task_id);
-            Ok(())
-        } else {
-            Err(Error::TaskNotFound {
-                task_id: task_id.to_string(),
-            })
+        {
+            let mut active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(task_id) {
+                task.cancel().await?;
+                active_heals.remove(task_id);
+                publish_active_heal_count(&active_heals);
+                info!("Cancelled active heal task: {}", task_id);
+                return Ok(());
+            }
         }
+
+        let mut queue = self.heal_queue.lock().await;
+        if queue.remove_request_id(task_id).is_some() {
+            publish_heal_queue_length(&queue);
+            info!("Cancelled queued heal task: {}", task_id);
+            return Ok(());
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    /// Cancel all queued or active tasks matching a heal path.
+    pub async fn cancel_tasks_for_path(&self, heal_path: &str) -> Result<usize> {
+        let mut cancelled = 0usize;
+
+        {
+            let mut active_heals = self.active_heals.lock().await;
+            let task_ids = active_heals
+                .iter()
+                .filter_map(|(task_id, task)| heal_type_matches_path(&task.heal_type, heal_path).then_some(task_id.clone()))
+                .collect::<Vec<_>>();
+
+            for task_id in task_ids {
+                if let Some(task) = active_heals.get(&task_id) {
+                    task.cancel().await?;
+                }
+                active_heals.remove(&task_id);
+                cancelled += 1;
+            }
+
+            if cancelled > 0 {
+                publish_active_heal_count(&active_heals);
+            }
+        }
+
+        let mut queue = self.heal_queue.lock().await;
+        let queued_cancelled = queue.remove_matching(|request| heal_type_matches_path(&request.heal_type, heal_path));
+        if queued_cancelled > 0 {
+            publish_heal_queue_length(&queue);
+            cancelled += queued_cancelled;
+        }
+
+        if cancelled == 0 {
+            return Err(Error::TaskNotFound {
+                task_id: heal_path.to_string(),
+            });
+        }
+
+        info!("Cancelled {} heal task(s) for path: {}", cancelled, heal_path);
+        Ok(cancelled)
     }
 
     /// Get statistics
@@ -612,6 +891,7 @@ impl HealManager {
         let config = self.config.clone();
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
+        let completed_heals = self.completed_heals.clone();
         let cancel_token = self.cancel_token.clone();
         let statistics = self.statistics.clone();
         let storage = self.storage.clone();
@@ -628,10 +908,10 @@ impl HealManager {
                         break;
                     }
                     _ = notify.notified(), if event_driven_scheduler_enable => {
-                        Self::process_heal_queue(&heal_queue, &active_heals, &config, &statistics, &storage, &notify).await;
+                        Self::process_heal_queue(&heal_queue, &active_heals, &completed_heals, &config, &statistics, &storage, &notify).await;
                     }
                     _ = interval.tick() => {
-                        Self::process_heal_queue(&heal_queue, &active_heals, &config, &statistics, &storage, &notify).await;
+                        Self::process_heal_queue(&heal_queue, &active_heals, &completed_heals, &config, &statistics, &storage, &notify).await;
                     }
                 }
             }
@@ -768,6 +1048,7 @@ impl HealManager {
     async fn process_heal_queue(
         heal_queue: &Arc<Mutex<PriorityHealQueue>>,
         active_heals: &Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
+        completed_heals: &Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
         config: &Arc<RwLock<HealConfig>>,
         statistics: &Arc<RwLock<HealStatistics>>,
         storage: &Arc<dyn HealStorageAPI>,
@@ -827,6 +1108,7 @@ impl HealManager {
                 publish_active_heal_count(&active_heals_guard);
                 update_task_running_metric_for_task(&active_heals_guard, task.as_ref());
                 let active_heals_clone = active_heals.clone();
+                let completed_heals_clone = completed_heals.clone();
                 let statistics_clone = statistics.clone();
                 let notify_clone = notify.clone();
                 let task_type_label_for_spawn = task_type_label.clone();
@@ -851,9 +1133,19 @@ impl HealManager {
                     if let Some(completed_task) = active_heals_guard.remove(&task_id) {
                         publish_active_heal_count(&active_heals_guard);
                         update_task_running_metric_for_task(&active_heals_guard, completed_task.as_ref());
+                        let completed_status = completed_task.get_status().await;
+                        let completed_status_entry = CompletedHealStatus {
+                            heal_type: completed_task.heal_type.clone(),
+                            status: completed_status.clone(),
+                            result_items: completed_task.get_result_items().await,
+                            completed_at: SystemTime::now(),
+                        };
+                        let mut completed_heals_guard = completed_heals_clone.lock().await;
+                        prune_completed_heal_statuses(&mut completed_heals_guard);
+                        completed_heals_guard.insert(task_id.clone(), completed_status_entry);
                         // update statistics
                         let mut stats = statistics_clone.write().await;
-                        match completed_task.get_status().await {
+                        match completed_status {
                             HealTaskStatus::Completed => {
                                 stats.update_task_completion(true);
                             }
@@ -957,6 +1249,20 @@ fn running_erasure_set_counts(active_heals: &HashMap<String, Arc<HealTask>>) -> 
         }
     }
     running
+}
+
+fn prune_completed_heal_statuses(completed_heals: &mut HashMap<String, CompletedHealStatus>) {
+    let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
+        return;
+    };
+
+    completed_heals.retain(|_, completed| {
+        completed
+            .completed_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|completed_at| now.saturating_sub(completed_at) <= KEEP_HEAL_TASK_STATUS_DURATION)
+            .unwrap_or(false)
+    });
 }
 
 fn can_schedule_request(request: &HealRequest, running_per_set: &HashMap<String, usize>, max_concurrent_per_set: usize) -> bool {
@@ -1498,6 +1804,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_task_status_reports_pending_for_queued_request() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::bucket("bucket".to_string());
+        let request_id = request.id.clone();
+
+        assert_eq!(
+            manager
+                .submit_heal_request(request)
+                .await
+                .expect("request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .get_task_status(&request_id)
+                .await
+                .expect("queued request should have status"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_path_rejects_wrong_token_when_path_is_active() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager
+            .submit_heal_request(HealRequest::bucket("bucket".to_string()))
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_status_for_path("bucket", "wrong-token").await,
+            Err(Error::InvalidClientToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_path_rejects_token_from_other_active_path() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let other_request = HealRequest::bucket("other".to_string());
+        let other_request_id = other_request.id.clone();
+
+        manager
+            .submit_heal_request(bucket_request)
+            .await
+            .expect("bucket request should be accepted");
+        manager
+            .submit_heal_request(other_request)
+            .await
+            .expect("other request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_status_for_path("bucket", &other_request_id).await,
+            Err(Error::InvalidClientToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_path_does_not_accept_token_from_inactive_path() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::bucket("bucket".to_string());
+        let request_id = request.id.clone();
+
+        manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_status_for_path("other", &request_id).await,
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_path_returns_not_found_when_path_is_inactive() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        assert!(matches!(
+            manager.get_task_status_for_path("bucket", "old-token").await,
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_empty_path_does_not_match_unrelated_tasks() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::bucket("bucket".to_string());
+        let request_id = request.id.clone();
+
+        manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_status_for_path("", &request_id).await,
+            Err(Error::TaskNotFound { .. })
+        ));
+        assert!(matches!(
+            manager.get_task_status_for_path("", "wrong-token").await,
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_reads_recent_completed_status() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager.completed_heals.lock().await.insert(
+            "completed-token".to_string(),
+            CompletedHealStatus {
+                heal_type: HealType::Bucket {
+                    bucket: "bucket".to_string(),
+                },
+                status: HealTaskStatus::Completed,
+                result_items: Vec::new(),
+                completed_at: SystemTime::now(),
+            },
+        );
+
+        assert_eq!(
+            manager
+                .get_task_status_for_path("bucket", "completed-token")
+                .await
+                .expect("recent completed task should be queryable"),
+            HealTaskStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_task_report_for_path_reads_completed_items() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager.completed_heals.lock().await.insert(
+            "completed-token".to_string(),
+            CompletedHealStatus {
+                heal_type: HealType::Object {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                },
+                status: HealTaskStatus::Completed,
+                result_items: vec![HealResultItem {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    object_size: 1024,
+                    ..Default::default()
+                }],
+                completed_at: SystemTime::now(),
+            },
+        );
+
+        let report = manager
+            .get_task_report_for_path("bucket/object", "completed-token")
+            .await
+            .expect("recent completed task report should be queryable");
+
+        assert_eq!(report.status, HealTaskStatus::Completed);
+        assert_eq!(report.result_items.len(), 1);
+        assert_eq!(report.result_items[0].object_size, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_get_task_report_for_empty_path_does_not_match_unrelated_tasks() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager
+            .submit_heal_request(HealRequest::bucket("bucket".to_string()))
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_report_for_path("", "wrong-token").await,
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_removes_queued_request() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::bucket("bucket".to_string());
+        let request_id = request.id.clone();
+
+        manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+        manager
+            .cancel_task(&request_id)
+            .await
+            .expect("queued request should be cancelled");
+
+        assert!(matches!(manager.get_task_status(&request_id).await, Err(Error::TaskNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_tasks_for_path_removes_matching_queued_requests() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let bucket_request_id = bucket_request.id.clone();
+        let other_request = HealRequest::bucket("other".to_string());
+        let other_request_id = other_request.id.clone();
+
+        manager
+            .submit_heal_request(bucket_request)
+            .await
+            .expect("bucket request should be accepted");
+        manager
+            .submit_heal_request(other_request)
+            .await
+            .expect("other request should be accepted");
+
+        assert_eq!(
+            manager
+                .cancel_tasks_for_path("bucket")
+                .await
+                .expect("matching request should be cancelled"),
+            1
+        );
+        assert!(matches!(
+            manager.get_task_status(&bucket_request_id).await,
+            Err(Error::TaskNotFound { .. })
+        ));
+        assert_eq!(
+            manager
+                .get_task_status(&other_request_id)
+                .await
+                .expect("unmatched request should remain queued"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
     async fn test_submit_heal_request_returns_merged_before_full_for_duplicate() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let manager = HealManager::new(
@@ -1574,6 +2132,122 @@ mod tests {
                 .await
                 .expect("low priority request should be dropped with explicit admission result"),
             HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_start_bypasses_duplicate_and_full_admission() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                low_priority_drop_when_full: true,
+                ..HealConfig::default()
+            }),
+        );
+
+        let normal = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let mut forced_duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        forced_duplicate.force_start = true;
+
+        let subsequent_duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(normal)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(forced_duplicate)
+                .await
+                .expect("force start should bypass duplicate/full policy"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(subsequent_duplicate)
+                .await
+                .expect("subsequent non-force duplicate should be merged"),
+            HealAdmissionResult::Merged
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_start_marks_dedup_key_for_future_duplicates() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        );
+
+        let normal = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let mut forced = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        forced.force_start = true;
+        let duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(normal)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(forced)
+                .await
+                .expect("forced request should bypass duplicate/full admission"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(duplicate)
+                .await
+                .expect("non-forced duplicate should merge while forced request is queued"),
+            HealAdmissionResult::Merged
         );
     }
 

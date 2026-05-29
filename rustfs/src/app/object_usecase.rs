@@ -35,12 +35,9 @@ use crate::storage::sse::{
     SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers,
     map_get_object_reader_error,
 };
-use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
+use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::*;
 use bytes::Bytes;
-use datafusion::arrow::{
-    csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
-};
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
@@ -76,7 +73,7 @@ use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
+use rustfs_ecstore::rio::{CompressReader, DynReader, EncryptReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{
     HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
@@ -89,13 +86,12 @@ use rustfs_filemeta::{
 use rustfs_io_metrics;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_s3_common::S3Operation;
-use rustfs_s3select_api::{
-    object_store::bytes_stream,
-    query::{Context, Query},
+use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
+use rustfs_s3select_api::object_store::bytes_stream;
+use rustfs_targets::{
+    EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
-use rustfs_s3select_query::get_global_db;
-use rustfs_targets::EventName;
+use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
@@ -111,17 +107,13 @@ use rustfs_utils::http::{
     insert_str, remove_str,
 };
 use rustfs_utils::path::{is_dir_object, path_join_buf};
-use rustfs_utils::{
-    CompressionAlgorithm, extract_params_header, extract_resp_elements, get_request_host, get_request_port,
-    get_request_user_agent,
-};
 use rustfs_zip::CompressionFormat;
 use s3s::dto::*;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::ops::Add;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,8 +122,6 @@ use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
@@ -162,7 +152,7 @@ impl Drop for DeadlockRequestGuard {
 }
 
 struct GetObjectBootstrap {
-    timeout_config: TimeoutConfig,
+    timeout_config: GetObjectTimeoutPolicy,
     wrapper: RequestTimeoutWrapper,
     request_start: std::time::Instant,
     request_guard: GetObjectGuard,
@@ -218,6 +208,12 @@ struct GetObjectOutputContext {
     event_info: ObjectInfo,
     response_content_length: i64,
     optimal_buffer_size: usize,
+}
+
+enum GetObjectTimeoutStage {
+    BeforeProcessing,
+    DiskPermitWait { permit_wait_duration: Duration },
+    BeforeRead,
 }
 
 async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &ObjectOptions, existing: Option<&ObjectInfo>) {
@@ -446,14 +442,14 @@ fn should_buffer_get_object_in_memory_with_threshold(
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
-    use crate::storage::deadlock_detector::{DeadlockDetector, DeadlockDetectorConfig};
+    use crate::storage::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
     use std::sync::Arc;
 
     #[test]
     fn deadlock_request_guard_unregisters_on_drop() {
-        let detector = Arc::new(DeadlockDetector::new(DeadlockDetectorConfig {
+        let detector = Arc::new(DeadlockDetector::new(RequestHangDetectionPolicy {
             enabled: true,
-            ..DeadlockDetectorConfig::default()
+            ..RequestHangDetectionPolicy::default()
         }));
         let request_id = "test-request-id".to_string();
 
@@ -782,16 +778,36 @@ fn snowball_meta_flag(headers: &HeaderMap, exact_keys: &[&str], suffix_lower: &s
     snowball_meta_value(headers, exact_keys, suffix_lower).is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-fn normalize_snowball_prefix(prefix: &str) -> Option<String> {
-    let normalized = prefix.trim().trim_matches('/');
-    if normalized.is_empty() {
-        return None;
-    }
-
-    Some(normalized.to_string())
+fn contains_parent_dir_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|component| component == "..")
 }
 
-fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> String {
+fn validate_extract_relative_path(path: &str) -> S3Result<()> {
+    let path = Path::new(path);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir | Component::ParentDir))
+        || contains_parent_dir_component(path.to_string_lossy().as_ref())
+    {
+        return Err(s3_error!(InvalidArgument, "archive entry path must stay within the target bucket"));
+    }
+
+    Ok(())
+}
+
+fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
+    let normalized = prefix.trim().trim_matches('/');
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+
+    validate_extract_relative_path(normalized)?;
+
+    Ok(Some(normalized.to_string()))
+}
+
+fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
+    validate_extract_relative_path(path)?;
     let path = path.trim_matches('/');
     let mut key = match prefix {
         Some(prefix) if !path.is_empty() => format!("{prefix}/{path}"),
@@ -803,7 +819,9 @@ fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -
         key.push('/');
     }
 
-    key
+    validate_extract_relative_path(&key)?;
+
+    Ok(key)
 }
 
 fn map_extract_archive_error(err: impl std::fmt::Display) -> S3Error {
@@ -999,17 +1017,19 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
-fn resolve_put_object_extract_options(headers: &HeaderMap) -> PutObjectExtractOptions {
+fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
     let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
-        .and_then(|value| normalize_snowball_prefix(&value));
+        .map(|value| normalize_snowball_prefix(&value))
+        .transpose()?
+        .flatten();
     let ignore_dirs = snowball_meta_flag(headers, SNOWBALL_IGNORE_DIRS_HEADER_KEYS, SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER);
     let ignore_errors = snowball_meta_flag(headers, SNOWBALL_IGNORE_ERRORS_HEADER_KEYS, SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER);
 
-    PutObjectExtractOptions {
+    Ok(PutObjectExtractOptions {
         prefix,
         ignore_dirs,
         ignore_errors,
-    }
+    })
 }
 
 fn is_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap) -> bool {
@@ -1128,7 +1148,7 @@ impl DefaultObjectUsecase {
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
-        let timeout_config = TimeoutConfig::from_env();
+        let timeout_config = GetObjectTimeoutPolicy::from_env();
         let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
         let request_start = std::time::Instant::now();
         let request_guard = ConcurrencyManager::track_request();
@@ -1139,16 +1159,7 @@ impl DefaultObjectUsecase {
         deadlock_detector.register_request(&request_id, format!("GetObject {bucket}/{key}"));
         let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
 
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out before processing"
-            );
-            return Err(s3_error!(InternalError, "Request timeout before processing"));
-        }
+        Self::ensure_get_object_not_timed_out(&wrapper, &timeout_config, bucket, key, GetObjectTimeoutStage::BeforeProcessing)?;
 
         rustfs_io_metrics::record_get_object_request_start(concurrent_requests);
 
@@ -1170,7 +1181,7 @@ impl DefaultObjectUsecase {
     async fn acquire_get_object_io_planning<'a>(
         manager: &'a ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
-        timeout_config: &TimeoutConfig,
+        timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
         key: &str,
     ) -> S3Result<GetObjectIoPlanning<'a>> {
@@ -1181,19 +1192,13 @@ impl DefaultObjectUsecase {
             .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?;
         let permit_wait_duration = permit_wait_start.elapsed();
 
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                wait_ms = permit_wait_duration.as_millis(),
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out while waiting for disk permit"
-            );
-
-            rustfs_io_metrics::record_get_object_timeout(Some("disk_permit"), Some(wrapper.elapsed().as_secs_f64()));
-            return Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"));
-        }
+        Self::ensure_get_object_not_timed_out(
+            wrapper,
+            timeout_config,
+            bucket,
+            key,
+            GetObjectTimeoutStage::DiskPermitWait { permit_wait_duration },
+        )?;
 
         let queue_status = manager.io_queue_status();
         let queue_snapshot = GetObjectQueueSnapshot::from_available_permits(
@@ -1215,17 +1220,7 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::record_io_queue_congestion();
         }
 
-        if wrapper.is_timeout() {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                timeout_secs = timeout_config.get_object_timeout.as_secs(),
-                elapsed_ms = wrapper.elapsed().as_millis(),
-                "GetObject request timed out before reading object"
-            );
-            rustfs_io_metrics::record_get_object_timeout(Some("before_read"), Some(wrapper.elapsed().as_secs_f64()));
-            return Err(s3_error!(InternalError, "Request timeout before reading object"));
-        }
+        Self::ensure_get_object_not_timed_out(wrapper, timeout_config, bucket, key, GetObjectTimeoutStage::BeforeRead)?;
 
         Ok(GetObjectIoPlanning {
             _disk_permit: disk_permit,
@@ -1290,7 +1285,7 @@ impl DefaultObjectUsecase {
         req: &S3Request<GetObjectInput>,
         manager: &'a ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
-        timeout_config: &TimeoutConfig,
+        timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
         key: &str,
         rs: Option<HTTPRangeSpec>,
@@ -1641,13 +1636,13 @@ impl DefaultObjectUsecase {
 
     fn put_object_execution_context(req: &S3Request<PutObjectInput>) -> (EventName, QuotaOperation, &'static str) {
         if req.extensions.get::<PostObjectRequestMarker>().is_some() {
-            (EventName::ObjectCreatedPost, QuotaOperation::PostObject, "POST")
+            (put_event_name_for_post_object(true), QuotaOperation::PostObject, "POST")
         } else {
-            (EventName::ObjectCreatedPut, QuotaOperation::PutObject, "PUT")
+            (put_event_name_for_post_object(false), QuotaOperation::PutObject, "PUT")
         }
     }
 
-    #[instrument(level = "debug", skip(self, _fs, req))]
+    #[instrument(level = "info", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let start_time = std::time::Instant::now();
         let mut req = req;
@@ -1837,14 +1832,18 @@ impl DefaultObjectUsecase {
         let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => {
+                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                Some(existing_obj_info.size.max(0) as u64)
+            }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
+                None
             }
-        }
+        };
 
         let actual_size = size;
 
@@ -1971,8 +1970,13 @@ impl DefaultObjectUsecase {
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
-        // Fast in-memory update for immediate quota consistency
-        rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+        // Fast in-memory update for immediate quota and admin usage consistency
+        rustfs_ecstore::data_usage::record_bucket_object_write_memory(
+            &bucket,
+            previous_current_size,
+            obj_info.size.max(0) as u64,
+        )
+        .await;
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -2053,7 +2057,7 @@ impl DefaultObjectUsecase {
 
     fn finalize_get_object_completion(
         wrapper: &RequestTimeoutWrapper,
-        timeout_config: &TimeoutConfig,
+        timeout_config: &GetObjectTimeoutPolicy,
         total_duration: Duration,
         response_content_length: i64,
         optimal_buffer_size: usize,
@@ -2079,6 +2083,57 @@ impl DefaultObjectUsecase {
             "GetObject completed: size={} duration={:?} buffer={}",
             response_content_length, total_duration, optimal_buffer_size
         );
+    }
+
+    fn ensure_get_object_not_timed_out(
+        wrapper: &RequestTimeoutWrapper,
+        timeout_config: &GetObjectTimeoutPolicy,
+        bucket: &str,
+        key: &str,
+        stage: GetObjectTimeoutStage,
+    ) -> S3Result<()> {
+        if !wrapper.is_timeout() {
+            return Ok(());
+        }
+
+        let timeout_secs = timeout_config.get_object_timeout.as_secs();
+        let elapsed_ms = wrapper.elapsed().as_millis();
+
+        match stage {
+            GetObjectTimeoutStage::BeforeProcessing => {
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    timeout_secs,
+                    elapsed_ms,
+                    "GetObject request timed out before processing"
+                );
+                Err(s3_error!(InternalError, "Request timeout before processing"))
+            }
+            GetObjectTimeoutStage::DiskPermitWait { permit_wait_duration } => {
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    wait_ms = permit_wait_duration.as_millis(),
+                    timeout_secs,
+                    elapsed_ms,
+                    "GetObject request timed out while waiting for disk permit"
+                );
+                rustfs_io_metrics::record_get_object_timeout(Some("disk_permit"), Some(wrapper.elapsed().as_secs_f64()));
+                Err(s3_error!(InternalError, "Request timeout while waiting for disk permit"))
+            }
+            GetObjectTimeoutStage::BeforeRead => {
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    timeout_secs,
+                    elapsed_ms,
+                    "GetObject request timed out before reading object"
+                );
+                rustfs_io_metrics::record_get_object_timeout(Some("before_read"), Some(wrapper.elapsed().as_secs_f64()));
+                Err(s3_error!(InternalError, "Request timeout before reading object"))
+            }
+        }
     }
 
     async fn finalize_get_object_response(
@@ -2211,7 +2266,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(
-        level = "debug",
+        level = "info",
         skip(self, req),
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
@@ -2662,14 +2717,18 @@ impl DefaultObjectUsecase {
         let current_opts: ObjectOptions = get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+            Ok(existing_obj_info) => {
+                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                Some(existing_obj_info.size.max(0) as u64)
+            }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
+                None
             }
-        }
+        };
 
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         let mut effective_sse = requested_sse.or_else(|| {
@@ -2841,7 +2900,8 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            rustfs_ecstore::data_usage::increment_bucket_usage_memory(&bucket, oi.size as u64).await;
+            rustfs_ecstore::data_usage::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64)
+                .await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3097,10 +3157,13 @@ impl DefaultObjectUsecase {
                     existing_object_infos[i].as_ref(),
                 )
                 .await;
-                let size = object_sizes[i];
-                if size > 0 {
-                    rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, size as u64).await;
-                }
+                let size = object_sizes[i].max(0) as u64;
+                rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
+                    &bucket,
+                    size,
+                    existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
+                )
+                .await;
                 continue;
             }
 
@@ -3169,11 +3232,7 @@ impl DefaultObjectUsecase {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
-                    let event_name = if dobj.delete_marker {
-                        EventName::ObjectRemovedDeleteMarkerCreated
-                    } else {
-                        EventName::ObjectRemovedDelete
-                    };
+                    let event_name = delete_event_name_for_marker(dobj.delete_marker);
                     let event_args = EventArgsBuilder::new(
                         event_name,
                         bucket.clone(),
@@ -3203,7 +3262,7 @@ impl DefaultObjectUsecase {
         result
     }
 
-    #[instrument(level = "debug", skip(self, req))]
+    #[instrument(level = "info", skip(self, req))]
     pub async fn execute_delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
@@ -3319,8 +3378,13 @@ impl DefaultObjectUsecase {
 
         enqueue_transitioned_delete_cleanup(&bucket, &key, &opts, existing_object_info.as_ref()).await;
 
-        // Fast in-memory update for immediate quota consistency
-        rustfs_ecstore::data_usage::decrement_bucket_usage_memory(&bucket, obj_info.size as u64).await;
+        // Fast in-memory update for immediate quota and admin usage consistency
+        rustfs_ecstore::data_usage::record_bucket_object_delete_memory(
+            &bucket,
+            obj_info.size.max(0) as u64,
+            opts.version_id.is_none(),
+        )
+        .await;
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {
@@ -3338,7 +3402,7 @@ impl DefaultObjectUsecase {
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
             helper = helper
-                .event_name(EventName::ObjectRemovedDelete)
+                .event_name(delete_event_name_for_marker(false))
                 .object(ObjectInfo {
                     name: key.clone(),
                     bucket: bucket.clone(),
@@ -3406,11 +3470,7 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let event_name = if delete_marker {
-            EventName::ObjectRemovedDeleteMarkerCreated
-        } else {
-            EventName::ObjectRemovedDelete
-        };
+        let event_name = delete_event_name_for_marker(delete_marker);
 
         helper = helper.event_name(event_name);
         helper = helper
@@ -3954,74 +4014,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        info!("handle select_object_content");
-
-        let input = Arc::new(req.input);
-        info!("{:?}", input);
-
-        let db = get_global_db((*input).clone(), false).await.map_err(|e| {
-            error!("get global db failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
-        let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
-        let result = db
-            .execute(&query)
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
-
-        let results = result
-            .result()
-            .chunk_result()
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?
-            .to_vec();
-
-        let mut buffer = Vec::new();
-        if input.request.output_serialization.csv.is_some() {
-            let mut csv_writer = CsvWriterBuilder::new().with_header(false).build(&mut buffer);
-            for batch in results {
-                csv_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to csv. e: {}", e.to_string()))?;
-            }
-        } else if input.request.output_serialization.json.is_some() {
-            let mut json_writer = JsonWriterBuilder::new()
-                .with_explicit_nulls(true)
-                .build::<_, JsonArray>(&mut buffer);
-            for batch in results {
-                json_writer
-                    .write(&batch)
-                    .map_err(|e| s3_error!(InternalError, "can't encode output to json. e: {}", e.to_string()))?;
-            }
-            json_writer
-                .finish()
-                .map_err(|e| s3_error!(InternalError, "writer output into json error, e: {}", e.to_string()))?;
-        } else {
-            return Err(s3_error!(
-                InvalidArgument,
-                "Unsupported output format. Supported formats are CSV and JSON"
-            ));
-        }
-
-        let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(2);
-        let stream = ReceiverStream::new(rx);
-        spawn_traced(async move {
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
-                .await;
-            let _ = tx
-                .send(Ok(SelectObjectContentEvent::Records(RecordsEvent {
-                    payload: Some(Bytes::from(buffer)),
-                })))
-                .await;
-            let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
-
-            drop(tx);
-        });
-
-        Ok(S3Response::new(SelectObjectContentOutput {
-            payload: Some(SelectObjectContentEventStream::new(stream)),
-        }))
+        crate::app::select_object::execute_select_object_content(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -4186,7 +4179,7 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let extract_options = resolve_put_object_extract_options(&req.headers);
+        let extract_options = resolve_put_object_extract_options(&req.headers)?;
         let version_id = match event_version_id {
             Some(v) => v.to_string(),
             None => String::new(),
@@ -4227,7 +4220,16 @@ impl DefaultObjectUsecase {
             };
 
             let is_dir = f.header().entry_type().is_dir();
-            let fpath = normalize_extract_entry_key(&fpath.to_string_lossy(), extract_options.prefix.as_deref(), is_dir);
+            let fpath = match normalize_extract_entry_key(&fpath.to_string_lossy(), extract_options.prefix.as_deref(), is_dir) {
+                Ok(fpath) => fpath,
+                Err(err) => {
+                    if extract_options.ignore_errors {
+                        warn!("Skipping archive entry because path is unsafe and ignore-errors is enabled: {err}");
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
 
             let mut auth_req = S3Request {
                 input: PutObjectInput::default(),
@@ -4368,7 +4370,7 @@ impl DefaultObjectUsecase {
             };
 
             let event_args = rustfs_notify::EventArgs {
-                event_name: EventName::ObjectCreatedPut,
+                event_name: put_event_name_for_post_object(false),
                 bucket_name: bucket.clone(),
                 object: obj_info.clone(),
                 req_params: req_params.clone(),
@@ -4522,18 +4524,39 @@ mod tests {
 
     #[test]
     fn normalize_snowball_prefix_trims_slashes_and_whitespace() {
-        assert_eq!(normalize_snowball_prefix(" /batch/incoming/ "), Some("batch/incoming".to_string()));
-        assert_eq!(normalize_snowball_prefix("///"), None);
+        assert_eq!(
+            normalize_snowball_prefix(" /batch/incoming/ ").unwrap(),
+            Some("batch/incoming".to_string())
+        );
+        assert_eq!(normalize_snowball_prefix("///").unwrap(), None);
+    }
+
+    #[test]
+    fn normalize_snowball_prefix_rejects_parent_dir_components() {
+        assert!(normalize_snowball_prefix("../victim-bucket").is_err());
+        assert!(normalize_snowball_prefix("safe/../../victim-bucket").is_err());
+        assert!(normalize_snowball_prefix("safe\\..\\victim-bucket").is_err());
     }
 
     #[test]
     fn normalize_extract_entry_key_applies_prefix_and_directory_suffix() {
         assert_eq!(
-            normalize_extract_entry_key("nested/path.txt", Some("imports"), false),
+            normalize_extract_entry_key("nested/path.txt", Some("imports"), false).unwrap(),
             "imports/nested/path.txt"
         );
-        assert_eq!(normalize_extract_entry_key("nested/dir/", Some("imports"), true), "imports/nested/dir/");
-        assert_eq!(normalize_extract_entry_key("top-level", None, false), "top-level");
+        assert_eq!(
+            normalize_extract_entry_key("nested/dir/", Some("imports"), true).unwrap(),
+            "imports/nested/dir/"
+        );
+        assert_eq!(normalize_extract_entry_key("top-level", None, false).unwrap(), "top-level");
+    }
+
+    #[test]
+    fn normalize_extract_entry_key_rejects_bucket_escape_paths() {
+        assert!(normalize_extract_entry_key("../victim-bucket/evil.txt", None, false).is_err());
+        assert!(normalize_extract_entry_key("safe/../../victim-bucket/evil.txt", None, false).is_err());
+        assert!(normalize_extract_entry_key("safe\\..\\victim-bucket\\evil.txt", None, false).is_err());
+        assert!(normalize_extract_entry_key("evil.txt", Some("../victim-bucket"), false).is_err());
     }
 
     #[test]
@@ -4758,7 +4781,7 @@ mod tests {
     #[test]
     fn resolve_put_object_extract_options_defaults_when_headers_missing() {
         let headers = HeaderMap::new();
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(
             options,
             PutObjectExtractOptions {
@@ -4776,7 +4799,7 @@ mod tests {
         headers.insert(AMZ_SNOWBALL_IGNORE_DIRS_INTERNAL, HeaderValue::from_static("true"));
         headers.insert(AMZ_SNOWBALL_IGNORE_ERRORS_INTERNAL, HeaderValue::from_static("TRUE"));
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(options.prefix.as_deref(), Some("internal/prefix"));
         assert!(options.ignore_dirs);
         assert!(options.ignore_errors);
@@ -4789,7 +4812,7 @@ mod tests {
         headers.insert(AMZ_SNOWBALL_IGNORE_DIRS, HeaderValue::from_static(" true "));
         headers.insert(AMZ_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("TRUE"));
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(options.prefix.as_deref(), Some("standard/prefix"));
         assert!(options.ignore_dirs);
         assert!(options.ignore_errors);
@@ -4811,7 +4834,7 @@ mod tests {
             HeaderValue::from_static("TRUE"),
         );
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(options.prefix.as_deref(), Some("partner/import"));
         assert!(options.ignore_dirs);
         assert!(options.ignore_errors);
@@ -4825,7 +4848,7 @@ mod tests {
         headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static("/standard/prefix/"));
         headers.insert(AMZ_MINIO_SNOWBALL_PREFIX, HeaderValue::from_static("/minio/prefix/"));
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert_eq!(options.prefix.as_deref(), Some("minio/prefix"));
     }
 
@@ -4837,9 +4860,17 @@ mod tests {
         headers.insert(AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, HeaderValue::from_static("false"));
         headers.insert("x-amz-meta-acme-snowball-ignore-errors", HeaderValue::from_static("true"));
 
-        let options = resolve_put_object_extract_options(&headers);
+        let options = resolve_put_object_extract_options(&headers).unwrap();
         assert!(!options.ignore_dirs);
         assert!(!options.ignore_errors);
+    }
+
+    #[test]
+    fn resolve_put_object_extract_options_rejects_unsafe_prefix_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static("../victim-bucket"));
+
+        assert!(resolve_put_object_extract_options(&headers).is_err());
     }
 
     #[tokio::test]

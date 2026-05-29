@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(any(target_os = "linux", test))]
+mod fs_type;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(unix, not(target_os = "linux")))]

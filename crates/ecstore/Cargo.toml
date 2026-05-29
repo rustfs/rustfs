@@ -40,6 +40,7 @@ rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
 rustfs-rio-v2 = { workspace = true, optional = true }
 rustfs-signer.workspace = true
+rustfs-tls-runtime.workspace = true
 rustfs-checksums.workspace = true
 rustfs-config = { workspace = true, features = ["constants", "notify", "audit"] }
 rustfs-credentials = { workspace = true }
@@ -47,7 +48,9 @@ rustfs-common.workspace = true
 rustfs-policy.workspace = true
 rustfs-protos.workspace = true
 rustfs-kms.workspace = true
-rustfs-s3-common = { workspace = true }
+rustfs-s3-types = { workspace = true }
+rustfs-data-usage.workspace = true
+rustfs-object-capacity.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }
@@ -91,6 +94,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
+rustls-pki-types.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "signal","io-uring"] }
 tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
@@ -105,7 +109,7 @@ memmap2 = { workspace = true }
 libc.workspace = true
 rustix = { workspace = true }
 rustfs-madmin.workspace = true
-rustfs-workers.workspace = true
+rustfs-concurrency.workspace = true
 reqwest = { workspace = true }
 aes-gcm.workspace = true
 aws-sdk-s3 = { workspace = true }
@@ -129,7 +133,7 @@ aws-smithy-http-client.workspace = true
 metrics = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true, features = ["async_closure"] }
 tracing-subscriber = { workspace = true }
@@ -145,6 +149,10 @@ harness = false
 
 [[bench]]
 name = "comparison_benchmark"
+harness = false
+
+[[bench]]
+name = "rename_data_meta_benchmark"
 harness = false
 
 [lib]

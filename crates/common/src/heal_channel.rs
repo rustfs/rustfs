@@ -260,9 +260,17 @@ pub enum HealChannelCommand {
         response_tx: oneshot::Sender<Result<HealAdmissionResult, String>>,
     },
     /// Query heal task status
-    Query { heal_path: String, client_token: String },
+    Query {
+        heal_path: String,
+        client_token: String,
+        response_tx: oneshot::Sender<Result<HealChannelResponse, String>>,
+    },
     /// Cancel heal task
-    Cancel { heal_path: String },
+    Cancel {
+        heal_path: String,
+        client_token: String,
+        response_tx: oneshot::Sender<Result<HealChannelResponse, String>>,
+    },
 }
 
 /// Heal request from admin to ahm
@@ -379,7 +387,9 @@ fn heal_response_sender() -> &'static HealResponseSender {
 
 /// Publish a heal response to subscribers.
 pub fn publish_heal_response(response: HealChannelResponse) -> Result<(), broadcast::error::SendError<HealChannelResponse>> {
-    heal_response_sender().send(response).map(|_| ())
+    let sender = heal_response_sender();
+    let _ = sender.send(response);
+    Ok(())
 }
 
 /// Subscribe to heal responses.
@@ -405,14 +415,36 @@ pub async fn send_heal_request(request: HealChannelRequest) -> Result<(), String
     }
 }
 
+async fn receive_heal_channel_response(
+    response_rx: oneshot::Receiver<Result<HealChannelResponse, String>>,
+) -> Result<HealChannelResponse, String> {
+    response_rx
+        .await
+        .map_err(|e| format!("Failed to receive heal channel response: {e}"))?
+}
+
 /// Send heal query request
-pub async fn query_heal_status(heal_path: String, client_token: String) -> Result<(), String> {
-    send_heal_command(HealChannelCommand::Query { heal_path, client_token }).await
+pub async fn query_heal_status(heal_path: String, client_token: String) -> Result<HealChannelResponse, String> {
+    let (response_tx, response_rx) = oneshot::channel();
+    send_heal_command(HealChannelCommand::Query {
+        heal_path,
+        client_token,
+        response_tx,
+    })
+    .await?;
+    receive_heal_channel_response(response_rx).await
 }
 
 /// Send heal cancel request
-pub async fn cancel_heal_task(heal_path: String) -> Result<(), String> {
-    send_heal_command(HealChannelCommand::Cancel { heal_path }).await
+pub async fn cancel_heal_task(heal_path: String, client_token: String) -> Result<HealChannelResponse, String> {
+    let (response_tx, response_rx) = oneshot::channel();
+    send_heal_command(HealChannelCommand::Cancel {
+        heal_path,
+        client_token,
+        response_tx,
+    })
+    .await?;
+    receive_heal_channel_response(response_rx).await
 }
 
 /// Create a new heal request
@@ -626,5 +658,10 @@ mod tests {
         let received = receiver.recv().await.expect("should receive heal response");
         assert_eq!(received.request_id, response.request_id);
         assert!(received.success);
+
+        drop(receiver);
+        let response = create_heal_response("req-no-subscriber".to_string(), true, None, None);
+
+        publish_heal_response(response).expect("publish without subscribers should be ignored");
     }
 }

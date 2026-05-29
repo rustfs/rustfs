@@ -27,7 +27,7 @@ pub use local_snapshot::{
     data_usage_dir, data_usage_state_dir, ensure_data_usage_layout, read_snapshot as read_local_snapshot, snapshot_file_name,
     snapshot_object_path, snapshot_path, write_snapshot as write_local_snapshot,
 };
-use rustfs_common::data_usage::{
+use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_io_metrics::record_system_path_failure;
@@ -48,7 +48,14 @@ const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
 
-type UsageMemoryCache = Arc<RwLock<HashMap<String, (u64, SystemTime)>>>;
+#[derive(Debug, Clone)]
+struct CachedBucketUsage {
+    usage: BucketUsageInfo,
+    refreshed_at: SystemTime,
+    usage_updated_at: SystemTime,
+}
+
+type UsageMemoryCache = Arc<RwLock<HashMap<String, CachedBucketUsage>>>;
 type CacheUpdating = Arc<RwLock<bool>>;
 
 static USAGE_MEMORY_CACHE: OnceLock<UsageMemoryCache> = OnceLock::new();
@@ -403,21 +410,90 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
     Ok(usage)
 }
 
-/// Fast in-memory increment for immediate quota consistency
-pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
+async fn ensure_bucket_usage_cached(bucket: &str) {
+    let cache = memory_cache().read().await;
+    if cache.contains_key(bucket) {
+        return;
+    }
+    drop(cache);
+
+    update_usage_cache_if_needed().await;
+}
+
+fn cached_bucket_usage_from_backend(usage: BucketUsageInfo, updated_at: SystemTime) -> CachedBucketUsage {
+    CachedBucketUsage {
+        usage,
+        refreshed_at: SystemTime::now(),
+        usage_updated_at: updated_at,
+    }
+}
+
+fn cached_bucket_usage_now(usage: BucketUsageInfo) -> CachedBucketUsage {
+    let now = SystemTime::now();
+    CachedBucketUsage {
+        usage,
+        refreshed_at: now,
+        usage_updated_at: now,
+    }
+}
+
+fn data_usage_info_updated_at(data_usage_info: &DataUsageInfo) -> SystemTime {
+    data_usage_info.last_update.unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Fast in-memory update for immediate quota and admin usage consistency.
+pub async fn record_bucket_object_write_memory(bucket: &str, previous_current_size: Option<u64>, new_size: u64) {
+    ensure_bucket_usage_cached(bucket).await;
+
     let mut cache = memory_cache().write().await;
-    let current = cache.entry(bucket.to_string()).or_insert_with(|| (0, SystemTime::now()));
-    current.0 += size_increment;
-    current.1 = SystemTime::now();
+    let entry = cache
+        .entry(bucket.to_string())
+        .or_insert_with(|| cached_bucket_usage_now(BucketUsageInfo::default()));
+
+    match previous_current_size {
+        Some(previous_size) => {
+            entry.usage.size = entry.usage.size.saturating_sub(previous_size).saturating_add(new_size);
+        }
+        None => {
+            entry.usage.size = entry.usage.size.saturating_add(new_size);
+            entry.usage.objects_count = entry.usage.objects_count.saturating_add(1);
+            entry.usage.versions_count = entry.usage.versions_count.saturating_add(1);
+        }
+    }
+
+    let now = SystemTime::now();
+    entry.refreshed_at = now;
+    entry.usage_updated_at = now;
+}
+
+/// Fast in-memory increment for immediate quota consistency.
+pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
+    record_bucket_object_write_memory(bucket, None, size_increment).await;
+}
+
+/// Fast in-memory update for successful object deletes.
+pub async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
+    ensure_bucket_usage_cached(bucket).await;
+
+    let mut cache = memory_cache().write().await;
+    let entry = cache
+        .entry(bucket.to_string())
+        .or_insert_with(|| cached_bucket_usage_now(BucketUsageInfo::default()));
+
+    entry.usage.size = entry.usage.size.saturating_sub(deleted_size);
+    if removed_current_object {
+        entry.usage.objects_count = entry.usage.objects_count.saturating_sub(1);
+        entry.usage.versions_count = entry.usage.versions_count.saturating_sub(1);
+    }
+
+    let now = SystemTime::now();
+    entry.refreshed_at = now;
+    entry.usage_updated_at = now;
 }
 
 /// Fast in-memory decrement for immediate quota consistency
 pub async fn decrement_bucket_usage_memory(bucket: &str, size_decrement: u64) {
-    let mut cache = memory_cache().write().await;
-    if let Some(current) = cache.get_mut(bucket) {
-        current.0 = current.0.saturating_sub(size_decrement);
-        current.1 = SystemTime::now();
-    }
+    record_bucket_object_delete_memory(bucket, size_decrement, size_decrement > 0).await;
 }
 
 /// Get bucket usage from in-memory cache
@@ -425,7 +501,7 @@ pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
     update_usage_cache_if_needed().await;
 
     let cache = memory_cache().read().await;
-    cache.get(bucket).map(|(usage, _)| *usage)
+    cache.get(bucket).map(|cached| cached.usage.size)
 }
 
 async fn update_usage_cache_if_needed() {
@@ -434,7 +510,7 @@ async fn update_usage_cache_if_needed() {
     let now = SystemTime::now();
 
     let cache = memory_cache().read().await;
-    let earliest_timestamp = cache.values().map(|(_, ts)| *ts).min();
+    let earliest_timestamp = cache.values().map(|cached| cached.refreshed_at).min();
     drop(cache);
 
     let age = match earliest_timestamp {
@@ -461,8 +537,12 @@ async fn update_usage_cache_if_needed() {
                 && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
             {
                 let mut cache = cache_clone.write().await;
+                let usage_updated_at = data_usage_info_updated_at(&data_usage_info);
                 for (bucket_name, bucket_usage) in data_usage_info.buckets_usage.iter() {
-                    cache.insert(bucket_name.clone(), (bucket_usage.size, SystemTime::now()));
+                    cache.insert(
+                        bucket_name.clone(),
+                        cached_bucket_usage_from_backend(bucket_usage.clone(), usage_updated_at),
+                    );
                 }
             }
             let mut updating = updating_clone.write().await;
@@ -488,8 +568,12 @@ async fn update_usage_cache_if_needed() {
         && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
     {
         let mut cache = memory_cache().write().await;
+        let usage_updated_at = data_usage_info_updated_at(&data_usage_info);
         for (bucket_name, bucket_usage) in data_usage_info.buckets_usage.iter() {
-            cache.insert(bucket_name.clone(), (bucket_usage.size, SystemTime::now()));
+            cache.insert(
+                bucket_name.clone(),
+                cached_bucket_usage_from_backend(bucket_usage.clone(), usage_updated_at),
+            );
         }
     }
 
@@ -497,15 +581,62 @@ async fn update_usage_cache_if_needed() {
     *updating = false;
 }
 
+pub async fn replace_bucket_usage_memory_from_info(data_usage_info: &DataUsageInfo) {
+    let usage_updated_at = data_usage_info_updated_at(data_usage_info);
+    let mut cache = memory_cache().write().await;
+    let mut next_cache = HashMap::new();
+
+    for (bucket, bucket_usage) in data_usage_info.buckets_usage.iter() {
+        if let Some(existing) = cache.get(bucket)
+            && existing.usage_updated_at > usage_updated_at
+        {
+            next_cache.insert(bucket.clone(), existing.clone());
+            continue;
+        }
+
+        next_cache.insert(bucket.clone(), cached_bucket_usage_from_backend(bucket_usage.clone(), usage_updated_at));
+    }
+
+    for (bucket, existing) in cache.iter() {
+        if !data_usage_info.buckets_usage.contains_key(bucket) && existing.usage_updated_at > usage_updated_at {
+            next_cache.insert(bucket.clone(), existing.clone());
+        }
+    }
+
+    *cache = next_cache;
+}
+
+pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageInfo) {
+    let cache = memory_cache().read().await;
+    if cache.is_empty() {
+        return;
+    }
+
+    let persisted_update = data_usage_info.last_update;
+    let mut changed = false;
+
+    for (bucket, cached) in cache.iter() {
+        if persisted_update.is_some_and(|persisted| cached.usage_updated_at <= persisted) {
+            continue;
+        }
+
+        data_usage_info.buckets_usage.insert(bucket.clone(), cached.usage.clone());
+        data_usage_info.bucket_sizes.insert(bucket.clone(), cached.usage.size);
+        changed = true;
+    }
+
+    if changed {
+        data_usage_info.buckets_count = data_usage_info.buckets_usage.len() as u64;
+        data_usage_info.calculate_totals();
+    }
+}
+
 /// Sync memory cache with backend data (called by scanner)
 pub async fn sync_memory_cache_with_backend() -> Result<(), Error> {
     if let Some(store) = crate::global::GLOBAL_OBJECT_API.get() {
         match load_data_usage_from_backend(store.clone()).await {
             Ok(data_usage_info) => {
-                let mut cache = memory_cache().write().await;
-                for (bucket, bucket_usage) in data_usage_info.buckets_usage.iter() {
-                    cache.insert(bucket.clone(), (bucket_usage.size, SystemTime::now()));
-                }
+                replace_bucket_usage_memory_from_info(&data_usage_info).await;
             }
             Err(e) => {
                 debug!("Failed to sync memory cache with backend: {}", e);
@@ -686,7 +817,33 @@ pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_common::data_usage::BucketUsageInfo;
+    use rustfs_data_usage::BucketUsageInfo;
+    use serial_test::serial;
+
+    async fn clear_usage_memory_cache_for_test() {
+        memory_cache().write().await.clear();
+        *cache_updating().write().await = false;
+    }
+
+    fn data_usage_info_for_test(bucket: &str, objects_count: u64, size: u64, last_update: SystemTime) -> DataUsageInfo {
+        let mut info = DataUsageInfo {
+            last_update: Some(last_update),
+            ..Default::default()
+        };
+        info.buckets_usage.insert(
+            bucket.to_string(),
+            BucketUsageInfo {
+                objects_count,
+                versions_count: objects_count,
+                size,
+                ..Default::default()
+            },
+        );
+        info.bucket_sizes.insert(bucket.to_string(), size);
+        info.buckets_count = info.buckets_usage.len() as u64;
+        info.calculate_totals();
+        info
+    }
 
     fn aggregate_for_test(
         inputs: Vec<(DiskUsageStatus, Result<Option<LocalUsageSnapshot>, Error>)>,
@@ -771,5 +928,102 @@ mod tests {
         assert_eq!(aggregated.objects_total_size, 42);
         assert_eq!(aggregated.buckets_count, 1);
         assert_eq!(aggregated.buckets_usage.get("bucket-a").map(|b| (b.objects_count, b.size)), Some((3, 42)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn memory_overlay_reflects_recent_delete_before_scanner_persists() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 1, 42, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_delete_memory("bucket-a", 42, true).await;
+
+        let mut response = persisted.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 0);
+        assert_eq!(response.objects_total_size, 0);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((0, 0))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn memory_overlay_preserves_object_count_for_overwrite() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 1, 10, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_write_memory("bucket-a", Some(10), 20).await;
+
+        let mut response = persisted.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 1);
+        assert_eq!(response.objects_total_size, 20);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((1, 20))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn memory_overlay_does_not_replace_newer_persisted_usage() {
+        clear_usage_memory_cache_for_test().await;
+
+        let now = SystemTime::now();
+        let old_persisted = data_usage_info_for_test("bucket-a", 1, 42, now - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&old_persisted).await;
+        record_bucket_object_delete_memory("bucket-a", 42, true).await;
+
+        let mut newer_persisted = data_usage_info_for_test("bucket-a", 2, 84, now + Duration::from_secs(10));
+        apply_bucket_usage_memory_overlay(&mut newer_persisted).await;
+
+        assert_eq!(newer_persisted.objects_total_count, 2);
+        assert_eq!(newer_persisted.objects_total_size, 84);
+        assert_eq!(
+            newer_persisted
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((2, 84))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_sync_preserves_newer_memory_update() {
+        clear_usage_memory_cache_for_test().await;
+
+        let now = SystemTime::now();
+        let old_persisted = data_usage_info_for_test("bucket-a", 1, 42, now - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&old_persisted).await;
+        record_bucket_object_delete_memory("bucket-a", 42, true).await;
+
+        let scanner_snapshot = data_usage_info_for_test("bucket-a", 1, 42, now - Duration::from_secs(5));
+        replace_bucket_usage_memory_from_info(&scanner_snapshot).await;
+
+        let mut response = scanner_snapshot.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 0);
+        assert_eq!(response.objects_total_size, 0);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((0, 0))
+        );
     }
 }
