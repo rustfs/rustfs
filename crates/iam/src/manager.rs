@@ -401,6 +401,9 @@ where
         }
 
         let policies = MappedPolicy::new(name).to_slice();
+        let cache = self.cache.snapshot();
+        let policy_docs = Arc::clone(&cache.policy_docs);
+        drop(cache);
 
         let mut to_merge = Vec::new();
         for policy in policies {
@@ -408,8 +411,7 @@ where
                 continue;
             }
 
-            let cache = self.cache.snapshot();
-            let v = cache.policy_docs.get(&policy).cloned().ok_or(Error::NoSuchPolicy)?;
+            let v = policy_docs.get(&policy).cloned().ok_or(Error::NoSuchPolicy)?;
 
             to_merge.push(v.policy);
         }
@@ -554,14 +556,16 @@ where
         let mut policies = Vec::new();
         let mut to_merge = Vec::new();
         let mut miss_policies = Vec::new();
+        let cache = self.cache.snapshot();
+        let policy_docs = Arc::clone(&cache.policy_docs);
+        drop(cache);
 
         for policy in MappedPolicy::new(name).to_slice() {
             if policy.is_empty() {
                 continue;
             }
 
-            let cache = self.cache.snapshot();
-            if let Some(v) = cache.policy_docs.get(&policy).cloned() {
+            if let Some(v) = policy_docs.get(&policy).cloned() {
                 policies.push(policy);
                 to_merge.push(v.policy);
             } else {
