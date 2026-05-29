@@ -450,7 +450,7 @@ impl RemoteDisk {
 
     async fn mark_faulty_and_evict(&self, reason: &'static str) {
         let previous_state = self.runtime_state();
-        let became_offline = self.mark_suspect_or_offline(reason);
+        let transitioned_to_offline = self.mark_suspect_or_offline(reason);
         let state = self.runtime_state();
 
         if state != previous_state {
@@ -461,7 +461,7 @@ impl RemoteDisk {
                 "reason" => reason.to_string()
             )
             .increment(1);
-            if became_offline || state == RuntimeDriveHealthState::Offline {
+            if transitioned_to_offline {
                 warn!(
                     "Remote disk marked faulty after timeout: endpoint={}, addr={}, reason={}",
                     self.endpoint, self.addr, reason
