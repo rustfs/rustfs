@@ -3780,6 +3780,18 @@ mod tests {
     }
 
     #[test]
+    fn test_site_replication_peer_client_cache_hit_returns_cached_ready_client() {
+        let cache = Some(SiteReplicationPeerClientCache {
+            generation: 7,
+            entry: SiteReplicationPeerClientCacheEntry::Ready(reqwest::Client::new()),
+        });
+
+        site_replication_peer_client_cache_hit(&cache, 7)
+            .expect("cache hit expected")
+            .expect("ready cache entry should return cached client");
+    }
+
+    #[test]
     fn test_site_replication_peer_client_cache_hit_returns_cached_error() {
         let cache = Some(SiteReplicationPeerClientCache {
             generation: 7,
