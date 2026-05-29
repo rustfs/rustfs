@@ -13,8 +13,10 @@ Default fixture root:
 crates/rio-v2/tests/fixtures/minio-generated
 ```
 
-The repository now carries a minimal checked-in fixture subset for the default matrix.
-To regenerate or expand it locally, use:
+The generated MinIO fixture data is intentionally not checked in and these tests are
+ignored by default, so they are not part of automated CI runs.
+
+To generate or expand fixtures locally, use:
 
 ```powershell
 uv run python .\minio_fixture_lab\lab.py capture-matrix `
@@ -28,7 +30,7 @@ Or point the tests at another generated root:
 
 ```powershell
 $env:RUSTFS_MINIO_FIXTURE_ROOT = '.\rustfs\tmp\minio-fixture-lab-smoke'
-cargo +1.95.0 test -p rustfs-rio-v2 --test minio_generated_fixtures
+cargo +1.95.0 test -p rustfs-rio-v2 --test minio_generated_fixtures -- --ignored
 ```
 
 ## Scope

@@ -116,6 +116,7 @@ fn expected_fixture_kms_key_id(case_id: &str, request: &RequestRecord) -> Option
 }
 
 #[test]
+#[ignore = "requires locally generated MinIO fixtures"]
 fn parses_singlepart_sse_s3_fixture() {
     require_generated_fixture_root();
 
@@ -136,6 +137,7 @@ fn parses_singlepart_sse_s3_fixture() {
 }
 
 #[test]
+#[ignore = "requires locally generated MinIO fixtures"]
 fn parses_singlepart_sse_kms_fixture() {
     require_generated_fixture_root();
 
@@ -170,6 +172,7 @@ fn parses_singlepart_sse_kms_fixture() {
 }
 
 #[test]
+#[ignore = "requires locally generated MinIO fixtures"]
 fn parses_multipart_sse_s3_fixture() {
     require_generated_fixture_root();
 
@@ -196,6 +199,7 @@ fn parses_multipart_sse_s3_fixture() {
 }
 
 #[test]
+#[ignore = "requires locally generated MinIO fixtures"]
 fn parses_multipart_sse_kms_fixture() {
     require_generated_fixture_root();
 
@@ -226,6 +230,7 @@ fn parses_multipart_sse_kms_fixture() {
 }
 
 #[test]
+#[ignore = "requires locally generated MinIO fixtures"]
 fn parses_singlepart_sse_c_fixture() {
     require_generated_fixture_root();
 
@@ -253,6 +258,7 @@ fn parses_singlepart_sse_c_fixture() {
 }
 
 #[test]
+#[ignore = "requires locally generated MinIO fixtures"]
 fn parses_multipart_sse_c_fixture() {
     require_generated_fixture_root();
 
