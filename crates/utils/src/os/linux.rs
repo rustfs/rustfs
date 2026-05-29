@@ -108,7 +108,11 @@ fn should_warn_bavail_greater_than_bfree(path: &Path) -> bool {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    warned_paths.insert(path.to_path_buf())
+    if warned_paths.contains(path) {
+        false
+    } else {
+        warned_paths.insert(path.to_path_buf())
+    }
 }
 
 pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
