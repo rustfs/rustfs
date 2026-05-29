@@ -588,6 +588,18 @@ impl SetDisks {
     // shuffle_disks TODO: use origin value
 }
 
+fn is_explicit_null_version(version_id: Option<Uuid>) -> bool {
+    version_id == Some(Uuid::nil())
+}
+
+fn delete_file_info_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
+    if is_explicit_null_version(version_id) {
+        None
+    } else {
+        version_id
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectIO for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1606,9 +1618,10 @@ impl ObjectOperations for SetDisks {
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
 
         for (i, dobj) in objects.iter().enumerate() {
+            let explicit_null_version = is_explicit_null_version(dobj.version_id);
             let mut vr = FileInfo {
                 name: dobj.object_name.clone(),
-                version_id: dobj.version_id,
+                version_id: delete_file_info_version_id(dobj.version_id),
                 idx: i,
                 replication_state_internal: Some(dobj.replication_state()),
                 ..Default::default()
@@ -1657,7 +1670,11 @@ impl ObjectOperations for SetDisks {
             } else {
                 del_objects[i] = DeletedObject {
                     object_name: vr.name.clone(),
-                    version_id: vr.version_id,
+                    version_id: if explicit_null_version {
+                        Some(Uuid::nil())
+                    } else {
+                        vr.version_id
+                    },
                     replication_state: vr.replication_state_internal.clone(),
                     ..Default::default()
                 }
@@ -6020,6 +6037,15 @@ mod tests {
         let part_numbers = vec![1, 2, 3];
 
         assert!(parts_after_marker(&part_numbers, 4).is_none());
+    }
+
+    #[test]
+    fn delete_file_info_version_id_maps_explicit_null_version_to_stored_null() {
+        assert_eq!(delete_file_info_version_id(Some(Uuid::nil())), None);
+
+        let version_id = Uuid::new_v4();
+        assert_eq!(delete_file_info_version_id(Some(version_id)), Some(version_id));
+        assert_eq!(delete_file_info_version_id(None), None);
     }
 
     #[test]
