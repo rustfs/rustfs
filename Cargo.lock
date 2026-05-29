@@ -3571,7 +3571,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3907,7 +3907,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5321,7 +5321,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6028,6 +6028,15 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memmap2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83faa42c0a078c393f6b29d5db232d8be22776a891f8f56e5284faee4a20b327"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "memmap2"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
@@ -6535,7 +6544,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6788,22 +6797,21 @@ dependencies = [
 
 [[package]]
 name = "object"
-version = "0.37.3"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+checksum = "21158b2c33aa6d4561f1c0a6ea283ca92bc54802a93b263e910746d679a7eb53"
 dependencies = [
+ "flate2",
  "memchr",
 ]
 
 [[package]]
 name = "object"
-version = "0.39.1"
+version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
- "flate2",
  "memchr",
- "ruzstd",
 ]
 
 [[package]]
@@ -7724,16 +7732,19 @@ dependencies = [
  "backtrace",
  "cfg-if",
  "findshlibs",
+ "framehop",
  "inferno 0.11.21",
  "libc",
  "log",
+ "memmap2 0.5.10",
  "nix 0.26.4",
+ "object 0.29.0",
  "once_cell",
  "protobuf",
  "protobuf-codegen",
  "smallvec",
  "spin 0.10.0",
- "symbolic-demangle 12.18.3",
+ "symbolic-demangle",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -7925,7 +7936,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "once_cell",
@@ -7945,7 +7956,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -7966,7 +7977,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7979,7 +7990,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -8126,29 +8137,18 @@ dependencies = [
 
 [[package]]
 name = "pyroscope"
-version = "2.0.6"
+version = "2.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6869e0f2cae5cef10281c57d5a260f91372d7f190a7f717eb1a54f643d92151"
+checksum = "01ebd83db08e07a69b4291e7043f5f2ca964c8869e0bd0b6d09b8b062de775bd"
 dependencies = [
- "aligned-vec",
- "backtrace",
- "findshlibs",
- "framehop",
  "lazy_static",
  "libc",
  "libflate",
  "log",
- "memmap2",
- "nix 0.26.4",
- "object 0.39.1",
- "once_cell",
+ "pprof-pyroscope-fork",
  "prost 0.14.3",
  "reqwest",
  "serde_json",
- "smallvec",
- "spin 0.12.0",
- "symbolic-demangle 13.1.1",
- "tempfile",
  "thiserror 2.0.18",
  "url",
  "uuid",
@@ -9327,7 +9327,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "md-5 0.11.0",
- "memmap2",
+ "memmap2 0.9.10",
  "metrics",
  "num_cpus",
  "opentelemetry 0.32.0",
@@ -9483,7 +9483,7 @@ name = "rustfs-io-core"
 version = "1.0.0-beta.6"
 dependencies = [
  "bytes",
- "memmap2",
+ "memmap2 0.9.10",
  "rustfs-io-metrics",
  "thiserror 2.0.18",
  "tokio",
@@ -10186,7 +10186,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10260,7 +10260,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10297,15 +10297,6 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
-]
-
-[[package]]
-name = "ruzstd"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
-dependencies = [
- "twox-hash",
 ]
 
 [[package]]
@@ -11049,15 +11040,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spin"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1527984ca054dfca79333baec451042863f485fbee01b7bf6d911de915cac865"
-dependencies = [
- "lock_api",
-]
-
-[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11297,19 +11279,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "332615d90111d8eeaf86a84dc9bbe9f65d0d8c5cf11b4caccedc37754eb0dcfd"
 dependencies = [
  "debugid",
- "memmap2",
- "stable_deref_trait",
- "uuid",
-]
-
-[[package]]
-name = "symbolic-common"
-version = "13.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c30da69ccd7ab2780ce5309791f3cd2ef9716262c07a0a29096226d4235a979"
-dependencies = [
- "debugid",
- "memmap2",
+ "memmap2 0.9.10",
  "stable_deref_trait",
  "uuid",
 ]
@@ -11322,17 +11292,7 @@ checksum = "912017718eb4d21930546245af9a3475c9dccf15675a5c215664e76621afc471"
 dependencies = [
  "cpp_demangle",
  "rustc-demangle",
- "symbolic-common 12.18.3",
-]
-
-[[package]]
-name = "symbolic-demangle"
-version = "13.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1245acf80236b4a0d99e9216532102a1670950e79c70b980b607c2040966e83d"
-dependencies = [
- "rustc-demangle",
- "symbolic-common 13.1.1",
+ "symbolic-common",
 ]
 
 [[package]]
@@ -11471,7 +11431,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12649,7 +12609,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
