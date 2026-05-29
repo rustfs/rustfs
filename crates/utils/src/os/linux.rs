@@ -26,7 +26,6 @@ static BAVAIL_GT_BFREE_WARNING_PATHS: OnceLock<Mutex<BTreeSet<String>>> = OnceLo
 
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
-    let path_display = p.as_ref().display().to_string();
     // Use statfs on Linux to get access to f_type (filesystem magic number)
     let stat = statfs(p.as_ref())?;
 
@@ -46,7 +45,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let bfree = stat.f_bfree as u64;
     let bavail = stat.f_bavail as u64;
     let blocks = stat.f_blocks as u64;
-    let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, &path_display)?;
+    let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, p.as_ref().display())?;
 
     let st = rustix::fs::stat(p.as_ref())?;
 
@@ -68,10 +67,11 @@ fn calculate_space_usage(
     bfree: u64,
     bavail: u64,
     bsize: u64,
-    path_display: &str,
+    path: impl std::fmt::Display,
 ) -> std::io::Result<(u64, u64, u64)> {
     let available = if bfree < bavail {
-        if should_warn_bavail_greater_than_bfree(path_display) {
+        let path_display = path.to_string();
+        if should_warn_bavail_greater_than_bfree(&path_display) {
             warn!(
                 path = %path_display,
                 f_bfree = bfree,
@@ -89,7 +89,7 @@ fn calculate_space_usage(
         Some(total) => total * bsize,
         None => {
             return Err(Error::other(format!(
-                "detected reserved space ({reserved}) > blocks space ({blocks}), fs corruption at ({path_display}). please run 'fsck'",
+                "detected reserved space ({reserved}) > blocks space ({blocks}), fs corruption at ({path}). please run 'fsck'",
             )));
         }
     };
@@ -99,7 +99,7 @@ fn calculate_space_usage(
         Some(used) => used,
         None => {
             return Err(Error::other(format!(
-                "detected free space ({free}) > total drive space ({total}), fs corruption at ({path_display}). please run 'fsck'"
+                "detected free space ({free}) > total drive space ({total}), fs corruption at ({path}). please run 'fsck'"
             )));
         }
     };
@@ -435,6 +435,55 @@ mod tests {
         let minor = u64::MAX;
         let ids = resolve_block_device_ids(major, minor).unwrap();
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![format!("{major}:{minor}")]);
+    }
+
+    #[test]
+    fn calculate_space_usage_normal_bfree_greater_than_bavail() {
+        // Typical ext4/xfs scenario: bavail < bfree due to reserved blocks
+        let blocks = 1_000_u64;
+        let bfree = 900_u64;
+        let bavail = 850_u64;
+        let bsize = 4_096_u64;
+
+        let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, "/data").unwrap();
+        assert_eq!(total, blocks * bsize);
+        assert_eq!(free, bavail * bsize);
+        assert_eq!(used, (blocks - bavail) * bsize);
+    }
+
+    #[test]
+    fn calculate_space_usage_bfree_equals_bavail() {
+        // No reserved blocks: bfree == bavail (e.g. FAT/exFAT or root user)
+        let blocks = 500_u64;
+        let bfree = 400_u64;
+        let bavail = 400_u64;
+        let bsize = 4_096_u64;
+
+        let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, "/data").unwrap();
+        assert_eq!(total, blocks * bsize);
+        assert_eq!(free, bfree * bsize);
+        assert_eq!(used, (blocks - bfree) * bsize);
+    }
+
+    #[test]
+    fn calculate_space_usage_all_zero_blocks() {
+        let (total, free, used) = calculate_space_usage(0, 0, 0, 4_096, "/data").unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(free, 0);
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn calculate_space_usage_all_blocks_free() {
+        let blocks = 1_000_u64;
+        let bfree = 1_000_u64;
+        let bavail = 1_000_u64;
+        let bsize = 4_096_u64;
+
+        let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, "/data").unwrap();
+        assert_eq!(total, blocks * bsize);
+        assert_eq!(free, blocks * bsize);
+        assert_eq!(used, 0);
     }
 
     #[test]
