@@ -19,10 +19,11 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, Error, ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
-    let path_display = p.as_ref().display();
+    let path_display = p.as_ref().display().to_string();
     // Use statfs on Linux to get access to f_type (filesystem magic number)
     let stat = statfs(p.as_ref())?;
 
@@ -42,15 +43,39 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let bfree = stat.f_bfree as u64;
     let bavail = stat.f_bavail as u64;
     let blocks = stat.f_blocks as u64;
+    let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, &path_display)?;
 
-    let reserved = match bfree.checked_sub(bavail) {
-        Some(reserved) => reserved,
-        None => {
-            return Err(Error::other(format!(
-                "detected f_bavail space ({bavail}) > f_bfree space ({bfree}), fs corruption at ({path_display}). please run 'fsck'",
-            )));
-        }
-    };
+    let st = rustix::fs::stat(p.as_ref())?;
+
+    Ok(DiskInfo {
+        total,
+        free,
+        used,
+        files: stat.f_files as u64,
+        ffree: stat.f_ffree as u64,
+        fstype: get_fs_type(stat.f_type as u64).to_string(),
+        major: rustix::fs::major(st.st_dev) as u64,
+        minor: rustix::fs::minor(st.st_dev) as u64,
+        ..Default::default()
+    })
+}
+
+fn calculate_space_usage(
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    bsize: u64,
+    path_display: &str,
+) -> std::io::Result<(u64, u64, u64)> {
+    let reserved = bfree.saturating_sub(bavail);
+    if bfree < bavail {
+        warn!(
+            path = %path_display,
+            f_bfree = bfree,
+            f_bavail = bavail,
+            "detected f_bavail greater than f_bfree, treating reserved blocks as 0 for compatibility"
+        );
+    }
 
     let total = match blocks.checked_sub(reserved) {
         Some(total) => total * bsize,
@@ -71,19 +96,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         }
     };
 
-    let st = rustix::fs::stat(p.as_ref())?;
-
-    Ok(DiskInfo {
-        total,
-        free,
-        used,
-        files: stat.f_files as u64,
-        ffree: stat.f_ffree as u64,
-        fstype: get_fs_type(stat.f_type as u64).to_string(),
-        major: rustix::fs::major(st.st_dev) as u64,
-        minor: rustix::fs::minor(st.st_dev) as u64,
-        ..Default::default()
-    })
+    Ok((total, free, used))
 }
 
 pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
@@ -406,5 +419,24 @@ mod tests {
         let minor = u64::MAX;
         let ids = resolve_block_device_ids(major, minor).unwrap();
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![format!("{major}:{minor}")]);
+    }
+
+    #[test]
+    fn calculate_space_usage_allows_bavail_greater_than_bfree() {
+        let blocks = 1_000_u64;
+        let bfree = 900_u64;
+        let bavail = 920_u64;
+        let bsize = 4_096_u64;
+
+        let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, "/data").unwrap();
+        assert_eq!(total, blocks * bsize);
+        assert_eq!(free, bavail * bsize);
+        assert_eq!(used, total - free);
+    }
+
+    #[test]
+    fn calculate_space_usage_rejects_free_greater_than_total() {
+        let err = calculate_space_usage(100, 100, 200, 4_096, "/data").unwrap_err();
+        assert!(err.to_string().contains("detected free space"));
     }
 }
