@@ -57,14 +57,15 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
-use tokio::sync::RwLock;
-use tokio::time::interval;
+use tokio::sync::{Notify, RwLock};
+use tokio::time::{Instant, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
+const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -331,6 +332,8 @@ pub struct LocalDisk {
     // pub format_data: Mutex<Vec<u8>>,
     // pub format_file_info: Mutex<Option<Metadata>>,
     // pub format_last_check: Mutex<Option<OffsetDateTime>>,
+    startup_cleanup_ready: Arc<AtomicU32>,
+    startup_cleanup_notify: Arc<Notify>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
@@ -370,7 +373,15 @@ impl LocalDisk {
 
         ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
 
-        if cleanup && let Err(err) = Self::cleanup_tmp_on_startup(&root).await {
+        let startup_cleanup_ready = Arc::new(AtomicU32::new(u32::from(!cleanup)));
+        let startup_cleanup_notify = Arc::new(Notify::new());
+
+        if cleanup
+            && let Err(err) =
+                Self::cleanup_tmp_on_startup(&root, startup_cleanup_ready.clone(), startup_cleanup_notify.clone()).await
+        {
+            startup_cleanup_ready.store(1, Ordering::Release);
+            startup_cleanup_notify.notify_waiters();
             warn!(root = ?root, error = ?err, "failed to cleanup temporary data during disk startup");
         }
 
@@ -466,6 +477,8 @@ impl LocalDisk {
             // format_last_check: Mutex::new(format_last_check),
             path_cache: Arc::new(ParkingLotRwLock::new(HashMap::with_capacity(2048))),
             current_dir: Arc::new(OnceLock::new()),
+            startup_cleanup_ready,
+            startup_cleanup_notify,
             exit_signal: None,
         };
         let (info, _root) = get_disk_info(root).await?;
@@ -497,7 +510,8 @@ impl LocalDisk {
     }
 
     async fn cleanup_deleted_objects_loop(root: PathBuf, mut exit_rx: tokio::sync::broadcast::Receiver<()>) {
-        let mut interval = interval(DELETED_OBJECTS_CLEANUP_INTERVAL);
+        let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
+        let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -525,11 +539,17 @@ impl LocalDisk {
         root.join(meta_path)
     }
 
-    async fn cleanup_tmp_on_startup(root: &Path) -> Result<()> {
+    async fn cleanup_tmp_on_startup(
+        root: &Path,
+        startup_cleanup_ready: Arc<AtomicU32>,
+        startup_cleanup_notify: Arc<Notify>,
+    ) -> Result<()> {
         let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
         let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
 
         rename_all(&tmp_path, &tmp_old_path, root).await?;
+
+        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
 
         let tmp_old_root = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET);
         tokio::spawn(async move {
@@ -538,10 +558,33 @@ impl LocalDisk {
             {
                 warn!(path = ?tmp_old_root, error = ?err, "failed to remove old temporary data");
             }
+            startup_cleanup_ready.store(1, Ordering::Release);
+            startup_cleanup_notify.notify_waiters();
         });
 
-        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
         Ok(())
+    }
+
+    async fn wait_for_startup_cleanup(&self) {
+        if self.startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+            return;
+        }
+
+        if wait_for_startup_cleanup_signal(
+            self.startup_cleanup_ready.as_ref(),
+            self.startup_cleanup_notify.as_ref(),
+            STARTUP_CLEANUP_WAIT_TIMEOUT,
+        )
+        .await
+        {
+            debug!(disk = %self.endpoint, "startup cleanup barrier released before walk_dir");
+        } else {
+            warn!(
+                disk = %self.endpoint,
+                timeout_ms = STARTUP_CLEANUP_WAIT_TIMEOUT.as_millis(),
+                "startup cleanup barrier timed out; continuing walk_dir"
+            );
+        }
     }
 
     async fn cleanup_stale_tmp_objects(root: PathBuf) -> Result<()> {
@@ -1163,32 +1206,44 @@ impl LocalDisk {
     }
     // write_all_internal do write file
     async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
-        let flags = O_CREATE | O_WRONLY | O_TRUNC;
-
-        let mut f = {
-            if sync {
-                // TODO: support sync
-                self.open_file(file_path, flags, skip_parent).await?
-            } else {
-                self.open_file(file_path, flags, skip_parent).await?
-            }
+        let skip_parent = if skip_parent.as_os_str().is_empty() {
+            self.root.as_path()
+        } else {
+            skip_parent
         };
 
         match data {
             InternalBuf::Ref(buf) => {
+                let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
                 f.write_all(buf).await.map_err(to_file_error)?;
             }
             InternalBuf::Owned(buf) => {
-                // Reduce one copy by using the owned buffer directly.
-                // It may be more efficient for larger writes.
-                let mut f = f.into_std().await;
-                let task = tokio::task::spawn_blocking(move || {
-                    use std::io::Write as _;
-                    f.write_all(buf.as_ref()).map_err(to_file_error)
-                });
-                task.await??;
+                let path = file_path.to_path_buf();
+                if let Some(parent) = path.parent()
+                    && parent != skip_parent
+                {
+                    os::make_dir_all(parent, skip_parent).await?;
+                }
+
+                tokio::task::spawn_blocking(move || {
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(path)
+                        .map_err(to_file_error)?;
+
+                    std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?;
+
+                    Ok::<(), std::io::Error>(())
+                })
+                .await
+                .map_err(DiskError::from)??;
             }
         }
+
+        // Keep existing durability contract: this path intentionally ignores `sync`.
+        let _ = sync;
 
         Ok(())
     }
@@ -1199,12 +1254,19 @@ impl LocalDisk {
             skip_parent = self.root.as_path();
         }
 
-        if let Some(parent) = path.as_ref().parent() {
+        if let Some(parent) = path.as_ref().parent()
+            && parent != skip_parent
+        {
             os::make_dir_all(parent, skip_parent).await?;
         }
 
         let f = super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?;
 
+        Ok(f)
+    }
+
+    async fn open_file_read_only(&self, path: impl AsRef<Path>) -> Result<File> {
+        let f = super::fs::open_file(path.as_ref(), O_RDONLY).await.map_err(to_file_error)?;
         Ok(f)
     }
 
@@ -1234,6 +1296,7 @@ impl LocalDisk {
     }
 
     #[async_recursion::async_recursion]
+    #[allow(clippy::too_many_arguments)]
     async fn scan_dir<W>(
         &self,
         mut current: String,
@@ -1242,6 +1305,7 @@ impl LocalDisk {
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
         skip_current_dir_object: bool,
+        multipart_dir_to_skip: Option<HashSet<String>>,
     ) -> Result<()>
     where
         W: AsyncWrite + Unpin + Send,
@@ -1297,6 +1361,14 @@ impl LocalDisk {
             // check limit
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
+            }
+            // check multipart dir
+            if skip_current_dir_object
+                && let Some(ref dir_to_skip) = multipart_dir_to_skip
+                && dir_to_skip.contains(entry.trim_end_matches(SLASH_SEPARATOR))
+            {
+                *item = "".to_owned();
+                continue;
             }
             // check prefix
             if !prefix.is_empty() && !entry.starts_with(prefix.as_str()) {
@@ -1367,15 +1439,25 @@ impl LocalDisk {
             }
         }
 
-        let mut dir_stack: Vec<(String, bool)> = Vec::with_capacity(5);
+        let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>)> = Vec::with_capacity(5);
         // Explicit directory markers and real directories can resolve to the same logical path.
-        let schedule_dir = |dir_stack: &mut Vec<(String, bool)>, dir_name: String, skip_object: bool| {
-            if let Some((last_dir_name, existing_skip_object)) = dir_stack.last_mut()
+        let schedule_dir = |dir_stack: &mut Vec<(String, bool, Option<HashSet<String>>)>,
+                            dir_name: String,
+                            skip_object: bool,
+                            dir_to_skip: Option<HashSet<String>>| {
+            if let Some((last_dir_name, existing_skip_object, existing_dir_to_skip)) = dir_stack.last_mut()
                 && *last_dir_name == dir_name
             {
                 *existing_skip_object |= skip_object;
+                if let Some(existing_dir_to_skip) = existing_dir_to_skip {
+                    if let Some(new_dir_to_skip) = &dir_to_skip {
+                        existing_dir_to_skip.extend(new_dir_to_skip.iter().cloned());
+                    }
+                } else {
+                    *existing_dir_to_skip = dir_to_skip;
+                }
             } else {
-                dir_stack.push((dir_name, skip_object));
+                dir_stack.push((dir_name, skip_object, dir_to_skip));
             }
         };
         prefix = "".to_owned();
@@ -1391,9 +1473,10 @@ impl LocalDisk {
 
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
-            while let Some((pop, skip_object)) = dir_stack.last().cloned()
-                && pop < name
+            while let Some((last_name, _, _)) = dir_stack.last()
+                && *last_name < name
             {
+                let (pop, skip_object, dir_to_skip) = dir_stack.pop().unwrap();
                 out.write_obj(&MetaCacheEntry {
                     name: pop.clone(),
                     ..Default::default()
@@ -1401,11 +1484,11 @@ impl LocalDisk {
                 .await?;
 
                 if opts.recursive
-                    && let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object)).await
+                    && let Err(er) =
+                        Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
                 {
                     error!("scan_dir err {:?}", er);
                 }
-                dir_stack.pop();
             }
 
             let mut meta = MetaCacheEntry {
@@ -1442,11 +1525,24 @@ impl LocalDisk {
                     // }
 
                     if opts.recursive {
+                        let mut dir_to_skip = HashSet::new();
+                        if let Ok(file_meta) = FileMeta::load(&res)
+                            && let Ok(data_dirs) = file_meta.get_data_dirs()
+                        {
+                            for data_dir in data_dirs.iter().flatten() {
+                                dir_to_skip.insert(data_dir.to_string());
+                            }
+                        }
                         let mut dir_name = meta.name.clone();
                         if !dir_name.ends_with(SLASH_SEPARATOR) {
                             dir_name.push_str(SLASH_SEPARATOR);
                         }
-                        schedule_dir(&mut dir_stack, dir_name, true);
+                        schedule_dir(
+                            &mut dir_stack,
+                            dir_name,
+                            true,
+                            if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
+                        );
                     }
                 }
                 Err(err) => {
@@ -1455,7 +1551,7 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            schedule_dir(&mut dir_stack, meta.name, false);
+                            schedule_dir(&mut dir_stack, meta.name, false, None);
                         }
                     }
 
@@ -1464,7 +1560,7 @@ impl LocalDisk {
             };
         }
 
-        while let Some((dir, skip_object)) = dir_stack.pop() {
+        while let Some((dir, skip_object, dir_to_skip)) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
             }
@@ -1476,7 +1572,8 @@ impl LocalDisk {
             .await?;
 
             if opts.recursive
-                && let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object)).await
+                && let Err(er) =
+                    Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
             {
                 warn!("scan_dir err {:?}", &er);
             }
@@ -1958,11 +2055,7 @@ impl DiskAPI for LocalDisk {
             let meta_op = match lstat_std(&src_file_path).map_err(|e| to_file_error(e).into()) {
                 Ok(meta) => Some(meta),
                 Err(e) => {
-                    if e != DiskError::FileNotFound {
-                        return Err(e);
-                    }
-
-                    None
+                    return Err(e);
                 }
             };
 
@@ -1974,9 +2067,21 @@ impl DiskAPI for LocalDisk {
             }
 
             remove_std(&dst_file_path).map_err(to_file_error)?;
+        } else {
+            let meta = lstat_std(&src_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
+            if meta.is_dir() {
+                warn!("rename_part src is dir {:?}", &src_file_path);
+                return Err(DiskError::FileAccessDenied);
+            }
         }
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
+
+        let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
+        if src_is_dir != dst_meta.is_dir() {
+            warn!("rename_part dst type changed after rename {:?}", &dst_file_path);
+            return Err(DiskError::FileAccessDenied);
+        }
 
         self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
 
@@ -2107,7 +2212,7 @@ impl DiskAPI for LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+        let f = self.open_file_read_only(file_path).await?;
 
         Ok(Box::new(f))
     }
@@ -2124,7 +2229,7 @@ impl DiskAPI for LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+        let mut f = self.open_file_read_only(file_path).await?;
 
         let meta = f.metadata().await?;
         let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
@@ -2313,6 +2418,8 @@ impl DiskAPI for LocalDisk {
     // FIXME: TODO: io.writer TODO cancel
     #[tracing::instrument(level = "debug", skip(self, wr))]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        self.wait_for_startup_cleanup().await;
+
         let volume_dir = self.get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket)
@@ -2328,6 +2435,7 @@ impl DiskAPI for LocalDisk {
         let mut objs_returned = 0;
 
         let mut skip_current_dir_object = false;
+        let mut multipart_dir_to_skip: HashSet<String> = HashSet::new();
         if opts.base_dir.ends_with(SLASH_SEPARATOR) {
             if let Ok(data) = self
                 .read_metadata(
@@ -2351,10 +2459,23 @@ impl DiskAPI for LocalDisk {
                 let fpath =
                     self.get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
 
-                if let Ok(meta) = tokio::fs::metadata(fpath).await
+                if let Ok(meta) = tokio::fs::metadata(&fpath).await
                     && meta.is_file()
                 {
                     skip_current_dir_object = true;
+                    if let Ok(meta_bytes) = self
+                        .read_metadata(
+                            opts.bucket.as_str(),
+                            path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str(),
+                        )
+                        .await
+                        && let Ok(file_meta) = FileMeta::load(&meta_bytes)
+                        && let Ok(data_dirs) = file_meta.get_data_dirs()
+                    {
+                        for data_dir in data_dirs.iter().flatten() {
+                            multipart_dir_to_skip.insert(data_dir.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -2366,6 +2487,11 @@ impl DiskAPI for LocalDisk {
             &mut out,
             &mut objs_returned,
             skip_current_dir_object,
+            if multipart_dir_to_skip.is_empty() {
+                None
+            } else {
+                Some(multipart_dir_to_skip)
+            },
         )
         .await?;
 
@@ -2464,32 +2590,41 @@ impl DiskAPI for LocalDisk {
 
         // TODO: Healing
 
-        let search_version_id = fi.version_id.or(Some(Uuid::nil()));
+        let version_id = fi.version_id.unwrap_or_default();
+        let search_version_id = Some(version_id);
+        let no_inline = fi.data.is_none() && fi.size > 0;
 
         // Check if there's an existing version with the same version_id that has a data_dir to clean up
-        let has_old_data_dir = {
-            xlmeta.find_version(search_version_id).ok().and_then(|(_, ver)| {
-                // shard_count == 0 means no other version shares this data_dir
-                ver.get_data_dir()
-                    .filter(|&data_dir| xlmeta.shard_data_dir_count(&search_version_id, &Some(data_dir)) == 0)
-            })
-        };
+        // Reuse one metadata scan to find the version data_dir and determine whether it is shared.
+        let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(search_version_id);
         if let Some(old_data_dir) = has_old_data_dir.as_ref() {
-            let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), *old_data_dir]);
+            let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
         }
 
-        xlmeta.add_version(fi.clone())?;
+        xlmeta.add_version(fi)?;
 
         if xlmeta.versions.len() <= 10 {
             // TODO: Sign
         }
 
-        let new_dst_buf = xlmeta.marshal_msg()?;
-
-        self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
-            .await?;
         if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
-            let no_inline = fi.data.is_none() && fi.size > 0;
+            let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
+            let meta_skip_parent = if no_inline {
+                src_file_parent
+            } else {
+                src_volume_dir.as_path()
+            };
+            let new_dst_buf = xlmeta.marshal_msg()?;
+
+            self.write_all_private(
+                src_volume,
+                format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(),
+                new_dst_buf.into(),
+                true,
+                meta_skip_parent,
+            )
+            .await?;
+
             if no_inline && let Err(err) = rename_all(&src_data_path, &dst_data_path, &skip_parent).await {
                 let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 info!(
@@ -2498,6 +2633,10 @@ impl DiskAPI for LocalDisk {
                 );
                 return Err(err);
             }
+        } else {
+            let new_dst_buf = xlmeta.marshal_msg()?;
+            self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
+                .await?;
         }
 
         if let Some(old_data_dir) = has_old_data_dir {
@@ -2984,7 +3123,6 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(skip(self))]
     async fn disk_info(&self, _: &DiskInfoOptions) -> Result<DiskInfo> {
         let mut info = Cache::get(self.disk_info_cache.clone()).await?;
-        // TODO: nr_requests, rotational
         info.nr_requests = self.nrrequests;
         info.rotational = self.rotational;
         info.mount_path = self.path().to_str().unwrap().to_string();
@@ -3010,6 +3148,31 @@ impl DiskAPI for LocalDisk {
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
         Ok(data.into())
     }
+}
+
+async fn wait_for_startup_cleanup_signal(
+    startup_cleanup_ready: &AtomicU32,
+    startup_cleanup_notify: &Notify,
+    wait_timeout: Duration,
+) -> bool {
+    if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+
+    timeout(wait_timeout, async {
+        loop {
+            if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            let notified = startup_cleanup_notify.notified();
+            if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .is_ok()
 }
 
 #[tracing::instrument]
@@ -3064,7 +3227,9 @@ mod test {
         fs::create_dir_all(leftover.parent().unwrap()).await.unwrap();
         fs::write(&leftover, b"temporary").await.unwrap();
 
-        LocalDisk::cleanup_tmp_on_startup(dir.path()).await.unwrap();
+        LocalDisk::cleanup_tmp_on_startup(dir.path(), Arc::new(AtomicU32::new(0)), Arc::new(Notify::new()))
+            .await
+            .unwrap();
 
         assert!(!tmp.join("leftover").exists());
         assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
@@ -3120,6 +3285,54 @@ mod test {
         assert!(entries.next_entry().await.unwrap().is_none());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_loop_interval_does_not_tick_immediately() {
+        let start_at = tokio::time::Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
+        let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
+
+        assert!(tokio::time::timeout(Duration::from_secs(1), interval.tick()).await.is_err());
+
+        tokio::time::advance(DELETED_OBJECTS_CLEANUP_INTERVAL).await;
+        interval.tick().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_cleanup_barrier_waits_for_notification() {
+        let ready = Arc::new(AtomicU32::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let wait = tokio::spawn({
+            let ready = ready.clone();
+            let notify = notify.clone();
+            async move { wait_for_startup_cleanup_signal(ready.as_ref(), notify.as_ref(), Duration::from_secs(2)).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+
+        ready.store(1, Ordering::Release);
+        notify.notify_waiters();
+
+        assert!(wait.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_cleanup_barrier_times_out() {
+        let ready = Arc::new(AtomicU32::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let wait = tokio::spawn({
+            let ready = ready.clone();
+            let notify = notify.clone();
+            async move { wait_for_startup_cleanup_signal(ready.as_ref(), notify.as_ref(), Duration::from_secs(2)).await }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        assert!(!wait.await.unwrap());
+    }
+
     #[tokio::test]
     async fn test_scan_dir_includes_nested_object_dirs() {
         use rustfs_filemeta::MetacacheReader;
@@ -3151,7 +3364,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
             .unwrap();
         out.close().await.unwrap();
@@ -3206,7 +3419,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
             .unwrap();
         out.close().await.unwrap();
@@ -3266,7 +3479,7 @@ mod test {
             };
             let mut objs_returned = 0;
 
-            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
                 .await
                 .unwrap();
             out.close().await.unwrap();
@@ -3325,6 +3538,155 @@ mod test {
             "forward_to must not skip a child directory whose name repeats the base prefix"
         );
         assert_eq!(double_count as usize, double_names.len());
+    }
+
+    #[tokio::test]
+    async fn test_walk_dir_ignore_multipart_dirs() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        const UUID_MULTIPART_1: &str = "8b262d24-fcf9-473d-a4cd-f9b27f24f60e";
+        const UUID_MULTIPART_2: &str = "fbf3183c-63be-45cc-b3bf-424ddb7f95f8";
+        const UUID_OBJ: &str = "db8b9b74-9016-4f9e-83e9-82a772947d28";
+        const VER_ID_1: &str = "c683f9f8-c0a1-4bc5-8a67-0faafa839a1a";
+        const VER_ID_2: &str = "a4b84f6e-c8ba-461b-8f9d-43feb0893efb";
+        const VER_ID_3: &str = "892c9ae7-2bb3-44ee-9a71-bc7ddf08d765";
+        const BASE_DIR: &str = "dir1/obj/";
+        const MULTIPART_DIR: &str = "multipart-file";
+        const DIR_IN_MULTIPART_DIR: &str = "dir-in-multipart";
+        const EMPTY_STR: &str = "";
+
+        let parse_uuid = |s: &str| Uuid::parse_str(s).unwrap();
+        let create_file_info = |version_id: &str, data_dir: &str| FileInfo {
+            version_id: Some(parse_uuid(version_id)),
+            data_dir: Some(parse_uuid(data_dir)),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        let dir = tempdir().unwrap();
+        let obj_base = dir.path().join("test-bucket").join(BASE_DIR);
+        let multipart_base = obj_base.join(MULTIPART_DIR);
+        let dir_in_multipart_base = multipart_base.join(DIR_IN_MULTIPART_DIR);
+
+        fs::create_dir_all(&multipart_base).await.unwrap();
+        for uuid in &[UUID_MULTIPART_1, UUID_MULTIPART_2] {
+            fs::create_dir_all(multipart_base.join(uuid)).await.unwrap();
+            fs::write(multipart_base.join(uuid).join("part.1"), b"part").await.unwrap();
+        }
+        fs::create_dir_all(obj_base.join(UUID_OBJ)).await.unwrap();
+        fs::write(obj_base.join(UUID_OBJ).join("part.1"), b"part").await.unwrap();
+
+        fs::create_dir_all(&dir_in_multipart_base).await.unwrap();
+        fs::write(dir_in_multipart_base.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .unwrap();
+
+        let mut fm = FileMeta::default();
+        fm.add_version(create_file_info(VER_ID_1, UUID_MULTIPART_1)).unwrap();
+        fm.add_version(create_file_info(VER_ID_2, UUID_MULTIPART_2)).unwrap();
+        fs::write(multipart_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().unwrap())
+            .await
+            .unwrap();
+
+        let mut fm = FileMeta::default();
+        fm.add_version(create_file_info(VER_ID_3, UUID_OBJ)).unwrap();
+        fs::write(obj_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().unwrap())
+            .await
+            .unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        disk.walk_dir(
+            WalkDirOptions {
+                bucket: "test-bucket".to_string(),
+                base_dir: BASE_DIR.to_string(),
+                recursive: true,
+                filter_prefix: Some(EMPTY_STR.to_string()),
+                ..Default::default()
+            },
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        MetacacheWriter::new(&mut writer).close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.unwrap();
+        let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
+
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}", BASE_DIR, MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/", BASE_DIR, MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}", BASE_DIR, MULTIPART_DIR, DIR_IN_MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}/", BASE_DIR, MULTIPART_DIR, DIR_IN_MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_1))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_2))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}", BASE_DIR, UUID_OBJ))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}/", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_1))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}/", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_2))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/", BASE_DIR, UUID_OBJ))
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -3503,6 +3865,8 @@ mod test {
         assert!(!disk_info.fs_type.is_empty(), "fs_type should not be empty on this platform");
         assert!(disk_info.total > 0);
         assert!(disk_info.free <= disk_info.total);
+        assert_eq!(disk_info.nr_requests, disk.nrrequests);
+        assert_eq!(disk_info.rotational, disk.rotational);
         assert!(!disk_info.mount_path.is_empty());
         assert!(!disk_info.endpoint.is_empty());
 

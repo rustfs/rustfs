@@ -15,7 +15,7 @@
 #[cfg(test)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
-    use crate::config::{Config, Opt};
+    use crate::config::{CommandResult, Config, Opt, TlsCommands};
     use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
     use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
     use rustfs_ecstore::disks_layout::DisksLayout;
@@ -70,6 +70,34 @@ mod tests {
         assert_eq!(opt_legacy.volumes, opt_server.volumes);
         assert_eq!(opt_legacy.address, opt_server.address);
         assert_eq!(opt_legacy.console_address, opt_server.console_address);
+    }
+
+    #[test]
+    #[serial]
+    fn test_tls_inspect_subcommand_parses() {
+        let result =
+            Opt::parse_command(["rustfs", "tls", "inspect", "--path", "/tmp/certs"]).expect("tls inspect command should parse");
+
+        match result {
+            CommandResult::Tls(opts) => match opts.command {
+                TlsCommands::Inspect(inspect) => assert_eq!(inspect.path, "/tmp/certs"),
+            },
+            _ => panic!("expected TLS command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_tls_inspect_subcommand_parses_tls_path_alias() {
+        let result =
+            Opt::parse_command(["rustfs", "tls", "inspect", "--tls-path", "/tmp/certs"]).expect("tls inspect alias should parse");
+
+        match result {
+            CommandResult::Tls(opts) => match opts.command {
+                TlsCommands::Inspect(inspect) => assert_eq!(inspect.path, "/tmp/certs"),
+            },
+            _ => panic!("expected TLS command result"),
+        }
     }
 
     #[test]

@@ -44,14 +44,19 @@ use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
-use rustfs_common::data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
+use rustfs_config::{
+    DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
+    DEFAULT_TRANSITION_WORKERS_CAP, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS,
+    ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
+};
+use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, RestoreStatusOps,
     VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
 };
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,
@@ -60,7 +65,7 @@ use s3s::dto::{
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION};
 use sha2::{Digest, Sha256};
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -70,6 +75,8 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
@@ -97,6 +104,57 @@ const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 lazy_static! {
     pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
     pub static ref GLOBAL_TransitionState: Arc<TransitionState> = TransitionState::new();
+}
+
+fn resolve_transition_worker_count() -> (i64, i64, i64) {
+    let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
+    let configured = env::var(ENV_TRANSITION_WORKERS)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback);
+    let mut effective = configured;
+    let absolute_max = resolve_transition_workers_absolute_max();
+    effective = std::cmp::min(effective, absolute_max);
+    (configured, absolute_max, effective)
+}
+
+fn resolve_transition_workers_absolute_max() -> i64 {
+    let absolute_max = get_env_i64(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+    if absolute_max > 0 {
+        absolute_max
+    } else {
+        DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX
+    }
+}
+
+fn resolve_transition_queue_capacity() -> usize {
+    get_env_usize(ENV_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_CAPACITY).max(1)
+}
+
+fn resolve_transition_queue_send_timeout() -> StdDuration {
+    StdDuration::from_millis(
+        get_env_usize(ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS).max(1) as u64,
+    )
+}
+
+fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
+    matches!(
+        src,
+        LcEventSrc::S3PutObject | LcEventSrc::S3CopyObject | LcEventSrc::S3CompleteMultipartUpload
+    )
+}
+
+#[cfg(any(test, debug_assertions))]
+fn should_force_immediate_transition_enqueue_timeout() -> bool {
+    env::var(rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT)
+        .ok()
+        .is_some_and(|value| value == "1")
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn should_force_immediate_transition_enqueue_timeout() -> bool {
+    false
 }
 
 pub struct LifecycleSys;
@@ -531,61 +589,234 @@ impl ExpiryOp for TransitionTask {
     }
 }
 
+struct TransitionWorker {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
 pub struct TransitionState {
     transition_tx: A_Sender<Option<TransitionTask>>,
     transition_rx: A_Receiver<Option<TransitionTask>>,
     pub num_workers: AtomicI64,
-    kill_tx: A_Sender<()>,
-    kill_rx: A_Receiver<()>,
+    workers: Mutex<Vec<TransitionWorker>>,
+    transition_queue_capacity: usize,
+    transition_queue_send_timeout: StdDuration,
     active_tasks: AtomicI64,
     missed_immediate_tasks: AtomicI64,
+    queue_full_tasks: AtomicI64,
+    queue_send_timeout_tasks: AtomicI64,
+    compensation_scheduled_tasks: AtomicI64,
+    compensation_running_tasks: AtomicI64,
+    compensation_buckets: Arc<Mutex<HashSet<String>>>,
     last_day_stats: Arc<Mutex<HashMap<String, LastDayTierStats>>>,
+}
+
+enum ImmediateEnqueueFailure {
+    ForcedTimeout,
+    QueueClosed { timeout_ms: Option<u64> },
+    QueueSendTimedOut { timeout_ms: u64 },
 }
 
 impl TransitionState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<Self> {
-        let (tx1, rx1) = bounded(1000);
-        let (tx2, rx2) = bounded(1);
+        Self::new_with_capacity(resolve_transition_queue_capacity())
+    }
+
+    fn new_with_capacity(capacity: usize) -> Arc<Self> {
+        let capacity = capacity.max(1);
+        let queue_send_timeout = resolve_transition_queue_send_timeout();
+        let (tx1, rx1) = bounded(capacity);
         Arc::new(Self {
             transition_tx: tx1,
             transition_rx: rx1,
             num_workers: AtomicI64::new(0),
-            kill_tx: tx2,
-            kill_rx: rx2,
+            workers: Mutex::new(Vec::new()),
+            transition_queue_capacity: capacity,
+            transition_queue_send_timeout: queue_send_timeout,
             active_tasks: AtomicI64::new(0),
             missed_immediate_tasks: AtomicI64::new(0),
+            queue_full_tasks: AtomicI64::new(0),
+            queue_send_timeout_tasks: AtomicI64::new(0),
+            compensation_scheduled_tasks: AtomicI64::new(0),
+            compensation_running_tasks: AtomicI64::new(0),
+            compensation_buckets: Arc::new(Mutex::new(HashSet::new())),
             last_day_stats: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    pub async fn queue_transition_task(&self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
+    fn schedule_bucket_compensation(self: &Arc<Self>, bucket: &str) -> bool {
+        let mut scheduled = self.compensation_buckets.lock().unwrap();
+        if !scheduled.insert(bucket.to_string()) {
+            return false;
+        }
+        Self::inc_counter(&self.compensation_scheduled_tasks);
+        let bucket = bucket.to_string();
+        let scheduled = Arc::clone(&self.compensation_buckets);
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            Self::inc_counter(&state.compensation_running_tasks);
+            let Some(api) = crate::new_object_layer_fn() else {
+                scheduled.lock().unwrap().remove(&bucket);
+                Self::add_counter(&state.compensation_running_tasks, -1);
+                warn!(bucket = %bucket, "transition compensation skipped because object layer is unavailable");
+                return;
+            };
+
+            if let Err(err) = enqueue_transition_for_existing_objects(api, &bucket).await {
+                warn!(bucket = %bucket, error = ?err, "transition compensation backfill failed");
+            } else {
+                info!(bucket = %bucket, "transition compensation backfill completed");
+            }
+
+            scheduled.lock().unwrap().remove(&bucket);
+            Self::add_counter(&state.compensation_running_tasks, -1);
+        });
+        true
+    }
+
+    #[inline]
+    fn inc_counter(counter: &AtomicI64) {
+        Self::add_counter(counter, 1);
+    }
+
+    #[inline]
+    fn add_counter(counter: &AtomicI64, delta: i64) {
+        counter.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn counter_value(counter: &AtomicI64) -> i64 {
+        counter.load(Ordering::Relaxed)
+    }
+
+    fn handle_immediate_enqueue_failure(self: &Arc<Self>, oi: &ObjectInfo, src: &LcEventSrc, failure: ImmediateEnqueueFailure) {
+        Self::inc_counter(&self.missed_immediate_tasks);
+        let scheduled = self.schedule_bucket_compensation(&oi.bucket);
+        match failure {
+            ImmediateEnqueueFailure::ForcedTimeout => {
+                Self::inc_counter(&self.queue_send_timeout_tasks);
+                warn!(
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    source = ?src,
+                    compensation_scheduled = scheduled,
+                    "transition enqueue forced into timeout path for test fault injection"
+                );
+            }
+            ImmediateEnqueueFailure::QueueClosed { timeout_ms } => match timeout_ms {
+                Some(timeout_ms) => {
+                    warn!(
+                        bucket = %oi.bucket,
+                        object = %oi.name,
+                        source = ?src,
+                        timeout_ms,
+                        compensation_scheduled = scheduled,
+                        "transition enqueue failed because the queue is closed"
+                    );
+                }
+                None => {
+                    warn!(
+                        bucket = %oi.bucket,
+                        object = %oi.name,
+                        source = ?src,
+                        compensation_scheduled = scheduled,
+                        "transition enqueue failed because the queue is closed"
+                    );
+                }
+            },
+            ImmediateEnqueueFailure::QueueSendTimedOut { timeout_ms } => {
+                Self::inc_counter(&self.queue_send_timeout_tasks);
+                warn!(
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    source = ?src,
+                    timeout_ms,
+                    compensation_scheduled = scheduled,
+                    "transition enqueue timed out under backpressure"
+                );
+            }
+        }
+    }
+
+    pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
+        if is_immediate_transition_source(src) && should_force_immediate_transition_enqueue_timeout() {
+            self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::ForcedTimeout);
+            return;
+        }
+
         let task = TransitionTask {
             obj_info: oi.clone(),
             src: src.clone(),
             event: event.clone(),
         };
-        select! {
-            //_ -> t.ctx.Done() => (),
-            _ = self.transition_tx.send(Some(task)) => (),
-            else => {
-                match src {
-                    LcEventSrc::S3PutObject | LcEventSrc::S3CopyObject | LcEventSrc::S3CompleteMultipartUpload => {
-                        self.missed_immediate_tasks.fetch_add(1, Ordering::SeqCst);
+        if is_immediate_transition_source(src) {
+            match self.transition_tx.try_send(Some(task)) {
+                Ok(()) => {}
+                Err(async_channel::TrySendError::Full(task)) => {
+                    Self::inc_counter(&self.queue_full_tasks);
+                    let send_timeout = self.transition_queue_send_timeout;
+                    match tokio::time::timeout(send_timeout, self.transition_tx.send(task)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            self.handle_immediate_enqueue_failure(
+                                oi,
+                                src,
+                                ImmediateEnqueueFailure::QueueClosed {
+                                    timeout_ms: Some(send_timeout.as_millis() as u64),
+                                },
+                            );
+                        }
+                        Err(_) => {
+                            self.handle_immediate_enqueue_failure(
+                                oi,
+                                src,
+                                ImmediateEnqueueFailure::QueueSendTimedOut {
+                                    timeout_ms: send_timeout.as_millis() as u64,
+                                },
+                            );
+                        }
                     }
-                    _ => ()
                 }
-            },
+                Err(async_channel::TrySendError::Closed(_task)) => {
+                    self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::QueueClosed { timeout_ms: None });
+                }
+            }
+            return;
+        }
+
+        if let Err(err) = self.transition_tx.try_send(Some(task)) {
+            match err {
+                async_channel::TrySendError::Full(_) => {
+                    debug!(
+                        bucket = %oi.bucket,
+                        object = %oi.name,
+                        source = ?src,
+                        "transition queue is full; deferring to scanner/backfill"
+                    );
+                }
+                async_channel::TrySendError::Closed(_) => {
+                    warn!(
+                        bucket = %oi.bucket,
+                        object = %oi.name,
+                        source = ?src,
+                        "transition enqueue failed because the queue is closed"
+                    );
+                }
+            }
         }
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let max_workers = get_env_i64("RUSTFS_MAX_TRANSITION_WORKERS", std::cmp::min(num_cpus::get() as i64, 16));
-        let mut n = max_workers;
-        let tw = 8; //globalILMConfig.getTransitionWorkers();
-        if tw > 0 {
-            n = tw;
-        }
+        let (configured, absolute_max, n) = resolve_transition_worker_count();
+        info!(
+            configured_transition_workers = configured,
+            absolute_max_workers = absolute_max,
+            effective_transition_workers = n,
+            transition_queue_capacity = GLOBAL_TransitionState.transition_queue_capacity,
+            transition_queue_send_timeout_ms = GLOBAL_TransitionState.transition_queue_send_timeout.as_millis() as u64,
+            "transition worker count resolved"
+        );
 
         //let mut transition_state = GLOBAL_TransitionState.write().await;
         //self.objAPI = objAPI
@@ -599,17 +830,35 @@ impl TransitionState {
     }
 
     pub fn active_tasks(&self) -> i64 {
-        self.active_tasks.load(Ordering::SeqCst)
+        Self::counter_value(&self.active_tasks)
     }
 
     pub fn missed_immediate_tasks(&self) -> i64 {
-        self.missed_immediate_tasks.load(Ordering::SeqCst)
+        Self::counter_value(&self.missed_immediate_tasks)
     }
 
-    pub async fn worker(api: Arc<ECStore>) {
+    pub fn queue_full_tasks(&self) -> i64 {
+        Self::counter_value(&self.queue_full_tasks)
+    }
+
+    pub fn queue_send_timeout_tasks(&self) -> i64 {
+        Self::counter_value(&self.queue_send_timeout_tasks)
+    }
+
+    pub fn compensation_scheduled_tasks(&self) -> i64 {
+        Self::counter_value(&self.compensation_scheduled_tasks)
+    }
+
+    pub fn compensation_running_tasks(&self) -> i64 {
+        Self::counter_value(&self.compensation_running_tasks)
+    }
+
+    async fn worker_with_cancel(api: Arc<ECStore>, cancel_token: CancellationToken) {
         loop {
             select! {
-                _ = GLOBAL_TransitionState.kill_rx.recv() => {
+                biased;
+
+                _ = cancel_token.cancelled() => {
                     return;
                 }
                 task = GLOBAL_TransitionState.transition_rx.recv() => {
@@ -626,7 +875,7 @@ impl TransitionState {
                     if task.as_any().is::<TransitionTask>() {
                         let task = task.as_any().downcast_ref::<TransitionTask>().expect("TransitionTask downcast failed");
 
-                        GLOBAL_TransitionState.active_tasks.fetch_add(1, Ordering::SeqCst);
+                        TransitionState::inc_counter(&GLOBAL_TransitionState.active_tasks);
 
                         let obj_info_for_event = ObjectInfo {
                             bucket: task.obj_info.bucket.clone(),
@@ -671,7 +920,7 @@ impl TransitionState {
                                 ..Default::default()
                             });
                         }
-                        GLOBAL_TransitionState.active_tasks.fetch_add(-1, Ordering::SeqCst);
+                        TransitionState::add_counter(&GLOBAL_TransitionState.active_tasks, -1);
                     }
                 }
                 else => ()
@@ -702,31 +951,54 @@ impl TransitionState {
 
     pub async fn update_workers_inner(api: Arc<ECStore>, n: i64) {
         let mut n = n;
+        let requested = n;
         if n == 0 {
-            let max_workers = get_env_i64("RUSTFS_MAX_TRANSITION_WORKERS", std::cmp::min(num_cpus::get() as i64, 16));
-            n = max_workers;
+            let (_, _, effective) = resolve_transition_worker_count();
+            n = effective;
         }
         // Allow environment override of maximum workers
-        let absolute_max = get_env_i64("RUSTFS_ABSOLUTE_MAX_WORKERS", 32);
-        n = std::cmp::min(n, absolute_max);
+        let absolute_max = resolve_transition_workers_absolute_max();
+        n = n.clamp(0, absolute_max);
 
-        let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
-        while num_workers < n {
+        Self::resize_workers_to(api, n, requested, absolute_max);
+    }
+
+    fn resize_workers_to(api: Arc<ECStore>, n: i64, requested: i64, absolute_max: i64) {
+        let target = n as usize;
+        let mut workers = GLOBAL_TransitionState.workers.lock().unwrap();
+        let tracked_workers = workers.len();
+        workers.retain(|worker| !worker.handle.is_finished());
+        let pruned_finished_workers = tracked_workers.saturating_sub(workers.len());
+        let previous_num_workers = workers.len() as i64;
+
+        while workers.len() < target {
             let clone_api = api.clone();
-            tokio::spawn(async move {
-                TransitionState::worker(clone_api).await;
+            let cancel = CancellationToken::new();
+            let worker_cancel = cancel.clone();
+            let handle = tokio::spawn(async move {
+                TransitionState::worker_with_cancel(clone_api, worker_cancel).await;
             });
-            num_workers += 1;
-            GLOBAL_TransitionState.num_workers.fetch_add(1, Ordering::SeqCst);
+            workers.push(TransitionWorker { cancel, handle });
         }
 
-        let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
-        while num_workers > n {
-            let worker = GLOBAL_TransitionState.kill_tx.clone();
-            let _ = worker.send(()).await;
-            num_workers -= 1;
-            GLOBAL_TransitionState.num_workers.fetch_add(-1, Ordering::SeqCst);
+        while workers.len() > target {
+            if let Some(worker) = workers.pop() {
+                worker.cancel.cancel();
+            }
         }
+
+        let current_workers = workers.len() as i64;
+        GLOBAL_TransitionState.num_workers.store(current_workers, Ordering::SeqCst);
+
+        info!(
+            requested_transition_workers = requested,
+            effective_transition_workers = n,
+            absolute_max_workers = absolute_max,
+            previous_transition_workers = previous_num_workers,
+            current_transition_workers = current_workers,
+            pruned_finished_transition_workers = pruned_finished_workers,
+            "transition workers updated"
+        );
     }
 }
 
@@ -2004,10 +2276,13 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 #[cfg(test)]
 mod tests {
     use super::{
-        DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, StaleMultipartUploadCandidate, cleanup_empty_multipart_sha_dirs_on_local_disks,
-        cleanup_stale_multipart_uploads_once_at, lifecycle_deleted_object, lifecycle_rule_has_date_expiration,
-        lifecycle_version_purge_state_from_completed_targets, mark_delete_opts_skip_decommissioned_on_remote_success,
-        merge_stale_multipart_candidate, replication_state_for_delete, should_defer_date_expiry_for_recent_config_update,
+        DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
+        DEFAULT_TRANSITION_WORKERS_CAP, GLOBAL_TransitionState, StaleMultipartUploadCandidate, TransitionState,
+        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at, lifecycle_deleted_object,
+        lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
+        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
+        resolve_transition_workers_absolute_max, should_defer_date_expiry_for_recent_config_update,
         should_reuse_lifecycle_delete_replication_state,
     };
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
@@ -2021,12 +2296,16 @@ mod tests {
     use crate::store_api::{
         BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader,
     };
+    use futures::FutureExt;
+    use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
+    use std::env;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, OnceLock};
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
@@ -2041,6 +2320,216 @@ mod tests {
         mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, true);
 
         assert!(opts.skip_decommissioned);
+    }
+
+    // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
+    // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
+    // process environment while `env::set_var`/`env::remove_var` is active.
+    #[allow(unsafe_code)]
+    fn with_transition_worker_env<F>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
+    where
+        F: FnOnce(),
+    {
+        let original_transition = env::var_os("RUSTFS_MAX_TRANSITION_WORKERS");
+        let original_absolute = env::var_os(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
+
+        match transition {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_MAX_TRANSITION_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_MAX_TRANSITION_WORKERS");
+            },
+        }
+        match absolute {
+            Some(value) => unsafe {
+                env::set_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, value);
+            },
+            None => unsafe {
+                env::remove_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            },
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test_fn));
+
+        match original_transition {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_MAX_TRANSITION_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_MAX_TRANSITION_WORKERS");
+            },
+        }
+        match original_absolute {
+            Some(value) => unsafe {
+                env::set_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, value);
+            },
+            None => unsafe {
+                env::remove_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
+    // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
+    // process environment while `env::set_var`/`env::remove_var` is active.
+    #[allow(unsafe_code)]
+    async fn with_transition_worker_env_async<F, Fut>(transition: Option<&str>, absolute: Option<&str>, test_fn: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let original_transition = env::var_os("RUSTFS_MAX_TRANSITION_WORKERS");
+        let original_absolute = env::var_os(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
+
+        match transition {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_MAX_TRANSITION_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_MAX_TRANSITION_WORKERS");
+            },
+        }
+        match absolute {
+            Some(value) => unsafe {
+                env::set_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, value);
+            },
+            None => unsafe {
+                env::remove_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            },
+        }
+
+        let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+
+        match original_transition {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_MAX_TRANSITION_WORKERS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_MAX_TRANSITION_WORKERS");
+            },
+        }
+        match original_absolute {
+            Some(value) => unsafe {
+                env::set_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX, value);
+            },
+            None => unsafe {
+                env::remove_var(ENV_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
+    // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
+    // process environment while `env::set_var`/`env::remove_var` is active.
+    #[allow(unsafe_code)]
+    fn with_transition_queue_env<F>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
+    where
+        F: FnOnce(),
+    {
+        let original_capacity = env::var_os("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+        let original_timeout = env::var_os("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+
+        match capacity {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_CAPACITY", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+            },
+        }
+        match timeout_ms {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+            },
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test_fn));
+
+        match original_capacity {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_CAPACITY", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+            },
+        }
+        match original_timeout {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
+    // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
+    // process environment while `env::set_var`/`env::remove_var` is active.
+    #[allow(unsafe_code)]
+    async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let original_capacity = env::var_os("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+        let original_timeout = env::var_os("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+
+        match capacity {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_CAPACITY", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+            },
+        }
+        match timeout_ms {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+            },
+        }
+
+        let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+
+        match original_capacity {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_CAPACITY", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_CAPACITY");
+            },
+        }
+        match original_timeout {
+            Some(value) => unsafe {
+                env::set_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", value);
+            },
+            None => unsafe {
+                env::remove_var("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS");
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     #[test]
@@ -2066,6 +2555,164 @@ mod tests {
 
         assert!(lifecycle_rule_has_date_expiration(&lc, "rule-date"));
         assert!(!lifecycle_rule_has_date_expiration(&lc, "missing-rule"));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_uses_fallback_when_env_missing() {
+        with_transition_worker_env(None, None, || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
+            assert_eq!(configured, fallback);
+            assert_eq!(absolute_max, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            assert_eq!(effective, fallback);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_honors_positive_env_value() {
+        with_transition_worker_env(Some("4"), Some("32"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            assert_eq!(configured, 4);
+            assert_eq!(absolute_max, 32);
+            assert_eq!(effective, 4);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_clamps_to_absolute_max() {
+        with_transition_worker_env(Some("64"), Some("16"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            assert_eq!(configured, 64);
+            assert_eq!(absolute_max, 16);
+            assert_eq!(effective, 16);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_ignores_non_positive_absolute_max() {
+        with_transition_worker_env(Some("4"), Some("0"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            assert_eq!(configured, 4);
+            assert_eq!(absolute_max, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            assert_eq!(effective, 4);
+        });
+
+        with_transition_worker_env(Some("4"), Some("-1"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            assert_eq!(configured, 4);
+            assert_eq!(absolute_max, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
+            assert_eq!(effective, 4);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_worker_count_falls_back_for_zero_value() {
+        with_transition_worker_env(Some("0"), Some("32"), || {
+            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+
+            let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
+            assert_eq!(configured, fallback);
+            assert_eq!(absolute_max, 32);
+            assert_eq!(effective, fallback);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_queue_capacity_uses_default_when_env_missing() {
+        with_transition_queue_env(None, None, || {
+            assert_eq!(resolve_transition_queue_capacity(), DEFAULT_TRANSITION_QUEUE_CAPACITY);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_queue_capacity_honors_positive_env_value() {
+        with_transition_queue_env(Some("128"), None, || {
+            assert_eq!(resolve_transition_queue_capacity(), 128);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_transition_queue_send_timeout_honors_positive_env_value() {
+        with_transition_queue_env(None, Some("250"), || {
+            assert_eq!(resolve_transition_queue_send_timeout(), StdDuration::from_millis(250));
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schedule_bucket_compensation_deduplicates_same_bucket() {
+        let state = TransitionState::new_with_capacity(1);
+
+        let first = state.schedule_bucket_compensation("bucket-a");
+        let second = state.schedule_bucket_compensation("bucket-a");
+
+        assert!(first);
+        assert!(!second);
+        assert_eq!(state.compensation_scheduled_tasks(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transition_state_init_honors_runtime_configured_worker_count() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let original_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
+        with_transition_worker_env_async(Some("3"), Some("8"), || async {
+            TransitionState::update_workers(ecstore.clone(), 0).await;
+            assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 3);
+        })
+        .await;
+
+        let absolute_max = resolve_transition_workers_absolute_max();
+        TransitionState::resize_workers_to(ecstore, original_workers, original_workers, absolute_max);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transition_worker_resize_cancels_removed_workers_directly() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let original_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
+        let absolute_max = resolve_transition_workers_absolute_max();
+
+        TransitionState::resize_workers_to(ecstore.clone(), 0, 0, absolute_max);
+        assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 0);
+
+        TransitionState::resize_workers_to(ecstore.clone(), 2, 2, absolute_max);
+        let worker_tokens = {
+            let workers = GLOBAL_TransitionState.workers.lock().unwrap();
+            assert_eq!(workers.len(), 2);
+            workers.iter().map(|worker| worker.cancel.clone()).collect::<Vec<_>>()
+        };
+
+        TransitionState::resize_workers_to(ecstore.clone(), 1, 1, absolute_max);
+
+        assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 1);
+        assert_eq!(worker_tokens.iter().filter(|token| token.is_cancelled()).count(), 1);
+
+        let remaining_token = {
+            let workers = GLOBAL_TransitionState.workers.lock().unwrap();
+            assert_eq!(workers.len(), 1);
+            let token = workers[0].cancel.clone();
+            assert!(!token.is_cancelled());
+            token
+        };
+
+        TransitionState::resize_workers_to(ecstore.clone(), 0, 0, absolute_max);
+        assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 0);
+        assert!(remaining_token.is_cancelled());
+
+        TransitionState::resize_workers_to(ecstore, original_workers, original_workers, absolute_max);
     }
 
     #[test]
@@ -2538,6 +3185,76 @@ mod tests {
             .expect("multipart parts should be readable");
         assert!(!parts.user_defined.contains_key(RUSTFS_MULTIPART_BUCKET_KEY));
         assert!(!parts.user_defined.contains_key(RUSTFS_MULTIPART_OBJECT_KEY));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repeated_upload_part_overwrites_previous_part_state() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("multipart-overwrite-{}", Uuid::new_v4().simple());
+        let object = "overwrite/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        let mut first = PutObjReader::from_vec(vec![1, 2, 3]);
+        let first_part = ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut first, &ObjectOptions::default())
+            .await
+            .expect("first multipart part should be uploaded");
+
+        let mut second = PutObjReader::from_vec(vec![4, 5, 6, 7]);
+        let second_part = ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut second, &ObjectOptions::default())
+            .await
+            .expect("second multipart part should overwrite the previous part");
+
+        assert_ne!(
+            first_part.etag, second_part.etag,
+            "the overwrite path should persist the latest part metadata rather than reusing stale state"
+        );
+
+        let parts = ecstore
+            .list_object_parts(
+                &bucket,
+                object,
+                &upload.upload_id,
+                None,
+                crate::set_disk::MAX_PARTS_COUNT,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("multipart parts should be readable after overwrite");
+
+        assert_eq!(parts.parts.len(), 1, "only the latest version of part 1 should remain visible");
+        assert_eq!(parts.parts[0].part_num, 1);
+        assert_eq!(parts.parts[0].etag, second_part.etag);
+        assert_eq!(parts.parts[0].size, second_part.size);
+        assert_eq!(parts.parts[0].actual_size, second_part.actual_size);
+
+        let completed = ecstore
+            .complete_multipart_upload(
+                &bucket,
+                object,
+                &upload.upload_id,
+                vec![crate::store_api::CompletePart {
+                    part_num: 1,
+                    etag: second_part.etag.clone(),
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    checksum_crc64nvme: None,
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete multipart upload should succeed with the latest overwritten part");
+
+        assert_eq!(completed.size, second_part.size as i64);
     }
 
     #[tokio::test]

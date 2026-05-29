@@ -29,7 +29,7 @@ use lapin::{
     options::{BasicAckOptions, BasicGetOptions, QueueBindOptions, QueueDeclareOptions, QueueDeleteOptions},
     types::FieldTable,
 };
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_targets::Target;
 use rustfs_targets::check_amqp_broker_available;
 use rustfs_targets::target::EntityTarget;

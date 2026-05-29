@@ -19,6 +19,7 @@ use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, Multip
 use s3s::{S3Error, S3ErrorCode};
 
 const MAX_MULTIPART_UPLOADS_LIST: i32 = 1000;
+const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ListPartsParams {
@@ -103,6 +104,17 @@ pub(crate) fn parse_list_parts_params(
     })
 }
 
+pub(crate) fn parse_upload_part_number(part_number: i32) -> Result<usize, S3Error> {
+    if !(1..=MAX_MULTIPART_PART_NUMBER).contains(&part_number) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("partNumber must be between 1 and {MAX_MULTIPART_PART_NUMBER}"),
+        ));
+    }
+
+    Ok(part_number as usize)
+}
+
 pub(crate) fn parse_list_multipart_uploads_params(
     prefix: Option<String>,
     key_marker: Option<String>,
@@ -176,7 +188,7 @@ pub(crate) fn build_list_multipart_uploads_output(
 mod tests {
     use super::{
         MAX_MULTIPART_UPLOADS_LIST, build_list_multipart_uploads_output, build_list_parts_output,
-        parse_list_multipart_uploads_params, parse_list_parts_params,
+        parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
     };
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
@@ -317,6 +329,21 @@ mod tests {
         let err = parse_list_parts_params(Some(-1), None).expect_err("expected invalid part_number_marker");
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("part-number-marker must be non-negative"));
+    }
+
+    #[test]
+    fn test_parse_upload_part_number_accepts_s3_range() {
+        assert_eq!(parse_upload_part_number(1).expect("part 1 should be valid"), 1);
+        assert_eq!(parse_upload_part_number(10000).expect("part 10000 should be valid"), 10000);
+    }
+
+    #[test]
+    fn test_parse_upload_part_number_rejects_out_of_s3_range() {
+        for part_number in [-1, 0, 10001] {
+            let err = parse_upload_part_number(part_number).expect_err("expected invalid part number");
+            assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
+        }
     }
 
     #[test]

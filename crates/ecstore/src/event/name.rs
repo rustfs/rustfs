@@ -13,6 +13,6 @@
 // limitations under the License.
 
 //! Compatibility re-export for the legacy `rustfs_ecstore::event::name::EventName` path.
-//! The canonical event definition now lives in `rustfs_s3_common::EventName`.
+//! The canonical event definition now lives in `rustfs_s3_types::EventName`.
 
-pub use rustfs_s3_common::EventName;
+pub use rustfs_s3_types::EventName;

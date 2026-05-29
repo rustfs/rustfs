@@ -30,7 +30,6 @@ use crate::disk::{
 };
 use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
 use crate::erasure_coding;
-use crate::erasure_coding::bitrot_verify;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
@@ -68,7 +67,6 @@ use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
-use rustfs_common::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
 use rustfs_common::heal_channel::{DriveState, HealChannelPriority, HealItemType, HealOpts, HealScanMode, send_heal_disk};
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
@@ -80,7 +78,10 @@ use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_lock::local_lock::LocalLock;
 use rustfs_lock::{FastLockGuard, LockManager, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_s3_common::EventName;
+use rustfs_object_capacity::capacity_scope::{
+    CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
+};
+use rustfs_s3_types::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
@@ -96,7 +97,6 @@ use rustfs_utils::{
     crypto::hex,
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
-use rustfs_workers::workers::Workers;
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
@@ -130,6 +130,7 @@ pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
@@ -268,6 +269,10 @@ fn record_lock_release(bucket: &str, object: &str, lock_id: &str, lock_type: &st
         lock_type = %lock_type,
         "Lock released for deadlock tracking"
     );
+}
+
+fn issue3031_diag_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_ISSUE3031_DIAG_ENABLE, false)
 }
 
 fn build_tiered_decommission_file_info(
@@ -618,12 +623,7 @@ impl ObjectIO for SetDisks {
                 .await?
                 .get_read_lock(get_lock_acquire_timeout())
                 .await
-                .map_err(|e| {
-                    Error::other(format!(
-                        "Failed to acquire read lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "read", &e)
-                    ))
-                })?;
+                .map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?;
 
             // Record lock acquisition for deadlock detection
             let _lock_id = record_lock_acquire(bucket, object, "read");
@@ -752,12 +752,12 @@ impl ObjectIO for SetDisks {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                    StorageError::other(format!(
-                        "Failed to acquire write lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "write", &e)
-                    ))
-                })?);
+                object_lock_guard = Some(
+                    ns_lock
+                        .get_write_lock(get_lock_acquire_timeout())
+                        .await
+                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                );
             }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -971,12 +971,12 @@ impl ObjectIO for SetDisks {
 
             if !opts.no_lock && object_lock_guard.is_none() {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                    StorageError::other(format!(
-                        "Failed to acquire write lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "write", &e)
-                    ))
-                })?);
+                object_lock_guard = Some(
+                    ns_lock
+                        .get_write_lock(get_lock_acquire_timeout())
+                        .await
+                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                );
             }
 
             let (online_disks, _, op_old_dir) = Self::rename_data(
@@ -1394,12 +1394,7 @@ impl ObjectOperations for SetDisks {
             .await?
             .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(|e| {
-                Error::other(format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(src_bucket, src_object, "write", &e)
-                ))
-            })?;
+            .map_err(|e| self.map_namespace_lock_error(src_bucket, src_object, "write", e))?;
 
         let disks = self.get_disks_internal().await;
 
@@ -1781,12 +1776,7 @@ impl ObjectOperations for SetDisks {
                     .await?
                     .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire write lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "write", &e)
-                        ))
-                    })?,
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
             )
         } else {
             None
@@ -1927,12 +1917,7 @@ impl ObjectOperations for SetDisks {
                     .await?
                     .get_read_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire read lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "read", &e)
-                        ))
-                    })?,
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?,
             )
         } else {
             None
@@ -1986,12 +1971,7 @@ impl ObjectOperations for SetDisks {
                     .await?
                     .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire write lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "write", &e)
-                        ))
-                    })?,
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
             )
         } else {
             None
@@ -2523,12 +2503,7 @@ impl SetDisks {
                     .await?
                     .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| {
-                        Error::other(format!(
-                            "Failed to acquire write lock: {}",
-                            self.format_lock_error_from_error(bucket, object, "write", &e)
-                        ))
-                    })?,
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
             )
         } else {
             None
@@ -3063,12 +3038,12 @@ impl MultipartOperations for SetDisks {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             let object_lock_guard = if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                    StorageError::other(format!(
-                        "Failed to acquire write lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "write", &e)
-                    ))
-                })?)
+                Some(
+                    ns_lock
+                        .get_write_lock(get_lock_acquire_timeout())
+                        .await
+                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                )
             } else {
                 None
             };
@@ -3245,12 +3220,12 @@ impl MultipartOperations for SetDisks {
         if let Some(http_preconditions) = opts.http_preconditions.clone() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                    StorageError::other(format!(
-                        "Failed to acquire write lock: {}",
-                        self.format_lock_error_from_error(bucket, object, "write", &e)
-                    ))
-                })?);
+                object_lock_guard = Some(
+                    ns_lock
+                        .get_write_lock(get_lock_acquire_timeout())
+                        .await
+                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                );
             }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
@@ -3262,6 +3237,7 @@ impl MultipartOperations for SetDisks {
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
+        let read_quorum = fi.read_quorum(self.default_read_quorum());
 
         let disks = self.disks.read().await;
 
@@ -3278,7 +3254,7 @@ impl MultipartOperations for SetDisks {
         let part_numbers = uploaded_parts.iter().map(|v| v.part_num).collect::<Vec<usize>>();
 
         let object_parts =
-            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, write_quorum).await?;
+            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum).await?;
 
         if object_parts.len() != uploaded_parts.len() {
             return Err(Error::other("part result number err"));
@@ -3302,6 +3278,21 @@ impl MultipartOperations for SetDisks {
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
                 error!("complete_multipart_upload part error: {:?}", &err);
+                if issue3031_diag_enabled() {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        op = "complete_multipart_upload",
+                        bucket = %bucket,
+                        object = %object,
+                        upload_id = %upload_id,
+                        uploaded_part_num = uploaded_parts[i].part_num,
+                        observed_part_num = part.number,
+                        read_quorum = read_quorum,
+                        write_quorum = write_quorum,
+                        error = %err,
+                        "issue3031_complete_part_error"
+                    );
+                }
             }
 
             if uploaded_parts[i].part_num != part.number {
@@ -3579,12 +3570,12 @@ impl MultipartOperations for SetDisks {
 
         if !opts.no_lock && object_lock_guard.is_none() {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            object_lock_guard = Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                StorageError::other(format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(bucket, object, "write", &e)
-                ))
-            })?);
+            object_lock_guard = Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+            );
         }
 
         self.cleanup_multipart_path(&parts).await;
@@ -3665,12 +3656,12 @@ impl HealOperations for SetDisks {
     ) -> Result<(HealResultItem, Option<Error>)> {
         let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                StorageError::other(format!(
-                    "Failed to acquire write lock: {}",
-                    self.format_lock_error_from_error(bucket, object, "write", &e)
-                ))
-            })?)
+            Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+            )
         } else {
             None
         };
@@ -4028,32 +4019,16 @@ async fn disks_with_all_parts(
             continue;
         }
 
-        // Always check data, if we got it.
+        // Inline data is stored inside xl.meta, so there is no separate part file to
+        // verify here. Treat the shard as present once metadata was read successfully;
+        // object reads/heal will validate the inline shard through the normal bitrot
+        // reader path. Running bitrot_verify directly here can falsely mark small
+        // inline shards corrupt when older metadata has no per-part checksum entries.
         if (meta.data.is_some() || meta.size == 0) && !meta.parts.is_empty() {
-            if let Some(data) = &meta.data {
-                let checksum_info = meta.erasure.get_checksum_info(meta.parts[0].number);
-                let checksum_algo = if meta.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-                    HashAlgorithm::HighwayHash256SLegacy
-                } else {
-                    checksum_info.algorithm
-                };
-                let data_len = data.len();
-                let verify_err = bitrot_verify(
-                    Box::new(Cursor::new(data.clone())),
-                    data_len,
-                    meta.erasure.shard_file_size(meta.size) as usize,
-                    checksum_algo,
-                    checksum_info.hash,
-                    meta.erasure.shard_size(),
-                )
-                .await
-                .err();
-
-                if let Some(vec) = data_errs_by_part.get_mut(&0)
-                    && index < vec.len()
-                {
-                    vec[index] = conv_part_err_to_int(&verify_err.map(|e| e.into()));
-                }
+            if let Some(vec) = data_errs_by_part.get_mut(&0)
+                && index < vec.len()
+            {
+                vec[index] = CHECK_PART_SUCCESS;
             }
             continue;
         }
@@ -4108,18 +4083,24 @@ async fn disks_with_all_parts(
         }
     }
 
-    // Build dataErrsByDisk from dataErrsByPart
-    for (part, disks) in data_errs_by_part.iter() {
-        for disk_idx in disks.iter() {
-            if let Some(parts) = data_errs_by_disk.get_mut(disk_idx)
-                && *part < parts.len()
+    populate_data_errs_by_disk(&mut data_errs_by_disk, &data_errs_by_part);
+
+    Ok((data_errs_by_disk, data_errs_by_part))
+}
+
+fn populate_data_errs_by_disk(
+    data_errs_by_disk: &mut HashMap<usize, Vec<usize>>,
+    data_errs_by_part: &HashMap<usize, Vec<usize>>,
+) {
+    for (part_index, part_errs) in data_errs_by_part {
+        for (disk_index, part_err) in part_errs.iter().enumerate() {
+            if let Some(disk_errs) = data_errs_by_disk.get_mut(&disk_index)
+                && *part_index < disk_errs.len()
             {
-                parts[*part] = disks[*disk_idx];
+                disk_errs[*part_index] = *part_err;
             }
         }
     }
-
-    Ok((data_errs_by_disk, data_errs_by_part))
 }
 
 pub fn should_heal_object_on_disk(
@@ -5364,6 +5345,62 @@ mod tests {
 
         let unknown_errors = vec![CHECK_PART_UNKNOWN, CHECK_PART_SUCCESS];
         assert!(has_part_err(&unknown_errors));
+    }
+
+    #[test]
+    fn test_populate_data_errs_by_disk_uses_disk_index_not_error_code() {
+        let mut data_errs_by_disk = HashMap::from([
+            (0, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (1, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (2, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+        ]);
+        let data_errs_by_part = HashMap::from([
+            (0, vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]),
+            (1, vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS]),
+        ]);
+
+        populate_data_errs_by_disk(&mut data_errs_by_disk, &data_errs_by_part);
+
+        assert_eq!(data_errs_by_disk.get(&0).unwrap(), &vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS]);
+        assert_eq!(data_errs_by_disk.get(&1).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_FILE_CORRUPT]);
+        assert_eq!(data_errs_by_disk.get(&2).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
+
+        let mut data_errs_by_disk = HashMap::from([
+            (0, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (1, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (2, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+            (3, vec![CHECK_PART_UNKNOWN, CHECK_PART_UNKNOWN]),
+        ]);
+        let data_errs_by_part = HashMap::from([
+            (
+                0,
+                vec![
+                    CHECK_PART_FILE_NOT_FOUND,
+                    CHECK_PART_SUCCESS,
+                    CHECK_PART_SUCCESS,
+                    CHECK_PART_SUCCESS,
+                ],
+            ),
+            (
+                1,
+                vec![
+                    CHECK_PART_FILE_CORRUPT,
+                    CHECK_PART_SUCCESS,
+                    CHECK_PART_SUCCESS,
+                    CHECK_PART_SUCCESS,
+                ],
+            ),
+        ]);
+
+        populate_data_errs_by_disk(&mut data_errs_by_disk, &data_errs_by_part);
+
+        assert_eq!(
+            data_errs_by_disk.get(&0).unwrap(),
+            &vec![CHECK_PART_FILE_NOT_FOUND, CHECK_PART_FILE_CORRUPT]
+        );
+        assert_eq!(data_errs_by_disk.get(&1).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
+        assert_eq!(data_errs_by_disk.get(&2).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
+        assert_eq!(data_errs_by_disk.get(&3).unwrap(), &vec![CHECK_PART_SUCCESS, CHECK_PART_SUCCESS]);
     }
 
     #[test]

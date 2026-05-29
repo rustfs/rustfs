@@ -31,6 +31,7 @@ use datafusion::{
     },
     error::Result as DFResult,
     execution::{RecordBatchStream, SendableRecordBatchStream},
+    sql::sqlparser::parser::ParserError,
 };
 use futures::{Stream, StreamExt};
 use rustfs_s3select_api::{
@@ -106,7 +107,11 @@ impl QueryDispatcher for SimpleQueryDispatcher {
 
         let stmt = match statements.front() {
             Some(stmt) => stmt.clone(),
-            None => return Ok(None),
+            None => {
+                return Err(QueryError::Parser {
+                    source: ParserError::ParserError("empty SQL expression".to_string()),
+                });
+            }
         };
 
         let logical_plan = self

@@ -121,14 +121,8 @@ impl ConcurrencyManager {
         // Keep 1000 samples for P95/P99 calculation
         let metrics_collector = Arc::new(MetricsCollector::new(performance_metrics, 1000));
 
-        // Build priority queue config
-        let queue_config = IoPriorityQueueConfig {
-            queue_high_capacity: scheduler_config.queue_high_capacity,
-            queue_normal_capacity: scheduler_config.queue_normal_capacity,
-            queue_low_capacity: scheduler_config.queue_low_capacity,
-            starvation_prevention_interval_ms: scheduler_config.starvation_prevention_interval_ms,
-            starvation_threshold_secs: scheduler_config.starvation_threshold_secs,
-        };
+        // Build queue config directly from scheduler config.
+        let queue_config = IoPriorityQueueConfig::from_scheduler_config(&scheduler_config);
 
         Self {
             disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),

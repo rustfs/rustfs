@@ -91,6 +91,10 @@ config:
       idle_mode: ""
       # Timeout for scanner cache saves in seconds (minimum 1 second)
       cache_save_timeout_secs: ""
+    # Drive timeout profile preset: default|high_latency
+    # - default: keep current timeout defaults.
+    # - high_latency: use higher timeout defaults for scanner-sensitive operations.
+    timeout_profile: ""
     obs_endpoint:
       enabled: false # If true, rustfs will export metrics, traces, logs and profiling data to the specified OTLP endpoints. If false, the individual settings for metrics, traces, logs and profiling endpoints will be ignored and all data will not be exported.
       base_endpoint: "" #Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318
@@ -172,6 +176,10 @@ service:
     traefik.ingress.kubernetes.io/service.sticky.cookie.samesite: none
     traefik.ingress.kubernetes.io/service.sticky.cookie.secure: "true"
   type: ClusterIP
+  # LoadBalancer-specific fields (only used when type=LoadBalancer)
+  loadBalancerIP: ""           # Request a specific IP from the load balancer (e.g. for Cilium LB-IPAM or MetalLB)
+  loadBalancerClass: ""        # Specify a load balancer implementation (e.g. "io.cilium/bgp", "metallb")
+  loadBalancerSourceRanges: [] # Restrict client IPs (e.g. ["10.0.0.0/8"])
   endpoint:
     port: 9000
     nodePort: 32000

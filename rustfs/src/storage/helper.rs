@@ -23,18 +23,19 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_ecstore::store_api::ObjectInfo;
+use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::{EventArgsBuilder, notifier_global};
-use rustfs_s3_common::record_s3_op;
-use rustfs_s3_common::{EventName, S3Operation};
-use rustfs_utils::{
+use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
+use rustfs_s3_types::EventName;
+use rustfs_targets::{
     extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
-    http::headers::AMZ_REQUEST_ID,
 };
+use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
 use std::future::Future;
 use tokio::runtime::{Builder, Handle};
-use tracing::{Instrument, info_span};
+use tracing::{Instrument, info_span, warn};
 
 /// Schedules an asynchronous task on the current runtime;
 /// if there is no runtime, creates a minimal runtime execution on a new thread.
@@ -89,6 +90,22 @@ pub struct EnabledOperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
+        let op_event_matches = operation_matches_event_name(op, event);
+        debug_assert!(op_event_matches, "operation/event mismatch: op={} event={}", op.as_str(), event.as_str());
+        if !op_event_matches {
+            counter!(
+                "rustfs_log_chain_op_event_mismatch_total",
+                "op" => op.as_str(),
+                "event" => event.as_str().to_string()
+            )
+            .increment(1);
+            warn!(
+                op = op.as_str(),
+                event = event.as_str(),
+                "operation/event mismatch detected; check S3 semantic mapping"
+            );
+        }
+
         let audit_enabled = is_audit_module_enabled();
         let notify_enabled = should_build_notification_event(is_notify_module_enabled());
 

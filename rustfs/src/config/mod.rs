@@ -51,6 +51,7 @@ mod config_test;
 
 // Re-export public types
 pub use cli::{CommandResult, InfoOpts, InfoType};
+pub use cli::{TlsCommands, TlsInspectOpts, TlsOpts};
 pub use config_struct::Config;
 pub use info::execute_info;
 pub use opt::Opt;

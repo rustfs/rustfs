@@ -16,16 +16,21 @@ use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode, fingerprint::TargetTlsGeneration,
+        validate::validate_tls_material,
+    },
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, invalidate_cache_on_connectivity_error, open_target_queue_store,
-        persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, invalidate_cache_on_connectivity_error,
+        open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
 use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
 use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAcks, SecurityConfig};
+use rustfs_tls_runtime::{load_cert_bundle_der_bytes, load_private_key};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{marker::PhantomData, sync::Arc, time::Duration};
@@ -104,6 +109,11 @@ where
     args: KafkaArgs,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     producer: Arc<Mutex<Option<Arc<AsyncProducer>>>>,
+    tls_state: Arc<Mutex<TargetTlsState>>,
+    /// Adapter that bridges this target to the TLS reload coordinator.
+    /// When `Some`, the target uses coordinator-managed material; when `None`,
+    /// it falls back to inline fingerprint-based change detection.
+    tls_adapter: Option<TlsReloadAdapter<Arc<AsyncProducer>>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: PhantomData<E>,
 }
@@ -144,6 +154,8 @@ where
             args,
             store: queue_store,
             producer: Arc::new(Mutex::new(None)),
+            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
+            tls_adapter: None,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
@@ -164,9 +176,27 @@ where
         if self.args.tls_enable {
             let mut security = SecurityConfig::new();
             if !self.args.tls_ca.is_empty() {
+                let certs = load_cert_bundle_der_bytes(&self.args.tls_ca)
+                    .map_err(|e| Self::map_kafka_error(KafkaError::Config(e.to_string()), "Failed to parse Kafka tls_ca"))?;
+                if certs.is_empty() {
+                    return Err(TargetError::Configuration(
+                        "Kafka tls_ca did not contain any parsable certificates".to_string(),
+                    ));
+                }
                 security = security.with_ca_cert(self.args.tls_ca.clone());
             }
             if !self.args.tls_client_cert.is_empty() && !self.args.tls_client_key.is_empty() {
+                let certs = load_cert_bundle_der_bytes(&self.args.tls_client_cert).map_err(|e| {
+                    Self::map_kafka_error(KafkaError::Config(e.to_string()), "Failed to parse Kafka tls_client_cert")
+                })?;
+                if certs.is_empty() {
+                    return Err(TargetError::Configuration(
+                        "Kafka tls_client_cert did not contain any parsable certificates".to_string(),
+                    ));
+                }
+                let _ = load_private_key(&self.args.tls_client_key).map_err(|e| {
+                    Self::map_kafka_error(KafkaError::Config(e.to_string()), "Failed to parse Kafka tls_client_key")
+                })?;
                 security = security.with_client_cert(self.args.tls_client_cert.clone(), self.args.tls_client_key.clone());
             }
             config = config.with_security(security);
@@ -178,6 +208,31 @@ where
     }
 
     async fn get_or_build_producer(&self) -> Result<Arc<AsyncProducer>, TargetError> {
+        // Adapter-managed path: use the material directly from the TLS reload adapter.
+        if let Some(adapter) = &self.tls_adapter {
+            let producer: Arc<AsyncProducer> = (*adapter.current_material()).clone();
+
+            // Ensure the producer is also stored locally so that close() can drain it.
+            {
+                let mut guard = self.producer.lock().await;
+                *guard = Some(Arc::clone(&producer));
+            }
+            return Ok(producer);
+        }
+
+        // Inline fingerprint fallback path (no coordinator).
+        let next_fingerprint =
+            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
+        let tls_changed = {
+            let tls_state_guard = self.tls_state.lock().await;
+            tls_state_guard.needs_update(&next_fingerprint)
+        };
+        if tls_changed {
+            let mut cached = self.producer.lock().await;
+            *cached = None;
+            self.tls_state.lock().await.refresh(next_fingerprint);
+        }
+
         let mut cached = self.producer.lock().await;
         if let Some(producer) = cached.as_ref() {
             return Ok(Arc::clone(producer));
@@ -191,6 +246,7 @@ where
     async fn invalidate_cached_producer(&self) {
         let mut cached = self.producer.lock().await;
         *cached = None;
+        self.tls_state.lock().await.reset();
     }
 
     /// Serializes the event and builds a QueuedPayload
@@ -230,6 +286,8 @@ where
             args: self.args.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             producer: Arc::clone(&self.producer),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })
@@ -292,6 +350,13 @@ where
     }
 
     async fn close(&self) -> Result<(), TargetError> {
+        {
+            let mut guard = self.producer.lock().await;
+            *guard = None;
+        }
+
+        self.tls_state.lock().await.reset();
+
         info!("Kafka target closed: {}", self.id);
         Ok(())
     }
@@ -315,6 +380,47 @@ where
 
     fn record_final_failure(&self) {
         self.delivery_counters.record_final_failure();
+    }
+}
+
+/// Coordinated TLS hot-reload implementation for Kafka targets.
+///
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the producer without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for KafkaTarget<E>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    type Material = Arc<AsyncProducer>;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: self.args.tls_client_cert.clone(),
+            client_key_path: self.args.tls_client_key.clone(),
+            target_label: format!("kafka:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        let producer = self.build_producer().await?;
+        Ok(Arc::new(producer))
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        let mut guard = self.producer.lock().await;
+        *guard = Some((*material).clone());
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
     }
 }
 

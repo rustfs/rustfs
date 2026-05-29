@@ -38,3 +38,16 @@ groups:
         expr: sum by (job) (rate(rustfs_scanner_buckets_scanned_total[5m]))
       - record: rustfs:scanner_cycles_success:rate5m
         expr: sum by (job) (rate(rustfs_scanner_cycles_total{result="success"}[5m]))
+
+      - record: rustfs:log_chain_op_event_mismatch:rate5m
+        expr: sum by (job) (rate(rustfs_log_chain_op_event_mismatch_total[5m]))
+
+      - alert: RustFSLogChainOpEventMismatchDetected
+        expr: rustfs:log_chain_op_event_mismatch:rate5m > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: s3-log-chain
+        annotations:
+          summary: "RustFS log-chain op/event mismatch detected"
+          description: "job={{ $labels.job }} has non-zero rustfs_log_chain_op_event_mismatch_total rate for more than 10m. Check s3 op/event mapping changes."

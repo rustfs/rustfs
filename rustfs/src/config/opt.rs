@@ -98,6 +98,9 @@ impl Opt {
                 // This should not happen in parse_from, as it's handled by parse_command
                 panic!("Info command should be handled by parse_command");
             }
+            Some(Commands::Tls(_)) => {
+                panic!("TLS command should be handled by parse_command");
+            }
             None => {
                 // Default to server with empty volumes (will be filled from env)
                 Self::from_server_opts(default_server_opts())
@@ -129,6 +132,7 @@ impl Opt {
         };
         match cli.command {
             Some(Commands::Info(opts)) => Ok(CommandResult::Info(opts)),
+            Some(Commands::Tls(opts)) => Ok(CommandResult::Tls(opts)),
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => {
                 // Default to server with empty volumes (will be filled from env)
@@ -157,7 +161,7 @@ impl Opt {
         let cli = Cli::try_parse_from(args)?;
         match cli.command {
             Some(Commands::Server(opts)) => Ok(Self::from_server_opts(*opts)),
-            Some(Commands::Info(_)) => Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp)),
+            Some(Commands::Info(_)) | Some(Commands::Tls(_)) => Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp)),
             None => {
                 // Default to server with empty volumes
                 Ok(Self::from_server_opts(default_server_opts()))

@@ -28,7 +28,8 @@ documentation = "https://docs.rs/rustfs-notify/latest/rustfs_notify/"
 [dependencies]
 rustfs-config = { workspace = true, features = ["notify", "constants"] }
 rustfs-ecstore = { workspace = true }
-rustfs-s3-common = { workspace = true }
+rustfs-s3-types = { workspace = true }
+rustfs-s3-ops = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-utils = { workspace = true }
 arc-swap = { workspace = true }
@@ -62,9 +63,14 @@ axum = { workspace = true }
 rustfs-utils = { workspace = true, features = ["path"] }
 serde_json = { workspace = true }
 time = { workspace = true }
+criterion = { workspace = true }
 
 [lints]
 workspace = true
 
 [lib]
 doctest = false
+
+[[bench]]
+name = "snapshot_mode_scan"
+harness = false

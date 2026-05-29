@@ -106,7 +106,7 @@ impl LegacyReedSolomonEncoder {
         Ok(())
     }
 
-    fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    fn reconstruct_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         let shard_len = shards
             .iter()
             .find_map(|s| s.as_ref().map(|v| v.len()))
@@ -172,6 +172,15 @@ impl LegacyReedSolomonEncoder {
 
         Ok(())
     }
+
+    fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        self.reconstruct_data(shards)?;
+        self.encode_parity(shards)
+    }
+
+    fn encode_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        encode_parity_shards(shards, self.data_shards, self.parity_shards, |shards| self.encode(shards))
+    }
 }
 
 /// Reed-Solomon encoder using reed-solomon-erasure
@@ -224,8 +233,8 @@ impl ReedSolomonEncoder {
         }
     }
 
-    /// Reconstruct missing shards.
-    pub fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    /// Reconstruct missing data shards.
+    pub fn reconstruct_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         if let Some(ref rs) = self.encoder {
             rs.reconstruct_data(shards)
                 .map_err(|e| io::Error::other(format!("Reed-Solomon reconstruct failed: {e:?}")))
@@ -233,6 +242,58 @@ impl ReedSolomonEncoder {
             Ok(())
         }
     }
+
+    /// Reconstruct missing data shards and regenerate parity shards.
+    pub fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        self.reconstruct_data(shards)?;
+        self.encode_parity(shards)
+    }
+
+    fn encode_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        encode_parity_shards(shards, self.data_shards, self.parity_shards, |shards| self.encode(shards))
+    }
+}
+
+fn encode_parity_shards<F>(shards: &mut [Option<Vec<u8>>], data_shards: usize, parity_shards: usize, encode: F) -> io::Result<()>
+where
+    F: FnOnce(SmallVec<[&mut [u8]; 16]>) -> io::Result<()>,
+{
+    let expected_shards = data_shards + parity_shards;
+    if shards.len() != expected_shards {
+        return Err(io::Error::other(format!(
+            "invalid shard count: got {}, expected {}",
+            shards.len(),
+            expected_shards
+        )));
+    }
+
+    let shard_len = shards
+        .iter()
+        .find_map(|s| s.as_ref().map(Vec::len))
+        .ok_or_else(|| io::Error::other("No valid shards found for parity encoding"))?;
+
+    for shard in shards.iter_mut().skip(data_shards) {
+        if shard.is_none() {
+            *shard = Some(vec![0; shard_len]);
+        }
+    }
+
+    let mut shard_refs: SmallVec<[&mut [u8]; 16]> = SmallVec::new();
+    for (index, shard) in shards.iter_mut().enumerate() {
+        let shard = shard
+            .as_mut()
+            .ok_or_else(|| io::Error::other(format!("missing shard {index} after data reconstruction")))?;
+        if shard.len() != shard_len {
+            return Err(io::Error::other(format!(
+                "inconsistent shard length at index {index}: got {}, expected {}",
+                shard.len(),
+                shard_len
+            )));
+        }
+        shard_refs.push(shard.as_mut_slice());
+    }
+
+    encode(shard_refs)
 }
 
 /// Erasure coding utility for data reliability using Reed-Solomon codes.
@@ -392,7 +453,7 @@ impl Erasure {
         Ok(shards)
     }
 
-    /// Decode and reconstruct missing shards in-place.
+    /// Decode and reconstruct missing data shards in-place.
     ///
     /// # Arguments
     /// * `shards` - Mutable slice of optional shard data. Missing shards should be `None`.
@@ -400,6 +461,25 @@ impl Erasure {
     /// # Returns
     /// Ok if reconstruction succeeds, error otherwise.
     pub fn decode_data(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        if self.parity_shards > 0 {
+            if self.uses_legacy {
+                if let Some(encoder) = self.legacy_encoder.as_ref() {
+                    encoder.reconstruct_data(shards)?;
+                } else {
+                    warn!("parity_shards > 0, uses_legacy but legacy_encoder is None");
+                }
+            } else if let Some(encoder) = self.encoder.as_ref() {
+                encoder.reconstruct_data(shards)?;
+            } else {
+                warn!("parity_shards > 0, but encoder is None");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Decode and reconstruct missing data shards, then regenerate parity shards.
+    pub fn decode_data_and_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         if self.parity_shards > 0 {
             if self.uses_legacy {
                 if let Some(encoder) = self.legacy_encoder.as_ref() {
@@ -507,7 +587,21 @@ impl Erasure {
                 Ok(n) if n > 0 => {
                     warn!("encode_stream_callback_async read n={}", n);
                     total += n;
-                    let res = self.encode_data(&buf[..n]);
+                    let erasure = self.clone();
+                    let encode_buf = std::mem::take(&mut buf);
+                    let (res, returned_buf) = match tokio::task::spawn_blocking(move || {
+                        let res = erasure.encode_data(&encode_buf[..n]);
+                        (res, encode_buf)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            on_block(Err(std::io::Error::other(format!("EC encode task failed: {err}")))).await?;
+                            break;
+                        }
+                    };
+                    buf = returned_buf;
                     on_block(res).await?
                 }
                 Ok(_) => {
@@ -533,6 +627,131 @@ impl Erasure {
 mod tests {
 
     use super::*;
+
+    fn optional_shards(shards: &[Bytes]) -> Vec<Option<Vec<u8>>> {
+        shards.iter().map(|shard| Some(shard.to_vec())).collect()
+    }
+
+    #[test]
+    fn decode_data_keeps_missing_parity_shard_unreconstructed() {
+        let erasure = Erasure::new(2, 2, 64);
+        let data = b"read decode should not rebuild parity";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+        let mut shards = optional_shards(&encoded);
+        let missing_parity = erasure.data_shards;
+        shards[missing_parity] = None;
+
+        erasure.decode_data(&mut shards).expect("decode should succeed");
+
+        assert!(shards[missing_parity].is_none(), "read decode should leave parity missing");
+        for index in 0..erasure.data_shards {
+            assert_eq!(
+                shards[index].as_deref(),
+                Some(encoded[index].as_ref()),
+                "data shard {index} should remain unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_decode_data_keeps_missing_parity_shard_unreconstructed() {
+        let erasure = Erasure::new_with_options(2, 2, 64, true);
+        let data = b"legacy read decode should not rebuild parity";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+        let mut shards = optional_shards(&encoded);
+        let missing_parity = erasure.data_shards + 1;
+        shards[missing_parity] = None;
+
+        erasure.decode_data(&mut shards).expect("decode should succeed");
+
+        assert!(shards[missing_parity].is_none(), "legacy read decode should leave parity missing");
+        for index in 0..erasure.data_shards {
+            assert_eq!(
+                shards[index].as_deref(),
+                Some(encoded[index].as_ref()),
+                "legacy data shard {index} should remain unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_data_and_parity_leaves_complete_shards_unchanged() {
+        let erasure = Erasure::new(4, 2, 128);
+        let data = b"complete shards should not be changed";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+        let original = optional_shards(&encoded);
+        let mut shards = original.clone();
+
+        erasure
+            .decode_data_and_parity(&mut shards)
+            .expect("decode should succeed without missing shards");
+
+        assert_eq!(shards, original);
+    }
+
+    #[test]
+    fn decode_data_and_parity_reconstructs_missing_parity_shard() {
+        let erasure = Erasure::new(2, 2, 64);
+        let data = b"parity shard must be rebuilt";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+        let mut shards = optional_shards(&encoded);
+        shards[2] = None;
+
+        erasure
+            .decode_data_and_parity(&mut shards)
+            .expect("decode should rebuild parity");
+
+        for (index, shard) in shards.iter().enumerate() {
+            assert_eq!(
+                shard.as_deref(),
+                Some(encoded[index].as_ref()),
+                "shard {index} should match encoded source"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_data_and_parity_reconstructs_missing_data_and_parity_shards() {
+        let erasure = Erasure::new(4, 2, 128);
+        let data = b"data and parity shards should both be reconstructed";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+        let mut shards = optional_shards(&encoded);
+        shards[1] = None;
+        shards[4] = None;
+
+        erasure
+            .decode_data_and_parity(&mut shards)
+            .expect("decode should rebuild all missing shards");
+
+        for (index, shard) in shards.iter().enumerate() {
+            assert_eq!(
+                shard.as_deref(),
+                Some(encoded[index].as_ref()),
+                "shard {index} should match encoded source"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_decode_data_and_parity_reconstructs_missing_parity_shard() {
+        let erasure = Erasure::new_with_options(2, 2, 64, true);
+        let data = b"legacy parity shard must be rebuilt";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+        let mut shards = optional_shards(&encoded);
+        shards[3] = None;
+
+        erasure
+            .decode_data_and_parity(&mut shards)
+            .expect("decode should rebuild parity");
+
+        for (index, shard) in shards.iter().enumerate() {
+            assert_eq!(
+                shard.as_deref(),
+                Some(encoded[index].as_ref()),
+                "shard {index} should match encoded source"
+            );
+        }
+    }
 
     #[test]
     fn test_shard_file_size_cases2() {

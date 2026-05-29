@@ -38,12 +38,14 @@ pin-project-lite.workspace = true
 serde = { workspace = true }
 bytes.workspace = true
 reqwest.workspace = true
+rustls-pki-types.workspace = true
 tokio-util.workspace = true
 faster-hex.workspace = true
 futures.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
-rustfs-common.workspace = true
-rustfs-utils = { workspace = true, features = ["io", "hash", "compress", "tls"] }
+rustfs-io-metrics.workspace = true
+rustfs-tls-runtime.workspace = true
+rustfs-utils = { workspace = true, features = ["io", "hash", "compress"] }
 serde_json.workspace = true
 md-5 = { workspace = true }
 tracing.workspace = true

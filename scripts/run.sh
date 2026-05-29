@@ -56,11 +56,22 @@ if [ -z "${RUSTFS_ALLOCATOR_RECLAIM_ENABLED+x}" ]; then
     export RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true
 fi
 
-export RUSTFS_VOLUMES="./target/volume/test{1...4}"
+export RUSTFS_VOLUMES="${RUSTFS_VOLUMES:-./target/volume/test{1...4}}"
 # export RUSTFS_VOLUMES="./target/volume/test"
-export RUSTFS_ADDRESS=":9000"
-export RUSTFS_CONSOLE_ENABLE=true
-export RUSTFS_CONSOLE_ADDRESS=":9001"
+export RUSTFS_ADDRESS="${RUSTFS_ADDRESS:-127.0.0.1:9000}"
+export RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfs-admin}"
+export RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfs-secret}"
+export RUSTFS_RPC_SECRET="${RUSTFS_RPC_SECRET:-rustfs-rpc-secret}"
+export RUSTFS_REGION="${RUSTFS_REGION:-us-east-1}"
+export RUSTFS_CONSOLE_ENABLE="${RUSTFS_CONSOLE_ENABLE:-true}"
+export RUSTFS_CONSOLE_ADDRESS="${RUSTFS_CONSOLE_ADDRESS:-127.0.0.1:9001}"
+if [ -z "${RUSTFS_CORS_ALLOWED_ORIGINS+x}" ]; then
+    console_port="${RUSTFS_CONSOLE_ADDRESS##*:}"
+    if [ -z "$console_port" ] || [ "$console_port" = "$RUSTFS_CONSOLE_ADDRESS" ]; then
+        console_port=9001
+    fi
+    export RUSTFS_CORS_ALLOWED_ORIGINS="http://127.0.0.1:${console_port},http://localhost:${console_port},http://127.0.0.1:3000,http://localhost:3000"
+fi
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS certificate directory
 # export RUSTFS_TLS_PATH="./deploy/certs"
@@ -75,8 +86,9 @@ export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector addre
 #export RUSTFS_OBS_LOG_ENDPOINT=http://loki:3100/otlp/v1/logs # OpenTelemetry Collector logs address http://loki:3100/otlp/v1/logs
 #export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://loki:3100/otlp/v1/logs
 export RUSTFS_OBS_PROFILING_ENDPOINT=http://localhost:4040 # OpenTelemetry Collector profiling address
+export RUSTFS_OBS_PROFILING_EXPORT_ENABLED="${RUSTFS_OBS_PROFILING_EXPORT_ENABLED:-true}" # Whether to enable profiling export
 export RUSTFS_OBS_USE_STDOUT=false # Whether to use standard output
-export RUSTFS_OBS_SAMPLE_RATIO=2.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
+export RUSTFS_OBS_SAMPLE_RATIO=1.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
 export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
 export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version

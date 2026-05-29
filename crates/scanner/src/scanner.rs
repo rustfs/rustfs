@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
-use crate::scanner_folder::data_usage_update_dir_cycles;
+use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::ScannerIO;
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
@@ -23,7 +23,10 @@ use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
 use rustfs_config::ScannerSpeed;
-use rustfs_config::{DEFAULT_SCANNER_SPEED, ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
+use rustfs_config::{
+    DEFAULT_SCANNER_BITROT_CYCLE_SECS, DEFAULT_SCANNER_SPEED, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE,
+    ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
+};
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -80,7 +83,7 @@ fn initial_scanner_delay() -> Duration {
 fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
     start_delay_secs
         .map(|secs| randomized_cycle_delay_for(Duration::from_secs(secs)))
-        .unwrap_or_else(|| Duration::from_secs(rand::random::<u64>() % 5))
+        .unwrap_or_else(randomized_cycle_delay)
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
@@ -111,9 +114,60 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     });
 }
 
-fn get_cycle_scan_mode(_current_cycle: u64, _bitrot_start_cycle: u64, _bitrot_start_time: Option<DateTime<Utc>>) -> HealScanMode {
-    // TODO: from config
-    HealScanMode::Normal
+fn bitrot_scan_cycle() -> Option<Duration> {
+    let Ok(value) = std::env::var(ENV_SCANNER_BITROT_CYCLE_SECS) else {
+        return Some(Duration::from_secs(DEFAULT_SCANNER_BITROT_CYCLE_SECS));
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "true" | "on" | "yes" => Some(Duration::ZERO),
+        "false" | "off" | "no" | "disabled" => None,
+        value => value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+            warn!(
+                env = ENV_SCANNER_BITROT_CYCLE_SECS,
+                value,
+                default_secs = DEFAULT_SCANNER_BITROT_CYCLE_SECS,
+                "Invalid scanner bitrot cycle, using default"
+            );
+            Some(Duration::from_secs(DEFAULT_SCANNER_BITROT_CYCLE_SECS))
+        }),
+    }
+}
+
+fn get_cycle_scan_mode(current_cycle: u64, bitrot_start_cycle: u64, bitrot_start_time: Option<DateTime<Utc>>) -> HealScanMode {
+    let Some(bitrot_cycle) = bitrot_scan_cycle() else {
+        return HealScanMode::Normal;
+    };
+
+    if bitrot_cycle.is_zero() {
+        return HealScanMode::Deep;
+    }
+
+    if current_cycle.saturating_sub(bitrot_start_cycle) < heal_object_select_prob() as u64 {
+        return HealScanMode::Deep;
+    }
+
+    let Some(bitrot_start_time) = bitrot_start_time else {
+        return HealScanMode::Deep;
+    };
+
+    let elapsed = Utc::now()
+        .signed_duration_since(bitrot_start_time)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    if elapsed >= bitrot_cycle {
+        HealScanMode::Deep
+    } else {
+        HealScanMode::Normal
+    }
+}
+
+fn retain_recent_cycle_completions(cycle_completed: &mut Vec<DateTime<Utc>>) {
+    let keep = data_usage_update_dir_cycles() as usize;
+    if cycle_completed.len() > keep {
+        let drop_count = cycle_completed.len() - keep;
+        cycle_completed.drain(..drop_count);
+    }
 }
 
 /// Background healing information
@@ -238,9 +292,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
 
     info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run data scanner cycle");
 
-    if cycle_info.cycle_completed.len() >= data_usage_update_dir_cycles() as usize {
-        cycle_info.cycle_completed = cycle_info.cycle_completed.split_off(data_usage_update_dir_cycles() as usize);
-    }
+    retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
 
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 
@@ -351,6 +403,8 @@ pub async fn store_data_usage_in_backend(
         // Save main configuration
         if let Err(e) = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await {
             error!("Failed to save data usage info to {}: {e}", DATA_USAGE_OBJ_NAME_PATH.as_str());
+        } else {
+            rustfs_ecstore::data_usage::replace_bucket_usage_memory_from_info(&data_usage_info).await;
         }
 
         attempts += 1;
@@ -380,6 +434,16 @@ mod tests {
         let delay = initial_scanner_delay_for(Some(120));
         assert!(delay >= Duration::from_secs(108));
         assert!(delay <= Duration::from_secs(132));
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_uses_cycle_without_explicit_start_delay() {
+        with_var(ENV_SCANNER_CYCLE, Some("120"), || {
+            let delay = initial_scanner_delay_for(None);
+            assert!(delay >= Duration::from_secs(108));
+            assert!(delay <= Duration::from_secs(132));
+        });
     }
 
     #[test]
@@ -425,5 +489,47 @@ mod tests {
         let delay = randomized_cycle_delay_for(Duration::from_secs(0));
         assert!(delay >= Duration::from_secs(1), "expected delay >= 1s");
         assert!(delay < Duration::from_secs(2), "expected delay < 2s");
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
+        with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
+            let mode = get_cycle_scan_mode(10, 0, Some(Utc::now()));
+            assert_eq!(mode, HealScanMode::Deep);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
+        with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
+            let recent = Utc::now() - chrono::Duration::minutes(30);
+            let old = Utc::now() - chrono::Duration::hours(2);
+
+            assert_eq!(get_cycle_scan_mode(2048, 0, Some(recent)), HealScanMode::Normal);
+            assert_eq!(get_cycle_scan_mode(2048, 0, Some(old)), HealScanMode::Deep);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_cycle_scan_mode_can_disable_periodic_deep_scan() {
+        with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("off"), || {
+            assert_eq!(get_cycle_scan_mode(1, 0, None), HealScanMode::Normal);
+        });
+    }
+
+    #[test]
+    fn test_retain_recent_cycle_completions_keeps_last_entries() {
+        let base = Utc::now();
+        let keep = data_usage_update_dir_cycles() as usize;
+        let mut completed: Vec<_> = (0..keep + 2).map(|i| base + chrono::Duration::seconds(i as i64)).collect();
+
+        retain_recent_cycle_completions(&mut completed);
+
+        assert_eq!(completed.len(), keep);
+        assert_eq!(completed.first().copied(), Some(base + chrono::Duration::seconds(2)));
+        assert_eq!(completed.last().copied(), Some(base + chrono::Duration::seconds((keep + 1) as i64)));
     }
 }

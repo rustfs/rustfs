@@ -143,6 +143,47 @@ record_backpressure_event("warning", 0.85);
 record_timeout_event("GetObject", Duration::from_secs(30));
 ```
 
+### Internode Transport Metrics
+
+Internode metrics are recorded by `src/internode_metrics.rs`. Aggregate metrics
+remain unlabeled for compatibility with existing dashboards:
+
+| Metric | Meaning |
+| --- | --- |
+| `rustfs_system_network_internode_sent_bytes_total` | Total internode bytes sent by this node. |
+| `rustfs_system_network_internode_recv_bytes_total` | Total internode bytes received by this node. |
+| `rustfs_system_network_internode_requests_outgoing_total` | Total outgoing internode requests. |
+| `rustfs_system_network_internode_requests_incoming_total` | Total incoming internode requests. |
+| `rustfs_system_network_internode_errors_total` | Total internode errors. |
+| `rustfs_system_network_internode_dial_errors_total` | Failed internode connection attempts. |
+| `rustfs_system_network_internode_dial_avg_time_nanos` | Average internode dial duration. |
+
+Operation-level metrics use the same low-cardinality label set:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `rustfs_system_network_internode_operation_sent_bytes_total` | `operation`, `backend` | Bytes sent for an internode operation. |
+| `rustfs_system_network_internode_operation_recv_bytes_total` | `operation`, `backend` | Bytes received for an internode operation. |
+| `rustfs_system_network_internode_operation_requests_outgoing_total` | `operation`, `backend` | Outgoing request attempts for an internode operation. |
+| `rustfs_system_network_internode_operation_requests_incoming_total` | `operation`, `backend` | Incoming request attempts for an internode operation. |
+| `rustfs_system_network_internode_operation_errors_total` | `operation`, `backend` | Failed internode operation attempts. |
+
+Current `operation` values are `read_file_stream`, `put_file_stream`,
+`walk_dir`, `grpc_read_all`, and `grpc_write_all`. Current `backend` values are
+`tcp-http` for the `InternodeDataTransport` TCP/HTTP path and `grpc` for the
+remaining gRPC byte paths. The compatibility wrapper uses `unknown` only for
+callers that have not been classified yet.
+
+Success/failure is intentionally not a high-cardinality label today. Failures
+are represented by `rustfs_system_network_internode_operation_errors_total`;
+successful completions are not emitted as a dedicated result-labeled metric.
+Adding completion/result labels is a follow-up once stream completion semantics
+are defined consistently for request setup, body transfer, and shutdown.
+
+`scripts/run_internode_transport_baseline.sh --metrics-url ...` records metric
+deltas with `operation` and `backend` columns, so the TCP baseline can attribute
+bytes and request/error counts to `tcp-http` transport operations.
+
 ### Unified Configuration
 
 Centralized configuration management:
@@ -181,6 +222,7 @@ rustfs-io-metrics/
 │   ├── deadlock_metrics.rs  # Deadlock metrics
 │   ├── lock_metrics.rs      # Lock metrics
 │   ├── timeout_metrics.rs   # Timeout metrics
+│   ├── internode_metrics.rs # Internode transport metrics
 │   ├── bandwidth.rs         # Bandwidth monitoring
 │   ├── global_metrics.rs    # Global metrics
 │   └── performance.rs       # Performance metrics
