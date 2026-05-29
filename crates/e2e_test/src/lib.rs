@@ -63,6 +63,10 @@ mod archive_download_integrity_test;
 #[cfg(test)]
 mod list_objects_v2_pagination_test;
 
+// Regression test for Issue #3107: mc mirror small-bucket listing must not time out.
+#[cfg(test)]
+mod mc_mirror_small_bucket_test;
+
 // Policy variables tests
 #[cfg(test)]
 mod policy;
