@@ -256,7 +256,7 @@
                 "RUSTFS_OBS_LOG_DIRECTORY": "./target/logs/rio-v2",
                 "RUSTFS_UNSAFE_BYPASS_DISK_CHECK": "true",
                 "RUSTFS_COMPRESSION_ENABLED": "true",
-                "RUSTFS_KMS_ENABLE": "false",
+                "RUSTFS_KMS_ENABLE": "true",
                 "RUSTFS_KMS_BACKEND": "local",
                 "RUSTFS_KMS_KEY_DIR": "./target/rio-v2/kms-key-dir",
                 "RUSTFS_KMS_LOCAL_MASTER_KEY": "my-secret-key", // Some Password
