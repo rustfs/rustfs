@@ -616,7 +616,7 @@ fn build_list_objects_v2m_output(
 
     ListObjectsV2MOutput {
         name: Some(bucket.to_owned()),
-        prefix: Some(encode_list_objects_v2_value(&params.prefix, encoding_type)),
+        prefix: Some(params.prefix.clone()),
         max_keys: Some(params.max_keys),
         key_count: Some(key_count),
         continuation_token: params.response_continuation_token.clone(),
@@ -624,15 +624,9 @@ fn build_list_objects_v2m_output(
         next_continuation_token,
         contents: Some(contents),
         common_prefixes: Some(common_prefixes),
-        delimiter: params
-            .delimiter
-            .as_deref()
-            .map(|delimiter| encode_list_objects_v2_value(delimiter, encoding_type)),
+        delimiter: params.delimiter.clone(),
         encoding_type: encoding_type.cloned(),
-        start_after: params
-            .response_start_after
-            .as_deref()
-            .map(|start_after| encode_list_objects_v2_value(start_after, encoding_type)),
+        start_after: params.response_start_after.clone(),
         ..Default::default()
     }
 }
@@ -2952,7 +2946,7 @@ mod tests {
         assert_eq!(output.name.as_deref(), Some("demo-bucket"));
         assert_eq!(output.prefix.as_deref(), Some("logs/"));
         assert_eq!(output.continuation_token.as_deref(), Some("start token"));
-        assert_eq!(output.start_after.as_deref(), Some("logs/start%20after"));
+        assert_eq!(output.start_after.as_deref(), Some("logs/start after"));
         assert_eq!(output.next_continuation_token.as_deref(), Some("bmV4dC10b2tlbg=="));
         assert_eq!(output.key_count, Some(2));
         assert_eq!(output.contents.as_ref().map(Vec::len), Some(1));
@@ -3017,10 +3011,10 @@ mod tests {
         );
 
         assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("logs%20and%20more/"));
+        assert_eq!(output.prefix.as_deref(), Some("logs and more/"));
         assert_eq!(output.delimiter.as_deref(), Some("/"));
         assert_eq!(output.continuation_token.as_deref(), Some("opaque token"));
-        assert_eq!(output.start_after.as_deref(), Some("logs%20and%20more/start%20after"));
+        assert_eq!(output.start_after.as_deref(), Some("logs and more/start after"));
         assert_eq!(output.key_count, Some(2));
         assert_eq!(output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
 

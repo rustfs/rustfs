@@ -73,7 +73,7 @@ pub(crate) fn build_list_objects_output(v2: ListObjectsV2Output, request_marker:
 
     // S3 API requires marker field in response, echoing back the request marker.
     // If no marker was provided in request, return empty string per S3 standard.
-    let marker = Some(encode_list_output_value(request_marker.unwrap_or_default(), v2.encoding_type.as_ref()));
+    let marker = Some(request_marker.unwrap_or_default());
 
     ListObjectsOutput {
         contents: v2.contents,
@@ -278,9 +278,6 @@ pub(crate) fn build_list_objects_v2_output(
     // Apply URL encoding if encoding_type is "url".
     // S3 URL encoding encodes special characters but keeps '/' unencoded.
     let should_encode = should_encode_url(encoding_type.as_ref());
-    let encode_output_value = |value: String| {
-        if should_encode { encode_s3_name(&value) } else { value }
-    };
 
     let objects: Vec<Object> = object_infos
         .objects
@@ -330,14 +327,14 @@ pub(crate) fn build_list_objects_v2_output(
         is_truncated: Some(object_infos.is_truncated),
         continuation_token: response_continuation_token,
         next_continuation_token,
-        start_after: response_start_after.map(encode_output_value),
+        start_after: response_start_after,
         key_count: Some(key_count),
         max_keys: Some(max_keys),
         contents: Some(objects),
-        delimiter: delimiter.map(encode_output_value),
+        delimiter,
         encoding_type,
         name: Some(bucket),
-        prefix: Some(encode_output_value(prefix)),
+        prefix: Some(prefix),
         common_prefixes: Some(common_prefixes),
         ..Default::default()
     }
@@ -439,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_objects_marker_is_url_encoded_when_requested() {
+    fn test_list_objects_marker_preserves_request_value_when_url_encoding_requested() {
         let output = build_list_objects_output(
             ListObjectsV2Output {
                 encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
@@ -448,7 +445,7 @@ mod tests {
             Some("logs and more/start after".to_string()),
         );
 
-        assert_eq!(output.marker.as_deref(), Some("logs%20and%20more/start%20after"));
+        assert_eq!(output.marker.as_deref(), Some("logs and more/start after"));
     }
 
     #[test]
@@ -560,9 +557,9 @@ mod tests {
 
         assert_eq!(contents[0].key.as_deref(), Some("dir%20a/file%2Bb%25.txt"));
         assert_eq!(common_prefixes[0].prefix.as_deref(), Some("prefix%20a/sub%2B"));
-        assert_eq!(output.prefix.as_deref(), Some("prefix%20b/child"));
+        assert_eq!(output.prefix.as_deref(), Some("prefix b/child"));
         assert_eq!(output.delimiter.as_deref(), Some("/"));
-        assert_eq!(output.start_after.as_deref(), Some("start%20after"));
+        assert_eq!(output.start_after.as_deref(), Some("start after"));
         assert!(contents[0].owner.is_some());
         assert_eq!(
             contents[0].owner.as_ref().and_then(|owner| owner.display_name.clone()),
