@@ -19,7 +19,10 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, Error, ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tracing::warn;
+
+static BAVAIL_GT_BFREE_WARNING_PATHS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
@@ -68,12 +71,14 @@ fn calculate_space_usage(
     path_display: &str,
 ) -> std::io::Result<(u64, u64, u64)> {
     let available = if bfree < bavail {
-        warn!(
-            path = %path_display,
-            f_bfree = bfree,
-            f_bavail = bavail,
-            "detected f_bavail greater than f_bfree, capping available blocks to f_bfree for compatibility"
-        );
+        if should_warn_bavail_greater_than_bfree(path_display) {
+            warn!(
+                path = %path_display,
+                f_bfree = bfree,
+                f_bavail = bavail,
+                "detected f_bavail greater than f_bfree, capping available blocks to f_bfree for compatibility"
+            );
+        }
         bfree
     } else {
         bavail
@@ -100,6 +105,14 @@ fn calculate_space_usage(
     };
 
     Ok((total, free, used))
+}
+
+fn should_warn_bavail_greater_than_bfree(path_display: &str) -> bool {
+    let warned_paths = BAVAIL_GT_BFREE_WARNING_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    match warned_paths.lock() {
+        Ok(mut warned_paths) => warned_paths.insert(path_display.to_owned()),
+        Err(_) => true,
+    }
 }
 
 pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
@@ -441,5 +454,14 @@ mod tests {
     fn calculate_space_usage_rejects_free_greater_than_total() {
         let err = calculate_space_usage(100, 120, 120, 4_096, "/data").unwrap_err();
         assert!(err.to_string().contains("detected free space"));
+    }
+
+    #[test]
+    fn bavail_greater_than_bfree_warning_is_once_per_path() {
+        let path = "/data/rustfs-bavail-warning-once";
+
+        assert!(should_warn_bavail_greater_than_bfree(path));
+        assert!(!should_warn_bavail_greater_than_bfree(path));
+        assert!(should_warn_bavail_greater_than_bfree("/data/rustfs-bavail-warning-other"));
     }
 }
