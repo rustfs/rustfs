@@ -535,7 +535,8 @@ async fn health_check(method: Method, uri: Uri) -> Response {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let response_parts = build_health_response_parts(method.clone(), probe, &readiness_report, "rustfs-console", Some(uptime));
+    let response_parts =
+        build_health_response_parts(method.clone(), probe, &readiness_report, "rustfs-console", Some(uptime), None);
 
     let builder = Response::builder()
         .status(response_parts.status_code)

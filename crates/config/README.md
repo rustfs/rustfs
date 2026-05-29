@@ -83,7 +83,7 @@ Current guidance:
   - enables busy protection behavior for health probes.
   - default is `false`.
 - `RUSTFS_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS`
-  - max active HTTP requests before health probes can return `429`.
+  - max active HTTP requests; health probes return `429` when active requests reach or exceed this value.
   - `0` disables thresholding even if busy protection is enabled.
 - `RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE`
   - enables KMS readiness enforcement for `/health/ready`.

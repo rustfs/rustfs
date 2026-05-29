@@ -33,7 +33,7 @@ pub const DEFAULT_HEALTH_MINIMAL_RESPONSE_ENABLE: bool = false;
 pub const ENV_HEALTH_COMPAT_BUSY_CHECK_ENABLE: &str = "RUSTFS_HEALTH_COMPAT_BUSY_CHECK_ENABLE";
 pub const DEFAULT_HEALTH_COMPAT_BUSY_CHECK_ENABLE: bool = false;
 
-/// Max active HTTP requests before alias health probes report busy (429).
+/// Max active HTTP requests; alias health probes report busy (429) when active requests reach or exceed this value.
 /// Set to 0 to disable thresholding even when busy protection is enabled.
 pub const ENV_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS: &str = "RUSTFS_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS";
 pub const DEFAULT_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS: usize = 0;

@@ -13,14 +13,13 @@
 // limitations under the License.
 
 use crate::admin::console::is_console_path;
-use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, probe_from_path};
+use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests,
-    collect_dependency_readiness_report,
+    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
@@ -665,7 +664,7 @@ fn alias_busy_threshold_exceeded(active_requests: u64) -> bool {
     }
 
     let max_active_requests = health_compat_busy_max_active_requests();
-    max_active_requests > 0 && active_requests > max_active_requests
+    max_active_requests > 0 && active_requests >= max_active_requests
 }
 
 fn is_public_health_endpoint_request(method: &Method, path: &str) -> bool {
@@ -688,7 +687,7 @@ where
     RestBody: From<Bytes>,
 {
     let probe = resolve_public_health_probe(&method, path.as_str())
-        .unwrap_or(probe_from_path(path.as_str()));
+        .expect("public health endpoint request should always resolve health probe");
 
     if probe == HealthProbe::Readiness && alias_busy_threshold_exceeded(active_http_requests()) {
         let retry_after = HeaderValue::from_static("5");
@@ -707,23 +706,14 @@ where
             .expect("failed to build health busy response");
     }
 
-    let mut readiness_report = collect_dependency_readiness_report().await;
-    if probe == HealthProbe::Readiness
-        && health_compat_kms_ready_check_enabled()
-        && !health_kms_ready().await
-    {
-        readiness_report.readiness.lock_quorum_ready = false;
-        if !readiness_report
-            .degraded_reasons
-            .contains(&crate::server::ReadinessDegradedReason::KmsNotReady)
-        {
-            readiness_report
-                .degraded_reasons
-                .push(crate::server::ReadinessDegradedReason::KmsNotReady);
-        }
-    }
+    let readiness_report = collect_dependency_readiness_report().await;
+    let kms_ready = if probe == HealthProbe::Readiness && health_compat_kms_ready_check_enabled() {
+        Some(health_kms_ready().await)
+    } else {
+        None
+    };
 
-    let response_parts = build_health_response_parts(method, probe, &readiness_report, "rustfs-endpoint", None);
+    let response_parts = build_health_response_parts(method, probe, &readiness_report, "rustfs-endpoint", None, kms_ready);
     let body = response_parts
         .payload
         .map(|payload| Bytes::from(serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec())))
@@ -899,7 +889,8 @@ impl ConditionalCorsLayer {
     }
 
     /// Exact paths that should be excluded from being treated as S3 paths.
-    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &["/health", "/health/live", "/health/ready", "/profile/cpu", "/profile/memory"];
+    const EXCLUDED_EXACT_PATHS: &'static [&'static str] =
+        &["/health", "/health/live", "/health/ready", "/profile/cpu", "/profile/memory"];
 
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
@@ -1342,7 +1333,8 @@ mod tests {
     fn alias_busy_threshold_exceeded_requires_switch_and_positive_threshold() {
         with_var(rustfs_config::ENV_HEALTH_COMPAT_BUSY_CHECK_ENABLE, Some("true"), || {
             with_var(rustfs_config::ENV_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS, Some("2"), || {
-                assert!(!alias_busy_threshold_exceeded(2));
+                assert!(!alias_busy_threshold_exceeded(1));
+                assert!(alias_busy_threshold_exceeded(2));
                 assert!(alias_busy_threshold_exceeded(3));
             });
         });

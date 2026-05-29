@@ -191,7 +191,7 @@ RUST_LOG=debug cargo test test_local_kms_end_to_end -- --nocapture
 4. **Monitor ports**
    ```bash
    netstat -an | grep 9050
-   curl http://127.0.0.1:9050/minio/health/ready
+   curl http://127.0.0.1:9050/health/ready
    ```
 
 ## 📊 Coverage
