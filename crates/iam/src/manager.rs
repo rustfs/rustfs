@@ -1793,6 +1793,18 @@ where
         }
     }
 
+    fn remove_user_from_cached_groups(&self, cache: &mut LockedCache, user: &str, now: OffsetDateTime) {
+        let member_of = cache.state().user_group_memberships.get(user).cloned().unwrap_or_default();
+        for group in member_of.iter() {
+            if let Some(group_info) = cache.state().groups.get(group).cloned() {
+                let mut group_info = group_info;
+                group_info.members.retain(|member| member != user);
+                cache.add_or_update_group(group, &group_info, now);
+            }
+        }
+        cache.delete_user_group_membership(user, now);
+    }
+
     pub async fn group_notification_handler(&self, group: &str) -> Result<()> {
         let mut m = HashMap::new();
         if let Err(err) = self.api.load_group(group, &mut m).await {
@@ -1916,28 +1928,9 @@ where
                 return Err(err);
             }
 
-            if user_type == UserType::Sts {
-                self.cache.delete_sts_account(name, OffsetDateTime::now_utc());
-            } else {
-                self.cache.delete_user(name, OffsetDateTime::now_utc());
-            }
-
-            let cache = self.cache.snapshot();
-            let member_of = cache.user_group_memberships.get(name).cloned();
-            drop(cache);
-            if let Some(m) = member_of {
-                for group in m.iter() {
-                    if let Err(err) = self.remove_members_from_group(group, vec![name.to_string()], true).await
-                        && !is_err_no_such_group(&err)
-                    {
-                        return Err(err);
-                    }
-                }
-            }
-
+            let mut service_accounts_to_delete = Vec::new();
+            let mut temp_accounts_to_delete = HashSet::new();
             if user_type == UserType::Reg {
-                let mut service_accounts_to_delete = Vec::new();
-                let mut temp_accounts_to_delete = HashSet::new();
                 let cache = self.cache.snapshot();
                 for (_, v) in cache.users.iter() {
                     let u = &v.credentials;
@@ -1960,19 +1953,27 @@ where
                 for access_key in temp_accounts_to_delete.iter() {
                     let _ = self.api.delete_user_identity(access_key, UserType::Sts).await;
                 }
+            }
 
-                self.cache.with_write_lock(|cache| {
-                    let now = OffsetDateTime::now_utc();
+            self.cache.with_write_lock(|cache| {
+                let now = OffsetDateTime::now_utc();
+                match user_type {
+                    UserType::Sts => cache.delete_sts_account(name, now),
+                    UserType::Reg | UserType::Svc => cache.delete_user(name, now),
+                    UserType::None => {}
+                }
+                self.remove_user_from_cached_groups(cache, name, now);
+                if user_type == UserType::Reg {
                     for access_key in service_accounts_to_delete.iter() {
                         cache.delete_user(access_key, now);
                     }
                     for access_key in temp_accounts_to_delete.iter() {
                         cache.delete_sts_account(access_key, now);
+                        cache.delete_user(access_key, now);
                     }
-                });
-            }
-
-            self.cache.delete_user_policy(name, OffsetDateTime::now_utc());
+                }
+                cache.delete_user_policy(name, now);
+            });
 
             return Ok(());
         }

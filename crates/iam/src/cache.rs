@@ -34,15 +34,15 @@ use crate::store::{GroupInfo, MappedPolicy};
 /// Readers should load one `CacheState` and read all related maps from it. Writers
 /// must go through `Cache`/`LockedCache` so multi-map updates publish as one state.
 #[derive(Clone)]
-pub struct CacheState {
-    pub policy_docs: Arc<CacheEntity<PolicyDoc>>,
-    pub users: Arc<CacheEntity<UserIdentity>>,
-    pub user_policies: Arc<CacheEntity<MappedPolicy>>,
-    pub sts_accounts: Arc<CacheEntity<UserIdentity>>,
-    pub sts_policies: Arc<CacheEntity<MappedPolicy>>,
-    pub groups: Arc<CacheEntity<GroupInfo>>,
-    pub user_group_memberships: Arc<CacheEntity<HashSet<String>>>,
-    pub group_policies: Arc<CacheEntity<MappedPolicy>>,
+pub(crate) struct CacheState {
+    pub(crate) policy_docs: Arc<CacheEntity<PolicyDoc>>,
+    pub(crate) users: Arc<CacheEntity<UserIdentity>>,
+    pub(crate) user_policies: Arc<CacheEntity<MappedPolicy>>,
+    pub(crate) sts_accounts: Arc<CacheEntity<UserIdentity>>,
+    pub(crate) sts_policies: Arc<CacheEntity<MappedPolicy>>,
+    pub(crate) groups: Arc<CacheEntity<GroupInfo>>,
+    pub(crate) user_group_memberships: Arc<CacheEntity<HashSet<String>>>,
+    pub(crate) group_policies: Arc<CacheEntity<MappedPolicy>>,
 }
 
 impl Default for CacheState {
@@ -74,10 +74,10 @@ impl Default for Cache {
     }
 }
 
-pub type CacheSnapshot = Guard<Arc<CacheState>>;
+pub(crate) type CacheSnapshot = Guard<Arc<CacheState>>;
 
 impl Cache {
-    pub fn snapshot(&self) -> CacheSnapshot {
+    pub(crate) fn snapshot(&self) -> CacheSnapshot {
         self.state.load()
     }
 
@@ -293,6 +293,12 @@ impl LockedCache {
 
     pub(crate) fn delete_user_policy(&mut self, key: &str, t: OffsetDateTime) {
         self.dirty |= Self::exec(&mut self.state.user_policies, t, |map| {
+            map.remove(key);
+        });
+    }
+
+    pub(crate) fn delete_user_group_membership(&mut self, key: &str, t: OffsetDateTime) {
+        self.dirty |= Self::exec(&mut self.state.user_group_memberships, t, |map| {
             map.remove(key);
         });
     }

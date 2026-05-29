@@ -1325,7 +1325,7 @@ mod tests {
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
     use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use time::OffsetDateTime;
 
     #[test]
@@ -1410,6 +1410,10 @@ mod tests {
         }
 
         async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            if name == "deleted-notify-user" {
+                return Err(Error::NoSuchUser(name.to_string()));
+            }
+
             if user_type == UserType::Reg && name == "load-failure-user" {
                 return Err(Error::Io(std::io::Error::other("load user failed")));
             }
@@ -2280,6 +2284,72 @@ mod tests {
             sts_policies.contains_key("notify-sts-parent"),
             "STS policy mapping notifications must update sts_policies instead of deleting them"
         );
+    }
+
+    #[tokio::test]
+    async fn test_missing_user_notification_cleans_related_cache_state() {
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        const USER: &str = "deleted-notify-user";
+        const GROUP: &str = "deleted-notify-group";
+        const SVC_CHILD: &str = "deleted-notify-service-child";
+        const STS_CHILD: &str = "deleted-notify-sts-child";
+        const OTHER_USER: &str = "deleted-notify-other-user";
+
+        let user = UserIdentity::from(Credentials {
+            access_key: USER.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+
+        let mut service_claims = HashMap::new();
+        service_claims.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string()));
+        let service_child = UserIdentity::from(Credentials {
+            access_key: SVC_CHILD.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: USER.to_string(),
+            claims: Some(service_claims),
+            ..Default::default()
+        });
+
+        let sts_child = UserIdentity::from(Credentials {
+            access_key: STS_CHILD.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            session_token: "session-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: USER.to_string(),
+            ..Default::default()
+        });
+
+        let membership = HashSet::from([GROUP.to_string()]);
+        let group = GroupInfo::new(vec![USER.to_string(), OTHER_USER.to_string()]);
+        let mapped_policy = MappedPolicy::new("readwrite");
+
+        iam_sys.store.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            cache.add_or_update_user(USER, &user, now);
+            cache.add_or_update_user_policy(USER, &mapped_policy, now);
+            cache.add_or_update_group(GROUP, &group, now);
+            cache.add_or_update_user_group_membership(USER, &membership, now);
+            cache.add_or_update_user(SVC_CHILD, &service_child, now);
+            cache.add_or_update_sts_account(STS_CHILD, &sts_child, now);
+        });
+
+        iam_sys.load_user(USER, UserType::Reg).await.unwrap();
+
+        let cache = iam_sys.store.cache.snapshot();
+        assert!(!cache.users.contains_key(USER));
+        assert!(!cache.user_policies.contains_key(USER));
+        assert!(!cache.user_group_memberships.contains_key(USER));
+        assert!(!cache.users.contains_key(SVC_CHILD));
+        assert!(!cache.sts_accounts.contains_key(STS_CHILD));
+        let group = cache.groups.get(GROUP).expect("group should remain after member removal");
+        assert!(!group.members.contains(&USER.to_string()));
+        assert!(group.members.contains(&OTHER_USER.to_string()));
     }
 
     #[tokio::test]
