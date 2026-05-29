@@ -24,7 +24,6 @@ use rustfs_config::{
 };
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) const LEGACY_ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
@@ -177,14 +176,6 @@ impl Config {
 
     pub fn is_using_default_credentials(&self) -> bool {
         DEFAULT_ACCESS_KEY.eq(&self.access_key) && DEFAULT_SECRET_KEY.eq(&self.secret_key)
-    }
-
-    /// Default root credentials remain allowed for backward compatibility.
-    ///
-    /// Callers should use [`Config::is_using_default_credentials`] to warn
-    /// operators instead of blocking startup.
-    pub fn default_credentials_allowed_for_addr(&self, _server_addr: SocketAddr, _allow_insecure_defaults: bool) -> bool {
-        true
     }
 
     /// Create Config from Opt
