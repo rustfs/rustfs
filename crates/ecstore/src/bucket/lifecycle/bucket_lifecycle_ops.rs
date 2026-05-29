@@ -75,6 +75,8 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
@@ -587,12 +589,16 @@ impl ExpiryOp for TransitionTask {
     }
 }
 
+struct TransitionWorker {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
 pub struct TransitionState {
     transition_tx: A_Sender<Option<TransitionTask>>,
     transition_rx: A_Receiver<Option<TransitionTask>>,
     pub num_workers: AtomicI64,
-    kill_tx: A_Sender<()>,
-    kill_rx: A_Receiver<()>,
+    workers: Mutex<Vec<TransitionWorker>>,
     transition_queue_capacity: usize,
     transition_queue_send_timeout: StdDuration,
     active_tasks: AtomicI64,
@@ -621,13 +627,11 @@ impl TransitionState {
         let capacity = capacity.max(1);
         let queue_send_timeout = resolve_transition_queue_send_timeout();
         let (tx1, rx1) = bounded(capacity);
-        let (tx2, rx2) = bounded(1);
         Arc::new(Self {
             transition_tx: tx1,
             transition_rx: rx1,
             num_workers: AtomicI64::new(0),
-            kill_tx: tx2,
-            kill_rx: rx2,
+            workers: Mutex::new(Vec::new()),
             transition_queue_capacity: capacity,
             transition_queue_send_timeout: queue_send_timeout,
             active_tasks: AtomicI64::new(0),
@@ -849,10 +853,12 @@ impl TransitionState {
         Self::counter_value(&self.compensation_running_tasks)
     }
 
-    pub async fn worker(api: Arc<ECStore>) {
+    async fn worker_with_cancel(api: Arc<ECStore>, cancel_token: CancellationToken) {
         loop {
             select! {
-                _ = GLOBAL_TransitionState.kill_rx.recv() => {
+                biased;
+
+                _ = cancel_token.cancelled() => {
                     return;
                 }
                 task = GLOBAL_TransitionState.transition_rx.recv() => {
@@ -952,33 +958,45 @@ impl TransitionState {
         }
         // Allow environment override of maximum workers
         let absolute_max = resolve_transition_workers_absolute_max();
-        n = std::cmp::min(n, absolute_max);
+        n = n.clamp(0, absolute_max);
 
-        let previous_num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
-        let mut num_workers = previous_num_workers;
-        while num_workers < n {
+        Self::resize_workers_to(api, n, requested, absolute_max);
+    }
+
+    fn resize_workers_to(api: Arc<ECStore>, n: i64, requested: i64, absolute_max: i64) {
+        let target = n as usize;
+        let mut workers = GLOBAL_TransitionState.workers.lock().unwrap();
+        let tracked_workers = workers.len();
+        workers.retain(|worker| !worker.handle.is_finished());
+        let pruned_finished_workers = tracked_workers.saturating_sub(workers.len());
+        let previous_num_workers = workers.len() as i64;
+
+        while workers.len() < target {
             let clone_api = api.clone();
-            tokio::spawn(async move {
-                TransitionState::worker(clone_api).await;
+            let cancel = CancellationToken::new();
+            let worker_cancel = cancel.clone();
+            let handle = tokio::spawn(async move {
+                TransitionState::worker_with_cancel(clone_api, worker_cancel).await;
             });
-            num_workers += 1;
-            GLOBAL_TransitionState.num_workers.fetch_add(1, Ordering::SeqCst);
+            workers.push(TransitionWorker { cancel, handle });
         }
 
-        let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
-        while num_workers > n {
-            let worker = GLOBAL_TransitionState.kill_tx.clone();
-            let _ = worker.send(()).await;
-            num_workers -= 1;
-            GLOBAL_TransitionState.num_workers.fetch_add(-1, Ordering::SeqCst);
+        while workers.len() > target {
+            if let Some(worker) = workers.pop() {
+                worker.cancel.cancel();
+            }
         }
+
+        let current_workers = workers.len() as i64;
+        GLOBAL_TransitionState.num_workers.store(current_workers, Ordering::SeqCst);
 
         info!(
             requested_transition_workers = requested,
             effective_transition_workers = n,
             absolute_max_workers = absolute_max,
             previous_transition_workers = previous_num_workers,
-            current_transition_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst),
+            current_transition_workers = current_workers,
+            pruned_finished_transition_workers = pruned_finished_workers,
             "transition workers updated"
         );
     }
@@ -2264,7 +2282,8 @@ mod tests {
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
         mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
         resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
-        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
+        resolve_transition_workers_absolute_max, should_defer_date_expiry_for_recent_config_update,
+        should_reuse_lifecycle_delete_replication_state,
     };
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -2655,15 +2674,45 @@ mod tests {
         })
         .await;
 
-        let current_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
-        if original_workers > 0 {
-            TransitionState::update_workers(ecstore, original_workers).await;
-        } else {
-            for _ in 0..current_workers {
-                let _ = GLOBAL_TransitionState.kill_tx.send(()).await;
-                GLOBAL_TransitionState.num_workers.fetch_add(-1, Ordering::SeqCst);
-            }
-        }
+        let absolute_max = resolve_transition_workers_absolute_max();
+        TransitionState::resize_workers_to(ecstore, original_workers, original_workers, absolute_max);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transition_worker_resize_cancels_removed_workers_directly() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let original_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
+        let absolute_max = resolve_transition_workers_absolute_max();
+
+        TransitionState::resize_workers_to(ecstore.clone(), 0, 0, absolute_max);
+        assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 0);
+
+        TransitionState::resize_workers_to(ecstore.clone(), 2, 2, absolute_max);
+        let worker_tokens = {
+            let workers = GLOBAL_TransitionState.workers.lock().unwrap();
+            assert_eq!(workers.len(), 2);
+            workers.iter().map(|worker| worker.cancel.clone()).collect::<Vec<_>>()
+        };
+
+        TransitionState::resize_workers_to(ecstore.clone(), 1, 1, absolute_max);
+
+        assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 1);
+        assert_eq!(worker_tokens.iter().filter(|token| token.is_cancelled()).count(), 1);
+
+        let remaining_token = {
+            let workers = GLOBAL_TransitionState.workers.lock().unwrap();
+            assert_eq!(workers.len(), 1);
+            let token = workers[0].cancel.clone();
+            assert!(!token.is_cancelled());
+            token
+        };
+
+        TransitionState::resize_workers_to(ecstore.clone(), 0, 0, absolute_max);
+        assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 0);
+        assert!(remaining_token.is_cancelled());
+
+        TransitionState::resize_workers_to(ecstore, original_workers, original_workers, absolute_max);
     }
 
     #[test]
@@ -3136,6 +3185,76 @@ mod tests {
             .expect("multipart parts should be readable");
         assert!(!parts.user_defined.contains_key(RUSTFS_MULTIPART_BUCKET_KEY));
         assert!(!parts.user_defined.contains_key(RUSTFS_MULTIPART_OBJECT_KEY));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repeated_upload_part_overwrites_previous_part_state() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("multipart-overwrite-{}", Uuid::new_v4().simple());
+        let object = "overwrite/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        let mut first = PutObjReader::from_vec(vec![1, 2, 3]);
+        let first_part = ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut first, &ObjectOptions::default())
+            .await
+            .expect("first multipart part should be uploaded");
+
+        let mut second = PutObjReader::from_vec(vec![4, 5, 6, 7]);
+        let second_part = ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut second, &ObjectOptions::default())
+            .await
+            .expect("second multipart part should overwrite the previous part");
+
+        assert_ne!(
+            first_part.etag, second_part.etag,
+            "the overwrite path should persist the latest part metadata rather than reusing stale state"
+        );
+
+        let parts = ecstore
+            .list_object_parts(
+                &bucket,
+                object,
+                &upload.upload_id,
+                None,
+                crate::set_disk::MAX_PARTS_COUNT,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("multipart parts should be readable after overwrite");
+
+        assert_eq!(parts.parts.len(), 1, "only the latest version of part 1 should remain visible");
+        assert_eq!(parts.parts[0].part_num, 1);
+        assert_eq!(parts.parts[0].etag, second_part.etag);
+        assert_eq!(parts.parts[0].size, second_part.size);
+        assert_eq!(parts.parts[0].actual_size, second_part.actual_size);
+
+        let completed = ecstore
+            .complete_multipart_upload(
+                &bucket,
+                object,
+                &upload.upload_id,
+                vec![crate::store_api::CompletePart {
+                    part_num: 1,
+                    etag: second_part.etag.clone(),
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    checksum_crc64nvme: None,
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete multipart upload should succeed with the latest overwritten part");
+
+        assert_eq!(completed.size, second_part.size as i64);
     }
 
     #[tokio::test]

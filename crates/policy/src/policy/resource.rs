@@ -192,7 +192,7 @@ impl Resource {
                 return true;
             }
 
-            if wildcard::is_match(resolved_pattern, resource) {
+            if cp != "." && wildcard::is_match(resolved_pattern, &cp) {
                 return true;
             }
         }
@@ -287,6 +287,8 @@ mod tests {
     #[test_case("arn:aws:s3:::mybucket/*","mybucket10/myobject" => false; "13")]
     #[test_case("arn:aws:s3:::mybucket?0/2010/photos/*","mybucket0/2010/photos/1.jpg" => false; "14")]
     #[test_case("arn:aws:s3:::mybucket","mybucket/myobject" => false; "15")]
+    #[test_case("arn:aws:s3:::attacker-bucket/*","attacker-bucket/../victim-bucket/evil.txt" => false; "16")]
+    #[test_case("arn:aws:s3:::attacker-bucket/*","attacker-bucket/safe/../../victim-bucket/evil.txt" => false; "17")]
     fn test_resource_is_match(resource: &str, object: &str) -> bool {
         let resource: Resource = resource.try_into().unwrap();
 

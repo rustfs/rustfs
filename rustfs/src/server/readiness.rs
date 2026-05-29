@@ -20,6 +20,8 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use metrics::{counter, gauge};
 use rustfs_common::GlobalReadiness;
+use rustfs_ecstore::global::is_dist_erasure;
+use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_lock_clients};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::StorageAPI;
 use rustfs_iam::get_global_iam_sys;
@@ -47,13 +49,18 @@ const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_
 pub struct DependencyReadiness {
     pub storage_ready: bool,
     pub iam_ready: bool,
+    pub lock_quorum_ready: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadinessDegradedReason {
     StorageQuorumUnavailable,
     IamNotReady,
+    LockQuorumUnavailable,
     StorageAndIamUnavailable,
+    StorageAndLockUnavailable,
+    IamAndLockUnavailable,
+    StorageIamAndLockUnavailable,
 }
 
 impl ReadinessDegradedReason {
@@ -61,7 +68,11 @@ impl ReadinessDegradedReason {
         match self {
             ReadinessDegradedReason::StorageQuorumUnavailable => "storage_quorum_unavailable",
             ReadinessDegradedReason::IamNotReady => "iam_not_ready",
+            ReadinessDegradedReason::LockQuorumUnavailable => "lock_quorum_unavailable",
             ReadinessDegradedReason::StorageAndIamUnavailable => "storage_and_iam_unavailable",
+            ReadinessDegradedReason::StorageAndLockUnavailable => "storage_and_lock_unavailable",
+            ReadinessDegradedReason::IamAndLockUnavailable => "iam_and_lock_unavailable",
+            ReadinessDegradedReason::StorageIamAndLockUnavailable => "storage_iam_and_lock_unavailable",
         }
     }
 }
@@ -211,6 +222,14 @@ struct StorageReadinessCacheEntry {
     storage_ready: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LockQuorumStatus {
+    pub ready: bool,
+    pub connected_clients: usize,
+    pub total_clients: usize,
+    pub required_quorum: usize,
+}
+
 const DISK_STATE_OK: &str = "ok";
 const DISK_STATE_UNFORMATTED: &str = "unformatted";
 const RUNTIME_STATE_RETURNING: &str = "returning";
@@ -346,17 +365,21 @@ fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
     })
 }
 
-fn degraded_reasons(storage_ready: bool, iam_ready_raw: bool) -> Vec<ReadinessDegradedReason> {
-    match (storage_ready, iam_ready_raw) {
-        (true, true) => Vec::new(),
-        (false, false) => vec![ReadinessDegradedReason::StorageAndIamUnavailable],
-        (false, true) => vec![ReadinessDegradedReason::StorageQuorumUnavailable],
-        (true, false) => vec![ReadinessDegradedReason::IamNotReady],
+fn degraded_reasons(storage_ready: bool, iam_ready_raw: bool, lock_quorum_ready: bool) -> Vec<ReadinessDegradedReason> {
+    match (storage_ready, iam_ready_raw, lock_quorum_ready) {
+        (true, true, true) => Vec::new(),
+        (false, false, false) => vec![ReadinessDegradedReason::StorageIamAndLockUnavailable],
+        (false, false, true) => vec![ReadinessDegradedReason::StorageAndIamUnavailable],
+        (false, true, false) => vec![ReadinessDegradedReason::StorageAndLockUnavailable],
+        (true, false, false) => vec![ReadinessDegradedReason::IamAndLockUnavailable],
+        (false, true, true) => vec![ReadinessDegradedReason::StorageQuorumUnavailable],
+        (true, false, true) => vec![ReadinessDegradedReason::IamNotReady],
+        (true, true, false) => vec![ReadinessDegradedReason::LockQuorumUnavailable],
     }
 }
 
 fn record_readiness_report(report: &DependencyReadinessReport) {
-    let ready = report.readiness.storage_ready && report.readiness.iam_ready;
+    let ready = report.readiness.storage_ready && report.readiness.iam_ready && report.readiness.lock_quorum_ready;
     gauge!(METRIC_RUNTIME_READINESS_READY).set(if ready { 1.0 } else { 0.0 });
     for reason in &report.degraded_reasons {
         counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
@@ -376,13 +399,15 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
         update_storage_readiness_cache(computed).await;
         computed
     };
+    let lock_quorum_status = collect_lock_quorum_status_uncached().await;
 
     let readiness = DependencyReadiness {
         storage_ready,
         iam_ready: iam_ready_raw,
+        lock_quorum_ready: lock_quorum_status.ready,
     };
     let report = DependencyReadinessReport {
-        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw),
+        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw, readiness.lock_quorum_ready),
         readiness,
     };
     record_readiness_report(&report);
@@ -392,13 +417,15 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
 async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
     let iam_ready_raw = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
     let storage_ready = collect_storage_readiness_uncached().await;
+    let lock_quorum_status = collect_lock_quorum_status_uncached().await;
 
     let readiness = DependencyReadiness {
         storage_ready,
         iam_ready: iam_ready_raw,
+        lock_quorum_ready: lock_quorum_status.ready,
     };
     let report = DependencyReadinessReport {
-        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw),
+        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw, readiness.lock_quorum_ready),
         readiness,
     };
     record_readiness_report(&report);
@@ -412,6 +439,115 @@ async fn collect_storage_readiness_uncached() -> bool {
     } else {
         false
     }
+}
+
+fn set_lock_quorum_status(
+    online_hosts: &HashSet<String>,
+    set_endpoints: &[rustfs_ecstore::disk::endpoint::Endpoint],
+) -> LockQuorumStatus {
+    let total_clients = set_endpoints
+        .iter()
+        .map(rustfs_ecstore::disk::endpoint::Endpoint::host_port)
+        .filter(|host| !host.is_empty())
+        .collect::<HashSet<_>>();
+    let total_clients_len = total_clients.len();
+    if total_clients_len == 0 {
+        return LockQuorumStatus::default();
+    }
+
+    let connected_clients = total_clients.iter().filter(|host| online_hosts.contains(*host)).count();
+    let required_quorum = if total_clients_len > 1 {
+        (total_clients_len / 2) + 1
+    } else {
+        1
+    };
+
+    LockQuorumStatus {
+        ready: connected_clients >= required_quorum,
+        connected_clients,
+        total_clients: total_clients_len,
+        required_quorum,
+    }
+}
+
+fn aggregate_lock_quorum_status(
+    pool_endpoints: &rustfs_ecstore::endpoints::EndpointServerPools,
+    online_hosts: &HashSet<String>,
+) -> LockQuorumStatus {
+    let mut connected_clients = 0usize;
+    let mut total_clients = 0usize;
+    let mut required_quorum = 0usize;
+
+    for pool in pool_endpoints.as_ref() {
+        for set_idx in 0..pool.set_count {
+            let set_endpoints = pool
+                .endpoints
+                .as_ref()
+                .iter()
+                .filter(|endpoint| endpoint.set_idx == set_idx as i32)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let status = set_lock_quorum_status(online_hosts, &set_endpoints);
+            if status.total_clients == 0 {
+                return LockQuorumStatus::default();
+            }
+
+            connected_clients += status.connected_clients;
+            total_clients += status.total_clients;
+            required_quorum += status.required_quorum;
+
+            if !status.ready {
+                return LockQuorumStatus {
+                    ready: false,
+                    connected_clients,
+                    total_clients,
+                    required_quorum,
+                };
+            }
+        }
+    }
+
+    if total_clients == 0 {
+        LockQuorumStatus::default()
+    } else {
+        LockQuorumStatus {
+            ready: true,
+            connected_clients,
+            total_clients,
+            required_quorum,
+        }
+    }
+}
+
+async fn collect_lock_quorum_status_uncached() -> LockQuorumStatus {
+    if !is_dist_erasure().await {
+        return LockQuorumStatus {
+            ready: true,
+            connected_clients: 1,
+            total_clients: 1,
+            required_quorum: 1,
+        };
+    }
+
+    let Some(pool_endpoints) = get_global_endpoints_opt() else {
+        return LockQuorumStatus::default();
+    };
+    let Some(lock_clients) = get_global_lock_clients() else {
+        return LockQuorumStatus::default();
+    };
+
+    let online_hosts = futures::future::join_all(lock_clients.iter().map(|(host, client)| {
+        let host = host.clone();
+        let client = client.clone();
+        async move { (host, client.is_online().await) }
+    }))
+    .await
+    .into_iter()
+    .filter_map(|(host, online)| online.then_some(host))
+    .collect::<HashSet<_>>();
+
+    aggregate_lock_quorum_status(&pool_endpoints, &online_hosts)
 }
 
 pub async fn wait_for_runtime_readiness_with<F, Fut, ReadyFn>(
@@ -429,17 +565,18 @@ where
 
     loop {
         let readiness = load_readiness().await;
-        if readiness.storage_ready && readiness.iam_ready {
+        if readiness.storage_ready && readiness.iam_ready && readiness.lock_quorum_ready {
             on_ready(readiness);
             return Ok(());
         }
 
         if tokio::time::Instant::now() >= startup_deadline {
             let reason = format!(
-                "startup readiness timed out after {}s: storage_ready={}, iam_ready={}",
+                "startup readiness timed out after {}s: storage_ready={}, iam_ready={}, lock_quorum_ready={}",
                 max_wait.as_secs(),
                 readiness.storage_ready,
-                readiness.iam_ready
+                readiness.iam_ready,
+                readiness.lock_quorum_ready
             );
             return Err(std::io::Error::other(reason));
         }
@@ -448,6 +585,7 @@ where
             target: "rustfs::server::readiness",
             storage_ready = readiness.storage_ready,
             iam_ready = readiness.iam_ready,
+            lock_quorum_ready = readiness.lock_quorum_ready,
             "Runtime readiness has not reached write quorum yet; delaying ready state publication"
         );
         tokio::time::sleep(poll_interval).await;
@@ -479,6 +617,7 @@ mod tests {
                 future::ready(DependencyReadiness {
                     storage_ready: false,
                     iam_ready: false,
+                    lock_quorum_ready: false,
                 })
             },
             |_| {
@@ -490,6 +629,34 @@ mod tests {
         .expect_err("unready startup should time out");
 
         assert!(err.to_string().contains("startup readiness timed out"));
+        assert!(!readiness.is_ready());
+        assert_eq!(state_manager.current_state(), ServiceState::Starting);
+    }
+
+    #[tokio::test]
+    async fn wait_for_runtime_readiness_with_does_not_publish_ready_when_lock_quorum_is_not_reached() {
+        let readiness = GlobalReadiness::new();
+        let state_manager = ServiceStateManager::new();
+
+        let err = wait_for_runtime_readiness_with(
+            Duration::ZERO,
+            Duration::from_millis(1),
+            || {
+                future::ready(DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: false,
+                })
+            },
+            |_| {
+                readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+                state_manager.update(ServiceState::Ready);
+            },
+        )
+        .await
+        .expect_err("lock quorum should block readiness publication");
+
+        assert!(err.to_string().contains("lock_quorum_ready=false"));
         assert!(!readiness.is_ready());
         assert_eq!(state_manager.current_state(), ServiceState::Starting);
     }
@@ -603,6 +770,128 @@ mod tests {
         assert!(
             !storage_ready_from_runtime_state(&info),
             "if any set fails write quorum, readiness must be false"
+        );
+    }
+
+    #[test]
+    fn aggregate_lock_quorum_status_requires_each_set_to_meet_quorum() {
+        use rustfs_ecstore::disk::endpoint::Endpoint;
+        use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+
+        let endpoints = vec![
+            Endpoint {
+                url: url::Url::parse("http://node1:9000/data1").unwrap(),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: 0,
+            },
+            Endpoint {
+                url: url::Url::parse("http://node2:9000/data2").unwrap(),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: 1,
+            },
+            Endpoint {
+                url: url::Url::parse("http://node3:9000/data3").unwrap(),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 1,
+                disk_idx: 0,
+            },
+            Endpoint {
+                url: url::Url::parse("http://node4:9000/data4").unwrap(),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 1,
+                disk_idx: 1,
+            },
+        ];
+        let pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 2,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+
+        let status = aggregate_lock_quorum_status(
+            &pools,
+            &["node1:9000", "node2:9000", "node3:9000", "node4:9000"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<HashSet<_>>(),
+        );
+
+        assert!(status.ready);
+        assert_eq!(status.connected_clients, 4);
+        assert_eq!(status.total_clients, 4);
+        assert_eq!(status.required_quorum, 4);
+    }
+
+    #[test]
+    fn aggregate_lock_quorum_status_fails_when_any_set_loses_quorum() {
+        use rustfs_ecstore::disk::endpoint::Endpoint;
+        use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+
+        let endpoints = vec![
+            Endpoint {
+                url: url::Url::parse("http://node1:9000/data1").unwrap(),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: 0,
+            },
+            Endpoint {
+                url: url::Url::parse("http://node2:9000/data2").unwrap(),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: 1,
+            },
+            Endpoint {
+                url: url::Url::parse("http://node3:9000/data3").unwrap(),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 1,
+                disk_idx: 0,
+            },
+            Endpoint {
+                url: url::Url::parse("http://node4:9000/data4").unwrap(),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 1,
+                disk_idx: 1,
+            },
+        ];
+        let pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 2,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+
+        let status =
+            aggregate_lock_quorum_status(&pools, &["node1:9000"].into_iter().map(str::to_string).collect::<HashSet<_>>());
+
+        assert!(!status.ready);
+    }
+
+    #[test]
+    fn degraded_reasons_include_lock_quorum_failures() {
+        assert_eq!(degraded_reasons(true, true, false), vec![ReadinessDegradedReason::LockQuorumUnavailable]);
+        assert_eq!(
+            degraded_reasons(false, true, false),
+            vec![ReadinessDegradedReason::StorageAndLockUnavailable]
+        );
+        assert_eq!(degraded_reasons(true, false, false), vec![ReadinessDegradedReason::IamAndLockUnavailable]);
+        assert_eq!(
+            degraded_reasons(false, false, false),
+            vec![ReadinessDegradedReason::StorageIamAndLockUnavailable]
         );
     }
 }

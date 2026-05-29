@@ -70,6 +70,36 @@ mod tests {
         Ok(builder.into_inner().await?.into_inner())
     }
 
+    fn build_archive_with_parent_dir_entry(victim_bucket: &str) -> Vec<u8> {
+        let path = format!("../{victim_bucket}/evil-injected.txt");
+        let data = b"injected-body";
+        let mut header = [0u8; 512];
+
+        header[..path.len()].copy_from_slice(path.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        let size = format!("{:011o}\0", data.len());
+        header[124..136].copy_from_slice(size.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+
+        let checksum: u32 = header.iter().map(|byte| *byte as u32).sum();
+        let checksum = format!("{:06o}\0 ", checksum);
+        header[148..156].copy_from_slice(checksum.as_bytes());
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(data);
+        let padding = (512 - (data.len() % 512)) % 512;
+        archive.extend(std::iter::repeat_n(0, padding));
+        archive.extend_from_slice(&[0u8; 1024]);
+        archive
+    }
+
     #[tokio::test]
     #[serial]
     async fn snowball_auto_extract_supports_minio_prefix_and_directory_markers() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -268,6 +298,49 @@ mod tests {
         let listed = client.list_objects_v2().bucket(bucket).prefix("tenant-c/").send().await?;
         let keys: Vec<_> = listed.contents().iter().filter_map(|entry| entry.key()).collect();
         assert_eq!(keys, vec!["tenant-c/valid.txt"]);
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snowball_auto_extract_rejects_parent_dir_entry_without_cross_bucket_write()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let attacker_bucket = "snowball-traversal-source";
+        let victim_bucket = "snowball-traversal-victim";
+        let archive = build_archive_with_parent_dir_entry(victim_bucket);
+
+        client.create_bucket().bucket(attacker_bucket).send().await?;
+        client.create_bucket().bucket(victim_bucket).send().await?;
+
+        let err = client
+            .put_object()
+            .bucket(attacker_bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .body(ByteStream::from(archive))
+            .send()
+            .await
+            .expect_err("parent directory archive entry should be rejected");
+        let service_err = err.into_service_error();
+        assert_eq!(service_err.code(), Some("InvalidArgument"));
+
+        let victim_err = client
+            .head_object()
+            .bucket(victim_bucket)
+            .key("evil-injected.txt")
+            .send()
+            .await
+            .expect_err("rejected archive entry must not write into the victim bucket");
+        let victim_service_err = victim_err.into_service_error();
+        assert_eq!(victim_service_err.code(), Some("NotFound"));
 
         env.stop_server();
         Ok(())
