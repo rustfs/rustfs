@@ -384,6 +384,7 @@ impl ObjectInfo {
     }
 
     pub fn is_encrypted(&self) -> bool {
+        // Corresponding to the logic in rustfs/src/sse.rs/encryption_material_to_metadata function
         use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 
         self.user_defined.keys().any(|key| {
@@ -395,6 +396,8 @@ impl ObjectInfo {
         }) || self.user_defined.contains_key(SSEC_ALGORITHM_HEADER)
             || self.user_defined.contains_key(SSEC_KEY_HEADER)
             || self.user_defined.contains_key(SSEC_KEY_MD5_HEADER)
+            || self.user_defined.contains_key("x-amz-server-side-encryption-aws-kms-key-id") // SSE-KMS
+            || self.user_defined.contains_key("x-amz-server-side-encryption") // SSE-S3/SSE-KMS/SSE-C
     }
 
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
@@ -1202,5 +1205,59 @@ mod tests {
         };
 
         assert!(info.get_actual_size().is_err());
+    }
+
+    #[test]
+    fn is_encrypted_correct_for_old_version_fileinfo() {
+        let mut user_defined: HashMap<String, String> = HashMap::new();
+
+        let metadata = vec![
+            ("content-type", "text/plain"),
+            ("etag", "e4336b5de4e2180a53fe2e17d03abe4f-4"),
+            ("x-minio-internal-actual-size", "67108864"),
+            ("x-rustfs-encryption-original-size", "67108864"),
+            ("x-rustfs-internal-actual-size", "67108864"),
+        ];
+
+        metadata.into_iter().for_each(|(key, value)| {
+            user_defined.insert(key.to_string(), value.to_string());
+        });
+
+        let info = ObjectInfo {
+            user_defined,
+            ..Default::default()
+        };
+
+        assert!(!info.is_encrypted());
+    }
+
+    #[test]
+    fn is_encrypted_returns_true_when_encryption_metadata_present() {
+        let mut user_defined: HashMap<String, String> = HashMap::new();
+
+        let metadata = vec![
+            ("content-type", "text/plain"),
+            ("etag", "f1c9645dbc14efddc7d8a322685f26eb"),
+            ("x-amz-server-side-encryption", "AES256"),
+            ("x-rustfs-encryption-algorithm", "AES256"),
+            ("x-rustfs-encryption-iv", "Fb9moBlEBRE0D14F"),
+            (
+                "x-rustfs-encryption-key",
+                "QUFBQUFBQUFBQUFBQUFBQTpZQk5sNnNJdmJHWWl3QmxZbCtsMTJlVlZCeXVoVml4UlV4b3JPbTNoRk5odUlYVnBPdlpXNWVyT0FTcklXMWJr",
+            ),
+            ("x-rustfs-encryption-key-id", "default"),
+            ("x-rustfs-encryption-original-size", "10485760"),
+        ];
+
+        metadata.into_iter().for_each(|(key, value)| {
+            user_defined.insert(key.to_string(), value.to_string());
+        });
+
+        let info = ObjectInfo {
+            user_defined,
+            ..Default::default()
+        };
+
+        assert!(info.is_encrypted());
     }
 }
