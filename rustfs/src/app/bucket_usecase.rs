@@ -616,7 +616,7 @@ fn build_list_objects_v2m_output(
 
     ListObjectsV2MOutput {
         name: Some(bucket.to_owned()),
-        prefix: Some(params.prefix.clone()),
+        prefix: Some(encode_list_objects_v2_value(&params.prefix, encoding_type)),
         max_keys: Some(params.max_keys),
         key_count: Some(key_count),
         continuation_token: params.response_continuation_token.clone(),
@@ -624,9 +624,15 @@ fn build_list_objects_v2m_output(
         next_continuation_token,
         contents: Some(contents),
         common_prefixes: Some(common_prefixes),
-        delimiter: params.delimiter.clone(),
+        delimiter: params
+            .delimiter
+            .as_deref()
+            .map(|delimiter| encode_list_objects_v2_value(delimiter, encoding_type)),
         encoding_type: encoding_type.cloned(),
-        start_after: params.response_start_after.clone(),
+        start_after: params
+            .response_start_after
+            .as_deref()
+            .map(|start_after| encode_list_objects_v2_value(start_after, encoding_type)),
         ..Default::default()
     }
 }
@@ -2022,6 +2028,7 @@ impl DefaultBucketUsecase {
         let ListObjectVersionsInput {
             bucket,
             delimiter,
+            encoding_type,
             key_marker,
             version_id_marker,
             max_keys,
@@ -2029,22 +2036,23 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let ListObjectVersionsParams {
-            prefix,
-            delimiter,
-            key_marker,
-            version_id_marker,
-            max_keys,
-        } = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
+        let params = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
-            .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
+            .list_object_versions(
+                &bucket,
+                &params.prefix,
+                params.key_marker.clone(),
+                params.version_id_marker.clone(),
+                params.delimiter.clone(),
+                params.max_keys,
+            )
             .await
             .map_err(ApiError::from)?;
 
-        let output = build_list_object_versions_output(object_infos, bucket, prefix, delimiter, max_keys);
+        let output = build_list_object_versions_output(object_infos, bucket, &params, encoding_type.as_ref());
 
         Ok(S3Response::new(output))
     }
@@ -2944,7 +2952,7 @@ mod tests {
         assert_eq!(output.name.as_deref(), Some("demo-bucket"));
         assert_eq!(output.prefix.as_deref(), Some("logs/"));
         assert_eq!(output.continuation_token.as_deref(), Some("start token"));
-        assert_eq!(output.start_after.as_deref(), Some("logs/start after"));
+        assert_eq!(output.start_after.as_deref(), Some("logs/start%20after"));
         assert_eq!(output.next_continuation_token.as_deref(), Some("bmV4dC10b2tlbg=="));
         assert_eq!(output.key_count, Some(2));
         assert_eq!(output.contents.as_ref().map(Vec::len), Some(1));
@@ -3009,10 +3017,10 @@ mod tests {
         );
 
         assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("logs and more/"));
+        assert_eq!(output.prefix.as_deref(), Some("logs%20and%20more/"));
         assert_eq!(output.delimiter.as_deref(), Some("/"));
         assert_eq!(output.continuation_token.as_deref(), Some("opaque token"));
-        assert_eq!(output.start_after.as_deref(), Some("logs and more/start after"));
+        assert_eq!(output.start_after.as_deref(), Some("logs%20and%20more/start%20after"));
         assert_eq!(output.key_count, Some(2));
         assert_eq!(output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
 
