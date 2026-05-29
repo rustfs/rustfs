@@ -388,11 +388,18 @@ impl ObjectInfo {
         use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 
         self.user_defined.keys().any(|key| {
-            rustfs_utils::http::is_encryption_metadata_key(key)
-                || key
-                    .to_ascii_lowercase()
-                    .starts_with("x-minio-internal-server-side-encryption-")
-                || key.eq_ignore_ascii_case("x-minio-internal-encrypted-multipart")
+            let lower = key.to_ascii_lowercase();
+            matches!(
+                lower.as_str(),
+                "x-rustfs-encryption-key"
+                    | "x-rustfs-encryption-algorithm"
+                    | "x-rustfs-encryption-iv"
+                    | "x-rustfs-encryption-key-id"
+                    | "x-rustfs-encryption-context"
+                    | "x-rustfs-encryption-tag"
+            ) || lower.starts_with("x-minio-encryption-")
+                || lower.starts_with("x-minio-internal-server-side-encryption-")
+                || lower == "x-minio-internal-encrypted-multipart"
         }) || self.user_defined.contains_key(SSEC_ALGORITHM_HEADER)
             || self.user_defined.contains_key(SSEC_KEY_HEADER)
             || self.user_defined.contains_key(SSEC_KEY_MD5_HEADER)
