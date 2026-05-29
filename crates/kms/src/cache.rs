@@ -87,11 +87,10 @@ impl KmsCache {
     /// A tuple containing total entries and total misses
     ///
     pub fn stats(&self) -> (u64, u64) {
-        let metadata_stats = (
+        (
             self.key_metadata_cache.entry_count(),
             0u64, // moka doesn't provide miss count directly
-        );
-        metadata_stats
+        )
     }
 }
 
