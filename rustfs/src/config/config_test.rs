@@ -128,10 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn default_credentials_allowed_only_for_loopback_or_explicit_opt_in() {
+    fn default_credentials_allowed_on_all_listeners() {
         let config = Config::new("0.0.0.0:9000", vec!["/tmp/rustfs-vol1".to_string()]);
 
-        assert!(!config.default_credentials_allowed_for_addr("0.0.0.0:9000".parse().unwrap(), false));
+        assert!(config.default_credentials_allowed_for_addr("0.0.0.0:9000".parse().unwrap(), false));
         assert!(config.default_credentials_allowed_for_addr("127.0.0.1:9000".parse().unwrap(), false));
         assert!(config.default_credentials_allowed_for_addr("0.0.0.0:9000".parse().unwrap(), true));
     }

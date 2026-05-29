@@ -179,8 +179,12 @@ impl Config {
         DEFAULT_ACCESS_KEY.eq(&self.access_key) && DEFAULT_SECRET_KEY.eq(&self.secret_key)
     }
 
-    pub fn default_credentials_allowed_for_addr(&self, server_addr: SocketAddr, allow_insecure_defaults: bool) -> bool {
-        !self.is_using_default_credentials() || server_addr.ip().is_loopback() || allow_insecure_defaults
+    /// Default root credentials remain allowed for backward compatibility.
+    ///
+    /// Callers should use [`Config::is_using_default_credentials`] to warn
+    /// operators instead of blocking startup.
+    pub fn default_credentials_allowed_for_addr(&self, _server_addr: SocketAddr, _allow_insecure_defaults: bool) -> bool {
+        true
     }
 
     /// Create Config from Opt
