@@ -96,10 +96,6 @@ impl Cache {
         ret
     }
 
-    pub fn build_user_group_memberships(&self) {
-        self.with_write_lock(|cache| cache.build_user_group_memberships());
-    }
-
     pub fn add_or_update_policy_doc(&self, key: &str, value: &PolicyDoc, t: OffsetDateTime) {
         self.with_write_lock(|cache| cache.add_or_update_policy_doc(key, value, t));
     }
