@@ -105,15 +105,10 @@ fn calculate_space_usage(blocks: u64, bfree: u64, bavail: u64, bsize: u64, path:
 fn should_warn_bavail_greater_than_bfree(path: &Path) -> bool {
     let warned_paths = BAVAIL_GT_BFREE_WARNING_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()));
     let mut warned_paths = match warned_paths.lock() {
-        Ok(warned_paths) => warned_paths,
+        Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if warned_paths.contains(path) {
-        false
-    } else {
-        warned_paths.insert(path.to_path_buf());
-        true
-    }
+    warned_paths.insert(path.to_path_buf())
 }
 
 pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
