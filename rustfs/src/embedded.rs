@@ -55,7 +55,6 @@ use crate::server::{
 };
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
-use rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS;
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
@@ -77,7 +76,7 @@ use rustfs_ecstore::{
 };
 use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
-use rustfs_utils::{get_env_bool, net::parse_and_resolve_address};
+use rustfs_utils::net::parse_and_resolve_address;
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -308,8 +307,7 @@ impl RustFSServerBuilder {
         // Trusted proxies.
         rustfs_trusted_proxies::init();
 
-        // Resolve listen address before credential initialization so unsafe
-        // default credentials can fail before the server binds a listener.
+        // Resolve listen address before endpoint/global initialization.
         let server_addr =
             parse_and_resolve_address(config.address.as_str()).map_err(|e| ServerError::Init(format!("address: {e}")))?;
 
@@ -318,14 +316,6 @@ impl RustFSServerBuilder {
                 "port 0 is not supported in embedded mode because startup requires \
                  a stable listen address and port before endpoint/global initialization. \
                  Use `find_available_port()` to obtain a free port."
-                    .to_string(),
-            ));
-        }
-
-        let allow_insecure_defaults = get_env_bool(ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS, false);
-        if !config.default_credentials_allowed_for_addr(server_addr, allow_insecure_defaults) {
-            return Err(ServerError::Init(
-                "default root credentials are not allowed on non-loopback listeners; set access_key and secret_key to non-default values, bind to loopback, or set RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true for local development only"
                     .to_string(),
             ));
         }

@@ -15,8 +15,8 @@ PRECHECK_AUTO_CLEANUP="${PRECHECK_AUTO_CLEANUP:-true}"
 WAIT_PROBE_MODE="${WAIT_PROBE_MODE:-service}"
 COMPOSE_UP_NO_BUILD="${COMPOSE_UP_NO_BUILD:-false}"
 
-RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfs-cluster-admin}"
-RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfs-cluster-secret}"
+RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfsadmin}"
 RUSTFS_DOCKER_PLATFORM="${RUSTFS_DOCKER_PLATFORM:-}"
 RUSTFS_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK="${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
@@ -30,6 +30,7 @@ FAILOVER_INTERVAL_SECS="${FAILOVER_INTERVAL_SECS:-1}"
 BENCH_WAIT_MODE="${BENCH_WAIT_MODE:-ready}"
 
 BENCH_ENDPOINT="${BENCH_ENDPOINT:-http://127.0.0.1:9000}"
+BENCH_WARP_HOSTS="${BENCH_WARP_HOSTS:-http://127.0.0.1:9000,http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003}"
 BENCH_BUCKET="${BENCH_BUCKET:-rustfs-four-node-bench}"
 BENCH_AUTO_NEW_BUCKET="${BENCH_AUTO_NEW_BUCKET:-true}"
 BENCH_BUCKET_PREFIX="${BENCH_BUCKET_PREFIX:-rustfs-four-node-bench}"
@@ -58,6 +59,7 @@ Options:
   --failover-node <nodeN>       node to stop during failover test (default: node4)
   --obs-endpoint <url>          RUSTFS_OBS_ENDPOINT (default: auto-select by mode)
   --bench-endpoint <url>        benchmark endpoint (default: http://127.0.0.1:9000)
+  --bench-warp-hosts <hosts>    comma-separated warp hosts (default: node1..node4)
   --bench-sizes <sizes>         comma list (default: 1KiB,4KiB,11Mi)
   --bench-concurrency <n>       benchmark concurrency
   --bench-concurrencies <list>  benchmark concurrency list (default: 8,16,32,64,128)
@@ -75,6 +77,7 @@ Environment:
   WAIT_PROBE_MODE (service|ready, default: service)
   WAIT_TIMEOUT_SECS FAILOVER_NODE FAILOVER_WARMUP_SECS FAILOVER_SAMPLE_SECS
   FAILOVER_INTERVAL_SECS BENCH_ENDPOINT BENCH_BUCKET BENCH_CONCURRENCY
+  BENCH_WARP_HOSTS (default: http://127.0.0.1:9000,http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003)
   BENCH_CONCURRENCIES BENCH_DURATION BENCH_SIZES OUT_DIR
   BENCH_WAIT_MODE (ready|service, default: ready)
   BENCH_READY_TIMEOUT_SECS (default: 180)
@@ -585,7 +588,7 @@ run_benchmark() {
       cd "${PROJECT_ROOT}"
       ./scripts/run_object_batch_bench.sh \
         --tool warp \
-        --endpoint "${BENCH_ENDPOINT}" \
+        --endpoint "${BENCH_WARP_HOSTS}" \
         --access-key "${RUSTFS_ACCESS_KEY}" \
         --secret-key "${RUSTFS_SECRET_KEY}" \
         --bucket "${bench_bucket}" \
@@ -662,6 +665,10 @@ parse_args() {
         ;;
       --bench-endpoint)
         BENCH_ENDPOINT="$2"
+        shift 2
+        ;;
+      --bench-warp-hosts)
+        BENCH_WARP_HOSTS="$2"
         shift 2
         ;;
       --bench-sizes)

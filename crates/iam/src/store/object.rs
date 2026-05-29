@@ -1025,14 +1025,7 @@ impl Store for ObjectStore {
     }
 
     async fn load_all(&self, cache: &Cache) -> Result<()> {
-        let policy_docs_snapshot = cache.policy_docs.load();
-        let users_snapshot = cache.users.load();
-        let user_policies_snapshot = cache.user_policies.load();
-        let groups_snapshot = cache.groups.load();
-        let user_group_memberships_snapshot = cache.user_group_memberships.load();
-        let group_policies_snapshot = cache.group_policies.load();
-        let sts_accounts_snapshot = cache.sts_accounts.load();
-        let sts_policies_snapshot = cache.sts_policies.load();
+        let cache_snapshot = cache.snapshot();
         let listed_config_items = self.list_all_iamconfig_items().await?;
 
         let mut policy_docs_cache = CacheEntity::new(get_default_policyes());
@@ -1080,8 +1073,6 @@ impl Store for ObjectStore {
         if let Some(item_name_list) = listed_config_items.get(USERS_LIST_KEY) {
             let mut item_name_list = item_name_list.clone();
 
-            // let mut items_cache = CacheEntity::default();
-
             loop {
                 if item_name_list.len() < 32 {
                     let items = self.load_user_concurrent(&item_name_list, UserType::Reg).await?;
@@ -1112,8 +1103,6 @@ impl Store for ObjectStore {
 
                 item_name_list = item_name_list.split_off(32);
             }
-
-            // cache.users.store(Arc::new(items_cache.update_load_time()));
         }
 
         // groups
@@ -1228,8 +1217,6 @@ impl Store for ObjectStore {
 
             // Merge items_cache to user_items_cache
             user_items_cache.extend(items_cache);
-
-            // cache.users.store(Arc::new(items_cache.update_load_time()));
         }
 
         let mut sts_items_cache = CacheEntity::default();
@@ -1260,191 +1247,29 @@ impl Store for ObjectStore {
             }
         }
 
-        let policy_docs_current = cache.policy_docs.load();
-        let users_current = cache.users.load();
-        let user_policies_current = cache.user_policies.load();
-        let groups_current = cache.groups.load();
-        let user_group_memberships_current = cache.user_group_memberships.load();
-        let group_policies_current = cache.group_policies.load();
-        let sts_accounts_current = cache.sts_accounts.load();
-        let sts_policies_current = cache.sts_policies.load();
-
-        if Cache::ptr_eq(&*policy_docs_snapshot, &*policy_docs_current)
-            && Cache::ptr_eq(&*users_snapshot, &*users_current)
-            && Cache::ptr_eq(&*user_policies_snapshot, &*user_policies_current)
-            && Cache::ptr_eq(&*groups_snapshot, &*groups_current)
-            && Cache::ptr_eq(&*user_group_memberships_snapshot, &*user_group_memberships_current)
-            && Cache::ptr_eq(&*group_policies_snapshot, &*group_policies_current)
-            && Cache::ptr_eq(&*sts_accounts_snapshot, &*sts_accounts_current)
-            && Cache::ptr_eq(&*sts_policies_snapshot, &*sts_policies_current)
-        {
-            cache.policy_docs.store(Arc::new(policy_docs_cache.update_load_time()));
-            if let Some(groups_cache) = groups_cache {
-                cache.groups.store(Arc::new(groups_cache.update_load_time()));
+        cache.with_write_lock(|cache| {
+            if cache.matches_snapshot(&cache_snapshot) {
+                cache.replace_policy_docs(policy_docs_cache);
+                if let Some(groups_cache) = groups_cache {
+                    cache.replace_groups(groups_cache);
+                }
+                if let Some(user_policies_cache) = user_policies_cache {
+                    cache.replace_user_policies(user_policies_cache);
+                }
+                if let Some(group_policies_cache) = group_policies_cache {
+                    cache.replace_group_policies(group_policies_cache);
+                }
+                cache.replace_users(user_items_cache);
+                cache.replace_sts_accounts(sts_items_cache);
+                cache.replace_sts_policies(sts_policies_cache);
+                cache.build_user_group_memberships();
+            } else {
+                warn!("skip IAM full reload cache commit because one or more IAM caches changed during reload");
             }
-            if let Some(user_policies_cache) = user_policies_cache {
-                cache.user_policies.store(Arc::new(user_policies_cache.update_load_time()));
-            }
-            if let Some(group_policies_cache) = group_policies_cache {
-                cache.group_policies.store(Arc::new(group_policies_cache.update_load_time()));
-            }
-            cache.users.store(Arc::new(user_items_cache.update_load_time()));
-            cache.sts_accounts.store(Arc::new(sts_items_cache.update_load_time()));
-            cache.sts_policies.store(Arc::new(sts_policies_cache.update_load_time()));
-            cache.build_user_group_memberships();
-        } else {
-            warn!("skip IAM full reload cache commit because one or more IAM caches changed during reload");
-        }
+        });
 
         Ok(())
     }
-
-    // /// load all and make a new cache.
-    // async fn load_all(&self, cache: &Cache) -> Result<()> {
-    //     let _items = &[
-    //         "policydb/",
-    //         "policies/",
-    //         "groups/",
-    //         "policydb/users/",
-    //         "policydb/groups/",
-    //         "service-accounts/",
-    //         "policydb/sts-users/",
-    //         "sts/",
-    //     ];
-
-    //     let items = self.list_iam_config_items("config/iam/").await?;
-    //     debug!("all iam items: {items:?}");
-
-    //     let (policy_docs, users, user_policies, sts_policies, sts_accounts) = (
-    //         Arc::new(tokio::sync::Mutex::new(CacheEntity::new(Self::get_default_policyes()))),
-    //         Arc::new(tokio::sync::Mutex::new(CacheEntity::default())),
-    //         Arc::new(tokio::sync::Mutex::new(CacheEntity::default())),
-    //         Arc::new(tokio::sync::Mutex::new(CacheEntity::default())),
-    //         Arc::new(tokio::sync::Mutex::new(CacheEntity::default())),
-    //     );
-
-    //     // Read 32 elements at a time
-    //     let iter = items
-    //         .iter()
-    //         .map(|item| item.trim_start_matches("config/iam/"))
-    //         .map(|item| split_path(item, item.starts_with("policydb/")))
-    //         .filter_map(|(list_key, trimmed_item)| {
-    //             debug!("list_key: {list_key}, trimmed_item: {trimmed_item}");
-
-    //             if list_key == "format.json" {
-    //                 return None;
-    //             }
-
-    //             let (policy_docs, users, user_policies, sts_policies, sts_accounts) = (
-    //                 policy_docs.clone(),
-    //                 users.clone(),
-    //                 user_policies.clone(),
-    //                 sts_policies.clone(),
-    //                 sts_accounts.clone(),
-    //             );
-
-    //             Some(async move {
-    //                 match list_key {
-    //                     "policies/" => {
-    //                         let trimmed_item = dir(trimmed_item);
-    //                         let name = trimmed_item.trim_end_matches('/');
-    //                         let policy_doc = self.load_policy(name).await?;
-    //                         policy_docs.lock().await.insert(name.to_owned(), policy_doc);
-    //                     }
-    //                     "users/" => {
-    //                         let name = dir(trimmed_item);
-    //                         if let Some(user) = self.load_user_identity(UserType::Reg, &name).await? {
-    //                             users.lock().await.insert(name.to_owned(), user);
-    //                         };
-    //                     }
-    //                     "groups/" => {}
-    //                     "policydb/users/" | "policydb/groups/" => {
-    //                         let name = trimmed_item.strip_suffix(".json").unwrap_or(trimmed_item);
-    //                         let mapped_policy = self
-    //                             .load_mapped_policy(UserType::Reg, name, list_key == "policydb/groups/")
-    //                             .await?;
-    //                         if !mapped_policy.policies.is_empty() {
-    //                             user_policies.lock().await.insert(name.to_owned(), mapped_policy);
-    //                         }
-    //                     }
-    //                     "service-accounts/" => {
-    //                         let trimmed_item = dir(trimmed_item);
-    //                         let name = trimmed_item.trim_end_matches('/');
-    //                         let Some(user) = self.load_user_identity(UserType::Svc, name).await? else {
-    //                             return Ok(());
-    //                         };
-
-    //                         let parent = user.credentials.parent_user.clone();
-
-    //                         {
-    //                             users.lock().await.insert(name.to_owned(), user);
-    //                         }
-
-    //                         if users.lock().await.get(&parent).is_some() {
-    //                             return Ok(());
-    //                         }
-
-    //                         match self.load_mapped_policy(UserType::Sts, parent.as_str(), false).await {
-    //                             Ok(m) => sts_policies.lock().await.insert(name.to_owned(), m),
-    //                             Err(Error::EcstoreError(e)) if is_err_config_not_found(&e) => return Ok(()),
-    //                             Err(e) => return Err(e),
-    //                         };
-    //                     }
-    //                     "sts/" => {
-    //                         let name = dir(trimmed_item);
-    //                         if let Some(user) = self.load_user_identity(UserType::Sts, &name).await? {
-    //                             warn!("sts_accounts insert {}, user {:?}", name, &user.credentials.access_key);
-    //                             sts_accounts.lock().await.insert(name.to_owned(), user);
-    //                         };
-    //                     }
-    //                     "policydb/sts-users/" => {
-    //                         let name = trimmed_item.strip_suffix(".json").unwrap_or(trimmed_item);
-    //                         let mapped_policy = self.load_mapped_policy(UserType::Sts, name, false).await?;
-    //                         if !mapped_policy.policies.is_empty() {
-    //                             sts_policies.lock().await.insert(name.to_owned(), mapped_policy);
-    //                         }
-    //                     }
-    //                     _ => {}
-    //                 }
-
-    //                 Result::Ok(())
-    //             })
-    //         });
-
-    //     let mut all_futures = Vec::with_capacity(32);
-
-    //     for f in iter {
-    //         all_futures.push(f);
-
-    //         if all_futures.len() == 32 {
-    //             try_join_all(all_futures).await?;
-    //             all_futures = Vec::with_capacity(32);
-    //         }
-    //     }
-
-    //     if !all_futures.is_empty() {
-    //         try_join_all(all_futures).await?;
-    //     }
-
-    //     if let Some(x) = Arc::into_inner(users) {
-    //         cache.users.store(Arc::new(x.into_inner().update_load_time()))
-    //     }
-
-    //     if let Some(x) = Arc::into_inner(policy_docs) {
-    //         cache.policy_docs.store(Arc::new(x.into_inner().update_load_time()))
-    //     }
-    //     if let Some(x) = Arc::into_inner(user_policies) {
-    //         cache.user_policies.store(Arc::new(x.into_inner().update_load_time()))
-    //     }
-    //     if let Some(x) = Arc::into_inner(sts_policies) {
-    //         cache.sts_policies.store(Arc::new(x.into_inner().update_load_time()))
-    //     }
-    //     if let Some(x) = Arc::into_inner(sts_accounts) {
-    //         cache.sts_accounts.store(Arc::new(x.into_inner().update_load_time()))
-    //     }
-
-    //     Ok(())
-    // }
 }
 
 #[cfg(test)]

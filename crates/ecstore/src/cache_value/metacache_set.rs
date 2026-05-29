@@ -442,10 +442,13 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 {
                     finished_fn(&errs).await;
                 }
-                if errs.iter().flatten().any(|err| *err == DiskError::Timeout) {
-                    return Err(DiskError::Timeout);
-                }
-
+                // All remaining readers are either at EOF or failed. Earlier logic
+                // returned Timeout here for even a single stalled drive, despite
+                // `has_err` being within the tolerated drive-failure budget. That
+                // makes small distributed listings fail once healthy quorum readers
+                // reach EOF but one remote walk stream is slow/stalled. Only the
+                // `has_err > opts.disks.len() - opts.min_disks` branch above should
+                // turn tolerated reader failures into request failures.
                 // error!("list_path_raw: at_eof + has_err == readers.len() break {:?}", &errs);
                 break;
             }
@@ -485,6 +488,12 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
         return Err(err);
     }
+
+    // The merge consumer can finish successfully before every producer finishes
+    // (for example after reaching EOF quorum while a tolerated drive is stalled,
+    // or after the requested listing limit is satisfied). Cancel remaining walk
+    // jobs before joining them so list calls do not wait for slow remote streams.
+    cancel_rx.cancel();
 
     let results = join_all(jobs).await;
     let mut job_errs = Vec::new();
@@ -545,16 +554,32 @@ mod tests {
             CancellationToken::new(),
             ListPathRawOptions {
                 disks: vec![None, None],
-                min_disks: 1,
+                min_disks: 2,
                 test_reader_behaviors: vec![TestReaderBehavior::Stall, TestReaderBehavior::Eof],
                 peek_timeout: Some(Duration::from_millis(20)),
                 ..Default::default()
             },
         )
         .await
-        .expect_err("stalled reader should make listing fail explicitly");
+        .expect_err("stalled reader should fail when read quorum cannot be met");
 
         assert_eq!(err, DiskError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_tolerates_stalled_reader_after_quorum_eof() {
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![TestReaderBehavior::Eof, TestReaderBehavior::Eof, TestReaderBehavior::Stall],
+                peek_timeout: Some(Duration::from_millis(20)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("listing should complete when healthy quorum reached EOF and only a tolerated drive stalled");
     }
 
     #[tokio::test]

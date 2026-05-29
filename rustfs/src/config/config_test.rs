@@ -88,6 +88,20 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_tls_inspect_subcommand_parses_tls_path_alias() {
+        let result =
+            Opt::parse_command(["rustfs", "tls", "inspect", "--tls-path", "/tmp/certs"]).expect("tls inspect alias should parse");
+
+        match result {
+            CommandResult::Tls(opts) => match opts.command {
+                TlsCommands::Inspect(inspect) => assert_eq!(inspect.path, "/tmp/certs"),
+            },
+            _ => panic!("expected TLS command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
     fn test_default_console_configuration() {
         // Test that default console configuration is correct
         let args = vec!["rustfs", "/test/volume"];
@@ -125,24 +139,6 @@ mod tests {
         assert_eq!(config.kms_default_key_id, None);
         assert!(!config.buffer_profile_disable);
         assert_eq!(config.buffer_profile, "GeneralPurpose");
-    }
-
-    #[test]
-    fn default_credentials_allowed_only_for_loopback_or_explicit_opt_in() {
-        let config = Config::new("0.0.0.0:9000", vec!["/tmp/rustfs-vol1".to_string()]);
-
-        assert!(!config.default_credentials_allowed_for_addr("0.0.0.0:9000".parse().unwrap(), false));
-        assert!(config.default_credentials_allowed_for_addr("127.0.0.1:9000".parse().unwrap(), false));
-        assert!(config.default_credentials_allowed_for_addr("0.0.0.0:9000".parse().unwrap(), true));
-    }
-
-    #[test]
-    fn custom_credentials_allowed_on_non_loopback() {
-        let mut config = Config::new("0.0.0.0:9000", vec!["/tmp/rustfs-vol1".to_string()]);
-        config.access_key = "custom-access-key".to_string();
-        config.secret_key = "custom-secret-key".to_string();
-
-        assert!(config.default_credentials_allowed_for_addr("0.0.0.0:9000".parse().unwrap(), false));
     }
 
     #[test]
