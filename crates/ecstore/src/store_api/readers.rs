@@ -2853,7 +2853,7 @@ mod tests {
             .expect("find large-range compression block in stored index");
         assert_eq!(original_offsets, (comp_off, uncomp_off));
         assert!(comp_off > DARE_PAYLOAD_SIZE);
-        assert_eq!(uncomp_off <= range.start, true);
+        assert!(uncomp_off <= range.start);
 
         let expected_storage_offset = ((comp_off / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE) as usize;
         let expected_decrypt_skip = comp_off % DARE_PAYLOAD_SIZE;
