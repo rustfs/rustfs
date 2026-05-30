@@ -387,17 +387,21 @@ impl ObjectInfo {
         // Corresponding to the logic in rustfs/src/sse.rs/encryption_material_to_metadata function
         use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 
-        self.user_defined
-            .keys()
-            .any(|key| key.to_lowercase().starts_with("x-minio-encryption-")) // Covers MinIO metadata
-            || self.user_defined.contains_key("x-rustfs-encryption-key") // SSE-S3/SSE-KMS
-            || self.user_defined.contains_key("x-rustfs-encryption-algorithm") // SSE-S3/SSE-KMS
-            || self.user_defined.contains_key("x-rustfs-encryption-iv") // SSE-S3/SSE-KMS
-            || self.user_defined.contains_key("x-amz-server-side-encryption-aws-kms-key-id") // SSE-KMS
-            || self.user_defined.contains_key(SSEC_ALGORITHM_HEADER) // SSE-C
-            || self.user_defined.contains_key(SSEC_KEY_HEADER) // SSE-C
-            || self.user_defined.contains_key(SSEC_KEY_MD5_HEADER) // SSE-C
-            || self.user_defined.contains_key("x-amz-server-side-encryption") // SSE-S3/SSE-KMS/SSE-C
+        self.user_defined.keys().any(|key| {
+            let key = key.to_lowercase();
+            key.starts_with("x-minio-encryption-")
+                || matches!(
+                    key.as_str(),
+                    "x-rustfs-encryption-key"
+                        | "x-rustfs-encryption-algorithm"
+                        | "x-rustfs-encryption-iv"
+                        | "x-amz-server-side-encryption-aws-kms-key-id"
+                        | SSEC_ALGORITHM_HEADER
+                        | SSEC_KEY_HEADER
+                        | SSEC_KEY_MD5_HEADER
+                        | "x-amz-server-side-encryption"
+                )
+        })
     }
 
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
@@ -1245,6 +1249,19 @@ mod tests {
         metadata.into_iter().for_each(|(key, value)| {
             user_defined.insert(key.to_string(), value.to_string());
         });
+
+        let info = ObjectInfo {
+            user_defined,
+            ..Default::default()
+        };
+
+        assert!(info.is_encrypted());
+    }
+
+    #[test]
+    fn is_encrypted_handles_case_insensitive_rustfs_metadata_keys() {
+        let mut user_defined: HashMap<String, String> = HashMap::new();
+        user_defined.insert("X-Rustfs-Encryption-Key".to_string(), "encrypted-key".to_string());
 
         let info = ObjectInfo {
             user_defined,
