@@ -2700,18 +2700,16 @@ impl DiskAPI for LocalDisk {
                 std::io::Write::write_all(&mut f, &new_buf)?;
                 match std::fs::rename(&src, &dst) {
                     Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !src.exists() => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound && !src.exists() => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                         if let Some(parent) = dst.parent() {
                             std::fs::create_dir_all(parent)?;
-                            std::fs::rename(&src, &dst)
-                        } else {
-                            Err(e)
                         }
+                        std::fs::rename(&src, &dst).map_err(to_file_error)?;
+                        Ok(())
                     }
-                    Err(e) => Err(e),
-                }
-                .map_err(to_file_error)?;
+                    Err(err) => Err(to_file_error(err)),
+                }?;
 
                 if let Some(old_dir) = old_data_dir.as_ref()
                     && let Some(ref buf) = has_dst_buf
