@@ -2053,4 +2053,52 @@ identity_openid client_id="existing-client""#,
         assert!(oidc.contains(r#"config_url="https://issuer.example""#));
         assert!(oidc.contains(r#"client_secret="restored-secret""#));
     }
+
+    #[test]
+    fn storage_class_get_target_none_matches_full_export() {
+        rustfs_ecstore::config::init();
+        let mut config = ServerConfig::new();
+        apply_set_directives(
+            &mut config,
+            &parse_config_directives(r#"storage_class standard="EC:4" rrs="EC:2""#, false).expect("parse"),
+        )
+        .expect("apply");
+
+        // Simulate "mc admin config export" (render_full_config)
+        let full_output = String::from_utf8(render_full_config(&config)).expect("utf8");
+
+        // Simulate "mc admin config get storage_class" (target=None, redact=true)
+        let selected_output = String::from_utf8(
+            render_selected_config(
+                &config,
+                &ConfigSelector {
+                    sub_system: "storage_class".to_string(),
+                    target: None,
+                },
+                true,
+            )
+            .expect("render"),
+        )
+        .expect("utf8");
+
+        assert!(
+            full_output.contains("EC:4"),
+            "full export should contain EC:4, got:\n{}",
+            full_output
+        );
+        assert!(
+            selected_output.contains("EC:4"),
+            "selected get should contain EC:4, got:\n{}",
+            selected_output
+        );
+        assert!(
+            selected_output.contains("EC:2"),
+            "selected get should contain EC:2, got:\n{}",
+            selected_output
+        );
+
+        let full_sc_line = full_output.lines().find(|l| l.starts_with("storage_class")).unwrap();
+        let selected_sc_line = selected_output.lines().find(|l| l.starts_with("storage_class")).unwrap();
+        assert_eq!(full_sc_line, selected_sc_line);
+    }
 }

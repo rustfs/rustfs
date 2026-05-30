@@ -2638,4 +2638,84 @@ mod tests {
         assert_eq!(object_info.bucket, crate::disk::RUSTFS_META_BUCKET);
         assert_eq!(object_info.name, "config/test.json");
     }
+
+    #[test]
+    fn test_encode_decode_roundtrip_preserves_storage_class() {
+        use crate::config::STORAGE_CLASS_SUB_SYS;
+
+        // Create a config with custom storage class values
+        let mut cfg = Config::new();
+        let kvs = storage_class_kvs_mut(&mut cfg);
+        kvs.insert("standard".to_string(), "EC:4".to_string());
+        kvs.insert("rrs".to_string(), "EC:2".to_string());
+        kvs.insert("optimize".to_string(), "availability".to_string());
+
+        // Encode to external format (what save_server_config produces)
+        let encoded = encode_server_config_blob(&cfg, None).expect("encode should succeed");
+
+        // Verify the encoded data uses "storageclass" (no underscore)
+        let v: serde_json::Value = serde_json::from_slice(&encoded).expect("should be valid json");
+        assert!(v.get("storageclass").is_some(), "encoded should have 'storageclass' key");
+        assert!(v.get("storage_class").is_none(), "encoded should NOT have 'storage_class' key");
+
+        // Decode back (what load_server_config_from_store produces)
+        let decoded = decode_server_config_blob(&encoded).expect("decode should succeed");
+
+        // Verify the decoded config has "storage_class" (with underscore) subsystem
+        let kvs = decoded
+            .get_value(STORAGE_CLASS_SUB_SYS, crate::config::DEFAULT_DELIMITER)
+            .expect("decoded config should have storage_class subsystem");
+        assert_eq!(kvs.get("standard"), "EC:4", "standard should be EC:4");
+        assert_eq!(kvs.get("rrs"), "EC:2", "rrs should be EC:2");
+        assert_eq!(kvs.get("optimize"), "availability", "optimize should be availability");
+    }
+
+    #[test]
+    fn test_set_then_load_preserves_storage_class_values() {
+        use crate::config::STORAGE_CLASS_SUB_SYS;
+
+        // Step 1: Start with a fresh config (simulates initial server state)
+        let mut cfg = Config::new();
+
+        // Step 2: Apply set directives (simulates "mc admin config set storage_class standard=EC:4 rrs=EC:2")
+        let kvs = cfg
+            .0
+            .entry(STORAGE_CLASS_SUB_SYS.to_string())
+            .or_default()
+            .entry(DEFAULT_DELIMITER.to_string())
+            .or_default();
+        kvs.insert("standard".to_string(), "EC:4".to_string());
+        kvs.insert("rrs".to_string(), "EC:2".to_string());
+        cfg.set_defaults();
+
+        // Step 3: Save (encode to external format)
+        let encoded = encode_server_config_blob(&cfg, None).expect("encode should succeed");
+
+        // Step 4: Load (decode from external format)
+        let loaded = decode_server_config_blob(&encoded).expect("decode should succeed");
+
+        // Step 5: Verify the values are preserved
+        let loaded_kvs = loaded
+            .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("should have storage_class");
+        assert_eq!(loaded_kvs.get("standard"), "EC:4");
+        assert_eq!(loaded_kvs.get("rrs"), "EC:2");
+
+        // Step 6: Verify the subsystem is accessible by name (what render_selected_config does)
+        let targets = loaded.0.get(STORAGE_CLASS_SUB_SYS).expect("storage_class subsystem should exist");
+        let target_kvs = targets.get(DEFAULT_DELIMITER).expect("default target should exist");
+        assert_eq!(target_kvs.get("standard"), "EC:4");
+        assert_eq!(target_kvs.get("rrs"), "EC:2");
+    }
+
+    #[test]
+    fn test_config_unmarshal_fails_on_external_format() {
+        // This verifies that the external "storageclass" format cannot be
+        // mistakenly parsed by Config::unmarshal (which expects internal format).
+        // If unmarshal succeeds, the config would have "storageclass" instead of
+        // "storage_class", causing render_selected_config to fail.
+        let external_json = r#"{"version":"33","storageclass":{"standard":"EC:4","rrs":"EC:2"}}"#;
+        let result = Config::unmarshal(external_json.as_bytes());
+        assert!(result.is_err(), "Config::unmarshal should fail on external format, but got: {:?}", result);
+    }
 }

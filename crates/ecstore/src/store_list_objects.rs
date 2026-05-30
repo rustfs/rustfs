@@ -842,10 +842,6 @@ impl ECStore {
         }
 
         if is_all_not_found(&errs) {
-            if is_all_volume_not_found(&errs) {
-                return Err(StorageError::VolumeNotFound);
-            }
-
             return Ok(Vec::new());
         }
 
