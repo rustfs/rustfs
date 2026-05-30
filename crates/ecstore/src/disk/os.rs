@@ -159,18 +159,22 @@ async fn reliable_rename(
                         if let Some(parent) = dst_file_path.as_ref().parent() {
                             reliable_mkdir_all(parent, base_dir.as_ref()).await?;
                         }
-                        return super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref())
-                            .map_err(|final_err| {
-                                warn!(
-                                    "reliable_rename failed after mkdir. src: {:?}, dst: {:?}, err: {:?}",
-                                    src_file_path.as_ref(), dst_file_path.as_ref(), final_err
-                                );
+                        return super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()).map_err(|final_err| {
+                            warn!(
+                                "reliable_rename failed after mkdir. src: {:?}, dst: {:?}, err: {:?}",
+                                src_file_path.as_ref(),
+                                dst_file_path.as_ref(),
                                 final_err
-                            });
+                            );
+                            final_err
+                        });
                     }
                     warn!(
                         "reliable_rename failed. src: {:?}, dst: {:?}, base_dir: {:?}, err: {:?}",
-                        src_file_path.as_ref(), dst_file_path.as_ref(), base_dir.as_ref(), retry_err
+                        src_file_path.as_ref(),
+                        dst_file_path.as_ref(),
+                        base_dir.as_ref(),
+                        retry_err
                     );
                     return Err(retry_err);
                 }
@@ -186,7 +190,9 @@ async fn reliable_rename(
     super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()).map_err(|e| {
         warn!(
             "reliable_rename failed after mkdir. src: {:?}, dst: {:?}, err: {:?}",
-            src_file_path.as_ref(), dst_file_path.as_ref(), e
+            src_file_path.as_ref(),
+            dst_file_path.as_ref(),
+            e
         );
         e
     })
