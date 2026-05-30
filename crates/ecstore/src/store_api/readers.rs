@@ -1145,6 +1145,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_encryption_material_accepts_case_insensitive_metadata_keys() {
+        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
+            let data_key = [0x24; 32];
+            let base_nonce = [0x14; 12];
+            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+            let metadata = HashMap::from([
+                ("X-Rustfs-Encryption-Key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
+                ("X-Rustfs-Encryption-IV".to_string(), BASE64_STANDARD.encode(base_nonce)),
+            ]);
+            let object_info = ObjectInfo {
+                user_defined: metadata,
+                ..Default::default()
+            };
+            let material = resolve_encryption_material(&object_info, &HeaderMap::new())
+                .await
+                .expect("resolve_encryption_material should accept mixed-case managed metadata");
+
+            assert_eq!(material.key_bytes, data_key);
+            assert_eq!(material.base_nonce, base_nonce);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_get_object_reader_rejects_ssec_read_without_headers() {
         let object_info = ObjectInfo {
             size: 10,
