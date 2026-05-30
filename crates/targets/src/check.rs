@@ -228,8 +228,10 @@ pub async fn check_postgres_server_available(args: &crate::target::postgres::Pos
 
 pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs) -> Result<(), crate::TargetError> {
     use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
-    use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, RequiredAcks, SecurityConfig};
+    use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, RequiredAcks};
     use std::time::Duration;
+
+    args.validate()?;
 
     let map_kafka_error = |err: KafkaError, context: &str| match err {
         KafkaError::Connection(ConnectionError::NoHostReachable) => crate::TargetError::NotConnected,
@@ -249,14 +251,7 @@ pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs
         .with_ack_timeout(Duration::from_secs(5))
         .with_required_acks(acks);
 
-    if args.tls_enable {
-        let mut security = SecurityConfig::new();
-        if !args.tls_ca.is_empty() {
-            security = security.with_ca_cert(args.tls_ca.clone());
-        }
-        if !args.tls_client_cert.is_empty() && !args.tls_client_key.is_empty() {
-            security = security.with_client_cert(args.tls_client_cert.clone(), args.tls_client_key.clone());
-        }
+    if let Some(security) = args.security_config(false)? {
         config = config.with_security(security);
     }
 

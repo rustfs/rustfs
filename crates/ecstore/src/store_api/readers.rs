@@ -19,6 +19,7 @@ use crate::rio::{DecryptReader, Index};
 
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
+const INTERNAL_ENCRYPTION_CONTEXT_HEADER: &str = "x-rustfs-encryption-context";
 const INTERNAL_ENCRYPTION_IV_HEADER: &str = "x-rustfs-encryption-iv";
 const INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER: &str = "x-rustfs-encryption-original-size";
 const SSEC_ORIGINAL_SIZE_HEADER: &str = "x-amz-server-side-encryption-customer-original-size";
@@ -1105,8 +1106,16 @@ fn multipart_part_numbers(parts: &[rustfs_filemeta::ObjectPartInfo]) -> Vec<usiz
     parts.iter().map(|part| part.number).collect()
 }
 
+fn metadata_get<'a>(metadata: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    metadata.get(key).map(String::as_str).or_else(|| {
+        metadata
+            .iter()
+            .find_map(|(candidate, value)| candidate.eq_ignore_ascii_case(key).then_some(value.as_str()))
+    })
+}
+
 async fn resolve_encryption_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
-    if oi.user_defined.contains_key(SSEC_ALGORITHM_HEADER) {
+    if metadata_get(&oi.user_defined, SSEC_ALGORITHM_HEADER).is_some() {
         return resolve_ssec_material(oi, headers);
     }
 
@@ -1118,15 +1127,15 @@ async fn resolve_encryption_material(oi: &ObjectInfo, headers: &HeaderMap<Header
 }
 
 fn contains_managed_encryption_metadata(metadata: &HashMap<String, String>) -> bool {
-    if metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER) {
+    if metadata_get(metadata, INTERNAL_ENCRYPTION_KEY_HEADER).is_some() {
         return true;
     }
 
     #[cfg(feature = "rio-v2")]
     {
-        metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
-            || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
-            || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
+        metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER).is_some()
+            || metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER).is_some()
+            || metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER).is_some()
     }
 
     #[cfg(not(feature = "rio-v2"))]
@@ -1150,12 +1159,12 @@ fn canonical_sse_path(bucket: &str, object: &str) -> String {
 
 #[cfg(feature = "rio-v2")]
 fn managed_sse_domain(metadata: &HashMap<String, String>) -> &'static str {
-    if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
-        || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
-        || matches!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"))
+    if metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER).is_some()
+        || metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER).is_some()
+        || matches!(metadata_get(metadata, "x-amz-server-side-encryption"), Some("aws:kms"))
     {
         "SSE-KMS"
-    } else if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER) {
+    } else if metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER).is_some() {
         "SSE-C"
     } else {
         "SSE-S3"
@@ -1210,24 +1219,23 @@ fn try_unseal_minio_object_key(
     object: &str,
     external_key: [u8; 32],
 ) -> Result<Option<[u8; 32]>> {
-    let Some(algorithm) = metadata.get(MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER) else {
+    let Some(algorithm) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER) else {
         return Ok(None);
     };
     if algorithm != MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM {
         return Ok(None);
     }
 
-    let Some(iv_b64) = metadata.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER) else {
+    let Some(iv_b64) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_IV_HEADER) else {
         return Ok(None);
     };
     let Some(iv) = try_decode_minio_sealing_iv(iv_b64)? else {
         return Ok(None);
     };
 
-    let sealed_key_b64 = metadata
-        .get(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
-        .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
-        .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER));
+    let sealed_key_b64 = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
+        .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
+        .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER));
     let Some(sealed_key_b64) = sealed_key_b64 else {
         return Ok(None);
     };
@@ -1294,11 +1302,9 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
         return Err(Error::other("SSE-C key MD5 mismatch"));
     }
 
-    let stored_md5 = oi
-        .user_defined
-        .get(SSEC_KEY_MD5_HEADER)
-        .ok_or_else(|| Error::other("missing stored SSE-C key md5"))?;
-    if stored_md5 != &expected_md5 {
+    let stored_md5 =
+        metadata_get(&oi.user_defined, SSEC_KEY_MD5_HEADER).ok_or_else(|| Error::other("missing stored SSE-C key md5"))?;
+    if stored_md5 != expected_md5 {
         return Err(Error::other("SSE-C key does not match object metadata"));
     }
 
@@ -1319,29 +1325,19 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
 }
 
 async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap<String, String>) -> Result<EncryptionMaterial> {
-    #[cfg(not(feature = "rio-v2"))]
-    let _ = (bucket, object);
     let normalized_metadata = normalize_managed_metadata(metadata);
-    let encrypted_dek = normalized_metadata
-        .get(INTERNAL_ENCRYPTION_KEY_HEADER)
+    let encrypted_dek = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_KEY_HEADER)
         .ok_or_else(|| Error::other("missing managed encrypted DEK"))?;
     let encrypted_dek = BASE64_STANDARD
         .decode(encrypted_dek)
         .map_err(|e| Error::other(format!("failed to decode managed encrypted DEK: {e}")))?;
 
-    let kms_key_id = normalized_metadata
-        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-        .map(String::as_str)
-        .unwrap_or("default");
+    let kms_key_id = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_KEY_ID_HEADER).unwrap_or("default");
     #[cfg(feature = "rio-v2")]
-    let kms_context = metadata
-        .get(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
+    let kms_context = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_CONTEXT_HEADER)
         .map(|value| {
-            let decoded = BASE64_STANDARD
-                .decode(value)
-                .map_err(|e| Error::other(format!("failed to decode MinIO KMS context: {e}")))?;
-            serde_json::from_slice::<HashMap<String, String>>(&decoded)
-                .map_err(|e| Error::other(format!("failed to parse MinIO KMS context: {e}")))
+            serde_json::from_str::<HashMap<String, String>>(value)
+                .map_err(|e| Error::other(format!("failed to parse managed KMS context: {e}")))
         })
         .transpose()?;
     #[cfg(not(feature = "rio-v2"))]
@@ -1359,7 +1355,7 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
     };
 
     #[cfg(feature = "rio-v2")]
-    if let Some(object_key) = try_unseal_minio_object_key(metadata, bucket, object, decrypted_key)? {
+    if let Some(object_key) = try_unseal_minio_object_key(&normalized_metadata, bucket, object, decrypted_key)? {
         return Ok(EncryptionMaterial {
             key_bytes: object_key,
             base_nonce: [0u8; 12],
@@ -1367,8 +1363,7 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
         });
     }
 
-    let iv_b64 = normalized_metadata
-        .get(INTERNAL_ENCRYPTION_IV_HEADER)
+    let iv_b64 = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_IV_HEADER)
         .ok_or_else(|| Error::other("missing managed encryption IV"))?;
     let iv = BASE64_STANDARD
         .decode(iv_b64)
@@ -1389,34 +1384,33 @@ fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<Str
     #[cfg(feature = "rio-v2")]
     {
         let mut normalized = metadata.clone();
-        if !normalized.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
-            && let Some(value) = metadata
-                .get(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
-                .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER))
-                .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
+        if metadata_get(&normalized, INTERNAL_ENCRYPTION_KEY_HEADER).is_none()
+            && let Some(value) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
+                .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER))
+                .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER))
         {
-            normalized.insert(INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), value.clone());
+            normalized.insert(INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), value.to_string());
         }
 
-        if !normalized.contains_key(INTERNAL_ENCRYPTION_IV_HEADER)
-            && let Some(value) = metadata.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER)
+        if metadata_get(&normalized, INTERNAL_ENCRYPTION_IV_HEADER).is_none()
+            && let Some(value) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_IV_HEADER)
         {
-            normalized.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), value.clone());
+            normalized.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), value.to_string());
         }
 
-        if !normalized.contains_key(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-            && let Some(value) = metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER)
+        if metadata_get(&normalized, INTERNAL_ENCRYPTION_KEY_ID_HEADER).is_none()
+            && let Some(value) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER)
         {
-            normalized.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), value.clone());
+            normalized.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), value.to_string());
         }
 
-        if !normalized.contains_key("x-rustfs-encryption-context")
-            && let Some(value) = metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
+        if metadata_get(&normalized, INTERNAL_ENCRYPTION_CONTEXT_HEADER).is_none()
+            && let Some(value) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
             && let Ok(decoded) = BASE64_STANDARD.decode(value)
             && let Ok(context) = serde_json::from_slice::<HashMap<String, String>>(&decoded)
             && let Ok(encoded) = serde_json::to_string(&context)
         {
-            normalized.insert("x-rustfs-encryption-context".to_string(), encoded);
+            normalized.insert(INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(), encoded);
         }
 
         normalized
@@ -1971,6 +1965,51 @@ mod tests {
         let nonce = Nonce::from([0u8; 12]);
         let ciphertext = cipher.encrypt(&nonce, dek.as_slice()).expect("encrypt managed dek");
         format!("{}:{}", BASE64_STANDARD.encode(nonce), BASE64_STANDARD.encode(ciphertext))
+    }
+
+    #[tokio::test]
+    async fn resolve_managed_material_accepts_case_insensitive_metadata_keys() {
+        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
+            let data_key = [0x24; 32];
+            let base_nonce = [0x14; 12];
+            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+            let metadata = HashMap::from([
+                ("X-Rustfs-Encryption-Key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
+                ("X-Rustfs-Encryption-IV".to_string(), BASE64_STANDARD.encode(base_nonce)),
+            ]);
+
+            let material = resolve_managed_material("", "", &metadata)
+                .await
+                .expect("managed material should resolve mixed-case metadata keys");
+
+            assert_eq!(material.key_bytes, data_key);
+            assert_eq!(material.base_nonce, base_nonce);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_encryption_material_accepts_case_insensitive_metadata_keys() {
+        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
+            let data_key = [0x24; 32];
+            let base_nonce = [0x14; 12];
+            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+            let metadata = HashMap::from([
+                ("X-Rustfs-Encryption-Key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
+                ("X-Rustfs-Encryption-IV".to_string(), BASE64_STANDARD.encode(base_nonce)),
+            ]);
+            let object_info = ObjectInfo {
+                user_defined: metadata,
+                ..Default::default()
+            };
+            let material = resolve_encryption_material(&object_info, &HeaderMap::new())
+                .await
+                .expect("resolve_encryption_material should accept mixed-case managed metadata");
+
+            assert_eq!(material.key_bytes, data_key);
+            assert_eq!(material.base_nonce, base_nonce);
+        })
+        .await;
     }
 
     #[tokio::test]
