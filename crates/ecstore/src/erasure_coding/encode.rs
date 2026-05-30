@@ -384,6 +384,64 @@ mod tests {
         assert!(!committed.lock().unwrap().is_empty());
     }
 
+    /// encode_inline_small: empty reader returns (reader, 0) without writing to any shard.
+    #[tokio::test]
+    async fn encode_inline_small_empty_stream_returns_zero() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let writer = DeferredCommitWriter::new(committed.clone());
+        // 2 data + 2 parity shards, block_size = 16
+        let mut writers = vec![Some(BitrotWriterWrapper::new(
+            CustomWriter::new_tokio_writer(writer),
+            16,
+            HashAlgorithm::HighwayHash256S,
+        ))];
+
+        let erasure = Arc::new(Erasure::new(1, 0, 16));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, 1).await.unwrap();
+
+        assert_eq!(total, 0);
+        // No shutdown was called, so nothing should be committed
+        assert!(committed.lock().unwrap().is_empty());
+    }
+
+    /// encode_inline_small: small payload is encoded into the correct number of shards
+    /// and each writer receives data after shutdown.
+    #[tokio::test]
+    async fn encode_inline_small_payload_writes_all_shards() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
+            .iter()
+            .map(|c| {
+                Some(BitrotWriterWrapper::new(
+                    CustomWriter::new_tokio_writer(DeferredCommitWriter::new(c.clone())),
+                    BLOCK_SIZE / DATA_SHARDS,
+                    HashAlgorithm::HighwayHash256S,
+                ))
+            })
+            .collect();
+
+        let payload = b"hello inline small";
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(payload.to_vec()));
+        let (_reader, total) = erasure
+            .encode_inline_small(reader, &mut writers, DATA_SHARDS)
+            .await
+            .unwrap();
+
+        assert_eq!(total, payload.len());
+        // All shards must have received data (shutdown flushed the bitrot header + shard bytes)
+        for (i, c) in committed.iter().enumerate() {
+            assert!(!c.lock().unwrap().is_empty(), "shard {i} should have received data");
+        }
+    }
+
     #[test]
     fn encode_channel_capacity_never_returns_zero() {
         assert_eq!(encode_channel_capacity(0, 1024), 1);
