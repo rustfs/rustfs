@@ -58,7 +58,7 @@ use rustfs_credentials::Credentials;
 use rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS;
 use rustfs_ecstore::config::com::{delete_config, read_config, read_config_without_migrate, save_config, save_server_config};
 use rustfs_ecstore::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
-use rustfs_ecstore::config::{Config as ServerConfig, DEFAULT_KVS, KV, KVS, get_global_server_config};
+use rustfs_ecstore::config::{Config as ServerConfig, DEFAULT_KVS, KV, KVS, get_global_server_config, set_global_server_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::ListOperations;
@@ -1417,6 +1417,7 @@ impl Operation for SetConfigKVHandler {
         apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, sub_system).await?;
         save_server_config_to_store(&config).await?;
+        set_global_server_config(config.clone());
         save_server_config_history(&body).await?;
         let mut config_applied = false;
         if let Some(sub_system) = sub_system
@@ -1452,6 +1453,7 @@ impl Operation for DelConfigKVHandler {
         apply_delete_directives(&mut config, &directives);
         validate_server_config(&config, sub_system).await?;
         save_server_config_to_store(&config).await?;
+        set_global_server_config(config.clone());
         save_server_config_history(&body).await?;
         let mut config_applied = false;
         if let Some(sub_system) = sub_system
@@ -1550,6 +1552,7 @@ impl Operation for RestoreConfigHistoryKVHandler {
         apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
+        set_global_server_config(config.clone());
         signal_config_snapshot_reload().await;
 
         success_response(false)
@@ -1586,6 +1589,7 @@ impl Operation for SetConfigHandler {
         apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
+        set_global_server_config(config.clone());
         save_server_config_history(&body).await?;
         signal_config_snapshot_reload().await;
 

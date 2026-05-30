@@ -37,11 +37,11 @@ use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 pub static GLOBAL_STORAGE_CLASS: LazyLock<OnceLock<storageclass::Config>> = LazyLock::new(OnceLock::new);
 pub static DEFAULT_KVS: LazyLock<OnceLock<HashMap<String, KVS>>> = LazyLock::new(OnceLock::new);
-pub static GLOBAL_SERVER_CONFIG: LazyLock<OnceLock<Config>> = LazyLock::new(OnceLock::new);
+pub static GLOBAL_SERVER_CONFIG: LazyLock<RwLock<Config>> = LazyLock::new(|| RwLock::new(Config::new()));
 pub static GLOBAL_CONFIG_SYS: LazyLock<ConfigSys> = LazyLock::new(ConfigSys::new);
 
 pub static RUSTFS_CONFIG_PREFIX: &str = "config";
@@ -63,14 +63,20 @@ impl ConfigSys {
 
         lookup_configs(&mut cfg, api).await;
 
-        let _ = GLOBAL_SERVER_CONFIG.set(cfg);
+        set_global_server_config(cfg);
 
         Ok(())
     }
 }
 
 pub fn get_global_server_config() -> Option<Config> {
-    GLOBAL_SERVER_CONFIG.get().cloned()
+    GLOBAL_SERVER_CONFIG.read().ok().map(|guard| guard.clone())
+}
+
+pub fn set_global_server_config(cfg: Config) {
+    if let Ok(mut guard) = GLOBAL_SERVER_CONFIG.write() {
+        *guard = cfg;
+    }
 }
 
 pub async fn init_global_config_sys(api: Arc<ECStore>) -> Result<()> {
@@ -261,4 +267,26 @@ pub fn init() {
 
     // Register all default configurations
     register_default_kvs(kvs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_server_config_set_and_get_roundtrip() {
+        init();
+        let mut cfg = Config::new();
+        let mut kvs = KVS::new();
+        kvs.insert("standard".to_string(), "EC:4".to_string());
+        cfg.0.insert(
+            STORAGE_CLASS_SUB_SYS.to_string(),
+            HashMap::from([("_".to_string(), kvs)]),
+        );
+
+        set_global_server_config(cfg.clone());
+        let loaded = get_global_server_config().expect("global config should be set");
+        let sc_kvs = loaded.get_value(STORAGE_CLASS_SUB_SYS, "_").expect("storage_class should exist");
+        assert_eq!(sc_kvs.get("standard"), "EC:4");
+    }
 }

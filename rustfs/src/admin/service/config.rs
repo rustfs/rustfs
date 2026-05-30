@@ -21,7 +21,7 @@ use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
 use rustfs_ecstore::config::storageclass;
-use rustfs_ecstore::config::{Config as ServerConfig, KVS};
+use rustfs_ecstore::config::{Config as ServerConfig, KVS, set_global_server_config};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
@@ -33,7 +33,7 @@ use s3s::{S3Error, S3ErrorCode, S3Result};
 use url::Url;
 
 pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
-    matches!(sub_system, AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS)
+    matches!(sub_system, STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS)
 }
 
 fn internal_error(message: impl Into<String>) -> S3Error {
@@ -279,9 +279,10 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
         return Err(internal_error("storage layer not initialized"));
     };
 
-    read_config_without_migrate(store)
+    let config = read_config_without_migrate(store)
         .await
         .map_err(|err| internal_error(format!("failed to load server config: {err}")))?;
+    set_global_server_config(config);
     Ok(())
 }
 
@@ -324,7 +325,7 @@ mod tests {
     fn dynamic_config_subsystems_match_runtime_apply_support() {
         assert!(is_dynamic_config_subsystem(AUDIT_WEBHOOK_SUB_SYS));
         assert!(is_dynamic_config_subsystem(AUDIT_MQTT_SUB_SYS));
-        assert!(!is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
+        assert!(is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
         assert!(!is_dynamic_config_subsystem("identity_openid"));
         assert!(!is_dynamic_config_subsystem("notify_webhook"));
     }
