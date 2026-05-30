@@ -585,7 +585,11 @@ async fn load_server_config_from_store() -> S3Result<ServerConfig> {
         .map_err(Into::into)
 }
 
-fn load_active_server_config() -> S3Result<ServerConfig> {
+async fn load_active_server_config() -> S3Result<ServerConfig> {
+    if let Ok(config) = load_server_config_from_store().await {
+        return Ok(config);
+    }
+
     get_global_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))
 }
 
@@ -1383,7 +1387,7 @@ impl Operation for GetConfigKVHandler {
                 .get("key")
                 .ok_or_else(|| s3_error!(InvalidRequest, "missing config key selector"))?,
         )?;
-        let config = load_active_server_config()?;
+        let config = load_active_server_config().await?;
         let payload = render_selected_config(&config, &selector, true)?;
         let (body, content_type) = encode_config_payload(req.uri.path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
         response_with_content_type(StatusCode::OK, body, &content_type)
@@ -1541,7 +1545,6 @@ impl Operation for RestoreConfigHistoryKVHandler {
         apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
-        delete_server_config_history(restore_id).await?;
         signal_config_snapshot_reload().await;
 
         success_response(false)
@@ -1554,7 +1557,7 @@ pub struct GetConfigHandler {}
 impl Operation for GetConfigHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_config_admin_request(&req).await?;
-        let config = load_active_server_config()?;
+        let config = load_active_server_config().await?;
         let payload = render_full_config(&config);
         let (body, content_type) = encode_config_payload(req.uri.path(), &cred.secret_key, payload, TEXT_CONTENT_TYPE)?;
         response_with_content_type(StatusCode::OK, body, &content_type)
@@ -1699,11 +1702,8 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
 
         let exported = String::from_utf8(render_full_config(&original)).expect("utf8 export");
         let mut restored = ServerConfig::new();
-        apply_set_directives(
-            &mut restored,
-            &parse_config_directives(&exported, false).expect("parse exported config"),
-        )
-        .expect("apply restored directives");
+        apply_set_directives(&mut restored, &parse_config_directives(&exported, false).expect("parse exported config"))
+            .expect("apply restored directives");
 
         assert_eq!(render_full_config(&original), render_full_config(&restored));
     }
@@ -1966,7 +1966,7 @@ notify_webhook:beta endpoint="http://beta.example""#,
     }
 
     #[test]
-    fn restore_history_directives_merge_into_existing_config() {
+    fn apply_set_directives_merge_into_existing_config() {
         let mut config = ServerConfig::new();
         apply_set_directives(
             &mut config,
@@ -2014,7 +2014,8 @@ identity_openid client_id="existing-client""#,
                 value: None,
             }],
         }];
-        let err = apply_set_directives(&mut ServerConfig::new(), &missing_value_directives).expect_err("missing value should fail");
+        let err =
+            apply_set_directives(&mut ServerConfig::new(), &missing_value_directives).expect_err("missing value should fail");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
 
         let storage_class = String::from_utf8(

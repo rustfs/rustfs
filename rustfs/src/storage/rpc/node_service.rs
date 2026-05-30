@@ -805,7 +805,8 @@ impl Node for NodeService {
             Some(vars) => vars.value,
             None => HashMap::new(),
         };
-        let signal = vars.get(PEER_RESTSIGNAL).and_then(|value| value.parse::<u64>().ok());
+        let raw_signal = vars.get(PEER_RESTSIGNAL).map(String::as_str);
+        let signal = raw_signal.and_then(|value| value.parse::<u64>().ok());
         let sub_system = vars.get(PEER_RESTSUB_SYS).map(String::as_str).unwrap_or_default();
 
         match signal {
@@ -833,9 +834,13 @@ impl Node for NodeService {
                 success: false,
                 error_info: Some(format!("unsupported service signal: {other}")),
             })),
+            None if raw_signal.is_some() => Ok(Response::new(SignalServiceResponse {
+                success: false,
+                error_info: Some(format!("invalid service signal value: {}", raw_signal.unwrap_or_default())),
+            })),
             None => Ok(Response::new(SignalServiceResponse {
                 success: false,
-                error_info: Some("missing or invalid service signal".to_string()),
+                error_info: Some("missing service signal".to_string()),
             })),
         }
     }
@@ -2505,7 +2510,26 @@ mod tests {
 
         let signal_response = response.unwrap().into_inner();
         assert!(!signal_response.success);
-        assert_eq!(signal_response.error_info.as_deref(), Some("missing or invalid service signal"));
+        assert_eq!(signal_response.error_info.as_deref(), Some("missing service signal"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_rejects_invalid_signal_value() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), "abc".to_string());
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        assert_eq!(signal_response.error_info.as_deref(), Some("invalid service signal value: abc"));
     }
 
     #[tokio::test]
@@ -2589,7 +2613,7 @@ mod tests {
         let signal_response = response.unwrap().into_inner();
         assert!(!signal_response.success);
         let error_info = signal_response.error_info.expect("expected error info");
-        assert!(error_info.contains("storage layer not initialized"));
+        assert!(error_info.contains("unsupported dynamic config subsystem: storage_class"));
     }
 
     fn assert_unimplemented_status<T>(response: Result<Response<T>, Status>, method: &str) {

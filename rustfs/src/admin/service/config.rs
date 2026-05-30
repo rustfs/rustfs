@@ -33,7 +33,7 @@ use s3s::{S3Error, S3ErrorCode, S3Result};
 use url::Url;
 
 pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
-    matches!(sub_system, STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS)
+    matches!(sub_system, AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS)
 }
 
 fn internal_error(message: impl Into<String>) -> S3Error {
@@ -279,7 +279,7 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
         return Err(internal_error("storage layer not initialized"));
     };
 
-    let _config = read_config_without_migrate(store)
+    read_config_without_migrate(store)
         .await
         .map_err(|err| internal_error(format!("failed to load server config: {err}")))?;
     Ok(())
@@ -322,9 +322,9 @@ mod tests {
 
     #[test]
     fn dynamic_config_subsystems_match_runtime_apply_support() {
-        assert!(is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
         assert!(is_dynamic_config_subsystem(AUDIT_WEBHOOK_SUB_SYS));
         assert!(is_dynamic_config_subsystem(AUDIT_MQTT_SUB_SYS));
+        assert!(!is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
         assert!(!is_dynamic_config_subsystem("identity_openid"));
         assert!(!is_dynamic_config_subsystem("notify_webhook"));
     }
