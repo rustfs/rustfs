@@ -279,14 +279,14 @@ mod tests {
         let mut cfg = Config::new();
         let mut kvs = KVS::new();
         kvs.insert("standard".to_string(), "EC:4".to_string());
-        cfg.0.insert(
-            STORAGE_CLASS_SUB_SYS.to_string(),
-            HashMap::from([("_".to_string(), kvs)]),
-        );
+        cfg.0
+            .insert(STORAGE_CLASS_SUB_SYS.to_string(), HashMap::from([("_".to_string(), kvs)]));
 
         set_global_server_config(cfg.clone());
         let loaded = get_global_server_config().expect("global config should be set");
-        let sc_kvs = loaded.get_value(STORAGE_CLASS_SUB_SYS, "_").expect("storage_class should exist");
+        let sc_kvs = loaded
+            .get_value(STORAGE_CLASS_SUB_SYS, "_")
+            .expect("storage_class should exist");
         assert_eq!(sc_kvs.get("standard"), "EC:4");
     }
 }

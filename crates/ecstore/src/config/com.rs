@@ -2702,7 +2702,10 @@ mod tests {
         assert_eq!(loaded_kvs.get("rrs"), "EC:2");
 
         // Step 6: Verify the subsystem is accessible by name (what render_selected_config does)
-        let targets = loaded.0.get(STORAGE_CLASS_SUB_SYS).expect("storage_class subsystem should exist");
+        let targets = loaded
+            .0
+            .get(STORAGE_CLASS_SUB_SYS)
+            .expect("storage_class subsystem should exist");
         let target_kvs = targets.get(DEFAULT_DELIMITER).expect("default target should exist");
         assert_eq!(target_kvs.get("standard"), "EC:4");
         assert_eq!(target_kvs.get("rrs"), "EC:2");

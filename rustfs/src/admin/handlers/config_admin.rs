@@ -2085,11 +2085,7 @@ identity_openid client_id="existing-client""#,
         )
         .expect("utf8");
 
-        assert!(
-            full_output.contains("EC:4"),
-            "full export should contain EC:4, got:\n{}",
-            full_output
-        );
+        assert!(full_output.contains("EC:4"), "full export should contain EC:4, got:\n{}", full_output);
         assert!(
             selected_output.contains("EC:4"),
             "selected get should contain EC:4, got:\n{}",
