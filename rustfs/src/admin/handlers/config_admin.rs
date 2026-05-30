@@ -1059,7 +1059,11 @@ fn config_target_keys(kvs: &KVS) -> Vec<&str> {
     keys
 }
 
-fn discover_env_targets(sub_system: &str, kvs: &KVS) -> Vec<String> {
+fn read_non_empty_env_vars() -> Vec<(String, String)> {
+    env::vars().filter(|(_, value)| !value.is_empty()).collect()
+}
+
+fn discover_env_targets(sub_system: &str, kvs: &KVS, env_vars: &[(String, String)]) -> Vec<String> {
     if !lookup_help_subsystem(sub_system).is_some_and(|metadata| metadata.multiple_targets) {
         return Vec::new();
     }
@@ -1067,10 +1071,7 @@ fn discover_env_targets(sub_system: &str, kvs: &KVS) -> Vec<String> {
     let mut targets = BTreeSet::new();
     for key in config_target_keys(kvs) {
         let prefix = format!("{}_", env_var_name_for_target(sub_system, DEFAULT_DELIMITER, key));
-        for (name, value) in env::vars() {
-            if value.is_empty() {
-                continue;
-            }
+        for (name, _) in env_vars {
             if let Some(target) = name.strip_prefix(&prefix)
                 && !target.is_empty()
             {
@@ -1082,16 +1083,19 @@ fn discover_env_targets(sub_system: &str, kvs: &KVS) -> Vec<String> {
     targets.into_iter().collect()
 }
 
-fn render_env_override_lines(sub_system: &str, target: &str, kvs: &KVS, redact_secrets: bool) -> Vec<String> {
+fn render_env_override_lines(
+    sub_system: &str,
+    target: &str,
+    kvs: &KVS,
+    redact_secrets: bool,
+    env_vars: &[(String, String)],
+) -> Vec<String> {
     let mut lines = Vec::new();
     for key in config_target_keys(kvs) {
         let env_name = env_var_name_for_target(sub_system, target, key);
-        let Ok(value) = env::var(&env_name) else {
+        let Some((_, value)) = env_vars.iter().find(|(name, _)| name == &env_name) else {
             continue;
         };
-        if value.is_empty() {
-            continue;
-        }
         if redact_secrets && is_sensitive_key_name(key) {
             continue;
         }
@@ -1106,13 +1110,14 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
         return Err(s3_error!(InvalidRequest, "config subsystem '{}' not found", selector.sub_system));
     };
 
+    let env_vars = read_non_empty_env_vars();
     let mut lines = Vec::new();
     let mut sorted_targets = targets.iter().collect::<Vec<_>>();
     sorted_targets.sort_by_key(|(lhs, _)| *lhs);
 
     if let Some(target) = selector.target.as_ref() {
         let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().unwrap_or_else(KVS::new);
-        let discovered_targets = discover_env_targets(&selector.sub_system, &default_kvs);
+        let discovered_targets = discover_env_targets(&selector.sub_system, &default_kvs, &env_vars);
         let kvs = if let Some(kvs) = targets.get(target) {
             kvs
         } else if discovered_targets.iter().any(|name| name == target) {
@@ -1126,7 +1131,7 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
             ));
         };
 
-        lines.extend(render_env_override_lines(&selector.sub_system, target, kvs, redact_secrets));
+        lines.extend(render_env_override_lines(&selector.sub_system, target, kvs, redact_secrets, &env_vars));
         if let Some(line) = render_scope_line(&selector.sub_system, target, kvs, redact_secrets) {
             lines.push(line);
         } else if !lines.is_empty() {
@@ -1138,13 +1143,13 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
             .iter()
             .map(|(target, _)| (*target).clone())
             .collect::<BTreeSet<_>>();
-        for target in discover_env_targets(&selector.sub_system, &default_kvs) {
+        for target in discover_env_targets(&selector.sub_system, &default_kvs, &env_vars) {
             target_names.insert(target);
         }
 
         for target in target_names {
             let kvs = targets.get(&target).unwrap_or(&default_kvs);
-            lines.extend(render_env_override_lines(&selector.sub_system, &target, kvs, redact_secrets));
+            lines.extend(render_env_override_lines(&selector.sub_system, &target, kvs, redact_secrets, &env_vars));
             if let Some(line) = render_scope_line(&selector.sub_system, &target, kvs, redact_secrets) {
                 lines.push(line);
             } else if !lines.is_empty() {
