@@ -1219,13 +1219,13 @@ impl LocalDisk {
             }
             InternalBuf::Owned(buf) => {
                 let path = file_path.to_path_buf();
-                let needs_mkdir = path.parent().is_some_and(|p| p != skip_parent);
+                if let Some(parent) = path.parent()
+                    && parent != skip_parent
+                {
+                    os::make_dir_all(parent, skip_parent).await?;
+                }
 
                 tokio::task::spawn_blocking(move || {
-                    if needs_mkdir && let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-
                     let mut f = std::fs::OpenOptions::new()
                         .create(true)
                         .write(true)
@@ -2698,17 +2698,10 @@ impl DiskAPI for LocalDisk {
                     .truncate(true)
                     .open(&src)?;
                 std::io::Write::write_all(&mut f, &new_buf)?;
-                // Try rename first; mkdir + retry only on NotFound (parent dir missing)
-                match std::fs::rename(&src, &dst) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        if let Some(parent) = dst.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::rename(&src, &dst).map_err(to_file_error)?;
-                    }
-                    Err(e) => return Err(to_file_error(e)),
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
                 }
+                std::fs::rename(&src, &dst).map_err(to_file_error)?;
 
                 // Preserve old xl.meta in old data dir
                 if let Some(old_dir) = old_data_dir.as_ref()

@@ -145,42 +145,37 @@ async fn reliable_rename(
     dst_file_path: impl AsRef<Path>,
     base_dir: impl AsRef<Path>,
 ) -> io::Result<()> {
-    // Try rename first; only mkdir on ENOENT from retry (avoids extra stat on happy path)
-    match super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
-        Ok(()) => return Ok(()),
-        // NotFound on first attempt: source already moved — treat as success
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => {}
+    if let Some(parent) = dst_file_path.as_ref().parent()
+        && !file_exists(parent)
+    {
+        reliable_mkdir_all(parent, base_dir.as_ref()).await?;
     }
 
-    // Retry once; if NotFound on retry, parent dir may be missing
-    match super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
-        Ok(()) => Ok(()),
-        Err(retry_err) if retry_err.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = dst_file_path.as_ref().parent() {
-                reliable_mkdir_all(parent, base_dir.as_ref()).await?;
+    let mut i = 0;
+    loop {
+        if let Err(e) = super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
+            if e.kind() == io::ErrorKind::NotFound {
+                break;
             }
-            super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()).map_err(|final_err| {
-                warn!(
-                    "reliable_rename failed after mkdir. src: {:?}, dst: {:?}, err: {:?}",
-                    src_file_path.as_ref(),
-                    dst_file_path.as_ref(),
-                    final_err
-                );
-                final_err
-            })
-        }
-        Err(retry_err) => {
+
+            if i == 0 {
+                i += 1;
+                continue;
+            }
             warn!(
-                "reliable_rename failed. src: {:?}, dst: {:?}, base_dir: {:?}, err: {:?}",
+                "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
                 src_file_path.as_ref(),
                 dst_file_path.as_ref(),
                 base_dir.as_ref(),
-                retry_err
+                e
             );
-            Err(retry_err)
+            return Err(e);
         }
+
+        break;
     }
+
+    Ok(())
 }
 
 pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
