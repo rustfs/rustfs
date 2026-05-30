@@ -389,7 +389,7 @@ mod tests {
     async fn encode_inline_small_empty_stream_returns_zero() {
         let committed = Arc::new(Mutex::new(Vec::new()));
         let writer = DeferredCommitWriter::new(committed.clone());
-        // 2 data + 2 parity shards, block_size = 16
+        // 1 data shard, 0 parity shards, block_size = 16
         let mut writers = vec![Some(BitrotWriterWrapper::new(
             CustomWriter::new_tokio_writer(writer),
             16,
@@ -414,7 +414,9 @@ mod tests {
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
         const BLOCK_SIZE: usize = 64;
 
-        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS)
+            .map(|_| Arc::new(Mutex::new(Vec::new())))
+            .collect();
 
         let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
             .iter()
