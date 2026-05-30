@@ -65,11 +65,12 @@ pub const ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE: &str = "RUSTFS_SCANNER_ALERT_EX
 pub const DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
 
 /// Environment variable that controls how many subfolders trigger scanner alerts.
-/// - Example: `export RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS=50000`
+/// - Example: `export RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS=65538`
 pub const ENV_SCANNER_ALERT_EXCESS_FOLDERS: &str = "RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS";
 
 /// Default subfolder count that triggers scanner alerts.
-pub const DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS: u64 = 50_000;
+/// Allows Proxmox Backup Server's chunk namespace layout.
+pub const DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS: u64 = 65_538;
 
 /// Environment variable that controls whether the scanner sleeps between operations.
 /// When `true` (default), the scanner throttles itself. When `false`, it runs at full speed.
