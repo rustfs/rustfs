@@ -145,57 +145,42 @@ async fn reliable_rename(
     dst_file_path: impl AsRef<Path>,
     base_dir: impl AsRef<Path>,
 ) -> io::Result<()> {
-    // Try rename first; only mkdir on ENOENT (avoids extra stat on happy path)
+    // Try rename first; only mkdir on ENOENT from retry (avoids extra stat on happy path)
     match super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
         Ok(()) => return Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => {
-            // Retry once on transient errors
-            match super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
-                Ok(()) => return Ok(()),
-                Err(retry_err) => {
-                    if retry_err.kind() == io::ErrorKind::NotFound {
-                        // Parent dir likely missing, create it
-                        if let Some(parent) = dst_file_path.as_ref().parent() {
-                            reliable_mkdir_all(parent, base_dir.as_ref()).await?;
-                        }
-                        return super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()).map_err(|final_err| {
-                            warn!(
-                                "reliable_rename failed after mkdir. src: {:?}, dst: {:?}, err: {:?}",
-                                src_file_path.as_ref(),
-                                dst_file_path.as_ref(),
-                                final_err
-                            );
-                            final_err
-                        });
-                    }
-                    warn!(
-                        "reliable_rename failed. src: {:?}, dst: {:?}, base_dir: {:?}, err: {:?}",
-                        src_file_path.as_ref(),
-                        dst_file_path.as_ref(),
-                        base_dir.as_ref(),
-                        retry_err
-                    );
-                    return Err(retry_err);
-                }
+        // NotFound on first attempt: source already moved — treat as success
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {}
+    }
+
+    // Retry once; if NotFound on retry, parent dir may be missing
+    match super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(retry_err) if retry_err.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = dst_file_path.as_ref().parent() {
+                reliable_mkdir_all(parent, base_dir.as_ref()).await?;
             }
+            super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()).map_err(|final_err| {
+                warn!(
+                    "reliable_rename failed after mkdir. src: {:?}, dst: {:?}, err: {:?}",
+                    src_file_path.as_ref(),
+                    dst_file_path.as_ref(),
+                    final_err
+                );
+                final_err
+            })
+        }
+        Err(retry_err) => {
+            warn!(
+                "reliable_rename failed. src: {:?}, dst: {:?}, base_dir: {:?}, err: {:?}",
+                src_file_path.as_ref(),
+                dst_file_path.as_ref(),
+                base_dir.as_ref(),
+                retry_err
+            );
+            Err(retry_err)
         }
     }
-
-    // First attempt returned NotFound — parent dir missing
-    if let Some(parent) = dst_file_path.as_ref().parent() {
-        reliable_mkdir_all(parent, base_dir.as_ref()).await?;
-    }
-
-    super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()).map_err(|e| {
-        warn!(
-            "reliable_rename failed after mkdir. src: {:?}, dst: {:?}, err: {:?}",
-            src_file_path.as_ref(),
-            dst_file_path.as_ref(),
-            e
-        );
-        e
-    })
 }
 
 pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {

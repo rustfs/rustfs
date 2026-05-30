@@ -2698,10 +2698,17 @@ impl DiskAPI for LocalDisk {
                     .truncate(true)
                     .open(&src)?;
                 std::io::Write::write_all(&mut f, &new_buf)?;
-                if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                // Try rename first; mkdir + retry only on NotFound (parent dir missing)
+                match std::fs::rename(&src, &dst) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(parent) = dst.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::rename(&src, &dst).map_err(to_file_error)?;
+                    }
+                    Err(e) => return Err(to_file_error(e)),
                 }
-                std::fs::rename(&src, &dst).map_err(to_file_error)?;
 
                 // Preserve old xl.meta in old data dir
                 if let Some(old_dir) = old_data_dir.as_ref()

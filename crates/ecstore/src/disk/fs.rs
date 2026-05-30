@@ -161,14 +161,19 @@ pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir_all(path.as_ref()).await
 }
 
+fn is_dir_error(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EISDIR)
+        || e.kind() == io::ErrorKind::IsADirectory
+        // macOS/BSD: remove_file on a directory returns EPERM
+        || (cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EPERM))
+}
+
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
     // Try remove_file first; fall back to remove_dir if it's a directory
     match fs::remove_file(path.as_ref()).await {
         Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::EISDIR) || e.kind() == io::ErrorKind::IsADirectory => {
-            fs::remove_dir(path.as_ref()).await
-        }
+        Err(e) if is_dir_error(&e) => fs::remove_dir(path.as_ref()).await,
         Err(e) => Err(e),
     }
 }
@@ -177,9 +182,7 @@ pub async fn remove_all(path: impl AsRef<Path>) -> io::Result<()> {
     // Try remove_file first; fall back to remove_dir_all if it's a directory
     match fs::remove_file(path.as_ref()).await {
         Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::EISDIR) || e.kind() == io::ErrorKind::IsADirectory => {
-            fs::remove_dir_all(path.as_ref()).await
-        }
+        Err(e) if is_dir_error(&e) => fs::remove_dir_all(path.as_ref()).await,
         Err(e) => Err(e),
     }
 }
@@ -189,9 +192,7 @@ pub fn remove_std(path: impl AsRef<Path>) -> io::Result<()> {
     // Try remove_file first; fall back to remove_dir if it's a directory
     match std::fs::remove_file(path.as_ref()) {
         Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::EISDIR) || e.kind() == io::ErrorKind::IsADirectory => {
-            std::fs::remove_dir(path.as_ref())
-        }
+        Err(e) if is_dir_error(&e) => std::fs::remove_dir(path.as_ref()),
         Err(e) => Err(e),
     }
 }
