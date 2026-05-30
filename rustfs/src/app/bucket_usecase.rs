@@ -2022,6 +2022,7 @@ impl DefaultBucketUsecase {
         let ListObjectVersionsInput {
             bucket,
             delimiter,
+            encoding_type,
             key_marker,
             version_id_marker,
             max_keys,
@@ -2029,22 +2030,23 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let ListObjectVersionsParams {
-            prefix,
-            delimiter,
-            key_marker,
-            version_id_marker,
-            max_keys,
-        } = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
+        let params = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
-            .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
+            .list_object_versions(
+                &bucket,
+                &params.prefix,
+                params.key_marker.clone(),
+                params.version_id_marker.clone(),
+                params.delimiter.clone(),
+                params.max_keys,
+            )
             .await
             .map_err(ApiError::from)?;
 
-        let output = build_list_object_versions_output(object_infos, bucket, prefix, delimiter, max_keys);
+        let output = build_list_object_versions_output(object_infos, bucket, &params, encoding_type.as_ref());
 
         Ok(S3Response::new(output))
     }

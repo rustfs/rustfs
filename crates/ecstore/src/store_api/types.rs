@@ -615,11 +615,12 @@ impl ObjectInfo {
         bucket: &str,
         prefix: &str,
         delimiter: Option<String>,
-        after_version_id: Option<Uuid>,
+        after_version_marker: Option<VersionMarker>,
     ) -> Vec<ObjectInfo> {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(entries.entries().len());
         let mut prev_prefix = "";
+        let mut after_version_marker = after_version_marker;
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
@@ -656,12 +657,8 @@ impl ObjectInfo {
                     }
                 };
 
-                let versions = if let Some(vid) = after_version_id {
-                    if let Some(idx) = file_infos.find_version_index(vid) {
-                        &file_infos.versions[idx + 1..]
-                    } else {
-                        &file_infos.versions
-                    }
+                let versions = if let Some(marker) = after_version_marker.take() {
+                    versions_after_marker(&file_infos, marker)
                 } else {
                     &file_infos.versions
                 };
@@ -831,6 +828,23 @@ impl ObjectInfo {
 
         Ok((HashMap::new(), false))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionMarker {
+    Null,
+    Version(Uuid),
+}
+
+fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> &[FileInfo] {
+    let marker_idx = match marker {
+        VersionMarker::Null => file_infos.versions.iter().position(|version| version.version_id.is_none()),
+        VersionMarker::Version(vid) => file_infos.find_version_index(vid),
+    };
+
+    marker_idx
+        .map(|idx| &file_infos.versions[idx + 1..])
+        .unwrap_or(&file_infos.versions)
 }
 
 #[derive(Debug, Default)]
@@ -1075,6 +1089,100 @@ pub struct ObjectInfoOrErr {
 mod tests {
     use super::*;
     use rustfs_filemeta::ReplicationState;
+
+    #[test]
+    fn versions_after_marker_handles_null_version_marker() {
+        let first_version = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let last_version = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let file_infos = rustfs_filemeta::FileInfoVersions {
+            versions: vec![
+                FileInfo {
+                    version_id: Some(first_version),
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: None,
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: Some(last_version),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let versions = versions_after_marker(&file_infos, VersionMarker::Null);
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id, Some(last_version));
+    }
+
+    #[test]
+    fn versions_after_marker_handles_uuid_version_marker() {
+        let first_version = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let last_version = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let file_infos = rustfs_filemeta::FileInfoVersions {
+            versions: vec![
+                FileInfo {
+                    version_id: Some(first_version),
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: None,
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: Some(last_version),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let versions = versions_after_marker(&file_infos, VersionMarker::Version(first_version));
+
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version_id, None);
+        assert_eq!(versions[1].version_id, Some(last_version));
+    }
+
+    #[tokio::test]
+    async fn versions_listing_applies_version_marker_only_to_first_entry() {
+        let metadata = rustfs_filemeta::test_data::create_real_xlmeta().expect("test metadata should be valid");
+        let entries = rustfs_filemeta::MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![
+                Some(rustfs_filemeta::MetaCacheEntry {
+                    name: "obj-a".to_owned(),
+                    metadata: metadata.clone(),
+                    ..Default::default()
+                }),
+                Some(rustfs_filemeta::MetaCacheEntry {
+                    name: "obj-b".to_owned(),
+                    metadata,
+                    ..Default::default()
+                }),
+            ]),
+            ..Default::default()
+        };
+        let marker_version = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+
+        let objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
+            &entries,
+            "bucket",
+            "",
+            None,
+            Some(VersionMarker::Version(marker_version)),
+        )
+        .await;
+
+        let obj_a_count = objects.iter().filter(|object| object.name == "obj-a").count();
+        let obj_b_count = objects.iter().filter(|object| object.name == "obj-b").count();
+
+        assert_eq!(obj_a_count, 2);
+        assert_eq!(obj_b_count, 3);
+        assert_eq!(objects.len(), 5);
+    }
 
     #[test]
     fn get_actual_size_prefers_actual_size_field() {
