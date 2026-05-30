@@ -197,7 +197,7 @@ fn parse_index(
     let (entries, used) = read_varint(body, signed_varint)?;
     body = &body[used..];
 
-    if total_uncompressed < 0 || est_block_uncompressed < 0 || entries < 0 || entries > MAX_INDEX_ENTRIES {
+    if total_uncompressed < 0 || est_block_uncompressed < 0 || !(0..=MAX_INDEX_ENTRIES).contains(&entries) {
         return Err("invalid index totals".to_string());
     }
 
