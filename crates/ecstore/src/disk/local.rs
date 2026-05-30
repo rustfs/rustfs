@@ -1222,10 +1222,8 @@ impl LocalDisk {
                 let needs_mkdir = path.parent().is_some_and(|p| p != skip_parent);
 
                 tokio::task::spawn_blocking(move || {
-                    if needs_mkdir {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
+                    if needs_mkdir && let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
                     }
 
                     let mut f = std::fs::OpenOptions::new()
@@ -2607,15 +2605,15 @@ impl DiskAPI for LocalDisk {
             )
             .await?;
 
-            if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
-                if let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await {
-                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
-                    info!(
-                        "rename all failed src_data_path: {:?}, dst_data_path: {:?}, err: {:?}",
-                        src_data_path, dst_data_path, err
-                    );
-                    return Err(err);
-                }
+            if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
+                && let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await
+            {
+                let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+                info!(
+                    "rename all failed src_data_path: {:?}, dst_data_path: {:?}, err: {:?}",
+                    src_data_path, dst_data_path, err
+                );
+                return Err(err);
             }
 
             if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
@@ -2626,21 +2624,20 @@ impl DiskAPI for LocalDisk {
                 return Err(err);
             }
 
-            if let Some(old_data_dir) = has_old_data_dir {
-                if let Some(dst_buf) = has_dst_buf
-                    && let Err(err) = self
-                        .write_all_private(
-                            dst_volume,
-                            &format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE),
-                            dst_buf.into(),
-                            true,
-                            &skip_parent,
-                        )
-                        .await
-                {
-                    info!("write_all_private failed err: {:?}", err);
-                    return Err(err);
-                }
+            if let Some(old_data_dir) = has_old_data_dir
+                && let Some(dst_buf) = has_dst_buf
+                && let Err(err) = self
+                    .write_all_private(
+                        dst_volume,
+                        &format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE),
+                        dst_buf.into(),
+                        true,
+                        &skip_parent,
+                    )
+                    .await
+            {
+                info!("write_all_private failed err: {:?}", err);
+                return Err(err);
             }
 
             if let Some(src_file_path_parent) = src_file_path.parent() {
@@ -2707,16 +2704,15 @@ impl DiskAPI for LocalDisk {
                 std::fs::rename(&src, &dst).map_err(to_file_error)?;
 
                 // Preserve old xl.meta in old data dir
-                if let Some(old_dir) = old_data_dir.as_ref() {
-                    if let Some(ref buf) = has_dst_buf {
-                        if let Some(parent) = dst.parent() {
-                            let old_path = parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE);
-                            if let Some(old_parent) = old_path.parent() {
-                                let _ = std::fs::create_dir_all(old_parent);
-                            }
-                            let _ = std::fs::write(&old_path, buf);
-                        }
+                if let Some(old_dir) = old_data_dir.as_ref()
+                    && let Some(ref buf) = has_dst_buf
+                    && let Some(parent) = dst.parent()
+                {
+                    let old_path = parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE);
+                    if let Some(old_parent) = old_path.parent() {
+                        let _ = std::fs::create_dir_all(old_parent);
                     }
+                    let _ = std::fs::write(&old_path, buf);
                 }
 
                 Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
