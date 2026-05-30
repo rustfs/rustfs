@@ -182,17 +182,11 @@ impl ECStore {
         Ok(())
     }
 
-    pub(super) async fn delete_prefix(&self, bucket: &str, object: &str) -> Result<()> {
+    pub(super) async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         for pool in self.pools.iter() {
-            pool.delete_object(
-                bucket,
-                object,
-                ObjectOptions {
-                    delete_prefix: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
+            let mut opts = opts.clone();
+            opts.delete_prefix = true;
+            pool.delete_object(bucket, object, opts).await?;
         }
 
         Ok(())

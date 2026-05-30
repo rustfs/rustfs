@@ -1241,7 +1241,8 @@ impl DiskAPI for LocalDiskWrapper {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        self.track_disk_health(
+        self.track_disk_health_with_op(
+            "rename_data",
             || async { self.disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await },
             get_max_timeout_duration(),
         )

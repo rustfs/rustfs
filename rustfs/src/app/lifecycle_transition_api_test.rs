@@ -18,7 +18,7 @@ use crate::storage::ecfs::FS;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
-use http::{Extensions, HeaderMap, Method, Uri};
+use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
 use rustfs_ecstore::{
     bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
@@ -482,6 +482,122 @@ fn build_request<T>(input: T, method: Method) -> S3Request<T> {
 fn streaming_blob_from_bytes(data: &[u8]) -> StreamingBlob {
     let body = Bytes::copy_from_slice(data);
     StreamingBlob::wrap::<_, Infallible>(stream::once(async move { Ok(body) }))
+}
+
+async fn read_object_bytes(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> Vec<u8> {
+    let mut reader = (**ecstore)
+        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("Failed to read object");
+    let mut buf = Vec::new();
+    reader
+        .stream
+        .read_to_end(&mut buf)
+        .await
+        .expect("Failed to drain object reader");
+    buf
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn put_object_if_none_match_existing_object_returns_precondition_failed() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let fs = FS::new();
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let bucket = format!("test-put-if-none-match-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let initial_payload = b"initial conditional put payload";
+    let replacement_payload = b"replacement conditional put payload";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    let initial_input = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .body(Some(streaming_blob_from_bytes(initial_payload)))
+        .content_length(Some(initial_payload.len() as i64))
+        .build()
+        .unwrap();
+    Box::pin(usecase.execute_put_object(&fs, build_request(initial_input, Method::PUT)))
+        .await
+        .expect("Failed to upload initial object through usecase");
+
+    let existing_info = ecstore
+        .get_object_info(bucket.as_str(), object, &ObjectOptions::default())
+        .await
+        .expect("Failed to fetch existing object info");
+    let existing_etag = existing_info.etag.expect("existing object should have an ETag");
+
+    let replacement_input = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .body(Some(streaming_blob_from_bytes(replacement_payload)))
+        .content_length(Some(replacement_payload.len() as i64))
+        .build()
+        .unwrap();
+    let mut req = build_request(replacement_input, Method::PUT);
+    req.headers
+        .insert(IF_NONE_MATCH, HeaderValue::from_str(existing_etag.as_str()).unwrap());
+
+    let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    assert_eq!(
+        read_object_bytes(&ecstore, bucket.as_str(), object).await,
+        initial_payload,
+        "failed conditional PutObject must not overwrite the current object"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn copy_object_if_none_match_existing_destination_returns_precondition_failed() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let src_bucket = format!("test-copy-if-none-match-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let dst_bucket = format!("test-copy-if-none-match-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let src_object = "test/source.txt";
+    let dst_object = "test/destination.txt";
+    let src_payload = b"conditional copy source payload";
+    let dst_payload = b"conditional copy destination payload";
+
+    create_test_bucket(&ecstore, src_bucket.as_str()).await;
+    create_test_bucket(&ecstore, dst_bucket.as_str()).await;
+    let _ = upload_test_object(&ecstore, src_bucket.as_str(), src_object, src_payload).await;
+    let _ = upload_test_object(&ecstore, dst_bucket.as_str(), dst_object, dst_payload).await;
+
+    let dst_info = ecstore
+        .get_object_info(dst_bucket.as_str(), dst_object, &ObjectOptions::default())
+        .await
+        .expect("Failed to fetch destination object info");
+    let dst_etag = dst_info.etag.expect("destination object should have an ETag");
+
+    let copy_input = CopyObjectInput::builder()
+        .copy_source(CopySource::Bucket {
+            bucket: src_bucket.clone().into(),
+            key: src_object.to_string().into(),
+            version_id: None,
+        })
+        .bucket(dst_bucket.clone())
+        .key(dst_object.to_string())
+        .build()
+        .unwrap();
+    let mut req = build_request(copy_input, Method::PUT);
+    req.headers
+        .insert(IF_NONE_MATCH, HeaderValue::from_str(dst_etag.as_str()).unwrap());
+
+    let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    assert_eq!(
+        read_object_bytes(&ecstore, dst_bucket.as_str(), dst_object).await,
+        dst_payload,
+        "failed conditional CopyObject must not overwrite the current destination object"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

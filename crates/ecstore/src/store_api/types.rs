@@ -61,6 +61,7 @@ pub struct ObjectOptions {
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,
     pub no_lock: bool,
+    pub release_reader_lock_after_setup: bool,
 
     pub versioned: bool,
     pub version_suspended: bool,

@@ -679,6 +679,11 @@ fn should_use_existing_delete_replication_info(opts: &ObjectOptions) -> bool {
     opts.version_id.is_some() && !opts.delete_marker
 }
 
+fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
+    opts.http_preconditions = None;
+    opts
+}
+
 fn delete_replication_state_source<'a>(
     opts: &ObjectOptions,
     existing_object_info: Option<&'a ObjectInfo>,
@@ -1812,9 +1817,11 @@ impl DefaultObjectUsecase {
         )
         .await?;
 
-        let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
+        let current_opts: ObjectOptions = internal_object_info_lookup_opts(
+            get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+                .await
+                .map_err(ApiError::from)?,
+        );
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info)?;
@@ -2668,6 +2675,7 @@ impl DefaultObjectUsecase {
             version_id: src_opts.version_id.clone(),
             versioned: src_opts.versioned,
             version_suspended: src_opts.version_suspended,
+            release_reader_lock_after_setup: true,
             ..Default::default()
         };
 
@@ -2685,9 +2693,11 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let current_opts: ObjectOptions = get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
+        let current_opts: ObjectOptions = internal_object_info_lookup_opts(
+            get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
+                .await
+                .map_err(ApiError::from)?,
+        );
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info)?;
@@ -4442,6 +4452,27 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[test]
+    fn internal_object_info_lookup_opts_drops_http_preconditions() {
+        let version_id = Uuid::new_v4().to_string();
+        let opts = ObjectOptions {
+            version_id: Some(version_id.clone()),
+            no_lock: true,
+            http_preconditions: Some(rustfs_ecstore::store_api::HTTPPreconditions {
+                if_none_match: Some("\"etag\"".to_string()),
+                if_match: Some("\"other\"".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let lookup_opts = internal_object_info_lookup_opts(opts);
+
+        assert!(lookup_opts.http_preconditions.is_none());
+        assert_eq!(lookup_opts.version_id.as_deref(), Some(version_id.as_str()));
+        assert!(lookup_opts.no_lock);
     }
 
     #[tokio::test]

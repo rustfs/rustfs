@@ -1148,7 +1148,8 @@ impl DiskAPI for RemoteDisk {
     ) -> Result<RenameDataResp> {
         info!("rename_data {}/{}/{}/{}", self.addr, self.endpoint.to_string(), dst_volume, dst_path);
 
-        self.execute_with_timeout(
+        self.execute_with_timeout_for_op(
+            "rename_data",
             || async {
                 let file_info = serde_json::to_string(&fi)?;
                 let mut client = self
