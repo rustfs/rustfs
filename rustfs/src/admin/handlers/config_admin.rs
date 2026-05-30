@@ -1426,6 +1426,7 @@ impl Operation for DelConfigKVHandler {
         apply_delete_directives(&mut config, &directives);
         validate_server_config(&config, sub_system).await?;
         save_server_config_to_store(&config).await?;
+        save_server_config_history(&body).await?;
         let mut config_applied = false;
         if let Some(sub_system) = sub_system
             && is_dynamic_config_subsystem(sub_system)
@@ -1519,7 +1520,7 @@ impl Operation for RestoreConfigHistoryKVHandler {
         }
         validate_config_directives(&directives)?;
 
-        let mut config = load_server_config_from_store().await?;
+        let mut config = ServerConfig::new();
         apply_set_directives(&mut config, &directives);
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;

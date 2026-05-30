@@ -286,11 +286,31 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
 }
 
 pub async fn signal_dynamic_config_reload(sub_system: &str) {
-    let _ = sub_system;
+    if !is_dynamic_config_subsystem(sub_system) {
+        return;
+    }
+
+    let Some(notification_sys) = get_global_notification_sys() else {
+        return;
+    };
+
+    for failure in notification_sys.reload_dynamic_config(sub_system).await {
+        if let Some(err) = failure.err {
+            tracing::warn!("peer {} dynamic config reload for {} failed: {}", failure.host, sub_system, err);
+        }
+    }
 }
 
 pub async fn signal_config_snapshot_reload() {
-    let _ = get_global_notification_sys();
+    let Some(notification_sys) = get_global_notification_sys() else {
+        return;
+    };
+
+    for failure in notification_sys.refresh_config_snapshot().await {
+        if let Some(err) = failure.err {
+            tracing::warn!("peer config snapshot refresh failed for {}: {}", failure.host, err);
+        }
+    }
 }
 
 #[cfg(test)]
