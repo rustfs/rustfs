@@ -903,7 +903,10 @@ impl ObjectIO for SetDisks {
             let use_fast_path = is_inline_buffer && data.size() <= fi.erasure.block_size as i64;
 
             let (reader, w_size) = if use_fast_path {
-                match Arc::new(erasure).encode_inline_small(stream, &mut writers, write_quorum).await {
+                match Arc::new(erasure)
+                    .encode_inline_small(stream, &mut writers, write_quorum)
+                    .await
+                {
                     Ok((r, w)) => (r, w),
                     Err(e) => {
                         error!("encode_inline_small err {:?}", e);
@@ -1045,6 +1048,10 @@ impl ObjectIO for SetDisks {
             Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
         }
         .await;
+
+        if let Err(err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
+            warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+        }
 
         result
     }

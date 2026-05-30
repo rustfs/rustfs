@@ -2567,7 +2567,9 @@ impl DiskAPI for LocalDisk {
                 Ok(res) => Some(res),
                 Err(e) => {
                     let e: DiskError = to_file_error(e).into();
-                    if e != DiskError::FileNotFound { return Err(e); }
+                    if e != DiskError::FileNotFound {
+                        return Err(e);
+                    }
                     None
                 }
             };
@@ -2596,13 +2598,22 @@ impl DiskAPI for LocalDisk {
             let new_dst_buf = xlmeta.marshal_msg()?;
 
             let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
-            self.write_all_private(src_volume, &format!("{}/{}", &src_path, STORAGE_FORMAT_FILE), new_dst_buf.into(), true, src_file_parent)
-                .await?;
+            self.write_all_private(
+                src_volume,
+                &format!("{}/{}", &src_path, STORAGE_FORMAT_FILE),
+                new_dst_buf.into(),
+                true,
+                src_file_parent,
+            )
+            .await?;
 
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
                 if let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await {
                     let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
-                    info!("rename all failed src_data_path: {:?}, dst_data_path: {:?}, err: {:?}", src_data_path, dst_data_path, err);
+                    info!(
+                        "rename all failed src_data_path: {:?}, dst_data_path: {:?}, err: {:?}",
+                        src_data_path, dst_data_path, err
+                    );
                     return Err(err);
                 }
             }
@@ -2618,7 +2629,13 @@ impl DiskAPI for LocalDisk {
             if let Some(old_data_dir) = has_old_data_dir {
                 if let Some(dst_buf) = has_dst_buf
                     && let Err(err) = self
-                        .write_all_private(dst_volume, &format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE), dst_buf.into(), true, &skip_parent)
+                        .write_all_private(
+                            dst_volume,
+                            &format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE),
+                            dst_buf.into(),
+                            true,
+                            &skip_parent,
+                        )
                         .await
                 {
                     info!("write_all_private failed err: {:?}", err);
@@ -2630,11 +2647,16 @@ impl DiskAPI for LocalDisk {
                 if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
                     let _ = remove_std(src_file_path_parent);
                 } else {
-                    let _ = self.delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false).await;
+                    let _ = self
+                        .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)
+                        .await;
                 }
             }
 
-            Ok(RenameDataResp { old_data_dir: None, sign: None })
+            Ok(RenameDataResp {
+                old_data_dir: has_old_data_dir,
+                sign: None,
+            })
         } else {
             // Inline: merge read + parse + write + rename into single spawn_blocking
             let src = src_file_path.clone();
@@ -2673,7 +2695,11 @@ impl DiskAPI for LocalDisk {
                 if let Some(parent) = src.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&src)?;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&src)?;
                 std::io::Write::write_all(&mut f, &new_buf)?;
                 if let Some(parent) = dst.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -2705,7 +2731,10 @@ impl DiskAPI for LocalDisk {
                 let _ = remove_std(parent);
             }
 
-            Ok(RenameDataResp { old_data_dir, sign: None })
+            Ok(RenameDataResp {
+                old_data_dir,
+                sign: None,
+            })
         }
     }
 
