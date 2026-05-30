@@ -648,7 +648,7 @@ fn history_restore_id_from_name(name: &str) -> Option<String> {
 }
 
 fn trim_history_entries(mut entries: Vec<ConfigHistoryEntry>, count: Option<usize>) -> Vec<ConfigHistoryEntry> {
-    entries.sort_by(|lhs, rhs| lhs.create_time.cmp(&rhs.create_time));
+    entries.sort_by_key(|lhs| lhs.create_time);
 
     if let Some(count) = count
         && entries.len() > count
@@ -1087,7 +1087,7 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
 
     let mut lines = Vec::new();
     let mut sorted_targets = targets.iter().collect::<Vec<_>>();
-    sorted_targets.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    sorted_targets.sort_by_key(|(lhs, _)| *lhs);
 
     if let Some(target) = selector.target.as_ref() {
         let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().unwrap_or_else(KVS::new);
@@ -1137,12 +1137,12 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
 
 fn render_full_config(config: &ServerConfig) -> Vec<u8> {
     let mut subsystems = config.0.iter().collect::<Vec<_>>();
-    subsystems.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    subsystems.sort_by_key(|(lhs, _)| *lhs);
 
     let mut lines = Vec::new();
     for (sub_system, targets) in subsystems {
         let mut sorted_targets = targets.iter().collect::<Vec<_>>();
-        sorted_targets.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        sorted_targets.sort_by_key(|(lhs, _)| *lhs);
 
         for (target, kvs) in sorted_targets {
             if let Some(line) = render_scope_line(sub_system, target, kvs, false) {

@@ -27,9 +27,8 @@ mod console_test;
 mod route_registration_test;
 
 use handlers::{
-    audit, bucket_meta, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools, profile_admin, quota,
-    rebalance, replication, site_replication, sts, system, tier, tls_debug, user,
-    config_admin,
+    audit, bucket_meta, config_admin, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools,
+    profile_admin, quota, rebalance, replication, site_replication, sts, system, tier, tls_debug, user,
 };
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;
