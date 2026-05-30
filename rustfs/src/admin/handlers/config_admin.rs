@@ -924,21 +924,38 @@ fn set_kvs_value(kvs: &mut KVS, key: &str, value: String) {
 
 fn is_sensitive_key_name(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
-    normalized.contains("secret") || normalized.contains("password") || normalized == "token" || normalized.ends_with("_token")
+    normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized == "token"
+        || normalized.ends_with("_token")
+        || normalized == "client_key"
+        || normalized.ends_with("_client_key")
+        || normalized == "tls_client_key"
+        || normalized.ends_with("_tls_client_key")
+        || normalized == "private_key"
+        || normalized.ends_with("_private_key")
 }
 
-fn apply_set_directives(config: &mut ServerConfig, directives: &[ConfigDirective]) {
+fn apply_set_directives(config: &mut ServerConfig, directives: &[ConfigDirective]) -> S3Result<()> {
     for directive in directives {
         let targets = config.0.entry(directive.sub_system.clone()).or_default();
         let kvs = targets.entry(directive.target.clone()).or_default();
 
         for entry in &directive.entries {
-            let value = entry.value.clone().unwrap_or_default();
+            let value = entry.value.clone().ok_or_else(|| {
+                s3_error!(
+                    InvalidRequest,
+                    "config key '{}' in subsystem '{}' is missing a value",
+                    entry.key,
+                    directive.sub_system
+                )
+            })?;
             set_kvs_value(kvs, &entry.key, value);
         }
     }
 
     config.set_defaults();
+    Ok(())
 }
 
 fn apply_delete_directives(config: &mut ServerConfig, directives: &[ConfigDirective]) {
@@ -1388,7 +1405,7 @@ impl Operation for SetConfigKVHandler {
 
         let sub_system = config_update_sub_system(&directives)?;
         let mut config = load_server_config_from_store().await?;
-        apply_set_directives(&mut config, &directives);
+        apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, sub_system).await?;
         save_server_config_to_store(&config).await?;
         save_server_config_history(&body).await?;
@@ -1521,7 +1538,7 @@ impl Operation for RestoreConfigHistoryKVHandler {
         validate_config_directives(&directives)?;
 
         let mut config = ServerConfig::new();
-        apply_set_directives(&mut config, &directives);
+        apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
         delete_server_config_history(restore_id).await?;
@@ -1558,7 +1575,7 @@ impl Operation for SetConfigHandler {
         validate_config_directives(&directives)?;
 
         let mut config = ServerConfig::new();
-        apply_set_directives(&mut config, &directives);
+        apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
         save_server_config_history(&body).await?;
@@ -1630,7 +1647,7 @@ mod tests {
             false,
         )
         .expect("parse directives");
-        apply_set_directives(&mut config, &directives);
+        apply_set_directives(&mut config, &directives).expect("apply directives");
 
         let rendered = String::from_utf8(
             render_selected_config(
@@ -1677,11 +1694,16 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
                 false,
             )
             .expect("parse directives"),
-        );
+        )
+        .expect("apply original directives");
 
         let exported = String::from_utf8(render_full_config(&original)).expect("utf8 export");
         let mut restored = ServerConfig::new();
-        apply_set_directives(&mut restored, &parse_config_directives(&exported, false).expect("parse exported config"));
+        apply_set_directives(
+            &mut restored,
+            &parse_config_directives(&exported, false).expect("parse exported config"),
+        )
+        .expect("apply restored directives");
 
         assert_eq!(render_full_config(&original), render_full_config(&restored));
     }
@@ -1778,7 +1800,8 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
                     &mut config,
                     &parse_config_directives(r#"notify_webhook:primary endpoint="http://file.example""#, false)
                         .expect("parse directives"),
-                );
+                )
+                .expect("apply directives");
 
                 let rendered = String::from_utf8(
                     render_selected_config(
@@ -1858,7 +1881,8 @@ notify_webhook:beta endpoint="http://beta.example""#,
                     false,
                 )
                 .expect("parse directives"),
-            );
+            )
+            .expect("apply directives");
 
             let rendered = String::from_utf8(
                 render_selected_config(
@@ -1952,14 +1976,46 @@ identity_openid client_id="existing-client""#,
                 false,
             )
             .expect("parse initial directives"),
-        );
+        )
+        .expect("apply initial directives");
 
         let history_directives = parse_config_directives(
             r#"identity_openid config_url="https://issuer.example" client_secret="restored-secret""#,
             false,
         )
         .expect("parse history directives");
-        apply_set_directives(&mut config, &history_directives);
+        apply_set_directives(&mut config, &history_directives).expect("apply history directives");
+
+        let mut webhook = ServerConfig::new();
+        apply_set_directives(
+            &mut webhook,
+            &parse_config_directives(r#"notify_webhook client_key="s3cr3t-key""#, false).expect("parse client key directives"),
+        )
+        .expect("apply client key directives");
+        let webhook_rendered = String::from_utf8(
+            render_selected_config(
+                &webhook,
+                &ConfigSelector {
+                    sub_system: "notify_webhook".to_string(),
+                    target: Some(DEFAULT_DELIMITER.to_string()),
+                },
+                true,
+            )
+            .expect("render webhook config"),
+        )
+        .expect("utf8");
+        assert!(webhook_rendered.contains(r#"client_key="*redacted*""#));
+
+        let missing_value_directives = vec![ConfigDirective {
+            sub_system: "identity_openid".to_string(),
+            target: DEFAULT_DELIMITER.to_string(),
+            entries: vec![ConfigEntry {
+                key: "client_secret".to_string(),
+                value: None,
+            }],
+        }];
+        let err = apply_set_directives(&mut ServerConfig::new(), &missing_value_directives).expect_err("missing value should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
 
         let storage_class = String::from_utf8(
             render_selected_config(
