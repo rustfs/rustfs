@@ -299,8 +299,28 @@ mod tests {
     use super::*;
     use crate::{
         TargetError,
-        target::{TargetType, mysql::MySqlArgs},
+        target::{TargetType, kafka::KafkaArgs, mysql::MySqlArgs},
     };
+
+    fn kafka_args() -> KafkaArgs {
+        KafkaArgs {
+            enable: true,
+            brokers: vec!["127.0.0.1:9092".to_string()],
+            topic: "rustfs-events".to_string(),
+            acks: 1,
+            tls_enable: false,
+            tls_ca: String::new(),
+            tls_client_cert: String::new(),
+            tls_client_key: String::new(),
+            sasl_enable: false,
+            sasl_mechanism: String::new(),
+            sasl_username: String::new(),
+            sasl_password: String::new(),
+            queue_dir: String::new(),
+            queue_limit: 100,
+            target_type: TargetType::NotifyEvent,
+        }
+    }
 
     fn mysql_args() -> MySqlArgs {
         MySqlArgs {
@@ -315,6 +335,24 @@ mod tests {
             queue_limit: 100,
             max_open_connections: 2,
             target_type: TargetType::NotifyEvent,
+        }
+    }
+
+    #[test]
+    fn check_kafka_broker_available_rejects_sasl_without_tls_before_connecting() {
+        let mut args = kafka_args();
+        args.sasl_enable = true;
+        args.sasl_username = "user".to_string();
+        args.sasl_password = "secret".to_string();
+
+        let err = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(check_kafka_broker_available(&args))
+            .expect_err("SASL without TLS should fail before opening a network connection");
+
+        match err {
+            TargetError::Configuration(msg) => assert!(msg.contains("requires tls_enable")),
+            other => panic!("expected configuration error, got {other:?}"),
         }
     }
 
