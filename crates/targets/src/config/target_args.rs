@@ -73,7 +73,7 @@ fn parse_kafka_sasl_enable(config: &KVS, has_sasl_fields: bool) -> Result<bool, 
     match config.lookup(KAFKA_SASL_ENABLE) {
         Some(value) => {
             if value.trim().is_empty() {
-                return Ok(false);
+                return Ok(has_sasl_fields);
             }
             parse_target_bool(Some(value.as_str()))
                 .ok_or_else(|| TargetError::Configuration(format!("Invalid Kafka {KAFKA_SASL_ENABLE} boolean value: {value}")))
@@ -799,6 +799,21 @@ mod tests {
         assert_eq!(args.sasl_mechanism, KAFKA_SASL_PLAIN);
         assert_eq!(args.sasl_username, "user");
         assert_eq!(args.sasl_password, "secret");
+    }
+
+    #[test]
+    fn build_kafka_args_infers_sasl_enable_when_enable_is_blank() {
+        let mut config = kafka_base_config();
+        config.insert(KAFKA_TLS_ENABLE.to_string(), "on".to_string());
+        config.insert(KAFKA_SASL_ENABLE.to_string(), "".to_string());
+        config.insert(KAFKA_SASL_USERNAME.to_string(), "user".to_string());
+        config.insert(KAFKA_SASL_PASSWORD.to_string(), "secret".to_string());
+
+        let args =
+            build_kafka_args(&config, "", TargetType::NotifyEvent).expect("blank sasl_enable should infer from SASL fields");
+
+        assert!(args.sasl_enable);
+        assert_eq!(args.sasl_mechanism, KAFKA_SASL_PLAIN);
     }
 
     #[test]
