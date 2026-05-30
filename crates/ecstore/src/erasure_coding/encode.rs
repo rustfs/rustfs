@@ -414,9 +414,7 @@ mod tests {
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
         const BLOCK_SIZE: usize = 64;
 
-        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS)
-            .map(|_| Arc::new(Mutex::new(Vec::new())))
-            .collect();
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
 
         let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
             .iter()
@@ -432,10 +430,7 @@ mod tests {
         let payload = b"hello inline small";
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
         let reader = tokio::io::BufReader::new(std::io::Cursor::new(payload.to_vec()));
-        let (_reader, total) = erasure
-            .encode_inline_small(reader, &mut writers, DATA_SHARDS)
-            .await
-            .unwrap();
+        let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, DATA_SHARDS).await.unwrap();
 
         assert_eq!(total, payload.len());
         // All shards must have received data (shutdown flushed the bitrot header + shard bytes)

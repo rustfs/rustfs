@@ -164,7 +164,7 @@ pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
 fn is_dir_error(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EISDIR)
         || e.kind() == io::ErrorKind::IsADirectory
-        // macOS/BSD: remove_file on a directory returns EPERM
+        // macOS: remove_file on a directory returns EPERM
         || (cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EPERM))
 }
 
