@@ -2698,21 +2698,30 @@ impl DiskAPI for LocalDisk {
                     .truncate(true)
                     .open(&src)?;
                 std::io::Write::write_all(&mut f, &new_buf)?;
-                if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                match std::fs::rename(&src, &dst) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !src.exists() => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(parent) = dst.parent() {
+                            std::fs::create_dir_all(parent)?;
+                            std::fs::rename(&src, &dst)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                    Err(e) => Err(e),
                 }
-                std::fs::rename(&src, &dst).map_err(to_file_error)?;
+                .map_err(to_file_error)?;
 
-                // Preserve old xl.meta in old data dir
                 if let Some(old_dir) = old_data_dir.as_ref()
                     && let Some(ref buf) = has_dst_buf
-                    && let Some(parent) = dst.parent()
+                    && let Some(dst_parent) = dst.parent()
                 {
-                    let old_path = parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE);
+                    let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE);
                     if let Some(old_parent) = old_path.parent() {
-                        let _ = std::fs::create_dir_all(old_parent);
+                        std::fs::create_dir_all(old_parent)?;
                     }
-                    let _ = std::fs::write(&old_path, buf);
+                    std::fs::write(&old_path, buf).map_err(to_file_error)?;
                 }
 
                 Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
