@@ -2613,7 +2613,7 @@ mod tests {
         let signal_response = response.unwrap().into_inner();
         assert!(!signal_response.success);
         let error_info = signal_response.error_info.expect("expected error info");
-        assert!(error_info.contains("unsupported dynamic config subsystem: storage_class"));
+        assert!(error_info.contains("storage layer not initialized"));
     }
 
     fn assert_unimplemented_status<T>(response: Result<Response<T>, Status>, method: &str) {
