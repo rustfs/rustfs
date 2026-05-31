@@ -436,7 +436,7 @@ impl DataUsageCache {
             self.delete_recursive(&candidate);
             self.replace_hashed(&candidate, &None, &flat);
 
-            remove -= removing;
+            remove = remove.saturating_sub(removing);
             leaves.remove(0);
         }
     }
@@ -869,15 +869,14 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec
         Some(e) => e,
         None => return,
     };
-    if !e.children.is_empty() {
+    if e.children.is_empty() {
+        let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
+        leaves.push(Inner {
+            objects: sz.objects,
+            path: path.clone(),
+        });
         return;
     }
-
-    let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
-    leaves.push(Inner {
-        objects: sz.objects,
-        path: path.clone(),
-    });
     for ch in e.children.iter() {
         add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
     }
@@ -1175,6 +1174,95 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    // --- Tests for `add` function (bug #1: logic inversion) ---
+
+    /// Build a small tree: root -> child1 (leaf), child2 -> grandchild (leaf).
+    /// Returns (cache, root_hash).
+    fn build_test_tree() -> (DataUsageCache, DataUsageHash) {
+        let root = hash_path("bucket");
+        let c1 = hash_path("bucket/a");
+        let c2 = hash_path("bucket/b");
+        let gc = hash_path("bucket/b/c");
+
+        let mut cache = DataUsageCache::default();
+        cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &c1,
+            &Some(root.clone()),
+            &DataUsageEntry { objects: 1, size: 10, ..Default::default() },
+        );
+        cache.replace_hashed(
+            &c2,
+            &Some(root.clone()),
+            &DataUsageEntry { objects: 2, size: 20, ..Default::default() },
+        );
+        cache.replace_hashed(
+            &gc,
+            &Some(c2.clone()),
+            &DataUsageEntry { objects: 3, size: 30, ..Default::default() },
+        );
+        (cache, root)
+    }
+
+    #[test]
+    fn test_add_collects_all_leaves_from_subtree() {
+        // Calling `add` on the root should recurse into children and collect leaf nodes.
+        let (cache, root) = build_test_tree();
+        let mut leaves = Vec::new();
+        add(&cache, &root, &mut leaves);
+
+        let mut paths: Vec<String> = leaves.iter().map(|l| l.path.key()).collect();
+        paths.sort();
+        // Leaves are "bucket/a" (objects=1) and "bucket/b/c" (objects=3).
+        assert_eq!(paths.len(), 2, "add() should find both leaf nodes");
+        assert!(paths.contains(&hash_path("bucket/a").key()));
+        assert!(paths.contains(&hash_path("bucket/b/c").key()));
+    }
+
+    #[test]
+    fn test_add_returns_empty_for_missing_path() {
+        let cache = DataUsageCache::default();
+        let mut leaves = Vec::new();
+        add(&cache, &hash_path("nonexistent"), &mut leaves);
+        assert!(leaves.is_empty());
+    }
+
+    #[test]
+    fn test_add_returns_single_leaf_for_leaf_node() {
+        let mut cache = DataUsageCache::default();
+        let h = hash_path("single-leaf");
+        cache.replace_hashed(&h, &None, &DataUsageEntry { objects: 5, size: 50, ..Default::default() });
+
+        let mut leaves = Vec::new();
+        add(&cache, &h, &mut leaves);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].objects, 5);
+    }
+
+    // --- Tests for `reduce_children_of` (bug #2: usize underflow) ---
+
+    #[test]
+    fn test_reduce_children_of_compacts_leaves() {
+        // Build tree with more children than limit, then compact.
+        let (mut cache, root) = build_test_tree();
+        // total_children_rec("bucket") = 2 direct children + 1 grandchild = 3
+        // limit=2 => remove=1 => should compact the smallest leaf
+        cache.reduce_children_of(&root, 2, false);
+
+        // After compaction, "bucket/a" (smallest leaf, objects=1) should be compacted.
+        let entry_a = cache.find("bucket/a").unwrap();
+        assert!(entry_a.compacted, "smallest leaf should be compacted");
+    }
+
+    #[test]
+    fn test_reduce_children_of_no_op_when_under_limit() {
+        let (mut cache, root) = build_test_tree();
+        let before = cache.cache.len();
+        // limit=10 > total children => no compaction
+        cache.reduce_children_of(&root, 10, false);
+        assert_eq!(cache.cache.len(), before);
     }
 
     #[tokio::test]

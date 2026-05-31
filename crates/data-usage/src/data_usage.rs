@@ -714,7 +714,7 @@ impl DataUsageCache {
             self.delete_recursive(&candidate);
             self.replace_hashed(&candidate, &None, &flat);
 
-            remove -= removing;
+            remove = remove.saturating_sub(removing);
             leaves.remove(0);
         }
     }
@@ -874,15 +874,14 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec
         Some(e) => e,
         None => return,
     };
-    if !e.children.is_empty() {
+    if e.children.is_empty() {
+        let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
+        leaves.push(Inner {
+            objects: sz.objects,
+            path: path.clone(),
+        });
         return;
     }
-
-    let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
-    leaves.push(Inner {
-        objects: sz.objects,
-        path: path.clone(),
-    });
     for ch in e.children.iter() {
         add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
     }
