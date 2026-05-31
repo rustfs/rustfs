@@ -458,11 +458,10 @@ impl Drop for PooledBuffer {
     // buffer moves it exactly once into the pool when a tier still owns it.
     #[allow(unsafe_code)]
     fn drop(&mut self) {
-        // Return buffer to pool if tier reference exists
+        // Return buffer to pool if tier reference exists.
+        // Otherwise, drop the standalone fallback buffer normally.
+        let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
         if let Some(ref tier) = self.tier {
-            // SAFETY: We're in drop(), so this is the last use of the buffer
-            // ManuallyDrop allows us to take the value without running BytesMut's drop
-            let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
             tier.return_buffer(buffer);
         }
         // The permit is automatically dropped here, releasing the semaphore slot

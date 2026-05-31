@@ -48,13 +48,12 @@ pub fn try_get_host_addr(req: &request::Request<Body>) -> Result<String, HostAdd
 pub fn get_host_addr(req: &request::Request<Body>) -> String {
     match try_get_host_addr(req) {
         Ok(host) => host,
-        Err(HostAddrError::MissingUriHost) => req
-            .headers()
-            .get("host")
-            .and_then(|host| host.to_str().ok())
-            .unwrap_or_default()
-            .to_string(),
-        Err(HostAddrError::InvalidHostHeader) => String::new(),
+        Err(HostAddrError::MissingUriHost) => match req.headers().get("host").map(|host| host.to_str()) {
+            Some(Ok(host)) => host.to_string(),
+            Some(Err(_)) => panic!("failed to resolve request host: invalid UTF-8 header value for `host`"),
+            None => panic!("failed to resolve request host: request uri has no host"),
+        },
+        Err(err) => panic!("failed to resolve request host: {err}"),
     }
 }
 
