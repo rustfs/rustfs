@@ -1666,7 +1666,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::AtomicBool;
-    use temp_env::with_var;
+    use temp_env::{with_var, with_var_unset};
     use uuid::Uuid;
 
     async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
@@ -1805,6 +1805,14 @@ mod tests {
     fn test_excessive_folders_threshold_uses_env() {
         with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, Some("3"), || {
             assert_eq!(scanner_excess_folders_threshold(), 3);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_excessive_folders_threshold_default_supports_pbs_layout() {
+        with_var_unset(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, || {
+            assert_eq!(scanner_excess_folders_threshold(), 65_538);
         });
     }
 

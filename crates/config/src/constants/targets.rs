@@ -49,6 +49,10 @@ pub const KAFKA_TLS_ENABLE: &str = "tls_enable";
 pub const KAFKA_TLS_CA: &str = "tls_ca";
 pub const KAFKA_TLS_CLIENT_CERT: &str = "tls_client_cert";
 pub const KAFKA_TLS_CLIENT_KEY: &str = "tls_client_key";
+pub const KAFKA_SASL_ENABLE: &str = "sasl_enable";
+pub const KAFKA_SASL_MECHANISM: &str = "sasl_mechanism";
+pub const KAFKA_SASL_USERNAME: &str = "sasl_username";
+pub const KAFKA_SASL_PASSWORD: &str = "sasl_password";
 
 pub const AMQP_URL: &str = "url";
 pub const AMQP_EXCHANGE: &str = "exchange";
