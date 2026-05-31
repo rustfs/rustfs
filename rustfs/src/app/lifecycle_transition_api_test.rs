@@ -19,7 +19,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
-use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
+use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_ecstore::{
     bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     bucket::metadata_sys,
@@ -53,7 +53,7 @@ use std::{
 };
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Barrier, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -598,6 +598,87 @@ async fn copy_object_if_none_match_existing_destination_returns_precondition_fai
         dst_payload,
         "failed conditional CopyObject must not overwrite the current destination object"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn concurrent_reverse_copy_object_does_not_deadlock_with_reader_locks() {
+    temp_env::async_with_vars([(ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+
+        let bucket = format!("test-reverse-copy-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_a = "test/a.bin";
+        let object_b = "test/b.bin";
+        let payload_a = vec![b'a'; 4 * 1024 * 1024];
+        let payload_b = vec![b'b'; 4 * 1024 * 1024];
+
+        create_test_bucket(&ecstore, bucket.as_str()).await;
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object_a, &payload_a).await;
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object_b, &payload_b).await;
+
+        let a_to_b_input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: object_a.to_string().into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key(object_b.to_string())
+            .build()
+            .unwrap();
+        let b_to_a_input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: object_b.to_string().into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key(object_a.to_string())
+            .build()
+            .unwrap();
+
+        let start = Arc::new(Barrier::new(3));
+        let start_a = start.clone();
+        let a_to_b = tokio::spawn(async move {
+            start_a.wait().await;
+            let usecase = DefaultObjectUsecase::without_context();
+            Box::pin(usecase.execute_copy_object(build_request(a_to_b_input, Method::PUT))).await
+        });
+        let start_b = start.clone();
+        let b_to_a = tokio::spawn(async move {
+            start_b.wait().await;
+            let usecase = DefaultObjectUsecase::without_context();
+            Box::pin(usecase.execute_copy_object(build_request(b_to_a_input, Method::PUT))).await
+        });
+
+        start.wait().await;
+
+        let (a_to_b_result, b_to_a_result) = tokio::time::timeout(Duration::from_secs(10), async {
+            let (a_to_b_result, b_to_a_result) = tokio::join!(a_to_b, b_to_a);
+            (
+                a_to_b_result.expect("A-to-B CopyObject task should not panic"),
+                b_to_a_result.expect("B-to-A CopyObject task should not panic"),
+            )
+        })
+        .await
+        .expect("reverse CopyObject operations should not deadlock");
+
+        a_to_b_result.expect("A-to-B CopyObject should succeed");
+        b_to_a_result.expect("B-to-A CopyObject should succeed");
+
+        let final_a = read_object_bytes(&ecstore, bucket.as_str(), object_a).await;
+        let final_b = read_object_bytes(&ecstore, bucket.as_str(), object_b).await;
+        assert!(
+            final_a == payload_a || final_a == payload_b,
+            "object A must contain a complete copied payload"
+        );
+        assert!(
+            final_b == payload_a || final_b == payload_b,
+            "object B must contain a complete copied payload"
+        );
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
