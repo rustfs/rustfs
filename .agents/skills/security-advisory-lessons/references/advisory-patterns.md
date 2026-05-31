@@ -71,6 +71,13 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 
 - `GHSA-xrrf-67jm-3c2r`: SSE metadata reported encryption while reader composition bypassed `EncryptReader` and stored plaintext. Lesson: test actual bytes on disk and wrapper order, not only API metadata.
 
+### Serde deserialization and input validation
+
+- No `#[serde(deny_unknown_fields)]` found across the entire codebase. Lesson: all structs deserialized from untrusted input (S3 API XML/JSON, lifecycle rules, bucket policies, replication configs) should have `#[serde(deny_unknown_fields)]` to reject malformed or adversarial payloads.
+- `#[serde(default)]` on security-critical fields silently accepts missing values as zero/empty. Lesson: when a field has security implications (retention days, permissions, limits), validate the deserialized value explicitly rather than relying on defaults.
+- Integer fields deserialized from user input and cast with `as` (e.g., `i32 as u32`) can wrap negative values to large positives. Lesson: validate ranges before casting; use `try_into()` or clamp.
+- XML config typos (e.g., `"NoncurentDays"` instead of `"NoncurrentDays"`) are silently accepted when `deny_unknown_fields` is absent. Lesson: strict deserialization prevents silent misconfiguration that could cause data loss or unexpected retention behavior.
+
 ## Useful Search Seeds
 
 Use these targeted searches when a diff touches security-sensitive code:
@@ -83,6 +90,7 @@ rg -n "DEFAULT_SECRET|DEFAULT_ACCESS|TEST_PRIVATE_KEY|rustfs rpc|RUSTFS_RPC_SECR
 rg -n "TONIC_RPC_PREFIX|verify_rpc_signature|check_auth|NodeServiceServer|x-rustfs-signature" rustfs crates
 rg -n "debug!|trace!|info!|error!|\\?resp|\\?merged_config|session_token|secret_key" rustfs crates
 rg -n "HashReader|EncryptReader|SSE|server-side encryption|Access-Control-Allow-Credentials|Origin" rustfs crates
+rg -n "deny_unknown_fields|serde.default|as u32|as usize|as i32" rustfs crates
 ```
 
 ## Minimum Regression Test Expectations
