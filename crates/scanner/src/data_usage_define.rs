@@ -869,13 +869,15 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec
         Some(e) => e,
         None => return,
     };
-    if e.children.is_empty() {
+    // Collect internal nodes (with children) as compaction candidates.
+    // Leaf nodes have no children to remove, so compacting them is a no-op —
+    // total_children_rec returns 0 for leaves, so `remove` would never decrement.
+    if !e.children.is_empty() {
         let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
         leaves.push(Inner {
             objects: sz.objects,
             path: path.clone(),
         });
-        return;
     }
     for ch in e.children.iter() {
         add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
@@ -1191,69 +1193,98 @@ mod tests {
         cache.replace_hashed(
             &c1,
             &Some(root.clone()),
-            &DataUsageEntry { objects: 1, size: 10, ..Default::default() },
+            &DataUsageEntry {
+                objects: 1,
+                size: 10,
+                ..Default::default()
+            },
         );
         cache.replace_hashed(
             &c2,
             &Some(root.clone()),
-            &DataUsageEntry { objects: 2, size: 20, ..Default::default() },
+            &DataUsageEntry {
+                objects: 2,
+                size: 20,
+                ..Default::default()
+            },
         );
         cache.replace_hashed(
             &gc,
             &Some(c2.clone()),
-            &DataUsageEntry { objects: 3, size: 30, ..Default::default() },
+            &DataUsageEntry {
+                objects: 3,
+                size: 30,
+                ..Default::default()
+            },
         );
         (cache, root)
     }
 
     #[test]
-    fn test_add_collects_all_leaves_from_subtree() {
-        // Calling `add` on the root should recurse into children and collect leaf nodes.
+    fn test_add_collects_internal_nodes_as_compaction_candidates() {
+        // `add()` should collect internal nodes (with children) as compaction candidates.
+        // Leaf nodes have no children to remove, so compacting them is a no-op.
         let (cache, root) = build_test_tree();
-        let mut leaves = Vec::new();
-        add(&cache, &root, &mut leaves);
+        let mut candidates = Vec::new();
+        add(&cache, &root, &mut candidates);
 
-        let mut paths: Vec<String> = leaves.iter().map(|l| l.path.key()).collect();
+        let mut paths: Vec<String> = candidates.iter().map(|l| l.path.key()).collect();
         paths.sort();
-        // Leaves are "bucket/a" (objects=1) and "bucket/b/c" (objects=3).
-        assert_eq!(paths.len(), 2, "add() should find both leaf nodes");
-        assert!(paths.contains(&hash_path("bucket/a").key()));
-        assert!(paths.contains(&hash_path("bucket/b/c").key()));
+        // Internal nodes: "bucket" (children: [a, b]) and "bucket/b" (children: [c]).
+        // Leaf nodes "bucket/a" and "bucket/b/c" are NOT collected.
+        assert_eq!(paths.len(), 2, "add() should find internal nodes with children");
+        assert!(paths.contains(&hash_path("bucket").key()));
+        assert!(paths.contains(&hash_path("bucket/b").key()));
     }
 
     #[test]
     fn test_add_returns_empty_for_missing_path() {
         let cache = DataUsageCache::default();
-        let mut leaves = Vec::new();
-        add(&cache, &hash_path("nonexistent"), &mut leaves);
-        assert!(leaves.is_empty());
+        let mut candidates = Vec::new();
+        add(&cache, &hash_path("nonexistent"), &mut candidates);
+        assert!(candidates.is_empty());
     }
 
     #[test]
-    fn test_add_returns_single_leaf_for_leaf_node() {
+    fn test_add_skips_leaf_node() {
+        // A leaf node (no children) is not a valid compaction candidate —
+        // total_children_rec returns 0 for leaves, so compacting them has no effect.
         let mut cache = DataUsageCache::default();
         let h = hash_path("single-leaf");
-        cache.replace_hashed(&h, &None, &DataUsageEntry { objects: 5, size: 50, ..Default::default() });
+        cache.replace_hashed(
+            &h,
+            &None,
+            &DataUsageEntry {
+                objects: 5,
+                size: 50,
+                ..Default::default()
+            },
+        );
 
-        let mut leaves = Vec::new();
-        add(&cache, &h, &mut leaves);
-        assert_eq!(leaves.len(), 1);
-        assert_eq!(leaves[0].objects, 5);
+        let mut candidates = Vec::new();
+        add(&cache, &h, &mut candidates);
+        assert!(candidates.is_empty(), "leaf node should not be a compaction candidate");
     }
 
     // --- Tests for `reduce_children_of` (bug #2: usize underflow) ---
 
     #[test]
-    fn test_reduce_children_of_compacts_leaves() {
-        // Build tree with more children than limit, then compact.
+    fn test_reduce_children_of_compacts_internal_node() {
+        // Build tree: root -> c1(leaf), c2 -> gc(leaf). total=3, limit=2, remove=1.
+        // Internal nodes (compaction candidates): root, c2.
+        // compact_self=false skips root; c2 (objects=2, 1 child) is the only candidate.
+        // Compacting c2 removes gc (removing=1), satisfying remove=1.
         let (mut cache, root) = build_test_tree();
-        // total_children_rec("bucket") = 2 direct children + 1 grandchild = 3
-        // limit=2 => remove=1 => should compact the smallest leaf
         cache.reduce_children_of(&root, 2, false);
 
-        // After compaction, "bucket/a" (smallest leaf, objects=1) should be compacted.
-        let entry_a = cache.find("bucket/a").unwrap();
-        assert!(entry_a.compacted, "smallest leaf should be compacted");
+        // "bucket/b" should be compacted (its child gc removed).
+        let entry_c2 = cache.find("bucket/b").unwrap();
+        assert!(entry_c2.compacted, "internal node 'bucket/b' should be compacted");
+        // "bucket/a" (leaf, not a candidate) should remain unchanged.
+        let entry_c1 = cache.find("bucket/a").unwrap();
+        assert!(!entry_c1.compacted, "leaf 'bucket/a' should not be compacted");
+        // "bucket/b/c" was deleted when its parent was compacted.
+        assert!(cache.find("bucket/b/c").is_none(), "grandchild should be removed after parent compaction");
     }
 
     #[test]

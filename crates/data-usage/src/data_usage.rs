@@ -874,13 +874,14 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec
         Some(e) => e,
         None => return,
     };
-    if e.children.is_empty() {
+    // Collect internal nodes (with children) as compaction candidates.
+    // Leaf nodes have no children to remove, so compacting them is a no-op.
+    if !e.children.is_empty() {
         let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
         leaves.push(Inner {
             objects: sz.objects,
             path: path.clone(),
         });
-        return;
     }
     for ch in e.children.iter() {
         add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
