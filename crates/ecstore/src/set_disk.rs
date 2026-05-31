@@ -759,7 +759,7 @@ impl ObjectIO for SetDisks {
 
         let mut object_lock_guard = None;
 
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+        if opts.http_preconditions.is_some() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
                 object_lock_guard = Some(
@@ -3086,18 +3086,18 @@ impl MultipartOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
-            let object_lock_guard = if !opts.no_lock {
+        let mut _object_lock_guard = None;
+
+        if opts.http_preconditions.is_some() {
+            if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                Some(
+                _object_lock_guard = Some(
                     ns_lock
                         .get_write_lock(get_lock_acquire_timeout())
                         .await
                         .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-                )
-            } else {
-                None
-            };
+                );
+            }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
                 return Err(err);
@@ -3267,8 +3267,7 @@ impl MultipartOperations for SetDisks {
     ) -> Result<ObjectInfo> {
         let mut object_lock_guard = None;
 
-        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+        if opts.http_preconditions.is_some() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
                 object_lock_guard = Some(
