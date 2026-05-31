@@ -93,6 +93,11 @@ pub const ENV_SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCU
 /// - Example: `export RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS=1`
 pub const ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS";
 
+/// Environment variable that controls how often scanner object loops yield to the async runtime.
+/// A value of `0` disables this extra object-count yield.
+/// - Example: `export RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS=32`
+pub const ENV_SCANNER_YIELD_EVERY_N_OBJECTS: &str = "RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS";
+
 /// Default scanner idle mode.
 pub const DEFAULT_SCANNER_IDLE_MODE: bool = true;
 
@@ -103,6 +108,9 @@ pub const DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS: usize = 0;
 /// Default disk scan concurrency budget.
 /// `0` means no additional limit beyond available disks in the set.
 pub const DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS: usize = 0;
+
+/// Default object interval for cooperative scanner yields.
+pub const DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS: u64 = 128;
 
 /// Compatibility flag kept for Patch 3 rollback windows.
 ///

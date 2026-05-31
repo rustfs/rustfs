@@ -79,3 +79,66 @@ pub static SCANNER_ACTIVE_PATHS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|
         subsystems::SCANNER,
     )
 });
+
+pub static SCANNER_CURRENT_CYCLE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycle,
+        "Current scanner cycle number, or zero when no cycle is running.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_COMPLETED_CYCLES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCompletedCycles,
+        "Total number of scanner cycles completed since server start.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CURRENT_CYCLE_AGE_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycleAgeSeconds,
+        "Time elapsed (in seconds) since the current scanner cycle started, or zero when no cycle is running.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CURRENT_SCAN_MODE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentScanMode,
+        "Current scanner mode: 0 unknown or idle, 1 normal, 2 deep bitrot scan.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleResult,
+        "Last scanner cycle result: 0 unknown, 1 success, 2 error.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_DURATION_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleDurationSeconds,
+        "Duration in seconds of the last finished scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_FAILED_CYCLES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::ScannerFailedCycles,
+        "Total number of scanner cycles that failed since server start.",
+        &[],
+        subsystems::SCANNER,
+    )
+});

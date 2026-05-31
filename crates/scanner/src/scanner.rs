@@ -438,6 +438,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         background_heal_info.bitrot_start_cycle,
         background_heal_info.bitrot_start_time,
     );
+    let _scan_mode_guard = ScannerScanModeGuard::new(scan_mode);
     if let Some(new_heal_info) =
         background_heal_info_for_scan_start(background_heal_info.clone(), cycle_info.current, scan_mode, Utc::now())
     {
@@ -475,6 +476,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     cycle_info.next += 1;
     cycle_info.current = 0;
     cycle_info.cycle_completed.push(Utc::now());
+    global_metrics().clear_current_scan_mode();
 
     info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run data scanner cycle");
 
@@ -551,6 +553,21 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     debug!("Data scanner done");
 
     Ok(())
+}
+
+struct ScannerScanModeGuard;
+
+impl ScannerScanModeGuard {
+    fn new(scan_mode: HealScanMode) -> Self {
+        global_metrics().set_current_scan_mode(scan_mode);
+        Self
+    }
+}
+
+impl Drop for ScannerScanModeGuard {
+    fn drop(&mut self) {
+        global_metrics().clear_current_scan_mode();
+    }
 }
 
 /// Store data usage info in backend. Will store all objects sent on the receiver until closed.

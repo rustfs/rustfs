@@ -110,6 +110,25 @@ pub enum HealScanMode {
     Deep = 2,
 }
 
+impl HealScanMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Normal => "normal",
+            Self::Deep => "deep",
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Normal),
+            2 => Some(Self::Deep),
+            _ => None,
+        }
+    }
+}
+
 impl Serialize for HealScanMode {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -137,12 +156,7 @@ impl<'de> Deserialize<'de> for HealScanMode {
             where
                 E: serde::de::Error,
             {
-                match value {
-                    0 => Ok(HealScanMode::Unknown),
-                    1 => Ok(HealScanMode::Normal),
-                    2 => Ok(HealScanMode::Deep),
-                    _ => Err(E::custom(format!("invalid HealScanMode value: {value}"))),
-                }
+                HealScanMode::from_u8(value).ok_or_else(|| E::custom(format!("invalid HealScanMode value: {value}")))
             }
 
             fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
