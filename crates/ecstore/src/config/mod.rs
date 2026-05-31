@@ -285,17 +285,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn global_server_config_returns_none_before_init() {
-        // After RwLock<Option<Config>> migration, callers that check for None
-        // to detect "config not initialized" must still work.
-        // This test verifies the type contract; actual None state is tested
-        // by the admin handler "not initialized" error paths.
-        let cfg = get_global_server_config();
-        // cfg may be Some if another test already set it, but the type is correct
-        let _ = cfg;
-    }
-
-    #[test]
     fn global_server_config_set_and_get_roundtrip() {
         init();
         let mut cfg = Config::new();

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use rustfs_audit::reload_audit_config;
+use tracing::warn;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
@@ -268,10 +269,14 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
         return Err(internal_error("storage layer not initialized"));
     };
 
-    let config = read_config_without_migrate(store)
-        .await
-        .map_err(|err| internal_error(format!("failed to load server config: {err}")))?;
-    let _ = apply_dynamic_config_for_subsystem(&config, sub_system).await?;
+    let config = read_config_without_migrate(store).await.map_err(|err| {
+        warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
+        internal_error(format!("failed to load server config: {err}"))
+    })?;
+    apply_dynamic_config_for_subsystem(&config, sub_system).await.map_err(|err| {
+        warn!("peer reload_dynamic_config: failed to apply {sub_system}: {err}");
+        err
+    })?;
     Ok(())
 }
 
@@ -280,14 +285,17 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
         return Err(internal_error("storage layer not initialized"));
     };
 
-    let config = read_config_without_migrate(store)
-        .await
-        .map_err(|err| internal_error(format!("failed to load server config: {err}")))?;
+    let config = read_config_without_migrate(store).await.map_err(|err| {
+        warn!("peer reload_runtime_config_snapshot: failed to load server config: {err}");
+        internal_error(format!("failed to load server config: {err}"))
+    })?;
 
     // Re-apply dynamic subsystems before publishing the snapshot, so that
     // runtime state (e.g. GLOBAL_STORAGE_CLASS) is refreshed on this peer.
     for sub_system in [STORAGE_CLASS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS, AUDIT_MQTT_SUB_SYS] {
-        let _ = apply_dynamic_config_for_subsystem(&config, sub_system).await;
+        if let Err(err) = apply_dynamic_config_for_subsystem(&config, sub_system).await {
+            warn!("peer reload_runtime_config_snapshot: failed to apply {sub_system}: {err}");
+        }
     }
 
     set_global_server_config(config);
