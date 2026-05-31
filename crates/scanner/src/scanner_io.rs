@@ -137,6 +137,28 @@ fn decrement_disk_bucket_scans_queued(counter: &AtomicUsize, pool: &str, set: &s
     record_disk_bucket_scans_queued(queued_count, pool, set);
 }
 
+fn reset_set_scan_gauges() {
+    metrics::gauge!(METRIC_SCANNER_SET_SCAN_CONCURRENCY_LIMIT).set(0.0);
+    metrics::gauge!(METRIC_SCANNER_SET_SCANS_QUEUED).set(0.0);
+    metrics::gauge!(METRIC_SCANNER_SET_SCANS_ACTIVE).set(0.0);
+}
+
+fn reset_disk_bucket_scan_gauges(pool: &str, set: &str) {
+    metrics::gauge!(
+        METRIC_SCANNER_DISK_SCAN_CONCURRENCY_LIMIT,
+        "pool" => pool.to_owned(),
+        "set" => set.to_owned()
+    )
+    .set(0.0);
+    record_disk_bucket_scans_queued(0, pool, set);
+    metrics::gauge!(
+        METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE,
+        "pool" => pool.to_owned(),
+        "set" => set.to_owned()
+    )
+    .set(0.0);
+}
+
 fn scanner_concurrency_limit(configured: usize, available: usize) -> usize {
     if available == 0 {
         return 0;
@@ -257,6 +279,7 @@ impl ScannerIO for ECStore {
         let all_buckets = self.list_bucket(&BucketOptions::default()).await?;
 
         if all_buckets.is_empty() {
+            reset_set_scan_gauges();
             if let Err(e) = updates.send(DataUsageInfo::default()).await {
                 error!("Failed to send data usage info: {}", e);
             }
@@ -269,6 +292,7 @@ impl ScannerIO for ECStore {
         }
         if total_results == 0 {
             warn!("nsscanner: no disk sets available for non-empty bucket list");
+            reset_set_scan_gauges();
             return Ok(());
         }
 
@@ -452,13 +476,18 @@ impl ScannerIOCache for SetDisks {
         want_cycle: u64,
         scan_mode: HealScanMode,
     ) -> Result<()> {
+        let pool_label = self.pool_index.to_string();
+        let set_label = self.set_index.to_string();
+
         if buckets.is_empty() {
+            reset_disk_bucket_scan_gauges(&pool_label, &set_label);
             return Ok(());
         }
 
         let (disks, healing) = self.get_online_disks_with_healing(false).await;
         if disks.is_empty() {
             debug!("nsscanner_cache: no online disks available for set");
+            reset_disk_bucket_scan_gauges(&pool_label, &set_label);
             return Ok(());
         }
         let disk_scan_limit = scanner_max_concurrent_disk_scans(disks.len());
@@ -476,8 +505,6 @@ impl ScannerIOCache for SetDisks {
             "nsscanner_cache: scanner disk concurrency budget"
         );
         let disk_scan_semaphore = Arc::new(Semaphore::new(disk_scan_limit));
-        let pool_label = self.pool_index.to_string();
-        let set_label = self.set_index.to_string();
         let queued_disk_bucket_scans = Arc::new(AtomicUsize::new(buckets.len()));
         let active_disk_bucket_scans = Arc::new(AtomicUsize::new(0));
         record_disk_bucket_scans_queued(buckets.len(), &pool_label, &set_label);

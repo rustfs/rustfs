@@ -163,7 +163,13 @@ fn single_disk_default_cycle_secs(features: ScannerMaintenanceFeatures) -> Optio
 
 async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
     let mut features = ScannerMaintenanceFeatures::default();
-    let buckets = match storeapi.list_bucket(&BucketOptions::default()).await {
+    let buckets = match storeapi
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+    {
         Ok(buckets) => buckets,
         Err(err) => {
             warn!(
