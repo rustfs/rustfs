@@ -281,6 +281,12 @@ impl HealChannelProcessor {
                 data: Some("stopped".as_bytes().to_vec()),
                 error: None,
             },
+            Err(Error::TaskNotFound { .. }) if client_token.is_empty() => HealChannelResponse {
+                request_id,
+                success: true,
+                data: Some("stopped".as_bytes().to_vec()),
+                error: None,
+            },
             Err(err) => HealChannelResponse {
                 request_id,
                 success: false,
@@ -963,6 +969,27 @@ mod tests {
             heal_manager.get_task_status(&task_id).await,
             Err(crate::Error::TaskNotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_process_cancel_request_treats_unknown_path_as_stopped() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+
+        processor
+            .process_cancel_request(".".to_string(), String::new(), tx)
+            .await
+            .expect("cancel should process");
+
+        let response = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("cancel response should be returned");
+        assert!(response.success);
+        assert_eq!(response.request_id, ".");
+        assert_eq!(response.data.as_deref(), Some("stopped".as_bytes()));
+        assert!(response.error.is_none());
     }
 
     #[tokio::test]
