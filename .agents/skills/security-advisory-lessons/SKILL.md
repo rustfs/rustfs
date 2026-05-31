@@ -70,6 +70,7 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 - Never join untrusted bucket/object/RPC path strings onto filesystem roots without normalization and boundary checks.
 - Reject or safely handle `..`, absolute paths, URL-encoded traversal, platform separators, empty components, and paths that canonicalize outside the intended root.
 - Validate both S3 object-key paths and internode/RPC disk paths; storage helpers can bypass S3 authorization if they trust already-parsed paths.
+- Archive auto-extract paths are object keys too. Validate tar/zip entry names before IAM checks and before storage writes, and prove cleaned paths cannot cross bucket or prefix boundaries.
 
 ### Secrets, default credentials, and crypto
 - Do not ship hard-coded shared tokens, HMAC secrets, private keys, or production test keys.
@@ -86,6 +87,7 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 - Treat all RPC payload bytes as attacker-controlled. Replace `unwrap`, `expect`, and panic-prone deserialization with typed errors.
 - Malformed request tests should cover empty bytes, truncated MessagePack/protobuf, invalid enum values, stale timestamps, and invalid signatures.
 - RPC authentication must be independently strong; do not depend on S3 admin credentials unless the fallback is explicit and safe.
+- RPC signatures must bind the exact generated gRPC method path, timestamp, and request method. Service-prefix signatures must not authorize a different concrete NodeService call.
 
 ### Browser, CORS, and console surfaces
 - Do not reflect arbitrary `Origin` while also allowing credentials. Default CORS should be no CORS unless explicitly configured.
@@ -115,5 +117,6 @@ Use these prompts while reviewing a diff:
 - Could a low-privileged authenticated user reach this path with the wrong action, parent, bucket, or source object?
 - Does a public/default/empty config change security behavior from fail-closed to fail-open?
 - Is any attacker-controlled value later used as a path, policy condition, credential identity, log field, URL, Origin, or response body?
+- Is an archive entry, object key, or policy resource normalized differently between authorization and storage?
 - Is the same operation implemented in multiple paths, such as `CopyObject` vs `UploadPartCopy`, and do all paths enforce the same security contract?
 - Does the test prove the exploit form is denied, or only that the intended form still works?

@@ -28,6 +28,13 @@ shared plugin/runtime primitives from `rustfs-targets`.
 - `stream.rs` is a compatibility shim; new replay/runtime work should prefer
   shared helpers in `rustfs-targets::runtime`.
 
+## Concurrency
+
+- `runtime_view.rs` acquires locks in order: `stream_cancellers` → `target_list`.
+- `runtime_facade.rs` acquires locks in order: `target_list` → `replay_workers`.
+- These orders must not be reversed in new code. When adding a function that needs both `target_list` and `stream_cancellers`, acquire `stream_cancellers` first (matching `runtime_view.rs` order).
+- Do not hold write guards across `.await` points unless the hold time is bounded and the operation is unavoidably async.
+
 ## Change Style
 
 - Preserve best-effort dispatch semantics and observability signals unless the
