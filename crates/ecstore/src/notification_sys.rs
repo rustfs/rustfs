@@ -189,6 +189,65 @@ impl NotificationSys {
         join_all(futures).await
     }
 
+    pub async fn reload_dynamic_config(&self, sub_sys: &str) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            let sub_sys = sub_sys.to_string();
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client
+                        .signal_service(crate::rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC, &sub_sys, false, SystemTime::UNIX_EPOCH)
+                        .await
+                    {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn refresh_config_snapshot(&self) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    match client
+                        .signal_service(crate::rpc::SERVICE_SIGNAL_REFRESH_CONFIG, "", false, SystemTime::UNIX_EPOCH)
+                        .await
+                    {
+                        Ok(_) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: None,
+                        },
+                        Err(e) => NotificationPeerErr {
+                            host: client.host.to_string(),
+                            err: Some(e),
+                        },
+                    }
+                } else {
+                    NotificationPeerErr {
+                        host: "".to_string(),
+                        err: Some(Error::other("peer is not reachable")),
+                    }
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
     pub async fn storage_info<S: StorageAPI>(&self, api: &S) -> rustfs_madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         let endpoints = get_global_endpoints();

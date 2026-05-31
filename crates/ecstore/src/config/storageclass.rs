@@ -101,13 +101,13 @@ pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
 });
 
 // StorageClass - holds storage class information
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct StorageClass {
     parity: usize,
 }
 
 // Config storage class configuration
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Config {
     standard: StorageClass,
     rrs: StorageClass,
@@ -205,7 +205,7 @@ pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
             if let Ok(ssc_str) = env::var(RRS_ENV) {
                 ssc_str
             } else {
-                kvs.get(RRS)
+                kvs.get(CLASS_RRS)
             }
         };
 
@@ -335,4 +335,37 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_config_reads_rrs_from_class_rrs_key() {
+        // Regression: kvs.get(RRS) used RRS="REDUCED_REDUNDANCY" instead of
+        // CLASS_RRS="rrs", so admin-written RRS values were never read back.
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:4".to_string());
+        kvs.insert(CLASS_RRS.to_string(), "EC:2".to_string());
+
+        let cfg = lookup_config(&kvs, 8).expect("lookup should succeed");
+        assert_eq!(cfg.standard.parity, 4, "standard parity should be 4");
+        assert_eq!(cfg.rrs.parity, 2, "rrs parity should be 2");
+    }
+
+    #[test]
+    fn lookup_config_ignores_redundancy_key_name() {
+        // Ensure the old key name "REDUCED_REDUNDANCY" is NOT read.
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:4".to_string());
+        kvs.insert(RRS.to_string(), "EC:2".to_string());
+
+        let cfg = lookup_config(&kvs, 8).expect("lookup should succeed");
+        assert_eq!(cfg.standard.parity, 4);
+        assert_eq!(
+            cfg.rrs.parity, DEFAULT_RRS_PARITY,
+            "rrs should fall back to default when CLASS_RRS key is absent"
+        );
+    }
 }
