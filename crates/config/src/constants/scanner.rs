@@ -83,8 +83,26 @@ pub const ENV_SCANNER_IDLE_MODE: &str = "RUSTFS_SCANNER_IDLE_MODE";
 /// - Example: `export RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS=30`
 pub const ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS: &str = "RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS";
 
+/// Environment variable that caps concurrent scanner set tasks.
+/// A value of `0` keeps the existing topology-based concurrency.
+/// - Example: `export RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS=2`
+pub const ENV_SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS";
+
+/// Environment variable that caps concurrent scanner disk bucket walks per set.
+/// A value of `0` keeps the existing disk-count-based concurrency.
+/// - Example: `export RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS=1`
+pub const ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS";
+
 /// Default scanner idle mode.
 pub const DEFAULT_SCANNER_IDLE_MODE: bool = true;
+
+/// Default set scan concurrency budget.
+/// `0` means no additional limit beyond deployment topology.
+pub const DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS: usize = 0;
+
+/// Default disk scan concurrency budget.
+/// `0` means no additional limit beyond available disks in the set.
+pub const DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS: usize = 0;
 
 /// Compatibility flag kept for Patch 3 rollback windows.
 ///

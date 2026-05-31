@@ -612,6 +612,7 @@ impl Metrics {
 
         m.collected_at = Utc::now();
         m.active_paths = self.get_current_paths().await;
+        m.ongoing_buckets = m.active_paths.len();
 
         // Lifetime operation counts
         for i in 0..Metric::Last as usize {
@@ -745,5 +746,25 @@ impl Drop for CloseDiskGuard {
             handle.spawn(async move { close_fn().await });
         }
         // If there is no runtime we are in a test or shutdown path; skip cleanup.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn report_counts_active_paths_as_ongoing_buckets() {
+        let metrics = Metrics::new();
+        metrics
+            .current_paths
+            .write()
+            .await
+            .insert("disk-a".to_string(), Arc::new(CurrentPathTracker::new("bucket-a".to_string())));
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.ongoing_buckets, 1);
+        assert_eq!(report.active_paths, vec!["disk-a/bucket-a".to_string()]);
     }
 }

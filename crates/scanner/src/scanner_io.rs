@@ -23,6 +23,10 @@ use metrics::counter;
 use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete};
+use rustfs_config::{
+    DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS,
+    ENV_SCANNER_MAX_CONCURRENT_SET_SCANS,
+};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
@@ -44,13 +48,44 @@ use rustfs_utils::path::path_join_buf;
 use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use std::{fmt::Debug, sync::Arc};
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+
+const METRIC_SCANNER_SET_SCAN_CONCURRENCY_LIMIT: &str = "rustfs_scanner_set_scan_concurrency_limit";
+const METRIC_SCANNER_DISK_SCAN_CONCURRENCY_LIMIT: &str = "rustfs_scanner_disk_scan_concurrency_limit";
+const METRIC_SCANNER_SET_SCAN_WAIT_SECONDS: &str = "rustfs_scanner_set_scan_wait_seconds";
+const METRIC_SCANNER_DISK_SCAN_WAIT_SECONDS: &str = "rustfs_scanner_disk_scan_wait_seconds";
+
+fn scanner_concurrency_limit(configured: usize, available: usize) -> usize {
+    if available == 0 {
+        return 0;
+    }
+
+    if configured == 0 {
+        available
+    } else {
+        configured.min(available).max(1)
+    }
+}
+
+fn scanner_max_concurrent_set_scans(available: usize) -> usize {
+    scanner_concurrency_limit(
+        rustfs_utils::get_env_usize(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS),
+        available,
+    )
+}
+
+fn scanner_max_concurrent_disk_scans(available: usize) -> usize {
+    scanner_concurrency_limit(
+        rustfs_utils::get_env_usize(ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS),
+        available,
+    )
+}
 
 fn record_set_scan_failure(first_err: &mut Option<Error>, err: Error) {
     if first_err.is_none() {
@@ -156,6 +191,19 @@ impl ScannerIO for ECStore {
         for pool in self.pools.iter() {
             total_results += pool.disk_set.len();
         }
+        if total_results == 0 {
+            warn!("nsscanner: no disk sets available for non-empty bucket list");
+            return Ok(());
+        }
+
+        let set_scan_limit = scanner_max_concurrent_set_scans(total_results);
+        metrics::gauge!(METRIC_SCANNER_SET_SCAN_CONCURRENCY_LIMIT).set(set_scan_limit as f64);
+        debug!(
+            total_sets = total_results,
+            concurrency_limit = set_scan_limit,
+            "nsscanner: scanner set concurrency budget"
+        );
+        let set_scan_semaphore = Arc::new(Semaphore::new(set_scan_limit));
 
         let results = vec![DataUsageCache::default(); total_results];
         let results_mutex: Arc<Mutex<Vec<DataUsageCache>>> = Arc::new(Mutex::new(results));
@@ -178,6 +226,7 @@ impl ScannerIO for ECStore {
                 let scan_mode_clone = scan_mode;
                 let results_mutex_clone = results_mutex.clone();
                 let first_err_mutex_clone = first_err_mutex.clone();
+                let set_scan_semaphore_clone = set_scan_semaphore.clone();
 
                 let (tx, mut rx) = mpsc::channel::<DataUsageCache>(1);
 
@@ -193,6 +242,22 @@ impl ScannerIO for ECStore {
                 let all_buckets_clone = all_buckets.clone();
                 // Spawn task to run the scanner
                 let scanner_fut = tokio::spawn(async move {
+                    let permit_wait = child_token_clone.clone();
+                    let permit_wait_start = Instant::now();
+                    let _permit = tokio::select! {
+                        permit = set_scan_semaphore_clone.acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            Err(_) => return,
+                        },
+                        _ = permit_wait.cancelled() => return,
+                    };
+                    metrics::histogram!(
+                        METRIC_SCANNER_SET_SCAN_WAIT_SECONDS,
+                        "pool" => pool_label.clone(),
+                        "set" => set_label.clone()
+                    )
+                    .record(permit_wait_start.elapsed().as_secs_f64());
+
                     if let Err(e) = set_clone
                         .nsscanner_cache(child_token_clone.clone(), all_buckets_clone, tx, want_cycle_clone, scan_mode_clone)
                         .await
@@ -309,6 +374,21 @@ impl ScannerIOCache for SetDisks {
             debug!("nsscanner_cache: no online disks available for set");
             return Ok(());
         }
+        let disk_scan_limit = scanner_max_concurrent_disk_scans(disks.len());
+        metrics::gauge!(
+            METRIC_SCANNER_DISK_SCAN_CONCURRENCY_LIMIT,
+            "pool" => self.pool_index.to_string(),
+            "set" => self.set_index.to_string()
+        )
+        .set(disk_scan_limit as f64);
+        debug!(
+            pool = self.pool_index,
+            set = self.set_index,
+            online_disks = disks.len(),
+            concurrency_limit = disk_scan_limit,
+            "nsscanner_cache: scanner disk concurrency budget"
+        );
+        let disk_scan_semaphore = Arc::new(Semaphore::new(disk_scan_limit));
 
         let mut old_cache = DataUsageCache::default();
         old_cache.load(self.clone(), DATA_USAGE_CACHE_NAME).await?;
@@ -412,8 +492,29 @@ impl ScannerIOCache for SetDisks {
             let store_clone_clone = self.clone();
             let bucket_result_tx_clone_clone = bucket_result_tx_clone.clone();
             let disk_clone = disk.clone();
+            let disk_scan_semaphore_clone = disk_scan_semaphore.clone();
             futs.push(tokio::spawn(async move {
-                while let Some(bucket) = bucket_rx_mutex_clone.lock().await.recv().await {
+                loop {
+                    let permit_wait = ctx_clone.clone();
+                    let permit_wait_start = Instant::now();
+                    let _permit = tokio::select! {
+                        permit = disk_scan_semaphore_clone.clone().acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        },
+                        _ = permit_wait.cancelled() => break,
+                    };
+                    metrics::histogram!(
+                        METRIC_SCANNER_DISK_SCAN_WAIT_SECONDS,
+                        "pool" => store_clone_clone.pool_index.to_string(),
+                        "set" => store_clone_clone.set_index.to_string()
+                    )
+                    .record(permit_wait_start.elapsed().as_secs_f64());
+
+                    let Some(bucket) = bucket_rx_mutex_clone.lock().await.recv().await else {
+                        break;
+                    };
+
                     if ctx_clone.is_cancelled() {
                         break;
                     }
@@ -721,6 +822,8 @@ impl ScannerIODisk for Disk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use temp_env::with_var;
 
     #[test]
     fn record_set_scan_failure_preserves_first_error() {
@@ -748,6 +851,42 @@ mod tests {
         let err = finalize_nsscanner_result(&results, Some(Error::other("set failed")))
             .expect_err("all failed sets should bubble first error");
         assert!(err.to_string().contains("set failed"));
+    }
+
+    #[test]
+    fn scanner_concurrency_limit_preserves_available_when_unconfigured() {
+        assert_eq!(scanner_concurrency_limit(0, 4), 4);
+    }
+
+    #[test]
+    fn scanner_concurrency_limit_caps_to_configured_value() {
+        assert_eq!(scanner_concurrency_limit(2, 4), 2);
+    }
+
+    #[test]
+    fn scanner_concurrency_limit_never_exceeds_available_work() {
+        assert_eq!(scanner_concurrency_limit(8, 4), 4);
+    }
+
+    #[test]
+    fn scanner_concurrency_limit_handles_no_available_work() {
+        assert_eq!(scanner_concurrency_limit(2, 0), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_max_concurrent_set_scans_uses_env_cap() {
+        with_var(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("2"), || {
+            assert_eq!(scanner_max_concurrent_set_scans(4), 2);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_max_concurrent_disk_scans_uses_env_cap() {
+        with_var(ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, Some("1"), || {
+            assert_eq!(scanner_max_concurrent_disk_scans(4), 1);
+        });
     }
 
     #[test]
