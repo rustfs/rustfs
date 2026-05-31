@@ -140,19 +140,7 @@ fn streaming_sign_v4_inner(
             };
             headers.append("X-Amz-Trailer", parsed);
         }
-        let chunked_value = match HeaderValue::from_str(&["aws-chunked"].join(",")) {
-            Ok(v) => v,
-            Err(err) => {
-                return streaming_fail(
-                    req,
-                    SignV4Error::HeaderValueParse {
-                        name: "Transfer-Encoding".to_string(),
-                        reason: err.to_string(),
-                    },
-                );
-            }
-        };
-        headers.insert(http::header::TRANSFER_ENCODING, chunked_value);
+        headers.insert(http::header::TRANSFER_ENCODING, HeaderValue::from_static("aws-chunked"));
     }
 
     if !session_token.is_empty() {

@@ -226,8 +226,9 @@ impl BytesPool {
     pub async fn acquire_buffer(&self, size: usize) -> PooledBuffer {
         let tier = self.select_tier(size);
         let mut buffer = tier.acquire_buffer(size, &self.metrics).await;
-        // Set tier reference for return on drop
-        buffer.tier = Some(Arc::clone(tier));
+        if buffer._permit.is_some() {
+            buffer.tier = Some(Arc::clone(tier));
+        }
         buffer
     }
 
@@ -537,6 +538,20 @@ mod tests {
         let pool = BytesPool::new_tiered();
         let buffer = pool.acquire_buffer(2048).await;
         assert!(buffer.capacity() >= 2048);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_buffer_after_shutdown_is_unpooled() {
+        let pool = BytesPool::new_tiered();
+        pool.small_pool.semaphore.close();
+
+        let buffer = pool.acquire_buffer(2048).await;
+
+        assert!(buffer.tier.is_none());
+        assert!(buffer._permit.is_none());
+        assert!(buffer.capacity() >= pool.small_pool.buffer_size);
+        drop(buffer);
+        assert_eq!(pool.available_buffers(), 0);
     }
 
     #[tokio::test]
