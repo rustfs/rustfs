@@ -1132,10 +1132,11 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
             ));
         };
 
+        let scope_start = lines.len();
         lines.extend(render_env_override_lines(&selector.sub_system, target, kvs, redact_secrets, &env_vars));
         if let Some(line) = render_scope_line(&selector.sub_system, target, kvs, redact_secrets) {
             lines.push(line);
-        } else if !lines.is_empty() {
+        } else if lines.len() > scope_start {
             lines.push(format_scope(&selector.sub_system, target));
         }
     } else {
@@ -1150,10 +1151,11 @@ fn render_selected_config(config: &ServerConfig, selector: &ConfigSelector, reda
 
         for target in target_names {
             let kvs = targets.get(&target).unwrap_or(&default_kvs);
+            let scope_start = lines.len();
             lines.extend(render_env_override_lines(&selector.sub_system, &target, kvs, redact_secrets, &env_vars));
             if let Some(line) = render_scope_line(&selector.sub_system, &target, kvs, redact_secrets) {
                 lines.push(line);
-            } else if !lines.is_empty() {
+            } else if lines.len() > scope_start {
                 lines.push(format_scope(&selector.sub_system, &target));
             }
         }
@@ -1381,6 +1383,18 @@ fn build_help_response(sub_system: Option<&str>, key: Option<&str>, env_only: bo
     })
 }
 
+/// Re-apply all dynamic subsystems from the given config and signal peers to reload.
+/// Used after full-config operations (restore, set-config) where the leader replaces
+/// the entire config and must ensure runtime state (e.g. GLOBAL_STORAGE_CLASS) is
+/// refreshed on both the leader and all peers.
+async fn apply_and_signal_dynamic_subsystems(config: &ServerConfig) {
+    for sub_system in [STORAGE_CLASS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS, AUDIT_MQTT_SUB_SYS] {
+        if apply_dynamic_config_for_subsystem(config, sub_system).await.unwrap_or(false) {
+            signal_dynamic_config_reload(sub_system).await;
+        }
+    }
+}
+
 pub struct GetConfigKVHandler {}
 
 #[async_trait::async_trait]
@@ -1554,6 +1568,7 @@ impl Operation for RestoreConfigHistoryKVHandler {
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
         set_global_server_config(config.clone());
+        apply_and_signal_dynamic_subsystems(&config).await;
         signal_config_snapshot_reload().await;
 
         success_response(false)
@@ -1592,6 +1607,7 @@ impl Operation for SetConfigHandler {
         save_server_config_history(&body).await?;
         save_server_config_to_store(&config).await?;
         set_global_server_config(config.clone());
+        apply_and_signal_dynamic_subsystems(&config).await;
         signal_config_snapshot_reload().await;
 
         success_response(false)

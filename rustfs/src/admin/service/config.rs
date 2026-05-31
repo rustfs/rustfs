@@ -283,6 +283,13 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
     let config = read_config_without_migrate(store)
         .await
         .map_err(|err| internal_error(format!("failed to load server config: {err}")))?;
+
+    // Re-apply dynamic subsystems before publishing the snapshot, so that
+    // runtime state (e.g. GLOBAL_STORAGE_CLASS) is refreshed on this peer.
+    for sub_system in [STORAGE_CLASS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS, AUDIT_MQTT_SUB_SYS] {
+        let _ = apply_dynamic_config_for_subsystem(&config, sub_system).await;
+    }
+
     set_global_server_config(config);
     Ok(())
 }
