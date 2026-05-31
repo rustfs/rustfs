@@ -279,6 +279,13 @@ pub enum MetricName {
     ScannerVersionsScanned,
     ScannerLastActivitySeconds,
     ScannerActivePaths,
+    ScannerCurrentCycle,
+    ScannerCompletedCycles,
+    ScannerCurrentCycleAgeSeconds,
+    ScannerCurrentScanMode,
+    ScannerLastCycleResult,
+    ScannerLastCycleDurationSeconds,
+    ScannerFailedCycles,
 
     // CPU system-related metrics
     SysCPUAvgIdle,
@@ -620,6 +627,13 @@ impl MetricName {
             Self::ScannerVersionsScanned => "versions_scanned".to_string(),
             Self::ScannerLastActivitySeconds => "last_activity_seconds".to_string(),
             Self::ScannerActivePaths => "active_paths".to_string(),
+            Self::ScannerCurrentCycle => "current_cycle".to_string(),
+            Self::ScannerCompletedCycles => "completed_cycles".to_string(),
+            Self::ScannerCurrentCycleAgeSeconds => "current_cycle_age_seconds".to_string(),
+            Self::ScannerCurrentScanMode => "current_scan_mode".to_string(),
+            Self::ScannerLastCycleResult => "last_cycle_result".to_string(),
+            Self::ScannerLastCycleDurationSeconds => "last_cycle_duration_seconds".to_string(),
+            Self::ScannerFailedCycles => "failed_cycles".to_string(),
 
             // CPU system-related metrics
             Self::SysCPUAvgIdle => "avg_idle".to_string(),

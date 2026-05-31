@@ -57,7 +57,6 @@ use tracing::{debug, error, info, warn};
 
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16;
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
-const YIELD_EVERY_N_OBJECTS: u64 = 128;
 const DATA_SCANNER_COMPACT_AT_CHILDREN: usize = 10000;
 const DATA_SCANNER_COMPACT_AT_FOLDERS: usize = DATA_SCANNER_COMPACT_AT_CHILDREN / 4;
 const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
@@ -142,6 +141,17 @@ fn scanner_excess_folders_threshold() -> u64 {
         rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS,
         rustfs_config::DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS,
     )
+}
+
+fn scanner_yield_every_n_objects() -> u64 {
+    rustfs_utils::get_env_u64(
+        rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS,
+        rustfs_config::DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS,
+    )
+}
+
+fn should_yield_after_object(object_count: u64, yield_every: u64) -> bool {
+    yield_every > 0 && object_count.is_multiple_of(yield_every)
 }
 
 fn should_alert_excessive_versions(remaining_versions: usize, cumulative_size: i64) -> (bool, bool) {
@@ -916,6 +926,7 @@ impl FolderScanner {
             let mut new_folders: Vec<CachedFolder> = Vec::new();
             let mut found_objects = false;
             let mut object_count: u64 = 0;
+            let yield_every_objects = scanner_yield_every_n_objects();
 
             let dir_path = path_join_buf(&[&self.root, &folder.name]);
 
@@ -1098,7 +1109,7 @@ impl FolderScanner {
 
                 timer.sleep().await;
 
-                if object_count.is_multiple_of(YIELD_EVERY_N_OBJECTS) {
+                if should_yield_after_object(object_count, yield_every_objects) {
                     tokio::task::yield_now().await;
                 }
             }
@@ -1814,6 +1825,29 @@ mod tests {
         with_var_unset(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, || {
             assert_eq!(scanner_excess_folders_threshold(), 65_538);
         });
+    }
+
+    #[test]
+    #[serial]
+    fn test_scanner_yield_every_n_objects_uses_env() {
+        with_var(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, Some("32"), || {
+            assert_eq!(scanner_yield_every_n_objects(), 32);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_scanner_yield_every_n_objects_uses_default() {
+        with_var_unset(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, || {
+            assert_eq!(scanner_yield_every_n_objects(), rustfs_config::DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS);
+        });
+    }
+
+    #[test]
+    fn test_should_yield_after_object_respects_interval_and_disable() {
+        assert!(!should_yield_after_object(127, 128));
+        assert!(should_yield_after_object(128, 128));
+        assert!(!should_yield_after_object(128, 0));
     }
 
     #[tokio::test]
