@@ -23,8 +23,8 @@ use crate::error::{
 };
 use crate::set_disk::SetDisks;
 use crate::store_api::{
-    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOperations, ObjectOptions, WalkOptions,
-    WalkVersionsSortOrder,
+    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOperations, ObjectOptions, VersionMarker,
+    WalkOptions, WalkVersionsSortOrder,
 };
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
@@ -118,8 +118,11 @@ pub struct ListPathOptions {
     pub filter_prefix: Option<String>,
 
     // Marker to resume listing.
-    // The response will be the first entry >= this object name.
     pub marker: Option<String>,
+
+    // Include marker itself in the returned entries. Version listings need this
+    // when a version marker selects a later version from the marker object.
+    pub include_marker: bool,
 
     // Limit the number of results.
     pub limit: i32,
@@ -159,6 +162,67 @@ pub struct ListPathOptions {
 }
 
 const MARKER_TAG_VERSION: &str = "v1";
+const ENV_API_LIST_QUORUM: &str = "RUSTFS_API_LIST_QUORUM";
+const DEFAULT_API_LIST_QUORUM: &str = "strict";
+
+fn normalize_list_quorum(value: &str) -> &'static str {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("disk") {
+        "disk"
+    } else if value.eq_ignore_ascii_case("reduced") {
+        "reduced"
+    } else if value.eq_ignore_ascii_case("optimal") {
+        "optimal"
+    } else if value.eq_ignore_ascii_case("auto") {
+        "auto"
+    } else {
+        DEFAULT_API_LIST_QUORUM
+    }
+}
+
+fn list_quorum_from_env() -> String {
+    let value = rustfs_utils::get_env_str(ENV_API_LIST_QUORUM, DEFAULT_API_LIST_QUORUM);
+    normalize_list_quorum(&value).to_owned()
+}
+
+fn list_metadata_resolution_params(bucket: String, listing_quorum: usize, versioned: bool) -> MetadataResolutionParams {
+    let mut resolver = MetadataResolutionParams {
+        dir_quorum: listing_quorum,
+        obj_quorum: listing_quorum,
+        bucket,
+        ..Default::default()
+    };
+
+    if !versioned {
+        resolver.requested_versions = 1;
+    }
+
+    resolver
+}
+
+fn parse_version_marker(marker: String) -> Result<VersionMarker> {
+    if marker == "null" {
+        Ok(VersionMarker::Null)
+    } else {
+        Ok(VersionMarker::Version(Uuid::parse_str(&marker)?))
+    }
+}
+
+fn version_marker_for_entries(
+    entries: Option<&MetaCacheEntriesSorted>,
+    key_marker: Option<&str>,
+    version_marker: Option<VersionMarker>,
+) -> Option<VersionMarker> {
+    let marker = version_marker?;
+    let Some(key_marker) = key_marker else {
+        return Some(marker);
+    };
+
+    entries
+        .and_then(|entries| entries.entries().first().map(|entry| entry.name.as_str() == key_marker))
+        .unwrap_or_default()
+        .then_some(marker)
+}
 
 impl ListPathOptions {
     pub fn set_filter(&mut self) {
@@ -182,50 +246,64 @@ impl ListPathOptions {
     }
 
     pub fn parse_marker(&mut self) {
-        if let Some(marker) = &self.marker {
-            let s = marker.clone();
-            if !s.contains(format!("[rustfs_cache:{MARKER_TAG_VERSION}").as_str()) {
-                return;
-            }
+        let Some(marker) = self.marker.clone() else {
+            return;
+        };
+        let Some(start_idx) = marker.rfind("[rustfs_cache:") else {
+            return;
+        };
+        let Some(end_offset) = marker[start_idx..].rfind(']') else {
+            return;
+        };
 
-            if let (Some(start_idx), Some(end_idx)) = (s.find("["), s.find("]")) {
-                self.marker = Some(s[0..start_idx].to_owned());
-                let tags: Vec<_> = s[start_idx..end_idx].trim_matches(['[', ']']).split(",").collect();
+        let end_idx = start_idx + end_offset;
+        let tag_body = marker[start_idx + 1..end_idx].to_owned();
+        let mut supported_marker = false;
 
-                for &tag in tags.iter() {
-                    let kv: Vec<_> = tag.split(":").collect();
-                    if kv.len() != 2 {
-                        continue;
-                    }
-
-                    match kv[0] {
-                        "rustfs_cache" if kv[1] != MARKER_TAG_VERSION => {
-                            continue;
-                        }
-                        "id" => self.id = Some(kv[1].to_owned()),
-                        "return" => {
-                            self.id = Some(Uuid::new_v4().to_string());
-                            self.create = true;
-                        }
-                        "p" => match kv[1].parse::<usize>() {
-                            Ok(res) => self.pool_idx = Some(res),
-                            Err(_) => {
-                                self.id = Some(Uuid::new_v4().to_string());
-                                self.create = true;
-                                continue;
-                            }
-                        },
-                        "s" => match kv[1].parse::<usize>() {
-                            Ok(res) => self.set_idx = Some(res),
-                            Err(_) => {
-                                self.id = Some(Uuid::new_v4().to_string());
-                                self.create = true;
-                                continue;
-                            }
-                        },
-                        _ => (),
-                    }
+        for tag in tag_body.split(',') {
+            let Some((key, value)) = tag.split_once(':') else {
+                continue;
+            };
+            if key == "rustfs_cache" {
+                if value != MARKER_TAG_VERSION {
+                    return;
                 }
+                supported_marker = true;
+            }
+        }
+
+        if !supported_marker {
+            return;
+        }
+
+        self.marker = Some(marker[..start_idx].to_owned());
+        for tag in tag_body.split(',') {
+            let Some((key, value)) = tag.split_once(':') else {
+                continue;
+            };
+
+            match key {
+                "rustfs_cache" => {}
+                "id" => self.id = Some(value.to_owned()),
+                "return" => {
+                    self.id = Some(Uuid::new_v4().to_string());
+                    self.create = true;
+                }
+                "p" => match value.parse::<usize>() {
+                    Ok(res) => self.pool_idx = Some(res),
+                    Err(_) => {
+                        self.id = Some(Uuid::new_v4().to_string());
+                        self.create = true;
+                    }
+                },
+                "s" => match value.parse::<usize>() {
+                    Ok(res) => self.set_idx = Some(res),
+                    Err(_) => {
+                        self.id = Some(Uuid::new_v4().to_string());
+                        self.create = true;
+                    }
+                },
+                _ => (),
             }
         }
     }
@@ -301,7 +379,7 @@ impl ECStore {
             limit: effective_max_keys,
             marker,
             incl_deleted,
-            ask_disks: "strict".to_owned(), //TODO: from config
+            ask_disks: list_quorum_from_env(),
             ..Default::default()
         };
 
@@ -444,13 +522,9 @@ impl ECStore {
             return Err(StorageError::NotImplemented);
         }
 
+        let has_version_marker = version_marker.is_some();
         let version_marker = if let Some(marker) = version_marker {
-            // "null" is used for non-versioned objects in AWS S3 API
-            if marker == "null" {
-                None
-            } else {
-                Some(Uuid::parse_str(&marker)?)
-            }
+            Some(parse_version_marker(marker)?)
         } else {
             None
         };
@@ -464,8 +538,9 @@ impl ECStore {
             limit: effective_max_keys,
             marker,
             incl_deleted: true,
-            ask_disks: "strict".to_owned(),
+            ask_disks: list_quorum_from_env(),
             versioned: true,
+            include_marker: has_version_marker,
             ..Default::default()
         };
 
@@ -486,9 +561,13 @@ impl ECStore {
             return Err(to_object_err(err.into(), vec![bucket, prefix]));
         }
 
-        if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(opts.marker);
+        if let Some(result) = list_result.entries.as_mut()
+            && !has_version_marker
+        {
+            result.forward_past(opts.marker.clone());
         }
+
+        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
         let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
@@ -762,11 +841,13 @@ impl ECStore {
             }
         }
 
+        // All sets returned not-found — the listing is simply empty.
+        // We intentionally do NOT distinguish VolumeNotFound here: during
+        // listing, a missing volume on a set is equivalent to "no entries"
+        // and must not surface as an error to the caller. The original
+        // VolumeNotFound check caused spurious errors when a pool had not
+        // yet created the bucket prefix on every set.
         if is_all_not_found(&errs) {
-            if is_all_volume_not_found(&errs) {
-                return Err(StorageError::VolumeNotFound);
-            }
-
             return Ok(Vec::new());
         }
 
@@ -1080,7 +1161,7 @@ async fn gather_results(
         }
 
         if let Some(marker) = &opts.marker
-            && &entry.name <= marker
+            && ((!opts.include_marker && &entry.name <= marker) || (opts.include_marker && &entry.name < marker))
         {
             continue;
         }
@@ -1349,16 +1430,7 @@ impl SetDisks {
             fallback_disks = disks.split_off(ask_disks as usize);
         }
 
-        let mut resolver = MetadataResolutionParams {
-            dir_quorum: listing_quorum,
-            obj_quorum: listing_quorum,
-            bucket: opts.bucket.clone(),
-            ..Default::default()
-        };
-
-        if opts.versioned {
-            resolver.requested_versions = 1;
-        }
+        let resolver = list_metadata_resolution_params(opts.bucket.clone(), listing_quorum, opts.versioned);
 
         let limit = {
             if opts.limit > 0 && opts.stop_disk_at_limit {
@@ -1483,9 +1555,13 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use super::{ListPathOptions, MAX_OBJECT_LIST, gather_results, max_keys_plus_one, walk_result_from_set_errors};
+    use super::{
+        ENV_API_LIST_QUORUM, ListPathOptions, MAX_OBJECT_LIST, VersionMarker, gather_results, list_metadata_resolution_params,
+        list_quorum_from_env, max_keys_plus_one, normalize_list_quorum, parse_version_marker, version_marker_for_entries,
+        walk_result_from_set_errors,
+    };
     use crate::error::StorageError;
-    use rustfs_filemeta::MetaCacheEntry;
+    use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
@@ -1495,6 +1571,13 @@ mod test {
     fn test_meta_entry(name: &str) -> MetaCacheEntry {
         MetaCacheEntry {
             name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn sorted_entries(names: &[&str]) -> MetaCacheEntriesSorted {
+        MetaCacheEntriesSorted {
+            o: MetaCacheEntries(names.iter().map(|name| Some(test_meta_entry(name))).collect()),
             ..Default::default()
         }
     }
@@ -1531,6 +1614,109 @@ mod test {
             .expect("gather_results should succeed");
     }
 
+    #[tokio::test]
+    async fn gather_results_keeps_marker_entry_for_version_marker_listing() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+
+        entry_tx.send(test_meta_entry("obj-a")).await.unwrap();
+        entry_tx.send(test_meta_entry("obj-b")).await.unwrap();
+
+        let handle = tokio::spawn(gather_results(
+            CancellationToken::new(),
+            ListPathOptions {
+                bucket: "bucket".to_owned(),
+                marker: Some("obj-a".to_owned()),
+                include_marker: true,
+                limit: 2,
+                incl_deleted: true,
+                versioned: true,
+                ..Default::default()
+            },
+            entry_rx,
+            result_tx,
+        ));
+
+        let result = timeout(Duration::from_secs(1), result_rx.recv())
+            .await
+            .expect("limited result should be sent promptly")
+            .expect("limited result should be present");
+        let entries = result.entries.unwrap();
+        let names = entries
+            .entries()
+            .into_iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["obj-a", "obj-b"]);
+
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("gather_results should finish after sending a limited result")
+            .expect("gather_results task should not panic")
+            .expect("gather_results should succeed");
+    }
+
+    #[test]
+    fn version_marker_is_applied_only_when_key_marker_entry_is_present() {
+        let version_marker = Some(VersionMarker::Null);
+
+        let listed_after_deleted_marker = sorted_entries(&["obj-b", "obj-c"]);
+        assert_eq!(
+            version_marker_for_entries(Some(&listed_after_deleted_marker), Some("obj-a"), version_marker),
+            None
+        );
+
+        let listed_with_marker = sorted_entries(&["obj-a", "obj-b"]);
+        assert_eq!(
+            version_marker_for_entries(Some(&listed_with_marker), Some("obj-a"), version_marker),
+            version_marker
+        );
+    }
+
+    #[tokio::test]
+    async fn gather_results_skips_marker_entry_by_default() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+
+        entry_tx.send(test_meta_entry("obj-a")).await.unwrap();
+        entry_tx.send(test_meta_entry("obj-b")).await.unwrap();
+        drop(entry_tx);
+
+        let handle = tokio::spawn(gather_results(
+            CancellationToken::new(),
+            ListPathOptions {
+                bucket: "bucket".to_owned(),
+                marker: Some("obj-a".to_owned()),
+                limit: 2,
+                incl_deleted: true,
+                ..Default::default()
+            },
+            entry_rx,
+            result_tx,
+        ));
+
+        let result = timeout(Duration::from_secs(1), result_rx.recv())
+            .await
+            .expect("eof result should be sent promptly")
+            .expect("eof result should be present");
+        let entries = result.entries.unwrap();
+        let names = entries
+            .entries()
+            .into_iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["obj-b"]);
+        assert!(result.err.is_some());
+
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("gather_results should finish after input closes")
+            .expect("gather_results task should not panic")
+            .expect("gather_results should succeed");
+    }
+
     #[test]
     fn test_max_keys_plus_one_caps_before_lookahead() {
         assert_eq!(max_keys_plus_one(999, true), 1000);
@@ -1540,28 +1726,74 @@ mod test {
         assert_eq!(max_keys_plus_one(-1, true), MAX_OBJECT_LIST + 1);
     }
 
-    /// Test that "null" version marker is handled correctly
-    /// AWS S3 API uses "null" string to represent non-versioned objects
+    #[test]
+    fn normalize_list_quorum_accepts_supported_values() {
+        assert_eq!(normalize_list_quorum("strict"), "strict");
+        assert_eq!(normalize_list_quorum("disk"), "disk");
+        assert_eq!(normalize_list_quorum("reduced"), "reduced");
+        assert_eq!(normalize_list_quorum("optimal"), "optimal");
+        assert_eq!(normalize_list_quorum("auto"), "auto");
+        assert_eq!(normalize_list_quorum(" OPTIMAL "), "optimal");
+    }
+
+    #[test]
+    fn normalize_list_quorum_falls_back_to_strict() {
+        assert_eq!(normalize_list_quorum(""), "strict");
+        assert_eq!(normalize_list_quorum("unknown"), "strict");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_quorum_from_env_defaults_to_strict() {
+        temp_env::with_var_unset(ENV_API_LIST_QUORUM, || {
+            assert_eq!(list_quorum_from_env(), "strict");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_quorum_from_env_honors_supported_value() {
+        temp_env::with_var(ENV_API_LIST_QUORUM, Some("auto"), || {
+            assert_eq!(list_quorum_from_env(), "auto");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_quorum_from_env_rejects_unknown_value() {
+        temp_env::with_var(ENV_API_LIST_QUORUM, Some("unsafe"), || {
+            assert_eq!(list_quorum_from_env(), "strict");
+        });
+    }
+
+    #[test]
+    fn list_metadata_resolution_params_limits_plain_listing_to_latest_version() {
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, false);
+
+        assert_eq!(resolver.dir_quorum, 2);
+        assert_eq!(resolver.obj_quorum, 2);
+        assert_eq!(resolver.bucket, "bucket");
+        assert_eq!(resolver.requested_versions, 1);
+    }
+
+    #[test]
+    fn list_metadata_resolution_params_keeps_all_versions_for_version_listing() {
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, true);
+
+        assert_eq!(resolver.dir_quorum, 3);
+        assert_eq!(resolver.obj_quorum, 3);
+        assert_eq!(resolver.bucket, "bucket");
+        assert_eq!(resolver.requested_versions, 0);
+    }
+
     #[test]
     fn test_null_version_marker_handling() {
-        // "null" should be treated as None (non-versioned)
-        let version_marker = "null";
-        let parsed: Option<Uuid> = if version_marker == "null" {
-            None
-        } else {
-            Uuid::parse_str(version_marker).ok()
-        };
-        assert!(parsed.is_none(), "\"null\" should be parsed as None");
+        let parsed = parse_version_marker("null".to_string()).expect("null marker should parse");
+        assert_eq!(parsed, VersionMarker::Null);
 
-        // Valid UUID should be parsed correctly
         let valid_uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let parsed: Option<Uuid> = if valid_uuid == "null" {
-            None
-        } else {
-            Uuid::parse_str(valid_uuid).ok()
-        };
-        assert!(parsed.is_some(), "Valid UUID should be parsed correctly");
-        assert_eq!(parsed.unwrap().to_string(), "550e8400-e29b-41d4-a716-446655440000");
+        let parsed = parse_version_marker(valid_uuid.to_string()).expect("uuid marker should parse");
+        assert_eq!(parsed, VersionMarker::Version(Uuid::parse_str(valid_uuid).unwrap()));
     }
 
     /// Test that next_version_idmarker returns "null" for non-versioned objects
@@ -1584,15 +1816,11 @@ mod test {
         // Scenario 1: Non-versioned object
         // Server returns "null" as NextVersionIdMarker
         // Client sends "null" as VersionIdMarker
-        // Server parses "null" as None
+        // Server parses "null" as an explicit null-version marker
         let server_response = "null";
         let client_request = server_response;
-        let parsed: Option<Uuid> = if client_request == "null" {
-            None
-        } else {
-            Uuid::parse_str(client_request).ok()
-        };
-        assert!(parsed.is_none());
+        let parsed = parse_version_marker(client_request.to_string()).expect("null marker should parse");
+        assert_eq!(parsed, VersionMarker::Null);
 
         // Scenario 2: Versioned object
         // Server returns UUID as NextVersionIdMarker
@@ -1601,13 +1829,8 @@ mod test {
         let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
         let server_response = uuid_str;
         let client_request = server_response;
-        let parsed: Option<Uuid> = if client_request == "null" {
-            None
-        } else {
-            Uuid::parse_str(client_request).ok()
-        };
-        assert!(parsed.is_some());
-        assert_eq!(parsed.unwrap().to_string(), uuid_str);
+        let parsed = parse_version_marker(client_request.to_string()).expect("uuid marker should parse");
+        assert_eq!(parsed, VersionMarker::Version(Uuid::parse_str(uuid_str).unwrap()));
     }
 
     #[test]
@@ -1636,6 +1859,41 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
+        assert!(!parsed.create);
+    }
+
+    #[test]
+    fn list_path_marker_parser_uses_trailing_cache_tag() {
+        let mut parsed = ListPathOptions {
+            marker: Some(format!(
+                "photos/[archive]/image.jpg[rustfs_cache:{},id:list-cache-id,p:3,s:7]",
+                super::MARKER_TAG_VERSION
+            )),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/[archive]/image.jpg"));
+        assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert_eq!(parsed.set_idx, Some(7));
+    }
+
+    #[test]
+    fn list_path_marker_parser_ignores_unsupported_cache_tag_version() {
+        let marker = "photos/image.jpg[rustfs_cache:v0,id:list-cache-id,p:3,s:7]".to_string();
+        let mut parsed = ListPathOptions {
+            marker: Some(marker.clone()),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some(marker.as_str()));
+        assert!(parsed.id.is_none());
+        assert!(parsed.pool_idx.is_none());
+        assert!(parsed.set_idx.is_none());
         assert!(!parsed.create);
     }
 

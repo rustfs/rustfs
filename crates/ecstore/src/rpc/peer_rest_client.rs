@@ -57,6 +57,8 @@ use tracing::warn;
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
+pub const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = 1;
+pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 

@@ -29,16 +29,20 @@ use crate::{
 };
 use async_trait::async_trait;
 use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
-use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAcks, SecurityConfig};
+use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAcks, SaslConfig, SecurityConfig};
 use rustfs_tls_runtime::{load_cert_bundle_der_bytes, load_private_key};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+use std::{fmt, marker::PhantomData, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
+pub(crate) const KAFKA_SASL_PLAIN: &str = "PLAIN";
+pub(crate) const KAFKA_SASL_SCRAM_SHA_256: &str = "SCRAM-SHA-256";
+pub(crate) const KAFKA_SASL_SCRAM_SHA_512: &str = "SCRAM-SHA-512";
+
 /// Arguments for configuring a Kafka target
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KafkaArgs {
     /// Whether the target is enabled
     pub enable: bool,
@@ -56,12 +60,72 @@ pub struct KafkaArgs {
     pub tls_client_cert: String,
     /// Optional path to client private key for mTLS
     pub tls_client_key: String,
+    /// Whether to enable SASL authentication over the TLS transport
+    pub sasl_enable: bool,
+    /// SASL mechanism (PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)
+    pub sasl_mechanism: String,
+    /// SASL username
+    pub sasl_username: String,
+    /// SASL password
+    pub sasl_password: String,
     /// The directory to store events in case of failure
     pub queue_dir: String,
     /// The maximum number of events to store
     pub queue_limit: u64,
     /// The target type (audit or notify)
     pub target_type: TargetType,
+}
+
+impl fmt::Debug for KafkaArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KafkaArgs")
+            .field("enable", &self.enable)
+            .field("brokers", &self.brokers)
+            .field("topic", &self.topic)
+            .field("acks", &self.acks)
+            .field("tls_enable", &self.tls_enable)
+            .field("tls_ca", &self.tls_ca)
+            .field("tls_client_cert", &self.tls_client_cert)
+            .field(
+                "tls_client_key",
+                if self.tls_client_key.is_empty() {
+                    &""
+                } else {
+                    &"***REDACTED***"
+                },
+            )
+            .field("sasl_enable", &self.sasl_enable)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field(
+                "sasl_password",
+                if self.sasl_password.is_empty() {
+                    &""
+                } else {
+                    &"***REDACTED***"
+                },
+            )
+            .field("queue_dir", &self.queue_dir)
+            .field("queue_limit", &self.queue_limit)
+            .field("target_type", &self.target_type)
+            .finish()
+    }
+}
+
+fn normalize_kafka_sasl_mechanism(mechanism: &str) -> Result<&'static str, TargetError> {
+    let mechanism = mechanism.trim();
+    if mechanism.is_empty() || mechanism.eq_ignore_ascii_case(KAFKA_SASL_PLAIN) {
+        return Ok(KAFKA_SASL_PLAIN);
+    }
+    if mechanism.eq_ignore_ascii_case(KAFKA_SASL_SCRAM_SHA_256) {
+        return Ok(KAFKA_SASL_SCRAM_SHA_256);
+    }
+    if mechanism.eq_ignore_ascii_case(KAFKA_SASL_SCRAM_SHA_512) {
+        return Ok(KAFKA_SASL_SCRAM_SHA_512);
+    }
+    Err(TargetError::Configuration(
+        "kafka sasl_mechanism must be one of: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512".to_string(),
+    ))
 }
 
 impl KafkaArgs {
@@ -89,6 +153,24 @@ impl KafkaArgs {
             ));
         }
 
+        if self.sasl_enable {
+            if !self.tls_enable {
+                return Err(TargetError::Configuration(
+                    "kafka sasl_enable requires tls_enable for SASL_SSL".to_string(),
+                ));
+            }
+            normalize_kafka_sasl_mechanism(&self.sasl_mechanism)?;
+            if self.sasl_username.is_empty() || self.sasl_password.is_empty() {
+                return Err(TargetError::Configuration(
+                    "kafka sasl_username and sasl_password must be specified when sasl_enable is true".to_string(),
+                ));
+            }
+        } else if !self.sasl_mechanism.is_empty() || !self.sasl_username.is_empty() || !self.sasl_password.is_empty() {
+            return Err(TargetError::Configuration(
+                "kafka sasl_enable must be true when SASL fields are specified".to_string(),
+            ));
+        }
+
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
             if !path.is_absolute() {
@@ -97,6 +179,49 @@ impl KafkaArgs {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn security_config(&self, validate_tls_files: bool) -> Result<Option<SecurityConfig>, TargetError> {
+        if !self.tls_enable && !self.sasl_enable {
+            return Ok(None);
+        }
+
+        let mut security = SecurityConfig::new();
+        if !self.tls_ca.is_empty() {
+            if validate_tls_files {
+                let certs = load_cert_bundle_der_bytes(&self.tls_ca)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to parse Kafka tls_ca: {e}")))?;
+                if certs.is_empty() {
+                    return Err(TargetError::Configuration(
+                        "Kafka tls_ca did not contain any parsable certificates".to_string(),
+                    ));
+                }
+            }
+            security = security.with_ca_cert(self.tls_ca.clone());
+        }
+        if !self.tls_client_cert.is_empty() && !self.tls_client_key.is_empty() {
+            if validate_tls_files {
+                let certs = load_cert_bundle_der_bytes(&self.tls_client_cert)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to parse Kafka tls_client_cert: {e}")))?;
+                if certs.is_empty() {
+                    return Err(TargetError::Configuration(
+                        "Kafka tls_client_cert did not contain any parsable certificates".to_string(),
+                    ));
+                }
+                let _ = load_private_key(&self.tls_client_key)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to parse Kafka tls_client_key: {e}")))?;
+            }
+            security = security.with_client_cert(self.tls_client_cert.clone(), self.tls_client_key.clone());
+        }
+        if self.sasl_enable {
+            security = security.with_sasl(SaslConfig::new(
+                normalize_kafka_sasl_mechanism(&self.sasl_mechanism)?.to_string(),
+                self.sasl_username.clone(),
+                self.sasl_password.clone(),
+            ));
+        }
+
+        Ok(Some(security))
     }
 }
 
@@ -173,32 +298,7 @@ where
             .with_ack_timeout(Duration::from_secs(30))
             .with_required_acks(acks);
 
-        if self.args.tls_enable {
-            let mut security = SecurityConfig::new();
-            if !self.args.tls_ca.is_empty() {
-                let certs = load_cert_bundle_der_bytes(&self.args.tls_ca)
-                    .map_err(|e| Self::map_kafka_error(KafkaError::Config(e.to_string()), "Failed to parse Kafka tls_ca"))?;
-                if certs.is_empty() {
-                    return Err(TargetError::Configuration(
-                        "Kafka tls_ca did not contain any parsable certificates".to_string(),
-                    ));
-                }
-                security = security.with_ca_cert(self.args.tls_ca.clone());
-            }
-            if !self.args.tls_client_cert.is_empty() && !self.args.tls_client_key.is_empty() {
-                let certs = load_cert_bundle_der_bytes(&self.args.tls_client_cert).map_err(|e| {
-                    Self::map_kafka_error(KafkaError::Config(e.to_string()), "Failed to parse Kafka tls_client_cert")
-                })?;
-                if certs.is_empty() {
-                    return Err(TargetError::Configuration(
-                        "Kafka tls_client_cert did not contain any parsable certificates".to_string(),
-                    ));
-                }
-                let _ = load_private_key(&self.args.tls_client_key).map_err(|e| {
-                    Self::map_kafka_error(KafkaError::Config(e.to_string()), "Failed to parse Kafka tls_client_key")
-                })?;
-                security = security.with_client_cert(self.args.tls_client_cert.clone(), self.args.tls_client_key.clone());
-            }
+        if let Some(security) = self.args.security_config(true)? {
             config = config.with_security(security);
         }
 
@@ -438,6 +538,10 @@ mod tests {
             tls_ca: String::new(),
             tls_client_cert: String::new(),
             tls_client_key: String::new(),
+            sasl_enable: false,
+            sasl_mechanism: String::new(),
+            sasl_username: String::new(),
+            sasl_password: String::new(),
             queue_dir: String::new(),
             queue_limit: 0,
             target_type: TargetType::NotifyEvent,
@@ -495,5 +599,85 @@ mod tests {
             ..base_args()
         };
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_sasl_requires_tls() {
+        let args = KafkaArgs {
+            sasl_enable: true,
+            sasl_mechanism: KAFKA_SASL_SCRAM_SHA_512.to_string(),
+            sasl_username: "user".to_string(),
+            sasl_password: "secret".to_string(),
+            ..base_args()
+        };
+        let err = args.validate().expect_err("SASL without TLS should fail");
+        assert!(err.to_string().contains("requires tls_enable"));
+    }
+
+    #[test]
+    fn test_validate_sasl_requires_username_and_password() {
+        let args = KafkaArgs {
+            tls_enable: true,
+            sasl_enable: true,
+            sasl_mechanism: KAFKA_SASL_PLAIN.to_string(),
+            sasl_username: "user".to_string(),
+            sasl_password: String::new(),
+            ..base_args()
+        };
+        let err = args.validate().expect_err("SASL credentials should be paired");
+        assert!(err.to_string().contains("sasl_username and sasl_password"));
+    }
+
+    #[test]
+    fn test_validate_sasl_rejects_unsupported_mechanism() {
+        let args = KafkaArgs {
+            tls_enable: true,
+            sasl_enable: true,
+            sasl_mechanism: "OAUTHBEARER".to_string(),
+            sasl_username: "user".to_string(),
+            sasl_password: "secret".to_string(),
+            ..base_args()
+        };
+        let err = args.validate().expect_err("unsupported SASL mechanism should fail");
+        assert!(err.to_string().contains("sasl_mechanism must be one of"));
+    }
+
+    #[test]
+    fn test_security_config_includes_sasl() {
+        let args = KafkaArgs {
+            tls_enable: true,
+            sasl_enable: true,
+            sasl_mechanism: "scram-sha-512".to_string(),
+            sasl_username: "user".to_string(),
+            sasl_password: "secret".to_string(),
+            ..base_args()
+        };
+
+        let security = args
+            .security_config(false)
+            .expect("valid security config")
+            .expect("security should be configured");
+        let sasl = security.sasl_config().expect("SASL should be configured");
+
+        assert_eq!(sasl.mechanism(), KAFKA_SASL_SCRAM_SHA_512);
+        assert_eq!(sasl.username(), "user");
+        assert_eq!(sasl.password(), "secret");
+    }
+
+    #[test]
+    fn test_debug_redacts_sasl_password_and_tls_key() {
+        let rendered = format!(
+            "{:?}",
+            KafkaArgs {
+                tls_client_key: "/tmp/client.key".to_string(),
+                sasl_enable: true,
+                sasl_password: "super-secret".to_string(),
+                ..base_args()
+            }
+        );
+
+        assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("/tmp/client.key"));
+        assert!(rendered.contains("***REDACTED***"));
     }
 }

@@ -3202,6 +3202,8 @@ impl DefaultObjectUsecase {
                 key: Some(v.object_name.clone()),
                 version_id: if is_dir_object(v.object_name.as_str()) && v.version_id == Some(Uuid::nil()) {
                     None
+                } else if v.version_id == Some(Uuid::nil()) {
+                    Some("null".to_string())
                 } else {
                     v.version_id.map(|v| v.to_string())
                 },
@@ -5156,6 +5158,15 @@ mod tests {
 
         let err = usecase.execute_delete_objects(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn normalize_delete_objects_version_id_preserves_explicit_null_marker() {
+        let (wire_version_id, internal_version_id) =
+            normalize_delete_objects_version_id(Some("null".to_string())).expect("null version marker should parse");
+
+        assert_eq!(wire_version_id.as_deref(), Some("null"));
+        assert_eq!(internal_version_id, Some(Uuid::nil()));
     }
 
     #[test]

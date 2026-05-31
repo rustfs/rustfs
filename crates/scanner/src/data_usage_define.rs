@@ -15,7 +15,7 @@
 use s3s::dto::BucketLifecycleConfiguration;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{Arc, LazyLock, Once},
     time::SystemTime,
@@ -27,7 +27,6 @@ use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, hash_path,
 };
-use rustfs_data_usage::{DataUsageCache as SharedDataUsageCache, DataUsageCacheInfo as SharedDataUsageCacheInfo};
 use rustfs_ecstore::{
     StorageAPI,
     bucket::{lifecycle::lifecycle::TRANSITION_COMPLETE, replication::ReplicationConfig},
@@ -238,28 +237,6 @@ pub struct DataUsageCache {
 }
 
 impl DataUsageCache {
-    fn as_shared(&self) -> SharedDataUsageCache {
-        SharedDataUsageCache {
-            info: SharedDataUsageCacheInfo {
-                name: self.info.name.clone(),
-                next_cycle: self.info.next_cycle,
-                last_update: self.info.last_update,
-                skip_healing: self.info.skip_healing,
-                failed_objects: self.info.failed_objects.clone(),
-            },
-            cache: self.cache.clone(),
-        }
-    }
-
-    fn apply_shared_state(&mut self, shared: SharedDataUsageCache) {
-        self.info.name = shared.info.name;
-        self.info.next_cycle = shared.info.next_cycle;
-        self.info.last_update = shared.info.last_update;
-        self.info.skip_healing = shared.info.skip_healing;
-        self.info.failed_objects = shared.info.failed_objects;
-        self.cache = shared.cache;
-    }
-
     fn ensure_cache_save_metrics_registered() {
         CACHE_SAVE_METRICS_ONCE.call_once(|| {
             describe_counter!(
@@ -286,15 +263,19 @@ impl DataUsageCache {
     }
 
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
-        let mut shared = self.as_shared();
-        shared.replace(path, parent, e);
-        self.apply_shared_state(shared);
+        let hash = hash_path(path);
+        self.cache.insert(hash.key(), e);
+        if !parent.is_empty() {
+            let parent_hash = hash_path(parent);
+            self.cache.entry(parent_hash.key()).or_default().add_child(&hash);
+        }
     }
 
     pub fn replace_hashed(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, e: &DataUsageEntry) {
-        let mut shared = self.as_shared();
-        shared.replace_hashed(hash, parent, e);
-        self.apply_shared_state(shared);
+        self.cache.insert(hash.key(), e.clone());
+        if let Some(parent) = parent {
+            self.cache.entry(parent.key()).or_default().add_child(hash);
+        }
     }
 
     pub fn find(&self, path: &str) -> Option<&DataUsageEntry> {
@@ -302,73 +283,278 @@ impl DataUsageCache {
     }
 
     pub fn find_children_copy(&mut self, h: DataUsageHash) -> DataUsageHashMap {
-        let mut shared = self.as_shared();
-        let children = shared.find_children_copy(h);
-        self.apply_shared_state(shared);
-        children
+        self.cache.entry(h.string()).or_default().children.clone()
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
-        self.as_shared().flatten(root)
+        let mut root = root.clone();
+        for id in root.children.clone().iter() {
+            if let Some(e) = self.cache.get(id) {
+                let mut e = e.clone();
+                if !e.children.is_empty() {
+                    e = self.flatten(&e);
+                }
+                root.merge(&e);
+            }
+        }
+        root.children.clear();
+        root
     }
 
     pub fn copy_with_children(&mut self, src: &DataUsageCache, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
-        let mut shared = self.as_shared();
-        shared.copy_with_children(&src.as_shared(), hash, parent);
-        self.apply_shared_state(shared);
+        if let Some(e) = src.cache.get(&hash.string()) {
+            self.cache.insert(hash.key(), e.clone());
+            for ch in e.children.iter() {
+                if *ch == hash.key() {
+                    return;
+                }
+                self.copy_with_children(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()));
+            }
+            if let Some(parent) = parent {
+                self.cache.entry(parent.key()).or_default().add_child(hash);
+            }
+        }
     }
 
     pub fn delete_recursive(&mut self, hash: &DataUsageHash) {
-        let mut shared = self.as_shared();
-        shared.delete_recursive(hash);
-        self.apply_shared_state(shared);
+        let mut need_remove = Vec::new();
+        if let Some(v) = self.cache.get(&hash.string()) {
+            for child in v.children.iter() {
+                need_remove.push(child.clone());
+            }
+        }
+        self.cache.remove(&hash.string());
+        for child in need_remove {
+            self.delete_recursive(&DataUsageHash(child));
+        }
     }
 
     pub fn size_recursive(&self, path: &str) -> Option<DataUsageEntry> {
-        self.as_shared().size_recursive(path)
+        match self.find(path) {
+            Some(root) => {
+                if root.children.is_empty() {
+                    return Some(root.clone());
+                }
+                let mut flat = self.flatten(root);
+                if flat.replication_stats.as_ref().is_some_and(|stats| stats.empty()) {
+                    flat.replication_stats = None;
+                }
+                Some(flat)
+            }
+            None => None,
+        }
     }
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
-        self.as_shared().search_parent(hash)
+        let want = hash.key();
+        if let Some(last_index) = want.rfind('/')
+            && let Some(v) = self.find(&want[0..last_index])
+            && v.children.contains(&want)
+        {
+            return Some(hash_path(&want[0..last_index]));
+        }
+
+        for (k, v) in self.cache.iter() {
+            if v.children.contains(&want) {
+                return Some(DataUsageHash(k.clone()));
+            }
+        }
+        None
     }
 
     pub fn is_compacted(&self, hash: &DataUsageHash) -> bool {
-        self.as_shared().is_compacted(hash)
+        self.cache.get(&hash.key()).is_some_and(|due| due.compacted)
     }
 
     pub fn force_compact(&mut self, limit: usize) {
-        let mut shared = self.as_shared();
-        shared.force_compact(limit);
-        self.apply_shared_state(shared);
+        if self.cache.len() < limit {
+            return;
+        }
+        let top = hash_path(&self.info.name).key();
+        let Some(top_e) = self.find(&top).cloned() else {
+            return;
+        };
+
+        if top_e.children.len() > 250_000 {
+            self.reduce_children_of(&hash_path(&self.info.name), limit, true);
+        }
+        if self.cache.len() <= limit {
+            return;
+        }
+
+        let mut found = HashSet::new();
+        found.insert(top);
+        mark(self, &top_e, &mut found);
+        self.cache.retain(|k, _| found.contains(k));
     }
 
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
-        let mut shared = self.as_shared();
-        shared.reduce_children_of(path, limit, compact_self);
-        self.apply_shared_state(shared);
+        let Some(e) = self.cache.get(&path.key()).cloned() else {
+            return;
+        };
+
+        if e.compacted {
+            return;
+        }
+
+        if e.children.len() > limit && compact_self {
+            let mut flat = self.size_recursive(&path.key()).unwrap_or_default();
+            flat.compacted = true;
+            self.delete_recursive(path);
+            self.replace_hashed(path, &None, &flat);
+            return;
+        }
+
+        let total = self.total_children_rec(&path.key());
+        if total < limit {
+            return;
+        }
+
+        let mut leaves = Vec::new();
+        let mut remove = total - limit;
+        add(self, path, &mut leaves);
+        leaves.sort_by_key(|a| a.objects);
+
+        while remove > 0 && !leaves.is_empty() {
+            let Some(e) = leaves.first() else {
+                break;
+            };
+            let candidate = e.path.clone();
+            if candidate == *path && !compact_self {
+                break;
+            }
+            let removing = self.total_children_rec(&candidate.key());
+            let mut flat = match self.size_recursive(&candidate.key()) {
+                Some(flat) => flat,
+                None => {
+                    leaves.remove(0);
+                    continue;
+                }
+            };
+
+            flat.compacted = true;
+            self.delete_recursive(&candidate);
+            self.replace_hashed(&candidate, &None, &flat);
+
+            remove -= removing;
+            leaves.remove(0);
+        }
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
-        self.as_shared().total_children_rec(path)
+        let Some(root) = self.find(path) else {
+            return 0;
+        };
+        if root.children.is_empty() {
+            return 0;
+        }
+
+        let mut n = root.children.len();
+        for ch in root.children.iter() {
+            n += self.total_children_rec(ch);
+        }
+        n
     }
 
     pub fn merge(&mut self, o: &DataUsageCache) {
-        let mut shared = self.as_shared();
-        shared.merge(&o.as_shared());
-        self.apply_shared_state(shared);
+        let Some(mut existing_root) = self.root() else {
+            if o.root().is_none() {
+                return;
+            }
+            *self = o.clone();
+            return;
+        };
+
+        let Some(other_root) = o.root() else {
+            return;
+        };
+
+        if o.info.last_update > self.info.last_update {
+            self.info.last_update = o.info.last_update;
+        }
+
+        existing_root.merge(&other_root);
+        self.cache.insert(hash_path(&self.info.name).key(), existing_root);
+
+        let root_hash = self.root_hash();
+        for key in other_root.children.iter() {
+            let Some(entry) = o.cache.get(key) else {
+                continue;
+            };
+            let flat = o.flatten(entry);
+            if let Some(existing) = self.cache.get_mut(key) {
+                existing.merge(&flat);
+            } else {
+                self.replace_hashed(&DataUsageHash(key.clone()), &Some(root_hash.clone()), &flat);
+            }
+        }
     }
 
     pub fn root_hash(&self) -> DataUsageHash {
-        self.as_shared().root_hash()
+        hash_path(&self.info.name)
     }
 
     pub fn root(&self) -> Option<DataUsageEntry> {
-        self.as_shared().root()
+        self.find(&self.info.name).cloned()
     }
 
     /// Convert cache to DataUsageInfo for a specific path
     pub fn dui(&self, path: &str, buckets: &[String]) -> DataUsageInfo {
-        self.as_shared().dui(path, buckets)
+        let e = match self.find(path) {
+            Some(e) => e,
+            None => return DataUsageInfo::default(),
+        };
+        let flat = self.flatten(e);
+
+        let mut buckets_usage = HashMap::new();
+        for bucket_name in buckets.iter() {
+            let e = match self.find(bucket_name) {
+                Some(e) => e,
+                None => continue,
+            };
+            let flat = self.flatten(e);
+            let mut bui = BucketUsageInfo {
+                size: flat.size as u64,
+                versions_count: flat.versions as u64,
+                objects_count: flat.objects as u64,
+                delete_markers_count: flat.delete_markers as u64,
+                object_size_histogram: flat.obj_sizes.to_map(),
+                object_versions_histogram: flat.obj_versions.to_map(),
+                ..Default::default()
+            };
+
+            if let Some(rs) = &flat.replication_stats {
+                bui.replica_size = rs.replica_size;
+                bui.replica_count = rs.replica_count;
+
+                for (arn, stat) in rs.targets.iter() {
+                    bui.replication_info.insert(
+                        arn.clone(),
+                        BucketTargetUsageInfo {
+                            replication_pending_size: stat.pending_size,
+                            replicated_size: stat.replicated_size,
+                            replication_failed_size: stat.failed_size,
+                            replication_pending_count: stat.pending_count,
+                            replication_failed_count: stat.failed_count,
+                            replicated_count: stat.replicated_count,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            buckets_usage.insert(bucket_name.clone(), bui);
+        }
+
+        DataUsageInfo {
+            last_update: self.info.last_update,
+            objects_total_count: flat.objects as u64,
+            versions_total_count: flat.versions as u64,
+            delete_markers_total_count: flat.delete_markers as u64,
+            objects_total_size: flat.size as u64,
+            buckets_count: e.children.len() as u64,
+            buckets_usage,
+            ..Default::default()
+        }
     }
 
     pub fn marshal_msg(&self) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
@@ -672,6 +858,40 @@ impl DataUsageCache {
     }
 }
 
+#[derive(Default, Clone)]
+struct Inner {
+    objects: usize,
+    path: DataUsageHash,
+}
+
+fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec<Inner>) {
+    let e = match data_usage_cache.cache.get(&path.key()) {
+        Some(e) => e,
+        None => return,
+    };
+    if !e.children.is_empty() {
+        return;
+    }
+
+    let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
+    leaves.push(Inner {
+        objects: sz.objects,
+        path: path.clone(),
+    });
+    for ch in e.children.iter() {
+        add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
+    }
+}
+
+fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>) {
+    for k in entry.children.iter() {
+        found.insert(k.to_string());
+        if let Some(ch) = duc.cache.get(k) {
+            mark(duc, ch, found);
+        }
+    }
+}
+
 /// Trait for storage-specific operations on DataUsageCache
 #[async_trait::async_trait]
 pub trait DataUsageCacheStorage {
@@ -801,6 +1021,111 @@ mod tests {
 
         let decoded: DataUsageEntry = serde_json::from_value(value).expect("Failed to deserialize entry");
         assert_eq!(decoded.failed_objects, 0);
+    }
+
+    #[test]
+    fn test_data_usage_cache_mutations_update_in_place() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                failed_objects: HashMap::from([("bad-object".to_string(), 7)]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let root_hash = hash_path("bucket");
+        let child_hash = hash_path("bucket/a");
+        let grandchild_hash = hash_path("bucket/a/b");
+
+        cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &child_hash,
+            &Some(root_hash.clone()),
+            &DataUsageEntry {
+                objects: 2,
+                size: 20,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &grandchild_hash,
+            &Some(child_hash.clone()),
+            &DataUsageEntry {
+                objects: 3,
+                size: 30,
+                ..Default::default()
+            },
+        );
+
+        assert!(cache.find("bucket").unwrap().children.contains(&child_hash.key()));
+        assert!(cache.find("bucket/a").unwrap().children.contains(&grandchild_hash.key()));
+        assert_eq!(cache.search_parent(&grandchild_hash), Some(child_hash.clone()));
+        assert_eq!(cache.info.failed_objects.get("bad-object"), Some(&7));
+
+        let flat = cache.size_recursive("bucket").unwrap();
+        assert_eq!(flat.objects, 5);
+        assert_eq!(flat.size, 50);
+        assert!(flat.children.is_empty());
+    }
+
+    #[test]
+    fn test_data_usage_cache_copy_and_delete_recursive() {
+        let root_hash = hash_path("bucket");
+        let child_hash = hash_path("bucket/a");
+        let grandchild_hash = hash_path("bucket/a/b");
+
+        let mut src = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        src.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+        src.replace_hashed(
+            &child_hash,
+            &Some(root_hash.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        src.replace_hashed(
+            &grandchild_hash,
+            &Some(child_hash.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut dst = DataUsageCache {
+            info: src.info.clone(),
+            ..Default::default()
+        };
+        dst.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+        dst.copy_with_children(&src, &child_hash, &Some(root_hash.clone()));
+
+        assert!(dst.cache.contains_key(&child_hash.key()));
+        assert!(dst.cache.contains_key(&grandchild_hash.key()));
+        assert!(dst.find("bucket").unwrap().children.contains(&child_hash.key()));
+        assert!(dst.find("bucket/a").unwrap().children.contains(&grandchild_hash.key()));
+
+        dst.delete_recursive(&child_hash);
+
+        assert!(!dst.cache.contains_key(&child_hash.key()));
+        assert!(!dst.cache.contains_key(&grandchild_hash.key()));
+        assert!(dst.cache.contains_key(&root_hash.key()));
+    }
+
+    #[test]
+    fn test_find_children_copy_preserves_missing_entry_behavior() {
+        let mut cache = DataUsageCache::default();
+        let missing_hash = hash_path("missing");
+
+        assert!(cache.find_children_copy(missing_hash.clone()).is_empty());
+        assert!(cache.cache.contains_key(&missing_hash.key()));
     }
 
     #[test]
