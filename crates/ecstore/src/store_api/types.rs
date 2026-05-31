@@ -1427,7 +1427,10 @@ mod tests {
         assert!(Arc::ptr_eq(&original.parts, &cloned.parts));
 
         // Verify Arc-wrapped data is accessible through the clone
-        assert_eq!(cloned.user_defined.get("content-type").map(String::as_str), Some("application/octet-stream"));
+        assert_eq!(
+            cloned.user_defined.get("content-type").map(String::as_str),
+            Some("application/octet-stream")
+        );
         assert_eq!(cloned.user_tags.as_str(), "env=prod&team=storage");
         assert_eq!(cloned.parts.len(), 2);
         assert_eq!(cloned.parts[0].number, 1);
