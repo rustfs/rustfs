@@ -1241,7 +1241,16 @@ async fn select_from(
     Ok(true)
 }
 
-// TODO: exit when cancel
+async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEntry>, entry: MetaCacheEntry) -> Result<bool> {
+    tokio::select! {
+        result = out_channel.send(entry) => {
+            result.map_err(Error::other)?;
+            Ok(true)
+        }
+        _ = rx.cancelled() => Ok(false),
+    }
+}
+
 async fn merge_entry_channels(
     rx: CancellationToken,
     in_channels: Vec<Receiver<MetaCacheEntry>>,
@@ -1259,7 +1268,9 @@ async fn merge_entry_channels(
                 has_entry = in_channels[0].recv()=>{
                     if let Some(entry) = has_entry{
                         // warn!("merge_entry_channels entry {}", &entry.name);
-                        out_channel.send(entry).await.map_err(Error::other)?;
+                        if !send_or_cancel(&rx, &out_channel, entry).await? {
+                            return Ok(());
+                        }
                     } else {
                         return Ok(())
                     }
@@ -1404,7 +1415,9 @@ async fn merge_entry_channels(
         if let Some(best_entry) = &best
             && best_entry.name > last
         {
-            out_channel.send(best_entry.clone()).await.map_err(Error::other)?;
+            if !send_or_cancel(&rx, &out_channel, best_entry.clone()).await? {
+                return Ok(());
+            }
             last = best_entry.name.clone();
         }
 
@@ -2370,6 +2383,39 @@ mod test {
             .expect("multi-channel merge should not hang after cancellation")
             .expect("task should not panic");
         assert!(result.is_ok(), "multi-channel merge should return Ok on cancellation");
+
+        drop(tx_a);
+        drop(tx_b);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_respects_cancellation_when_output_is_full() {
+        let (tx_a, rx_a) = mpsc::channel::<MetaCacheEntry>(4);
+        let (tx_b, rx_b) = mpsc::channel::<MetaCacheEntry>(4);
+        let (out_tx, _out_rx) = mpsc::channel(1);
+
+        out_tx
+            .send(test_meta_entry("already-buffered"))
+            .await
+            .expect("output channel should accept initial entry");
+        tx_a.send(test_meta_entry("a"))
+            .await
+            .expect("input channel a should accept entry");
+        tx_b.send(test_meta_entry("b"))
+            .await
+            .expect("input channel b should accept entry");
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        let handle = tokio::spawn(merge_entry_channels(cancel_clone, vec![rx_a, rx_b], out_tx, 1));
+        cancel.cancel();
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("merge should not hang when output is full and cancellation fires")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "merge should return Ok when cancelled during output send");
 
         drop(tx_a);
         drop(tx_b);
