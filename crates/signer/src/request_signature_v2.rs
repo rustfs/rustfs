@@ -460,7 +460,7 @@ mod tests {
             .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
 
         let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
-        let expected_string_to_sign = string_to_sign_v2(&req, false);
+        let expected_string_to_sign = try_string_to_sign_v2(&req, false).expect("string to sign should build");
         let expected_signature = base64_simd::URL_SAFE_NO_PAD.encode_to_string(hmac_sha1("SECRET", expected_string_to_sign));
 
         assert_eq!(
