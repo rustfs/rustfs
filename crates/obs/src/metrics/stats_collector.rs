@@ -875,6 +875,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let versions_scanned = metrics.life_time_ilm.values().copied().sum();
     let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
     let last_activity_seconds = Utc::now().signed_duration_since(reference_time).num_seconds().max(0) as u64;
+    let active_paths = metrics.ongoing_buckets as u64;
 
     Some(ScannerStats {
         bucket_scans_finished,
@@ -886,6 +887,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
         objects_scanned,
         versions_scanned,
         last_activity_seconds,
+        active_paths,
     })
 }
 
