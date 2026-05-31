@@ -278,6 +278,7 @@ pub enum MetricName {
     ScannerObjectsScanned,
     ScannerVersionsScanned,
     ScannerLastActivitySeconds,
+    ScannerActivePaths,
 
     // CPU system-related metrics
     SysCPUAvgIdle,
@@ -618,6 +619,7 @@ impl MetricName {
             Self::ScannerObjectsScanned => "objects_scanned".to_string(),
             Self::ScannerVersionsScanned => "versions_scanned".to_string(),
             Self::ScannerLastActivitySeconds => "last_activity_seconds".to_string(),
+            Self::ScannerActivePaths => "active_paths".to_string(),
 
             // CPU system-related metrics
             Self::SysCPUAvgIdle => "avg_idle".to_string(),

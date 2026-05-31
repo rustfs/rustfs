@@ -370,6 +370,8 @@ pub struct ScannerMetricsReport {
     pub current_started: DateTime<Utc>,
     pub cycles_completed_at: Vec<DateTime<Utc>>,
     pub ongoing_buckets: usize,
+    #[serde(default)]
+    pub active_scan_paths: usize,
     pub life_time_ops: HashMap<String, u64>,
     pub life_time_ilm: HashMap<String, u64>,
     pub last_minute: ScannerLastMinute,
@@ -600,18 +602,22 @@ impl Metrics {
     pub async fn report(&self) -> ScannerMetricsReport {
         let mut m = ScannerMetricsReport::default();
 
-        if let Some(cycle) = self.get_cycle().await {
+        let has_cycle = if let Some(cycle) = self.get_cycle().await {
             m.current_cycle = cycle.current;
             m.cycles_completed_at = cycle.cycle_completed;
             m.current_started = cycle.started;
-        }
+            true
+        } else {
+            false
+        };
 
-        if let Some(init_time) = crate::get_global_init_time().await {
+        if !has_cycle && let Some(init_time) = crate::get_global_init_time().await {
             m.current_started = init_time;
         }
 
         m.collected_at = Utc::now();
         m.active_paths = self.get_current_paths().await;
+        m.active_scan_paths = m.active_paths.len();
 
         // Lifetime operation counts
         for i in 0..Metric::Last as usize {
@@ -745,5 +751,48 @@ impl Drop for CloseDiskGuard {
             handle.spawn(async move { close_fn().await });
         }
         // If there is no runtime we are in a test or shutdown path; skip cleanup.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn report_counts_active_scan_paths() {
+        let metrics = Metrics::new();
+        metrics
+            .current_paths
+            .write()
+            .await
+            .insert("disk-a".to_string(), Arc::new(CurrentPathTracker::new("bucket-a".to_string())));
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.active_scan_paths, 1);
+        assert_eq!(report.ongoing_buckets, 0);
+        assert_eq!(report.active_paths, vec!["disk-a/bucket-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn report_preserves_current_cycle_started_time() {
+        let previous_init_time = *crate::globals::GLOBAL_INIT_TIME.read().await;
+        let init_time = Utc::now() - chrono::Duration::hours(1);
+        let cycle_started = Utc::now();
+        *crate::globals::GLOBAL_INIT_TIME.write().await = Some(init_time);
+
+        let metrics = Metrics::new();
+        metrics
+            .set_cycle(Some(CurrentCycle {
+                current: 7,
+                started: cycle_started,
+                ..Default::default()
+            }))
+            .await;
+
+        let report = metrics.report().await;
+        *crate::globals::GLOBAL_INIT_TIME.write().await = previous_init_time;
+
+        assert_eq!(report.current_started, cycle_started);
     }
 }
