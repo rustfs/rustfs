@@ -35,9 +35,20 @@ impl ECStore {
                 ns_lock
                     .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| StorageError::other(format!(
-                        "make_bucket: failed to acquire write lock on {bucket}: {e}"
-                    )))?,
+                    .map_err(|e| match e {
+                        rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
+                            StorageError::NamespaceLockQuorumUnavailable {
+                                mode: "write",
+                                bucket: bucket.to_string(),
+                                object: bucket.to_string(),
+                                required,
+                                achieved,
+                            }
+                        }
+                        other => StorageError::other(format!(
+                            "make_bucket: failed to acquire write lock on {bucket}: {other}"
+                        )),
+                    })?,
             )
         } else {
             None
@@ -130,9 +141,20 @@ impl ECStore {
                 ns_lock
                     .get_write_lock(get_lock_acquire_timeout())
                     .await
-                    .map_err(|e| StorageError::other(format!(
-                        "delete_bucket: failed to acquire write lock on {bucket}: {e}"
-                    )))?,
+                    .map_err(|e| match e {
+                        rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
+                            StorageError::NamespaceLockQuorumUnavailable {
+                                mode: "write",
+                                bucket: bucket.to_string(),
+                                object: bucket.to_string(),
+                                required,
+                                achieved,
+                            }
+                        }
+                        other => StorageError::other(format!(
+                            "delete_bucket: failed to acquire write lock on {bucket}: {other}"
+                        )),
+                    })?,
             )
         } else {
             None

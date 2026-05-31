@@ -2306,18 +2306,33 @@ mod test {
 
     #[tokio::test]
     async fn merge_entry_channels_respects_cancellation() {
-        let (tx_a, rx_a) = mpsc::channel::<MetaCacheEntry>(4);
-        let (tx_b, rx_b) = mpsc::channel::<MetaCacheEntry>(4);
-        let (out_tx, _out_rx) = mpsc::channel(8);
-
-        // Drop senders so channels close immediately, allowing select_from to return None
-        drop(tx_a);
-        drop(tx_b);
+        let (tx, rx) = mpsc::channel::<MetaCacheEntry>(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
 
         let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Use a single channel so the cancellation check in tokio::select! is exercised.
+        let handle = tokio::spawn(merge_entry_channels(cancel_clone, vec![rx], out_tx, 1));
+
+        // Send an entry to prove the function is running and processing data.
+        tx.send(test_meta_entry("a")).await.unwrap();
+        let received = timeout(Duration::from_millis(500), out_rx.recv())
+            .await
+            .expect("should receive entry before cancellation")
+            .map(|e| e.name);
+        assert_eq!(received, Some("a".to_string()));
+
+        // Cancel while the sender is still alive (channel is not closed).
         cancel.cancel();
 
-        let result = merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1).await;
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("merge should not hang after cancellation")
+            .expect("task should not panic");
         assert!(result.is_ok(), "merge should return Ok on cancellation");
+
+        // Keep tx alive until after the assertion so the channel doesn't close prematurely.
+        drop(tx);
     }
 }

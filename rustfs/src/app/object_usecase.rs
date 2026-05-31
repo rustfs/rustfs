@@ -558,7 +558,7 @@ fn delete_replication_state_from_config(
 ) -> Option<ReplicationState> {
     let opts = ReplicationObjectOpts {
         name: obj_info.name.clone(),
-        user_tags: obj_info.user_tags.clone(),
+        user_tags: (*obj_info.user_tags).clone(),
         version_id,
         delete_marker: obj_info.delete_marker,
         op_type: ReplicationType::Delete,
@@ -1316,7 +1316,7 @@ impl DefaultObjectUsecase {
         check_preconditions(&req.headers, &info)?;
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
-        for part in &info.parts {
+        for part in info.parts.iter() {
             debug!(
                 part_number = part.number,
                 part_size = part.size,
@@ -2766,7 +2766,10 @@ impl DefaultObjectUsecase {
             src_info.metadata_only = true;
         }
 
-        strip_managed_encryption_metadata(&mut src_info.user_defined);
+        // Extract user_defined from Arc for mutation; it will be re-wrapped after all edits.
+        let mut user_defined = (*src_info.user_defined).clone();
+
+        strip_managed_encryption_metadata(&mut user_defined);
 
         let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
 
@@ -2780,27 +2783,27 @@ impl DefaultObjectUsecase {
             insert_str(&mut compress_metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
-            remove_str(&mut src_info.user_defined, SUFFIX_COMPRESSION);
-            remove_str(&mut src_info.user_defined, SUFFIX_ACTUAL_SIZE);
-            remove_str(&mut src_info.user_defined, SUFFIX_COMPRESSION_SIZE);
+            remove_str(&mut user_defined, SUFFIX_COMPRESSION);
+            remove_str(&mut user_defined, SUFFIX_ACTUAL_SIZE);
+            remove_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE);
         }
 
         // Handle MetadataDirective REPLACE: replace user metadata while preserving system metadata.
         // System metadata (compression, encryption) is added after this block to ensure
         // it's not cleared by the REPLACE operation.
         if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
-            src_info.user_defined.clear();
+            user_defined.clear();
             if let Some(metadata) = metadata {
-                src_info.user_defined.extend(metadata);
+                user_defined.extend(metadata);
             }
             if let Some(ct) = content_type {
                 src_info.content_type = Some(ct.clone());
-                src_info.user_defined.insert("content-type".to_string(), ct);
+                user_defined.insert("content-type".to_string(), ct);
             }
         }
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
-        remove_object_lock_metadata_for_copy(&mut src_info.user_defined);
+        remove_object_lock_metadata_for_copy(&mut user_defined);
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
             object_lock_legal_hold_status,
@@ -2809,9 +2812,9 @@ impl DefaultObjectUsecase {
         )
         .await?
         {
-            src_info.user_defined.extend(object_lock_metadata);
+            user_defined.extend(object_lock_metadata);
         }
-        apply_bucket_default_lock_retention(&bucket, &mut src_info.user_defined, has_explicit_object_lock_retention).await?;
+        apply_bucket_default_lock_retention(&bucket, &mut user_defined, has_explicit_object_lock_retention).await?;
 
         let mut reader = if should_compress {
             let hrd = HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
@@ -2848,7 +2851,7 @@ impl DefaultObjectUsecase {
             reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                 .map_err(ApiError::from)?;
 
-            src_info.user_defined.extend(encryption_material_to_metadata(&material));
+            user_defined.extend(encryption_material_to_metadata(&material));
         }
 
         src_info.put_object_reader = Some(PutObjReader::new(reader));
@@ -2856,8 +2859,10 @@ impl DefaultObjectUsecase {
         // check quota
 
         for (k, v) in compress_metadata {
-            src_info.user_defined.insert(k, v);
+            user_defined.insert(k, v);
         }
+
+        src_info.user_defined = Arc::new(user_defined);
 
         self.check_bucket_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
             .await?;
@@ -3855,7 +3860,7 @@ impl DefaultObjectUsecase {
         }
 
         let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), *rreq.days.as_ref().unwrap_or(&1));
-        let mut metadata = obj_info.user_defined.clone();
+        let mut metadata = (*obj_info.user_defined).clone();
 
         let mut header = HeaderMap::new();
 
@@ -3887,7 +3892,7 @@ impl DefaultObjectUsecase {
                     .to_string(),
                 );
             }
-            obj_info.user_defined = metadata;
+            obj_info.user_defined = Arc::new(metadata);
 
             store
                 .clone()
@@ -4967,7 +4972,7 @@ mod tests {
         let metadata = HashMap::new();
         let standard_info = ObjectInfo {
             storage_class: Some(storageclass::STANDARD.to_string()),
-            user_defined: metadata.clone(),
+            user_defined: Arc::new(metadata.clone()),
             ..Default::default()
         };
         assert!(response_storage_class(&standard_info, &metadata).is_none());
@@ -4976,7 +4981,7 @@ mod tests {
         metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string());
         let infrequent_access_info = ObjectInfo {
             storage_class: Some(storageclass::STANDARD_IA.to_string()),
-            user_defined: metadata.clone(),
+            user_defined: Arc::new(metadata.clone()),
             ..Default::default()
         };
         assert_eq!(
