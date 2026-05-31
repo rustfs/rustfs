@@ -38,6 +38,7 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 
 - `GHSA-pq29-69jg-9mxc`: RPC `read_file_stream` joined untrusted paths under a volume directory without canonical boundary checks. Lesson: `PathBuf::join` plus length checks are not path security.
 - `GHSA-8r6f-hmq2-28rg`: object keys containing traversal sequences bypassed bucket/object authorization when mapped to filesystem paths. Lesson: reject traversal at object-key parsing and verify final storage paths remain under the expected bucket/key root.
+- `GHSA-f4vq-9ffr-m8m3`: Snowball auto-extract accepted archive entries such as `../victim-bucket/object`, authorized the raw attacker-bucket path, then storage path cleaning crossed bucket boundaries. Lesson: archive entries become object keys and need traversal rejection plus consistent authz/storage normalization before writes.
 
 ### Secrets, defaults, and cryptographic misuse
 
@@ -55,6 +56,7 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 
 - `GHSA-gw2x-q739-qhcr`: malformed gRPC `GetMetrics` payloads reached `unwrap()` on deserialization and caused remote DoS. Lesson: every network/RPC deserialization failure returns an error, not a panic.
 - `GHSA-h956-rh7x-ppgj` and `GHSA-r5qv-rc46-hv8q`: weak RPC auth increased reachability of otherwise internal handlers. Lesson: panic bugs become more severe when internode auth is weak or defaulted.
+- `GHSA-c667-rgrv-99vj`: NodeService authentication signed the service prefix instead of the concrete generated method path, so valid metadata for one RPC could be replayed to another method during the timestamp window. Lesson: RPC HMAC payloads must bind exact gRPC method path, HTTP method surrogate, timestamp, and secret.
 
 ### Browser, CORS, and console isolation
 
@@ -69,6 +71,13 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 
 - `GHSA-xrrf-67jm-3c2r`: SSE metadata reported encryption while reader composition bypassed `EncryptReader` and stored plaintext. Lesson: test actual bytes on disk and wrapper order, not only API metadata.
 
+### Serde deserialization and input validation
+
+- No `#[serde(deny_unknown_fields)]` found across the entire codebase. Lesson: all structs deserialized from untrusted input (S3 API XML/JSON, lifecycle rules, bucket policies, replication configs) should have `#[serde(deny_unknown_fields)]` to reject malformed or adversarial payloads.
+- `#[serde(default)]` on security-critical fields silently accepts missing values as zero/empty. Lesson: when a field has security implications (retention days, permissions, limits), validate the deserialized value explicitly rather than relying on defaults.
+- Integer fields deserialized from user input and cast with `as` (e.g., `i32 as u32`) can wrap negative values to large positives. Lesson: validate ranges before casting; use `try_into()` or clamp.
+- XML config typos (e.g., `"NoncurentDays"` instead of `"NoncurrentDays"`) are silently accepted when `deny_unknown_fields` is absent. Lesson: strict deserialization prevents silent misconfiguration that could cause data loss or unexpected retention behavior.
+
 ## Useful Search Seeds
 
 Use these targeted searches when a diff touches security-sensitive code:
@@ -76,10 +85,12 @@ Use these targeted searches when a diff touches security-sensitive code:
 ```bash
 rg -n "validate_admin_request|check_permissions|AdminAction::|deny_only|is_allowed" rustfs crates
 rg -n "UploadPartCopy|upload_part_copy|CompleteMultipart|PostObject|content-length-range|starts-with" rustfs crates
-rg -n "PathBuf::join|canonicalize|\\.\\.|x-forwarded-for|x-real-ip|SourceIp" rustfs crates
+rg -n "normalize_extract_entry_key|Snowball|auto-extract|PathBuf::join|canonicalize|\\.\\.|x-forwarded-for|x-real-ip|SourceIp" rustfs crates
 rg -n "DEFAULT_SECRET|DEFAULT_ACCESS|TEST_PRIVATE_KEY|rustfs rpc|RUSTFS_RPC_SECRET" rustfs crates
+rg -n "TONIC_RPC_PREFIX|verify_rpc_signature|check_auth|NodeServiceServer|x-rustfs-signature" rustfs crates
 rg -n "debug!|trace!|info!|error!|\\?resp|\\?merged_config|session_token|secret_key" rustfs crates
 rg -n "HashReader|EncryptReader|SSE|server-side encryption|Access-Control-Allow-Credentials|Origin" rustfs crates
+rg -n "deny_unknown_fields|serde.default|as u32|as usize|as i32" rustfs crates
 ```
 
 ## Minimum Regression Test Expectations
@@ -87,7 +98,8 @@ rg -n "HashReader|EncryptReader|SSE|server-side encryption|Access-Control-Allow-
 - Authz fixes: include unauthenticated, valid low-privilege, wrong-action, correct-action, owner, non-owner, and root/admin cases as applicable.
 - IAM fixes: include import/update/list service-account cases with attacker-controlled parent, claims, access key, secret key, and policy.
 - Copy/upload fixes: include cross-bucket, cross-user, source-denied, destination-denied, copy-source-condition, and multipart completion cases.
-- Path fixes: include encoded traversal, absolute path, nested traversal, valid object keys that resemble traversal text but should be rejected, and canonical boundary checks.
+- Path fixes: include encoded traversal, absolute path, nested traversal, archive entries with `..`, valid object keys that resemble traversal text but should be rejected, and canonical bucket/prefix boundary checks.
 - Logging fixes: assert redacted output for structs and response bodies that may contain credentials.
+- RPC auth fixes: include captured metadata replay across two concrete methods, stale timestamps, wrong path, wrong method surrogate, wrong secret, and valid same-method calls.
 - Browser/CORS fixes: assert no credentials on reflected/default origins, correct behavior for explicit allowlists, and no same-origin script execution for previewed object content.
 - SSE fixes: inspect stored bytes and verify API metadata, read-back behavior, and on-disk ciphertext together.

@@ -41,7 +41,7 @@ use crate::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
     },
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
-    config::{GLOBAL_STORAGE_CLASS, storageclass},
+    config::{get_global_storage_class, storageclass},
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
@@ -283,8 +283,7 @@ fn build_tiered_decommission_file_info(
     default_parity_count: usize,
     storage_class: Option<&str>,
 ) -> (FileInfo, usize) {
-    let parity_drives = GLOBAL_STORAGE_CLASS
-        .get()
+    let parity_drives = get_global_storage_class()
         .and_then(|sc| sc.get_parity_for_sc(storage_class.unwrap_or_default()))
         .unwrap_or(default_parity_count);
     let data_drives = disk_count - parity_drives;
@@ -784,7 +783,7 @@ impl ObjectIO for SetDisks {
             }
         }
         let sc_parity_drives = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None
@@ -838,45 +837,52 @@ impl ObjectIO for SetDisks {
             let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
             let is_inline_buffer = {
-                if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+                if let Some(sc) = get_global_storage_class() {
                     sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
                 } else {
                     false
                 }
             };
 
-            let mut writers = Vec::with_capacity(shuffle_disks.len());
-            let mut errors = Vec::with_capacity(shuffle_disks.len());
-            for disk_op in shuffle_disks.iter() {
-                if let Some(disk) = disk_op
-                    && disk.is_online().await
-                {
-                    let writer = match create_bitrot_writer(
-                        is_inline_buffer,
-                        Some(disk),
-                        RUSTFS_META_TMP_BUCKET,
-                        &tmp_object,
-                        erasure.shard_file_size(data.size()),
-                        erasure.shard_size(),
-                        HashAlgorithm::HighwayHash256S,
-                    )
-                    .await
-                    {
-                        Ok(writer) => writer,
-                        Err(err) => {
-                            warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
-                            errors.push(Some(err));
-                            writers.push(None);
-                            continue;
+            let shard_file_size = erasure.shard_file_size(data.size());
+            let shard_size = erasure.shard_size();
+            let writer_futs: Vec<_> = shuffle_disks
+                .iter()
+                .map(|disk_op| {
+                    let tmp_obj = tmp_object.clone();
+                    async move {
+                        if let Some(disk) = disk_op
+                            && disk.is_online().await
+                        {
+                            match create_bitrot_writer(
+                                is_inline_buffer,
+                                Some(disk),
+                                RUSTFS_META_TMP_BUCKET,
+                                &tmp_obj,
+                                shard_file_size,
+                                shard_size,
+                                HashAlgorithm::HighwayHash256S,
+                            )
+                            .await
+                            {
+                                Ok(writer) => (Some(writer), None),
+                                Err(err) => {
+                                    warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                                    (None, Some(err))
+                                }
+                            }
+                        } else {
+                            (None, Some(DiskError::DiskNotFound))
                         }
-                    };
-
-                    writers.push(Some(writer));
-                    errors.push(None);
-                } else {
-                    errors.push(Some(DiskError::DiskNotFound));
-                    writers.push(None);
-                }
+                    }
+                })
+                .collect();
+            let writer_results = join_all(writer_futs).await;
+            let mut writers = Vec::with_capacity(writer_results.len());
+            let mut errors = Vec::with_capacity(writer_results.len());
+            for (w, e) in writer_results {
+                writers.push(w);
+                errors.push(e);
             }
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
@@ -894,13 +900,28 @@ impl ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
-                Ok((r, w)) => (r, w),
-                Err(e) => {
-                    error!("encode err {:?}", e);
-                    return Err(e.into());
+            let use_fast_path = is_inline_buffer && data.size() <= fi.erasure.block_size as i64;
+
+            let (reader, w_size) = if use_fast_path {
+                match Arc::new(erasure)
+                    .encode_inline_small(stream, &mut writers, write_quorum)
+                    .await
+                {
+                    Ok((r, w)) => (r, w),
+                    Err(e) => {
+                        error!("encode_inline_small err {:?}", e);
+                        return Err(e.into());
+                    }
                 }
-            }; // TODO: delete temporary directory on error
+            } else {
+                match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
+                    Ok((r, w)) => (r, w),
+                    Err(e) => {
+                        error!("encode err {:?}", e);
+                        return Err(e.into());
+                    }
+                }
+            };
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -3087,7 +3108,7 @@ impl MultipartOperations for SetDisks {
         }
 
         let sc_parity_drives = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None

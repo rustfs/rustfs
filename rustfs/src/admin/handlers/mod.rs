@@ -16,6 +16,7 @@ pub mod account_info;
 pub mod audit;
 mod audit_runtime_config;
 pub mod bucket_meta;
+pub mod config_admin;
 pub mod event;
 pub mod group;
 pub mod heal;
@@ -60,6 +61,12 @@ mod tests {
     fn test_handler_struct_creation() {
         // Test that handler structs can be created
         let _account_handler = account_info::AccountInfoHandler {};
+        let _get_config_kv_handler = config_admin::GetConfigKVHandler {};
+        let _set_config_kv_handler = config_admin::SetConfigKVHandler {};
+        let _del_config_kv_handler = config_admin::DelConfigKVHandler {};
+        let _help_config_kv_handler = config_admin::HelpConfigKVHandler {};
+        let _get_config_handler = config_admin::GetConfigHandler {};
+        let _set_config_handler = config_admin::SetConfigHandler {};
         let _list_audit_targets = audit::ListAuditTargets {};
         let _get_module_switches = module_switch::GetModuleSwitchesHandler {};
         let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};

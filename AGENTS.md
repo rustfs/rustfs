@@ -111,6 +111,18 @@ Do not open a PR with code changes when the required checks fail.
 cargo run -p rustfs-filemeta --example dump_fileinfo -- "/path/to/file/xl.meta"
 ```
 
+## Serde Safety
+
+- Add `#[serde(deny_unknown_fields)]` to structs deserialized from untrusted input (S3 API XML/JSON, lifecycle rules, bucket policies, replication configs).
+- When `deny_unknown_fields` is impractical (backward compatibility), at minimum log unknown fields at `warn` level.
+- Never use `#[serde(default)]` on security-critical fields without explicit validation of the resulting value.
+
+## Naming Conventions
+
+- Follow Rust API Guidelines for naming: `SCREAMING_SNAKE_CASE` for statics and constants, `snake_case` for functions and variables, `PascalCase` for types.
+- Do not use camelCase or Hungarian notation (e.g., `globalDeploymentIDPtr` → `GLOBAL_DEPLOYMENT_ID`).
+- If existing code violates naming conventions, do not widen the violation in new code. Fix opportunistically when touching the surrounding area.
+
 ## Scoped Guidance in This Repository
 
 - `.github/AGENTS.md`

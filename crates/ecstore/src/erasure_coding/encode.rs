@@ -294,6 +294,33 @@ impl Erasure {
         writers.shutdown().await?;
         Ok((reader, total))
     }
+
+    /// Fast path for small inline objects: skip tokio::spawn + mpsc channel.
+    /// Reads all data, encodes directly, writes shards sequentially.
+    pub async fn encode_inline_small<R>(
+        self: Arc<Self>,
+        mut reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::with_capacity(self.block_size);
+        let total = reader.read_to_end(&mut buf).await?;
+
+        if total == 0 {
+            return Ok((reader, 0));
+        }
+
+        let shards = self.encode_data(&buf)?;
+        let mut mw = MultiWriter::new(writers, quorum);
+        mw.write(shards).await?;
+        mw.shutdown().await?;
+        Ok((reader, total))
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +382,61 @@ mod tests {
 
         assert_eq!(written, b"small payload".len());
         assert!(!committed.lock().unwrap().is_empty());
+    }
+
+    /// encode_inline_small: empty reader returns (reader, 0) without writing to any shard.
+    #[tokio::test]
+    async fn encode_inline_small_empty_stream_returns_zero() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let writer = DeferredCommitWriter::new(committed.clone());
+        // 1 data shard, 0 parity shards, block_size = 16
+        let mut writers = vec![Some(BitrotWriterWrapper::new(
+            CustomWriter::new_tokio_writer(writer),
+            16,
+            HashAlgorithm::HighwayHash256S,
+        ))];
+
+        let erasure = Arc::new(Erasure::new(1, 0, 16));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, 1).await.unwrap();
+
+        assert_eq!(total, 0);
+        // No shutdown was called, so nothing should be committed
+        assert!(committed.lock().unwrap().is_empty());
+    }
+
+    /// encode_inline_small: small payload is encoded into the correct number of shards
+    /// and each writer receives data after shutdown.
+    #[tokio::test]
+    async fn encode_inline_small_payload_writes_all_shards() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
+            .iter()
+            .map(|c| {
+                Some(BitrotWriterWrapper::new(
+                    CustomWriter::new_tokio_writer(DeferredCommitWriter::new(c.clone())),
+                    BLOCK_SIZE / DATA_SHARDS,
+                    HashAlgorithm::HighwayHash256S,
+                ))
+            })
+            .collect();
+
+        let payload = b"hello inline small";
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(payload.to_vec()));
+        let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, DATA_SHARDS).await.unwrap();
+
+        assert_eq!(total, payload.len());
+        // All shards must have received data (shutdown flushed the bitrot header + shard bytes)
+        for (i, c) in committed.iter().enumerate() {
+            assert!(!c.lock().unwrap().is_empty(), "shard {i} should have received data");
+        }
     }
 
     #[test]

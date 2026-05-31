@@ -2557,75 +2557,57 @@ impl DiskAPI for LocalDisk {
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
-        // Read the previous xl.meta
-
-        let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
-            Ok(res) => Some(res),
-            Err(e) => {
-                let e: DiskError = to_file_error(e).into();
-
-                if e != DiskError::FileNotFound {
-                    return Err(e);
-                }
-
-                None
-            }
-        };
-
-        let mut xlmeta = FileMeta::new();
-
-        if let Some(dst_buf) = has_dst_buf.as_ref()
-            && FileMeta::is_xl2_v1_format(dst_buf)
-            && let Ok(nmeta) = FileMeta::load(dst_buf)
-        {
-            xlmeta = nmeta
-        }
-
-        let mut skip_parent = dst_volume_dir.clone();
-        if has_dst_buf.as_ref().is_some()
-            && let Some(parent) = dst_file_path.parent()
-        {
-            skip_parent = parent.to_path_buf();
-        }
-
-        // TODO: Healing
-
-        let version_id = fi.version_id.unwrap_or_default();
-        let search_version_id = Some(version_id);
         let no_inline = fi.data.is_none() && fi.size > 0;
 
-        // Check if there's an existing version with the same version_id that has a data_dir to clean up
-        // Reuse one metadata scan to find the version data_dir and determine whether it is shared.
-        let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(search_version_id);
-        if let Some(old_data_dir) = has_old_data_dir.as_ref() {
-            let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
-        }
-
-        xlmeta.add_version(fi)?;
-
-        if xlmeta.versions.len() <= 10 {
-            // TODO: Sign
-        }
-
-        if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
-            let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
-            let meta_skip_parent = if no_inline {
-                src_file_parent
-            } else {
-                src_volume_dir.as_path()
+        if no_inline {
+            // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta
+            let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
+                Ok(res) => Some(res),
+                Err(e) => {
+                    let e: DiskError = to_file_error(e).into();
+                    if e != DiskError::FileNotFound {
+                        return Err(e);
+                    }
+                    None
+                }
             };
+
+            let mut xlmeta = FileMeta::new();
+            if let Some(dst_buf) = has_dst_buf.as_ref()
+                && FileMeta::is_xl2_v1_format(dst_buf)
+                && let Ok(nmeta) = FileMeta::load(dst_buf)
+            {
+                xlmeta = nmeta
+            }
+
+            let mut skip_parent = dst_volume_dir.clone();
+            if has_dst_buf.as_ref().is_some()
+                && let Some(parent) = dst_file_path.parent()
+            {
+                skip_parent = parent.to_path_buf();
+            }
+
+            let version_id = fi.version_id.unwrap_or_default();
+            let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+            if let Some(old_data_dir) = has_old_data_dir.as_ref() {
+                let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
+            }
+            xlmeta.add_version(fi)?;
             let new_dst_buf = xlmeta.marshal_msg()?;
 
+            let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
             self.write_all_private(
                 src_volume,
-                format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(),
+                &format!("{}/{}", &src_path, STORAGE_FORMAT_FILE),
                 new_dst_buf.into(),
                 true,
-                meta_skip_parent,
+                src_file_parent,
             )
             .await?;
 
-            if no_inline && let Err(err) = rename_all(&src_data_path, &dst_data_path, &skip_parent).await {
+            if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
+                && let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await
+            {
                 let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 info!(
                     "rename all failed src_data_path: {:?}, dst_data_path: {:?}, err: {:?}",
@@ -2633,19 +2615,21 @@ impl DiskAPI for LocalDisk {
                 );
                 return Err(err);
             }
-        } else {
-            let new_dst_buf = xlmeta.marshal_msg()?;
-            self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
-                .await?;
-        }
 
-        if let Some(old_data_dir) = has_old_data_dir {
-            // preserve current xl.meta inside the oldDataDir.
-            if let Some(dst_buf) = has_dst_buf
+            if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
+                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
+                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+                }
+                info!("rename all failed err: {:?}", err);
+                return Err(err);
+            }
+
+            if let Some(old_data_dir) = has_old_data_dir
+                && let Some(dst_buf) = has_dst_buf
                 && let Err(err) = self
                     .write_all_private(
                         dst_volume,
-                        format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE).as_str(),
+                        &format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE),
                         dst_buf.into(),
                         true,
                         &skip_parent,
@@ -2655,30 +2639,106 @@ impl DiskAPI for LocalDisk {
                 info!("write_all_private failed err: {:?}", err);
                 return Err(err);
             }
-        }
 
-        if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
-            if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
-                let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+            if let Some(src_file_path_parent) = src_file_path.parent() {
+                if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
+                    let _ = remove_std(src_file_path_parent);
+                } else {
+                    let _ = self
+                        .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)
+                        .await;
+                }
             }
-            info!("rename all failed err: {:?}", err);
-            return Err(err);
-        }
 
-        if let Some(src_file_path_parent) = src_file_path.parent() {
-            if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
-                let _ = remove_std(src_file_path_parent);
+            Ok(RenameDataResp {
+                old_data_dir: has_old_data_dir,
+                sign: None,
+            })
+        } else {
+            // Inline: merge read + parse + write + rename into single spawn_blocking
+            let src = src_file_path.clone();
+            let dst = dst_file_path.clone();
+            let cleanup_path = if src_volume == super::RUSTFS_META_MULTIPART_BUCKET {
+                src_file_path.parent().map(|p| p.to_path_buf())
             } else {
-                let _ = self
-                    .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)
-                    .await;
-            }
-        }
+                None
+            };
 
-        Ok(RenameDataResp {
-            old_data_dir: has_old_data_dir,
-            sign: None, // TODO:
-        })
+            let (old_data_dir, _dst_buf) = tokio::task::spawn_blocking(move || {
+                // Read existing xl.meta
+                let has_dst_buf = match std::fs::read(&dst) {
+                    Ok(buf) => Some(Bytes::from(buf)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(to_file_error(e)),
+                };
+
+                let mut xlmeta = FileMeta::new();
+                if let Some(ref buf) = has_dst_buf
+                    && FileMeta::is_xl2_v1_format(buf)
+                    && let Ok(nmeta) = FileMeta::load(buf)
+                {
+                    xlmeta = nmeta
+                }
+
+                let version_id = fi.version_id.unwrap_or_default();
+                let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+                if let Some(d) = old_data_dir.as_ref() {
+                    let _ = xlmeta.data.remove_two(version_id, *d);
+                }
+                xlmeta.add_version(fi)?;
+                let new_buf = xlmeta.marshal_msg()?;
+
+                // Write new xl.meta + rename
+                if let Some(parent) = src.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&src)?;
+                std::io::Write::write_all(&mut f, &new_buf)?;
+                match std::fs::rename(&src, &dst) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound && !src.exists() => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(parent) = dst.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::rename(&src, &dst).map_err(to_file_error)?;
+                        Ok(())
+                    }
+                    Err(err) => Err(to_file_error(err)),
+                }?;
+
+                if let Some(old_dir) = old_data_dir.as_ref()
+                    && let Some(ref buf) = has_dst_buf
+                    && let Some(dst_parent) = dst.parent()
+                {
+                    let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE);
+                    if let Some(old_parent) = old_path.parent() {
+                        std::fs::create_dir_all(old_parent)?;
+                    }
+                    std::fs::write(&old_path, buf).map_err(to_file_error)?;
+                }
+
+                Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
+            })
+            .await
+            .map_err(DiskError::from)??;
+
+            // Cleanup
+            if let Some(ref cleanup) = cleanup_path {
+                let _ = self.delete_file(&dst_volume_dir, cleanup, true, false).await;
+            } else if let Some(parent) = src_file_path.parent() {
+                let _ = remove_std(parent);
+            }
+
+            Ok(RenameDataResp {
+                old_data_dir,
+                sign: None,
+            })
+        }
     }
 
     #[tracing::instrument(skip(self))]
