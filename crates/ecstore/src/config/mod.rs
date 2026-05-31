@@ -39,7 +39,8 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock, RwLock};
 
-pub static GLOBAL_STORAGE_CLASS: LazyLock<OnceLock<storageclass::Config>> = LazyLock::new(OnceLock::new);
+pub static GLOBAL_STORAGE_CLASS: LazyLock<RwLock<storageclass::Config>> =
+    LazyLock::new(|| RwLock::new(storageclass::Config::default()));
 pub static DEFAULT_KVS: LazyLock<OnceLock<HashMap<String, KVS>>> = LazyLock::new(OnceLock::new);
 pub static GLOBAL_SERVER_CONFIG: LazyLock<RwLock<Config>> = LazyLock::new(|| RwLock::new(Config::new()));
 pub static GLOBAL_CONFIG_SYS: LazyLock<ConfigSys> = LazyLock::new(ConfigSys::new);
@@ -75,6 +76,16 @@ pub fn get_global_server_config() -> Option<Config> {
 
 pub fn set_global_server_config(cfg: Config) {
     if let Ok(mut guard) = GLOBAL_SERVER_CONFIG.write() {
+        *guard = cfg;
+    }
+}
+
+pub fn get_global_storage_class() -> Option<storageclass::Config> {
+    GLOBAL_STORAGE_CLASS.read().ok().map(|guard| (*guard).clone())
+}
+
+pub fn set_global_storage_class(cfg: storageclass::Config) {
+    if let Ok(mut guard) = GLOBAL_STORAGE_CLASS.write() {
         *guard = cfg;
     }
 }

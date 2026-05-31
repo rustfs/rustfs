@@ -101,13 +101,13 @@ pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
 });
 
 // StorageClass - holds storage class information
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct StorageClass {
     parity: usize,
 }
 
 // Config storage class configuration
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Config {
     standard: StorageClass,
     rrs: StorageClass,
