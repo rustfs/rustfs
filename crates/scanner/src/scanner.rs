@@ -12,20 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::ScannerIO;
-use crate::sleeper::SCANNER_SLEEPER;
+use crate::sleeper::{SCANNER_SLEEPER, scanner_speed_from_env_or_default, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
 use rustfs_config::ScannerSpeed;
 use rustfs_config::{
-    DEFAULT_SCANNER_BITROT_CYCLE_SECS, DEFAULT_SCANNER_SPEED, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE,
-    ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
+    DEFAULT_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED,
+    ENV_SCANNER_START_DELAY_SECS,
 };
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
@@ -40,12 +43,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
+const SINGLE_DISK_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
+const NO_DEFAULT_CYCLE_OVERRIDE: u64 = 0;
+
+static SCANNER_DEFAULT_CYCLE_SECS: AtomicU64 = AtomicU64::new(NO_DEFAULT_CYCLE_OVERRIDE);
 
 /// Returns the base cycle interval.
 /// Priority order:
 /// 1. RUSTFS_SCANNER_CYCLE (if set, overrides everything)
 /// 2. RUSTFS_SCANNER_START_DELAY_SECS (for backward compatibility)
-/// 3. RUSTFS_SCANNER_SPEED preset
+/// 3. Deployment-specific default cycle override
+/// 4. RUSTFS_SCANNER_SPEED preset
 fn cycle_interval() -> Duration {
     if let Some(secs) = rustfs_utils::get_env_opt_u64(ENV_SCANNER_CYCLE) {
         return Duration::from_secs(secs);
@@ -53,8 +61,21 @@ fn cycle_interval() -> Duration {
     if let Some(secs) = scanner_start_delay_secs() {
         return Duration::from_secs(secs);
     }
-    let speed_str = rustfs_utils::get_env_str(ENV_SCANNER_SPEED, DEFAULT_SCANNER_SPEED);
-    ScannerSpeed::from_env_str(&speed_str).cycle_interval()
+    if let Some(secs) = scanner_default_cycle_secs() {
+        return Duration::from_secs(secs);
+    }
+    scanner_speed_from_env_or_default().cycle_interval()
+}
+
+fn scanner_default_cycle_secs() -> Option<u64> {
+    match SCANNER_DEFAULT_CYCLE_SECS.load(Ordering::Relaxed) {
+        NO_DEFAULT_CYCLE_OVERRIDE => None,
+        secs => Some(secs),
+    }
+}
+
+fn set_scanner_default_cycle_secs(secs: Option<u64>) {
+    SCANNER_DEFAULT_CYCLE_SECS.store(secs.unwrap_or(NO_DEFAULT_CYCLE_OVERRIDE), Ordering::Relaxed);
 }
 
 fn scanner_start_delay_secs() -> Option<u64> {
@@ -87,6 +108,7 @@ fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
+    configure_scanner_defaults().await;
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
 
@@ -112,6 +134,23 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             }
         }
     });
+}
+
+async fn configure_scanner_defaults() {
+    if is_erasure_sd().await {
+        set_scanner_default_speed(ScannerSpeed::Slowest);
+        set_scanner_default_cycle_secs(Some(SINGLE_DISK_SCANNER_CYCLE_SECS));
+        info!(
+            env_speed = ENV_SCANNER_SPEED,
+            env_cycle = ENV_SCANNER_CYCLE,
+            env_start_delay = ENV_SCANNER_START_DELAY_SECS,
+            default_cycle_secs = SINGLE_DISK_SCANNER_CYCLE_SECS,
+            "Using slower scanner defaults for single-disk deployments; explicit scanner cycle or start-delay settings still take precedence"
+        );
+    } else {
+        set_scanner_default_speed(ScannerSpeed::Default);
+        set_scanner_default_cycle_secs(None);
+    }
 }
 
 fn bitrot_scan_cycle() -> Option<Duration> {
@@ -471,6 +510,50 @@ mod tests {
     use serial_test::serial;
     use temp_env::{with_var, with_var_unset};
 
+    struct ScannerDefaultSpeedGuard;
+
+    impl ScannerDefaultSpeedGuard {
+        fn set(speed: ScannerSpeed) -> Self {
+            set_scanner_default_speed(speed);
+            Self
+        }
+    }
+
+    impl Drop for ScannerDefaultSpeedGuard {
+        fn drop(&mut self) {
+            set_scanner_default_speed(ScannerSpeed::Default);
+        }
+    }
+
+    struct ScannerDefaultCycleGuard;
+
+    impl ScannerDefaultCycleGuard {
+        fn set(secs: u64) -> Self {
+            set_scanner_default_cycle_secs(Some(secs));
+            Self
+        }
+    }
+
+    impl Drop for ScannerDefaultCycleGuard {
+        fn drop(&mut self) {
+            set_scanner_default_cycle_secs(None);
+        }
+    }
+
+    fn with_unset_scanner_timing_env(f: impl FnOnce()) {
+        with_var_unset(ENV_SCANNER_SPEED, || {
+            with_var_unset("MINIO_SCANNER_SPEED", || {
+                with_var_unset(ENV_SCANNER_CYCLE, || {
+                    with_var_unset("MINIO_SCANNER_CYCLE", || {
+                        with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
+                            with_var_unset(ENV_SCANNER_START_DELAY_SECS_DEPRECATED, f);
+                        });
+                    });
+                });
+            });
+        });
+    }
+
     #[test]
     #[serial]
     fn test_randomized_cycle_delay_keeps_configured_start_delay() {
@@ -506,6 +589,86 @@ mod tests {
         with_var(ENV_SCANNER_SPEED, Some("slowest"), || {
             with_var(ENV_SCANNER_CYCLE, Some("42"), || {
                 assert_eq!(cycle_interval(), Duration::from_secs(42));
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_prefers_explicit_cycle_over_default_cycle() {
+        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+
+        with_var(ENV_SCANNER_CYCLE, Some("42"), || {
+            assert_eq!(cycle_interval(), Duration::from_secs(42));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_uses_scanner_default_speed_override_when_unconfigured() {
+        let _guard = ScannerDefaultSpeedGuard::set(ScannerSpeed::Slowest);
+
+        with_unset_scanner_timing_env(|| {
+            assert_eq!(cycle_interval(), Duration::from_secs(30 * 60));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_prefers_explicit_speed_over_default_speed_override() {
+        let _guard = ScannerDefaultSpeedGuard::set(ScannerSpeed::Slowest);
+
+        with_var_unset(ENV_SCANNER_CYCLE, || {
+            with_var_unset("MINIO_SCANNER_CYCLE", || {
+                with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
+                    with_var_unset(ENV_SCANNER_START_DELAY_SECS_DEPRECATED, || {
+                        with_var(ENV_SCANNER_SPEED, Some("fastest"), || {
+                            assert_eq!(cycle_interval(), Duration::from_secs(1));
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_uses_default_cycle_override_when_unconfigured() {
+        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+
+        with_unset_scanner_timing_env(|| {
+            assert_eq!(cycle_interval(), Duration::from_secs(SINGLE_DISK_SCANNER_CYCLE_SECS));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_keeps_single_disk_cycle_with_explicit_speed() {
+        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+
+        with_var_unset(ENV_SCANNER_CYCLE, || {
+            with_var_unset("MINIO_SCANNER_CYCLE", || {
+                with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
+                    with_var_unset(ENV_SCANNER_START_DELAY_SECS_DEPRECATED, || {
+                        with_var(ENV_SCANNER_SPEED, Some("slowest"), || {
+                            assert_eq!(cycle_interval(), Duration::from_secs(SINGLE_DISK_SCANNER_CYCLE_SECS));
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_prefers_explicit_start_delay_over_default_cycle() {
+        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+
+        with_var_unset(ENV_SCANNER_CYCLE, || {
+            with_var_unset("MINIO_SCANNER_CYCLE", || {
+                with_var(ENV_SCANNER_START_DELAY_SECS, Some("120"), || {
+                    assert_eq!(cycle_interval(), Duration::from_secs(120));
+                });
             });
         });
     }
