@@ -393,8 +393,8 @@ impl SetDisks {
                     let disk = disk.clone();
                     let bucket = bucket.to_string();
                     let path = path_join_buf(&[prefix, STORAGE_FORMAT_FILE]);
-                    revert_futures.push(tokio::spawn(async move {
-                        let _ = disk
+                    revert_futures.push(async move {
+                        if let Err(err) = disk
                             .delete(
                                 &bucket,
                                 &path,
@@ -404,15 +404,14 @@ impl SetDisks {
                                 },
                             )
                             .await
-                            .map_err(|e| {
-                                warn!("write meta revert err {:?}", e);
-                                e
-                            });
-                    }));
+                        {
+                            warn!("write meta revert err {:?}", err);
+                        }
+                    });
                 }
             }
 
-            let _ = join_all(revert_futures).await;
+            join_all(revert_futures).await;
             return Err(err);
         }
         Ok(())

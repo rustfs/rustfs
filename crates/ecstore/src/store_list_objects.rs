@@ -1218,12 +1218,18 @@ async fn gather_results(
 }
 
 async fn select_from(
+    rx: &CancellationToken,
     in_channels: &mut [Receiver<MetaCacheEntry>],
     idx: usize,
     top: &mut [Option<MetaCacheEntry>],
     n_done: &mut usize,
-) -> Result<()> {
-    match in_channels[idx].recv().await {
+) -> Result<bool> {
+    let entry = tokio::select! {
+        entry = in_channels[idx].recv() => entry,
+        _ = rx.cancelled() => return Ok(false),
+    };
+
+    match entry {
         Some(entry) => {
             top[idx] = Some(entry);
         }
@@ -1232,7 +1238,7 @@ async fn select_from(
             *n_done += 1;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 // TODO: exit when cancel
@@ -1272,7 +1278,9 @@ async fn merge_entry_channels(
     let in_channels_len = in_channels.len();
 
     for idx in 0..in_channels_len {
-        select_from(&mut in_channels, idx, &mut top, &mut n_done).await?;
+        if !select_from(&rx, &mut in_channels, idx, &mut top, &mut n_done).await? {
+            return Ok(());
+        }
     }
 
     let mut last = String::new();
@@ -1287,9 +1295,8 @@ async fn merge_entry_channels(
         to_merge.clear();
 
         // Note: `select_from` mutates `top[idx]` during the inner loop, but this is safe
-        // because we clone entries into `best`/`other_entry` before calling `select_from`,
-        // and each loop iteration reads `top[other_idx]` by reference only once before
-        // any potential `select_from` on that index (which is followed by `continue`).
+        // because each borrow from `top[other_idx]` is only used before any later
+        // `select_from` call that can mutate that slot.
 
         for other_idx in 1..top.len() {
             if let Some(other_entry) = &top[other_idx] {
@@ -1308,7 +1315,9 @@ async fn merge_entry_channels(
                             // dir and object has the save name
                             if other_entry.is_dir() {
                                 // TODO: read next entry to top
-                                select_from(&mut in_channels, other_idx, &mut top, &mut n_done).await?;
+                                if !select_from(&rx, &mut in_channels, other_idx, &mut top, &mut n_done).await? {
+                                    return Ok(());
+                                }
                                 continue;
                             }
 
@@ -1349,7 +1358,9 @@ async fn merge_entry_channels(
                         let xl2 = match entry.clone().xl_meta() {
                             Ok(res) => res,
                             Err(_) => {
-                                select_from(&mut in_channels, idx, &mut top, &mut n_done).await?;
+                                if !select_from(&rx, &mut in_channels, idx, &mut top, &mut n_done).await? {
+                                    return Ok(());
+                                }
 
                                 continue;
                             }
@@ -1358,13 +1369,17 @@ async fn merge_entry_channels(
                         versions.push(xl2.versions.clone());
 
                         if has_xl.is_none() {
-                            select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
+                            if !select_from(&rx, &mut in_channels, best_idx, &mut top, &mut n_done).await? {
+                                return Ok(());
+                            }
 
                             best_idx = idx;
                             best = Some(entry.clone());
                             has_xl = Some(xl2);
                         } else {
-                            select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
+                            if !select_from(&rx, &mut in_channels, best_idx, &mut top, &mut n_done).await? {
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -1393,7 +1408,9 @@ async fn merge_entry_channels(
             last = best_entry.name.clone();
         }
 
-        select_from(&mut in_channels, best_idx, &mut top, &mut n_done).await?;
+        if !select_from(&rx, &mut in_channels, best_idx, &mut top, &mut n_done).await? {
+            return Ok(());
+        }
     }
 }
 
@@ -2334,5 +2351,27 @@ mod test {
 
         // Keep tx alive until after the assertion so the channel doesn't close prematurely.
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_respects_cancellation_with_multiple_live_channels() {
+        let (tx_a, rx_a) = mpsc::channel::<MetaCacheEntry>(4);
+        let (tx_b, rx_b) = mpsc::channel::<MetaCacheEntry>(4);
+        let (out_tx, _out_rx) = mpsc::channel(8);
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        let handle = tokio::spawn(merge_entry_channels(cancel_clone, vec![rx_a, rx_b], out_tx, 1));
+        cancel.cancel();
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("multi-channel merge should not hang after cancellation")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "multi-channel merge should return Ok on cancellation");
+
+        drop(tx_a);
+        drop(tx_b);
     }
 }
