@@ -410,13 +410,13 @@ impl DataUsageCache {
             return;
         }
 
-        let mut leaves = Vec::new();
+        let mut candidates = Vec::new();
         let mut remove = total - limit;
-        add(self, path, &mut leaves);
-        leaves.sort_by_key(|a| a.objects);
+        add(self, path, &mut candidates);
+        candidates.sort_by_key(|a| a.objects);
 
-        while remove > 0 && !leaves.is_empty() {
-            let Some(e) = leaves.first() else {
+        while remove > 0 && !candidates.is_empty() {
+            let Some(e) = candidates.first() else {
                 break;
             };
             let candidate = e.path.clone();
@@ -427,7 +427,7 @@ impl DataUsageCache {
             let mut flat = match self.size_recursive(&candidate.key()) {
                 Some(flat) => flat,
                 None => {
-                    leaves.remove(0);
+                    candidates.remove(0);
                     continue;
                 }
             };
@@ -437,7 +437,7 @@ impl DataUsageCache {
             self.replace_hashed(&candidate, &None, &flat);
 
             remove = remove.saturating_sub(removing);
-            leaves.remove(0);
+            candidates.remove(0);
         }
     }
 
@@ -864,7 +864,7 @@ struct Inner {
     path: DataUsageHash,
 }
 
-fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec<Inner>) {
+fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) {
     let e = match data_usage_cache.cache.get(&path.key()) {
         Some(e) => e,
         None => return,
@@ -874,13 +874,13 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec
     // total_children_rec returns 0 for leaves, so `remove` would never decrement.
     if !e.children.is_empty() {
         let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
-        leaves.push(Inner {
+        candidates.push(Inner {
             objects: sz.objects,
             path: path.clone(),
         });
     }
     for ch in e.children.iter() {
-        add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
+        add(data_usage_cache, &DataUsageHash(ch.clone()), candidates);
     }
 }
 

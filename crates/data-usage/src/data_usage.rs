@@ -688,13 +688,13 @@ impl DataUsageCache {
             return;
         }
 
-        let mut leaves = Vec::new();
+        let mut candidates = Vec::new();
         let mut remove = total - limit;
-        add(self, path, &mut leaves);
-        leaves.sort_by_key(|a| a.objects);
+        add(self, path, &mut candidates);
+        candidates.sort_by_key(|a| a.objects);
 
-        while remove > 0 && !leaves.is_empty() {
-            let Some(e) = leaves.first() else {
+        while remove > 0 && !candidates.is_empty() {
+            let Some(e) = candidates.first() else {
                 break;
             };
             let candidate = e.path.clone();
@@ -705,7 +705,7 @@ impl DataUsageCache {
             let mut flat = match self.size_recursive(&candidate.key()) {
                 Some(flat) => flat,
                 None => {
-                    leaves.remove(0);
+                    candidates.remove(0);
                     continue;
                 }
             };
@@ -715,7 +715,7 @@ impl DataUsageCache {
             self.replace_hashed(&candidate, &None, &flat);
 
             remove = remove.saturating_sub(removing);
-            leaves.remove(0);
+            candidates.remove(0);
         }
     }
 
@@ -869,7 +869,7 @@ struct Inner {
     path: DataUsageHash,
 }
 
-fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec<Inner>) {
+fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) {
     let e = match data_usage_cache.cache.get(&path.key()) {
         Some(e) => e,
         None => return,
@@ -878,13 +878,13 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec
     // Leaf nodes have no children to remove, so compacting them is a no-op.
     if !e.children.is_empty() {
         let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
-        leaves.push(Inner {
+        candidates.push(Inner {
             objects: sz.objects,
             path: path.clone(),
         });
     }
     for ch in e.children.iter() {
-        add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
+        add(data_usage_cache, &DataUsageHash(ch.clone()), candidates);
     }
 }
 
@@ -1360,5 +1360,101 @@ mod tests {
         let child_entry = base.find("bucket/child").expect("child should remain after merge");
         assert_eq!(child_entry.size, 30);
         assert_eq!(child_entry.objects, 3);
+    }
+
+    // --- Tests for `add` and `reduce_children_of` (bug fixes) ---
+
+    /// Build a small tree: root -> child1 (leaf), child2 -> grandchild (leaf).
+    fn build_test_tree() -> (DataUsageCache, DataUsageHash) {
+        let root = hash_path("bucket");
+        let c1 = hash_path("bucket/a");
+        let c2 = hash_path("bucket/b");
+        let gc = hash_path("bucket/b/c");
+
+        let mut cache = DataUsageCache::default();
+        cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &c1,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 10,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &c2,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 2,
+                size: 20,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &gc,
+            &Some(c2.clone()),
+            &DataUsageEntry {
+                objects: 3,
+                size: 30,
+                ..Default::default()
+            },
+        );
+        (cache, root)
+    }
+
+    #[test]
+    fn test_add_collects_internal_nodes_as_compaction_candidates() {
+        let (cache, root) = build_test_tree();
+        let mut candidates = Vec::new();
+        add(&cache, &root, &mut candidates);
+
+        let mut paths: Vec<String> = candidates.iter().map(|l| l.path.key()).collect();
+        paths.sort();
+        assert_eq!(paths.len(), 2, "add() should find internal nodes with children");
+        assert!(paths.contains(&hash_path("bucket").key()));
+        assert!(paths.contains(&hash_path("bucket/b").key()));
+    }
+
+    #[test]
+    fn test_add_skips_leaf_node() {
+        let mut cache = DataUsageCache::default();
+        let h = hash_path("single-leaf");
+        cache.replace_hashed(
+            &h,
+            &None,
+            &DataUsageEntry {
+                objects: 5,
+                size: 50,
+                ..Default::default()
+            },
+        );
+
+        let mut candidates = Vec::new();
+        add(&cache, &h, &mut candidates);
+        assert!(candidates.is_empty(), "leaf node should not be a compaction candidate");
+    }
+
+    #[test]
+    fn test_reduce_children_of_compacts_internal_node() {
+        let (mut cache, root) = build_test_tree();
+        cache.reduce_children_of(&root, 2, false);
+
+        let entry_c2 = cache.find("bucket/b").unwrap();
+        assert!(entry_c2.compacted, "internal node 'bucket/b' should be compacted");
+        let entry_c1 = cache.find("bucket/a").unwrap();
+        assert!(!entry_c1.compacted, "leaf 'bucket/a' should not be compacted");
+        assert!(cache.find("bucket/b/c").is_none(), "grandchild should be removed");
+    }
+
+    #[test]
+    fn test_reduce_children_of_usize_underflow_saturates() {
+        // Verify saturating_sub prevents underflow when removing > remove.
+        let (mut cache, root) = build_test_tree();
+        // total=3, limit=1 => remove=2. Compacting c2 (removing=1) leaves remove=1.
+        // Then compacting root candidate would have removing=2, but saturating_sub
+        // ensures remove goes to 0 instead of underflowing.
+        cache.reduce_children_of(&root, 1, true);
+        // Should complete without panic.
     }
 }
