@@ -1097,6 +1097,7 @@ fn render_env_override_lines(
             continue;
         };
         if redact_secrets && is_sensitive_key_name(key) {
+            lines.push(format!("# {env_name}={REDACTED_VALUE}"));
             continue;
         }
         lines.push(format!("# {env_name}={value}"));
@@ -1416,9 +1417,9 @@ impl Operation for SetConfigKVHandler {
         let mut config = load_server_config_from_store().await?;
         apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, sub_system).await?;
+        save_server_config_history(&body).await?;
         save_server_config_to_store(&config).await?;
         set_global_server_config(config.clone());
-        save_server_config_history(&body).await?;
         let mut config_applied = false;
         if let Some(sub_system) = sub_system
             && is_dynamic_config_subsystem(sub_system)
@@ -1452,9 +1453,9 @@ impl Operation for DelConfigKVHandler {
         let mut config = load_server_config_from_store().await?;
         apply_delete_directives(&mut config, &directives);
         validate_server_config(&config, sub_system).await?;
+        save_server_config_history(&body).await?;
         save_server_config_to_store(&config).await?;
         set_global_server_config(config.clone());
-        save_server_config_history(&body).await?;
         let mut config_applied = false;
         if let Some(sub_system) = sub_system
             && is_dynamic_config_subsystem(sub_system)
@@ -1588,9 +1589,9 @@ impl Operation for SetConfigHandler {
         let mut config = ServerConfig::new();
         apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, None).await?;
+        save_server_config_history(&body).await?;
         save_server_config_to_store(&config).await?;
         set_global_server_config(config.clone());
-        save_server_config_history(&body).await?;
         signal_config_snapshot_reload().await;
 
         success_response(false)

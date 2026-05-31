@@ -841,6 +841,12 @@ impl ECStore {
             }
         }
 
+        // All sets returned not-found — the listing is simply empty.
+        // We intentionally do NOT distinguish VolumeNotFound here: during
+        // listing, a missing volume on a set is equivalent to "no entries"
+        // and must not surface as an error to the caller. The original
+        // VolumeNotFound check caused spurious errors when a pool had not
+        // yet created the bucket prefix on every set.
         if is_all_not_found(&errs) {
             return Ok(Vec::new());
         }
