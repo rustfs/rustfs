@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use rustfs_audit::reload_audit_config;
-use tracing::warn;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
@@ -31,6 +30,7 @@ use rustfs_targets::config::{
     validate_postgres_config, validate_pulsar_config, validate_redis_config, validate_webhook_config,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result};
+use tracing::warn;
 use url::Url;
 
 pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {

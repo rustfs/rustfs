@@ -363,6 +363,9 @@ mod tests {
 
         let cfg = lookup_config(&kvs, 8).expect("lookup should succeed");
         assert_eq!(cfg.standard.parity, 4);
-        assert_eq!(cfg.rrs.parity, DEFAULT_RRS_PARITY, "rrs should fall back to default when CLASS_RRS key is absent");
+        assert_eq!(
+            cfg.rrs.parity, DEFAULT_RRS_PARITY,
+            "rrs should fall back to default when CLASS_RRS key is absent"
+        );
     }
 }
