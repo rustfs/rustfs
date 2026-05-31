@@ -1482,7 +1482,7 @@ impl ObjectOperations for SetDisks {
             }
         };
 
-        fi.metadata = src_info.user_defined.clone();
+        fi.metadata = (*src_info.user_defined).clone();
 
         if let Some(etag) = &src_info.etag {
             fi.metadata.insert("etag".to_owned(), etag.clone());
@@ -1498,7 +1498,7 @@ impl ObjectOperations for SetDisks {
 
             for fi in metas.iter_mut() {
                 if fi.is_valid() {
-                    fi.metadata = src_info.user_defined.clone();
+                    fi.metadata = (*src_info.user_defined).clone();
                     if let Some(etag) = &src_info.etag {
                         fi.metadata.insert("etag".to_owned(), etag.clone());
                     }
@@ -2059,8 +2059,8 @@ impl ObjectOperations for SetDisks {
 
         check_object_lock_retention_update(bucket, object, &obj_info, opts)?;
 
-        for (k, v) in obj_info.user_defined {
-            fi.metadata.insert(k, v);
+        for (k, v) in obj_info.user_defined.iter() {
+            fi.metadata.insert(k.clone(), v.clone());
         }
 
         if let Some(mt) = &opts.eval_metadata {
@@ -2086,7 +2086,7 @@ impl ObjectOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
         let oi = self.get_object_info(bucket, object, opts).await?;
-        Ok(oi.user_tags)
+        Ok((*oi.user_tags).clone())
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -2158,7 +2158,7 @@ impl ObjectOperations for SetDisks {
         let dest_obj = dest_obj.unwrap();
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        let mut transition_meta = oi.user_defined.clone();
+        let mut transition_meta = (*oi.user_defined).clone();
         transition_meta.insert("name".to_string(), object.to_string());
 
         if let Some(content_type) = oi.content_type.as_ref().filter(|value| !value.is_empty()) {
@@ -2326,9 +2326,9 @@ impl ObjectOperations for SetDisks {
         //}
 
         let mut uploaded_parts: Vec<CompletePart> = vec![];
-        let parts = oi.parts.clone();
+        let parts = Arc::clone(&oi.parts);
         let mut part_offset: i64 = 0;
-        for part_info in &parts {
+        for part_info in parts.iter() {
             let mut part_opts = opts.clone();
             part_opts.part_number = Some(part_info.number);
             if part_info.actual_size <= 0 {
@@ -5792,7 +5792,7 @@ mod tests {
         );
 
         let obj_info = ObjectInfo {
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
         let opts = ObjectOptions {
@@ -5827,7 +5827,7 @@ mod tests {
         );
 
         let obj_info = ObjectInfo {
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
         let opts = ObjectOptions {

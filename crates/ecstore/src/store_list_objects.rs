@@ -1286,16 +1286,14 @@ async fn merge_entry_channels(
         let mut best_idx = 0;
         to_merge.clear();
 
-        // FIXME: top move when select_from call
-        // let vtop = top.clone();
-
-        // let vtop = top.as_slice();
+        // Note: `select_from` mutates `top[idx]` during the inner loop, but this is safe
+        // because we clone entries into `best`/`other_entry` before calling `select_from`,
+        // and each loop iteration reads `top[other_idx]` by reference only once before
+        // any potential `select_from` on that index (which is followed by `continue`).
 
         for other_idx in 1..top.len() {
             if let Some(other_entry) = &top[other_idx] {
                 if let Some(best_entry) = &best {
-                    // println!("get other_entry {:?}", other_entry.name);
-
                     if path::clean(&best_entry.name) == path::clean(&other_entry.name) {
                         let dir_matches = best_entry.is_dir() && other_entry.is_dir();
                         let suffix_matches =
@@ -1557,8 +1555,8 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod test {
     use super::{
         ENV_API_LIST_QUORUM, ListPathOptions, MAX_OBJECT_LIST, VersionMarker, gather_results, list_metadata_resolution_params,
-        list_quorum_from_env, max_keys_plus_one, normalize_list_quorum, parse_version_marker, version_marker_for_entries,
-        walk_result_from_set_errors,
+        list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum, parse_version_marker,
+        version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::error::StorageError;
     use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
@@ -2224,4 +2222,102 @@ mod test {
     //         println!("get entry {:?}", entry)
     //     }
     // }
+
+    #[tokio::test]
+    async fn merge_entry_channels_produces_sorted_unique_output_from_two_channels() {
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        // Send sorted entries from two channels with some overlap
+        tx_a.send(test_meta_entry("obj-a")).await.unwrap();
+        tx_a.send(test_meta_entry("obj-c")).await.unwrap();
+        tx_a.send(test_meta_entry("obj-e")).await.unwrap();
+        drop(tx_a);
+
+        tx_b.send(test_meta_entry("obj-b")).await.unwrap();
+        tx_b.send(test_meta_entry("obj-d")).await.unwrap();
+        drop(tx_b);
+
+        let rx = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(rx, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+
+        handle.await.unwrap().unwrap();
+
+        // Results should be sorted and deduplicated
+        assert_eq!(results, vec!["obj-a", "obj-b", "obj-c", "obj-d", "obj-e"]);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_deduplicates_entries_across_channels() {
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        // Both channels have the same entry
+        tx_a.send(test_meta_entry("obj-a")).await.unwrap();
+        tx_a.send(test_meta_entry("obj-c")).await.unwrap();
+        drop(tx_a);
+
+        tx_b.send(test_meta_entry("obj-a")).await.unwrap();
+        tx_b.send(test_meta_entry("obj-b")).await.unwrap();
+        drop(tx_b);
+
+        let rx = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(rx, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+
+        handle.await.unwrap().unwrap();
+
+        // "obj-a" should appear only once despite being in both channels
+        assert_eq!(results, vec!["obj-a", "obj-b", "obj-c"]);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_handles_single_channel() {
+        let (tx, rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        tx.send(test_meta_entry("obj-a")).await.unwrap();
+        tx.send(test_meta_entry("obj-b")).await.unwrap();
+        drop(tx);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(results, vec!["obj-a", "obj-b"]);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_respects_cancellation() {
+        let (tx_a, rx_a) = mpsc::channel::<MetaCacheEntry>(4);
+        let (tx_b, rx_b) = mpsc::channel::<MetaCacheEntry>(4);
+        let (out_tx, _out_rx) = mpsc::channel(8);
+
+        // Drop senders so channels close immediately, allowing select_from to return None
+        drop(tx_a);
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1).await;
+        assert!(result.is_ok(), "merge should return Ok on cancellation");
+    }
 }

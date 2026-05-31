@@ -1079,7 +1079,7 @@ pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc:
         target_statuses: tgt_statuses,
         target_purge_statuses: purge_statuses,
         replication_timestamp: tm,
-        user_tags: oi.user_tags,
+        user_tags: (*oi.user_tags).clone(),
         checksum: None,
         retry_count: 0,
         event_type: "".to_string(),
