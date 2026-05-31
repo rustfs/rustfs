@@ -415,10 +415,9 @@ impl DataUsageCache {
         add(self, path, &mut candidates);
         candidates.sort_by_key(|a| a.objects);
 
-        while remove > 0 && !candidates.is_empty() {
-            let Some(e) = candidates.first() else {
-                break;
-            };
+        let mut candidate_index = 0;
+        while remove > 0 && candidate_index < candidates.len() {
+            let e = &candidates[candidate_index];
             let candidate = e.path.clone();
             if candidate == *path && !compact_self {
                 break;
@@ -427,7 +426,7 @@ impl DataUsageCache {
             let mut flat = match self.size_recursive(&candidate.key()) {
                 Some(flat) => flat,
                 None => {
-                    candidates.remove(0);
+                    candidate_index += 1;
                     continue;
                 }
             };
@@ -437,7 +436,7 @@ impl DataUsageCache {
             self.replace_hashed(&candidate, &None, &flat);
 
             remove = remove.saturating_sub(removing);
-            candidates.remove(0);
+            candidate_index += 1;
         }
     }
 
@@ -864,24 +863,25 @@ struct Inner {
     path: DataUsageHash,
 }
 
-fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) {
+fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) -> usize {
     let e = match data_usage_cache.cache.get(&path.key()) {
         Some(e) => e,
-        None => return,
+        None => return 0,
     };
+    let mut objects = e.objects;
+    for ch in e.children.iter() {
+        objects += add(data_usage_cache, &DataUsageHash(ch.clone()), candidates);
+    }
     // Collect internal nodes (with children) as compaction candidates.
     // Leaf nodes have no children to remove, so compacting them is a no-op —
     // total_children_rec returns 0 for leaves, so `remove` would never decrement.
     if !e.children.is_empty() {
-        let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
         candidates.push(Inner {
-            objects: sz.objects,
+            objects,
             path: path.clone(),
         });
     }
-    for ch in e.children.iter() {
-        add(data_usage_cache, &DataUsageHash(ch.clone()), candidates);
-    }
+    objects
 }
 
 fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>) {
@@ -1220,6 +1220,61 @@ mod tests {
         (cache, root)
     }
 
+    fn build_underflow_test_tree() -> (DataUsageCache, DataUsageHash) {
+        let root = hash_path("bucket");
+        let small = hash_path("bucket/small");
+        let small_a = hash_path("bucket/small/a");
+        let small_b = hash_path("bucket/small/b");
+        let large = hash_path("bucket/large");
+        let large_a = hash_path("bucket/large/a");
+        let large_b = hash_path("bucket/large/b");
+
+        let mut cache = DataUsageCache::default();
+        cache.replace_hashed(
+            &root,
+            &None,
+            &DataUsageEntry {
+                objects: 100,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(&small, &Some(root.clone()), &DataUsageEntry::default());
+        cache.replace_hashed(
+            &small_a,
+            &Some(small.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &small_b,
+            &Some(small.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(&large, &Some(root.clone()), &DataUsageEntry::default());
+        cache.replace_hashed(
+            &large_a,
+            &Some(large.clone()),
+            &DataUsageEntry {
+                objects: 10,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &large_b,
+            &Some(large.clone()),
+            &DataUsageEntry {
+                objects: 10,
+                ..Default::default()
+            },
+        );
+        (cache, root)
+    }
+
     #[test]
     fn test_add_collects_internal_nodes_as_compaction_candidates() {
         // `add()` should collect internal nodes (with children) as compaction candidates.
@@ -1294,6 +1349,23 @@ mod tests {
         // limit=10 > total children => no compaction
         cache.reduce_children_of(&root, 10, false);
         assert_eq!(cache.cache.len(), before);
+    }
+
+    #[test]
+    fn test_reduce_children_of_usize_underflow_saturates() {
+        let (mut cache, root) = build_underflow_test_tree();
+
+        // total children=6, limit=5, remove=1. The smallest candidate removes
+        // two descendants, so plain subtraction would underflow and compact the
+        // next candidate too.
+        cache.reduce_children_of(&root, 5, false);
+
+        assert!(cache.find("bucket/small").is_some_and(|entry| entry.compacted));
+        assert!(cache.find("bucket/small/a").is_none());
+        assert!(cache.find("bucket/small/b").is_none());
+        assert!(cache.find("bucket/large").is_some_and(|entry| !entry.compacted));
+        assert!(cache.find("bucket/large/a").is_some());
+        assert!(cache.find("bucket/large/b").is_some());
     }
 
     #[tokio::test]
