@@ -46,7 +46,15 @@ pub fn try_get_host_addr(req: &request::Request<Body>) -> Result<String, HostAdd
 }
 
 pub fn get_host_addr(req: &request::Request<Body>) -> String {
-    try_get_host_addr(req).unwrap()
+    match try_get_host_addr(req) {
+        Ok(host) => host,
+        Err(HostAddrError::MissingUriHost) => match req.headers().get("host").map(|host| host.to_str()) {
+            Some(Ok(host)) => host.to_string(),
+            Some(Err(_)) => panic!("failed to resolve request host: invalid UTF-8 header value for `host`"),
+            None => panic!("failed to resolve request host: request uri has no host"),
+        },
+        Err(err) => panic!("failed to resolve request host: {err}"),
+    }
 }
 
 pub fn sign_v4_trim_all(input: &str) -> String {
@@ -63,7 +71,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{HostAddrError, try_get_host_addr};
+    use super::{HostAddrError, get_host_addr, try_get_host_addr};
     use http::HeaderValue;
     use http::request;
     use s3s::Body;
@@ -81,6 +89,30 @@ mod tests {
         let host = try_get_host_addr(&req).expect("host lookup should succeed");
 
         assert_eq!(host, "proxy.internal:9443");
+    }
+
+    #[test]
+    fn get_host_addr_preserves_legacy_string_api() {
+        let req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://bucket.example.com:9443/object")
+            .body(Body::empty())
+            .expect("request should build");
+
+        assert_eq!(get_host_addr(&req), "bucket.example.com:9443");
+    }
+
+    #[test]
+    fn get_host_addr_uses_host_header_for_relative_uri() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("/object")
+            .body(Body::empty())
+            .expect("request should build");
+        req.headers_mut()
+            .insert("host", HeaderValue::from_static("bucket.example.com"));
+
+        assert_eq!(get_host_addr(&req), "bucket.example.com");
     }
 
     #[test]
