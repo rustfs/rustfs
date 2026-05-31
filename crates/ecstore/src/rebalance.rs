@@ -1002,7 +1002,7 @@ impl ECStore {
                 return true;
             }
 
-            // Mark pool rebalance as done if within 5% of the PercentFreeGoal
+            // Mark pool rebalance as done only after it reaches the PercentFreeGoal.
             let pfi = if pool_stat.init_capacity == 0 {
                 0.0
             } else {
@@ -4138,7 +4138,7 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_rebalance_goal_reached_tolerance_and_regression() {
+    fn test_rebalance_goal_reached_requires_target_ratio() {
         let init_free_space = 150_u64;
         let init_capacity = 800_u64;
         let goal = 0.35_f64;
