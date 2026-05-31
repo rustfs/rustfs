@@ -45,8 +45,8 @@ pub fn try_get_host_addr(req: &request::Request<Body>) -> Result<String, HostAdd
     Ok(req_host)
 }
 
-pub fn get_host_addr(req: &request::Request<Body>) -> String {
-    try_get_host_addr(req).unwrap()
+pub fn get_host_addr(req: &request::Request<Body>) -> Result<String, HostAddrError> {
+    try_get_host_addr(req)
 }
 
 pub fn sign_v4_trim_all(input: &str) -> String {
