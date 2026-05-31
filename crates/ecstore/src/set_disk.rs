@@ -759,7 +759,7 @@ impl ObjectIO for SetDisks {
 
         let mut object_lock_guard = None;
 
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+        if opts.http_preconditions.is_some() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
                 object_lock_guard = Some(
@@ -1408,8 +1408,8 @@ impl ObjectOperations for SetDisks {
         &self,
         src_bucket: &str,
         src_object: &str,
-        _dst_bucket: &str,
-        _dst_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
         src_info: &mut ObjectInfo,
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
@@ -1420,13 +1420,27 @@ impl ObjectOperations for SetDisks {
             return Err(StorageError::NotImplemented);
         }
 
-        // Guard lock for source object metadata update
-        let _lock_guard = self
-            .new_ns_lock(src_bucket, src_object)
-            .await?
-            .get_write_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(|e| self.map_namespace_lock_error(src_bucket, src_object, "write", e))?;
+        if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object]) {
+            return Err(StorageError::NotImplemented);
+        }
+
+        let _lock_guard = if dst_opts.no_lock {
+            None
+        } else {
+            Some(
+                self.new_ns_lock(dst_bucket, dst_object)
+                    .await?
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(dst_bucket, dst_object, "write", e))?,
+            )
+        };
+
+        if dst_opts.http_preconditions.is_some()
+            && let Some(err) = self.check_write_precondition(dst_bucket, dst_object, dst_opts).await
+        {
+            return Err(err);
+        }
 
         let disks = self.get_disks_internal().await;
 
@@ -1807,7 +1821,7 @@ impl ObjectOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
         // Guard lock for single object delete
-        let _lock_guard = if !opts.delete_prefix {
+        let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
             Some(
                 self.new_ns_lock(bucket, object)
                     .await?
@@ -3072,18 +3086,18 @@ impl MultipartOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
-            let object_lock_guard = if !opts.no_lock {
+        let mut _object_lock_guard = None;
+
+        if opts.http_preconditions.is_some() {
+            if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                Some(
+                _object_lock_guard = Some(
                     ns_lock
                         .get_write_lock(get_lock_acquire_timeout())
                         .await
                         .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-                )
-            } else {
-                None
-            };
+                );
+            }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
                 return Err(err);
@@ -3253,8 +3267,7 @@ impl MultipartOperations for SetDisks {
     ) -> Result<ObjectInfo> {
         let mut object_lock_guard = None;
 
-        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+        if opts.http_preconditions.is_some() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
                 object_lock_guard = Some(
@@ -5001,6 +5014,227 @@ mod tests {
             err_str.contains("quorum") || err_str.contains("not reached"),
             "expected quorum error, got: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn copy_object_honors_no_lock_when_outer_write_lock_is_held() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let mut src_info = ObjectInfo {
+            metadata_only: true,
+            ..Default::default()
+        };
+        let dst_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.copy_object(
+                "bucket",
+                "object",
+                "bucket",
+                "object",
+                &mut src_info,
+                &ObjectOptions::default(),
+                &dst_opts,
+            ),
+        )
+        .await
+        .expect("no_lock copy path must not wait for the outer lock");
+
+        let err = result.expect_err("empty test disks should fail after bypassing the inner lock");
+        assert!(
+            !err.to_string().to_ascii_lowercase().contains("lock"),
+            "copy_object returned a lock error despite no_lock=true: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn copy_object_rejects_metadata_only_cross_key() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let mut src_info = ObjectInfo {
+            metadata_only: true,
+            ..Default::default()
+        };
+
+        let err = set_disks
+            .copy_object(
+                "bucket",
+                "source",
+                "bucket",
+                "dest",
+                &mut src_info,
+                &ObjectOptions::default(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("metadata-only lower copy is only valid for self-copy updates");
+
+        assert!(matches!(err, StorageError::NotImplemented));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn delete_object_honors_no_lock_when_outer_write_lock_is_held() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.delete_object(
+                "bucket",
+                "object",
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("no_lock delete path must not wait for the outer lock");
+
+        let err = result.expect_err("empty test disks should fail after bypassing the inner lock");
+        assert!(
+            !err.to_string().to_ascii_lowercase().contains("lock"),
+            "delete_object returned a lock error despite no_lock=true: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn delete_prefix_does_not_lock_literal_prefix_key() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "prefix")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.delete_object(
+                "bucket",
+                "prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("broad prefix delete must not wait on a literal prefix namespace lock")
+        .expect("empty test disks should allow broad prefix cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn delete_prefix_object_honors_no_lock_when_outer_write_lock_is_held() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.delete_object(
+                "bucket",
+                "object",
+                ObjectOptions {
+                    delete_prefix: true,
+                    delete_prefix_object: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("no_lock exact prefix delete path must not wait for the outer lock")
+        .expect("empty test disks should allow exact prefix cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn delete_prefix_object_locks_real_object_key() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            set_disks.delete_object(
+                "bucket",
+                "object",
+                ObjectOptions {
+                    delete_prefix: true,
+                    delete_prefix_object: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+
+        assert!(result.is_err(), "exact prefix delete should wait on the real object namespace lock");
     }
 
     #[tokio::test(flavor = "multi_thread")]
