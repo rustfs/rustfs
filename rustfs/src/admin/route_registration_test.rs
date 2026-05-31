@@ -14,8 +14,8 @@
 
 use crate::admin::{
     handlers::{
-        audit, bucket_meta, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools, profile_admin,
-        quota, rebalance, replication, site_replication, sts, system, tier, tls_debug, user,
+        audit, bucket_meta, config_admin, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools,
+        profile_admin, quota, rebalance, replication, site_replication, sts, system, tier, tls_debug, user,
     },
     router::{AdminOperation, S3Router},
 };
@@ -52,6 +52,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     tier::register_tier_route(router).expect("register tier route");
     quota::register_quota_route(router).expect("register quota route");
     bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
+    config_admin::register_config_route(router).expect("register config admin route");
     audit::register_audit_target_route(router).expect("register audit target route");
     module_switch::register_module_switch_route(router).expect("register module switch route");
     plugins_catalog::register_plugin_catalog_route(router).expect("register plugin catalog route");
@@ -112,6 +113,16 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
+
+    assert_route(&router, Method::GET, &admin_path("/v3/get-config-kv"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/set-config-kv"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/del-config-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/help-config-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/list-config-history-kv"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/clear-config-history-kv"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/restore-config-history-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/config"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/config"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));
@@ -237,6 +248,15 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, compat_admin_alias_path("/v3/kms/status")),
         (Method::POST, compat_admin_alias_path("/v3/kms/status")),
         (Method::GET, compat_admin_alias_path("/v3/kms/key/status")),
+        (Method::GET, compat_admin_alias_path("/v3/get-config-kv")),
+        (Method::PUT, compat_admin_alias_path("/v3/set-config-kv")),
+        (Method::DELETE, compat_admin_alias_path("/v3/del-config-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/help-config-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/list-config-history-kv")),
+        (Method::DELETE, compat_admin_alias_path("/v3/clear-config-history-kv")),
+        (Method::PUT, compat_admin_alias_path("/v3/restore-config-history-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/config")),
+        (Method::PUT, compat_admin_alias_path("/v3/config")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),

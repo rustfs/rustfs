@@ -70,3 +70,12 @@ pub static SCANNER_LAST_ACTIVITY_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLo
         subsystems::SCANNER,
     )
 });
+
+pub static SCANNER_ACTIVE_PATHS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerActivePaths,
+        "Current number of scanner paths being processed.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
