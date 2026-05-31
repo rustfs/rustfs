@@ -1128,23 +1128,28 @@ impl DefaultObjectUsecase {
     where
         R: AsyncRead + Send + Sync + 'static,
     {
-        let mut emitted = 0usize;
         let expected = response_content_length.max(0) as usize;
-        let stream = ReaderStream::with_capacity(reader, optimal_buffer_size).inspect(move |item| match item {
-            Ok(bytes) => {
-                emitted += bytes.len();
-                tracing::debug!(emitted, expected, chunk_len = bytes.len(), "GetObject ReaderStream emitted bytes");
-            }
-            Err(err) => {
-                tracing::error!(
-                    emitted,
-                    expected,
-                    error = %err,
-                    "GetObject ReaderStream returned error"
-                );
-            }
-        });
-        Some(StreamingBlob::wrap(bytes_stream(stream, response_content_length as usize)))
+        #[cfg(feature = "tracing-chunk-debug")]
+        let stream = {
+            let mut emitted = 0usize;
+            ReaderStream::with_capacity(reader, optimal_buffer_size).inspect(move |item| match item {
+                Ok(bytes) => {
+                    emitted += bytes.len();
+                    tracing::debug!(emitted, expected, chunk_len = bytes.len(), "GetObject ReaderStream emitted bytes");
+                }
+                Err(err) => {
+                    tracing::error!(
+                        emitted,
+                        expected,
+                        error = %err,
+                        "GetObject ReaderStream returned error"
+                    );
+                }
+            })
+        };
+        #[cfg(not(feature = "tracing-chunk-debug"))]
+        let stream = ReaderStream::with_capacity(reader, optimal_buffer_size);
+        Some(StreamingBlob::wrap(bytes_stream(stream, expected)))
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
