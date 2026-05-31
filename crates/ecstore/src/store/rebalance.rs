@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::config::get_global_storage_class;
 
 struct LatestObjectInfoCandidate {
     info: Option<ObjectInfo>,
@@ -605,7 +606,7 @@ impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_backend_info(&self) -> rustfs_madmin::BackendInfo {
         let (standard_sc_parity, rr_sc_parity) = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 let sc_parity = sc
                     .get_parity_for_sc(storageclass::CLASS_STANDARD)
                     .or(Some(self.pools[0].default_parity_count));
