@@ -45,8 +45,8 @@ pub fn try_get_host_addr(req: &request::Request<Body>) -> Result<String, HostAdd
     Ok(req_host)
 }
 
-pub fn get_host_addr(req: &request::Request<Body>) -> Result<String, HostAddrError> {
-    try_get_host_addr(req)
+pub fn get_host_addr(req: &request::Request<Body>) -> String {
+    try_get_host_addr(req).unwrap_or_default()
 }
 
 pub fn sign_v4_trim_all(input: &str) -> String {
@@ -63,7 +63,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{HostAddrError, try_get_host_addr};
+    use super::{HostAddrError, get_host_addr, try_get_host_addr};
     use http::HeaderValue;
     use http::request;
     use s3s::Body;
@@ -81,6 +81,17 @@ mod tests {
         let host = try_get_host_addr(&req).expect("host lookup should succeed");
 
         assert_eq!(host, "proxy.internal:9443");
+    }
+
+    #[test]
+    fn get_host_addr_preserves_legacy_string_api() {
+        let req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://bucket.example.com:9443/object")
+            .body(Body::empty())
+            .expect("request should build");
+
+        assert_eq!(get_host_addr(&req), "bucket.example.com:9443");
     }
 
     #[test]

@@ -52,7 +52,12 @@ fn streaming_fail(request: request::Request<Body>, error: SignV4Error) -> Stream
 }
 
 #[allow(dead_code)]
-fn try_build_chunk_string_to_sign(t: OffsetDateTime, region: &str, previous_sig: &str, chunk_check_sum: &str) -> Result<String, SignV4Error> {
+fn try_build_chunk_string_to_sign(
+    t: OffsetDateTime,
+    region: &str,
+    previous_sig: &str,
+    chunk_check_sum: &str,
+) -> Result<String, SignV4Error> {
     let mut string_to_sign_parts = <Vec<String>>::new();
     string_to_sign_parts.push(STREAMING_PAYLOAD_HDR.to_string());
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
@@ -67,12 +72,6 @@ fn try_build_chunk_string_to_sign(t: OffsetDateTime, region: &str, previous_sig:
     Ok(string_to_sign_parts.join("\n"))
 }
 
-#[allow(dead_code)]
-fn build_chunk_string_to_sign(t: OffsetDateTime, region: &str, previous_sig: &str, chunk_check_sum: &str) -> String {
-    try_build_chunk_string_to_sign(t, region, previous_sig, chunk_check_sum)
-        .expect("build_chunk_string_to_sign: time format failed")
-}
-
 fn _try_build_chunk_signature(
     chunk_check_sum: &str,
     req_time: OffsetDateTime,
@@ -83,17 +82,6 @@ fn _try_build_chunk_signature(
     let chunk_string_to_sign = try_build_chunk_string_to_sign(req_time, region, previous_signature, chunk_check_sum)?;
     let signing_key = get_signing_key(secret_access_key, region, req_time, SERVICE_TYPE_S3);
     Ok(get_signature(signing_key, &chunk_string_to_sign))
-}
-
-fn _build_chunk_signature(
-    chunk_check_sum: &str,
-    req_time: OffsetDateTime,
-    region: &str,
-    previous_signature: &str,
-    secret_access_key: &str,
-) -> String {
-    _try_build_chunk_signature(chunk_check_sum, req_time, region, previous_signature, secret_access_key)
-        .expect("_build_chunk_signature: signing failed")
 }
 
 #[allow(clippy::too_many_arguments)]

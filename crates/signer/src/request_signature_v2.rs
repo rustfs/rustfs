@@ -22,7 +22,7 @@ use tracing::warn;
 
 use http::HeaderValue;
 
-use super::utils::{HostAddrError, get_host_addr};
+use super::utils::{HostAddrError, try_get_host_addr};
 use rustfs_utils::crypto::{hex, hmac_sha1};
 use s3s::Body;
 
@@ -112,7 +112,7 @@ fn pre_sign_v2_inner(
     let query_source = req.uri().query().unwrap_or("");
     let result = serde_urlencoded::from_str::<HashMap<String, String>>(query_source);
     let mut query = result.unwrap_or_default();
-    let host_addr = match get_host_addr(&req) {
+    let host_addr = match try_get_host_addr(&req) {
         Ok(v) => v,
         Err(err) => return sign_v2_fail(req, SignV2Error::HostAddr(err)),
     };
@@ -130,12 +130,10 @@ fn pre_sign_v2_inner(
         Ok(v) => v,
         Err(err) => return sign_v2_fail(req, SignV2Error::QueryEncode { reason: err.to_string() }),
     };
-    parts.path_and_query = Some(
-        match format!("{}?{}&Signature={}", uri.path(), query_str, signature).parse() {
-            Ok(v) => v,
-            Err(err) => return sign_v2_fail(req, SignV2Error::InvalidUri { reason: err.to_string() }),
-        },
-    );
+    parts.path_and_query = Some(match format!("{}?{}&Signature={}", uri.path(), query_str, signature).parse() {
+        Ok(v) => v,
+        Err(err) => return sign_v2_fail(req, SignV2Error::InvalidUri { reason: err.to_string() }),
+    });
 
     *req.uri_mut() = match Uri::from_parts(parts) {
         Ok(v) => v,
@@ -279,11 +277,6 @@ fn try_pre_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -
     String::from_utf8(buf.to_vec()).map_err(|err| SignV2Error::CanonicalUtf8 { reason: err.to_string() })
 }
 
-#[allow(dead_code)]
-fn pre_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> String {
-    try_pre_string_to_sign_v2(req, virtual_host).expect("pre_string_to_sign_v2 produced non-UTF8 data")
-}
-
 fn write_pre_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
     let _ = buf.write_str(req.method().as_str());
     let _ = buf.write_char('\n');
@@ -301,11 +294,6 @@ fn try_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> Re
     write_canonicalized_headers(&mut buf, req);
     write_canonicalized_resource(&mut buf, req, virtual_host);
     String::from_utf8(buf.to_vec()).map_err(|err| SignV2Error::CanonicalUtf8 { reason: err.to_string() })
-}
-
-#[allow(dead_code)]
-fn string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> String {
-    try_string_to_sign_v2(req, virtual_host).expect("string_to_sign_v2 produced non-UTF8 data")
 }
 
 fn write_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {

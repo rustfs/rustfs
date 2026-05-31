@@ -371,7 +371,7 @@ impl PoolTier {
         let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
             Ok(p) => p,
             Err(_) => {
-                let buffer = BytesMut::with_capacity(size);
+                let buffer = BytesMut::with_capacity(size.max(self.buffer_size));
                 return PooledBuffer {
                     buffer: ManuallyDrop::new(buffer),
                     tier: None,
@@ -513,7 +513,10 @@ impl std::fmt::Debug for PoolTier {
             .field("buffer_size", &self.buffer_size)
             .field("max_buffers", &self.max_buffers)
             .field("available_permits", &self.semaphore.available_permits())
-            .field("available_buffers", &self.available_buffers.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .field(
+                "available_buffers",
+                &self.available_buffers.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            )
             .finish()
     }
 }
