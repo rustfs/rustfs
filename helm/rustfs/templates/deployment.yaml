@@ -127,12 +127,18 @@ spec:
               mountPath: /opt/tls/client_ca.crt
               subPath: client_ca.crt
             {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
             - name: data
               mountPath: /data
       volumes:
+      {{- with .Values.extraVolumes }}
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if .Values.mtls.enabled }}
         - name: server-cert
           secret:
