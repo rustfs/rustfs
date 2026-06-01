@@ -455,12 +455,14 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
     let cycle_start = std::time::Instant::now();
+    let cycle_work_start = global_metrics().start_scan_cycle_work();
     if let Err(e) = storeapi
         .clone()
         .nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode)
         .await
     {
         error!(duration = ?now.elapsed(), "Fail run data scanner cycle: {e}");
+        global_metrics().finish_scan_cycle_work(cycle_work_start);
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
             save_background_heal_info(storeapi.clone(), new_heal_info).await;
@@ -468,6 +470,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         return;
     }
     done_cycle();
+    global_metrics().finish_scan_cycle_work(cycle_work_start);
     emit_scan_cycle_complete(true, cycle_start.elapsed());
     if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
         save_background_heal_info(storeapi.clone(), new_heal_info).await;
