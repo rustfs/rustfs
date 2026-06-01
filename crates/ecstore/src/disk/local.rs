@@ -356,20 +356,68 @@ impl Debug for LocalDisk {
     }
 }
 
+/// Resolve the local disk root path from an endpoint path.
+///
+/// Tries `canonicalize` first (fast path). On Windows, if canonicalization reports
+/// `NotFound` for paths that may still be valid mount roots, falls back to
+/// `absolutize` + metadata check to accept valid local directory roots that
+/// don't support full canonicalization.
+fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
+    match rustfs_utils::canonicalize(ep_path) {
+        Ok(path) => Ok(path),
+        Err(err) => {
+            if err.kind() != ErrorKind::NotFound {
+                return Err(to_file_error(err).into());
+            }
+
+            #[cfg(windows)]
+            {
+                // On Windows, canonicalize can fail for ZFS volumes, junction points,
+                // subst drives, and other non-standard filesystem mounts. Try a fallback
+                // path resolution using absolutize + metadata check.
+                use path_absolutize::Absolutize;
+
+                let absolute = match Path::new(ep_path).absolutize() {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) => {
+                        return Err(DiskError::VolumeNotFound);
+                    }
+                };
+
+                match std::fs::metadata(&absolute) {
+                    Ok(metadata) => {
+                        if !metadata.is_dir() {
+                            return Err(DiskError::DiskNotDir);
+                        }
+                        warn!(
+                            path = %ep_path,
+                            canonicalize_error = %err,
+                            resolved = ?absolute,
+                            "using windows fallback path resolution for local disk root"
+                        );
+                        return Ok(absolute);
+                    }
+                    Err(meta_err) => {
+                        if meta_err.kind() == ErrorKind::NotFound {
+                            return Err(DiskError::VolumeNotFound);
+                        }
+                        return Err(to_file_error(meta_err).into());
+                    }
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                Err(DiskError::VolumeNotFound)
+            }
+        }
+    }
+}
+
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         debug!("Creating local disk");
-        // Use optimized path resolution instead of absolutize() for better performance
-        // Use dunce::canonicalize instead of std::fs::canonicalize to avoid UNC paths on Windows
-        let root = match rustfs_utils::canonicalize(ep.get_file_path()) {
-            Ok(path) => path,
-            Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
-                    return Err(DiskError::VolumeNotFound);
-                }
-                return Err(to_file_error(e).into());
-            }
-        };
+        let root = resolve_local_disk_root(&ep.get_file_path())?;
 
         ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
 

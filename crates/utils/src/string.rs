@@ -423,9 +423,23 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
 /// ```
 ///
 pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
-    let pattern = [ELLIPSES, OPEN_BRACES, CLOSE_BRACES];
-
-    s.iter().any(|v| pattern.iter().any(|p| v.as_ref().contains(p)))
+    s.iter().any(|v| {
+        let v = v.as_ref();
+        // Check for {content} where content contains dots; this covers both
+        // valid ellipsis patterns like {1...64} and invalid attempts like {1..64},
+        // while excluding Windows Volume{GUID} paths (GUIDs use hyphens, not dots).
+        if let (Some(start), Some(end)) = (v.find(OPEN_BRACES), v.find(CLOSE_BRACES))
+            && start < end
+            && v[start + 1..end].contains('.')
+        {
+            return true;
+        }
+        // Bare `...` without braces (e.g. "1...64") is still an ellipsis attempt.
+        if v.contains(ELLIPSES) {
+            return true;
+        }
+        false
+    })
 }
 
 /// Parses an ellipses range pattern of following style
@@ -569,6 +583,9 @@ mod tests {
             ),
             (15, vec!["mydisk-{a...z}{1...20}"], true),
             (16, vec!["mydisk-{1...4}{1..2.}"], true),
+            // Windows Volume{GUID} paths must not match; GUIDs use hyphens, not dots.
+            (17, vec![r"\\?\Volume{9425a190-4bb3-11f1-86de-803253b6a8b8}\"], false),
+            (18, vec![r"//./Volume{9425a190-4bb3-11f1-86de-803253b6a8b8}/"], false),
         ];
 
         for (i, args, expected) in test_cases {
