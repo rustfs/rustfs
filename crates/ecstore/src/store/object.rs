@@ -423,7 +423,7 @@ impl ECStore {
         };
 
         let put_opts = ObjectOptions {
-            user_defined: src_info.user_defined.clone(),
+            user_defined: (*src_info.user_defined).clone(),
             versioned: dst_opts.versioned,
             version_id: dst_opts.version_id.clone(),
             no_lock: dst_opts.no_lock,
@@ -823,7 +823,7 @@ impl ECStore {
         }
 
         let (oi, _) = self.get_latest_accessible_object_info_with_idx(bucket, &object, opts).await?;
-        Ok(oi.user_tags)
+        Ok((*oi.user_tags).clone())
     }
 
     #[instrument(level = "debug", skip(self))]

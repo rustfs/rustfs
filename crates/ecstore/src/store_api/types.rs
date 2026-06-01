@@ -293,7 +293,7 @@ pub struct ObjectInfo {
     // Actual size is the real size of the object uploaded by client.
     pub actual_size: i64,
     pub is_dir: bool,
-    pub user_defined: HashMap<String, String>,
+    pub user_defined: Arc<HashMap<String, String>>,
     pub parity_blocks: usize,
     pub data_blocks: usize,
     pub version_id: Option<Uuid>,
@@ -301,8 +301,8 @@ pub struct ObjectInfo {
     pub transitioned_object: TransitionedObject,
     pub restore_ongoing: bool,
     pub restore_expires: Option<OffsetDateTime>,
-    pub user_tags: String,
-    pub parts: Vec<ObjectPartInfo>,
+    pub user_tags: Arc<String>,
+    pub parts: Arc<Vec<ObjectPartInfo>>,
     pub is_latest: bool,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
@@ -477,7 +477,11 @@ impl ObjectInfo {
         };
 
         // tags
-        let user_tags = fi.metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default();
+        let user_tags: Arc<String> = fi
+            .metadata
+            .get(AMZ_OBJECT_TAGGING)
+            .map(|s| Arc::new(s.clone()))
+            .unwrap_or_default();
 
         let inlined = fi.inline_data();
 
@@ -571,7 +575,7 @@ impl ObjectInfo {
                 number: part.number,
                 error: part.error.clone(),
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         // TODO: part checksums
 
@@ -585,7 +589,7 @@ impl ObjectInfo {
             delete_marker: fi.deleted,
             mod_time: fi.mod_time,
             size: fi.size,
-            parts,
+            parts: Arc::new(parts),
             is_latest: fi.is_latest,
             user_tags,
             content_type,
@@ -595,7 +599,7 @@ impl ObjectInfo {
             successor_mod_time: fi.successor_mod_time,
             etag,
             inlined,
-            user_defined: metadata,
+            user_defined: Arc::new(metadata),
             transitioned_object,
             checksum: fi.checksum.clone(),
             storage_class,
@@ -1207,7 +1211,7 @@ mod tests {
         let info = ObjectInfo {
             size: 100,
             actual_size: 0,
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1225,7 +1229,7 @@ mod tests {
         let info = ObjectInfo {
             size: 100,
             actual_size: 0,
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1277,8 +1281,8 @@ mod tests {
         let info = ObjectInfo {
             size: 12,
             actual_size: 0,
-            user_defined,
-            parts: vec![
+            user_defined: Arc::new(user_defined),
+            parts: Arc::new(vec![
                 rustfs_filemeta::ObjectPartInfo {
                     actual_size: 4,
                     ..Default::default()
@@ -1287,7 +1291,7 @@ mod tests {
                     actual_size: 5,
                     ..Default::default()
                 },
-            ],
+            ]),
             ..Default::default()
         };
 
@@ -1305,7 +1309,7 @@ mod tests {
         let info = ObjectInfo {
             size: 12,
             actual_size: 0,
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1329,7 +1333,7 @@ mod tests {
         });
 
         let info = ObjectInfo {
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1359,7 +1363,7 @@ mod tests {
         });
 
         let info = ObjectInfo {
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1372,10 +1376,72 @@ mod tests {
         user_defined.insert("X-Rustfs-Encryption-Key".to_string(), "encrypted-key".to_string());
 
         let info = ObjectInfo {
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
         assert!(info.is_encrypted());
+    }
+
+    #[test]
+    fn objectinfo_clone_shares_arc_data_and_is_correct() {
+        let mut ud = HashMap::new();
+        ud.insert("content-type".to_string(), "application/octet-stream".to_string());
+        ud.insert("x-custom-header".to_string(), "custom-value".to_string());
+
+        let original = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "test-object".to_string(),
+            user_defined: Arc::new(ud),
+            user_tags: Arc::new("env=prod&team=storage".to_string()),
+            parts: Arc::new(vec![
+                rustfs_filemeta::ObjectPartInfo {
+                    number: 1,
+                    size: 1024,
+                    actual_size: 1024,
+                    ..Default::default()
+                },
+                rustfs_filemeta::ObjectPartInfo {
+                    number: 2,
+                    size: 512,
+                    actual_size: 512,
+                    ..Default::default()
+                },
+            ]),
+            size: 1536,
+            etag: Some("abc123".to_string()),
+            ..Default::default()
+        };
+
+        let cloned = original.clone();
+
+        // Verify cloned values are correct
+        assert_eq!(cloned.bucket, "test-bucket");
+        assert_eq!(cloned.name, "test-object");
+        assert_eq!(cloned.size, 1536);
+        assert_eq!(cloned.etag, Some("abc123".to_string()));
+
+        // Verify Arc fields share the same allocation
+        assert!(Arc::ptr_eq(&original.user_defined, &cloned.user_defined));
+        assert!(Arc::ptr_eq(&original.user_tags, &cloned.user_tags));
+        assert!(Arc::ptr_eq(&original.parts, &cloned.parts));
+
+        // Verify Arc-wrapped data is accessible through the clone
+        assert_eq!(
+            cloned.user_defined.get("content-type").map(String::as_str),
+            Some("application/octet-stream")
+        );
+        assert_eq!(cloned.user_tags.as_str(), "env=prod&team=storage");
+        assert_eq!(cloned.parts.len(), 2);
+        assert_eq!(cloned.parts[0].number, 1);
+        assert_eq!(cloned.parts[1].size, 512);
+
+        // Verify default ObjectInfo clone also works
+        let default_obj = ObjectInfo::default();
+        let default_cloned = default_obj.clone();
+        assert!(default_obj.user_defined.is_empty());
+        assert!(default_cloned.user_defined.is_empty());
+        assert!(default_cloned.user_tags.is_empty());
+        assert!(default_cloned.parts.is_empty());
     }
 }
