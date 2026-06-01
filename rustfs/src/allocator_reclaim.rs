@@ -23,10 +23,7 @@ pub fn allocator_backend() -> &'static str {
         "jemalloc"
     }
 
-    #[cfg(all(
-        not(target_os = "windows"),
-        not(any(target_os = "linux", target_os = "macos"))
-    ))]
+    #[cfg(all(not(target_os = "windows"), not(any(target_os = "linux", target_os = "macos"))))]
     {
         "mimalloc"
     }
@@ -85,10 +82,7 @@ fn reclaimable_work_snapshot() -> ReclaimableWorkSnapshot {
     }
 }
 
-#[cfg(all(
-    not(target_os = "windows"),
-    not(any(target_os = "linux", target_os = "macos"))
-))]
+#[cfg(all(not(target_os = "windows"), not(any(target_os = "linux", target_os = "macos"))))]
 #[allow(unsafe_code)]
 fn collect_allocator_memory(force: bool) -> Result<(), String> {
     // SAFETY: `mi_collect` is provided by the active global allocator backend
