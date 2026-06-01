@@ -32,5 +32,8 @@ Current `test-and-lint` gate includes:
 - `cargo test -p e2e_test archive_multipart_roundtrip_preserves_bytes`
 - `cargo test -p e2e_test presigned_get_and_reverse_proxy_preserve_multipart_bytes_with_fast_path`
 - `cargo fmt --all --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo nextest run -p rustfs -p rustfs-ecstore --features rio-v2`
+- `cargo test -p rustfs --doc --features rio-v2`
+- `cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings`
 - `./scripts/check_layer_dependencies.sh`

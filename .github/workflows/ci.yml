@@ -134,7 +134,7 @@ jobs:
         run: ./scripts/check_unsafe_code_allowances.sh
 
       - name: Run clippy lints
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Check layered dependencies
         run: ./scripts/check_layer_dependencies.sh
@@ -329,7 +329,7 @@ jobs:
 
   s3-implemented-tests:
     name: S3 Implemented Tests
-    needs: [ skip-check, build-rustfs-debug-binary ]
+    needs: [ skip-check, build-rustfs-debug-binary, e2e-tests ]
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: rustfs
     timeout-minutes: 60
