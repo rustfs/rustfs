@@ -301,7 +301,7 @@ opentelemetry-otlp = { version = "0.32.0", features = ["gzip-http", "reqwest-rus
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 opentelemetry-semantic-conventions = { version = "0.32.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.32.0" }
-pyroscope = { version = "2.0.6", features = ["backend-pprof-rs"] }
+pyroscope = { version = "=2.0.5", features = ["backend-pprof-rs", "backend-jemalloc"] }
 
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
@@ -324,7 +324,9 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profilin
 jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
 # pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
-# Pyroscope uses a patched pprof, until they merge back upstream, replace all references. Otherwise, two pprof libs with symbol collision.
+# Use pprof-pyroscope-fork to match pyroscope 2.0.5's internal pprof dependency (v0.1500.4).
+# Cargo unifies them into a single instance, avoiding duplicate perf_signal_handler symbols.
+# NOTE: Do NOT upgrade pyroscope to >=2.0.6 — it vendors pprof-rs internally, causing symbol collision.
 pprof = { package = "pprof-pyroscope-fork", version = "0.1500.4", features = ["flamegraph", "protobuf-codec"] }
 
 [workspace.metadata.cargo-shear]

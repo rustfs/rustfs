@@ -70,7 +70,7 @@ impl Operation for ProfileHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_profile_request(&req).await?;
 
-        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let requested_url = req.uri.to_string();
             let target_os = std::env::consts::OS;
@@ -82,7 +82,7 @@ impl Operation for ProfileHandler {
             return Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(msg))));
         }
 
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use rustfs_config::{DEFAULT_CPU_FREQ, ENV_CPU_FREQ};
             use rustfs_utils::get_env_usize;
@@ -172,9 +172,9 @@ impl Operation for ProfileStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_profile_request(&req).await?;
 
-        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let message = format!("CPU profiling is not supported on {} platform", std::env::consts::OS);
-        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let status = HashMap::from([
             ("enabled", "false"),
             ("status", "not_supported"),
@@ -182,7 +182,7 @@ impl Operation for ProfileStatusHandler {
             ("message", message.as_str()),
         ]);
 
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let status = {
             use rustfs_config::{DEFAULT_ENABLE_PROFILING, ENV_ENABLE_PROFILING};
             use rustfs_utils::get_env_bool;
