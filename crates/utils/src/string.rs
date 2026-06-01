@@ -423,9 +423,30 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
 /// ```
 ///
 pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
-    let pattern = [ELLIPSES, OPEN_BRACES, CLOSE_BRACES];
+    s.iter().any(|v| {
+        let v = v.as_ref();
 
-    s.iter().any(|v| pattern.iter().any(|p| v.as_ref().contains(p)))
+        let mut remaining = v;
+        while let Some(start) = remaining.find(OPEN_BRACES) {
+            let after_start = &remaining[start + OPEN_BRACES.len()..];
+            let Some(end) = after_start.find(CLOSE_BRACES) else {
+                break;
+            };
+            // Dotted brace content covers both valid ellipsis patterns like
+            // {1...64} and invalid attempts like {1..64}, while excluding
+            // Windows Volume{GUID} paths (GUIDs use hyphens, not dots).
+            if after_start[..end].contains('.') {
+                return true;
+            }
+            remaining = &after_start[end + CLOSE_BRACES.len()..];
+        }
+
+        // Bare `...` without braces (e.g. "1...64") is still an ellipsis attempt.
+        if v.contains(ELLIPSES) {
+            return true;
+        }
+        false
+    })
 }
 
 /// Parses an ellipses range pattern of following style
@@ -569,6 +590,10 @@ mod tests {
             ),
             (15, vec!["mydisk-{a...z}{1...20}"], true),
             (16, vec!["mydisk-{1...4}{1..2.}"], true),
+            // Windows Volume{GUID} paths must not match; GUIDs use hyphens, not dots.
+            (17, vec![r"\\?\Volume{9425a190-4bb3-11f1-86de-803253b6a8b8}\"], false),
+            (18, vec![r"//./Volume{9425a190-4bb3-11f1-86de-803253b6a8b8}/"], false),
+            (19, vec![r"\\?\Volume{9425a190-4bb3-11f1-86de-803253b6a8b8}\disk-{1..4}"], true),
         ];
 
         for (i, args, expected) in test_cases {
