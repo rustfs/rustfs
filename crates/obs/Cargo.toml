@@ -72,7 +72,8 @@ sysinfo = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
+pyroscope = { workspace = true }
+jemalloc_pprof = { workspace = true }
 
 
 [dev-dependencies]
