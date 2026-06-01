@@ -521,7 +521,7 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
     let sample_rate = 100; // 100 Hz
 
     let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
-        .tags(vec![("version", version)]) // TODO: add git commit tag
+        .tags(vec![("version", version), ("profile_type", "cpu")])
         .build()
         .ok()?;
 
