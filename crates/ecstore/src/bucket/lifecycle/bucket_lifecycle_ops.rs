@@ -1868,11 +1868,11 @@ pub async fn put_restore_opts(
             ..Default::default()
         });
     }
-    for (k, v) in &oi.user_defined {
+    for (k, v) in oi.user_defined.iter() {
         meta.insert(k.to_string(), v.clone());
     }
     if !oi.user_tags.is_empty() {
-        meta.insert(AMZ_OBJECT_TAGGING.to_string(), oi.user_tags.clone());
+        meta.insert(AMZ_OBJECT_TAGGING.to_string(), (*oi.user_tags).clone());
     }
     let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
     meta.insert(
@@ -1903,7 +1903,7 @@ impl LifecycleOps for ObjectInfo {
     fn to_lifecycle_opts(&self) -> lifecycle::ObjectOpts {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
-            user_tags: self.user_tags.clone(),
+            user_tags: (*self.user_tags).clone(),
             version_id: self.version_id,
             mod_time: self.mod_time,
             size: self.size as usize,

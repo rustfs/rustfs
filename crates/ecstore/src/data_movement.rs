@@ -94,7 +94,7 @@ fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usiz
     ObjectOptions {
         versioned: object_info.version_id.is_some(),
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
-        user_defined: object_info.user_defined.clone(),
+        user_defined: (*object_info.user_defined).clone(),
         preserve_etag: object_info.etag.clone(),
         src_pool_idx,
         data_movement: true,
@@ -120,7 +120,7 @@ fn data_movement_put_object_opts(object_info: &ObjectInfo, src_pool_idx: usize) 
         data_movement: true,
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
         mod_time: object_info.mod_time,
-        user_defined: object_info.user_defined.clone(),
+        user_defined: (*object_info.user_defined).clone(),
         preserve_etag: object_info.etag.clone(),
         ..Default::default()
     }
@@ -341,7 +341,7 @@ mod tests {
         let object_info = ObjectInfo {
             version_id: Some(version_id),
             etag: Some("etag-value".to_string()),
-            user_defined: std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            user_defined: Arc::new(std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())])),
             ..Default::default()
         };
 
@@ -382,7 +382,7 @@ mod tests {
             version_id: Some(version_id),
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
             etag: Some("etag-value".to_string()),
-            user_defined: std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            user_defined: Arc::new(std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())])),
             ..Default::default()
         };
 

@@ -31,11 +31,15 @@ use rustfs_config::{
     ENV_SCANNER_START_DELAY_SECS,
 };
 use rustfs_ecstore::StorageAPI as _;
+use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle as _;
+use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_replication_config};
+use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::Error as EcstoreError;
 use rustfs_ecstore::global::is_erasure_sd;
 use rustfs_ecstore::store::ECStore;
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -108,7 +112,7 @@ fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
-    configure_scanner_defaults().await;
+    configure_scanner_defaults(&storeapi).await;
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
 
@@ -136,16 +140,105 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     });
 }
 
-async fn configure_scanner_defaults() {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScannerMaintenanceFeatures {
+    lifecycle: bool,
+    replication: bool,
+    inspection_failed: bool,
+}
+
+impl ScannerMaintenanceFeatures {
+    fn needs_regular_cycle(self) -> bool {
+        self.lifecycle || self.replication || self.inspection_failed
+    }
+}
+
+fn single_disk_default_cycle_secs(features: ScannerMaintenanceFeatures) -> Option<u64> {
+    if features.needs_regular_cycle() {
+        None
+    } else {
+        Some(SINGLE_DISK_SCANNER_CYCLE_SECS)
+    }
+}
+
+async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
+    let mut features = ScannerMaintenanceFeatures::default();
+    let buckets = match storeapi
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(buckets) => buckets,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to inspect scanner maintenance features; preserving speed-based scanner cycle"
+            );
+            features.inspection_failed = true;
+            return features;
+        }
+    };
+
+    for bucket in buckets {
+        if !features.lifecycle {
+            match get_lifecycle_config(&bucket.name).await {
+                Ok((lifecycle, _)) => {
+                    features.lifecycle = lifecycle.has_active_rules("");
+                }
+                Err(EcstoreError::ConfigNotFound) => {}
+                Err(err) => {
+                    warn!(
+                        bucket = %bucket.name,
+                        error = %err,
+                        "Failed to inspect bucket lifecycle config; preserving speed-based scanner cycle"
+                    );
+                    features.inspection_failed = true;
+                }
+            }
+        }
+
+        if !features.replication {
+            match get_replication_config(&bucket.name).await {
+                Ok((replication, _)) => {
+                    features.replication = replication.has_active_rules("", true);
+                }
+                Err(EcstoreError::ConfigNotFound) => {}
+                Err(err) => {
+                    warn!(
+                        bucket = %bucket.name,
+                        error = %err,
+                        "Failed to inspect bucket replication config; preserving speed-based scanner cycle"
+                    );
+                    features.inspection_failed = true;
+                }
+            }
+        }
+
+        if features.needs_regular_cycle() {
+            break;
+        }
+    }
+
+    features
+}
+
+async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) {
     if is_erasure_sd().await {
+        let features = detect_scanner_maintenance_features(storeapi).await;
+        let default_cycle_secs = single_disk_default_cycle_secs(features);
         set_scanner_default_speed(ScannerSpeed::Slowest);
-        set_scanner_default_cycle_secs(Some(SINGLE_DISK_SCANNER_CYCLE_SECS));
+        set_scanner_default_cycle_secs(default_cycle_secs);
         info!(
             env_speed = ENV_SCANNER_SPEED,
             env_cycle = ENV_SCANNER_CYCLE,
             env_start_delay = ENV_SCANNER_START_DELAY_SECS,
-            default_cycle_secs = SINGLE_DISK_SCANNER_CYCLE_SECS,
-            "Using slower scanner defaults for single-disk deployments; explicit scanner cycle or start-delay settings still take precedence"
+            ?default_cycle_secs,
+            lifecycle_active = features.lifecycle,
+            replication_active = features.replication,
+            feature_inspection_failed = features.inspection_failed,
+            "Using slower scanner defaults for single-disk deployments; regular scanner cycles are preserved when maintenance features are active"
         );
     } else {
         set_scanner_default_speed(ScannerSpeed::Default);
@@ -345,6 +438,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         background_heal_info.bitrot_start_cycle,
         background_heal_info.bitrot_start_time,
     );
+    let _scan_mode_guard = ScannerScanModeGuard::new(scan_mode);
     if let Some(new_heal_info) =
         background_heal_info_for_scan_start(background_heal_info.clone(), cycle_info.current, scan_mode, Utc::now())
     {
@@ -382,6 +476,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     cycle_info.next += 1;
     cycle_info.current = 0;
     cycle_info.cycle_completed.push(Utc::now());
+    global_metrics().clear_current_scan_mode();
 
     info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run data scanner cycle");
 
@@ -458,6 +553,21 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     debug!("Data scanner done");
 
     Ok(())
+}
+
+struct ScannerScanModeGuard;
+
+impl ScannerScanModeGuard {
+    fn new(scan_mode: HealScanMode) -> Self {
+        global_metrics().set_current_scan_mode(scan_mode);
+        Self
+    }
+}
+
+impl Drop for ScannerScanModeGuard {
+    fn drop(&mut self) {
+        global_metrics().clear_current_scan_mode();
+    }
 }
 
 /// Store data usage info in backend. Will store all objects sent on the receiver until closed.
@@ -639,6 +749,47 @@ mod tests {
         with_unset_scanner_timing_env(|| {
             assert_eq!(cycle_interval(), Duration::from_secs(SINGLE_DISK_SCANNER_CYCLE_SECS));
         });
+    }
+
+    #[test]
+    fn test_single_disk_default_cycle_uses_long_interval_without_maintenance_features() {
+        assert_eq!(
+            single_disk_default_cycle_secs(ScannerMaintenanceFeatures::default()),
+            Some(SINGLE_DISK_SCANNER_CYCLE_SECS)
+        );
+    }
+
+    #[test]
+    fn test_single_disk_default_cycle_preserves_regular_cycle_for_lifecycle() {
+        assert_eq!(
+            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
+                lifecycle: true,
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn test_single_disk_default_cycle_preserves_regular_cycle_for_replication() {
+        assert_eq!(
+            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
+                replication: true,
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn test_single_disk_default_cycle_preserves_regular_cycle_on_inspection_failure() {
+        assert_eq!(
+            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
+                inspection_failed: true,
+                ..Default::default()
+            }),
+            None
+        );
     }
 
     #[test]

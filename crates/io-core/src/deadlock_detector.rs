@@ -155,7 +155,7 @@ impl DeadlockDetector {
     /// Register a new lock.
     pub fn register_lock(&self, lock_type: LockType) -> u64 {
         let id = {
-            let mut next = self.next_lock_id.lock().unwrap();
+            let mut next = self.next_lock_id.lock().unwrap_or_else(|e| e.into_inner());
             *next += 1;
             *next
         };
@@ -243,7 +243,10 @@ impl DeadlockDetector {
             return None;
         }
 
-        let graph = self.wait_graph.lock().unwrap();
+        let graph = match self.wait_graph.lock() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
 
         // Build adjacency list
         let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -310,7 +313,10 @@ impl DeadlockDetector {
             return Vec::new();
         }
 
-        let locks = self.locks.lock().unwrap();
+        let locks = match self.locks.lock() {
+            Ok(l) => l,
+            Err(_) => return Vec::new(),
+        };
         let mut result = Vec::new();
 
         for (&id, info) in locks.iter() {
@@ -349,13 +355,13 @@ impl DeadlockDetector {
 
     /// Get lock info.
     pub fn get_lock_info(&self, lock_id: u64) -> Option<LockInfo> {
-        let locks = self.locks.lock().unwrap();
+        let locks = self.locks.lock().ok()?;
         locks.get(&lock_id).cloned()
     }
 
     /// Get total number of registered locks.
     pub fn lock_count(&self) -> usize {
-        let locks = self.locks.lock().unwrap();
+        let locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
         locks.len()
     }
 }

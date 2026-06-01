@@ -73,11 +73,11 @@ const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

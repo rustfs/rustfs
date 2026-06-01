@@ -15,10 +15,10 @@
 use crate::admin::{auth::validate_admin_request, router::Operation};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use http::HeaderMap;
 use http::StatusCode;
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use http::header::CONTENT_TYPE;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -52,7 +52,7 @@ impl Operation for TriggerProfileCPU {
         authorize_profile_request(&req).await?;
         info!("Triggering CPU profile dump via S3 request...");
 
-        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             return Ok(S3Response::new((
                 StatusCode::NOT_IMPLEMENTED,
@@ -64,7 +64,7 @@ impl Operation for TriggerProfileCPU {
             )));
         }
 
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let dur = std::time::Duration::from_secs(60);
             match crate::profiling::dump_cpu_pprof_for(dur).await {
@@ -86,7 +86,7 @@ impl Operation for TriggerProfileMemory {
         authorize_profile_request(&req).await?;
         info!("Triggering Memory profile dump via S3 request...");
 
-        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             return Ok(S3Response::new((
                 StatusCode::NOT_IMPLEMENTED,
@@ -94,7 +94,7 @@ impl Operation for TriggerProfileMemory {
             )));
         }
 
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             match crate::profiling::dump_memory_pprof_now().await {
                 Ok(path) => {

@@ -175,12 +175,12 @@ hashbrown = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
-[target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
+[target.'cfg(not(any(target_os = "linux", target_os = "macos")))'.dependencies]
 mimalloc = { workspace = true }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
-# Only enable pprof-based profiling on linux + gnu + x86_64.
-[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
+# jemalloc + pprof-based profiling on linux and macos.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 jemalloc_pprof = { workspace = true }

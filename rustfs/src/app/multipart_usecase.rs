@@ -151,6 +151,11 @@ fn has_complete_multipart_object_lock_headers(headers: &HeaderMap) -> bool {
         || has_bypass_governance_header(headers)
 }
 
+fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
+    opts.http_preconditions = None;
+    opts
+}
+
 fn encode_s3_path(path: &str) -> String {
     path.split('/')
         .map(|part| encode(part).to_string())
@@ -339,9 +344,11 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let current_opts = get_opts(&bucket, &key, None, None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
+        let current_opts = internal_object_info_lookup_opts(
+            get_opts(&bucket, &key, None, None, &req.headers)
+                .await
+                .map_err(ApiError::from)?,
+        );
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info)?;
@@ -1317,6 +1324,26 @@ mod tests {
         let location = build_complete_multipart_location(&HeaderMap::new(), &Uri::from_static("/"), "bucket", "nested/object");
 
         assert_eq!(location, "/bucket/nested/object");
+    }
+
+    #[test]
+    fn internal_object_info_lookup_opts_drops_http_preconditions() {
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            no_lock: true,
+            http_preconditions: Some(rustfs_ecstore::store_api::HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                if_match: Some("\"etag\"".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let lookup_opts = internal_object_info_lookup_opts(opts);
+
+        assert!(lookup_opts.http_preconditions.is_none());
+        assert!(lookup_opts.no_lock);
+        assert!(lookup_opts.version_id.is_some());
     }
 
     #[test]

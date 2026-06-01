@@ -383,30 +383,35 @@ impl SetDisks {
         }
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            // TODO: add concurrency
+            let mut revert_futures = Vec::with_capacity(disks.len());
             for (i, err) in errs.iter().enumerate() {
                 if err.is_some() {
                     continue;
                 }
 
                 if let Some(disk) = disks[i].as_ref() {
-                    let _ = disk
-                        .delete(
-                            bucket,
-                            &path_join_buf(&[prefix, STORAGE_FORMAT_FILE]),
-                            DeleteOptions {
-                                recursive: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(|e| {
-                            warn!("write meta revert err {:?}", e);
-                            e
-                        });
+                    let disk = disk.clone();
+                    let bucket = bucket.to_string();
+                    let path = path_join_buf(&[prefix, STORAGE_FORMAT_FILE]);
+                    revert_futures.push(async move {
+                        if let Err(err) = disk
+                            .delete(
+                                &bucket,
+                                &path,
+                                DeleteOptions {
+                                    recursive: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            warn!("write meta revert err {:?}", err);
+                        }
+                    });
                 }
             }
 
+            join_all(revert_futures).await;
             return Err(err);
         }
         Ok(())

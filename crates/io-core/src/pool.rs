@@ -226,8 +226,9 @@ impl BytesPool {
     pub async fn acquire_buffer(&self, size: usize) -> PooledBuffer {
         let tier = self.select_tier(size);
         let mut buffer = tier.acquire_buffer(size, &self.metrics).await;
-        // Set tier reference for return on drop
-        buffer.tier = Some(Arc::clone(tier));
+        if buffer._permit.is_some() {
+            buffer.tier = Some(Arc::clone(tier));
+        }
         buffer
     }
 
@@ -304,12 +305,12 @@ impl PoolTier {
     }
 
     fn set_metrics(&self, metrics: Arc<BytesPoolMetrics>) {
-        *self.metrics.lock().unwrap() = Some(metrics);
+        *self.metrics.lock().unwrap_or_else(|e| e.into_inner()) = Some(metrics);
     }
 
     fn take_or_allocate_buffer(&self, size: usize, pool_metrics: &BytesPoolMetrics) -> (BytesMut, bool) {
         let buffer_opt = {
-            let mut available = self.available_buffers.lock().unwrap();
+            let mut available = self.available_buffers.lock().unwrap_or_else(|e| e.into_inner());
             available.pop()
         };
         let was_reused = buffer_opt.is_some();
@@ -368,10 +369,20 @@ impl PoolTier {
 
     async fn acquire_buffer(&self, size: usize, pool_metrics: &BytesPoolMetrics) -> PooledBuffer {
         // Acquire semaphore permit (owned for storage in PooledBuffer)
-        let permit = Arc::clone(&self.semaphore).acquire_owned().await.unwrap();
+        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                let buffer = BytesMut::with_capacity(size.max(self.buffer_size));
+                return PooledBuffer {
+                    buffer: ManuallyDrop::new(buffer),
+                    tier: None,
+                    _permit: None,
+                };
+            }
+        };
 
         // Use the pool's shared metrics for recording
-        let _metrics_lock = self.metrics.lock().unwrap();
+        let _metrics_lock = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
         let _metrics = _metrics_lock.as_ref().unwrap();
 
         // Record acquisition
@@ -394,7 +405,7 @@ impl PoolTier {
         let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
 
         // Use the pool's shared metrics for recording
-        let _metrics_lock = self.metrics.lock().unwrap();
+        let _metrics_lock = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
         let _metrics = _metrics_lock.as_ref().unwrap();
 
         // Record acquisition
@@ -414,11 +425,11 @@ impl PoolTier {
 
     /// Return a buffer to the pool for reuse.
     fn return_buffer(&self, buffer: BytesMut) {
-        let mut available = self.available_buffers.lock().unwrap();
+        let mut available = self.available_buffers.lock().unwrap_or_else(|e| e.into_inner());
         // Limit the size of the pool to prevent unbounded growth
         if available.len() < self.max_buffers {
             available.push(buffer);
-            if let Some(ref metrics) = *self.metrics.lock().unwrap() {
+            if let Some(ref metrics) = *self.metrics.lock().unwrap_or_else(|e| e.into_inner()) {
                 metrics.available_buffers.fetch_add(1, Ordering::Relaxed);
             }
         } else {
@@ -428,7 +439,7 @@ impl PoolTier {
                     Some(current.saturating_sub(released_bytes))
                 })
                 .ok();
-            if let Some(ref metrics) = *self.metrics.lock().unwrap() {
+            if let Some(ref metrics) = *self.metrics.lock().unwrap_or_else(|e| e.into_inner()) {
                 metrics
                     .current_allocated_bytes
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -447,11 +458,10 @@ impl Drop for PooledBuffer {
     // buffer moves it exactly once into the pool when a tier still owns it.
     #[allow(unsafe_code)]
     fn drop(&mut self) {
-        // Return buffer to pool if tier reference exists
+        // Return buffer to pool if tier reference exists.
+        // Otherwise, drop the standalone fallback buffer normally.
+        let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
         if let Some(ref tier) = self.tier {
-            // SAFETY: We're in drop(), so this is the last use of the buffer
-            // ManuallyDrop allows us to take the value without running BytesMut's drop
-            let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
             tier.return_buffer(buffer);
         }
         // The permit is automatically dropped here, releasing the semaphore slot
@@ -503,7 +513,10 @@ impl std::fmt::Debug for PoolTier {
             .field("buffer_size", &self.buffer_size)
             .field("max_buffers", &self.max_buffers)
             .field("available_permits", &self.semaphore.available_permits())
-            .field("available_buffers", &self.available_buffers.lock().unwrap().len())
+            .field(
+                "available_buffers",
+                &self.available_buffers.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            )
             .finish()
     }
 }
@@ -524,6 +537,20 @@ mod tests {
         let pool = BytesPool::new_tiered();
         let buffer = pool.acquire_buffer(2048).await;
         assert!(buffer.capacity() >= 2048);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_buffer_after_shutdown_is_unpooled() {
+        let pool = BytesPool::new_tiered();
+        pool.small_pool.semaphore.close();
+
+        let buffer = pool.acquire_buffer(2048).await;
+
+        assert!(buffer.tier.is_none());
+        assert!(buffer._permit.is_none());
+        assert!(buffer.capacity() >= pool.small_pool.buffer_size);
+        drop(buffer);
+        assert_eq!(pool.available_buffers(), 0);
     }
 
     #[tokio::test]

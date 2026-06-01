@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::bucket::utils::is_meta_bucketname;
+use crate::set_disk::get_lock_acquire_timeout;
 
 fn should_override_created_from_metadata(created: OffsetDateTime) -> bool {
     created != OffsetDateTime::UNIX_EPOCH
@@ -28,7 +29,28 @@ impl ECStore {
             return Err(StorageError::BucketNameInvalid(err.to_string()));
         }
 
-        // TODO: nslock
+        let _ns_guard = if !opts.no_lock {
+            let ns_lock = self.new_ns_lock(bucket, bucket).await?;
+            Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| match e {
+                        rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
+                            StorageError::NamespaceLockQuorumUnavailable {
+                                mode: "write",
+                                bucket: bucket.to_string(),
+                                object: bucket.to_string(),
+                                required,
+                                achieved,
+                            }
+                        }
+                        other => StorageError::other(format!("make_bucket: failed to acquire write lock on {bucket}: {other}")),
+                    })?,
+            )
+        } else {
+            None
+        };
 
         if let Err(err) = self.peer_sys.make_bucket(bucket, opts).await {
             let err = to_object_err(err.into(), vec![bucket]);
@@ -111,7 +133,28 @@ impl ECStore {
             return Err(StorageError::BucketNameInvalid(err.to_string()));
         }
 
-        // TODO: nslock
+        let _ns_guard = if !opts.no_lock {
+            let ns_lock = self.new_ns_lock(bucket, bucket).await?;
+            Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| match e {
+                        rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
+                            StorageError::NamespaceLockQuorumUnavailable {
+                                mode: "write",
+                                bucket: bucket.to_string(),
+                                object: bucket.to_string(),
+                                required,
+                                achieved,
+                            }
+                        }
+                        other => StorageError::other(format!("delete_bucket: failed to acquire write lock on {bucket}: {other}")),
+                    })?,
+            )
+        } else {
+            None
+        };
 
         // Check bucket exists before deletion (per S3 API spec)
         // If bucket doesn't exist, return NoSuchBucket error
