@@ -1439,6 +1439,7 @@ mod tests {
         // Verify default ObjectInfo clone also works
         let default_obj = ObjectInfo::default();
         let default_cloned = default_obj.clone();
+        assert!(default_obj.user_defined.is_empty());
         assert!(default_cloned.user_defined.is_empty());
         assert!(default_cloned.user_tags.is_empty());
         assert!(default_cloned.parts.is_empty());
