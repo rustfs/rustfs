@@ -65,6 +65,14 @@ fn scanner_scan_mode_code(scan_mode: &str) -> u64 {
     }
 }
 
+fn scanner_work_rate_per_second(count: u64, seconds: f64) -> f64 {
+    if seconds > 0.0 && seconds.is_finite() {
+        count as f64 / seconds
+    } else {
+        0.0
+    }
+}
+
 const DRIVE_STATE_OK: &str = "ok";
 const DRIVE_STATE_ONLINE: &str = "online";
 const DRIVE_STATE_UNFORMATTED: &str = "unformatted";
@@ -901,6 +909,8 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let active_paths = metrics.active_scan_paths as u64;
     let current_cycle_age_seconds = current_scanner_cycle_age_seconds(metrics.current_cycle, metrics.current_started, now);
     let current_scan_mode = scanner_scan_mode_code(&metrics.current_scan_mode);
+    let current_cycle_age = current_cycle_age_seconds as f64;
+    let last_cycle_duration = metrics.last_cycle_duration_seconds;
 
     Some(ScannerStats {
         bucket_scans_finished,
@@ -916,9 +926,33 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
         current_cycle: metrics.current_cycle,
         completed_cycles,
         current_cycle_age_seconds,
+        current_cycle_objects_scanned: metrics.current_cycle_objects_scanned,
+        current_cycle_directories_scanned: metrics.current_cycle_directories_scanned,
+        current_cycle_bucket_drive_scans: metrics.current_cycle_bucket_drive_scans,
+        current_cycle_objects_per_second: scanner_work_rate_per_second(metrics.current_cycle_objects_scanned, current_cycle_age),
+        current_cycle_directories_per_second: scanner_work_rate_per_second(
+            metrics.current_cycle_directories_scanned,
+            current_cycle_age,
+        ),
+        current_cycle_bucket_drive_scans_per_second: scanner_work_rate_per_second(
+            metrics.current_cycle_bucket_drive_scans,
+            current_cycle_age,
+        ),
         current_scan_mode,
         last_cycle_result: metrics.last_cycle_result_code,
         last_cycle_duration_seconds: metrics.last_cycle_duration_seconds,
+        last_cycle_objects_scanned: metrics.last_cycle_objects_scanned,
+        last_cycle_directories_scanned: metrics.last_cycle_directories_scanned,
+        last_cycle_bucket_drive_scans: metrics.last_cycle_bucket_drive_scans,
+        last_cycle_objects_per_second: scanner_work_rate_per_second(metrics.last_cycle_objects_scanned, last_cycle_duration),
+        last_cycle_directories_per_second: scanner_work_rate_per_second(
+            metrics.last_cycle_directories_scanned,
+            last_cycle_duration,
+        ),
+        last_cycle_bucket_drive_scans_per_second: scanner_work_rate_per_second(
+            metrics.last_cycle_bucket_drive_scans,
+            last_cycle_duration,
+        ),
         failed_cycles: metrics.failed_cycles,
     })
 }
@@ -1020,5 +1054,17 @@ mod tests {
     #[test]
     fn scanner_scan_mode_code_maps_unknown_mode() {
         assert_eq!(scanner_scan_mode_code(""), HealScanMode::Unknown as u8 as u64);
+    }
+
+    #[test]
+    fn scanner_work_rate_per_second_reports_rate() {
+        assert_eq!(scanner_work_rate_per_second(90, 45.0), 2.0);
+    }
+
+    #[test]
+    fn scanner_work_rate_per_second_returns_zero_for_invalid_seconds() {
+        assert_eq!(scanner_work_rate_per_second(90, 0.0), 0.0);
+        assert_eq!(scanner_work_rate_per_second(90, f64::INFINITY), 0.0);
+        assert_eq!(scanner_work_rate_per_second(90, f64::NAN), 0.0);
     }
 }

@@ -107,6 +107,60 @@ pub static SCANNER_CURRENT_CYCLE_AGE_SECONDS_MD: LazyLock<MetricDescriptor> = La
     )
 });
 
+pub static SCANNER_CURRENT_CYCLE_OBJECTS_SCANNED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycleObjectsScanned,
+        "Number of objects scanned by the currently running scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CURRENT_CYCLE_DIRECTORIES_SCANNED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycleDirectoriesScanned,
+        "Number of directories scanned by the currently running scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CURRENT_CYCLE_BUCKET_DRIVE_SCANS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycleBucketDriveScans,
+        "Number of bucket-drive scans finished by the currently running scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CURRENT_CYCLE_OBJECTS_PER_SECOND_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycleObjectsPerSecond,
+        "Object scan rate for the currently running scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CURRENT_CYCLE_DIRECTORIES_PER_SECOND_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycleDirectoriesPerSecond,
+        "Directory scan rate for the currently running scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CURRENT_CYCLE_BUCKET_DRIVE_SCANS_PER_SECOND_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycleBucketDriveScansPerSecond,
+        "Bucket-drive scan rate for the currently running scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
 pub static SCANNER_CURRENT_SCAN_MODE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerCurrentScanMode,
@@ -129,6 +183,60 @@ pub static SCANNER_LAST_CYCLE_DURATION_SECONDS_MD: LazyLock<MetricDescriptor> = 
     new_gauge_md(
         MetricName::ScannerLastCycleDurationSeconds,
         "Duration in seconds of the last finished scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_OBJECTS_SCANNED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleObjectsScanned,
+        "Number of objects scanned by the last finished scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_DIRECTORIES_SCANNED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleDirectoriesScanned,
+        "Number of directories scanned by the last finished scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_BUCKET_DRIVE_SCANS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleBucketDriveScans,
+        "Number of bucket-drive scans finished by the last scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_OBJECTS_PER_SECOND_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleObjectsPerSecond,
+        "Object scan rate for the last finished scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_DIRECTORIES_PER_SECOND_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleDirectoriesPerSecond,
+        "Directory scan rate for the last finished scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_BUCKET_DRIVE_SCANS_PER_SECOND_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleBucketDriveScansPerSecond,
+        "Bucket-drive scan rate for the last finished scanner cycle.",
         &[],
         subsystems::SCANNER,
     )
