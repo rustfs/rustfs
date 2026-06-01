@@ -375,10 +375,8 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
                 // On Windows, canonicalize can fail for ZFS volumes, junction points,
                 // subst drives, and other non-standard filesystem mounts. Try a fallback
                 // path resolution using absolutize + metadata check.
-                use path_absolutize::Absolutize;
-
-                let absolute = match Path::new(ep_path).absolutize() {
-                    Ok(p) => p.to_path_buf(),
+                let absolute = match crate::disk::endpoint::windows_fallback_local_path(ep_path, &err, "local disk root") {
+                    Ok(path) => path,
                     Err(_) => {
                         return Err(DiskError::VolumeNotFound);
                     }
@@ -389,12 +387,6 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
                         if !metadata.is_dir() {
                             return Err(DiskError::DiskNotDir);
                         }
-                        warn!(
-                            path = %ep_path,
-                            canonicalize_error = %err,
-                            resolved = ?absolute,
-                            "using windows fallback path resolution for local disk root"
-                        );
                         return Ok(absolute);
                     }
                     Err(meta_err) => {

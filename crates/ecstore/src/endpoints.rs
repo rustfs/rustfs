@@ -693,15 +693,8 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
                 // subst drives, and other non-standard mounts. Try absolutize as fallback.
                 #[cfg(windows)]
                 {
-                    use path_absolutize::Absolutize;
-                    match std::path::Path::new(path.as_str()).absolutize() {
+                    match crate::disk::endpoint::windows_fallback_local_path(path, &err, "disk independence validation") {
                         Ok(absolute) => {
-                            warn!(
-                                path = %path,
-                                canonicalize_error = %err,
-                                resolved = ?absolute,
-                                "using fallback path resolution for disk independence validation"
-                            );
                             let abs_path = absolute.to_string_lossy().into_owned();
                             match rustfs_utils::os::get_physical_device_ids(&abs_path) {
                                 Ok(ids) => {
