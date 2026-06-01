@@ -12,27 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::ScannerIO;
-use crate::sleeper::SCANNER_SLEEPER;
+use crate::sleeper::{SCANNER_SLEEPER, scanner_speed_from_env_or_default, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
 use rustfs_config::ScannerSpeed;
 use rustfs_config::{
-    DEFAULT_SCANNER_BITROT_CYCLE_SECS, DEFAULT_SCANNER_SPEED, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE,
-    ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
+    DEFAULT_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED,
+    ENV_SCANNER_START_DELAY_SECS,
 };
 use rustfs_ecstore::StorageAPI as _;
+use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle as _;
+use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_replication_config};
+use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt as _;
 use rustfs_ecstore::config::com::{read_config, save_config};
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::Error as EcstoreError;
 use rustfs_ecstore::global::is_erasure_sd;
 use rustfs_ecstore::store::ECStore;
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -40,12 +47,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
+const SINGLE_DISK_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
+const NO_DEFAULT_CYCLE_OVERRIDE: u64 = 0;
+
+static SCANNER_DEFAULT_CYCLE_SECS: AtomicU64 = AtomicU64::new(NO_DEFAULT_CYCLE_OVERRIDE);
 
 /// Returns the base cycle interval.
 /// Priority order:
 /// 1. RUSTFS_SCANNER_CYCLE (if set, overrides everything)
 /// 2. RUSTFS_SCANNER_START_DELAY_SECS (for backward compatibility)
-/// 3. RUSTFS_SCANNER_SPEED preset
+/// 3. Deployment-specific default cycle override
+/// 4. RUSTFS_SCANNER_SPEED preset
 fn cycle_interval() -> Duration {
     if let Some(secs) = rustfs_utils::get_env_opt_u64(ENV_SCANNER_CYCLE) {
         return Duration::from_secs(secs);
@@ -53,8 +65,21 @@ fn cycle_interval() -> Duration {
     if let Some(secs) = scanner_start_delay_secs() {
         return Duration::from_secs(secs);
     }
-    let speed_str = rustfs_utils::get_env_str(ENV_SCANNER_SPEED, DEFAULT_SCANNER_SPEED);
-    ScannerSpeed::from_env_str(&speed_str).cycle_interval()
+    if let Some(secs) = scanner_default_cycle_secs() {
+        return Duration::from_secs(secs);
+    }
+    scanner_speed_from_env_or_default().cycle_interval()
+}
+
+fn scanner_default_cycle_secs() -> Option<u64> {
+    match SCANNER_DEFAULT_CYCLE_SECS.load(Ordering::Relaxed) {
+        NO_DEFAULT_CYCLE_OVERRIDE => None,
+        secs => Some(secs),
+    }
+}
+
+fn set_scanner_default_cycle_secs(secs: Option<u64>) {
+    SCANNER_DEFAULT_CYCLE_SECS.store(secs.unwrap_or(NO_DEFAULT_CYCLE_OVERRIDE), Ordering::Relaxed);
 }
 
 fn scanner_start_delay_secs() -> Option<u64> {
@@ -87,6 +112,7 @@ fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
+    configure_scanner_defaults(&storeapi).await;
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
 
@@ -112,6 +138,112 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             }
         }
     });
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScannerMaintenanceFeatures {
+    lifecycle: bool,
+    replication: bool,
+    inspection_failed: bool,
+}
+
+impl ScannerMaintenanceFeatures {
+    fn needs_regular_cycle(self) -> bool {
+        self.lifecycle || self.replication || self.inspection_failed
+    }
+}
+
+fn single_disk_default_cycle_secs(features: ScannerMaintenanceFeatures) -> Option<u64> {
+    if features.needs_regular_cycle() {
+        None
+    } else {
+        Some(SINGLE_DISK_SCANNER_CYCLE_SECS)
+    }
+}
+
+async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
+    let mut features = ScannerMaintenanceFeatures::default();
+    let buckets = match storeapi
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(buckets) => buckets,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to inspect scanner maintenance features; preserving speed-based scanner cycle"
+            );
+            features.inspection_failed = true;
+            return features;
+        }
+    };
+
+    for bucket in buckets {
+        if !features.lifecycle {
+            match get_lifecycle_config(&bucket.name).await {
+                Ok((lifecycle, _)) => {
+                    features.lifecycle = lifecycle.has_active_rules("");
+                }
+                Err(EcstoreError::ConfigNotFound) => {}
+                Err(err) => {
+                    warn!(
+                        bucket = %bucket.name,
+                        error = %err,
+                        "Failed to inspect bucket lifecycle config; preserving speed-based scanner cycle"
+                    );
+                    features.inspection_failed = true;
+                }
+            }
+        }
+
+        if !features.replication {
+            match get_replication_config(&bucket.name).await {
+                Ok((replication, _)) => {
+                    features.replication = replication.has_active_rules("", true);
+                }
+                Err(EcstoreError::ConfigNotFound) => {}
+                Err(err) => {
+                    warn!(
+                        bucket = %bucket.name,
+                        error = %err,
+                        "Failed to inspect bucket replication config; preserving speed-based scanner cycle"
+                    );
+                    features.inspection_failed = true;
+                }
+            }
+        }
+
+        if features.needs_regular_cycle() {
+            break;
+        }
+    }
+
+    features
+}
+
+async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) {
+    if is_erasure_sd().await {
+        let features = detect_scanner_maintenance_features(storeapi).await;
+        let default_cycle_secs = single_disk_default_cycle_secs(features);
+        set_scanner_default_speed(ScannerSpeed::Slowest);
+        set_scanner_default_cycle_secs(default_cycle_secs);
+        info!(
+            env_speed = ENV_SCANNER_SPEED,
+            env_cycle = ENV_SCANNER_CYCLE,
+            env_start_delay = ENV_SCANNER_START_DELAY_SECS,
+            ?default_cycle_secs,
+            lifecycle_active = features.lifecycle,
+            replication_active = features.replication,
+            feature_inspection_failed = features.inspection_failed,
+            "Using slower scanner defaults for single-disk deployments; regular scanner cycles are preserved when maintenance features are active"
+        );
+    } else {
+        set_scanner_default_speed(ScannerSpeed::Default);
+        set_scanner_default_cycle_secs(None);
+    }
 }
 
 fn bitrot_scan_cycle() -> Option<Duration> {
@@ -160,6 +292,59 @@ fn get_cycle_scan_mode(current_cycle: u64, bitrot_start_cycle: u64, bitrot_start
     } else {
         HealScanMode::Normal
     }
+}
+
+fn background_heal_info_for_scan_start(
+    mut info: BackgroundHealInfo,
+    current_cycle: u64,
+    scan_mode: HealScanMode,
+    now: DateTime<Utc>,
+) -> Option<BackgroundHealInfo> {
+    let reset_bitrot_start = scan_mode == HealScanMode::Deep && should_reset_bitrot_start(&info, current_cycle, now);
+    if info.current_scan_mode == scan_mode && !reset_bitrot_start {
+        return None;
+    }
+
+    info.current_scan_mode = scan_mode;
+    if reset_bitrot_start {
+        info.bitrot_start_cycle = current_cycle;
+        info.bitrot_start_time = Some(now);
+    }
+
+    Some(info)
+}
+
+fn should_reset_bitrot_start(info: &BackgroundHealInfo, current_cycle: u64, now: DateTime<Utc>) -> bool {
+    let Some(bitrot_start_time) = info.bitrot_start_time else {
+        return true;
+    };
+
+    let Some(bitrot_cycle) = bitrot_scan_cycle() else {
+        return false;
+    };
+
+    if bitrot_cycle.is_zero() {
+        return true;
+    }
+
+    if current_cycle.saturating_sub(info.bitrot_start_cycle) < heal_object_select_prob() as u64 {
+        return false;
+    }
+
+    let elapsed = now
+        .signed_duration_since(bitrot_start_time)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    elapsed >= bitrot_cycle
+}
+
+fn background_heal_info_for_scan_complete(mut info: BackgroundHealInfo, scan_mode: HealScanMode) -> Option<BackgroundHealInfo> {
+    if scan_mode != HealScanMode::Deep || info.current_scan_mode != HealScanMode::Deep {
+        return None;
+    }
+
+    info.current_scan_mode = HealScanMode::Normal;
+    Some(info)
 }
 
 fn retain_recent_cycle_completions(cycle_completed: &mut Vec<DateTime<Utc>>) {
@@ -246,22 +431,18 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
 
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 
-    let background_heal_info = read_background_heal_info(storeapi.clone()).await;
+    let mut background_heal_info = read_background_heal_info(storeapi.clone()).await;
 
     let scan_mode = get_cycle_scan_mode(
         cycle_info.current,
         background_heal_info.bitrot_start_cycle,
         background_heal_info.bitrot_start_time,
     );
-    if background_heal_info.current_scan_mode != scan_mode {
-        let mut new_heal_info = background_heal_info.clone();
-        new_heal_info.current_scan_mode = scan_mode;
-
-        if scan_mode == HealScanMode::Deep {
-            new_heal_info.bitrot_start_cycle = cycle_info.current;
-            new_heal_info.bitrot_start_time = Some(Utc::now());
-        }
-
+    let _scan_mode_guard = ScannerScanModeGuard::new(scan_mode);
+    if let Some(new_heal_info) =
+        background_heal_info_for_scan_start(background_heal_info.clone(), cycle_info.current, scan_mode, Utc::now())
+    {
+        background_heal_info = new_heal_info.clone();
         save_background_heal_info(storeapi.clone(), new_heal_info).await;
     }
 
@@ -274,21 +455,31 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
     let cycle_start = std::time::Instant::now();
+    let cycle_work_start = global_metrics().start_scan_cycle_work();
     if let Err(e) = storeapi
         .clone()
         .nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode)
         .await
     {
         error!(duration = ?now.elapsed(), "Fail run data scanner cycle: {e}");
+        global_metrics().finish_scan_cycle_work(cycle_work_start);
         emit_scan_cycle_complete(false, cycle_start.elapsed());
+        if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
+            save_background_heal_info(storeapi.clone(), new_heal_info).await;
+        }
         return;
     }
     done_cycle();
+    global_metrics().finish_scan_cycle_work(cycle_work_start);
     emit_scan_cycle_complete(true, cycle_start.elapsed());
+    if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
+        save_background_heal_info(storeapi.clone(), new_heal_info).await;
+    }
 
     cycle_info.next += 1;
     cycle_info.current = 0;
     cycle_info.cycle_completed.push(Utc::now());
+    global_metrics().clear_current_scan_mode();
 
     info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run data scanner cycle");
 
@@ -367,6 +558,21 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     Ok(())
 }
 
+struct ScannerScanModeGuard;
+
+impl ScannerScanModeGuard {
+    fn new(scan_mode: HealScanMode) -> Self {
+        global_metrics().set_current_scan_mode(scan_mode);
+        Self
+    }
+}
+
+impl Drop for ScannerScanModeGuard {
+    fn drop(&mut self) {
+        global_metrics().clear_current_scan_mode();
+    }
+}
+
 /// Store data usage info in backend. Will store all objects sent on the receiver until closed.
 #[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
@@ -417,6 +623,50 @@ mod tests {
     use serial_test::serial;
     use temp_env::{with_var, with_var_unset};
 
+    struct ScannerDefaultSpeedGuard;
+
+    impl ScannerDefaultSpeedGuard {
+        fn set(speed: ScannerSpeed) -> Self {
+            set_scanner_default_speed(speed);
+            Self
+        }
+    }
+
+    impl Drop for ScannerDefaultSpeedGuard {
+        fn drop(&mut self) {
+            set_scanner_default_speed(ScannerSpeed::Default);
+        }
+    }
+
+    struct ScannerDefaultCycleGuard;
+
+    impl ScannerDefaultCycleGuard {
+        fn set(secs: u64) -> Self {
+            set_scanner_default_cycle_secs(Some(secs));
+            Self
+        }
+    }
+
+    impl Drop for ScannerDefaultCycleGuard {
+        fn drop(&mut self) {
+            set_scanner_default_cycle_secs(None);
+        }
+    }
+
+    fn with_unset_scanner_timing_env(f: impl FnOnce()) {
+        with_var_unset(ENV_SCANNER_SPEED, || {
+            with_var_unset("MINIO_SCANNER_SPEED", || {
+                with_var_unset(ENV_SCANNER_CYCLE, || {
+                    with_var_unset("MINIO_SCANNER_CYCLE", || {
+                        with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
+                            with_var_unset(ENV_SCANNER_START_DELAY_SECS_DEPRECATED, f);
+                        });
+                    });
+                });
+            });
+        });
+    }
+
     #[test]
     #[serial]
     fn test_randomized_cycle_delay_keeps_configured_start_delay() {
@@ -452,6 +702,127 @@ mod tests {
         with_var(ENV_SCANNER_SPEED, Some("slowest"), || {
             with_var(ENV_SCANNER_CYCLE, Some("42"), || {
                 assert_eq!(cycle_interval(), Duration::from_secs(42));
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_prefers_explicit_cycle_over_default_cycle() {
+        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+
+        with_var(ENV_SCANNER_CYCLE, Some("42"), || {
+            assert_eq!(cycle_interval(), Duration::from_secs(42));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_uses_scanner_default_speed_override_when_unconfigured() {
+        let _guard = ScannerDefaultSpeedGuard::set(ScannerSpeed::Slowest);
+
+        with_unset_scanner_timing_env(|| {
+            assert_eq!(cycle_interval(), Duration::from_secs(30 * 60));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_prefers_explicit_speed_over_default_speed_override() {
+        let _guard = ScannerDefaultSpeedGuard::set(ScannerSpeed::Slowest);
+
+        with_var_unset(ENV_SCANNER_CYCLE, || {
+            with_var_unset("MINIO_SCANNER_CYCLE", || {
+                with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
+                    with_var_unset(ENV_SCANNER_START_DELAY_SECS_DEPRECATED, || {
+                        with_var(ENV_SCANNER_SPEED, Some("fastest"), || {
+                            assert_eq!(cycle_interval(), Duration::from_secs(1));
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_uses_default_cycle_override_when_unconfigured() {
+        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+
+        with_unset_scanner_timing_env(|| {
+            assert_eq!(cycle_interval(), Duration::from_secs(SINGLE_DISK_SCANNER_CYCLE_SECS));
+        });
+    }
+
+    #[test]
+    fn test_single_disk_default_cycle_uses_long_interval_without_maintenance_features() {
+        assert_eq!(
+            single_disk_default_cycle_secs(ScannerMaintenanceFeatures::default()),
+            Some(SINGLE_DISK_SCANNER_CYCLE_SECS)
+        );
+    }
+
+    #[test]
+    fn test_single_disk_default_cycle_preserves_regular_cycle_for_lifecycle() {
+        assert_eq!(
+            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
+                lifecycle: true,
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn test_single_disk_default_cycle_preserves_regular_cycle_for_replication() {
+        assert_eq!(
+            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
+                replication: true,
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn test_single_disk_default_cycle_preserves_regular_cycle_on_inspection_failure() {
+        assert_eq!(
+            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
+                inspection_failed: true,
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_keeps_single_disk_cycle_with_explicit_speed() {
+        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+
+        with_var_unset(ENV_SCANNER_CYCLE, || {
+            with_var_unset("MINIO_SCANNER_CYCLE", || {
+                with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
+                    with_var_unset(ENV_SCANNER_START_DELAY_SECS_DEPRECATED, || {
+                        with_var(ENV_SCANNER_SPEED, Some("slowest"), || {
+                            assert_eq!(cycle_interval(), Duration::from_secs(SINGLE_DISK_SCANNER_CYCLE_SECS));
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_cycle_interval_prefers_explicit_start_delay_over_default_cycle() {
+        let _guard = ScannerDefaultCycleGuard::set(SINGLE_DISK_SCANNER_CYCLE_SECS);
+
+        with_var_unset(ENV_SCANNER_CYCLE, || {
+            with_var_unset("MINIO_SCANNER_CYCLE", || {
+                with_var(ENV_SCANNER_START_DELAY_SECS, Some("120"), || {
+                    assert_eq!(cycle_interval(), Duration::from_secs(120));
+                });
             });
         });
     }
@@ -518,6 +889,68 @@ mod tests {
         with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("off"), || {
             assert_eq!(get_cycle_scan_mode(1, 0, None), HealScanMode::Normal);
         });
+    }
+
+    #[test]
+    #[serial]
+    fn test_background_heal_info_for_scan_start_marks_deep_active() {
+        let now = Utc::now();
+        let info = background_heal_info_for_scan_start(BackgroundHealInfo::default(), 7, HealScanMode::Deep, now)
+            .expect("deep scan should update background heal info");
+
+        assert_eq!(info.current_scan_mode, HealScanMode::Deep);
+        assert_eq!(info.bitrot_start_cycle, 7);
+        assert_eq!(info.bitrot_start_time, Some(now));
+    }
+
+    #[test]
+    #[serial]
+    fn test_background_heal_info_for_scan_start_keeps_deep_window_start() {
+        with_var_unset(ENV_SCANNER_BITROT_CYCLE_SECS, || {
+            let started_at = Utc::now();
+            let info = BackgroundHealInfo {
+                bitrot_start_time: Some(started_at),
+                bitrot_start_cycle: 7,
+                current_scan_mode: HealScanMode::Normal,
+            };
+
+            let info = background_heal_info_for_scan_start(info, 8, HealScanMode::Deep, Utc::now())
+                .expect("deep scan should mark active status");
+
+            assert_eq!(info.current_scan_mode, HealScanMode::Deep);
+            assert_eq!(info.bitrot_start_cycle, 7);
+            assert_eq!(info.bitrot_start_time, Some(started_at));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_background_heal_info_for_scan_complete_marks_deep_idle() {
+        let started_at = Utc::now();
+        let info = BackgroundHealInfo {
+            bitrot_start_time: Some(started_at),
+            bitrot_start_cycle: 7,
+            current_scan_mode: HealScanMode::Deep,
+        };
+
+        let info = background_heal_info_for_scan_complete(info, HealScanMode::Deep)
+            .expect("completed deep scan should update background heal info");
+
+        assert_eq!(info.current_scan_mode, HealScanMode::Normal);
+        assert_eq!(info.bitrot_start_cycle, 7);
+        assert_eq!(info.bitrot_start_time, Some(started_at));
+    }
+
+    #[test]
+    #[serial]
+    fn test_background_heal_info_for_scan_complete_leaves_normal_scan_unchanged() {
+        let info = BackgroundHealInfo {
+            bitrot_start_time: Some(Utc::now()),
+            bitrot_start_cycle: 7,
+            current_scan_mode: HealScanMode::Normal,
+        };
+
+        assert!(background_heal_info_for_scan_complete(info, HealScanMode::Normal).is_none());
     }
 
     #[test]

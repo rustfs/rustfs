@@ -1002,7 +1002,7 @@ impl ECStore {
                 return true;
             }
 
-            // Mark pool rebalance as done if within 5% of the PercentFreeGoal
+            // Mark pool rebalance as done only after it reaches the PercentFreeGoal.
             let pfi = if pool_stat.init_capacity == 0 {
                 0.0
             } else {
@@ -1032,7 +1032,7 @@ fn rebalance_goal_reached(init_free_space: u64, init_capacity: u64, bytes: u64, 
     }
 
     let pfi = (init_free_space + bytes) as f64 / init_capacity as f64;
-    (pfi - percent_free_goal).abs() <= 0.05 + f64::EPSILON
+    pfi + f64::EPSILON >= percent_free_goal
 }
 
 fn percent_free_ratio(total_free: u64, total_cap: u64) -> f64 {
@@ -2664,23 +2664,20 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_rebalance_goal_reached_exact_tolerance_bound() {
+    fn test_rebalance_goal_reached_at_target() {
         let init_free_space = 200_u64;
         let init_capacity = 1_000_u64;
         let goal = 0.45_f64;
 
-        // goal - 0.05 => 200 + 200 = 400 free / 1000 => 0.4 exactly
-        assert!(rebalance_goal_reached(init_free_space, init_capacity, 200, goal));
-
-        // one byte above the tolerance boundary should be false
-        assert!(!rebalance_goal_reached(init_free_space, init_capacity, 199, goal));
+        assert!(rebalance_goal_reached(init_free_space, init_capacity, 250, goal));
+        assert!(!rebalance_goal_reached(init_free_space, init_capacity, 249, goal));
     }
 
     #[test]
-    fn test_rebalance_goal_reached_within_tolerance() {
+    fn test_rebalance_goal_reached_above_target() {
         let init_free_space = 200_u64;
         let init_capacity = 1_000_u64;
-        let bytes = 250_u64;
+        let bytes = 251_u64;
         let goal = 0.45_f64;
 
         assert!(rebalance_goal_reached(init_free_space, init_capacity, bytes, goal));
@@ -2702,12 +2699,12 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_rebalance_goal_above_one_is_true_when_within_tolerance() {
+    fn test_rebalance_goal_above_one_is_true_when_reached() {
         assert!(rebalance_goal_reached(950, 1_000, 100, 1.0));
     }
 
     #[test]
-    fn test_rebalance_goal_below_zero_is_true_when_within_tolerance() {
+    fn test_rebalance_goal_below_zero_is_true_when_reached() {
         assert!(rebalance_goal_reached(10, 1_000, 0, -0.01));
     }
 
@@ -3356,6 +3353,18 @@ mod rebalance_unit_tests {
     }
 
     #[test]
+    fn test_rebalance_goal_not_reached_for_issue_3137_initial_imbalance() {
+        let pool0_capacity = 10_000_u64;
+        let pool0_free = 9_135_u64;
+        let pool1_capacity = 10_000_u64;
+        let pool1_free = 9_800_u64;
+        let goal = percent_free_ratio(pool0_free + pool1_free, pool0_capacity + pool1_capacity);
+
+        assert!(should_pool_participate(pool0_free, pool0_capacity, goal));
+        assert!(!rebalance_goal_reached(pool0_free, pool0_capacity, 0, goal));
+    }
+
+    #[test]
     fn test_complete_rebalance_pools_at_goal_marks_started_participants_completed() {
         let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
         let mut meta = RebalanceMeta {
@@ -3365,7 +3374,7 @@ mod rebalance_unit_tests {
                     participating: true,
                     init_free_space: 400,
                     init_capacity: 1_000,
-                    bytes: 50,
+                    bytes: 100,
                     info: RebalanceInfo {
                         status: RebalStatus::Started,
                         ..Default::default()
@@ -4129,13 +4138,13 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_rebalance_goal_reached_tolerance_and_regression() {
+    fn test_rebalance_goal_reached_requires_target_ratio() {
         let init_free_space = 150_u64;
         let init_capacity = 800_u64;
         let goal = 0.35_f64;
 
         assert!(!rebalance_goal_reached(init_free_space, init_capacity, 0, goal));
-        assert!(rebalance_goal_reached(init_free_space, init_capacity, 90, goal));
-        assert!(!rebalance_goal_reached(init_free_space, init_capacity, 89, goal));
+        assert!(!rebalance_goal_reached(init_free_space, init_capacity, 129, goal));
+        assert!(rebalance_goal_reached(init_free_space, init_capacity, 130, goal));
     }
 }

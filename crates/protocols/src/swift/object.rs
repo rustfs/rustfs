@@ -867,7 +867,7 @@ pub async fn copy_object(
 
     // 10. Prepare metadata for destination object
     // Start with source metadata
-    let mut new_metadata = src_info.user_defined.clone();
+    let mut new_metadata = (*src_info.user_defined).clone();
 
     // 11. If custom metadata headers provided, use those instead (Swift behavior)
     let mut has_custom_meta = false;

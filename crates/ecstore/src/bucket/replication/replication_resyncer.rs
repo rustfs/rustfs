@@ -934,7 +934,7 @@ fn heal_should_use_check_replicate_delete(oi: &ObjectInfo) -> bool {
 
 pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationConfig) -> ReplicateObjectInfo {
     let mut oi = oi.clone();
-    let mut user_defined = oi.user_defined.clone();
+    let mut user_defined = (*oi.user_defined).clone();
 
     if let Some(rc) = rcfg.config.as_ref()
         && !rc.role.is_empty()
@@ -982,7 +982,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
             &oi.name,
             MustReplicateOptions::new(
                 &user_defined,
-                oi.user_tags.clone(),
+                (*oi.user_tags).clone(),
                 ReplicationStatusType::Empty,
                 ReplicationType::Heal,
                 ObjectOptions::default(),
@@ -1020,7 +1020,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         target_purge_statuses,
         replication_timestamp: None,
         ssec: false, // TODO: add ssec support
-        user_tags: oi.user_tags.clone(),
+        user_tags: (*oi.user_tags).clone(),
         checksum: oi.checksum.clone(),
         retry_count: 0,
     }
@@ -1158,7 +1158,7 @@ impl ReplicationConfig {
             return self.resync_internal(oi, dsc, status);
         }
 
-        let mut user_defined = oi.user_defined.clone();
+        let mut user_defined = (*oi.user_defined).clone();
         user_defined.remove(AMZ_BUCKET_REPLICATION_STATUS);
 
         let dsc = must_replicate(
@@ -1166,7 +1166,7 @@ impl ReplicationConfig {
             &oi.name,
             MustReplicateOptions::new(
                 &user_defined,
-                oi.user_tags.clone(),
+                (*oi.user_tags).clone(),
                 ReplicationStatusType::Empty,
                 ReplicationType::ExistingObject,
                 ObjectOptions::default(),
@@ -1296,7 +1296,7 @@ impl MustReplicateOptions {
     }
 
     pub fn from_object_info(oi: &ObjectInfo, op_type: ReplicationType, opts: ObjectOptions) -> Self {
-        Self::new(&oi.user_defined, oi.user_tags.clone(), oi.replication_status.clone(), op_type, opts)
+        Self::new(&oi.user_defined, (*oi.user_tags).clone(), oi.replication_status.clone(), op_type, opts)
     }
 
     pub fn replication_status(&self) -> ReplicationStatusType {
@@ -1411,7 +1411,7 @@ fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> Obj
     ObjectOpts {
         name: dobj.object_name.clone(),
         ssec: is_ssec_encrypted(&oi.user_defined),
-        user_tags: oi.user_tags.clone(),
+        user_tags: (*oi.user_tags).clone(),
         delete_marker: oi.delete_marker,
         version_id: dobj.version_id,
         op_type: ReplicationType::Delete,
@@ -2995,7 +2995,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             mod_time: self.mod_time,
             version_id: self.version_id,
             size: self.size,
-            user_tags: self.user_tags.clone(),
+            user_tags: Arc::new(self.user_tags.clone()),
             actual_size: self.actual_size,
             replication_status_internal: self.replication_status_internal.clone(),
             replication_status: self.replication_status.clone(),
@@ -3221,7 +3221,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     }
 
     // Use case-insensitive lookup for headers
-    let lk_map = object_info.user_defined.clone();
+    let lk_map = &*object_info.user_defined;
 
     if let Some(lang) = lk_map.lookup(CONTENT_LANGUAGE) {
         put_op.content_language = lang.to_string();
@@ -3500,7 +3500,7 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
 
     // compare metadata on both maps to see if meta is identical
     let mut compare_meta1 = HashMap::new();
-    for (k, v) in &oi1.user_defined {
+    for (k, v) in oi1.user_defined.iter() {
         let mut found = false;
         for prefix in &compare_keys {
             if strings_has_prefix_fold(k, prefix) {

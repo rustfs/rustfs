@@ -70,9 +70,9 @@ use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::is_valid_storage_class;
+use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store_api::{
-    HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader,
+    HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader, StorageAPI,
 };
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
@@ -80,6 +80,7 @@ use rustfs_filemeta::{
     version_purge_statuses_map,
 };
 use rustfs_io_metrics;
+use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
@@ -103,7 +104,7 @@ use rustfs_utils::http::{
     },
     insert_str, remove_str,
 };
-use rustfs_utils::path::{is_dir_object, path_join_buf};
+use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_zip::CompressionFormat;
 use s3s::dto::*;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
@@ -558,7 +559,7 @@ fn delete_replication_state_from_config(
 ) -> Option<ReplicationState> {
     let opts = ReplicationObjectOpts {
         name: obj_info.name.clone(),
-        user_tags: obj_info.user_tags.clone(),
+        user_tags: (*obj_info.user_tags).clone(),
         version_id,
         delete_marker: obj_info.delete_marker,
         op_type: ReplicationType::Delete,
@@ -677,6 +678,36 @@ fn delete_replication_version_id(replication_source: &ObjectInfo, deleted_delete
 
 fn should_use_existing_delete_replication_info(opts: &ObjectOptions) -> bool {
     opts.version_id.is_some() && !opts.delete_marker
+}
+
+fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
+    opts.http_preconditions = None;
+    opts
+}
+
+fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
+    match err {
+        rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            required,
+            achieved,
+        },
+        other => StorageError::other(format!("Failed to acquire {mode} lock on {bucket}/{object}: {other}")),
+    }
+}
+
+async fn acquire_self_copy_namespace_lock<S: StorageAPI + ?Sized>(
+    store: &S,
+    bucket: &str,
+    object: &str,
+) -> S3Result<NamespaceLockGuard> {
+    let object = encode_dir_object(object);
+    let lock = store.new_ns_lock(bucket, &object).await.map_err(ApiError::from)?;
+    lock.get_write_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(|err| ApiError::from(copy_namespace_lock_error(bucket, &object, "write", err)).into())
 }
 
 fn delete_replication_state_source<'a>(
@@ -1316,7 +1347,7 @@ impl DefaultObjectUsecase {
         check_preconditions(&req.headers, &info)?;
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
-        for part in &info.parts {
+        for part in info.parts.iter() {
             debug!(
                 part_number = part.number,
                 part_size = part.size,
@@ -1812,9 +1843,11 @@ impl DefaultObjectUsecase {
         )
         .await?;
 
-        let current_opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
+        let current_opts: ObjectOptions = internal_object_info_lookup_opts(
+            get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+                .await
+                .map_err(ApiError::from)?,
+        );
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info)?;
@@ -2671,23 +2704,34 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let dst_opts = copy_dst_opts(&bucket, &key, version_id, &req.headers, HashMap::new())
+        let mut dst_opts = copy_dst_opts(&bucket, &key, version_id, &req.headers, HashMap::new())
             .await
             .map_err(ApiError::from)?;
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
 
-        if cp_src_dst_same {
-            src_get_opts.no_lock = true;
-        }
-
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let current_opts: ObjectOptions = get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
+        let _self_copy_lock_guard = if cp_src_dst_same {
+            let guard = acquire_self_copy_namespace_lock(store.as_ref(), &bucket, &key).await?;
+            src_opts.no_lock = true;
+            src_get_opts.no_lock = true;
+            dst_opts.no_lock = true;
+            Some(guard)
+        } else {
+            None
+        };
+
+        let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
+            get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
+                .await
+                .map_err(ApiError::from)?,
+        );
+        if cp_src_dst_same {
+            current_opts.no_lock = true;
+        }
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info)?;
@@ -2766,7 +2810,10 @@ impl DefaultObjectUsecase {
             src_info.metadata_only = true;
         }
 
-        strip_managed_encryption_metadata(&mut src_info.user_defined);
+        // Extract user_defined from Arc for mutation; it will be re-wrapped after all edits.
+        let mut user_defined = (*src_info.user_defined).clone();
+
+        strip_managed_encryption_metadata(&mut user_defined);
 
         let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
 
@@ -2780,27 +2827,27 @@ impl DefaultObjectUsecase {
             insert_str(&mut compress_metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
-            remove_str(&mut src_info.user_defined, SUFFIX_COMPRESSION);
-            remove_str(&mut src_info.user_defined, SUFFIX_ACTUAL_SIZE);
-            remove_str(&mut src_info.user_defined, SUFFIX_COMPRESSION_SIZE);
+            remove_str(&mut user_defined, SUFFIX_COMPRESSION);
+            remove_str(&mut user_defined, SUFFIX_ACTUAL_SIZE);
+            remove_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE);
         }
 
         // Handle MetadataDirective REPLACE: replace user metadata while preserving system metadata.
         // System metadata (compression, encryption) is added after this block to ensure
         // it's not cleared by the REPLACE operation.
         if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
-            src_info.user_defined.clear();
+            user_defined.clear();
             if let Some(metadata) = metadata {
-                src_info.user_defined.extend(metadata);
+                user_defined.extend(metadata);
             }
             if let Some(ct) = content_type {
                 src_info.content_type = Some(ct.clone());
-                src_info.user_defined.insert("content-type".to_string(), ct);
+                user_defined.insert("content-type".to_string(), ct);
             }
         }
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
-        remove_object_lock_metadata_for_copy(&mut src_info.user_defined);
+        remove_object_lock_metadata_for_copy(&mut user_defined);
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
             &bucket,
             object_lock_legal_hold_status,
@@ -2809,9 +2856,9 @@ impl DefaultObjectUsecase {
         )
         .await?
         {
-            src_info.user_defined.extend(object_lock_metadata);
+            user_defined.extend(object_lock_metadata);
         }
-        apply_bucket_default_lock_retention(&bucket, &mut src_info.user_defined, has_explicit_object_lock_retention).await?;
+        apply_bucket_default_lock_retention(&bucket, &mut user_defined, has_explicit_object_lock_retention).await?;
 
         let mut reader = if should_compress {
             let hrd = HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
@@ -2848,7 +2895,7 @@ impl DefaultObjectUsecase {
             reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
                 .map_err(ApiError::from)?;
 
-            src_info.user_defined.extend(encryption_material_to_metadata(&material));
+            user_defined.extend(encryption_material_to_metadata(&material));
         }
 
         src_info.put_object_reader = Some(PutObjReader::new(reader));
@@ -2856,8 +2903,10 @@ impl DefaultObjectUsecase {
         // check quota
 
         for (k, v) in compress_metadata {
-            src_info.user_defined.insert(k, v);
+            user_defined.insert(k, v);
         }
+
+        src_info.user_defined = Arc::new(user_defined);
 
         self.check_bucket_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
             .await?;
@@ -3158,6 +3207,8 @@ impl DefaultObjectUsecase {
                 key: Some(v.object_name.clone()),
                 version_id: if is_dir_object(v.object_name.as_str()) && v.version_id == Some(Uuid::nil()) {
                     None
+                } else if v.version_id == Some(Uuid::nil()) {
+                    Some("null".to_string())
                 } else {
                     v.version_id.map(|v| v.to_string())
                 },
@@ -3853,7 +3904,7 @@ impl DefaultObjectUsecase {
         }
 
         let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), *rreq.days.as_ref().unwrap_or(&1));
-        let mut metadata = obj_info.user_defined.clone();
+        let mut metadata = (*obj_info.user_defined).clone();
 
         let mut header = HeaderMap::new();
 
@@ -3885,7 +3936,7 @@ impl DefaultObjectUsecase {
                     .to_string(),
                 );
             }
-            obj_info.user_defined = metadata;
+            obj_info.user_defined = Arc::new(metadata);
 
             store
                 .clone()
@@ -4444,6 +4495,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn internal_object_info_lookup_opts_drops_http_preconditions() {
+        let version_id = Uuid::new_v4().to_string();
+        let opts = ObjectOptions {
+            version_id: Some(version_id.clone()),
+            no_lock: true,
+            http_preconditions: Some(rustfs_ecstore::store_api::HTTPPreconditions {
+                if_none_match: Some("\"etag\"".to_string()),
+                if_match: Some("\"other\"".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let lookup_opts = internal_object_info_lookup_opts(opts);
+
+        assert!(lookup_opts.http_preconditions.is_none());
+        assert_eq!(lookup_opts.version_id.as_deref(), Some(version_id.as_str()));
+        assert!(lookup_opts.no_lock);
+    }
+
     #[tokio::test]
     async fn build_put_like_object_lock_metadata_rejects_mode_without_retain_until_date() {
         let err = build_put_like_object_lock_metadata(
@@ -4965,7 +5037,7 @@ mod tests {
         let metadata = HashMap::new();
         let standard_info = ObjectInfo {
             storage_class: Some(storageclass::STANDARD.to_string()),
-            user_defined: metadata.clone(),
+            user_defined: Arc::new(metadata.clone()),
             ..Default::default()
         };
         assert!(response_storage_class(&standard_info, &metadata).is_none());
@@ -4974,7 +5046,7 @@ mod tests {
         metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string());
         let infrequent_access_info = ObjectInfo {
             storage_class: Some(storageclass::STANDARD_IA.to_string()),
-            user_defined: metadata.clone(),
+            user_defined: Arc::new(metadata.clone()),
             ..Default::default()
         };
         assert_eq!(
@@ -5091,6 +5163,15 @@ mod tests {
 
         let err = usecase.execute_delete_objects(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn normalize_delete_objects_version_id_preserves_explicit_null_marker() {
+        let (wire_version_id, internal_version_id) =
+            normalize_delete_objects_version_id(Some("null".to_string())).expect("null version marker should parse");
+
+        assert_eq!(wire_version_id.as_deref(), Some("null"));
+        assert_eq!(internal_version_id, Some(Uuid::nil()));
     }
 
     #[test]

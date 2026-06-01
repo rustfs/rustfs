@@ -41,7 +41,7 @@ use crate::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
     },
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
-    config::{GLOBAL_STORAGE_CLASS, storageclass},
+    config::{get_global_storage_class, storageclass},
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
@@ -282,8 +282,7 @@ fn build_tiered_decommission_file_info(
     default_parity_count: usize,
     storage_class: Option<&str>,
 ) -> (FileInfo, usize) {
-    let parity_drives = GLOBAL_STORAGE_CLASS
-        .get()
+    let parity_drives = get_global_storage_class()
         .and_then(|sc| sc.get_parity_for_sc(storage_class.unwrap_or_default()))
         .unwrap_or(default_parity_count);
     let data_drives = disk_count - parity_drives;
@@ -588,6 +587,18 @@ impl SetDisks {
     // shuffle_disks TODO: use origin value
 }
 
+fn is_explicit_null_version(version_id: Option<Uuid>) -> bool {
+    version_id == Some(Uuid::nil())
+}
+
+fn delete_file_info_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
+    if is_explicit_null_version(version_id) {
+        None
+    } else {
+        version_id
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectIO for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
@@ -748,7 +759,7 @@ impl ObjectIO for SetDisks {
 
         let mut object_lock_guard = None;
 
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+        if opts.http_preconditions.is_some() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
                 object_lock_guard = Some(
@@ -771,7 +782,7 @@ impl ObjectIO for SetDisks {
             }
         }
         let sc_parity_drives = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None
@@ -825,45 +836,52 @@ impl ObjectIO for SetDisks {
             let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
             let is_inline_buffer = {
-                if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+                if let Some(sc) = get_global_storage_class() {
                     sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
                 } else {
                     false
                 }
             };
 
-            let mut writers = Vec::with_capacity(shuffle_disks.len());
-            let mut errors = Vec::with_capacity(shuffle_disks.len());
-            for disk_op in shuffle_disks.iter() {
-                if let Some(disk) = disk_op
-                    && disk.is_online().await
-                {
-                    let writer = match create_bitrot_writer(
-                        is_inline_buffer,
-                        Some(disk),
-                        RUSTFS_META_TMP_BUCKET,
-                        &tmp_object,
-                        erasure.shard_file_size(data.size()),
-                        erasure.shard_size(),
-                        HashAlgorithm::HighwayHash256S,
-                    )
-                    .await
-                    {
-                        Ok(writer) => writer,
-                        Err(err) => {
-                            warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
-                            errors.push(Some(err));
-                            writers.push(None);
-                            continue;
+            let shard_file_size = erasure.shard_file_size(data.size());
+            let shard_size = erasure.shard_size();
+            let writer_futs: Vec<_> = shuffle_disks
+                .iter()
+                .map(|disk_op| {
+                    let tmp_obj = tmp_object.clone();
+                    async move {
+                        if let Some(disk) = disk_op
+                            && disk.is_online().await
+                        {
+                            match create_bitrot_writer(
+                                is_inline_buffer,
+                                Some(disk),
+                                RUSTFS_META_TMP_BUCKET,
+                                &tmp_obj,
+                                shard_file_size,
+                                shard_size,
+                                HashAlgorithm::HighwayHash256S,
+                            )
+                            .await
+                            {
+                                Ok(writer) => (Some(writer), None),
+                                Err(err) => {
+                                    warn!("create_bitrot_writer  disk {}, err {:?}, skipping operation", disk.to_string(), err);
+                                    (None, Some(err))
+                                }
+                            }
+                        } else {
+                            (None, Some(DiskError::DiskNotFound))
                         }
-                    };
-
-                    writers.push(Some(writer));
-                    errors.push(None);
-                } else {
-                    errors.push(Some(DiskError::DiskNotFound));
-                    writers.push(None);
-                }
+                    }
+                })
+                .collect();
+            let writer_results = join_all(writer_futs).await;
+            let mut writers = Vec::with_capacity(writer_results.len());
+            let mut errors = Vec::with_capacity(writer_results.len());
+            for (w, e) in writer_results {
+                writers.push(w);
+                errors.push(e);
             }
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
@@ -881,13 +899,28 @@ impl ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let (reader, w_size) = match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
-                Ok((r, w)) => (r, w),
-                Err(e) => {
-                    error!("encode err {:?}", e);
-                    return Err(e.into());
+            let use_fast_path = is_inline_buffer && data.size() <= fi.erasure.block_size as i64;
+
+            let (reader, w_size) = if use_fast_path {
+                match Arc::new(erasure)
+                    .encode_inline_small(stream, &mut writers, write_quorum)
+                    .await
+                {
+                    Ok((r, w)) => (r, w),
+                    Err(e) => {
+                        error!("encode_inline_small err {:?}", e);
+                        return Err(e.into());
+                    }
                 }
-            }; // TODO: delete temporary directory on error
+            } else {
+                match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
+                    Ok((r, w)) => (r, w),
+                    Err(e) => {
+                        error!("encode err {:?}", e);
+                        return Err(e.into());
+                    }
+                }
+            };
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -1375,8 +1408,8 @@ impl ObjectOperations for SetDisks {
         &self,
         src_bucket: &str,
         src_object: &str,
-        _dst_bucket: &str,
-        _dst_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
         src_info: &mut ObjectInfo,
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
@@ -1387,13 +1420,27 @@ impl ObjectOperations for SetDisks {
             return Err(StorageError::NotImplemented);
         }
 
-        // Guard lock for source object metadata update
-        let _lock_guard = self
-            .new_ns_lock(src_bucket, src_object)
-            .await?
-            .get_write_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(|e| self.map_namespace_lock_error(src_bucket, src_object, "write", e))?;
+        if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object]) {
+            return Err(StorageError::NotImplemented);
+        }
+
+        let _lock_guard = if dst_opts.no_lock {
+            None
+        } else {
+            Some(
+                self.new_ns_lock(dst_bucket, dst_object)
+                    .await?
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(dst_bucket, dst_object, "write", e))?,
+            )
+        };
+
+        if dst_opts.http_preconditions.is_some()
+            && let Some(err) = self.check_write_precondition(dst_bucket, dst_object, dst_opts).await
+        {
+            return Err(err);
+        }
 
         let disks = self.get_disks_internal().await;
 
@@ -1449,7 +1496,7 @@ impl ObjectOperations for SetDisks {
             }
         };
 
-        fi.metadata = src_info.user_defined.clone();
+        fi.metadata = (*src_info.user_defined).clone();
 
         if let Some(etag) = &src_info.etag {
             fi.metadata.insert("etag".to_owned(), etag.clone());
@@ -1465,7 +1512,7 @@ impl ObjectOperations for SetDisks {
 
             for fi in metas.iter_mut() {
                 if fi.is_valid() {
-                    fi.metadata = src_info.user_defined.clone();
+                    fi.metadata = (*src_info.user_defined).clone();
                     if let Some(etag) = &src_info.etag {
                         fi.metadata.insert("etag".to_owned(), etag.clone());
                     }
@@ -1606,9 +1653,10 @@ impl ObjectOperations for SetDisks {
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
 
         for (i, dobj) in objects.iter().enumerate() {
+            let explicit_null_version = is_explicit_null_version(dobj.version_id);
             let mut vr = FileInfo {
                 name: dobj.object_name.clone(),
-                version_id: dobj.version_id,
+                version_id: delete_file_info_version_id(dobj.version_id),
                 idx: i,
                 replication_state_internal: Some(dobj.replication_state()),
                 ..Default::default()
@@ -1657,7 +1705,11 @@ impl ObjectOperations for SetDisks {
             } else {
                 del_objects[i] = DeletedObject {
                     object_name: vr.name.clone(),
-                    version_id: vr.version_id,
+                    version_id: if explicit_null_version {
+                        Some(Uuid::nil())
+                    } else {
+                        vr.version_id
+                    },
                     replication_state: vr.replication_state_internal.clone(),
                     ..Default::default()
                 }
@@ -1769,7 +1821,7 @@ impl ObjectOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
         // Guard lock for single object delete
-        let _lock_guard = if !opts.delete_prefix {
+        let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
             Some(
                 self.new_ns_lock(bucket, object)
                     .await?
@@ -2021,8 +2073,8 @@ impl ObjectOperations for SetDisks {
 
         check_object_lock_retention_update(bucket, object, &obj_info, opts)?;
 
-        for (k, v) in obj_info.user_defined {
-            fi.metadata.insert(k, v);
+        for (k, v) in obj_info.user_defined.iter() {
+            fi.metadata.insert(k.clone(), v.clone());
         }
 
         if let Some(mt) = &opts.eval_metadata {
@@ -2048,7 +2100,7 @@ impl ObjectOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
         let oi = self.get_object_info(bucket, object, opts).await?;
-        Ok(oi.user_tags)
+        Ok((*oi.user_tags).clone())
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -2120,7 +2172,7 @@ impl ObjectOperations for SetDisks {
         let dest_obj = dest_obj.unwrap();
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        let mut transition_meta = oi.user_defined.clone();
+        let mut transition_meta = (*oi.user_defined).clone();
         transition_meta.insert("name".to_string(), object.to_string());
 
         if let Some(content_type) = oi.content_type.as_ref().filter(|value| !value.is_empty()) {
@@ -2288,9 +2340,9 @@ impl ObjectOperations for SetDisks {
         //}
 
         let mut uploaded_parts: Vec<CompletePart> = vec![];
-        let parts = oi.parts.clone();
+        let parts = Arc::clone(&oi.parts);
         let mut part_offset: i64 = 0;
-        for part_info in &parts {
+        for part_info in parts.iter() {
             let mut part_opts = opts.clone();
             part_opts.part_number = Some(part_info.number);
             if part_info.actual_size <= 0 {
@@ -3034,18 +3086,18 @@ impl MultipartOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
-            let object_lock_guard = if !opts.no_lock {
+        let mut _object_lock_guard = None;
+
+        if opts.http_preconditions.is_some() {
+            if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
-                Some(
+                _object_lock_guard = Some(
                     ns_lock
                         .get_write_lock(get_lock_acquire_timeout())
                         .await
                         .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-                )
-            } else {
-                None
-            };
+                );
+            }
 
             if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
                 return Err(err);
@@ -3069,7 +3121,7 @@ impl MultipartOperations for SetDisks {
         }
 
         let sc_parity_drives = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
             } else {
                 None
@@ -3215,8 +3267,7 @@ impl MultipartOperations for SetDisks {
     ) -> Result<ObjectInfo> {
         let mut object_lock_guard = None;
 
-        // Acquire per-object exclusive lock via RAII guard. It auto-releases asynchronously on drop.
-        if let Some(http_preconditions) = opts.http_preconditions.clone() {
+        if opts.http_preconditions.is_some() {
             if !opts.no_lock {
                 let ns_lock = self.new_ns_lock(bucket, object).await?;
                 object_lock_guard = Some(
@@ -4967,6 +5018,227 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
+    async fn copy_object_honors_no_lock_when_outer_write_lock_is_held() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let mut src_info = ObjectInfo {
+            metadata_only: true,
+            ..Default::default()
+        };
+        let dst_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.copy_object(
+                "bucket",
+                "object",
+                "bucket",
+                "object",
+                &mut src_info,
+                &ObjectOptions::default(),
+                &dst_opts,
+            ),
+        )
+        .await
+        .expect("no_lock copy path must not wait for the outer lock");
+
+        let err = result.expect_err("empty test disks should fail after bypassing the inner lock");
+        assert!(
+            !err.to_string().to_ascii_lowercase().contains("lock"),
+            "copy_object returned a lock error despite no_lock=true: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn copy_object_rejects_metadata_only_cross_key() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let mut src_info = ObjectInfo {
+            metadata_only: true,
+            ..Default::default()
+        };
+
+        let err = set_disks
+            .copy_object(
+                "bucket",
+                "source",
+                "bucket",
+                "dest",
+                &mut src_info,
+                &ObjectOptions::default(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("metadata-only lower copy is only valid for self-copy updates");
+
+        assert!(matches!(err, StorageError::NotImplemented));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn delete_object_honors_no_lock_when_outer_write_lock_is_held() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.delete_object(
+                "bucket",
+                "object",
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("no_lock delete path must not wait for the outer lock");
+
+        let err = result.expect_err("empty test disks should fail after bypassing the inner lock");
+        assert!(
+            !err.to_string().to_ascii_lowercase().contains("lock"),
+            "delete_object returned a lock error despite no_lock=true: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn delete_prefix_does_not_lock_literal_prefix_key() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "prefix")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.delete_object(
+                "bucket",
+                "prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("broad prefix delete must not wait on a literal prefix namespace lock")
+        .expect("empty test disks should allow broad prefix cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn delete_prefix_object_honors_no_lock_when_outer_write_lock_is_held() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.delete_object(
+                "bucket",
+                "object",
+                ObjectOptions {
+                    delete_prefix: true,
+                    delete_prefix_object: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("no_lock exact prefix delete path must not wait for the outer lock")
+        .expect("empty test disks should allow exact prefix cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn delete_prefix_object_locks_real_object_key() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            set_disks.delete_object(
+                "bucket",
+                "object",
+                ObjectOptions {
+                    delete_prefix: true,
+                    delete_prefix_object: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+
+        assert!(result.is_err(), "exact prefix delete should wait on the real object namespace lock");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
     async fn test_acquire_dist_delete_object_locks_batch_succeeds_with_two_healthy_lockers() {
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
 
@@ -5754,7 +6026,7 @@ mod tests {
         );
 
         let obj_info = ObjectInfo {
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
         let opts = ObjectOptions {
@@ -5789,7 +6061,7 @@ mod tests {
         );
 
         let obj_info = ObjectInfo {
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
         let opts = ObjectOptions {
@@ -6020,6 +6292,15 @@ mod tests {
         let part_numbers = vec![1, 2, 3];
 
         assert!(parts_after_marker(&part_numbers, 4).is_none());
+    }
+
+    #[test]
+    fn delete_file_info_version_id_maps_explicit_null_version_to_stored_null() {
+        assert_eq!(delete_file_info_version_id(Some(Uuid::nil())), None);
+
+        let version_id = Uuid::new_v4();
+        assert_eq!(delete_file_info_version_id(Some(version_id)), Some(version_id));
+        assert_eq!(delete_file_info_version_id(None), None);
     }
 
     #[test]

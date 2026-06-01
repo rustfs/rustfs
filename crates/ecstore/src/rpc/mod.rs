@@ -29,7 +29,10 @@ pub use internode_data_transport::{
     InternodeDataTransport, InternodeDataTransportCapabilities, ReadStreamRequest, TcpHttpInternodeDataTransport,
     WalkDirStreamRequest, WriteStreamRequest, build_internode_data_transport, build_internode_data_transport_from_env,
 };
-pub use peer_rest_client::PeerRestClient;
+pub use peer_rest_client::{
+    PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC,
+};
 pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, RemotePeerS3Client, S3PeerSys};
 pub use remote_disk::RemoteDisk;
 pub use remote_locker::RemoteClient;

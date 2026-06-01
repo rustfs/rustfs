@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::heal_channel::HealScanMode;
 use crate::last_minute::{AccElem, LastMinuteLatency};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -340,7 +341,25 @@ pub struct Metrics {
     actions_latency: Vec<LockedLastMinuteLatency>,
     current_paths: Arc<RwLock<HashMap<String, Arc<CurrentPathTracker>>>>,
     cycle_info: Arc<RwLock<Option<CurrentCycle>>>,
+    current_scan_mode: AtomicU8,
+    current_scan_cycle_work_active: AtomicBool,
+    current_scan_cycle_objects_start: AtomicU64,
+    current_scan_cycle_directories_start: AtomicU64,
+    current_scan_cycle_bucket_drive_scans_start: AtomicU64,
+    last_scan_cycle_result: AtomicU8,
+    last_scan_cycle_duration_millis: AtomicU64,
+    last_scan_cycle_objects_scanned: AtomicU64,
+    last_scan_cycle_directories_scanned: AtomicU64,
+    last_scan_cycle_bucket_drive_scans: AtomicU64,
+    failed_scan_cycles: AtomicU64,
 }
+
+const SCAN_CYCLE_RESULT_UNKNOWN: u8 = 0;
+const SCAN_CYCLE_RESULT_SUCCESS: u8 = 1;
+const SCAN_CYCLE_RESULT_ERROR: u8 = 2;
+const SCAN_CYCLE_RESULT_UNKNOWN_LABEL: &str = "unknown";
+const SCAN_CYCLE_RESULT_SUCCESS_LABEL: &str = "success";
+const SCAN_CYCLE_RESULT_ERROR_LABEL: &str = "error";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CurrentCycle {
@@ -348,6 +367,13 @@ pub struct CurrentCycle {
     pub next: u64,
     pub cycle_completed: Vec<DateTime<Utc>>,
     pub started: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanCycleWorkSnapshot {
+    objects_scanned: u64,
+    directories_scanned: u64,
+    bucket_drive_scans: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -370,10 +396,29 @@ pub struct ScannerMetricsReport {
     pub current_started: DateTime<Utc>,
     pub cycles_completed_at: Vec<DateTime<Utc>>,
     pub ongoing_buckets: usize,
+    #[serde(default)]
+    pub active_scan_paths: usize,
     pub life_time_ops: HashMap<String, u64>,
     pub life_time_ilm: HashMap<String, u64>,
     pub last_minute: ScannerLastMinute,
     pub active_paths: Vec<String>,
+    pub current_scan_mode: String,
+    #[serde(default)]
+    pub current_cycle_objects_scanned: u64,
+    #[serde(default)]
+    pub current_cycle_directories_scanned: u64,
+    #[serde(default)]
+    pub current_cycle_bucket_drive_scans: u64,
+    pub last_cycle_result: String,
+    pub last_cycle_result_code: u64,
+    pub last_cycle_duration_seconds: f64,
+    #[serde(default)]
+    pub last_cycle_objects_scanned: u64,
+    #[serde(default)]
+    pub last_cycle_directories_scanned: u64,
+    #[serde(default)]
+    pub last_cycle_bucket_drive_scans: u64,
+    pub failed_cycles: u64,
 }
 
 impl CurrentCycle {
@@ -407,8 +452,25 @@ fn emit_otel_counter(metric: usize, count: u64) {
     }
 }
 
+fn scan_cycle_result_label(result: u8) -> &'static str {
+    match result {
+        SCAN_CYCLE_RESULT_SUCCESS => SCAN_CYCLE_RESULT_SUCCESS_LABEL,
+        SCAN_CYCLE_RESULT_ERROR => SCAN_CYCLE_RESULT_ERROR_LABEL,
+        _ => SCAN_CYCLE_RESULT_UNKNOWN_LABEL,
+    }
+}
+
+fn duration_millis_saturated(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
 pub fn emit_scan_cycle_complete(success: bool, duration: Duration) {
-    let result = if success { "success" } else { "error" };
+    let result = if success {
+        SCAN_CYCLE_RESULT_SUCCESS_LABEL
+    } else {
+        SCAN_CYCLE_RESULT_ERROR_LABEL
+    };
+    global_metrics().record_scan_cycle_complete(success, duration);
     metrics::counter!(OTEL_SCANNER_CYCLES, "result" => result).increment(1);
     if success {
         metrics::gauge!(OTEL_SCANNER_CYCLE_DURATION_SECONDS).set(duration.as_secs_f64());
@@ -447,6 +509,17 @@ impl Metrics {
                 .collect(),
             current_paths: Arc::new(RwLock::new(HashMap::new())),
             cycle_info: Arc::new(RwLock::new(None)),
+            current_scan_mode: AtomicU8::new(HealScanMode::Unknown as u8),
+            current_scan_cycle_work_active: AtomicBool::new(false),
+            current_scan_cycle_objects_start: AtomicU64::new(0),
+            current_scan_cycle_directories_start: AtomicU64::new(0),
+            current_scan_cycle_bucket_drive_scans_start: AtomicU64::new(0),
+            last_scan_cycle_result: AtomicU8::new(SCAN_CYCLE_RESULT_UNKNOWN),
+            last_scan_cycle_duration_millis: AtomicU64::new(0),
+            last_scan_cycle_objects_scanned: AtomicU64::new(0),
+            last_scan_cycle_directories_scanned: AtomicU64::new(0),
+            last_scan_cycle_bucket_drive_scans: AtomicU64::new(0),
+            failed_scan_cycles: AtomicU64::new(0),
         }
     }
 
@@ -581,6 +654,83 @@ impl Metrics {
         self.cycle_info.read().await.clone()
     }
 
+    pub fn set_current_scan_mode(&self, scan_mode: HealScanMode) {
+        self.current_scan_mode.store(scan_mode as u8, Ordering::Relaxed);
+    }
+
+    pub fn clear_current_scan_mode(&self) {
+        self.set_current_scan_mode(HealScanMode::Unknown);
+    }
+
+    pub fn current_scan_mode(&self) -> HealScanMode {
+        HealScanMode::from_u8(self.current_scan_mode.load(Ordering::Relaxed)).unwrap_or(HealScanMode::Unknown)
+    }
+
+    pub fn record_scan_cycle_complete(&self, success: bool, duration: Duration) {
+        let result = if success {
+            SCAN_CYCLE_RESULT_SUCCESS
+        } else {
+            self.failed_scan_cycles.fetch_add(1, Ordering::Relaxed);
+            SCAN_CYCLE_RESULT_ERROR
+        };
+        self.last_scan_cycle_result.store(result, Ordering::Relaxed);
+        self.last_scan_cycle_duration_millis
+            .store(duration_millis_saturated(duration), Ordering::Relaxed);
+    }
+
+    pub fn start_scan_cycle_work(&self) -> ScanCycleWorkSnapshot {
+        let snapshot = self.scan_cycle_work_snapshot();
+        self.current_scan_cycle_objects_start
+            .store(snapshot.objects_scanned, Ordering::Relaxed);
+        self.current_scan_cycle_directories_start
+            .store(snapshot.directories_scanned, Ordering::Relaxed);
+        self.current_scan_cycle_bucket_drive_scans_start
+            .store(snapshot.bucket_drive_scans, Ordering::Relaxed);
+        self.current_scan_cycle_work_active.store(true, Ordering::Relaxed);
+        snapshot
+    }
+
+    pub fn finish_scan_cycle_work(&self, start: ScanCycleWorkSnapshot) {
+        let work = self.scan_cycle_work_since(start);
+        self.record_scan_cycle_work(work.objects_scanned, work.directories_scanned, work.bucket_drive_scans);
+        self.current_scan_cycle_work_active.store(false, Ordering::Relaxed);
+    }
+
+    fn scan_cycle_work_snapshot(&self) -> ScanCycleWorkSnapshot {
+        ScanCycleWorkSnapshot {
+            objects_scanned: self.lifetime(Metric::ScanObject),
+            directories_scanned: self.lifetime(Metric::ScanFolder),
+            bucket_drive_scans: self.lifetime(Metric::ScanBucketDrive),
+        }
+    }
+
+    fn current_scan_cycle_work_start(&self) -> ScanCycleWorkSnapshot {
+        ScanCycleWorkSnapshot {
+            objects_scanned: self.current_scan_cycle_objects_start.load(Ordering::Relaxed),
+            directories_scanned: self.current_scan_cycle_directories_start.load(Ordering::Relaxed),
+            bucket_drive_scans: self.current_scan_cycle_bucket_drive_scans_start.load(Ordering::Relaxed),
+        }
+    }
+
+    fn scan_cycle_work_since(&self, start: ScanCycleWorkSnapshot) -> ScanCycleWorkSnapshot {
+        let current = self.scan_cycle_work_snapshot();
+        ScanCycleWorkSnapshot {
+            objects_scanned: current.objects_scanned.saturating_sub(start.objects_scanned),
+            directories_scanned: current.directories_scanned.saturating_sub(start.directories_scanned),
+            bucket_drive_scans: current.bucket_drive_scans.saturating_sub(start.bucket_drive_scans),
+        }
+    }
+
+    pub fn record_scan_cycle_work(&self, objects_scanned: u64, directories_scanned: u64, bucket_drive_scans: u64) {
+        // Telemetry-only gauges: readers may observe a transient mixed snapshot
+        // while these independent atomic fields are updated.
+        self.last_scan_cycle_objects_scanned.store(objects_scanned, Ordering::Relaxed);
+        self.last_scan_cycle_directories_scanned
+            .store(directories_scanned, Ordering::Relaxed);
+        self.last_scan_cycle_bucket_drive_scans
+            .store(bucket_drive_scans, Ordering::Relaxed);
+    }
+
     /// Snapshot of every path currently being scanned.
     pub async fn get_current_paths(&self) -> Vec<String> {
         let paths = self.current_paths.read().await;
@@ -600,18 +750,37 @@ impl Metrics {
     pub async fn report(&self) -> ScannerMetricsReport {
         let mut m = ScannerMetricsReport::default();
 
-        if let Some(cycle) = self.get_cycle().await {
+        let has_cycle = if let Some(cycle) = self.get_cycle().await {
             m.current_cycle = cycle.current;
             m.cycles_completed_at = cycle.cycle_completed;
             m.current_started = cycle.started;
-        }
+            true
+        } else {
+            false
+        };
 
-        if let Some(init_time) = crate::get_global_init_time().await {
+        if !has_cycle && let Some(init_time) = crate::get_global_init_time().await {
             m.current_started = init_time;
         }
 
         m.collected_at = Utc::now();
         m.active_paths = self.get_current_paths().await;
+        m.active_scan_paths = m.active_paths.len();
+        m.current_scan_mode = self.current_scan_mode().as_str().to_string();
+        if self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
+            let current_work = self.scan_cycle_work_since(self.current_scan_cycle_work_start());
+            m.current_cycle_objects_scanned = current_work.objects_scanned;
+            m.current_cycle_directories_scanned = current_work.directories_scanned;
+            m.current_cycle_bucket_drive_scans = current_work.bucket_drive_scans;
+        }
+        let last_cycle_result = self.last_scan_cycle_result.load(Ordering::Relaxed);
+        m.last_cycle_result = scan_cycle_result_label(last_cycle_result).to_string();
+        m.last_cycle_result_code = last_cycle_result as u64;
+        m.last_cycle_duration_seconds = self.last_scan_cycle_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
+        m.last_cycle_objects_scanned = self.last_scan_cycle_objects_scanned.load(Ordering::Relaxed);
+        m.last_cycle_directories_scanned = self.last_scan_cycle_directories_scanned.load(Ordering::Relaxed);
+        m.last_cycle_bucket_drive_scans = self.last_scan_cycle_bucket_drive_scans.load(Ordering::Relaxed);
+        m.failed_cycles = self.failed_scan_cycles.load(Ordering::Relaxed);
 
         // Lifetime operation counts
         for i in 0..Metric::Last as usize {
@@ -745,5 +914,125 @@ impl Drop for CloseDiskGuard {
             handle.spawn(async move { close_fn().await });
         }
         // If there is no runtime we are in a test or shutdown path; skip cleanup.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn report_counts_active_scan_paths() {
+        let metrics = Metrics::new();
+        metrics
+            .current_paths
+            .write()
+            .await
+            .insert("disk-a".to_string(), Arc::new(CurrentPathTracker::new("bucket-a".to_string())));
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.active_scan_paths, 1);
+        assert_eq!(report.ongoing_buckets, 0);
+        assert_eq!(report.active_paths, vec!["disk-a/bucket-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn report_preserves_current_cycle_started_time() {
+        let previous_init_time = *crate::globals::GLOBAL_INIT_TIME.read().await;
+        let init_time = Utc::now() - chrono::Duration::hours(1);
+        let cycle_started = Utc::now();
+        *crate::globals::GLOBAL_INIT_TIME.write().await = Some(init_time);
+
+        let metrics = Metrics::new();
+        metrics
+            .set_cycle(Some(CurrentCycle {
+                current: 7,
+                started: cycle_started,
+                ..Default::default()
+            }))
+            .await;
+
+        let report = metrics.report().await;
+        *crate::globals::GLOBAL_INIT_TIME.write().await = previous_init_time;
+
+        assert_eq!(report.current_started, cycle_started);
+    }
+
+    #[tokio::test]
+    async fn report_includes_current_scan_mode() {
+        let metrics = Metrics::new();
+        metrics.set_current_scan_mode(HealScanMode::Deep);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.current_scan_mode, HealScanMode::Deep.as_str());
+    }
+
+    #[tokio::test]
+    async fn report_includes_last_scan_cycle_result() {
+        let metrics = Metrics::new();
+        metrics.record_scan_cycle_complete(false, Duration::from_millis(1500));
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.last_cycle_result, SCAN_CYCLE_RESULT_ERROR_LABEL);
+        assert_eq!(report.last_cycle_result_code, SCAN_CYCLE_RESULT_ERROR as u64);
+        assert_eq!(report.last_cycle_duration_seconds, 1.5);
+        assert_eq!(report.failed_cycles, 1);
+    }
+
+    #[tokio::test]
+    async fn report_tracks_successful_scan_cycle_without_failed_increment() {
+        let metrics = Metrics::new();
+        metrics.record_scan_cycle_complete(true, Duration::from_secs(2));
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.last_cycle_result, SCAN_CYCLE_RESULT_SUCCESS_LABEL);
+        assert_eq!(report.last_cycle_result_code, SCAN_CYCLE_RESULT_SUCCESS as u64);
+        assert_eq!(report.last_cycle_duration_seconds, 2.0);
+        assert_eq!(report.failed_cycles, 0);
+    }
+
+    #[tokio::test]
+    async fn report_includes_last_scan_cycle_work() {
+        let metrics = Metrics::new();
+        metrics.record_scan_cycle_work(11, 7, 3);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.last_cycle_objects_scanned, 11);
+        assert_eq!(report.last_cycle_directories_scanned, 7);
+        assert_eq!(report.last_cycle_bucket_drive_scans, 3);
+    }
+
+    #[tokio::test]
+    async fn report_includes_active_scan_cycle_work() {
+        let metrics = Metrics::new();
+        metrics.operations[Metric::ScanObject as usize].store(10, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].store(5, Ordering::Relaxed);
+        metrics.operations[Metric::ScanBucketDrive as usize].store(1, Ordering::Relaxed);
+
+        let start = metrics.start_scan_cycle_work();
+        metrics.operations[Metric::ScanObject as usize].store(17, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].store(8, Ordering::Relaxed);
+        metrics.operations[Metric::ScanBucketDrive as usize].store(3, Ordering::Relaxed);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.current_cycle_objects_scanned, 7);
+        assert_eq!(report.current_cycle_directories_scanned, 3);
+        assert_eq!(report.current_cycle_bucket_drive_scans, 2);
+
+        metrics.finish_scan_cycle_work(start);
+        let report = metrics.report().await;
+
+        assert_eq!(report.current_cycle_objects_scanned, 0);
+        assert_eq!(report.current_cycle_directories_scanned, 0);
+        assert_eq!(report.current_cycle_bucket_drive_scans, 0);
+        assert_eq!(report.last_cycle_objects_scanned, 7);
+        assert_eq!(report.last_cycle_directories_scanned, 3);
+        assert_eq!(report.last_cycle_bucket_drive_scans, 2);
     }
 }

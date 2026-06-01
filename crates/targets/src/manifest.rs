@@ -14,8 +14,8 @@
 
 use crate::domain::TargetDomain;
 use rustfs_config::{
-    AMQP_PASSWORD, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY, KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY, MQTT_PASSWORD,
-    MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MYSQL_DSN_STRING, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY,
+    AMQP_PASSWORD, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY, KAFKA_SASL_PASSWORD, KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY,
+    MQTT_PASSWORD, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MYSQL_DSN_STRING, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY,
     NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TOKEN, POSTGRES_DSN_STRING,
     POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, REDIS_PASSWORD, REDIS_TLS_CLIENT_CERT,
     REDIS_TLS_CLIENT_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY,
@@ -106,7 +106,7 @@ const NO_SECRET_FIELDS: &[&str] = &[];
 
 const WEBHOOK_SECRET_FIELDS: &[&str] = &[WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY];
 const MQTT_SECRET_FIELDS: &[&str] = &[MQTT_PASSWORD, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY];
-const KAFKA_SECRET_FIELDS: &[&str] = &[KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY];
+const KAFKA_SECRET_FIELDS: &[&str] = &[KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY, KAFKA_SASL_PASSWORD];
 const AMQP_SECRET_FIELDS: &[&str] = &[AMQP_PASSWORD, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY];
 const NATS_SECRET_FIELDS: &[&str] = &[
     NATS_PASSWORD,
@@ -221,7 +221,7 @@ mod tests {
         installable_target_marketplace_manifest,
     };
     use crate::domain::TargetDomain;
-    use rustfs_config::{WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY};
+    use rustfs_config::{KAFKA_SASL_PASSWORD, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY};
 
     #[test]
     fn builtin_webhook_manifest_marks_secret_fields() {
@@ -259,6 +259,13 @@ mod tests {
         let manifest = builtin_target_marketplace_manifest("kafka");
 
         assert_eq!(manifest.supported_domains, &[TargetDomain::Audit, TargetDomain::Notify]);
+    }
+
+    #[test]
+    fn builtin_kafka_manifest_marks_sasl_password_secret() {
+        let manifest = builtin_target_manifest("kafka");
+
+        assert!(manifest.secret_fields.contains(&KAFKA_SASL_PASSWORD));
     }
 
     #[test]

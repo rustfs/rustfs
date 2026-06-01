@@ -843,12 +843,13 @@ impl PeerS3Client for RemotePeerS3Client {
                 });
                 let response = client.make_bucket(request).await?.into_inner();
 
-                // TODO: deal with error
                 if !response.success {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(Error::other(format!(
+                            "make_bucket({bucket}): peer returned failure without error details"
+                        )))
                     };
                 }
 

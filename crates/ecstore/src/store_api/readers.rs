@@ -652,12 +652,20 @@ fn multipart_part_numbers(parts: &[rustfs_filemeta::ObjectPartInfo]) -> Vec<usiz
     parts.iter().map(|part| part.number).collect()
 }
 
+fn metadata_get<'a>(metadata: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    metadata.get(key).map(String::as_str).or_else(|| {
+        metadata
+            .iter()
+            .find_map(|(candidate, value)| candidate.eq_ignore_ascii_case(key).then_some(value.as_str()))
+    })
+}
+
 async fn resolve_encryption_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> Result<EncryptionMaterial> {
-    if oi.user_defined.contains_key(SSEC_ALGORITHM_HEADER) {
+    if metadata_get(&oi.user_defined, SSEC_ALGORITHM_HEADER).is_some() {
         return resolve_ssec_material(oi, headers);
     }
 
-    if oi.user_defined.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER) {
+    if metadata_get(&oi.user_defined, INTERNAL_ENCRYPTION_KEY_HEADER).is_some() {
         return resolve_managed_material(&oi.user_defined).await;
     }
 
@@ -697,11 +705,9 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
         return Err(Error::other("SSE-C key MD5 mismatch"));
     }
 
-    let stored_md5 = oi
-        .user_defined
-        .get(SSEC_KEY_MD5_HEADER)
-        .ok_or_else(|| Error::other("missing stored SSE-C key md5"))?;
-    if stored_md5 != &expected_md5 {
+    let stored_md5 =
+        metadata_get(&oi.user_defined, SSEC_KEY_MD5_HEADER).ok_or_else(|| Error::other("missing stored SSE-C key md5"))?;
+    if stored_md5 != expected_md5 {
         return Err(Error::other("SSE-C key does not match object metadata"));
     }
 
@@ -712,16 +718,14 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
 }
 
 async fn resolve_managed_material(metadata: &HashMap<String, String>) -> Result<EncryptionMaterial> {
-    let encrypted_dek = metadata
-        .get(INTERNAL_ENCRYPTION_KEY_HEADER)
-        .ok_or_else(|| Error::other("missing managed encrypted DEK"))?;
+    let encrypted_dek =
+        metadata_get(metadata, INTERNAL_ENCRYPTION_KEY_HEADER).ok_or_else(|| Error::other("missing managed encrypted DEK"))?;
     let encrypted_dek = BASE64_STANDARD
         .decode(encrypted_dek)
         .map_err(|e| Error::other(format!("failed to decode managed encrypted DEK: {e}")))?;
 
-    let iv_b64 = metadata
-        .get(INTERNAL_ENCRYPTION_IV_HEADER)
-        .ok_or_else(|| Error::other("missing managed encryption IV"))?;
+    let iv_b64 =
+        metadata_get(metadata, INTERNAL_ENCRYPTION_IV_HEADER).ok_or_else(|| Error::other("missing managed encryption IV"))?;
     let iv = BASE64_STANDARD
         .decode(iv_b64)
         .map_err(|e| Error::other(format!("failed to decode managed encryption IV: {e}")))?;
@@ -730,10 +734,7 @@ async fn resolve_managed_material(metadata: &HashMap<String, String>) -> Result<
         .try_into()
         .map_err(|_| Error::other("managed encryption IV must be 12 bytes"))?;
 
-    let kms_key_id = metadata
-        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-        .map(String::as_str)
-        .unwrap_or("default");
+    let kms_key_id = metadata_get(metadata, INTERNAL_ENCRYPTION_KEY_ID_HEADER).unwrap_or("default");
 
     let key_bytes = if let Some(service) = get_global_encryption_service().await {
         service
@@ -960,7 +961,7 @@ mod tests {
     fn test_http_range_spec_from_object_info_valid_and_invalid_parts() {
         let object_info = ObjectInfo {
             size: 300,
-            parts: vec![
+            parts: Arc::new(vec![
                 ObjectPartInfo {
                     etag: String::new(),
                     number: 1,
@@ -982,7 +983,7 @@ mod tests {
                     actual_size: 100,
                     ..Default::default()
                 },
-            ],
+            ]),
             ..Default::default()
         };
 
@@ -998,7 +999,7 @@ mod tests {
     fn test_http_range_spec_from_object_info_uses_actual_size() {
         let object_info = ObjectInfo {
             size: 90,
-            parts: vec![
+            parts: Arc::new(vec![
                 ObjectPartInfo {
                     etag: String::new(),
                     number: 1,
@@ -1020,7 +1021,7 @@ mod tests {
                     actual_size: 50,
                     ..Default::default()
                 },
-            ],
+            ]),
             ..Default::default()
         };
 
@@ -1033,7 +1034,7 @@ mod tests {
     fn test_http_range_spec_from_object_info_falls_back_to_part_size_when_actual_size_missing() {
         let object_info = ObjectInfo {
             size: 90,
-            parts: vec![
+            parts: Arc::new(vec![
                 ObjectPartInfo {
                     etag: String::new(),
                     number: 1,
@@ -1055,7 +1056,7 @@ mod tests {
                     actual_size: 0,
                     ..Default::default()
                 },
-            ],
+            ]),
             ..Default::default()
         };
 
@@ -1123,13 +1124,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_managed_material_accepts_case_insensitive_metadata_keys() {
+        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
+            let data_key = [0x24; 32];
+            let base_nonce = [0x14; 12];
+            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+            let metadata = HashMap::from([
+                ("X-Rustfs-Encryption-Key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
+                ("X-Rustfs-Encryption-IV".to_string(), BASE64_STANDARD.encode(base_nonce)),
+            ]);
+
+            let material = resolve_managed_material(&metadata)
+                .await
+                .expect("managed material should resolve mixed-case metadata keys");
+
+            assert_eq!(material.key_bytes, data_key);
+            assert_eq!(material.base_nonce, base_nonce);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_encryption_material_accepts_case_insensitive_metadata_keys() {
+        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32])))], async {
+            let data_key = [0x24; 32];
+            let base_nonce = [0x14; 12];
+            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+            let metadata = HashMap::from([
+                ("X-Rustfs-Encryption-Key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
+                ("X-Rustfs-Encryption-IV".to_string(), BASE64_STANDARD.encode(base_nonce)),
+            ]);
+            let object_info = ObjectInfo {
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            };
+            let material = resolve_encryption_material(&object_info, &HeaderMap::new())
+                .await
+                .expect("resolve_encryption_material should accept mixed-case managed metadata");
+
+            assert_eq!(material.key_bytes, data_key);
+            assert_eq!(material.base_nonce, base_nonce);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_get_object_reader_rejects_ssec_read_without_headers() {
         let object_info = ObjectInfo {
             size: 10,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 ("x-amz-server-side-encryption-customer-original-size".to_string(), "20".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -1155,10 +1201,10 @@ mod tests {
     async fn test_get_object_reader_restore_request_bypasses_encryption_range_rewrite() {
         let object_info = ObjectInfo {
             size: 10,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string()),
                 ("x-rustfs-encryption-original-size".to_string(), "20".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -1201,12 +1247,12 @@ mod tests {
 
             let object_info = ObjectInfo {
                 size: encrypted.len() as i64,
-                user_defined: HashMap::from([
+                user_defined: Arc::new(HashMap::from([
                     ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
                     ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
                     ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
                     ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                ]),
+                ])),
                 ..Default::default()
             };
 
@@ -1247,12 +1293,12 @@ mod tests {
 
             let object_info = ObjectInfo {
                 size: encrypted.len() as i64,
-                user_defined: HashMap::from([
+                user_defined: Arc::new(HashMap::from([
                     ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
                     ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
                     ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
                     ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                ]),
+                ])),
                 ..Default::default()
             };
             let range = HTTPRangeSpec {
@@ -1303,12 +1349,12 @@ mod tests {
 
                 let object_info = ObjectInfo {
                     size: encrypted.len() as i64,
-                    user_defined: HashMap::from([
+                    user_defined: Arc::new(HashMap::from([
                         ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
                         ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
                         ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
                         ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                    ]),
+                    ])),
                     ..Default::default()
                 };
 
@@ -1340,18 +1386,18 @@ mod tests {
 
         let object_info = ObjectInfo {
             size: 3_000_000,
-            parts: vec![ObjectPartInfo {
+            parts: Arc::new(vec![ObjectPartInfo {
                 etag: String::new(),
                 number: 1,
                 size: 3_000_000,
                 actual_size: 4_194_304,
                 index: Some(index.into_vec()),
                 ..Default::default()
-            }],
-            user_defined: HashMap::from([
+            }]),
+            user_defined: Arc::new(HashMap::from([
                 ("x-minio-internal-compression".to_string(), "gzip".to_string()),
                 ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -1397,7 +1443,7 @@ mod tests {
             bucket: bucket.to_string(),
             name: object.to_string(),
             size: encrypted.len() as i64,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -1407,7 +1453,7 @@ mod tests {
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
                 ),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -1450,7 +1496,7 @@ mod tests {
             bucket: bucket.to_string(),
             name: object.to_string(),
             size: encrypted.len() as i64,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -1460,7 +1506,7 @@ mod tests {
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
                 ),
-            ]),
+            ])),
             ..Default::default()
         };
         let range = HTTPRangeSpec {
@@ -1514,7 +1560,7 @@ mod tests {
             bucket: bucket.to_string(),
             name: object.to_string(),
             size: encrypted.len() as i64,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -1526,7 +1572,7 @@ mod tests {
                 ),
                 ("x-minio-internal-compression".to_string(), CompressionAlgorithm::default().to_string()),
                 ("x-minio-internal-actual-size".to_string(), plaintext.len().to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
         let range = HTTPRangeSpec {

@@ -293,8 +293,10 @@ fn is_empty_body_admin_path(method: &Method, uri: &http::Uri) -> bool {
             path,
             "/minio/admin/v3/set-user-status"
                 | "/minio/admin/v3/set-group-status"
+                | "/minio/admin/v3/restore-config-history-kv"
                 | "/rustfs/admin/v3/set-user-status"
                 | "/rustfs/admin/v3/set-group-status"
+                | "/rustfs/admin/v3/restore-config-history-kv"
         ),
         Method::POST => {
             matches!(
@@ -1569,6 +1571,17 @@ mod tests {
             .expect("request");
 
         assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn admin_restore_config_history_without_content_length_is_normalized() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/minio/admin/v3/restore-config-history-kv?restoreId=test")
+            .body(())
+            .expect("request");
+
+        assert!(should_force_zero_content_length_for_empty_body_route(&request));
     }
 
     #[test]

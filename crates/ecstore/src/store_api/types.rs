@@ -293,7 +293,7 @@ pub struct ObjectInfo {
     // Actual size is the real size of the object uploaded by client.
     pub actual_size: i64,
     pub is_dir: bool,
-    pub user_defined: HashMap<String, String>,
+    pub user_defined: Arc<HashMap<String, String>>,
     pub parity_blocks: usize,
     pub data_blocks: usize,
     pub version_id: Option<Uuid>,
@@ -301,8 +301,8 @@ pub struct ObjectInfo {
     pub transitioned_object: TransitionedObject,
     pub restore_ongoing: bool,
     pub restore_expires: Option<OffsetDateTime>,
-    pub user_tags: String,
-    pub parts: Vec<ObjectPartInfo>,
+    pub user_tags: Arc<String>,
+    pub parts: Arc<Vec<ObjectPartInfo>>,
     pub is_latest: bool,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
@@ -387,17 +387,21 @@ impl ObjectInfo {
         // Corresponding to the logic in rustfs/src/sse.rs/encryption_material_to_metadata function
         use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 
-        self.user_defined
-            .keys()
-            .any(|key| key.to_lowercase().starts_with("x-minio-encryption-")) // Covers MinIO metadata
-            || self.user_defined.contains_key("x-rustfs-encryption-key") // SSE-S3/SSE-KMS
-            || self.user_defined.contains_key("x-rustfs-encryption-algorithm") // SSE-S3/SSE-KMS
-            || self.user_defined.contains_key("x-rustfs-encryption-iv") // SSE-S3/SSE-KMS
-            || self.user_defined.contains_key("x-amz-server-side-encryption-aws-kms-key-id") // SSE-KMS
-            || self.user_defined.contains_key(SSEC_ALGORITHM_HEADER) // SSE-C
-            || self.user_defined.contains_key(SSEC_KEY_HEADER) // SSE-C
-            || self.user_defined.contains_key(SSEC_KEY_MD5_HEADER) // SSE-C
-            || self.user_defined.contains_key("x-amz-server-side-encryption") // SSE-S3/SSE-KMS/SSE-C
+        self.user_defined.keys().any(|key| {
+            let key = key.to_lowercase();
+            key.starts_with("x-minio-encryption-")
+                || matches!(
+                    key.as_str(),
+                    "x-rustfs-encryption-key"
+                        | "x-rustfs-encryption-algorithm"
+                        | "x-rustfs-encryption-iv"
+                        | "x-amz-server-side-encryption-aws-kms-key-id"
+                        | SSEC_ALGORITHM_HEADER
+                        | SSEC_KEY_HEADER
+                        | SSEC_KEY_MD5_HEADER
+                        | "x-amz-server-side-encryption"
+                )
+        })
     }
 
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
@@ -473,7 +477,11 @@ impl ObjectInfo {
         };
 
         // tags
-        let user_tags = fi.metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default();
+        let user_tags: Arc<String> = fi
+            .metadata
+            .get(AMZ_OBJECT_TAGGING)
+            .map(|s| Arc::new(s.clone()))
+            .unwrap_or_default();
 
         let inlined = fi.inline_data();
 
@@ -567,7 +575,7 @@ impl ObjectInfo {
                 number: part.number,
                 error: part.error.clone(),
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         // TODO: part checksums
 
@@ -581,7 +589,7 @@ impl ObjectInfo {
             delete_marker: fi.deleted,
             mod_time: fi.mod_time,
             size: fi.size,
-            parts,
+            parts: Arc::new(parts),
             is_latest: fi.is_latest,
             user_tags,
             content_type,
@@ -591,7 +599,7 @@ impl ObjectInfo {
             successor_mod_time: fi.successor_mod_time,
             etag,
             inlined,
-            user_defined: metadata,
+            user_defined: Arc::new(metadata),
             transitioned_object,
             checksum: fi.checksum.clone(),
             storage_class,
@@ -611,11 +619,12 @@ impl ObjectInfo {
         bucket: &str,
         prefix: &str,
         delimiter: Option<String>,
-        after_version_id: Option<Uuid>,
+        after_version_marker: Option<VersionMarker>,
     ) -> Vec<ObjectInfo> {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(entries.entries().len());
         let mut prev_prefix = "";
+        let mut after_version_marker = after_version_marker;
         for entry in entries.entries() {
             if entry.is_object() {
                 if let Some(delimiter) = &delimiter {
@@ -652,12 +661,8 @@ impl ObjectInfo {
                     }
                 };
 
-                let versions = if let Some(vid) = after_version_id {
-                    if let Some(idx) = file_infos.find_version_index(vid) {
-                        &file_infos.versions[idx + 1..]
-                    } else {
-                        &file_infos.versions
-                    }
+                let versions = if let Some(marker) = after_version_marker.take() {
+                    versions_after_marker(&file_infos, marker)
                 } else {
                     &file_infos.versions
                 };
@@ -827,6 +832,23 @@ impl ObjectInfo {
 
         Ok((HashMap::new(), false))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionMarker {
+    Null,
+    Version(Uuid),
+}
+
+fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> &[FileInfo] {
+    let marker_idx = match marker {
+        VersionMarker::Null => file_infos.versions.iter().position(|version| version.version_id.is_none()),
+        VersionMarker::Version(vid) => file_infos.find_version_index(vid),
+    };
+
+    marker_idx
+        .map(|idx| &file_infos.versions[idx + 1..])
+        .unwrap_or(&file_infos.versions)
 }
 
 #[derive(Debug, Default)]
@@ -1073,6 +1095,100 @@ mod tests {
     use rustfs_filemeta::ReplicationState;
 
     #[test]
+    fn versions_after_marker_handles_null_version_marker() {
+        let first_version = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let last_version = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let file_infos = rustfs_filemeta::FileInfoVersions {
+            versions: vec![
+                FileInfo {
+                    version_id: Some(first_version),
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: None,
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: Some(last_version),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let versions = versions_after_marker(&file_infos, VersionMarker::Null);
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id, Some(last_version));
+    }
+
+    #[test]
+    fn versions_after_marker_handles_uuid_version_marker() {
+        let first_version = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let last_version = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let file_infos = rustfs_filemeta::FileInfoVersions {
+            versions: vec![
+                FileInfo {
+                    version_id: Some(first_version),
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: None,
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: Some(last_version),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let versions = versions_after_marker(&file_infos, VersionMarker::Version(first_version));
+
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version_id, None);
+        assert_eq!(versions[1].version_id, Some(last_version));
+    }
+
+    #[tokio::test]
+    async fn versions_listing_applies_version_marker_only_to_first_entry() {
+        let metadata = rustfs_filemeta::test_data::create_real_xlmeta().expect("test metadata should be valid");
+        let entries = rustfs_filemeta::MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![
+                Some(rustfs_filemeta::MetaCacheEntry {
+                    name: "obj-a".to_owned(),
+                    metadata: metadata.clone(),
+                    ..Default::default()
+                }),
+                Some(rustfs_filemeta::MetaCacheEntry {
+                    name: "obj-b".to_owned(),
+                    metadata,
+                    ..Default::default()
+                }),
+            ]),
+            ..Default::default()
+        };
+        let marker_version = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+
+        let objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
+            &entries,
+            "bucket",
+            "",
+            None,
+            Some(VersionMarker::Version(marker_version)),
+        )
+        .await;
+
+        let obj_a_count = objects.iter().filter(|object| object.name == "obj-a").count();
+        let obj_b_count = objects.iter().filter(|object| object.name == "obj-b").count();
+
+        assert_eq!(obj_a_count, 2);
+        assert_eq!(obj_b_count, 3);
+        assert_eq!(objects.len(), 5);
+    }
+
+    #[test]
     fn get_actual_size_prefers_actual_size_field() {
         let info = ObjectInfo {
             size: 5,
@@ -1095,7 +1211,7 @@ mod tests {
         let info = ObjectInfo {
             size: 100,
             actual_size: 0,
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1113,7 +1229,7 @@ mod tests {
         let info = ObjectInfo {
             size: 100,
             actual_size: 0,
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1165,8 +1281,8 @@ mod tests {
         let info = ObjectInfo {
             size: 12,
             actual_size: 0,
-            user_defined,
-            parts: vec![
+            user_defined: Arc::new(user_defined),
+            parts: Arc::new(vec![
                 rustfs_filemeta::ObjectPartInfo {
                     actual_size: 4,
                     ..Default::default()
@@ -1175,7 +1291,7 @@ mod tests {
                     actual_size: 5,
                     ..Default::default()
                 },
-            ],
+            ]),
             ..Default::default()
         };
 
@@ -1193,7 +1309,7 @@ mod tests {
         let info = ObjectInfo {
             size: 12,
             actual_size: 0,
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1217,7 +1333,7 @@ mod tests {
         });
 
         let info = ObjectInfo {
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1247,10 +1363,85 @@ mod tests {
         });
 
         let info = ObjectInfo {
-            user_defined,
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
         assert!(info.is_encrypted());
+    }
+
+    #[test]
+    fn is_encrypted_handles_case_insensitive_rustfs_metadata_keys() {
+        let mut user_defined: HashMap<String, String> = HashMap::new();
+        user_defined.insert("X-Rustfs-Encryption-Key".to_string(), "encrypted-key".to_string());
+
+        let info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        assert!(info.is_encrypted());
+    }
+
+    #[test]
+    fn objectinfo_clone_shares_arc_data_and_is_correct() {
+        let mut ud = HashMap::new();
+        ud.insert("content-type".to_string(), "application/octet-stream".to_string());
+        ud.insert("x-custom-header".to_string(), "custom-value".to_string());
+
+        let original = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "test-object".to_string(),
+            user_defined: Arc::new(ud),
+            user_tags: Arc::new("env=prod&team=storage".to_string()),
+            parts: Arc::new(vec![
+                rustfs_filemeta::ObjectPartInfo {
+                    number: 1,
+                    size: 1024,
+                    actual_size: 1024,
+                    ..Default::default()
+                },
+                rustfs_filemeta::ObjectPartInfo {
+                    number: 2,
+                    size: 512,
+                    actual_size: 512,
+                    ..Default::default()
+                },
+            ]),
+            size: 1536,
+            etag: Some("abc123".to_string()),
+            ..Default::default()
+        };
+
+        let cloned = original.clone();
+
+        // Verify cloned values are correct
+        assert_eq!(cloned.bucket, "test-bucket");
+        assert_eq!(cloned.name, "test-object");
+        assert_eq!(cloned.size, 1536);
+        assert_eq!(cloned.etag, Some("abc123".to_string()));
+
+        // Verify Arc fields share the same allocation
+        assert!(Arc::ptr_eq(&original.user_defined, &cloned.user_defined));
+        assert!(Arc::ptr_eq(&original.user_tags, &cloned.user_tags));
+        assert!(Arc::ptr_eq(&original.parts, &cloned.parts));
+
+        // Verify Arc-wrapped data is accessible through the clone
+        assert_eq!(
+            cloned.user_defined.get("content-type").map(String::as_str),
+            Some("application/octet-stream")
+        );
+        assert_eq!(cloned.user_tags.as_str(), "env=prod&team=storage");
+        assert_eq!(cloned.parts.len(), 2);
+        assert_eq!(cloned.parts[0].number, 1);
+        assert_eq!(cloned.parts[1].size, 512);
+
+        // Verify default ObjectInfo clone also works
+        let default_obj = ObjectInfo::default();
+        let default_cloned = default_obj.clone();
+        assert!(default_obj.user_defined.is_empty());
+        assert!(default_cloned.user_defined.is_empty());
+        assert!(default_cloned.user_tags.is_empty());
+        assert!(default_cloned.parts.is_empty());
     }
 }

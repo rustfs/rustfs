@@ -1868,11 +1868,11 @@ pub async fn put_restore_opts(
             ..Default::default()
         });
     }
-    for (k, v) in &oi.user_defined {
+    for (k, v) in oi.user_defined.iter() {
         meta.insert(k.to_string(), v.clone());
     }
     if !oi.user_tags.is_empty() {
-        meta.insert(AMZ_OBJECT_TAGGING.to_string(), oi.user_tags.clone());
+        meta.insert(AMZ_OBJECT_TAGGING.to_string(), (*oi.user_tags).clone());
     }
     let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
     meta.insert(
@@ -1903,7 +1903,7 @@ impl LifecycleOps for ObjectInfo {
     fn to_lifecycle_opts(&self) -> lifecycle::ObjectOpts {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
-            user_tags: self.user_tags.clone(),
+            user_tags: (*self.user_tags).clone(),
             version_id: self.version_id,
             mod_time: self.mod_time,
             size: self.size as usize,
@@ -3041,6 +3041,51 @@ mod tests {
                 .and_then(|metadata| metadata.get("k")),
             Some(&"v".to_string())
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ecstore_new_succeeds_on_fresh_local_volumes() {
+        let test_base_dir = format!("/tmp/rustfs_ecstore_empty_boot_{}", Uuid::new_v4());
+        let temp_dir = PathBuf::from(&test_base_dir);
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir).await.ok();
+        }
+        fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let disk_paths = vec![
+            temp_dir.join("disk1"),
+            temp_dir.join("disk2"),
+            temp_dir.join("disk3"),
+            temp_dir.join("disk4"),
+        ];
+
+        for disk_path in &disk_paths {
+            fs::create_dir_all(disk_path).await.unwrap();
+        }
+
+        let mut endpoints = Vec::new();
+        for (i, disk_path) in disk_paths.iter().enumerate() {
+            let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(i);
+            endpoints.push(endpoint);
+        }
+
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "fresh-boot-test".to_string(),
+            platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+        }]);
+
+        crate::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+
+        let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new()).await;
+        assert!(ecstore.is_ok(), "fresh local ECStore boot should succeed, got {ecstore:?}");
     }
 
     #[tokio::test]

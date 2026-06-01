@@ -306,12 +306,10 @@ impl Sets {
     //     unimplemented!()
     // }
 
-    async fn delete_prefix(&self, bucket: &str, object: &str) -> Result<()> {
+    async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         let mut futures = Vec::new();
-        let opt = ObjectOptions {
-            delete_prefix: true,
-            ..Default::default()
-        };
+        let mut opt = opts.clone();
+        opt.delete_prefix = true;
 
         for set in self.disk_set.iter() {
             futures.push(set.delete_object(bucket, object, opt.clone()));
@@ -463,6 +461,7 @@ impl ObjectOperations for Sets {
             versioned: dst_opts.versioned,
             version_id: dst_opts.version_id.clone(),
             mod_time: dst_opts.mod_time,
+            http_preconditions: dst_opts.http_preconditions.clone(),
             ..Default::default()
         };
 
@@ -485,7 +484,7 @@ impl ObjectOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix && !opts.delete_prefix_object {
-            self.delete_prefix(bucket, object).await?;
+            self.delete_prefix(bucket, object, &opts).await?;
             return Ok(ObjectInfo::default());
         }
 

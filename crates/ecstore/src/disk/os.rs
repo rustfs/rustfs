@@ -148,17 +148,12 @@ async fn reliable_rename(
     if let Some(parent) = dst_file_path.as_ref().parent()
         && !file_exists(parent)
     {
-        // info!("reliable_rename reliable_mkdir_all parent: {:?}", parent);
         reliable_mkdir_all(parent, base_dir.as_ref()).await?;
     }
 
     let mut i = 0;
     loop {
         if let Err(e) = super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
-            if e.kind() == io::ErrorKind::NotFound {
-                break;
-            }
-
             if i == 0 {
                 i += 1;
                 continue;
@@ -248,4 +243,24 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn file_exists(path: impl AsRef<Path>) -> bool {
     std::fs::metadata(path.as_ref()).map(|_| true).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn rename_all_missing_source_returns_file_not_found() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let src = temp_dir.path().join("missing");
+        let dst = temp_dir.path().join("dst");
+
+        let err = rename_all(&src, &dst, temp_dir.path())
+            .await
+            .expect_err("missing source must fail");
+
+        assert!(matches!(err, DiskError::FileNotFound));
+        assert!(!dst.exists());
+    }
 }

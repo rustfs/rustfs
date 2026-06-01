@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::config::get_global_storage_class;
 
 struct LatestObjectInfoCandidate {
     info: Option<ObjectInfo>,
@@ -182,17 +183,11 @@ impl ECStore {
         Ok(())
     }
 
-    pub(super) async fn delete_prefix(&self, bucket: &str, object: &str) -> Result<()> {
+    pub(super) async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         for pool in self.pools.iter() {
-            pool.delete_object(
-                bucket,
-                object,
-                ObjectOptions {
-                    delete_prefix: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
+            let mut opts = opts.clone();
+            opts.delete_prefix = true;
+            pool.delete_object(bucket, object, opts).await?;
         }
 
         Ok(())
@@ -605,7 +600,7 @@ impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_backend_info(&self) -> rustfs_madmin::BackendInfo {
         let (standard_sc_parity, rr_sc_parity) = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 let sc_parity = sc
                     .get_parity_for_sc(storageclass::CLASS_STANDARD)
                     .or(Some(self.pools[0].default_parity_count));

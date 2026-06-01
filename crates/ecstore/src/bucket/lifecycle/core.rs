@@ -881,7 +881,7 @@ impl ObjectOpts {
     pub fn from_object_info(oi: &ObjectInfo) -> Self {
         Self {
             name: oi.name.clone(),
-            user_tags: oi.user_tags.clone(),
+            user_tags: (*oi.user_tags).clone(),
             mod_time: oi.mod_time,
             size: oi.size as usize,
             version_id: oi.version_id,
@@ -894,7 +894,7 @@ impl ObjectOpts {
             restore_expires: oi.restore_expires,
             versioned: false,
             version_suspended: false,
-            user_defined: oi.user_defined.clone(),
+            user_defined: (*oi.user_defined).clone(),
             version_purge_status: oi.version_purge_status.clone(),
             replication_status: oi.replication_status.clone(),
         }
