@@ -961,7 +961,7 @@ mod tests {
     fn test_http_range_spec_from_object_info_valid_and_invalid_parts() {
         let object_info = ObjectInfo {
             size: 300,
-            parts: vec![
+            parts: Arc::new(vec![
                 ObjectPartInfo {
                     etag: String::new(),
                     number: 1,
@@ -983,7 +983,7 @@ mod tests {
                     actual_size: 100,
                     ..Default::default()
                 },
-            ],
+            ]),
             ..Default::default()
         };
 
@@ -999,7 +999,7 @@ mod tests {
     fn test_http_range_spec_from_object_info_uses_actual_size() {
         let object_info = ObjectInfo {
             size: 90,
-            parts: vec![
+            parts: Arc::new(vec![
                 ObjectPartInfo {
                     etag: String::new(),
                     number: 1,
@@ -1021,7 +1021,7 @@ mod tests {
                     actual_size: 50,
                     ..Default::default()
                 },
-            ],
+            ]),
             ..Default::default()
         };
 
@@ -1034,7 +1034,7 @@ mod tests {
     fn test_http_range_spec_from_object_info_falls_back_to_part_size_when_actual_size_missing() {
         let object_info = ObjectInfo {
             size: 90,
-            parts: vec![
+            parts: Arc::new(vec![
                 ObjectPartInfo {
                     etag: String::new(),
                     number: 1,
@@ -1056,7 +1056,7 @@ mod tests {
                     actual_size: 0,
                     ..Default::default()
                 },
-            ],
+            ]),
             ..Default::default()
         };
 
@@ -1155,7 +1155,7 @@ mod tests {
                 ("X-Rustfs-Encryption-IV".to_string(), BASE64_STANDARD.encode(base_nonce)),
             ]);
             let object_info = ObjectInfo {
-                user_defined: metadata,
+                user_defined: Arc::new(metadata),
                 ..Default::default()
             };
             let material = resolve_encryption_material(&object_info, &HeaderMap::new())
@@ -1172,10 +1172,10 @@ mod tests {
     async fn test_get_object_reader_rejects_ssec_read_without_headers() {
         let object_info = ObjectInfo {
             size: 10,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 ("x-amz-server-side-encryption-customer-original-size".to_string(), "20".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -1201,10 +1201,10 @@ mod tests {
     async fn test_get_object_reader_restore_request_bypasses_encryption_range_rewrite() {
         let object_info = ObjectInfo {
             size: 10,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string()),
                 ("x-rustfs-encryption-original-size".to_string(), "20".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -1247,12 +1247,12 @@ mod tests {
 
             let object_info = ObjectInfo {
                 size: encrypted.len() as i64,
-                user_defined: HashMap::from([
+                user_defined: Arc::new(HashMap::from([
                     ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
                     ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
                     ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
                     ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                ]),
+                ])),
                 ..Default::default()
             };
 
@@ -1293,12 +1293,12 @@ mod tests {
 
             let object_info = ObjectInfo {
                 size: encrypted.len() as i64,
-                user_defined: HashMap::from([
+                user_defined: Arc::new(HashMap::from([
                     ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
                     ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
                     ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
                     ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                ]),
+                ])),
                 ..Default::default()
             };
             let range = HTTPRangeSpec {
@@ -1349,12 +1349,12 @@ mod tests {
 
                 let object_info = ObjectInfo {
                     size: encrypted.len() as i64,
-                    user_defined: HashMap::from([
+                    user_defined: Arc::new(HashMap::from([
                         ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
                         ("x-rustfs-encryption-key".to_string(), BASE64_STANDARD.encode(encrypted_dek.as_bytes())),
                         ("x-rustfs-encryption-iv".to_string(), BASE64_STANDARD.encode(base_nonce)),
                         ("x-rustfs-encryption-original-size".to_string(), plaintext.len().to_string()),
-                    ]),
+                    ])),
                     ..Default::default()
                 };
 
@@ -1386,18 +1386,18 @@ mod tests {
 
         let object_info = ObjectInfo {
             size: 3_000_000,
-            parts: vec![ObjectPartInfo {
+            parts: Arc::new(vec![ObjectPartInfo {
                 etag: String::new(),
                 number: 1,
                 size: 3_000_000,
                 actual_size: 4_194_304,
                 index: Some(index.into_vec()),
                 ..Default::default()
-            }],
-            user_defined: HashMap::from([
+            }]),
+            user_defined: Arc::new(HashMap::from([
                 ("x-minio-internal-compression".to_string(), "gzip".to_string()),
                 ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -1443,7 +1443,7 @@ mod tests {
             bucket: bucket.to_string(),
             name: object.to_string(),
             size: encrypted.len() as i64,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -1453,7 +1453,7 @@ mod tests {
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
                 ),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -1496,7 +1496,7 @@ mod tests {
             bucket: bucket.to_string(),
             name: object.to_string(),
             size: encrypted.len() as i64,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -1506,7 +1506,7 @@ mod tests {
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
                 ),
-            ]),
+            ])),
             ..Default::default()
         };
         let range = HTTPRangeSpec {
@@ -1560,7 +1560,7 @@ mod tests {
             bucket: bucket.to_string(),
             name: object.to_string(),
             size: encrypted.len() as i64,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -1572,7 +1572,7 @@ mod tests {
                 ),
                 ("x-minio-internal-compression".to_string(), CompressionAlgorithm::default().to_string()),
                 ("x-minio-internal-actual-size".to_string(), plaintext.len().to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
         let range = HTTPRangeSpec {

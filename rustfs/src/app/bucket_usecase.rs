@@ -472,7 +472,7 @@ fn build_list_object_versions_m_output(
                 None
             };
             let user_tags = if permission.tags_allowed && !object.user_tags.is_empty() {
-                Some(object.user_tags.clone())
+                Some((*object.user_tags).clone())
             } else {
                 None
             };
@@ -569,7 +569,7 @@ fn build_list_objects_v2m_output(
                 None
             };
             let user_tags = if permission.tags_allowed && !object.user_tags.is_empty() {
-                Some(object.user_tags.clone())
+                Some((*object.user_tags).clone())
             } else {
                 None
             };
@@ -2101,6 +2101,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri};
+    use std::sync::Arc;
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -2717,11 +2718,11 @@ mod tests {
                     name: "obj-a".to_string(),
                     mod_time: Some(datetime!(2025-01-01 00:00 UTC)),
                     size: 11,
-                    user_defined: HashMap::from([("project".to_string(), "alpha".to_string())]),
+                    user_defined: Arc::new(HashMap::from([("project".to_string(), "alpha".to_string())])),
                     parity_blocks: 2,
                     data_blocks: 4,
                     version_id: Some(Uuid::nil()),
-                    user_tags: "env=prod".to_string(),
+                    user_tags: Arc::new("env=prod".to_string()),
                     is_latest: true,
                     etag: Some("0123456789abcdef0123456789abcdef".to_string()),
                     ..Default::default()
@@ -2731,7 +2732,7 @@ mod tests {
                     name: "obj-b".to_string(),
                     mod_time: Some(datetime!(2025-01-02 00:00 UTC)),
                     delete_marker: true,
-                    user_defined: HashMap::from([("marker".to_string(), "true".to_string())]),
+                    user_defined: Arc::new(HashMap::from([("marker".to_string(), "true".to_string())])),
                     version_id: None,
                     ..Default::default()
                 },
@@ -2825,8 +2826,8 @@ mod tests {
                 name: "logs and more/object one.txt".to_string(),
                 mod_time: Some(datetime!(2025-01-04 00:00 UTC)),
                 size: 7,
-                user_defined: HashMap::from([("secret".to_string(), "value".to_string())]),
-                user_tags: "env=prod".to_string(),
+                user_defined: Arc::new(HashMap::from([("secret".to_string(), "value".to_string())])),
+                user_tags: Arc::new("env=prod".to_string()),
                 parity_blocks: 1,
                 data_blocks: 2,
                 ..Default::default()
@@ -2905,10 +2906,10 @@ mod tests {
                 name: "logs/obj a.txt".to_string(),
                 mod_time: Some(datetime!(2025-01-03 00:00 UTC)),
                 size: 11,
-                user_defined: HashMap::from([("project".to_string(), "alpha".to_string())]),
+                user_defined: Arc::new(HashMap::from([("project".to_string(), "alpha".to_string())])),
                 parity_blocks: 2,
                 data_blocks: 4,
-                user_tags: "env=prod".to_string(),
+                user_tags: Arc::new("env=prod".to_string()),
                 etag: Some("0123456789abcdef0123456789abcdef".to_string()),
                 ..Default::default()
             }],
@@ -2981,8 +2982,8 @@ mod tests {
                 name: "logs and more/object one.txt".to_string(),
                 mod_time: Some(datetime!(2025-01-05 00:00 UTC)),
                 size: 13,
-                user_defined: HashMap::from([("secret".to_string(), "value".to_string())]),
-                user_tags: "env=prod".to_string(),
+                user_defined: Arc::new(HashMap::from([("secret".to_string(), "value".to_string())])),
+                user_tags: Arc::new("env=prod".to_string()),
                 parity_blocks: 1,
                 data_blocks: 2,
                 ..Default::default()
