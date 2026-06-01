@@ -23,6 +23,12 @@ export no_proxy="${NO_PROXY}"
 # Ensure user-level Python scripts are discoverable (awscurl/tox installed via --user)
 PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.14")
 export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
+if command -v uv >/dev/null 2>&1; then
+    UV_TOOL_BIN="$(uv tool dir --bin 2>/dev/null || true)"
+    if [ -n "${UV_TOOL_BIN}" ]; then
+        export PATH="${UV_TOOL_BIN}:$PATH"
+    fi
+fi
 
 # Configuration
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
@@ -697,6 +703,17 @@ log_info "Provisioning s3-tests alt user..."
 install_python_package() {
     local package=$1
     local error_output
+
+    if command -v uv >/dev/null 2>&1; then
+        if uv tool install --upgrade "${package}"; then
+            UV_TOOL_BIN="$(uv tool dir --bin 2>/dev/null || true)"
+            if [ -n "${UV_TOOL_BIN}" ]; then
+                export PATH="${UV_TOOL_BIN}:$PATH"
+            fi
+            return 0
+        fi
+        log_warn "Failed to install ${package} with uv, falling back to python3 -m pip"
+    fi
 
     # Try --user first (works on most Linux systems)
     error_output=$(python3 -m pip install --user --upgrade pip "${package}" 2>&1)

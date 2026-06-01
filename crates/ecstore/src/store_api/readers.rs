@@ -2079,10 +2079,10 @@ mod tests {
     async fn test_read_plan_restore_request_uses_plain_range() {
         let object_info = ObjectInfo {
             size: 10,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string()),
                 ("x-rustfs-encryption-original-size".to_string(), "20".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -2275,7 +2275,7 @@ mod tests {
 
             let object_info = ObjectInfo {
                 size: encrypted.len() as i64,
-                user_defined: HashMap::from([
+                user_defined: Arc::new(HashMap::from([
                     ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
                     (
                         MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
@@ -2288,7 +2288,7 @@ mod tests {
                     ),
                     (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), "default".to_string()),
                     ("x-minio-internal-actual-size".to_string(), plaintext.len().to_string()),
-                ]),
+                ])),
                 ..Default::default()
             };
 
@@ -2321,18 +2321,18 @@ mod tests {
 
         let object_info = ObjectInfo {
             size: 3_000_000,
-            parts: vec![ObjectPartInfo {
+            parts: Arc::new(vec![ObjectPartInfo {
                 etag: String::new(),
                 number: 1,
                 size: 3_000_000,
                 actual_size: 4_194_304,
                 index: Some(index.into_vec()),
                 ..Default::default()
-            }],
-            user_defined: HashMap::from([
+            }]),
+            user_defined: Arc::new(HashMap::from([
                 ("x-minio-internal-compression".to_string(), "gzip".to_string()),
                 ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -2420,10 +2420,10 @@ mod tests {
     async fn test_read_plan_accepts_minio_s2_compression_scheme() {
         let object_info = ObjectInfo {
             size: 3_000_000,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-minio-internal-compression".to_string(), "klauspost/compress/s2".to_string()),
                 ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -2456,18 +2456,18 @@ mod tests {
 
         let object_info = ObjectInfo {
             size: 3_000_000,
-            parts: vec![ObjectPartInfo {
+            parts: Arc::new(vec![ObjectPartInfo {
                 etag: String::new(),
                 number: 1,
                 size: 3_000_000,
                 actual_size: 4_194_304,
                 index: Some(headerless_index),
                 ..Default::default()
-            }],
-            user_defined: HashMap::from([
+            }]),
+            user_defined: Arc::new(HashMap::from([
                 ("x-minio-internal-compression".to_string(), "klauspost/compress/s2".to_string()),
                 ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -2511,15 +2511,15 @@ mod tests {
 
         let object_info = ObjectInfo {
             size: 400_000,
-            parts: vec![ObjectPartInfo {
+            parts: Arc::new(vec![ObjectPartInfo {
                 etag: String::new(),
                 number: 1,
                 size: 400_000,
                 actual_size: 4_194_304,
                 index: Some(stored_index),
                 ..Default::default()
-            }],
-            user_defined: HashMap::from([
+            }]),
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 ("x-amz-server-side-encryption-customer-original-size".to_string(), "4194304".to_string()),
                 (
@@ -2527,7 +2527,7 @@ mod tests {
                     crate::rio::compression_metadata_value(CompressionAlgorithm::default()),
                 ),
                 ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -2614,7 +2614,7 @@ mod tests {
             bucket: bucket.to_string(),
             name: object.to_string(),
             size: encrypted.len() as i64,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -2633,7 +2633,7 @@ mod tests {
                     MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
                     BASE64_STANDARD.encode(sealed_key),
                 ),
-            ]),
+            ])),
             ..Default::default()
         };
 
@@ -2740,7 +2740,7 @@ mod tests {
             bucket: bucket.to_string(),
             name: object.to_string(),
             size: encrypted.len() as i64,
-            user_defined: HashMap::from([
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -2750,7 +2750,7 @@ mod tests {
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
                 ),
-            ]),
+            ])),
             ..Default::default()
         };
         let range = HTTPRangeSpec {
@@ -2945,15 +2945,15 @@ mod tests {
             bucket: bucket.to_string(),
             name: object.to_string(),
             size: encrypted.len() as i64,
-            parts: vec![ObjectPartInfo {
+            parts: Arc::new(vec![ObjectPartInfo {
                 etag: String::new(),
                 number: 1,
                 size: encrypted.len(),
                 actual_size: plaintext.len() as i64,
                 index: Some(stored_index),
                 ..Default::default()
-            }],
-            user_defined: HashMap::from([
+            }]),
+            user_defined: Arc::new(HashMap::from([
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
@@ -2968,7 +2968,7 @@ mod tests {
                     crate::rio::compression_metadata_value(CompressionAlgorithm::default()),
                 ),
                 ("x-minio-internal-actual-size".to_string(), plaintext.len().to_string()),
-            ]),
+            ])),
             ..Default::default()
         };
 
