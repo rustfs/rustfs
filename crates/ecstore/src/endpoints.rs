@@ -689,10 +689,6 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
         let canonical = match rustfs_utils::canonicalize(path) {
             Ok(path) => path,
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                missing_paths.push(path.clone());
-                continue;
-            }
-            Err(err) => {
                 // On Windows, canonicalize can fail for ZFS volumes, junction points,
                 // subst drives, and other non-standard mounts. Try absolutize as fallback.
                 #[cfg(windows)]
@@ -730,10 +726,14 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
                 }
                 #[cfg(not(windows))]
                 {
-                    return Err(Error::other(format!(
-                        "failed to resolve local endpoint path '{path}' for disk validation: {err}"
-                    )));
+                    missing_paths.push(path.clone());
+                    continue;
                 }
+            }
+            Err(err) => {
+                return Err(Error::other(format!(
+                    "failed to resolve local endpoint path '{path}' for disk validation: {err}"
+                )));
             }
         };
         let canonical_path = canonical.to_string_lossy().into_owned();
