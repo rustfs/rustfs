@@ -2166,7 +2166,7 @@ mod tests {
             let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
 
             let mut encrypted = Vec::new();
-            rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+            crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
                 .read_to_end(&mut encrypted)
                 .await
                 .expect("encrypt managed ranged object");
