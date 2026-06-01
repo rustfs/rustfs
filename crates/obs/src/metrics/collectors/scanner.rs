@@ -16,7 +16,7 @@
 
 //! Scanner metrics collector.
 //!
-//! Collects background scanner metrics including bucket scans,
+//! Collects background scanner metrics including bucket-drive scans,
 //! directory scans, and object scans.
 
 use crate::metrics::report::PrometheusMetric;
@@ -44,9 +44,9 @@ use crate::metrics::schema::scanner::{
 /// Scanner statistics.
 #[derive(Debug, Clone, Default)]
 pub struct ScannerStats {
-    /// Number of bucket scans finished
+    /// Number of bucket-drive scans finished
     pub bucket_scans_finished: u64,
-    /// Number of bucket scans started
+    /// Number of bucket-drive scans started
     pub bucket_scans_started: u64,
     /// Number of bucket-drive scans that failed
     pub bucket_scans_failed: u64,

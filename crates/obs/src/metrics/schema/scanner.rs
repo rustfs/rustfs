@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 pub static SCANNER_BUCKET_SCANS_FINISHED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ScannerBucketScansFinished,
-        "Total number of bucket scans finished since server start",
+        "Total number of bucket-drive scans finished since server start",
         &[],
         subsystems::SCANNER,
     )
@@ -29,7 +29,7 @@ pub static SCANNER_BUCKET_SCANS_FINISHED_MD: LazyLock<MetricDescriptor> = LazyLo
 pub static SCANNER_BUCKET_SCANS_STARTED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ScannerBucketScansStarted,
-        "Total number of bucket scans started since server start",
+        "Total number of bucket-drive scans started since server start",
         &[],
         subsystems::SCANNER,
     )
@@ -38,7 +38,7 @@ pub static SCANNER_BUCKET_SCANS_STARTED_MD: LazyLock<MetricDescriptor> = LazyLoc
 pub static SCANNER_BUCKET_SCANS_FAILED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ScannerBucketScansFailed,
-        "Total number of bucket-drive scans that failed since server start.",
+        "Total number of bucket-drive scans that failed since server start",
         &[],
         subsystems::SCANNER,
     )
