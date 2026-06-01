@@ -56,6 +56,8 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.kms.vault.vault_mount_path | string | `"transit"`| The vault mount path, only works if `vault_backend` equals `vault-transit` . |
 | config.rustfs.kms.vault.default_key | string | `"transit"`| The master key id for RustFS. |
 | extraEnv | map | `[]` |  Extra environment variables for RustFS container. |
+| extraVolumes | list | `[]` | Extra volumes to add to the pod spec. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
+| extraVolumeMounts | list | `[]` | Extra volume mounts to add to the RustFS container. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
