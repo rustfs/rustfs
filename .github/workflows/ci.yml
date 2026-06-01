@@ -127,6 +127,11 @@ jobs:
           cargo nextest run --all --exclude e2e_test
           cargo test --all --doc
 
+      - name: Run rio-v2 feature tests
+        run: |
+          cargo nextest run -p rustfs -p rustfs-ecstore --features rio-v2
+          cargo test -p rustfs --doc --features rio-v2
+
       - name: Check code formatting
         run: cargo fmt --all --check
 
@@ -168,6 +173,39 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: rustfs-debug-binary
+          path: target/debug/rustfs
+          if-no-files-found: error
+          retention-days: 1
+
+  build-rustfs-debug-binary-rio-v2:
+    name: Build RustFS Debug Binary (rio-v2)
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubicloud-standard-4
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-rustfs-debug-binary-rio-v2-${{ hashFiles('**/Cargo.lock') }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build debug binary with rio-v2
+        run: |
+          touch rustfs/build.rs
+          cargo build -p rustfs --bins --features rio-v2 --jobs 2
+
+      - name: Upload debug binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: rustfs-debug-binary-rio-v2
           path: target/debug/rustfs
           if-no-files-found: error
           retention-days: 1
@@ -216,6 +254,53 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: e2e-test-logs-${{ github.run_number }}
+          path: /tmp/rustfs.log
+          retention-days: 3
+
+  e2e-tests-rio-v2:
+    name: End-to-End Tests (rio-v2)
+    needs: [ skip-check, build-rustfs-debug-binary-rio-v2 ]
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Clean up previous test run
+        run: |
+          rm -rf /tmp/rustfs
+          rm -f /tmp/rustfs.log
+
+      - name: Download debug binary
+        uses: actions/download-artifact@v7
+        with:
+          name: rustfs-debug-binary-rio-v2
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
+
+      - name: Setup Rust toolchain for s3s-e2e installation
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install s3s-e2e test tool
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: s3s-e2e
+          git: https://github.com/s3s-project/s3s.git
+          rev: 62cb4a71dd759a6ec56b64c4c42fcc183a2c6a52
+
+      - name: Run end-to-end tests
+        run: |
+          s3s-e2e --version
+          ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: e2e-test-logs-rio-v2-${{ github.run_number }}
           path: /tmp/rustfs.log
           retention-days: 3
 
