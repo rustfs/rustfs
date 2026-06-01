@@ -16,7 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
-use rustfs_config::{DEFAULT_SCANNER_IDLE_MODE, ENV_SCANNER_IDLE_MODE, ENV_SCANNER_SPEED, ScannerSpeed};
+use rustfs_common::metrics::global_metrics;
+use rustfs_config::{
+    DEFAULT_SCANNER_IDLE_MODE, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS, ENV_SCANNER_IDLE_MODE, ENV_SCANNER_SPEED,
+    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
+};
 use tokio::time::Duration;
 
 const MIN_SLEEP: Duration = Duration::from_millis(1);
@@ -64,6 +68,10 @@ fn scanner_env_config() -> (ScannerSpeed, bool) {
     (speed, idle_mode)
 }
 
+pub(crate) fn scanner_yield_every_n_objects() -> u64 {
+    rustfs_utils::get_env_u64(ENV_SCANNER_YIELD_EVERY_N_OBJECTS, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS)
+}
+
 /// When `true` (default), the scanner throttles itself between operations.
 /// When `false`, all sleeps are skipped and the scanner runs at full speed.
 pub static SCANNER_IDLE_MODE: AtomicBool = AtomicBool::new(DEFAULT_SCANNER_IDLE_MODE);
@@ -74,7 +82,9 @@ pub static SCANNER_SLEEPER: LazyLock<DynamicSleeper> = LazyLock::new(|| {
     let (speed, idle_mode) = scanner_env_config();
     SCANNER_IDLE_MODE.store(idle_mode, Ordering::Relaxed);
 
-    DynamicSleeper::new(speed)
+    let sleeper = DynamicSleeper::new(speed);
+    sleeper.record_throttle_config();
+    sleeper
 });
 
 /// Proportional-backoff sleeper for the data scanner.
@@ -124,6 +134,7 @@ impl DynamicSleeper {
         let sleep_dur = Duration::from_secs_f64(MIN_SLEEP.as_secs_f64() * factor).min(max_sleep);
         if !sleep_dur.is_zero() {
             tokio::time::sleep(sleep_dur).await;
+            global_metrics().record_scanner_yield(sleep_dur);
         }
     }
 
@@ -150,6 +161,17 @@ impl DynamicSleeper {
         let (speed, idle_mode) = scanner_env_config();
         self.update(speed);
         SCANNER_IDLE_MODE.store(idle_mode, Ordering::Relaxed);
+        self.record_throttle_config();
+    }
+
+    fn record_throttle_config(&self) {
+        let (factor, max_sleep) = self.read_params();
+        global_metrics().record_scanner_throttle_config(
+            SCANNER_IDLE_MODE.load(Ordering::Relaxed),
+            factor,
+            max_sleep,
+            scanner_yield_every_n_objects(),
+        );
     }
 }
 
@@ -177,6 +199,7 @@ impl SleepTimer {
             .min(max_sleep);
         if !sleep_dur.is_zero() {
             tokio::time::sleep(sleep_dur).await;
+            global_metrics().record_scanner_yield(sleep_dur);
         }
     }
 }
