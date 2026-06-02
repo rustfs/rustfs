@@ -493,6 +493,12 @@ impl Drop for ScannerCycleBudget {
     }
 }
 
+async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
+    cycle_info.current = 0;
+    global_metrics().clear_current_scan_mode();
+    global_metrics().set_cycle(Some(cycle_info.clone())).await;
+}
+
 #[instrument(skip_all)]
 async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
     let _activity_guard = ScannerActivityGuard::new();
@@ -557,6 +563,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
                 "Data scanner cycle stopped after reaching its runtime budget"
             );
             emit_scan_cycle_partial(cycle_start.elapsed());
+            mark_scan_cycle_idle(cycle_info).await;
             return;
         }
         error!(duration = ?now.elapsed(), "Fail run data scanner cycle: {e}");
@@ -574,6 +581,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         );
         global_metrics().finish_scan_cycle_work(cycle_work_start);
         emit_scan_cycle_partial(cycle_start.elapsed());
+        mark_scan_cycle_idle(cycle_info).await;
         return;
     }
     done_cycle();
@@ -591,7 +599,6 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run data scanner cycle");
 
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
-
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 
     let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
@@ -843,6 +850,35 @@ mod tests {
         drop(budget);
 
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
+        let mut cycle_info = CurrentCycle {
+            current: 12,
+            next: 13,
+            cycle_completed: vec![Utc::now()],
+            started: Utc::now(),
+        };
+
+        global_metrics().set_current_scan_mode(HealScanMode::Deep);
+        global_metrics().set_cycle(Some(cycle_info.clone())).await;
+
+        mark_scan_cycle_idle(&mut cycle_info).await;
+
+        let published = global_metrics()
+            .get_cycle()
+            .await
+            .expect("scanner cycle state should remain published");
+
+        assert_eq!(cycle_info.current, 0);
+        assert_eq!(cycle_info.next, 13);
+        assert_eq!(published.current, 0);
+        assert_eq!(published.next, 13);
+        assert_eq!(global_metrics().current_scan_mode(), HealScanMode::Unknown);
+
+        global_metrics().set_cycle(None).await;
     }
 
     #[test]
