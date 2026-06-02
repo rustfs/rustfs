@@ -41,11 +41,25 @@ where
         if self.remaining < 0 {
             return Poll::Ready(Err(Error::other("input provided more bytes than specified")));
         }
+        let original_filled = buf.filled().len();
         if self.remaining == 0 {
-            return Poll::Ready(Ok(()));
+            let mut discard = [0u8; 8192];
+            let mut discard_buf = ReadBuf::new(&mut discard);
+            return match self.as_mut().project().inner.poll_read(cx, &mut discard_buf) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    if discard_buf.filled().is_empty() {
+                        debug_assert_eq!(buf.filled().len(), original_filled);
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Ready(Err(Error::other("input provided more bytes than specified")))
+                    }
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            };
         }
         // Save the initial length
-        let before = buf.filled().len();
+        let before = original_filled;
 
         // Poll the inner reader
         let this = self.as_mut().project();
@@ -161,5 +175,24 @@ mod tests {
                 .is_some(),
             "error should retain the incomplete body marker"
         );
+    }
+
+    #[tokio::test]
+    async fn test_hardlimit_reader_rejects_extra_bytes_after_limit() {
+        let data = b"abcdef";
+        let reader = BufReader::new(&data[..]);
+        let mut r = HardLimitReader::new(reader, 3);
+
+        let mut first = [0u8; 3];
+        let n = read_full(&mut r, &mut first).await.expect("first read should consume limit");
+        assert_eq!(n, 3);
+        assert_eq!(&first, b"abc");
+
+        let mut second = [0u8; 1];
+        let err = read_full(&mut r, &mut second)
+            .await
+            .expect_err("bytes beyond the declared limit must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("more bytes than specified"));
     }
 }
