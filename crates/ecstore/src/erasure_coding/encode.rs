@@ -223,8 +223,8 @@ impl Erasure {
             let mut total = 0;
             let mut buf = vec![0u8; block_size];
             loop {
-                match rustfs_utils::read_full(&mut reader, &mut buf).await {
-                    Ok(n) if n > 0 => {
+                match rustfs_utils::read_full_or_eof(&mut reader, &mut buf).await {
+                    Ok(Some(n)) if n > 0 => {
                         total += n;
                         let erasure = self.clone();
                         let encode_buf = std::mem::take(&mut buf);
@@ -243,7 +243,7 @@ impl Erasure {
                             return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                         }
                     }
-                    Ok(_) => {
+                    Ok(None) => {
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -255,6 +255,7 @@ impl Erasure {
                         }
                         return Err(e);
                     }
+                    Ok(Some(_)) => unreachable!("read_full_or_eof never returns Some(0)"),
                     Err(e) => {
                         return Err(e);
                     }
