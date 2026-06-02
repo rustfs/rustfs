@@ -246,10 +246,25 @@ fn validate_scan_range(request: &SelectObjectContentRequest) -> S3Result<()> {
     if validate_scan_range_bounds(start, end, u64::MAX).is_err() {
         return Err(invalid_scan_range_error());
     }
-    if request.input_serialization.parquet.is_some() || request.input_serialization.json.as_ref().is_some_and(is_json_document) {
-        return Err(invalid_scan_range_error());
-    }
+    validate_scan_range_protocol(request).map_err(|_| invalid_scan_range_error())?;
     Ok(())
+}
+
+fn validate_scan_range_protocol(request: &SelectObjectContentRequest) -> Result<(), ()> {
+    let input_serialization = &request.input_serialization;
+
+    let supports_scan_range = match (
+        input_serialization.csv.as_ref(),
+        input_serialization.json.as_ref(),
+        input_serialization.parquet.as_ref(),
+    ) {
+        (Some(_), None, None) => true,
+        (None, Some(json), None) if !is_json_document(json) => true,
+        (None, None, Some(_)) => true,
+        _ => false,
+    };
+
+    if supports_scan_range { Ok(()) } else { Err(()) }
 }
 
 fn validate_scan_range_for_object_size(request: &SelectObjectContentRequest, object_size: u64) -> S3Result<()> {
@@ -719,6 +734,57 @@ mod tests {
         let err = validate_select_request(&HeaderMap::new(), &mut input).unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequestParameter);
         assert_eq!(err.message(), Some(INVALID_SCAN_RANGE_MESSAGE));
+    }
+
+    #[test]
+    fn validate_allows_scan_range_for_json_lines_as_request_parameter() {
+        let mut input = base_input();
+        input.request.input_serialization = InputSerialization {
+            csv: None,
+            json: Some(JSONInput {
+                type_: Some(JSONType::from_static(JSONType::LINES)),
+            }),
+            parquet: None,
+            compression_type: None,
+        };
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(10),
+        });
+
+        validate_select_request(&HeaderMap::new(), &mut input).expect("json lines scan range should validate");
+        validate_scan_range_for_object_size(&input.request, 16)
+            .expect("json lines scan range should validate against object size");
+    }
+
+    #[test]
+    fn validate_allows_scan_range_for_parquet_as_request_parameter() {
+        let mut input = base_input();
+        input.request.input_serialization = InputSerialization {
+            csv: None,
+            json: None,
+            parquet: Some(ParquetInput {}),
+            compression_type: None,
+        };
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(10),
+        });
+
+        validate_select_request(&HeaderMap::new(), &mut input).expect("parquet scan range should validate");
+        validate_scan_range_for_object_size(&input.request, 16).expect("parquet scan range should validate against object size");
+    }
+
+    #[test]
+    fn validate_allows_scan_range_for_csv_as_request_parameter() {
+        let mut input = base_input();
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(10),
+        });
+
+        validate_select_request(&HeaderMap::new(), &mut input).expect("csv scan range should validate");
+        validate_scan_range_for_object_size(&input.request, 16).expect("csv scan range should validate against object size");
     }
 
     #[test]
