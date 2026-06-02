@@ -253,7 +253,7 @@ impl Erasure {
                         {
                             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
                         }
-                        break;
+                        return Err(e);
                     }
                     Err(e) => {
                         return Err(e);
@@ -327,7 +327,9 @@ impl Erasure {
 mod tests {
     use super::*;
     use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
+    use rustfs_rio::HardLimitReader;
     use rustfs_utils::HashAlgorithm;
+    use std::io::Cursor;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -382,6 +384,27 @@ mod tests {
 
         assert_eq!(written, b"small payload".len());
         assert!(!committed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn encode_returns_unexpected_eof_for_truncated_limited_reader() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let writer = DeferredCommitWriter::new(committed);
+        let mut writers = vec![Some(BitrotWriterWrapper::new(
+            CustomWriter::new_tokio_writer(writer),
+            16,
+            HashAlgorithm::HighwayHash256S,
+        ))];
+
+        let erasure = Arc::new(Erasure::new(1, 0, 16));
+        let truncated = HardLimitReader::new(Cursor::new(b"short".to_vec()), 10);
+
+        let err = match erasure.encode(truncated, &mut writers, 1).await {
+            Ok(_) => panic!("truncated input must fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     /// encode_inline_small: empty reader returns (reader, 0) without writing to any shard.

@@ -29,8 +29,8 @@ pub async fn write_all<W: AsyncWrite + Send + Sync + Unpin>(writer: &mut W, buf:
     Ok(total)
 }
 
-/// Read exactly buf.len() bytes into buf, or return an error if EOF is reached before.
-/// Like Go's io.ReadFull.
+/// Read up to buf.len() bytes into buf, returning 0 only when EOF is reached before any bytes are read.
+/// Returns an error if the reader fails after partially filling the buffer.
 #[allow(dead_code)]
 pub async fn read_full<R: AsyncRead + Send + Sync + Unpin>(mut reader: R, mut buf: &mut [u8]) -> std::io::Result<usize> {
     let mut total = 0;
@@ -46,17 +46,14 @@ pub async fn read_full<R: AsyncRead + Send + Sync + Unpin>(mut reader: R, mut bu
                 if e.kind() == std::io::ErrorKind::InvalidData {
                     return Err(e);
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("read {total} bytes, error: {e}"),
-                ));
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e));
             }
         };
         if n == 0 {
             if total > 0 {
                 return Ok(total);
             }
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early EOF"));
+            return Ok(0);
         }
         buf = &mut buf[n..];
         total += n;
