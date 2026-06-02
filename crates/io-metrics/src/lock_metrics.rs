@@ -62,6 +62,61 @@ pub fn record_contention_event() {
     counter!("rustfs_lock_contentions").increment(1);
 }
 
+/// Record object namespace lock diagnostics being enabled.
+#[inline(always)]
+pub fn record_object_lock_diag_enabled(enabled: bool) {
+    use metrics::gauge;
+    gauge!("rustfs_object_lock_diag_enabled").set(if enabled { 1.0 } else { 0.0 });
+}
+
+/// Record object namespace lock acquire duration.
+#[inline(always)]
+pub fn record_object_lock_diag_acquire_duration(op: &str, mode: &str, duration: Duration) {
+    use metrics::histogram;
+    histogram!(
+        "rustfs_object_lock_diag_acquire_duration_seconds",
+        "op" => op.to_string(),
+        "mode" => mode.to_string()
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record object namespace lock hold duration.
+#[inline(always)]
+pub fn record_object_lock_diag_hold_duration(op: &str, mode: &str, duration: Duration) {
+    use metrics::histogram;
+    histogram!(
+        "rustfs_object_lock_diag_hold_duration_seconds",
+        "op" => op.to_string(),
+        "mode" => mode.to_string()
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record an object namespace lock slow-acquire event.
+#[inline(always)]
+pub fn record_object_lock_diag_slow_acquire(op: &str, mode: &str) {
+    use metrics::counter;
+    counter!(
+        "rustfs_object_lock_diag_slow_acquire_total",
+        "op" => op.to_string(),
+        "mode" => mode.to_string()
+    )
+    .increment(1);
+}
+
+/// Record an object namespace lock slow-hold event.
+#[inline(always)]
+pub fn record_object_lock_diag_slow_hold(op: &str, mode: &str) {
+    use metrics::counter;
+    counter!(
+        "rustfs_object_lock_diag_slow_hold_total",
+        "op" => op.to_string(),
+        "mode" => mode.to_string()
+    )
+    .increment(1);
+}
+
 /// Lock statistics summary.
 #[derive(Debug, Clone, Default)]
 pub struct LockMetricsSummary {
@@ -141,6 +196,28 @@ mod tests {
     #[test]
     fn test_record_contention_event() {
         record_contention_event();
+    }
+
+    #[test]
+    fn test_record_object_lock_diag_enabled() {
+        record_object_lock_diag_enabled(true);
+        record_object_lock_diag_enabled(false);
+    }
+
+    #[test]
+    fn test_record_object_lock_diag_acquire_duration() {
+        record_object_lock_diag_acquire_duration("get_object", "read", Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_record_object_lock_diag_hold_duration() {
+        record_object_lock_diag_hold_duration("put_object_commit", "write", Duration::from_millis(20));
+    }
+
+    #[test]
+    fn test_record_object_lock_diag_slow_events() {
+        record_object_lock_diag_slow_acquire("get_object_info", "read");
+        record_object_lock_diag_slow_hold("complete_multipart_upload_commit", "write");
     }
 
     #[test]
