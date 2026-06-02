@@ -54,6 +54,7 @@ runs:
           build-essential \
           pkg-config \
           libssl-dev \
+          unzip \
           protobuf-compiler
 
     - name: Install protoc
