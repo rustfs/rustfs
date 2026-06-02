@@ -209,6 +209,13 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
+        if self.block_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "erasure block_size must be non-zero",
+            ));
+        }
+
         // Bound queued encoded blocks by memory budget to avoid per-request spikes.
         let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
         let max_inflight_bytes = rustfs_utils::get_env_usize(
@@ -224,7 +231,8 @@ impl Erasure {
             let mut buf = vec![0u8; block_size];
             loop {
                 match rustfs_utils::read_full_or_eof(&mut reader, &mut buf).await {
-                    Ok(Some(n)) if n > 0 => {
+                    Ok(Some(n)) => {
+                        debug_assert!(n > 0, "non-zero block_size prevents zero-length reads");
                         total += n;
                         let erasure = self.clone();
                         let encode_buf = std::mem::take(&mut buf);
@@ -255,7 +263,6 @@ impl Erasure {
                         }
                         return Err(e);
                     }
-                    Ok(Some(_)) => unreachable!("read_full_or_eof never returns Some(0)"),
                     Err(e) => {
                         return Err(e);
                     }
@@ -406,6 +413,27 @@ mod tests {
         };
 
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn encode_rejects_zero_block_size() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let writer = DeferredCommitWriter::new(committed);
+        let mut writers = vec![Some(BitrotWriterWrapper::new(
+            CustomWriter::new_tokio_writer(writer),
+            16,
+            HashAlgorithm::HighwayHash256S,
+        ))];
+
+        let erasure = Arc::new(Erasure::new(1, 0, 0));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(b"payload".to_vec()));
+        let err = erasure
+            .encode(reader, &mut writers, 1)
+            .await
+            .expect_err("zero block size must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("block_size"));
     }
 
     /// encode_inline_small: empty reader returns (reader, 0) without writing to any shard.
