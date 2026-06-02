@@ -29,10 +29,15 @@ pub async fn write_all<W: AsyncWrite + Send + Sync + Unpin>(writer: &mut W, buf:
     Ok(total)
 }
 
-/// Read exactly buf.len() bytes into buf, or return an error if EOF is reached before.
-/// Like Go's io.ReadFull.
-#[allow(dead_code)]
-pub async fn read_full<R: AsyncRead + Send + Sync + Unpin>(mut reader: R, mut buf: &mut [u8]) -> std::io::Result<usize> {
+/// Read up to buf.len() bytes into buf and distinguish a clean EOF from a short read.
+///
+/// Returns `Ok(None)` when EOF is reached before any bytes are read, `Ok(Some(n))` when
+/// at least one byte is read, and preserves the underlying error chain when the reader
+/// fails after a partial fill.
+pub async fn read_full_or_eof<R: AsyncRead + Send + Sync + Unpin>(
+    mut reader: R,
+    mut buf: &mut [u8],
+) -> std::io::Result<Option<usize>> {
     let mut total = 0;
     while !buf.is_empty() {
         let n = match reader.read(buf).await {
@@ -46,22 +51,29 @@ pub async fn read_full<R: AsyncRead + Send + Sync + Unpin>(mut reader: R, mut bu
                 if e.kind() == std::io::ErrorKind::InvalidData {
                     return Err(e);
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("read {total} bytes, error: {e}"),
-                ));
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e));
             }
         };
         if n == 0 {
             if total > 0 {
-                return Ok(total);
+                return Ok(Some(total));
             }
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early EOF"));
+            return Ok(None);
         }
         buf = &mut buf[n..];
         total += n;
     }
-    Ok(total)
+    Ok(Some(total))
+}
+
+/// Read exactly buf.len() bytes into buf, or return an error if EOF is reached before any bytes are read.
+/// Like Go's io.ReadFull.
+#[allow(dead_code)]
+pub async fn read_full<R: AsyncRead + Send + Sync + Unpin>(reader: R, buf: &mut [u8]) -> std::io::Result<usize> {
+    match read_full_or_eof(reader, buf).await? {
+        Some(n) => Ok(n),
+        None => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early EOF")),
+    }
 }
 
 /// Encodes a u64 into buf and returns the number of bytes written.
@@ -161,6 +173,17 @@ mod tests {
         let mut buf = vec![0u8; size / 3];
         read_full(&mut reader, &mut buf).await.unwrap();
         assert_eq!(buf, data[..size / 3]);
+    }
+
+    #[tokio::test]
+    async fn test_read_full_or_eof_returns_none_for_empty_reader() {
+        let data = b"";
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = [0u8; 8];
+
+        let n = read_full_or_eof(&mut reader, &mut buf).await.unwrap();
+
+        assert_eq!(n, None);
     }
 
     #[test]
