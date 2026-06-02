@@ -896,10 +896,23 @@ pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
 ///
 /// Task 5 maps scanner runtime snapshots from `global_metrics()` into the
 /// rustfs-obs scanner collector shape.
+fn scanner_bucket_scans_started(life_time_ops: &HashMap<String, u64>, bucket_scans_finished: u64) -> u64 {
+    life_time_ops
+        .get("scan_bucket_drive_start")
+        .copied()
+        .unwrap_or(bucket_scans_finished)
+}
+
 pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let metrics = global_metrics().report().await;
     let now = Utc::now();
     let bucket_scans_finished = metrics.life_time_ops.get("scan_bucket_drive").copied().unwrap_or_default();
+    let bucket_scans_started = scanner_bucket_scans_started(&metrics.life_time_ops, bucket_scans_finished);
+    let bucket_scans_failed = metrics
+        .life_time_ops
+        .get("scan_bucket_drive_failure")
+        .copied()
+        .unwrap_or_default();
     let completed_cycles = metrics.life_time_ops.get("scan_cycle").copied().unwrap_or_default();
     let directories_scanned = metrics.life_time_ops.get("scan_folder").copied().unwrap_or_default();
     let objects_scanned = metrics.life_time_ops.get("scan_object").copied().unwrap_or_default();
@@ -914,21 +927,27 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
 
     Some(ScannerStats {
         bucket_scans_finished,
-        // `global_metrics()` currently tracks completed bucket-drive scans, not a
-        // separate started counter. Mirror the finished count until Task 5/Task 10
-        // expands the scanner runtime source shape.
-        bucket_scans_started: bucket_scans_finished,
+        bucket_scans_started,
+        bucket_scans_failed,
         directories_scanned,
         objects_scanned,
         versions_scanned,
         last_activity_seconds,
         active_paths,
+        throttle_idle_mode_enabled: u64::from(metrics.throttle_idle_mode_enabled),
+        throttle_sleep_factor: metrics.throttle_sleep_factor,
+        throttle_max_sleep_seconds: metrics.throttle_max_sleep_seconds,
+        yield_every_n_objects: metrics.yield_every_n_objects,
+        cycle_interval_seconds: metrics.cycle_interval_seconds,
+        bitrot_cycle_enabled: u64::from(metrics.bitrot_cycle_enabled),
+        bitrot_cycle_seconds: metrics.bitrot_cycle_seconds,
         current_cycle: metrics.current_cycle,
         completed_cycles,
         current_cycle_age_seconds,
         current_cycle_objects_scanned: metrics.current_cycle_objects_scanned,
         current_cycle_directories_scanned: metrics.current_cycle_directories_scanned,
         current_cycle_bucket_drive_scans: metrics.current_cycle_bucket_drive_scans,
+        current_cycle_bucket_drive_failures: metrics.current_cycle_bucket_drive_failures,
         current_cycle_objects_per_second: scanner_work_rate_per_second(metrics.current_cycle_objects_scanned, current_cycle_age),
         current_cycle_directories_per_second: scanner_work_rate_per_second(
             metrics.current_cycle_directories_scanned,
@@ -938,12 +957,19 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
             metrics.current_cycle_bucket_drive_scans,
             current_cycle_age,
         ),
+        current_cycle_yield_events: metrics.current_cycle_yield_events,
+        current_cycle_yield_duration_seconds: metrics.current_cycle_yield_duration_seconds,
+        current_cycle_ilm_actions: metrics.current_cycle_ilm_actions,
+        current_cycle_heal_objects: metrics.current_cycle_heal_objects,
+        current_cycle_replication_checks: metrics.current_cycle_replication_checks,
+        current_cycle_usage_saves: metrics.current_cycle_usage_saves,
         current_scan_mode,
         last_cycle_result: metrics.last_cycle_result_code,
         last_cycle_duration_seconds: metrics.last_cycle_duration_seconds,
         last_cycle_objects_scanned: metrics.last_cycle_objects_scanned,
         last_cycle_directories_scanned: metrics.last_cycle_directories_scanned,
         last_cycle_bucket_drive_scans: metrics.last_cycle_bucket_drive_scans,
+        last_cycle_bucket_drive_failures: metrics.last_cycle_bucket_drive_failures,
         last_cycle_objects_per_second: scanner_work_rate_per_second(metrics.last_cycle_objects_scanned, last_cycle_duration),
         last_cycle_directories_per_second: scanner_work_rate_per_second(
             metrics.last_cycle_directories_scanned,
@@ -953,6 +979,12 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
             metrics.last_cycle_bucket_drive_scans,
             last_cycle_duration,
         ),
+        last_cycle_yield_events: metrics.last_cycle_yield_events,
+        last_cycle_yield_duration_seconds: metrics.last_cycle_yield_duration_seconds,
+        last_cycle_ilm_actions: metrics.last_cycle_ilm_actions,
+        last_cycle_heal_objects: metrics.last_cycle_heal_objects,
+        last_cycle_replication_checks: metrics.last_cycle_replication_checks,
+        last_cycle_usage_saves: metrics.last_cycle_usage_saves,
         failed_cycles: metrics.failed_cycles,
     })
 }
@@ -1054,6 +1086,21 @@ mod tests {
     #[test]
     fn scanner_scan_mode_code_maps_unknown_mode() {
         assert_eq!(scanner_scan_mode_code(""), HealScanMode::Unknown as u8 as u64);
+    }
+
+    #[test]
+    fn scanner_bucket_scans_started_uses_explicit_started_count() {
+        let mut life_time_ops = HashMap::new();
+        life_time_ops.insert("scan_bucket_drive_start".to_string(), 7);
+
+        assert_eq!(scanner_bucket_scans_started(&life_time_ops, 5), 7);
+    }
+
+    #[test]
+    fn scanner_bucket_scans_started_falls_back_to_finished_count() {
+        let life_time_ops = HashMap::new();
+
+        assert_eq!(scanner_bucket_scans_started(&life_time_ops, 5), 5);
     }
 
     #[test]

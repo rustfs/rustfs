@@ -146,6 +146,8 @@ pub enum Metric {
     ScanCycle,       // Full cycle, cluster global.
     ScanBucketDrive, // Single bucket on one drive.
     CompactFolder,   // Folder compacted.
+    ScanBucketDriveStart,
+    ScanBucketDriveFailure,
 
     // Must be last:
     Last,
@@ -179,6 +181,8 @@ impl Metric {
             Self::ScanCycle => "scan_cycle",
             Self::ScanBucketDrive => "scan_bucket_drive",
             Self::CompactFolder => "compact_folder",
+            Self::ScanBucketDriveStart => "scan_bucket_drive_start",
+            Self::ScanBucketDriveFailure => "scan_bucket_drive_failure",
             Self::Last => "last",
         }
     }
@@ -213,7 +217,9 @@ impl Metric {
             21 => Some(Self::ScanCycle),
             22 => Some(Self::ScanBucketDrive),
             23 => Some(Self::CompactFolder),
-            24 => Some(Self::Last),
+            24 => Some(Self::ScanBucketDriveStart),
+            25 => Some(Self::ScanBucketDriveFailure),
+            26 => Some(Self::Last),
             _ => None,
         }
     }
@@ -346,12 +352,35 @@ pub struct Metrics {
     current_scan_cycle_objects_start: AtomicU64,
     current_scan_cycle_directories_start: AtomicU64,
     current_scan_cycle_bucket_drive_scans_start: AtomicU64,
+    current_scan_cycle_bucket_drive_failures_start: AtomicU64,
+    current_scan_cycle_yield_events_start: AtomicU64,
+    current_scan_cycle_yield_duration_millis_start: AtomicU64,
+    current_scan_cycle_ilm_actions_start: AtomicU64,
+    current_scan_cycle_heal_objects_start: AtomicU64,
+    current_scan_cycle_replication_checks_start: AtomicU64,
+    current_scan_cycle_usage_saves_start: AtomicU64,
     last_scan_cycle_result: AtomicU8,
     last_scan_cycle_duration_millis: AtomicU64,
     last_scan_cycle_objects_scanned: AtomicU64,
     last_scan_cycle_directories_scanned: AtomicU64,
     last_scan_cycle_bucket_drive_scans: AtomicU64,
+    last_scan_cycle_bucket_drive_failures: AtomicU64,
+    last_scan_cycle_yield_events: AtomicU64,
+    last_scan_cycle_yield_duration_millis: AtomicU64,
+    last_scan_cycle_ilm_actions: AtomicU64,
+    last_scan_cycle_heal_objects: AtomicU64,
+    last_scan_cycle_replication_checks: AtomicU64,
+    last_scan_cycle_usage_saves: AtomicU64,
     failed_scan_cycles: AtomicU64,
+    scanner_yield_duration_millis: AtomicU64,
+    scanner_ilm_actions: AtomicU64,
+    scanner_throttle_idle_mode_enabled: AtomicBool,
+    scanner_throttle_sleep_factor_micros: AtomicU64,
+    scanner_throttle_max_sleep_millis: AtomicU64,
+    scanner_yield_every_n_objects: AtomicU64,
+    scanner_cycle_interval_millis: AtomicU64,
+    scanner_bitrot_cycle_enabled: AtomicBool,
+    scanner_bitrot_cycle_millis: AtomicU64,
 }
 
 const SCAN_CYCLE_RESULT_UNKNOWN: u8 = 0;
@@ -374,6 +403,13 @@ pub struct ScanCycleWorkSnapshot {
     objects_scanned: u64,
     directories_scanned: u64,
     bucket_drive_scans: u64,
+    bucket_drive_failures: u64,
+    yield_events: u64,
+    yield_duration_millis: u64,
+    ilm_actions: u64,
+    heal_objects: u64,
+    replication_checks: u64,
+    usage_saves: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -409,6 +445,20 @@ pub struct ScannerMetricsReport {
     pub current_cycle_directories_scanned: u64,
     #[serde(default)]
     pub current_cycle_bucket_drive_scans: u64,
+    #[serde(default)]
+    pub current_cycle_bucket_drive_failures: u64,
+    #[serde(default)]
+    pub current_cycle_yield_events: u64,
+    #[serde(default)]
+    pub current_cycle_yield_duration_seconds: f64,
+    #[serde(default)]
+    pub current_cycle_ilm_actions: u64,
+    #[serde(default)]
+    pub current_cycle_heal_objects: u64,
+    #[serde(default)]
+    pub current_cycle_replication_checks: u64,
+    #[serde(default)]
+    pub current_cycle_usage_saves: u64,
     pub last_cycle_result: String,
     pub last_cycle_result_code: u64,
     pub last_cycle_duration_seconds: f64,
@@ -418,7 +468,35 @@ pub struct ScannerMetricsReport {
     pub last_cycle_directories_scanned: u64,
     #[serde(default)]
     pub last_cycle_bucket_drive_scans: u64,
+    #[serde(default)]
+    pub last_cycle_bucket_drive_failures: u64,
+    #[serde(default)]
+    pub last_cycle_yield_events: u64,
+    #[serde(default)]
+    pub last_cycle_yield_duration_seconds: f64,
+    #[serde(default)]
+    pub last_cycle_ilm_actions: u64,
+    #[serde(default)]
+    pub last_cycle_heal_objects: u64,
+    #[serde(default)]
+    pub last_cycle_replication_checks: u64,
+    #[serde(default)]
+    pub last_cycle_usage_saves: u64,
     pub failed_cycles: u64,
+    #[serde(default)]
+    pub throttle_idle_mode_enabled: bool,
+    #[serde(default)]
+    pub throttle_sleep_factor: f64,
+    #[serde(default)]
+    pub throttle_max_sleep_seconds: f64,
+    #[serde(default)]
+    pub yield_every_n_objects: u64,
+    #[serde(default)]
+    pub cycle_interval_seconds: f64,
+    #[serde(default)]
+    pub bitrot_cycle_enabled: bool,
+    #[serde(default)]
+    pub bitrot_cycle_seconds: f64,
 }
 
 impl CurrentCycle {
@@ -462,6 +540,14 @@ fn scan_cycle_result_label(result: u8) -> &'static str {
 
 fn duration_millis_saturated(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn scaled_f64_to_u64_saturated(value: f64, scale: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+
+    (value * scale).round().clamp(0.0, u64::MAX as f64) as u64
 }
 
 pub fn emit_scan_cycle_complete(success: bool, duration: Duration) {
@@ -514,12 +600,35 @@ impl Metrics {
             current_scan_cycle_objects_start: AtomicU64::new(0),
             current_scan_cycle_directories_start: AtomicU64::new(0),
             current_scan_cycle_bucket_drive_scans_start: AtomicU64::new(0),
+            current_scan_cycle_bucket_drive_failures_start: AtomicU64::new(0),
+            current_scan_cycle_yield_events_start: AtomicU64::new(0),
+            current_scan_cycle_yield_duration_millis_start: AtomicU64::new(0),
+            current_scan_cycle_ilm_actions_start: AtomicU64::new(0),
+            current_scan_cycle_heal_objects_start: AtomicU64::new(0),
+            current_scan_cycle_replication_checks_start: AtomicU64::new(0),
+            current_scan_cycle_usage_saves_start: AtomicU64::new(0),
             last_scan_cycle_result: AtomicU8::new(SCAN_CYCLE_RESULT_UNKNOWN),
             last_scan_cycle_duration_millis: AtomicU64::new(0),
             last_scan_cycle_objects_scanned: AtomicU64::new(0),
             last_scan_cycle_directories_scanned: AtomicU64::new(0),
             last_scan_cycle_bucket_drive_scans: AtomicU64::new(0),
+            last_scan_cycle_bucket_drive_failures: AtomicU64::new(0),
+            last_scan_cycle_yield_events: AtomicU64::new(0),
+            last_scan_cycle_yield_duration_millis: AtomicU64::new(0),
+            last_scan_cycle_ilm_actions: AtomicU64::new(0),
+            last_scan_cycle_heal_objects: AtomicU64::new(0),
+            last_scan_cycle_replication_checks: AtomicU64::new(0),
+            last_scan_cycle_usage_saves: AtomicU64::new(0),
             failed_scan_cycles: AtomicU64::new(0),
+            scanner_yield_duration_millis: AtomicU64::new(0),
+            scanner_ilm_actions: AtomicU64::new(0),
+            scanner_throttle_idle_mode_enabled: AtomicBool::new(false),
+            scanner_throttle_sleep_factor_micros: AtomicU64::new(0),
+            scanner_throttle_max_sleep_millis: AtomicU64::new(0),
+            scanner_yield_every_n_objects: AtomicU64::new(0),
+            scanner_cycle_interval_millis: AtomicU64::new(0),
+            scanner_bitrot_cycle_enabled: AtomicBool::new(false),
+            scanner_bitrot_cycle_millis: AtomicU64::new(0),
         }
     }
 
@@ -621,6 +730,58 @@ impl Metrics {
         }
     }
 
+    pub fn record_scanner_yield(&self, duration: Duration) {
+        let metric_idx = Metric::Yield as usize;
+        self.operations[metric_idx].fetch_add(1, Ordering::Relaxed);
+        if metric_idx < Metric::LastRealtime as usize {
+            self.latency[metric_idx].add(duration);
+        }
+        let duration_millis = duration_millis_saturated(duration);
+        let _ = self
+            .scanner_yield_duration_millis
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(duration_millis))
+            });
+    }
+
+    pub fn record_scanner_ilm_action(&self, count: u64) {
+        self.scanner_ilm_actions.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_scan_bucket_drive_start(&self) {
+        self.operations[Metric::ScanBucketDriveStart as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_scan_bucket_drive_failure(&self) {
+        self.operations[Metric::ScanBucketDriveFailure as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_throttle_config(
+        &self,
+        idle_mode_enabled: bool,
+        sleep_factor: f64,
+        max_sleep: Duration,
+        yield_every_n_objects: u64,
+    ) {
+        self.scanner_throttle_idle_mode_enabled
+            .store(idle_mode_enabled, Ordering::Relaxed);
+        self.scanner_throttle_sleep_factor_micros
+            .store(scaled_f64_to_u64_saturated(sleep_factor, 1_000_000.0), Ordering::Relaxed);
+        self.scanner_throttle_max_sleep_millis
+            .store(duration_millis_saturated(max_sleep), Ordering::Relaxed);
+        self.scanner_yield_every_n_objects
+            .store(yield_every_n_objects, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_cycle_config(&self, cycle_interval: Duration, bitrot_cycle: Option<Duration>) {
+        self.scanner_cycle_interval_millis
+            .store(duration_millis_saturated(cycle_interval), Ordering::Relaxed);
+        self.scanner_bitrot_cycle_enabled
+            .store(bitrot_cycle.is_some(), Ordering::Relaxed);
+        self.scanner_bitrot_cycle_millis
+            .store(bitrot_cycle.map(duration_millis_saturated).unwrap_or_default(), Ordering::Relaxed);
+    }
+
     // -----------------------------------------------------------------------
     // Read-side helpers
     // -----------------------------------------------------------------------
@@ -686,13 +847,27 @@ impl Metrics {
             .store(snapshot.directories_scanned, Ordering::Relaxed);
         self.current_scan_cycle_bucket_drive_scans_start
             .store(snapshot.bucket_drive_scans, Ordering::Relaxed);
+        self.current_scan_cycle_bucket_drive_failures_start
+            .store(snapshot.bucket_drive_failures, Ordering::Relaxed);
+        self.current_scan_cycle_yield_events_start
+            .store(snapshot.yield_events, Ordering::Relaxed);
+        self.current_scan_cycle_yield_duration_millis_start
+            .store(snapshot.yield_duration_millis, Ordering::Relaxed);
+        self.current_scan_cycle_ilm_actions_start
+            .store(snapshot.ilm_actions, Ordering::Relaxed);
+        self.current_scan_cycle_heal_objects_start
+            .store(snapshot.heal_objects, Ordering::Relaxed);
+        self.current_scan_cycle_replication_checks_start
+            .store(snapshot.replication_checks, Ordering::Relaxed);
+        self.current_scan_cycle_usage_saves_start
+            .store(snapshot.usage_saves, Ordering::Relaxed);
         self.current_scan_cycle_work_active.store(true, Ordering::Relaxed);
         snapshot
     }
 
     pub fn finish_scan_cycle_work(&self, start: ScanCycleWorkSnapshot) {
         let work = self.scan_cycle_work_since(start);
-        self.record_scan_cycle_work(work.objects_scanned, work.directories_scanned, work.bucket_drive_scans);
+        self.record_scan_cycle_work(work);
         self.current_scan_cycle_work_active.store(false, Ordering::Relaxed);
     }
 
@@ -701,6 +876,13 @@ impl Metrics {
             objects_scanned: self.lifetime(Metric::ScanObject),
             directories_scanned: self.lifetime(Metric::ScanFolder),
             bucket_drive_scans: self.lifetime(Metric::ScanBucketDrive),
+            bucket_drive_failures: self.lifetime(Metric::ScanBucketDriveFailure),
+            yield_events: self.lifetime(Metric::Yield),
+            yield_duration_millis: self.scanner_yield_duration_millis.load(Ordering::Relaxed),
+            ilm_actions: self.scanner_ilm_actions.load(Ordering::Relaxed),
+            heal_objects: self.lifetime(Metric::HealAbandonedObject),
+            replication_checks: self.lifetime(Metric::CheckReplication),
+            usage_saves: self.lifetime(Metric::SaveUsage),
         }
     }
 
@@ -709,6 +891,13 @@ impl Metrics {
             objects_scanned: self.current_scan_cycle_objects_start.load(Ordering::Relaxed),
             directories_scanned: self.current_scan_cycle_directories_start.load(Ordering::Relaxed),
             bucket_drive_scans: self.current_scan_cycle_bucket_drive_scans_start.load(Ordering::Relaxed),
+            bucket_drive_failures: self.current_scan_cycle_bucket_drive_failures_start.load(Ordering::Relaxed),
+            yield_events: self.current_scan_cycle_yield_events_start.load(Ordering::Relaxed),
+            yield_duration_millis: self.current_scan_cycle_yield_duration_millis_start.load(Ordering::Relaxed),
+            ilm_actions: self.current_scan_cycle_ilm_actions_start.load(Ordering::Relaxed),
+            heal_objects: self.current_scan_cycle_heal_objects_start.load(Ordering::Relaxed),
+            replication_checks: self.current_scan_cycle_replication_checks_start.load(Ordering::Relaxed),
+            usage_saves: self.current_scan_cycle_usage_saves_start.load(Ordering::Relaxed),
         }
     }
 
@@ -718,17 +907,35 @@ impl Metrics {
             objects_scanned: current.objects_scanned.saturating_sub(start.objects_scanned),
             directories_scanned: current.directories_scanned.saturating_sub(start.directories_scanned),
             bucket_drive_scans: current.bucket_drive_scans.saturating_sub(start.bucket_drive_scans),
+            bucket_drive_failures: current.bucket_drive_failures.saturating_sub(start.bucket_drive_failures),
+            yield_events: current.yield_events.saturating_sub(start.yield_events),
+            yield_duration_millis: current.yield_duration_millis.saturating_sub(start.yield_duration_millis),
+            ilm_actions: current.ilm_actions.saturating_sub(start.ilm_actions),
+            heal_objects: current.heal_objects.saturating_sub(start.heal_objects),
+            replication_checks: current.replication_checks.saturating_sub(start.replication_checks),
+            usage_saves: current.usage_saves.saturating_sub(start.usage_saves),
         }
     }
 
-    pub fn record_scan_cycle_work(&self, objects_scanned: u64, directories_scanned: u64, bucket_drive_scans: u64) {
+    pub fn record_scan_cycle_work(&self, work: ScanCycleWorkSnapshot) {
         // Telemetry-only gauges: readers may observe a transient mixed snapshot
         // while these independent atomic fields are updated.
-        self.last_scan_cycle_objects_scanned.store(objects_scanned, Ordering::Relaxed);
+        self.last_scan_cycle_objects_scanned
+            .store(work.objects_scanned, Ordering::Relaxed);
         self.last_scan_cycle_directories_scanned
-            .store(directories_scanned, Ordering::Relaxed);
+            .store(work.directories_scanned, Ordering::Relaxed);
         self.last_scan_cycle_bucket_drive_scans
-            .store(bucket_drive_scans, Ordering::Relaxed);
+            .store(work.bucket_drive_scans, Ordering::Relaxed);
+        self.last_scan_cycle_bucket_drive_failures
+            .store(work.bucket_drive_failures, Ordering::Relaxed);
+        self.last_scan_cycle_yield_events.store(work.yield_events, Ordering::Relaxed);
+        self.last_scan_cycle_yield_duration_millis
+            .store(work.yield_duration_millis, Ordering::Relaxed);
+        self.last_scan_cycle_ilm_actions.store(work.ilm_actions, Ordering::Relaxed);
+        self.last_scan_cycle_heal_objects.store(work.heal_objects, Ordering::Relaxed);
+        self.last_scan_cycle_replication_checks
+            .store(work.replication_checks, Ordering::Relaxed);
+        self.last_scan_cycle_usage_saves.store(work.usage_saves, Ordering::Relaxed);
     }
 
     /// Snapshot of every path currently being scanned.
@@ -772,6 +979,13 @@ impl Metrics {
             m.current_cycle_objects_scanned = current_work.objects_scanned;
             m.current_cycle_directories_scanned = current_work.directories_scanned;
             m.current_cycle_bucket_drive_scans = current_work.bucket_drive_scans;
+            m.current_cycle_bucket_drive_failures = current_work.bucket_drive_failures;
+            m.current_cycle_yield_events = current_work.yield_events;
+            m.current_cycle_yield_duration_seconds = current_work.yield_duration_millis as f64 / 1000.0;
+            m.current_cycle_ilm_actions = current_work.ilm_actions;
+            m.current_cycle_heal_objects = current_work.heal_objects;
+            m.current_cycle_replication_checks = current_work.replication_checks;
+            m.current_cycle_usage_saves = current_work.usage_saves;
         }
         let last_cycle_result = self.last_scan_cycle_result.load(Ordering::Relaxed);
         m.last_cycle_result = scan_cycle_result_label(last_cycle_result).to_string();
@@ -780,7 +994,21 @@ impl Metrics {
         m.last_cycle_objects_scanned = self.last_scan_cycle_objects_scanned.load(Ordering::Relaxed);
         m.last_cycle_directories_scanned = self.last_scan_cycle_directories_scanned.load(Ordering::Relaxed);
         m.last_cycle_bucket_drive_scans = self.last_scan_cycle_bucket_drive_scans.load(Ordering::Relaxed);
+        m.last_cycle_bucket_drive_failures = self.last_scan_cycle_bucket_drive_failures.load(Ordering::Relaxed);
+        m.last_cycle_yield_events = self.last_scan_cycle_yield_events.load(Ordering::Relaxed);
+        m.last_cycle_yield_duration_seconds = self.last_scan_cycle_yield_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
+        m.last_cycle_ilm_actions = self.last_scan_cycle_ilm_actions.load(Ordering::Relaxed);
+        m.last_cycle_heal_objects = self.last_scan_cycle_heal_objects.load(Ordering::Relaxed);
+        m.last_cycle_replication_checks = self.last_scan_cycle_replication_checks.load(Ordering::Relaxed);
+        m.last_cycle_usage_saves = self.last_scan_cycle_usage_saves.load(Ordering::Relaxed);
         m.failed_cycles = self.failed_scan_cycles.load(Ordering::Relaxed);
+        m.throttle_idle_mode_enabled = self.scanner_throttle_idle_mode_enabled.load(Ordering::Relaxed);
+        m.throttle_sleep_factor = self.scanner_throttle_sleep_factor_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        m.throttle_max_sleep_seconds = self.scanner_throttle_max_sleep_millis.load(Ordering::Relaxed) as f64 / 1000.0;
+        m.yield_every_n_objects = self.scanner_yield_every_n_objects.load(Ordering::Relaxed);
+        m.cycle_interval_seconds = self.scanner_cycle_interval_millis.load(Ordering::Relaxed) as f64 / 1000.0;
+        m.bitrot_cycle_enabled = self.scanner_bitrot_cycle_enabled.load(Ordering::Relaxed);
+        m.bitrot_cycle_seconds = self.scanner_bitrot_cycle_millis.load(Ordering::Relaxed) as f64 / 1000.0;
 
         // Lifetime operation counts
         for i in 0..Metric::Last as usize {
@@ -998,13 +1226,43 @@ mod tests {
     #[tokio::test]
     async fn report_includes_last_scan_cycle_work() {
         let metrics = Metrics::new();
-        metrics.record_scan_cycle_work(11, 7, 3);
+        metrics.record_scan_cycle_work(ScanCycleWorkSnapshot {
+            objects_scanned: 11,
+            directories_scanned: 7,
+            bucket_drive_scans: 3,
+            bucket_drive_failures: 2,
+            yield_events: 5,
+            yield_duration_millis: 250,
+            ilm_actions: 13,
+            heal_objects: 2,
+            replication_checks: 4,
+            usage_saves: 6,
+        });
 
         let report = metrics.report().await;
 
         assert_eq!(report.last_cycle_objects_scanned, 11);
         assert_eq!(report.last_cycle_directories_scanned, 7);
         assert_eq!(report.last_cycle_bucket_drive_scans, 3);
+        assert_eq!(report.last_cycle_bucket_drive_failures, 2);
+        assert_eq!(report.last_cycle_yield_events, 5);
+        assert_eq!(report.last_cycle_yield_duration_seconds, 0.25);
+        assert_eq!(report.last_cycle_ilm_actions, 13);
+        assert_eq!(report.last_cycle_heal_objects, 2);
+        assert_eq!(report.last_cycle_replication_checks, 4);
+        assert_eq!(report.last_cycle_usage_saves, 6);
+    }
+
+    #[tokio::test]
+    async fn report_includes_bucket_drive_scan_starts() {
+        let metrics = Metrics::new();
+        metrics.record_scan_bucket_drive_start();
+        metrics.record_scan_bucket_drive_failure();
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.life_time_ops.get("scan_bucket_drive_start"), Some(&1));
+        assert_eq!(report.life_time_ops.get("scan_bucket_drive_failure"), Some(&1));
     }
 
     #[tokio::test]
@@ -1013,17 +1271,39 @@ mod tests {
         metrics.operations[Metric::ScanObject as usize].store(10, Ordering::Relaxed);
         metrics.operations[Metric::ScanFolder as usize].store(5, Ordering::Relaxed);
         metrics.operations[Metric::ScanBucketDrive as usize].store(1, Ordering::Relaxed);
+        metrics.operations[Metric::ScanBucketDriveFailure as usize].store(1, Ordering::Relaxed);
+        metrics.operations[Metric::Yield as usize].store(2, Ordering::Relaxed);
+        metrics.operations[Metric::HealAbandonedObject as usize].store(4, Ordering::Relaxed);
+        metrics.operations[Metric::CheckReplication as usize].store(5, Ordering::Relaxed);
+        metrics.operations[Metric::SaveUsage as usize].store(3, Ordering::Relaxed);
+        metrics.actions[IlmAction::DeleteAction as usize].store(100, Ordering::Relaxed);
+        metrics.record_scanner_ilm_action(6);
+        metrics.scanner_yield_duration_millis.store(100, Ordering::Relaxed);
 
         let start = metrics.start_scan_cycle_work();
         metrics.operations[Metric::ScanObject as usize].store(17, Ordering::Relaxed);
         metrics.operations[Metric::ScanFolder as usize].store(8, Ordering::Relaxed);
         metrics.operations[Metric::ScanBucketDrive as usize].store(3, Ordering::Relaxed);
+        metrics.operations[Metric::ScanBucketDriveFailure as usize].store(4, Ordering::Relaxed);
+        metrics.operations[Metric::HealAbandonedObject as usize].store(7, Ordering::Relaxed);
+        metrics.operations[Metric::CheckReplication as usize].store(11, Ordering::Relaxed);
+        metrics.operations[Metric::SaveUsage as usize].store(5, Ordering::Relaxed);
+        metrics.actions[IlmAction::DeleteAction as usize].store(150, Ordering::Relaxed);
+        metrics.record_scanner_ilm_action(9);
+        metrics.record_scanner_yield(Duration::from_millis(150));
 
         let report = metrics.report().await;
 
         assert_eq!(report.current_cycle_objects_scanned, 7);
         assert_eq!(report.current_cycle_directories_scanned, 3);
         assert_eq!(report.current_cycle_bucket_drive_scans, 2);
+        assert_eq!(report.current_cycle_bucket_drive_failures, 3);
+        assert_eq!(report.current_cycle_yield_events, 1);
+        assert_eq!(report.current_cycle_yield_duration_seconds, 0.15);
+        assert_eq!(report.current_cycle_ilm_actions, 9);
+        assert_eq!(report.current_cycle_heal_objects, 3);
+        assert_eq!(report.current_cycle_replication_checks, 6);
+        assert_eq!(report.current_cycle_usage_saves, 2);
 
         metrics.finish_scan_cycle_work(start);
         let report = metrics.report().await;
@@ -1031,8 +1311,78 @@ mod tests {
         assert_eq!(report.current_cycle_objects_scanned, 0);
         assert_eq!(report.current_cycle_directories_scanned, 0);
         assert_eq!(report.current_cycle_bucket_drive_scans, 0);
+        assert_eq!(report.current_cycle_bucket_drive_failures, 0);
+        assert_eq!(report.current_cycle_yield_events, 0);
+        assert_eq!(report.current_cycle_yield_duration_seconds, 0.0);
+        assert_eq!(report.current_cycle_ilm_actions, 0);
+        assert_eq!(report.current_cycle_heal_objects, 0);
+        assert_eq!(report.current_cycle_replication_checks, 0);
+        assert_eq!(report.current_cycle_usage_saves, 0);
         assert_eq!(report.last_cycle_objects_scanned, 7);
         assert_eq!(report.last_cycle_directories_scanned, 3);
         assert_eq!(report.last_cycle_bucket_drive_scans, 2);
+        assert_eq!(report.last_cycle_bucket_drive_failures, 3);
+        assert_eq!(report.last_cycle_yield_events, 1);
+        assert_eq!(report.last_cycle_yield_duration_seconds, 0.15);
+        assert_eq!(report.last_cycle_ilm_actions, 9);
+        assert_eq!(report.last_cycle_heal_objects, 3);
+        assert_eq!(report.last_cycle_replication_checks, 6);
+        assert_eq!(report.last_cycle_usage_saves, 2);
+    }
+
+    #[test]
+    fn record_scanner_yield_tracks_count_and_duration() {
+        let metrics = Metrics::new();
+
+        metrics.record_scanner_yield(Duration::from_millis(42));
+
+        assert_eq!(metrics.lifetime(Metric::Yield), 1);
+        assert_eq!(metrics.scanner_yield_duration_millis.load(Ordering::Relaxed), 42);
+        assert_eq!(metrics.last_minute(Metric::Yield).n, 1);
+    }
+
+    #[tokio::test]
+    async fn report_includes_scanner_throttle_config() {
+        let metrics = Metrics::new();
+
+        metrics.record_scanner_throttle_config(true, 2.5, Duration::from_millis(1500), 128);
+        let report = metrics.report().await;
+
+        assert!(report.throttle_idle_mode_enabled);
+        assert_eq!(report.throttle_sleep_factor, 2.5);
+        assert_eq!(report.throttle_max_sleep_seconds, 1.5);
+        assert_eq!(report.yield_every_n_objects, 128);
+    }
+
+    #[tokio::test]
+    async fn scanner_throttle_config_rejects_invalid_sleep_factor() {
+        let metrics = Metrics::new();
+
+        metrics.record_scanner_throttle_config(false, f64::NAN, Duration::ZERO, 0);
+        let report = metrics.report().await;
+
+        assert!(!report.throttle_idle_mode_enabled);
+        assert_eq!(report.throttle_sleep_factor, 0.0);
+        assert_eq!(report.throttle_max_sleep_seconds, 0.0);
+        assert_eq!(report.yield_every_n_objects, 0);
+    }
+
+    #[tokio::test]
+    async fn report_includes_scanner_cycle_config() {
+        let metrics = Metrics::new();
+
+        metrics.record_scanner_cycle_config(Duration::from_secs(3600), Some(Duration::from_secs(86400)));
+        let report = metrics.report().await;
+
+        assert_eq!(report.cycle_interval_seconds, 3600.0);
+        assert!(report.bitrot_cycle_enabled);
+        assert_eq!(report.bitrot_cycle_seconds, 86400.0);
+
+        metrics.record_scanner_cycle_config(Duration::from_secs(60), None);
+        let report = metrics.report().await;
+
+        assert_eq!(report.cycle_interval_seconds, 60.0);
+        assert!(!report.bitrot_cycle_enabled);
+        assert_eq!(report.bitrot_cycle_seconds, 0.0);
     }
 }

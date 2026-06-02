@@ -22,7 +22,7 @@ use futures::future::join_all;
 use metrics::counter;
 use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete};
+use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, global_metrics};
 use rustfs_config::{
     DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS,
     ENV_SCANNER_MAX_CONCURRENT_SET_SCANS,
@@ -113,6 +113,28 @@ impl Drop for DiskBucketScanActiveGuard {
             "set" => self.set.clone()
         )
         .set(active_count as f64);
+    }
+}
+
+struct BucketDriveFailureGuard {
+    failed: bool,
+}
+
+impl BucketDriveFailureGuard {
+    fn new() -> Self {
+        Self { failed: true }
+    }
+
+    fn mark_success(&mut self) {
+        self.failed = false;
+    }
+}
+
+impl Drop for BucketDriveFailureGuard {
+    fn drop(&mut self) {
+        if self.failed {
+            global_metrics().record_scan_bucket_drive_failure();
+        }
     }
 }
 
@@ -217,9 +239,11 @@ async fn persist_and_publish_cache_snapshot<S: StorageAPI>(
 ) -> Option<SystemTime> {
     let last_update = cache_snapshot.info.last_update;
 
+    let done_save = Metrics::time(Metric::SaveUsage);
     if let Err(e) = cache_snapshot.save(store, DATA_USAGE_CACHE_NAME).await {
         error!("Failed to save data usage cache: {}", e);
     }
+    done_save();
 
     if let Err(e) = updates.send(cache_snapshot).await {
         error!("Failed to send data usage cache: {}", e);
@@ -732,9 +756,12 @@ impl ScannerIOCache for SetDisks {
 
                             if let (Some(last_update), Some(before_update)) = (cache.info.last_update, before)
                                 && last_update > before_update
-                                && let Err(e) = cache.save(store_clone_clone.clone(), cache_name.as_str()).await
                             {
-                                error!("Failed to save data usage cache: {}", e);
+                                let done_save = Metrics::time(Metric::SaveUsage);
+                                if let Err(e) = cache.save(store_clone_clone.clone(), cache_name.as_str()).await {
+                                    error!("Failed to save data usage cache: {}", e);
+                                }
+                                done_save();
                             }
 
                             if let Err(e) = update_fut.await {
@@ -775,9 +802,11 @@ impl ScannerIOCache for SetDisks {
                         error!("nsscanner_disk: Failed to send data usage entry info: {}", e);
                     }
 
+                    let done_save = Metrics::time(Metric::SaveUsage);
                     if let Err(e) = cache.save(store_clone_clone.clone(), &cache_name).await {
                         error!("nsscanner_disk: Failed to save data usage cache: {}", e);
                     }
+                    done_save();
                 }
             }));
         }
@@ -900,6 +929,8 @@ impl ScannerIODisk for Disk {
         let drive_start = std::time::Instant::now();
         let bucket = cache.info.name.clone();
         let disk_path = self.path().to_string_lossy().to_string();
+        global_metrics().record_scan_bucket_drive_start();
+        let mut failure_guard = BucketDriveFailureGuard::new();
         let _guard = self.start_scan();
 
         let mut cache = cache;
@@ -966,9 +997,11 @@ impl ScannerIODisk for Disk {
                 done_drive();
                 emit_scan_bucket_drive_complete(true, &bucket, &disk_path, drive_start.elapsed());
                 data_usage_info.info.last_update = Some(SystemTime::now());
+                failure_guard.mark_success();
                 Ok(data_usage_info)
             }
             Err(e) => {
+                done_drive();
                 emit_scan_bucket_drive_complete(false, &bucket, &disk_path, drive_start.elapsed());
                 Err(StorageError::other(format!("Failed to scan data folder: {e}")))
             }
