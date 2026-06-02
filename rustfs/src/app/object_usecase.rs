@@ -141,10 +141,14 @@ fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i
 }
 
 fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
-    headers
-        .get("content-encoding")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case("aws-chunked")))
+    let has_aws_chunked = |header_name: &str| {
+        headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case("aws-chunked")))
+    };
+
+    has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
 }
 
 struct DeadlockRequestGuard {

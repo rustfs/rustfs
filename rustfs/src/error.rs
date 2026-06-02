@@ -185,6 +185,17 @@ fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
 where
     T: std::error::Error + 'static,
 {
+    if err.downcast_ref::<T>().is_some() {
+        return true;
+    }
+
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+        && let Some(inner) = io_err.get_ref()
+        && error_chain_has_type::<T>(inner)
+    {
+        return true;
+    }
+
     let mut current = Some(err);
     while let Some(err) = current {
         if err.downcast_ref::<T>().is_some() {
@@ -466,6 +477,19 @@ mod tests {
     fn test_api_error_from_unexpected_eof_maps_to_incomplete_body() {
         let io_error = IoError::new(ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining: 7 });
         let api_error: ApiError = io_error.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+        assert!(api_error.source.is_some());
+    }
+
+    #[test]
+    fn test_api_error_from_nested_unexpected_eof_maps_to_incomplete_body() {
+        let nested = IoError::new(
+            ErrorKind::UnexpectedEof,
+            IoError::new(ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining: 7 }),
+        );
+        let api_error: ApiError = nested.into();
 
         assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
         assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));

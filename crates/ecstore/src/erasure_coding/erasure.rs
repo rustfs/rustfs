@@ -583,8 +583,8 @@ impl Erasure {
         let mut total = 0;
         let mut buf = vec![0u8; block_size];
         loop {
-            match rustfs_utils::read_full(&mut *reader, &mut buf).await {
-                Ok(n) if n > 0 => {
+            match rustfs_utils::read_full_or_eof(&mut *reader, &mut buf).await {
+                Ok(Some(n)) if n > 0 => {
                     warn!("encode_stream_callback_async read n={}", n);
                     total += n;
                     let erasure = self.clone();
@@ -604,7 +604,7 @@ impl Erasure {
                     buf = returned_buf;
                     on_block(res).await?
                 }
-                Ok(_) => {
+                Ok(None) => {
                     warn!("encode_stream_callback_async read unexpected ok");
                     break;
                 }
@@ -612,6 +612,7 @@ impl Erasure {
                     warn!("encode_stream_callback_async read unexpected eof");
                     break;
                 }
+                Ok(Some(_)) => unreachable!("read_full_or_eof never returns Some(0)"),
                 Err(e) => {
                     warn!("encode_stream_callback_async read error={:?}", e);
                     on_block(Err(e)).await?;
