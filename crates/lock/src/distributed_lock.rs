@@ -56,6 +56,10 @@ fn is_remote_lock_rpc_failure(error: &str) -> bool {
         || has_case_insensitive_prefix(error, REMOTE_LOCK_RPC_TIMED_OUT_PREFIX)
 }
 
+fn is_remote_lock_rpc_timeout(error: &str) -> bool {
+    has_case_insensitive_prefix(error, REMOTE_LOCK_RPC_TIMED_OUT_PREFIX)
+}
+
 fn has_case_insensitive_prefix(error: &str, expected_prefix: &str) -> bool {
     error
         .get(0..expected_prefix.len())
@@ -361,12 +365,6 @@ impl DistributedLock {
         }
     }
 
-    fn is_retryable_lock_failure(resp: &LockResponse) -> bool {
-        resp.error
-            .as_deref()
-            .is_some_and(|error| matches!(classify_lock_failure(error), LockAcquireFailureKind::RetryableContention))
-    }
-
     async fn release_entries(entries: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
         let mut pending = entries;
 
@@ -505,7 +503,7 @@ impl DistributedLock {
             attempt_request.lock_id = LockId::new_unique(&request.resource);
 
             let result = self.acquire_lock_quorum_once(&attempt_request).await?;
-            if result.response.success || !Self::is_retryable_lock_failure(&result.response) {
+            if result.response.success || !matches!(result.failure_kind, Some(LockAcquireFailureKind::RetryableContention)) {
                 return Ok(result);
             }
 
@@ -554,7 +552,7 @@ impl DistributedLock {
                         }
                     } else {
                         let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
-                        if is_remote_lock_rpc_failure(&error) {
+                        if is_remote_lock_rpc_failure(&error) && !is_remote_lock_rpc_timeout(&error) {
                             hard_failures += 1;
                         }
                         self.log_failed_lock_response(request, idx, error.clone());
@@ -985,7 +983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_guard_returns_quorum_error_when_rpc_timeouts_make_quorum_impossible() {
+    async fn acquire_guard_retries_rpc_timeouts_until_caller_timeout() {
         let clients: Vec<Arc<dyn LockClient>> = vec![
             ResponseClient::new(LockResponse::failure(
                 "Remote lock RPC timed out: RPC timed out after 50ms",
@@ -1006,19 +1004,16 @@ mod tests {
         ];
         let lock = DistributedLock::new("test".to_string(), clients, 3);
         let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
-            .with_acquire_timeout(Duration::from_secs(1));
+            .with_acquire_timeout(Duration::from_millis(900));
 
+        let started = tokio::time::Instant::now();
         let result = lock.acquire_guard(&request).await;
+        let elapsed = started.elapsed();
 
+        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
         assert!(
-            matches!(
-                result,
-                Err(LockError::QuorumNotReached {
-                    required: 3,
-                    achieved: 0
-                })
-            ),
-            "unexpected result: {result:?}"
+            elapsed >= Duration::from_millis(250),
+            "remote RPC timeouts should be retried within the caller timeout, got {elapsed:?}"
         );
     }
 
@@ -1036,7 +1031,7 @@ mod tests {
         ];
         let lock = DistributedLock::new("test".to_string(), clients, 3);
         let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
-            .with_acquire_timeout(Duration::from_secs(2));
+            .with_acquire_timeout(Duration::from_millis(120));
 
         let started = tokio::time::Instant::now();
         let result = lock.acquire_guard(&request).await;
