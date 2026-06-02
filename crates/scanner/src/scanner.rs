@@ -835,7 +835,9 @@ mod tests {
         let parent = CancellationToken::new();
         let budget = ScannerCycleBudget::new(&parent, Some(Duration::from_millis(1)));
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_secs(5), budget.token().cancelled())
+            .await
+            .expect("scanner cycle budget should cancel after max duration");
 
         assert!(budget.budget_elapsed());
         assert!(budget.token().is_cancelled());
