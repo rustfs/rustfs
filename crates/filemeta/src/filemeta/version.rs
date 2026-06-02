@@ -2052,10 +2052,9 @@ impl MetaObject {
         let transitioned_objname = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
-        let transition_version_id =
-            get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
-                .and_then(|v| Uuid::from_slice(v.as_slice()).ok())
-                .filter(|u| !u.is_nil());
+        let transition_version_id = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
+            .and_then(|v| Uuid::from_slice(v.as_slice()).ok())
+            .filter(|u| !u.is_nil());
         let transition_tier = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
@@ -2360,10 +2359,9 @@ impl MetaDeleteMarker {
                 .map(|v| String::from_utf8_lossy(&v).to_string())
                 .unwrap_or_default();
 
-            fi.transition_version_id =
-                get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
-                    .and_then(|v| Uuid::from_slice(v.as_slice()).ok())
-                    .filter(|u| !u.is_nil());
+            fi.transition_version_id = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
+                .and_then(|v| Uuid::from_slice(v.as_slice()).ok())
+                .filter(|u| !u.is_nil());
         }
 
         fi
