@@ -30,8 +30,8 @@ use uuid::Uuid;
 
 const UNLOCK_RETRY_ATTEMPTS: usize = 3;
 const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
-const LOCK_ACQUIRE_RETRY_ATTEMPTS: usize = 3;
 const LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const LOCK_ACQUIRE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 const REMOTE_LOCK_RPC_FAILED_PREFIX: &str = "remote lock rpc failed:";
 const REMOTE_LOCK_RPC_TIMED_OUT_PREFIX: &str = "remote lock rpc timed out:";
 const UNRECOVERABLE_QUORUM_FAILURE_PREFIX: &str = "unrecoverable quorum failure";
@@ -353,6 +353,14 @@ impl DistributedLock {
         LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF * attempt as u32
     }
 
+    fn lock_acquire_attempt_timeout(&self, remaining: Duration) -> Duration {
+        if self.clients.len() <= 1 {
+            remaining
+        } else {
+            remaining.min(LOCK_ACQUIRE_ATTEMPT_TIMEOUT)
+        }
+    }
+
     fn is_retryable_lock_failure(resp: &LockResponse) -> bool {
         resp.error
             .as_deref()
@@ -493,15 +501,11 @@ impl DistributedLock {
 
             let remaining = request.acquire_timeout - elapsed;
             let mut attempt_request = request.clone();
-            attempt_request.acquire_timeout = remaining;
+            attempt_request.acquire_timeout = self.lock_acquire_attempt_timeout(remaining);
             attempt_request.lock_id = LockId::new_unique(&request.resource);
 
             let result = self.acquire_lock_quorum_once(&attempt_request).await?;
-            if result.response.success
-                || !result.individual_locks.is_empty()
-                || !Self::is_retryable_lock_failure(&result.response)
-                || attempt >= LOCK_ACQUIRE_RETRY_ATTEMPTS
-            {
+            if result.response.success || !Self::is_retryable_lock_failure(&result.response) {
                 return Ok(result);
             }
 
@@ -710,7 +714,7 @@ fn record_lock_held_release(lock_type: LockType) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DistributedLock, is_remote_lock_rpc_failure};
+    use super::{DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, is_remote_lock_rpc_failure};
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
     use std::{
         collections::{HashMap, VecDeque},
@@ -749,6 +753,61 @@ mod tests {
                 tokio::time::sleep(self.delay).await;
             }
             Ok(self.response.clone())
+        }
+
+        async fn release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        async fn force_release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> crate::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            true
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug)]
+    struct TimeoutRecordingClient {
+        seen_timeouts: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl TimeoutRecordingClient {
+        fn new(seen_timeouts: Arc<Mutex<Vec<Duration>>>) -> Self {
+            Self { seen_timeouts }
+        }
+
+        fn into_client(self) -> Arc<dyn LockClient> {
+            Arc::new(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for TimeoutRecordingClient {
+        async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+            self.seen_timeouts.lock().unwrap().push(request.acquire_timeout);
+            Ok(LockResponse::failure("Lock acquisition timeout", Duration::ZERO))
         }
 
         async fn release(&self, _lock_id: &LockId) -> crate::Result<bool> {
@@ -1026,6 +1085,95 @@ mod tests {
             elapsed >= Duration::from_millis(250),
             "expected at least one retry attempt for transient timeout, got {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_uses_bounded_distributed_attempt_timeout() {
+        let seen_timeouts = Arc::new(Mutex::new(Vec::new()));
+        let clients: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| TimeoutRecordingClient::new(seen_timeouts.clone()).into_client())
+            .collect();
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(1500));
+
+        let result = lock.acquire_guard(&request).await;
+
+        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        let seen_timeouts = seen_timeouts.lock().unwrap();
+        assert!(!seen_timeouts.is_empty(), "expected lock clients to observe acquire timeouts");
+        assert!(
+            seen_timeouts.iter().all(|timeout| *timeout <= LOCK_ACQUIRE_ATTEMPT_TIMEOUT),
+            "distributed attempts should be bounded by {LOCK_ACQUIRE_ATTEMPT_TIMEOUT:?}, saw {seen_timeouts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_retries_partial_quorum_after_rollback() {
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            Arc::new(SequencedClient::new(
+                vec![
+                    AcquirePlan::Success { delay: Duration::ZERO },
+                    AcquirePlan::Success { delay: Duration::ZERO },
+                ],
+                seen_ids.clone(),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![
+                    AcquirePlan::Failure {
+                        error: "Lock acquisition timeout",
+                        delay: Duration::ZERO,
+                    },
+                    AcquirePlan::Success { delay: Duration::ZERO },
+                ],
+                seen_ids.clone(),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![
+                    AcquirePlan::Failure {
+                        error: "Lock acquisition timeout",
+                        delay: Duration::ZERO,
+                    },
+                    AcquirePlan::Success { delay: Duration::ZERO },
+                ],
+                seen_ids.clone(),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![
+                    AcquirePlan::Failure {
+                        error: "Lock acquisition timeout",
+                        delay: Duration::ZERO,
+                    },
+                    AcquirePlan::Success { delay: Duration::ZERO },
+                ],
+                seen_ids.clone(),
+            )),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(2));
+
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("partial quorum retry should not fail")
+            .expect("second attempt should reach quorum");
+
+        let unique_id_count = seen_ids
+            .lock()
+            .unwrap()
+            .iter()
+            .fold(Vec::<String>::new(), |mut uuids, lock_id| {
+                if !uuids.iter().any(|uuid| uuid == &lock_id.uuid) {
+                    uuids.push(lock_id.uuid.clone());
+                }
+                uuids
+            })
+            .len();
+
+        assert!(unique_id_count >= 2, "partial quorum should retry with a fresh lock id");
+        drop(guard);
     }
 
     #[tokio::test]
