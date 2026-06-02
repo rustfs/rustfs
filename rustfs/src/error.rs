@@ -181,6 +181,20 @@ impl ApiError {
     }
 }
 
+fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
+where
+    T: std::error::Error + 'static,
+{
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if err.downcast_ref::<T>().is_some() {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
         let mut s3e = S3Error::with_message(err.code, err.message);
@@ -260,17 +274,18 @@ impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
         // Check if the error is a ChecksumMismatch (BadDigest)
         if let Some(inner) = err.get_ref() {
-            if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some() {
+            if error_chain_has_type::<rustfs_rio::ChecksumMismatch>(inner) || error_chain_has_type::<rustfs_rio::BadDigest>(inner)
+            {
                 return ApiError {
                     code: S3ErrorCode::BadDigest,
                     message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
                     source: Some(Box::new(err)),
                 };
             }
-            if inner.downcast_ref::<rustfs_rio::BadDigest>().is_some() {
+            if error_chain_has_type::<rustfs_rio::IncompleteBody>(inner) {
                 return ApiError {
-                    code: S3ErrorCode::BadDigest,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                    code: S3ErrorCode::IncompleteBody,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
                     source: Some(Box::new(err)),
                 };
             }
@@ -445,6 +460,16 @@ mod tests {
             assert_eq!(api_error.code, expected_code);
             assert!(api_error.source.is_some());
         }
+    }
+
+    #[test]
+    fn test_api_error_from_unexpected_eof_maps_to_incomplete_body() {
+        let io_error = IoError::new(ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining: 7 });
+        let api_error: ApiError = io_error.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+        assert!(api_error.source.is_some());
     }
 
     #[test]

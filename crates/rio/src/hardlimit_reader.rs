@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::IncompleteBody;
 use pin_project_lite::pin_project;
 use std::io::{Error, Result};
 use std::pin::Pin;
@@ -40,6 +41,9 @@ where
         if self.remaining < 0 {
             return Poll::Ready(Err(Error::other("input provided more bytes than specified")));
         }
+        if self.remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
         // Save the initial length
         let before = buf.filled().len();
 
@@ -50,6 +54,14 @@ where
         if let Poll::Ready(Ok(())) = &poll {
             let after = buf.filled().len();
             let read = (after - before) as i64;
+            if read == 0 && *this.remaining > 0 {
+                return Poll::Ready(Err(Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    IncompleteBody {
+                        remaining: *this.remaining,
+                    },
+                )));
+            }
             *this.remaining -= read;
             if *this.remaining < 0 {
                 return Poll::Ready(Err(Error::other("input provided more bytes than specified")));
@@ -73,7 +85,7 @@ mod tests {
     async fn test_hardlimit_reader_normal() {
         let data = b"hello world";
         let reader = BufReader::new(&data[..]);
-        let hardlimit = HardLimitReader::new(reader, 20);
+        let hardlimit = HardLimitReader::new(reader, data.len() as i64);
         let mut r = hardlimit;
         let mut buf = Vec::new();
         let n = r.read_to_end(&mut buf).await.unwrap();
@@ -121,11 +133,33 @@ mod tests {
     async fn test_hardlimit_reader_empty() {
         let data = b"";
         let reader = BufReader::new(&data[..]);
-        let hardlimit = HardLimitReader::new(reader, 5);
+        let hardlimit = HardLimitReader::new(reader, 0);
         let mut r = hardlimit;
         let mut buf = Vec::new();
         let n = r.read_to_end(&mut buf).await.unwrap();
         assert_eq!(n, 0);
         assert_eq!(&buf, data);
+    }
+
+    #[tokio::test]
+    async fn test_hardlimit_reader_short_input_returns_unexpected_eof() {
+        let data = b"abc";
+        let reader = BufReader::new(&data[..]);
+        let mut r = HardLimitReader::new(reader, 5);
+        let mut buf = [0u8; 8];
+
+        let err = read_full(&mut r, &mut buf)
+            .await
+            .expect_err("short input must surface unexpected eof");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.get_ref()
+                .and_then(|inner| inner.downcast_ref::<std::io::Error>())
+                .and_then(|inner| inner.get_ref())
+                .and_then(|inner| inner.downcast_ref::<IncompleteBody>())
+                .is_some(),
+            "error should retain the incomplete body marker"
+        );
     }
 }
