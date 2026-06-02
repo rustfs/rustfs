@@ -84,6 +84,17 @@ fn classify_lock_failure(error: &str) -> LockAcquireFailureKind {
     LockAcquireFailureKind::NonRetryable
 }
 
+fn should_warn_lock_failure(error: &str) -> bool {
+    if is_remote_lock_rpc_failure(error) {
+        return !is_remote_lock_rpc_timeout(error);
+    }
+
+    matches!(
+        classify_lock_failure(error),
+        LockAcquireFailureKind::NonRetryable | LockAcquireFailureKind::UnrecoverableQuorum
+    )
+}
+
 /// A RAII guard for distributed locks that releases the lock asynchronously when dropped.
 #[derive(Debug)]
 pub struct DistributedLockGuard {
@@ -467,7 +478,7 @@ impl DistributedLock {
     }
 
     fn log_failed_lock_response(&self, request: &LockRequest, idx: usize, error: String) {
-        if request.suppress_contention_logs {
+        if request.suppress_contention_logs || !should_warn_lock_failure(&error) {
             tracing::debug!(
                 resource = %request.resource,
                 owner = %request.owner,
@@ -712,7 +723,7 @@ fn record_lock_held_release(lock_type: LockType) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, is_remote_lock_rpc_failure};
+    use super::{DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, is_remote_lock_rpc_failure, should_warn_lock_failure};
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
     use std::{
         collections::{HashMap, VecDeque},
@@ -949,6 +960,15 @@ mod tests {
         assert!(is_remote_lock_rpc_failure("Remote lock RPC timed out: RPC timed out after 50ms"));
         assert!(!is_remote_lock_rpc_failure("Lock is already held"));
         assert!(!is_remote_lock_rpc_failure("acquired lock failed for other reason"));
+    }
+
+    #[test]
+    fn test_should_warn_lock_failure() {
+        assert!(should_warn_lock_failure("Remote lock RPC failed: backend unreachable"));
+        assert!(should_warn_lock_failure("permission denied"));
+        assert!(should_warn_lock_failure("Unrecoverable quorum failure: 1/3 required"));
+        assert!(!should_warn_lock_failure("Remote lock RPC timed out: RPC timed out after 50ms"));
+        assert!(!should_warn_lock_failure("Lock acquisition timeout"));
     }
 
     #[tokio::test]
