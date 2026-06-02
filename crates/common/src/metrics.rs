@@ -381,6 +381,7 @@ pub struct Metrics {
     failed_scan_cycles: AtomicU64,
     scanner_yield_duration_millis: AtomicU64,
     scanner_throttle_sleep_duration_millis: AtomicU64,
+    scanner_ilm_actions: AtomicU64,
     scanner_throttle_idle_mode_enabled: AtomicBool,
     scanner_throttle_sleep_factor_micros: AtomicU64,
     scanner_throttle_max_sleep_millis: AtomicU64,
@@ -673,6 +674,7 @@ impl Metrics {
             failed_scan_cycles: AtomicU64::new(0),
             scanner_yield_duration_millis: AtomicU64::new(0),
             scanner_throttle_sleep_duration_millis: AtomicU64::new(0),
+            scanner_ilm_actions: AtomicU64::new(0),
             scanner_throttle_idle_mode_enabled: AtomicBool::new(false),
             scanner_throttle_sleep_factor_micros: AtomicU64::new(0),
             scanner_throttle_max_sleep_millis: AtomicU64::new(0),
@@ -812,6 +814,10 @@ impl Metrics {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(duration_millis))
             });
+    }
+
+    pub fn record_scanner_ilm_action(&self, count: u64) {
+        self.scanner_ilm_actions.fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_scan_bucket_drive_start(&self) {
@@ -966,7 +972,7 @@ impl Metrics {
             yield_duration_millis: self.scanner_yield_duration_millis.load(Ordering::Relaxed),
             throttle_sleep_events: self.lifetime(Metric::ThrottleSleep),
             throttle_sleep_duration_millis: self.scanner_throttle_sleep_duration_millis.load(Ordering::Relaxed),
-            ilm_actions: self.lifetime(Metric::Ilm),
+            ilm_actions: self.scanner_ilm_actions.load(Ordering::Relaxed),
             heal_objects: self.lifetime(Metric::HealAbandonedObject),
             replication_checks: self.lifetime(Metric::CheckReplication),
             usage_saves: self.lifetime(Metric::SaveUsage),
@@ -1399,6 +1405,7 @@ mod tests {
         metrics.operations[Metric::Yield as usize].store(2, Ordering::Relaxed);
         metrics.operations[Metric::ThrottleSleep as usize].store(3, Ordering::Relaxed);
         metrics.operations[Metric::Ilm as usize].store(6, Ordering::Relaxed);
+        metrics.record_scanner_ilm_action(6);
         metrics.operations[Metric::HealAbandonedObject as usize].store(4, Ordering::Relaxed);
         metrics.operations[Metric::CheckReplication as usize].store(5, Ordering::Relaxed);
         metrics.operations[Metric::SaveUsage as usize].store(3, Ordering::Relaxed);
@@ -1411,6 +1418,7 @@ mod tests {
         metrics.operations[Metric::ScanBucketDrive as usize].store(3, Ordering::Relaxed);
         metrics.operations[Metric::ScanBucketDriveFailure as usize].store(4, Ordering::Relaxed);
         metrics.operations[Metric::Ilm as usize].store(15, Ordering::Relaxed);
+        metrics.record_scanner_ilm_action(9);
         metrics.operations[Metric::HealAbandonedObject as usize].store(7, Ordering::Relaxed);
         metrics.operations[Metric::CheckReplication as usize].store(11, Ordering::Relaxed);
         metrics.operations[Metric::SaveUsage as usize].store(5, Ordering::Relaxed);
@@ -1459,6 +1467,29 @@ mod tests {
         assert_eq!(report.last_cycle_heal_objects, 3);
         assert_eq!(report.last_cycle_replication_checks, 6);
         assert_eq!(report.last_cycle_usage_saves, 2);
+    }
+
+    #[tokio::test]
+    async fn scanner_cycle_ilm_actions_ignore_global_ilm_work() {
+        let metrics = Metrics::new();
+        metrics.operations[Metric::Ilm as usize].store(4, Ordering::Relaxed);
+
+        let start = metrics.start_scan_cycle_work();
+        metrics.operations[Metric::Ilm as usize].store(11, Ordering::Relaxed);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.current_cycle_ilm_actions, 0);
+
+        metrics.record_scanner_ilm_action(3);
+        let report = metrics.report().await;
+
+        assert_eq!(report.current_cycle_ilm_actions, 3);
+
+        metrics.finish_scan_cycle_work(start);
+        let report = metrics.report().await;
+
+        assert_eq!(report.last_cycle_ilm_actions, 3);
     }
 
     #[test]

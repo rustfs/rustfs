@@ -478,6 +478,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
                         done_ilm(1)();
+                        global_metrics().record_scanner_ilm_action(1);
                         break 'eventLoop;
                     }
 
@@ -490,6 +491,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
                         done_ilm(1)();
+                        global_metrics().record_scanner_ilm_action(1);
                     }
                     IlmAction::DeleteVersionAction => {
                         remaining_versions -= 1;
@@ -503,11 +505,13 @@ impl ScannerItem {
                         }
                         noncurrent_events.push(event.clone());
                         done_ilm(1)();
+                        global_metrics().record_scanner_ilm_action(1);
                     }
                     IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                         debug!("apply_actions: applying transition rule for object: {} {}", oi.name, event.action);
                         apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
                         done_ilm(1)();
+                        global_metrics().record_scanner_ilm_action(1);
                     }
 
                     IlmAction::NoneAction | IlmAction::ActionCount => {
