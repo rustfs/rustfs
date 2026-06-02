@@ -209,6 +209,13 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
+        if self.block_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "erasure block_size must be non-zero",
+            ));
+        }
+
         // Bound queued encoded blocks by memory budget to avoid per-request spikes.
         let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
         let max_inflight_bytes = rustfs_utils::get_env_usize(
@@ -223,8 +230,9 @@ impl Erasure {
             let mut total = 0;
             let mut buf = vec![0u8; block_size];
             loop {
-                match rustfs_utils::read_full(&mut reader, &mut buf).await {
-                    Ok(n) if n > 0 => {
+                match rustfs_utils::read_full_or_eof(&mut reader, &mut buf).await {
+                    Ok(Some(n)) => {
+                        debug_assert!(n > 0, "non-zero block_size prevents zero-length reads");
                         total += n;
                         let erasure = self.clone();
                         let encode_buf = std::mem::take(&mut buf);
@@ -243,7 +251,7 @@ impl Erasure {
                             return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                         }
                     }
-                    Ok(_) => {
+                    Ok(None) => {
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -253,7 +261,7 @@ impl Erasure {
                         {
                             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
                         }
-                        break;
+                        return Err(e);
                     }
                     Err(e) => {
                         return Err(e);
@@ -327,7 +335,9 @@ impl Erasure {
 mod tests {
     use super::*;
     use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
+    use rustfs_rio::HardLimitReader;
     use rustfs_utils::HashAlgorithm;
+    use std::io::Cursor;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -382,6 +392,48 @@ mod tests {
 
         assert_eq!(written, b"small payload".len());
         assert!(!committed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn encode_returns_unexpected_eof_for_truncated_limited_reader() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let writer = DeferredCommitWriter::new(committed);
+        let mut writers = vec![Some(BitrotWriterWrapper::new(
+            CustomWriter::new_tokio_writer(writer),
+            16,
+            HashAlgorithm::HighwayHash256S,
+        ))];
+
+        let erasure = Arc::new(Erasure::new(1, 0, 16));
+        let truncated = HardLimitReader::new(Cursor::new(b"short".to_vec()), 10);
+
+        let err = match erasure.encode(truncated, &mut writers, 1).await {
+            Ok(_) => panic!("truncated input must fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn encode_rejects_zero_block_size() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let writer = DeferredCommitWriter::new(committed);
+        let mut writers = vec![Some(BitrotWriterWrapper::new(
+            CustomWriter::new_tokio_writer(writer),
+            16,
+            HashAlgorithm::HighwayHash256S,
+        ))];
+
+        let erasure = Arc::new(Erasure::new(1, 0, 0));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(b"payload".to_vec()));
+        let err = erasure
+            .encode(reader, &mut writers, 1)
+            .await
+            .expect_err("zero block size must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("block_size"));
     }
 
     /// encode_inline_small: empty reader returns (reader, 0) without writing to any shard.
