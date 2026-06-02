@@ -19,6 +19,23 @@ use std::{fmt::Display, path::Path};
 use tracing::debug;
 use url::{ParseError, Url};
 
+#[cfg(windows)]
+pub(crate) fn windows_fallback_local_path(
+    path: &str,
+    canonicalize_error: &std::io::Error,
+    context: &'static str,
+) -> std::io::Result<std::path::PathBuf> {
+    let absolute = Path::new(path).absolutize()?.to_path_buf();
+    tracing::warn!(
+        path = %path,
+        canonicalize_error = %canonicalize_error,
+        resolved = ?absolute,
+        context = context,
+        "using windows fallback path resolution for local endpoint"
+    );
+    Ok(absolute)
+}
+
 /// enum for endpoint type.
 #[derive(PartialEq, Eq, Debug)]
 pub enum EndpointType {
