@@ -535,6 +535,14 @@ impl DistributedLock {
         }))
     }
 
+    fn lock_acquire_timeout_result(timeout: Duration) -> LockAcquireQuorumResult {
+        LockAcquireQuorumResult {
+            response: LockResponse::failure("Lock acquisition timeout", timeout),
+            individual_locks: Vec::new(),
+            failure_kind: Some(LockAcquireFailureKind::RetryableContention),
+        }
+    }
+
     /// Quorum-based lock acquisition: success if at least the required quorum succeeds.
     /// Collects all individual lock_ids from successful clients and creates an aggregate lock_id.
     /// Returns the LockResponse with aggregate lock_id and individual lock mappings.
@@ -545,8 +553,36 @@ impl DistributedLock {
         let fallback_lock_id = request.lock_id.clone();
         let mut last_failure = None;
         let mut hard_failures = 0usize;
+        let deadline = tokio::time::Instant::now() + request.acquire_timeout;
 
-        while let Some(join_result) = pending.join_next().await {
+        while !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_attempt_timeout");
+                Self::spawn_pending_cleanup(
+                    pending,
+                    self.clients.clone(),
+                    fallback_lock_id.clone(),
+                    "distributed_lock_attempt_timeout_cleanup",
+                );
+                return Ok(Self::lock_acquire_timeout_result(request.acquire_timeout));
+            }
+
+            let join_result = match tokio::time::timeout(remaining, pending.join_next()).await {
+                Ok(Some(join_result)) => join_result,
+                Ok(None) => break,
+                Err(_) => {
+                    Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_attempt_timeout");
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_attempt_timeout_cleanup",
+                    );
+                    return Ok(Self::lock_acquire_timeout_result(request.acquire_timeout));
+                }
+            };
+
             match join_result {
                 Ok((idx, Ok(resp))) => {
                     if resp.success {
@@ -1121,6 +1157,24 @@ mod tests {
             seen_timeouts.iter().all(|timeout| *timeout <= LOCK_ACQUIRE_ATTEMPT_TIMEOUT),
             "distributed attempts should be bounded by {LOCK_ACQUIRE_ATTEMPT_TIMEOUT:?}, saw {seen_timeouts:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_enforces_attempt_timeout_when_clients_ignore_budget() {
+        let clients: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| {
+                ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                    .with_delay(Duration::from_secs(5))
+                    .into_client()
+            })
+            .collect();
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(200));
+
+        let result = tokio::time::timeout(Duration::from_millis(800), lock.acquire_guard(&request)).await;
+
+        assert!(matches!(result, Ok(Ok(None))), "unexpected result: {result:?}");
     }
 
     #[tokio::test]
