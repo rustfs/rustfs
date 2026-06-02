@@ -543,6 +543,36 @@ impl DistributedLock {
         }
     }
 
+    fn lock_acquire_attempt_timeout_result(
+        timeout: Duration,
+        individual_locks: Vec<(LockId, Arc<dyn LockClient>)>,
+        hard_failures: usize,
+        last_failure: Option<String>,
+    ) -> LockAcquireQuorumResult {
+        let last_failure_kind = last_failure.as_deref().map(classify_lock_failure);
+        let failure_kind = if hard_failures > 0 {
+            LockAcquireFailureKind::UnrecoverableQuorum
+        } else if let Some(kind @ (LockAcquireFailureKind::NonRetryable | LockAcquireFailureKind::UnrecoverableQuorum)) =
+            last_failure_kind
+        {
+            kind
+        } else {
+            return Self::lock_acquire_timeout_result(timeout);
+        };
+
+        let mut error = "Lock acquisition timeout".to_string();
+        if let Some(last_failure) = last_failure {
+            error.push_str("; last failure: ");
+            error.push_str(&last_failure);
+        }
+
+        LockAcquireQuorumResult {
+            response: LockResponse::failure(error, timeout),
+            individual_locks,
+            failure_kind: Some(failure_kind),
+        }
+    }
+
     /// Quorum-based lock acquisition: success if at least the required quorum succeeds.
     /// Collects all individual lock_ids from successful clients and creates an aggregate lock_id.
     /// Returns the LockResponse with aggregate lock_id and individual lock mappings.
@@ -565,7 +595,12 @@ impl DistributedLock {
                     fallback_lock_id.clone(),
                     "distributed_lock_attempt_timeout_cleanup",
                 );
-                return Ok(Self::lock_acquire_timeout_result(request.acquire_timeout));
+                return Ok(Self::lock_acquire_attempt_timeout_result(
+                    request.acquire_timeout,
+                    individual_locks,
+                    hard_failures,
+                    last_failure,
+                ));
             }
 
             let join_result = match tokio::time::timeout(remaining, pending.join_next()).await {
@@ -579,7 +614,12 @@ impl DistributedLock {
                         fallback_lock_id.clone(),
                         "distributed_lock_attempt_timeout_cleanup",
                     );
-                    return Ok(Self::lock_acquire_timeout_result(request.acquire_timeout));
+                    return Ok(Self::lock_acquire_attempt_timeout_result(
+                        request.acquire_timeout,
+                        individual_locks,
+                        hard_failures,
+                        last_failure,
+                    ));
                 }
             };
 
@@ -759,7 +799,10 @@ fn record_lock_held_release(lock_type: LockType) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, is_remote_lock_rpc_failure, should_warn_lock_failure};
+    use super::{
+        DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, LockAcquireFailureKind, is_remote_lock_rpc_failure,
+        should_warn_lock_failure,
+    };
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
     use std::{
         collections::{HashMap, VecDeque},
@@ -1096,6 +1139,35 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "acquire should fail this attempt before waiting for delayed impossible-quorum tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_quorum_timeout_preserves_non_retryable_failure() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            ResponseClient::new(LockResponse::failure("permission denied", Duration::ZERO)).into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_secs(1))
+                .into_client(),
+            ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO))
+                .with_delay(Duration::from_secs(1))
+                .into_client(),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 2);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(120));
+
+        let result = lock.acquire_lock_quorum_with_retry(&request).await.unwrap();
+
+        assert!(matches!(result.failure_kind, Some(LockAcquireFailureKind::NonRetryable)));
+        assert!(
+            result
+                .response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("permission denied")),
+            "unexpected response: {:?}",
+            result.response
         );
     }
 
