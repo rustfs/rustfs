@@ -73,7 +73,7 @@ jobs:
   # Build strategy check - determine build type based on trigger
   build-check:
     name: Build Strategy Check
-    runs-on: rustfs
+    runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       build_type: ${{ steps.check.outputs.build_type }}
@@ -146,7 +146,7 @@ jobs:
   # Build RustFS binaries
   prepare-platform-matrix:
     name: Prepare Platform Matrix
-    runs-on: rustfs
+    runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       selected: ${{ steps.select.outputs.selected }}
@@ -549,7 +549,7 @@ jobs:
     name: Build Summary
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: rustfs
+    runs-on: ubuntu-latest
     steps:
       - name: Build completion summary
         shell: bash
@@ -601,7 +601,7 @@ jobs:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: rustfs
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
@@ -687,7 +687,7 @@ jobs:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: rustfs
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: read
@@ -768,7 +768,7 @@ jobs:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: rustfs
+    runs-on: ubuntu-latest
     steps:
       - name: Update latest.json
         env:
@@ -793,9 +793,10 @@ jobs:
 
           curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
           unzip "$OSSUTIL_ZIP"
-          mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
+          OSSUTIL_BIN="${RUNNER_TEMP}/ossutil"
+          mv "${OSSUTIL_DIR}/ossutil" "$OSSUTIL_BIN"
           rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-          chmod +x /usr/local/bin/ossutil
+          chmod +x "$OSSUTIL_BIN"
 
           # Create latest.json
           cat > latest.json << EOF
@@ -809,7 +810,7 @@ jobs:
           EOF
 
           # Upload to OSS
-          ossutil cp latest.json oss://rustfs-version/latest.json --force
+          "$OSSUTIL_BIN" cp latest.json oss://rustfs-version/latest.json --force
 
           echo "✅ Updated latest.json for stable release $VERSION"
 
@@ -818,7 +819,7 @@ jobs:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: rustfs
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
