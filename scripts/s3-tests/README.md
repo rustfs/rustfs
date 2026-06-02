@@ -335,17 +335,17 @@ The test script automatically cleans up processes and containers when it exits. 
 A dedicated cleanup script is available to clean up test resources:
 
 ```bash
-# Clean up port 9000 and test data directory
+# Report port 9000 usage and clean the test data directory
 ./scripts/s3-tests/cleanup.sh
 
-# Use custom port and host
-S3_PORT=9001 S3_HOST=127.0.0.1 ./scripts/s3-tests/cleanup.sh
+# Use custom port
+S3_PORT=9001 ./scripts/s3-tests/cleanup.sh
 ```
 
 The cleanup script will:
-- Kill any process using the specified port (default: 9000)
+- Report any process using the specified port (default: 9000)
 - Clean test data directory at `target/test-data/rustfs-single/`
-- Verify port is released
+- Leave unrelated processes running
 
 ### Manual Cleanup
 
