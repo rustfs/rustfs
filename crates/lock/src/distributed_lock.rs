@@ -553,10 +553,10 @@ impl DistributedLock {
         let fallback_lock_id = request.lock_id.clone();
         let mut last_failure = None;
         let mut hard_failures = 0usize;
-        let deadline = tokio::time::Instant::now() + request.acquire_timeout;
+        let start = tokio::time::Instant::now();
 
         while !pending.is_empty() {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = request.acquire_timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 Self::spawn_release_cleanup(individual_locks.clone(), "distributed_lock_attempt_timeout");
                 Self::spawn_pending_cleanup(

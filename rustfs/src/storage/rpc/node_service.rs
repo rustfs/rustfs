@@ -2574,6 +2574,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated global object layer state"]
+    #[serial_test::serial]
     async fn test_signal_service_refresh_config_requires_object_layer() {
         let service = create_test_node_service();
 
@@ -2595,6 +2596,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated global object layer state"]
+    #[serial_test::serial]
     async fn test_signal_service_reload_dynamic_requires_object_layer() {
         let service = create_test_node_service();
 
