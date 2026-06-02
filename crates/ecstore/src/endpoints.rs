@@ -683,7 +683,8 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
     }
 
     let mut device_paths = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut missing_paths: Vec<String> = Vec::new();
+    #[cfg(not(windows))]
+    let mut missing_paths = Vec::new();
 
     for path in &local_paths {
         let canonical = match rustfs_utils::canonicalize(path) {
@@ -739,6 +740,7 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
         }
     }
 
+    #[cfg(not(windows))]
     if !missing_paths.is_empty() {
         warn!(
             missing_paths = ?missing_paths,

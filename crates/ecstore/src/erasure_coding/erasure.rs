@@ -579,12 +579,22 @@ impl Erasure {
         F: FnMut(std::io::Result<Vec<Bytes>>) -> Fut + Send,
         Fut: std::future::Future<Output = Result<(), E>> + Send,
     {
+        if self.block_size == 0 {
+            on_block(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "erasure block_size must be non-zero",
+            )))
+            .await?;
+            return Ok(0);
+        }
+
         let block_size = self.block_size;
         let mut total = 0;
         let mut buf = vec![0u8; block_size];
         loop {
-            match rustfs_utils::read_full(&mut *reader, &mut buf).await {
-                Ok(n) if n > 0 => {
+            match rustfs_utils::read_full_or_eof(&mut *reader, &mut buf).await {
+                Ok(Some(n)) => {
+                    debug_assert!(n > 0, "non-zero block_size prevents zero-length reads");
                     warn!("encode_stream_callback_async read n={}", n);
                     total += n;
                     let erasure = self.clone();
@@ -604,7 +614,7 @@ impl Erasure {
                     buf = returned_buf;
                     on_block(res).await?
                 }
-                Ok(_) => {
+                Ok(None) => {
                     warn!("encode_stream_callback_async read unexpected ok");
                     break;
                 }
@@ -1030,6 +1040,35 @@ mod tests {
         }
         recovered.truncate(data_clone.len());
         assert_eq!(&recovered, &data_clone);
+    }
+
+    #[tokio::test]
+    async fn test_encode_stream_callback_async_reports_zero_block_size() {
+        use std::io::Cursor;
+        use std::sync::{Arc, Mutex};
+
+        let erasure = Arc::new(Erasure::new(1, 0, 0));
+        let mut reader = Cursor::new(b"payload".to_vec());
+        let observed = Arc::new(Mutex::new(None));
+        let observed_clone = observed.clone();
+
+        let total = erasure
+            .encode_stream_callback_async::<_, _, (), _>(&mut reader, move |res| {
+                let observed = observed_clone.clone();
+                async move {
+                    let err = res.expect_err("zero block size should report an error");
+                    *observed.lock().unwrap() = Some((err.kind(), err.to_string()));
+                    Ok(())
+                }
+            })
+            .await
+            .expect("callback should handle the zero block size error");
+
+        assert_eq!(total, 0);
+        let observed = observed.lock().unwrap();
+        let (kind, message) = observed.as_ref().expect("callback should be invoked once");
+        assert_eq!(*kind, std::io::ErrorKind::InvalidInput);
+        assert!(message.contains("block_size"));
     }
 
     // SIMD mode specific tests

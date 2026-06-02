@@ -16,19 +16,19 @@ use std::collections::HashSet;
 use std::fs::FileType;
 use std::io::ErrorKind;
 use std::sync::{Arc, Once};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary, hash_path};
 use crate::error::ScannerError;
 use crate::scanner_io::ScannerIODisk as _;
-use crate::sleeper::DynamicSleeper;
+use crate::sleeper::{DynamicSleeper, scanner_yield_every_n_objects};
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode,
     send_heal_request_with_admission,
 };
-use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater};
+use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater, global_metrics};
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_expiry_rule};
 use rustfs_ecstore::bucket::lifecycle::evaluator::Evaluator;
@@ -140,13 +140,6 @@ fn scanner_excess_folders_threshold() -> u64 {
     rustfs_utils::get_env_u64(
         rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS,
         rustfs_config::DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS,
-    )
-}
-
-fn scanner_yield_every_n_objects() -> u64 {
-    rustfs_utils::get_env_u64(
-        rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS,
-        rustfs_config::DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS,
     )
 }
 
@@ -485,6 +478,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
                         done_ilm(1)();
+                        global_metrics().record_scanner_ilm_action(1);
                         break 'eventLoop;
                     }
 
@@ -497,6 +491,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
                         done_ilm(1)();
+                        global_metrics().record_scanner_ilm_action(1);
                     }
                     IlmAction::DeleteVersionAction => {
                         remaining_versions -= 1;
@@ -510,11 +505,13 @@ impl ScannerItem {
                         }
                         noncurrent_events.push(event.clone());
                         done_ilm(1)();
+                        global_metrics().record_scanner_ilm_action(1);
                     }
                     IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                         debug!("apply_actions: applying transition rule for object: {} {}", oi.name, event.action);
                         apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
                         done_ilm(1)();
+                        global_metrics().record_scanner_ilm_action(1);
                     }
 
                     IlmAction::NoneAction | IlmAction::ActionCount => {
@@ -560,7 +557,9 @@ impl ScannerItem {
             return;
         };
 
+        let done_replication = Metrics::time(Metric::CheckReplication);
         let roi = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
+        done_replication();
         if !Self::should_account_replication_stats(oi) {
             return;
         }
@@ -1110,7 +1109,9 @@ impl FolderScanner {
                 timer.sleep().await;
 
                 if should_yield_after_object(object_count, yield_every_objects) {
+                    let yield_start = Instant::now();
                     tokio::task::yield_now().await;
+                    global_metrics().record_scanner_yield(yield_start.elapsed());
                 }
             }
 

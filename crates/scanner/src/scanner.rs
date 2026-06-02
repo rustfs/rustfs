@@ -266,8 +266,13 @@ fn bitrot_scan_cycle() -> Option<Duration> {
     }
 }
 
-fn get_cycle_scan_mode(current_cycle: u64, bitrot_start_cycle: u64, bitrot_start_time: Option<DateTime<Utc>>) -> HealScanMode {
-    let Some(bitrot_cycle) = bitrot_scan_cycle() else {
+fn get_cycle_scan_mode(
+    current_cycle: u64,
+    bitrot_start_cycle: u64,
+    bitrot_start_time: Option<DateTime<Utc>>,
+    bitrot_cycle: Option<Duration>,
+) -> HealScanMode {
+    let Some(bitrot_cycle) = bitrot_cycle else {
         return HealScanMode::Normal;
     };
 
@@ -299,8 +304,10 @@ fn background_heal_info_for_scan_start(
     current_cycle: u64,
     scan_mode: HealScanMode,
     now: DateTime<Utc>,
+    bitrot_cycle: Option<Duration>,
 ) -> Option<BackgroundHealInfo> {
-    let reset_bitrot_start = scan_mode == HealScanMode::Deep && should_reset_bitrot_start(&info, current_cycle, now);
+    let reset_bitrot_start =
+        scan_mode == HealScanMode::Deep && should_reset_bitrot_start(&info, current_cycle, now, bitrot_cycle);
     if info.current_scan_mode == scan_mode && !reset_bitrot_start {
         return None;
     }
@@ -314,12 +321,17 @@ fn background_heal_info_for_scan_start(
     Some(info)
 }
 
-fn should_reset_bitrot_start(info: &BackgroundHealInfo, current_cycle: u64, now: DateTime<Utc>) -> bool {
+fn should_reset_bitrot_start(
+    info: &BackgroundHealInfo,
+    current_cycle: u64,
+    now: DateTime<Utc>,
+    bitrot_cycle: Option<Duration>,
+) -> bool {
     let Some(bitrot_start_time) = info.bitrot_start_time else {
         return true;
     };
 
-    let Some(bitrot_cycle) = bitrot_scan_cycle() else {
+    let Some(bitrot_cycle) = bitrot_cycle else {
         return false;
     };
 
@@ -424,6 +436,9 @@ fn get_lock_acquire_timeout() -> Duration {
 async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
     let _activity_guard = ScannerActivityGuard::new();
     SCANNER_SLEEPER.refresh_from_env();
+    let configured_cycle_interval = cycle_interval();
+    let configured_bitrot_cycle = bitrot_scan_cycle();
+    global_metrics().record_scanner_cycle_config(configured_cycle_interval, configured_bitrot_cycle);
     info!("Start run data scanner cycle");
     cycle_info.current = cycle_info.next;
     let now = Instant::now();
@@ -437,11 +452,16 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         cycle_info.current,
         background_heal_info.bitrot_start_cycle,
         background_heal_info.bitrot_start_time,
+        configured_bitrot_cycle,
     );
     let _scan_mode_guard = ScannerScanModeGuard::new(scan_mode);
-    if let Some(new_heal_info) =
-        background_heal_info_for_scan_start(background_heal_info.clone(), cycle_info.current, scan_mode, Utc::now())
-    {
+    if let Some(new_heal_info) = background_heal_info_for_scan_start(
+        background_heal_info.clone(),
+        cycle_info.current,
+        scan_mode,
+        Utc::now(),
+        configured_bitrot_cycle,
+    ) {
         background_heal_info = new_heal_info.clone();
         save_background_heal_info(storeapi.clone(), new_heal_info).await;
     }
@@ -600,18 +620,22 @@ pub async fn store_data_usage_in_backend(
         // Save a backup every 10th update
         if attempts > 10 {
             let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+            let done_save = Metrics::time(Metric::SaveUsage);
             if let Err(e) = save_config(storeapi.clone(), &backup_path, data.clone()).await {
                 warn!("Failed to save data usage backup to {}: {}", backup_path, e);
             }
+            done_save();
             attempts = 1;
         }
 
         // Save main configuration
+        let done_save = Metrics::time(Metric::SaveUsage);
         if let Err(e) = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await {
             error!("Failed to save data usage info to {}: {e}", DATA_USAGE_OBJ_NAME_PATH.as_str());
         } else {
             rustfs_ecstore::data_usage::replace_bucket_usage_memory_from_info(&data_usage_info).await;
         }
+        done_save();
 
         attempts += 1;
     }
@@ -866,7 +890,7 @@ mod tests {
     #[serial]
     fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
         with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
-            let mode = get_cycle_scan_mode(10, 0, Some(Utc::now()));
+            let mode = get_cycle_scan_mode(10, 0, Some(Utc::now()), bitrot_scan_cycle());
             assert_eq!(mode, HealScanMode::Deep);
         });
     }
@@ -878,8 +902,8 @@ mod tests {
             let recent = Utc::now() - chrono::Duration::minutes(30);
             let old = Utc::now() - chrono::Duration::hours(2);
 
-            assert_eq!(get_cycle_scan_mode(2048, 0, Some(recent)), HealScanMode::Normal);
-            assert_eq!(get_cycle_scan_mode(2048, 0, Some(old)), HealScanMode::Deep);
+            assert_eq!(get_cycle_scan_mode(2048, 0, Some(recent), bitrot_scan_cycle()), HealScanMode::Normal);
+            assert_eq!(get_cycle_scan_mode(2048, 0, Some(old), bitrot_scan_cycle()), HealScanMode::Deep);
         });
     }
 
@@ -887,7 +911,7 @@ mod tests {
     #[serial]
     fn test_get_cycle_scan_mode_can_disable_periodic_deep_scan() {
         with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("off"), || {
-            assert_eq!(get_cycle_scan_mode(1, 0, None), HealScanMode::Normal);
+            assert_eq!(get_cycle_scan_mode(1, 0, None, bitrot_scan_cycle()), HealScanMode::Normal);
         });
     }
 
@@ -895,8 +919,9 @@ mod tests {
     #[serial]
     fn test_background_heal_info_for_scan_start_marks_deep_active() {
         let now = Utc::now();
-        let info = background_heal_info_for_scan_start(BackgroundHealInfo::default(), 7, HealScanMode::Deep, now)
-            .expect("deep scan should update background heal info");
+        let info =
+            background_heal_info_for_scan_start(BackgroundHealInfo::default(), 7, HealScanMode::Deep, now, bitrot_scan_cycle())
+                .expect("deep scan should update background heal info");
 
         assert_eq!(info.current_scan_mode, HealScanMode::Deep);
         assert_eq!(info.bitrot_start_cycle, 7);
@@ -914,7 +939,7 @@ mod tests {
                 current_scan_mode: HealScanMode::Normal,
             };
 
-            let info = background_heal_info_for_scan_start(info, 8, HealScanMode::Deep, Utc::now())
+            let info = background_heal_info_for_scan_start(info, 8, HealScanMode::Deep, Utc::now(), bitrot_scan_cycle())
                 .expect("deep scan should mark active status");
 
             assert_eq!(info.current_scan_mode, HealScanMode::Deep);
