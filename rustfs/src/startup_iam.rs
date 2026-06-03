@@ -69,7 +69,8 @@ type RecoveryInitFn = Box<dyn FnMut() -> RecoveryFuture + Send>;
 type RecoveryFinalizeFn = Box<dyn FnMut() -> RecoveryFuture + Send>;
 
 fn compute_backoff_interval(attempt: u64, initial: Duration, max: Duration) -> Duration {
-    let multiplier = 2u32.saturating_pow(attempt.saturating_sub(1) as u32);
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 2u32.saturating_pow(exponent);
     let backoff = initial.saturating_mul(multiplier);
     if backoff > max { max } else { backoff }
 }
@@ -84,6 +85,7 @@ fn spawn_iam_recovery_task(
         let mut attempts: u64 = 0;
         let degraded_since = std::time::Instant::now();
 
+        // Phase 1: retry init until it succeeds
         loop {
             attempts += 1;
             let sleep_duration = compute_backoff_interval(attempts, initial_interval, max_interval);
@@ -97,13 +99,6 @@ fn spawn_iam_recovery_task(
                         degraded_duration_secs = degraded_secs,
                         "IAM bootstrap recovered after startup; publishing IAM readiness"
                     );
-
-                    if let Err(err) = finalize_fn().await {
-                        warn!(
-                            error = %err,
-                            "IAM recovered, but runtime readiness publication is still pending"
-                        );
-                    }
                     break;
                 }
                 Err(err) => {
@@ -128,6 +123,33 @@ fn spawn_iam_recovery_task(
                 }
             }
         }
+
+        // Phase 2: retry finalize until readiness is published
+        let mut finalize_attempts: u64 = 0;
+        loop {
+            finalize_attempts += 1;
+            match finalize_fn().await {
+                Ok(()) => {
+                    info!(
+                        init_attempts = attempts,
+                        finalize_attempts,
+                        degraded_duration_secs = degraded_since.elapsed().as_secs(),
+                        "IAM readiness published successfully"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    let retry_interval = compute_backoff_interval(finalize_attempts, initial_interval, max_interval);
+                    warn!(
+                        finalize_attempts,
+                        retry_secs = retry_interval.as_secs(),
+                        error = %err,
+                        "IAM recovered, but readiness publication failed; retrying"
+                    );
+                    tokio::time::sleep(retry_interval).await;
+                }
+            }
+        }
     });
 }
 
@@ -137,23 +159,39 @@ fn initial_retry_interval() -> Duration {
         .unwrap_or(IAM_RETRY_INITIAL_INTERVAL)
 }
 
+// Sentinel marks "not yet initialized"; env var is read on first call.
+static TEST_REMAINING_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 fn should_fail_test_init_attempt() -> bool {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
 
-    static REMAINING_FAILURES: OnceLock<AtomicU64> = OnceLock::new();
-    let remaining = REMAINING_FAILURES
-        .get_or_init(|| AtomicU64::new(rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_FAIL_INIT_ATTEMPTS).unwrap_or(0)));
+    let mut current = TEST_REMAINING_FAILURES.load(Ordering::SeqCst);
+    if current == u64::MAX {
+        let configured = rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_FAIL_INIT_ATTEMPTS).unwrap_or(0);
+        match TEST_REMAINING_FAILURES.compare_exchange(u64::MAX, configured, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => current = configured,
+            Err(actual) => current = actual,
+        }
+    }
 
-    let mut current = remaining.load(Ordering::SeqCst);
     while current > 0 {
-        match remaining.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+        match TEST_REMAINING_FAILURES.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => return true,
             Err(actual) => current = actual,
         }
     }
 
     false
+}
+
+/// Reset the test failure counter so the next `should_fail_test_init_attempt`
+/// call re-reads the environment variable. No-op when env var is not set.
+/// Intended for use in integration tests that share a process.
+#[doc(hidden)]
+pub fn reset_test_failure_counter() {
+    use std::sync::atomic::Ordering;
+    let configured = rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_FAIL_INIT_ATTEMPTS).unwrap_or(0);
+    TEST_REMAINING_FAILURES.store(configured, Ordering::SeqCst);
 }
 
 async fn attempt_init_iam_sys(store: Arc<ECStore>) -> std::result::Result<(), std::io::Error> {
@@ -324,7 +362,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recovery_task_keeps_retrying_when_finalize_fails_after_recovery() {
+    async fn recovery_task_retries_finalize_when_finalize_fails_after_init() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let finalize_calls = Arc::new(AtomicUsize::new(0));
 
@@ -344,25 +382,42 @@ mod tests {
             Box::new(move || {
                 let finalize_calls = finalize_calls.clone();
                 Box::pin(async move {
-                    finalize_calls.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::other("finalize failed"))
+                    let call = finalize_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if call < 3 {
+                        Err(Error::other("finalize failed"))
+                    } else {
+                        Ok(())
+                    }
                 })
             }),
         );
 
         tokio::task::yield_now().await;
+
+        // Init succeeds after first 5s sleep
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 1);
 
-        // No more attempts after init succeeds (even if finalize failed)
+        // Finalize retried after 5s backoff (attempt 1 failed)
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 2);
+
+        // Finalize retried after 10s backoff (attempt 2 failed)
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 3);
+
+        // No more retries after finalize succeeds
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 3);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]

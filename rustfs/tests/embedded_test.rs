@@ -8,6 +8,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
 use reqwest::StatusCode;
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
+use rustfs::startup_iam::reset_test_failure_counter;
 use serial_test::serial;
 use temp_env::async_with_vars;
 
@@ -27,6 +28,7 @@ fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
 #[tokio::test]
 #[serial]
 async fn test_embedded_server_basic_s3_operations() {
+    reset_test_failure_counter();
     async_with_vars(
         [
             ("RUSTFS_TEST_IAM_FAIL_INIT_ATTEMPTS", None::<&str>),
@@ -109,6 +111,7 @@ async fn test_embedded_server_basic_s3_operations() {
 #[tokio::test]
 #[serial]
 async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
+    reset_test_failure_counter();
     async_with_vars(
         [
             ("RUSTFS_TEST_IAM_FAIL_INIT_ATTEMPTS", Some("1")),
