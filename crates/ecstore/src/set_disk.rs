@@ -4649,6 +4649,9 @@ mod tests {
     use super::*;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
+    use crate::disk::RUSTFS_META_BUCKET;
+    use crate::disk::STORAGE_FORMAT_FILE;
+    use crate::disk::WalkDirOptions;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::health_state::RuntimeDriveHealthState;
@@ -4656,7 +4659,9 @@ mod tests {
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::store_api::{CompletePart, ObjectInfo};
     use crate::store_init::save_format_file;
+    use crate::store_list_objects::ListPathOptions;
     use rustfs_filemeta::ErasureInfo;
+    use rustfs_filemeta::MetaCacheEntry;
     use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
@@ -5933,6 +5938,175 @@ mod tests {
         assert_eq!(err, StorageError::ErasureReadQuorum);
 
         drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn list_path_still_uses_disk_after_prior_walk_timeout() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::AsyncWrite;
+
+        struct PendingWriter;
+
+        impl AsyncWrite for PendingWriter {
+            fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        let bucket = "bucket";
+        let object = "obj";
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+        let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
+        disk.write_all(bucket, &metadata_path, bytes::Bytes::from_static(b"not-an-xl-meta"))
+            .await
+            .expect("metadata file should be created");
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![Some(disk.clone())])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
+            let mut writer = PendingWriter;
+            let walk_err = disk
+                .walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        ..Default::default()
+                    },
+                    &mut writer,
+                )
+                .await
+                .expect_err("walk_dir should time out");
+            assert_eq!(walk_err, DiskError::Timeout);
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
+            set_disks
+                .list_path(
+                    CancellationToken::new(),
+                    ListPathOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        ..Default::default()
+                    },
+                    tx,
+                )
+                .await
+                .expect("list_path should still succeed after prior walk timeout");
+
+            let entry = rx.recv().await.expect("listing should yield the object entry");
+            assert_eq!(entry.name, object);
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+        })
+        .await;
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn list_path_system_prefix_survives_prior_walk_timeout() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::AsyncWrite;
+
+        struct PendingWriter;
+
+        impl AsyncWrite for PendingWriter {
+            fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        let object = "config/iam/sts/test/identity.json";
+
+        let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &metadata_path, bytes::Bytes::from_static(b"not-an-xl-meta"))
+            .await
+            .expect("system path metadata file should be created");
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![Some(disk.clone())])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
+            let mut writer = PendingWriter;
+            let walk_err = disk
+                .walk_dir(
+                    WalkDirOptions {
+                        bucket: RUSTFS_META_BUCKET.to_string(),
+                        base_dir: "config/iam/".to_string(),
+                        recursive: true,
+                        ..Default::default()
+                    },
+                    &mut writer,
+                )
+                .await
+                .expect_err("walk_dir should time out");
+            assert_eq!(walk_err, DiskError::Timeout);
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
+            set_disks
+                .list_path(
+                    CancellationToken::new(),
+                    ListPathOptions {
+                        bucket: RUSTFS_META_BUCKET.to_string(),
+                        recursive: true,
+                        ..Default::default()
+                    },
+                    tx,
+                )
+                .await
+                .expect("system prefix list_path should still succeed after prior walk timeout");
+
+            let entry = rx.recv().await.expect("listing should yield the system-path entry");
+            assert_eq!(entry.name, object);
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+        })
+        .await;
+
+        drop(temp_dir);
     }
 
     #[test]
