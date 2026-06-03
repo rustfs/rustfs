@@ -1140,7 +1140,8 @@ impl DiskAPI for LocalDiskWrapper {
             "walk_dir",
             || async { self.disk.walk_dir(opts, wr).await },
             get_drive_walkdir_timeout(),
-            self.scanner_timeout_health_action(),
+            // Listing/scanner backpressure should fail only the current walk, not poison drive health.
+            TimeoutHealthAction::IgnoreFailure,
         )
         .await
     }
@@ -1604,7 +1605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn walk_dir_writer_backpressure_timeout_marks_drive_failure_by_default() {
+    async fn walk_dir_writer_backpressure_timeout_does_not_mark_drive_failure_by_default() {
         temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
             let dir = tempfile::tempdir().expect("temp dir should be created");
             let endpoint =
@@ -1640,7 +1641,60 @@ mod tests {
                 .await;
 
             assert_eq!(result.expect_err("walk_dir should time out"), DiskError::Timeout);
-            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Suspect);
+            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!wrapper.health.is_faulty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn walk_dir_timeout_does_not_break_followup_stat_volume() {
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+            let wrapper = LocalDiskWrapper::new(disk, false);
+            let bucket = "test-bucket";
+            let object = "test-object";
+
+            wrapper.make_volume(bucket).await.expect("bucket should be created");
+
+            let mut file_info = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+            file_info.volume = bucket.to_string();
+            file_info.name = object.to_string();
+            file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+            file_info.erasure.index = 1;
+
+            wrapper
+                .write_metadata("", bucket, object, file_info)
+                .await
+                .expect("object metadata should be written");
+
+            let mut writer = PendingWriter;
+            let walk_err = wrapper
+                .walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        ..Default::default()
+                    },
+                    &mut writer,
+                )
+                .await
+                .expect_err("walk_dir should time out");
+
+            assert_eq!(walk_err, DiskError::Timeout);
+            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!wrapper.health.is_faulty());
+
+            let info = wrapper
+                .stat_volume(bucket)
+                .await
+                .expect("follow-up bucket stat should still succeed after walk timeout");
+            assert_eq!(info.name, bucket);
+            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!wrapper.health.is_faulty());
         })
         .await;
     }
