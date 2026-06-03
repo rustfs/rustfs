@@ -52,6 +52,11 @@ impl NamespaceLockWrapper {
         Self { lock, resource, owner }
     }
 
+    /// Get lock owner identifier used for acquisition.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
     /// Acquire write lock (exclusive lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_write_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {

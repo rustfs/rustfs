@@ -73,6 +73,10 @@ use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, ReplicateDecision, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw, merge_file_meta_versions,
 };
+use rustfs_io_metrics::{
+    record_object_lock_diag_acquire_duration, record_object_lock_diag_enabled, record_object_lock_diag_hold_duration,
+    record_object_lock_diag_slow_acquire, record_object_lock_diag_slow_hold,
+};
 use rustfs_lock::LockClient;
 use rustfs_lock::fast_lock::types::LockResult;
 use rustfs_lock::local_lock::LocalLock;
@@ -101,6 +105,7 @@ use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OB
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem::{self};
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
@@ -131,6 +136,66 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
 const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
+
+struct ObjectLockDiagGuard {
+    guard: NamespaceLockGuard,
+    enabled: bool,
+    op: &'static str,
+    bucket: Option<String>,
+    object: Option<String>,
+    owner: Option<String>,
+    mode: &'static str,
+    acquired_at: Instant,
+}
+
+impl ObjectLockDiagGuard {
+    fn new(
+        guard: NamespaceLockGuard,
+        enabled: bool,
+        op: &'static str,
+        bucket: Option<String>,
+        object: Option<String>,
+        owner: Option<String>,
+        mode: &'static str,
+    ) -> Self {
+        Self {
+            guard,
+            enabled,
+            op,
+            bucket,
+            object,
+            owner,
+            mode,
+            acquired_at: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ObjectLockDiagGuard {
+    fn drop(&mut self) {
+        if !self.enabled || self.guard.is_released() {
+            return;
+        }
+
+        let hold = self.acquired_at.elapsed();
+        record_object_lock_diag_hold_duration(self.op, self.mode, hold);
+        let threshold = get_object_lock_diag_slow_hold_threshold();
+        if hold >= threshold {
+            record_object_lock_diag_slow_hold(self.op, self.mode);
+            warn!(
+                target: "rustfs_ecstore::object_lock_diag",
+                op = self.op,
+                bucket = %self.bucket.as_deref().unwrap_or_default(),
+                object = %self.object.as_deref().unwrap_or_default(),
+                mode = self.mode,
+                owner = %self.owner.as_deref().unwrap_or_default(),
+                hold_ms = hold.as_millis(),
+                threshold_ms = threshold.as_millis(),
+                "object namespace lock held longer than threshold"
+            );
+        }
+    }
+}
 
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
@@ -190,6 +255,7 @@ pub fn get_duplex_buffer_size() -> usize {
 }
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
+static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod heal;
 mod list;
@@ -206,6 +272,31 @@ pub fn get_lock_acquire_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(
         rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT,
         rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+    ))
+}
+
+pub fn is_object_lock_diag_enabled() -> bool {
+    *OBJECT_LOCK_DIAG_ENABLED.get_or_init(|| {
+        let enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_LOCK_DIAG_ENABLE,
+        );
+        record_object_lock_diag_enabled(enabled);
+        enabled
+    })
+}
+
+pub fn get_object_lock_diag_slow_acquire_threshold() -> Duration {
+    Duration::from_millis(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS,
+        rustfs_config::DEFAULT_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS,
+    ))
+}
+
+pub fn get_object_lock_diag_slow_hold_threshold() -> Duration {
+    Duration::from_millis(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_OBJECT_LOCK_DIAG_SLOW_HOLD_MS,
+        rustfs_config::DEFAULT_OBJECT_LOCK_DIAG_SLOW_HOLD_MS,
     ))
 }
 
@@ -343,6 +434,89 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
+    async fn acquire_read_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
+        let diag_enabled = is_object_lock_diag_enabled();
+        let ns_lock = self.new_ns_lock(bucket, object).await?;
+        let acquire_start = Instant::now();
+        let guard = ns_lock
+            .get_read_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?;
+        let owner = diag_enabled.then(|| ns_lock.owner().to_string());
+        self.log_object_lock_acquire_if_slow(op, bucket, object, "read", owner.as_deref(), acquire_start.elapsed(), diag_enabled);
+        Ok(ObjectLockDiagGuard::new(
+            guard,
+            diag_enabled,
+            op,
+            diag_enabled.then(|| bucket.to_string()),
+            diag_enabled.then(|| object.to_string()),
+            owner,
+            "read",
+        ))
+    }
+
+    async fn acquire_write_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
+        let diag_enabled = is_object_lock_diag_enabled();
+        let ns_lock = self.new_ns_lock(bucket, object).await?;
+        let acquire_start = Instant::now();
+        let guard = ns_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?;
+        let owner = diag_enabled.then(|| ns_lock.owner().to_string());
+        self.log_object_lock_acquire_if_slow(
+            op,
+            bucket,
+            object,
+            "write",
+            owner.as_deref(),
+            acquire_start.elapsed(),
+            diag_enabled,
+        );
+        Ok(ObjectLockDiagGuard::new(
+            guard,
+            diag_enabled,
+            op,
+            diag_enabled.then(|| bucket.to_string()),
+            diag_enabled.then(|| object.to_string()),
+            owner,
+            "write",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_object_lock_acquire_if_slow(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        mode: &'static str,
+        owner: Option<&str>,
+        elapsed: Duration,
+        diag_enabled: bool,
+    ) {
+        if !diag_enabled {
+            return;
+        }
+
+        let threshold = get_object_lock_diag_slow_acquire_threshold();
+        record_object_lock_diag_acquire_duration(op, mode, elapsed);
+        if elapsed >= threshold {
+            record_object_lock_diag_slow_acquire(op, mode);
+            warn!(
+                target: "rustfs_ecstore::object_lock_diag",
+                op,
+                bucket,
+                object,
+                mode,
+                owner = owner.unwrap_or_default(),
+                acquire_ms = elapsed.as_millis(),
+                threshold_ms = threshold.as_millis(),
+                "object namespace lock acquisition exceeded threshold"
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         locker_owner: String,
@@ -629,12 +803,7 @@ impl ObjectIO for SetDisks {
                 );
             }
 
-            let guard = self
-                .new_ns_lock(bucket, object)
-                .await?
-                .get_read_lock(get_lock_acquire_timeout())
-                .await
-                .map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?;
+            let guard = self.acquire_read_lock_diag("get_object", bucket, object).await?;
 
             // Record lock acquisition for deadlock detection
             let _lock_id = record_lock_acquire(bucket, object, "read");
@@ -762,12 +931,9 @@ impl ObjectIO for SetDisks {
 
         if opts.http_preconditions.is_some() {
             if !opts.no_lock {
-                let ns_lock = self.new_ns_lock(bucket, object).await?;
                 object_lock_guard = Some(
-                    ns_lock
-                        .get_write_lock(get_lock_acquire_timeout())
-                        .await
-                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                    self.acquire_write_lock_diag("put_object_precondition", bucket, object)
+                        .await?,
                 );
             }
 
@@ -1003,13 +1169,7 @@ impl ObjectIO for SetDisks {
             drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
 
             if !opts.no_lock && object_lock_guard.is_none() {
-                let ns_lock = self.new_ns_lock(bucket, object).await?;
-                object_lock_guard = Some(
-                    ns_lock
-                        .get_write_lock(get_lock_acquire_timeout())
-                        .await
-                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-                );
+                object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
 
             let (online_disks, _, op_old_dir) = Self::rename_data(
@@ -1429,11 +1589,8 @@ impl ObjectOperations for SetDisks {
             None
         } else {
             Some(
-                self.new_ns_lock(dst_bucket, dst_object)
-                    .await?
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(dst_bucket, dst_object, "write", e))?,
+                self.acquire_write_lock_diag("copy_object_metadata", dst_bucket, dst_object)
+                    .await?,
             )
         };
 
@@ -1823,13 +1980,7 @@ impl ObjectOperations for SetDisks {
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
         // Guard lock for single object delete
         let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
-            Some(
-                self.new_ns_lock(bucket, object)
-                    .await?
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-            )
+            Some(self.acquire_write_lock_diag("delete_object", bucket, object).await?)
         } else {
             None
         };
@@ -1964,13 +2115,7 @@ impl ObjectOperations for SetDisks {
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         // Acquire a shared read-lock to protect consistency during info fetch
         let _read_lock_guard = if !opts.no_lock {
-            Some(
-                self.new_ns_lock(bucket, object)
-                    .await?
-                    .get_read_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "read", e))?,
-            )
+            Some(self.acquire_read_lock_diag("get_object_info", bucket, object).await?)
         } else {
             None
         };
@@ -2018,13 +2163,7 @@ impl ObjectOperations for SetDisks {
 
         // Guard lock for metadata update
         let _lock_guard = if !opts.no_lock {
-            Some(
-                self.new_ns_lock(bucket, object)
-                    .await?
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-            )
+            Some(self.acquire_write_lock_diag("put_object_metadata", bucket, object).await?)
         } else {
             None
         };
@@ -3091,12 +3230,9 @@ impl MultipartOperations for SetDisks {
 
         if opts.http_preconditions.is_some() {
             if !opts.no_lock {
-                let ns_lock = self.new_ns_lock(bucket, object).await?;
                 _object_lock_guard = Some(
-                    ns_lock
-                        .get_write_lock(get_lock_acquire_timeout())
-                        .await
-                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                    self.acquire_write_lock_diag("new_multipart_upload_precondition", bucket, object)
+                        .await?,
                 );
             }
 
@@ -3270,12 +3406,9 @@ impl MultipartOperations for SetDisks {
 
         if opts.http_preconditions.is_some() {
             if !opts.no_lock {
-                let ns_lock = self.new_ns_lock(bucket, object).await?;
                 object_lock_guard = Some(
-                    ns_lock
-                        .get_write_lock(get_lock_acquire_timeout())
-                        .await
-                        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                    self.acquire_write_lock_diag("complete_multipart_upload_precondition", bucket, object)
+                        .await?,
                 );
             }
 
@@ -3620,12 +3753,9 @@ impl MultipartOperations for SetDisks {
         }
 
         if !opts.no_lock && object_lock_guard.is_none() {
-            let ns_lock = self.new_ns_lock(bucket, object).await?;
             object_lock_guard = Some(
-                ns_lock
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+                self.acquire_write_lock_diag("complete_multipart_upload_commit", bucket, object)
+                    .await?,
             );
         }
 

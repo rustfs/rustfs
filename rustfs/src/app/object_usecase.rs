@@ -1039,7 +1039,15 @@ pub(crate) async fn build_put_like_object_lock_metadata(
     Ok(Some(eval_metadata))
 }
 
-pub(crate) fn validate_existing_object_lock_for_write(existing_obj_info: &ObjectInfo) -> S3Result<()> {
+fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
+    opts.version_id.is_none() && opts.versioned && !opts.version_suspended
+}
+
+pub(crate) fn validate_existing_object_lock_for_write(existing_obj_info: &ObjectInfo, opts: &ObjectOptions) -> S3Result<()> {
+    if put_like_write_creates_new_version(opts) {
+        return Ok(());
+    }
+
     let legal_hold = get_object_legalhold_meta(&existing_obj_info.user_defined);
     if legal_hold
         .status
@@ -1888,7 +1896,7 @@ impl DefaultObjectUsecase {
         );
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                validate_existing_object_lock_for_write(&existing_obj_info, &opts)?;
                 Some(existing_obj_info.size.max(0) as u64)
             }
             Err(err) => {
@@ -2754,7 +2762,7 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let mut dst_opts = copy_dst_opts(&bucket, &key, version_id, &req.headers, HashMap::new())
+        let mut dst_opts = copy_dst_opts(&bucket, &key, dest_version_id.clone(), &req.headers, HashMap::new())
             .await
             .map_err(ApiError::from)?;
 
@@ -2784,7 +2792,7 @@ impl DefaultObjectUsecase {
         }
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                validate_existing_object_lock_for_write(&existing_obj_info, &dst_opts)?;
                 Some(existing_obj_info.size.max(0) as u64)
             }
             Err(err) => {
@@ -4588,6 +4596,85 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
+    }
+
+    fn object_info_with_lock_metadata(metadata: HashMap<String, String>) -> ObjectInfo {
+        ObjectInfo {
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        }
+    }
+
+    fn compliance_retained_object_info() -> ObjectInfo {
+        let mut metadata = HashMap::new();
+        metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::COMPLIANCE.to_string());
+        metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string());
+        object_info_with_lock_metadata(metadata)
+    }
+
+    fn legal_hold_object_info() -> ObjectInfo {
+        let mut metadata = HashMap::new();
+        metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), ObjectLockLegalHoldStatus::ON.to_string());
+        object_info_with_lock_metadata(metadata)
+    }
+
+    #[test]
+    fn validate_existing_object_lock_allows_versioned_new_version_with_compliance_retention() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: None,
+            ..Default::default()
+        };
+
+        validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+            .expect("versioned put should create a new version");
+    }
+
+    #[test]
+    fn validate_existing_object_lock_allows_versioned_new_version_with_legal_hold() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: None,
+            ..Default::default()
+        };
+
+        validate_existing_object_lock_for_write(&legal_hold_object_info(), &opts)
+            .expect("versioned put should create a new version");
+    }
+
+    #[test]
+    fn validate_existing_object_lock_blocks_unversioned_compliance_overwrite() {
+        let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &ObjectOptions::default())
+            .expect_err("unversioned overwrite should still be blocked");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn validate_existing_object_lock_blocks_suspended_version_compliance_overwrite() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_suspended: true,
+            version_id: None,
+            ..Default::default()
+        };
+        let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+            .expect_err("suspended versioning overwrite should still be blocked");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn validate_existing_object_lock_blocks_explicit_version_compliance_overwrite() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+            .expect_err("explicit version overwrite should still be blocked");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
     #[test]

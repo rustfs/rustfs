@@ -22,7 +22,7 @@ use futures::future::join_all;
 use metrics::counter;
 use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, global_metrics};
+use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics};
 use rustfs_config::{
     DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS,
     ENV_SCANNER_MAX_CONCURRENT_SET_SCANS,
@@ -125,7 +125,7 @@ impl BucketDriveFailureGuard {
         Self { failed: true }
     }
 
-    fn mark_success(&mut self) {
+    fn mark_not_failed(&mut self) {
         self.failed = false;
     }
 }
@@ -395,6 +395,16 @@ impl ScannerIO for ECStore {
                         .nsscanner_cache(child_token_clone.clone(), all_buckets_clone, tx, want_cycle_clone, scan_mode_clone)
                         .await
                     {
+                        if child_token_clone.is_cancelled() {
+                            debug!(
+                                pool = %pool_label,
+                                set = %set_label,
+                                error = %e,
+                                "Scanner set scan stopped after cancellation"
+                            );
+                            return;
+                        }
+
                         counter!(
                             "rustfs_scanner_set_failure_total",
                             "pool" => pool_label.clone(),
@@ -752,7 +762,11 @@ impl ScannerIOCache for SetDisks {
                     {
                         Ok(cache) => cache,
                         Err(e) => {
-                            error!("Failed to scan disk: {}", e);
+                            if ctx_clone.is_cancelled() {
+                                debug!("Scanner disk scan stopped after cancellation: {}", e);
+                            } else {
+                                error!("Failed to scan disk: {}", e);
+                            }
 
                             if let (Some(last_update), Some(before_update)) = (cache.info.last_update, before)
                                 && last_update > before_update
@@ -990,19 +1004,24 @@ impl ScannerIODisk for Disk {
 
         let disks = disks_result.into_iter().flatten().collect::<Vec<Arc<Disk>>>();
 
-        let result = scan_data_folder(ctx, disks, local_disk, cache, updates, scan_mode, SCANNER_SLEEPER.clone()).await;
+        let result = scan_data_folder(ctx.clone(), disks, local_disk, cache, updates, scan_mode, SCANNER_SLEEPER.clone()).await;
 
         match result {
             Ok(mut data_usage_info) => {
                 done_drive();
                 emit_scan_bucket_drive_complete(true, &bucket, &disk_path, drive_start.elapsed());
                 data_usage_info.info.last_update = Some(SystemTime::now());
-                failure_guard.mark_success();
+                failure_guard.mark_not_failed();
                 Ok(data_usage_info)
             }
             Err(e) => {
-                done_drive();
-                emit_scan_bucket_drive_complete(false, &bucket, &disk_path, drive_start.elapsed());
+                if ctx.is_cancelled() {
+                    emit_scan_bucket_drive_partial(&bucket, &disk_path, drive_start.elapsed());
+                    failure_guard.mark_not_failed();
+                } else {
+                    done_drive();
+                    emit_scan_bucket_drive_complete(false, &bucket, &disk_path, drive_start.elapsed());
+                }
                 Err(StorageError::other(format!("Failed to scan data folder: {e}")))
             }
         }

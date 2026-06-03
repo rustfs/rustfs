@@ -18,7 +18,9 @@ use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
-use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
+use crate::server::{
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
+};
 use crate::storage::access::{ReqInfo, authorize_request};
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use bytes::Bytes;
@@ -2216,12 +2218,10 @@ fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }
 
-fn is_admin_path(path: &str) -> bool {
-    path.starts_with(ADMIN_PREFIX) || path.starts_with(MINIO_ADMIN_PREFIX)
-}
-
 fn canonicalize_admin_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(suffix) = path.strip_prefix(MINIO_ADMIN_PREFIX) {
+    if is_admin_path(path)
+        && let Some(suffix) = path.strip_prefix(MINIO_ADMIN_PREFIX)
+    {
         return std::borrow::Cow::Owned(format!("{ADMIN_PREFIX}{suffix}"));
     }
 
@@ -2445,7 +2445,13 @@ mod tests {
     #[test]
     fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
         assert_eq!(canonicalize_admin_path("/minio/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
+        assert_eq!(canonicalize_admin_path("/minio/admin").as_ref(), "/rustfs/admin");
         assert_eq!(canonicalize_admin_path("/rustfs/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
+        assert_eq!(
+            canonicalize_admin_path("/minio/administrator/object").as_ref(),
+            "/minio/administrator/object"
+        );
+        assert_eq!(canonicalize_admin_path("/minio/adminx/object").as_ref(), "/minio/adminx/object");
     }
 
     #[test]
@@ -2453,6 +2459,10 @@ mod tests {
         assert!(is_admin_path("/rustfs/admin/v3/info"));
         assert!(is_admin_path("/minio/admin/v3/info"));
         assert!(!is_admin_path("/bucket/object"));
+        assert!(!is_admin_path("/rustfs/administrator/object"));
+        assert!(!is_admin_path("/minio/administrator/object"));
+        assert!(!is_admin_path("/rustfs/adminx/object"));
+        assert!(!is_admin_path("/minio/adminx/object"));
     }
 
     #[test]

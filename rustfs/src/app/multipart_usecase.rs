@@ -351,7 +351,7 @@ impl DefaultMultipartUsecase {
         );
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info)?;
+                validate_existing_object_lock_for_write(&existing_obj_info, &current_opts)?;
                 Some(existing_obj_info.size.max(0) as u64)
             }
             Err(err) => {
@@ -624,7 +624,7 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
         match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info)?,
+            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info, &opts)?,
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());

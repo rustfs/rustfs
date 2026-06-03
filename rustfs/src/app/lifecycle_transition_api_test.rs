@@ -30,8 +30,8 @@ use rustfs_ecstore::{
     global::GLOBAL_TierConfigMgr,
     store::ECStore,
     store_api::{
-        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions,
-        PutObjReader,
+        BucketOperations, BucketOptions, ListOperations, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations,
+        ObjectOptions, PutObjReader,
     },
     tier::{
         tier_config::{TierConfig, TierType},
@@ -498,6 +498,20 @@ async fn read_object_bytes(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -
     buf
 }
 
+async fn live_object_version_count(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> usize {
+    let versions = ecstore
+        .clone()
+        .list_object_versions(bucket, object, None, None, None, 1000)
+        .await
+        .expect("Failed to list object versions");
+
+    versions
+        .objects
+        .iter()
+        .filter(|info| info.name == object && !info.delete_marker)
+        .count()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "requires isolated global object layer state"]
@@ -598,6 +612,94 @@ async fn copy_object_if_none_match_existing_destination_returns_precondition_fai
         dst_payload,
         "failed conditional CopyObject must not overwrite the current destination object"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explicit_overwrite() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let fs = FS::new();
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let bucket = format!("test-copy-object-lock-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let src_object = "test/source.txt";
+    let dst_object = "test/destination.txt";
+    let locked_payload = b"locked destination payload";
+    let source_payload = b"copy source payload";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_object_lock_enabled(bucket.as_str())
+        .await
+        .expect("Failed to enable object lock for bucket");
+    let _ = upload_test_object(&ecstore, bucket.as_str(), src_object, source_payload).await;
+
+    let retain_until = Timestamp::from(time::OffsetDateTime::now_utc().saturating_add(time::Duration::days(1)));
+    let locked_input = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(dst_object.to_string())
+        .body(Some(streaming_blob_from_bytes(locked_payload)))
+        .content_length(Some(locked_payload.len() as i64))
+        .object_lock_mode(Some(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE)))
+        .object_lock_retain_until_date(Some(retain_until))
+        .build()
+        .unwrap();
+
+    Box::pin(usecase.execute_put_object(&fs, build_request(locked_input, Method::PUT)))
+        .await
+        .expect("Failed to upload locked destination object");
+
+    let locked_info = ecstore
+        .get_object_info(bucket.as_str(), dst_object, &ObjectOptions::default())
+        .await
+        .expect("Failed to fetch locked destination object info");
+    let locked_version_id = locked_info
+        .version_id
+        .expect("locked destination should have a version ID")
+        .to_string();
+
+    let copy_input = CopyObjectInput::builder()
+        .copy_source(CopySource::Bucket {
+            bucket: bucket.clone().into(),
+            key: src_object.to_string().into(),
+            version_id: None,
+        })
+        .bucket(bucket.clone())
+        .key(dst_object.to_string())
+        .build()
+        .unwrap();
+
+    let copy_output = Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
+        .await
+        .expect("CopyObject should create a new version over a locked current version");
+    let copied_version_id = copy_output
+        .output
+        .version_id
+        .expect("versioned CopyObject should return the created version ID");
+
+    assert_ne!(copied_version_id, locked_version_id);
+    assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), dst_object).await, source_payload);
+    assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), dst_object).await, 2);
+
+    let explicit_overwrite_input = CopyObjectInput::builder()
+        .copy_source(CopySource::Bucket {
+            bucket: bucket.clone().into(),
+            key: src_object.to_string().into(),
+            version_id: None,
+        })
+        .bucket(bucket.clone())
+        .key(dst_object.to_string())
+        .version_id(Some(locked_version_id))
+        .build()
+        .unwrap();
+
+    let err = Box::pin(usecase.execute_copy_object(build_request(explicit_overwrite_input, Method::PUT)))
+        .await
+        .expect_err("explicit CopyObject overwrite of a locked version should be blocked");
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
+    assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), dst_object).await, source_payload);
+    assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), dst_object).await, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
