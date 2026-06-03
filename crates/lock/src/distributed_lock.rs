@@ -365,7 +365,7 @@ impl DistributedLock {
     }
 
     fn lock_acquire_retry_backoff(attempt: usize) -> Duration {
-        LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF * attempt as u32
+        LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF.saturating_mul(attempt.try_into().unwrap_or(u32::MAX))
     }
 
     fn lock_acquire_attempt_timeout(&self, remaining: Duration) -> Duration {
@@ -546,19 +546,17 @@ impl DistributedLock {
     fn lock_acquire_attempt_timeout_result(
         timeout: Duration,
         individual_locks: Vec<(LockId, Arc<dyn LockClient>)>,
-        hard_failures: usize,
         last_failure: Option<String>,
     ) -> LockAcquireQuorumResult {
         let last_failure_kind = last_failure.as_deref().map(classify_lock_failure);
-        let failure_kind = if hard_failures > 0 {
-            LockAcquireFailureKind::UnrecoverableQuorum
-        } else if let Some(kind @ (LockAcquireFailureKind::NonRetryable | LockAcquireFailureKind::UnrecoverableQuorum)) =
-            last_failure_kind
-        {
-            kind
-        } else {
-            return Self::lock_acquire_timeout_result(timeout);
-        };
+        let failure_kind =
+            if let Some(kind @ (LockAcquireFailureKind::NonRetryable | LockAcquireFailureKind::UnrecoverableQuorum)) =
+                last_failure_kind
+            {
+                kind
+            } else {
+                return Self::lock_acquire_timeout_result(timeout);
+            };
 
         let mut error = "Lock acquisition timeout".to_string();
         if let Some(last_failure) = last_failure {
@@ -598,7 +596,6 @@ impl DistributedLock {
                 return Ok(Self::lock_acquire_attempt_timeout_result(
                     request.acquire_timeout,
                     individual_locks,
-                    hard_failures,
                     last_failure,
                 ));
             }
@@ -617,7 +614,6 @@ impl DistributedLock {
                     return Ok(Self::lock_acquire_attempt_timeout_result(
                         request.acquire_timeout,
                         individual_locks,
-                        hard_failures,
                         last_failure,
                     ));
                 }
@@ -1140,6 +1136,61 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "acquire should fail this attempt before waiting for delayed impossible-quorum tasks"
         );
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_retries_attempt_timeout_when_hard_failure_does_not_preclude_quorum() {
+        let clients: Vec<Arc<dyn LockClient>> = vec![
+            Arc::new(SequencedClient::new(
+                vec![
+                    AcquirePlan::Failure {
+                        error: "Remote lock RPC failed: node unavailable",
+                        delay: Duration::ZERO,
+                    },
+                    AcquirePlan::Success { delay: Duration::ZERO },
+                ],
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![
+                    AcquirePlan::Success {
+                        delay: Duration::from_millis(1200),
+                    },
+                    AcquirePlan::Success { delay: Duration::ZERO },
+                ],
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![
+                    AcquirePlan::Success {
+                        delay: Duration::from_millis(1200),
+                    },
+                    AcquirePlan::Success { delay: Duration::ZERO },
+                ],
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+            Arc::new(SequencedClient::new(
+                vec![
+                    AcquirePlan::Success {
+                        delay: Duration::from_millis(1200),
+                    },
+                    AcquirePlan::Success { delay: Duration::ZERO },
+                ],
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+        ];
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(2));
+
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("attempt timeout with possible quorum should retry")
+            .expect("second attempt should acquire quorum");
+
+        assert_eq!(guard.entries.len(), 3);
+        drop(guard);
     }
 
     #[tokio::test]
