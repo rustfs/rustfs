@@ -3316,4 +3316,71 @@ mod tests {
         let decoded = FileMetaVersion::decode_data_dir_from_meta(&encoded).expect("decode data_dir");
         assert_eq!(decoded, Some(data_dir));
     }
+
+    fn make_meta_object_with_sys(meta_sys: HashMap<String, Vec<u8>>) -> MetaObject {
+        MetaObject {
+            erasure_algorithm: ErasureAlgo::ReedSolomon,
+            erasure_m: 2,
+            erasure_n: 4,
+            erasure_block_size: 1_048_576,
+            erasure_index: 1,
+            erasure_dist: vec![1, 2, 3, 4, 5, 6],
+            bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+            meta_sys,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn meta_object_transition_version_id_absent_yields_none() {
+        let fi = make_meta_object_with_sys(HashMap::new()).into_fileinfo("b", "k", false);
+        assert_eq!(fi.transition_version_id, None);
+    }
+
+    #[test]
+    fn meta_object_transition_version_id_empty_bytes_yields_none() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, vec![]);
+        let fi = make_meta_object_with_sys(sys).into_fileinfo("b", "k", false);
+        assert_eq!(fi.transition_version_id, None);
+    }
+
+    #[test]
+    fn meta_object_transition_version_id_nil_uuid_yields_none() {
+        // Regression: old code used unwrap_or_default() which turned nil bytes into Some(Uuid::nil())
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, Uuid::nil().as_bytes().to_vec());
+        let fi = make_meta_object_with_sys(sys).into_fileinfo("b", "k", false);
+        assert_eq!(fi.transition_version_id, None);
+    }
+
+    #[test]
+    fn meta_object_transition_version_id_valid_uuid_round_trips() {
+        let id = sample_version_id();
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, id.as_bytes().to_vec());
+        let fi = make_meta_object_with_sys(sys).into_fileinfo("b", "k", false);
+        assert_eq!(fi.transition_version_id, Some(id));
+    }
+
+    #[test]
+    fn delete_marker_free_version_transition_version_id_nil_uuid_yields_none() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, Uuid::nil().as_bytes().to_vec());
+        let fi = MetaDeleteMarker { version_id: None, mod_time: None, meta_sys: sys }
+            .into_fileinfo("b", "k", false);
+        assert_eq!(fi.transition_version_id, None);
+    }
+
+    #[test]
+    fn delete_marker_free_version_transition_version_id_valid_uuid_round_trips() {
+        let id = sample_version_id();
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, id.as_bytes().to_vec());
+        let fi = MetaDeleteMarker { version_id: None, mod_time: None, meta_sys: sys }
+            .into_fileinfo("b", "k", false);
+        assert_eq!(fi.transition_version_id, Some(id));
+    }
 }
