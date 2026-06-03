@@ -281,6 +281,40 @@ pub const ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT: &str = "RUSTFS_OBJECT_LOCK_ACQUIRE_TI
 /// Default lock acquisition timeout: 5 seconds.
 pub const DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT: u64 = 5;
 
+/// Environment variable to enable object namespace lock diagnostics.
+///
+/// When enabled, RustFS emits slow lock acquisition and long lock hold
+/// warnings for object-level namespace locks. This is intended for
+/// production debugging of contention on hot object keys.
+///
+/// Default: false (disabled, can be overridden by `RUSTFS_OBJECT_LOCK_DIAG_ENABLE`).
+pub const ENV_OBJECT_LOCK_DIAG_ENABLE: &str = "RUSTFS_OBJECT_LOCK_DIAG_ENABLE";
+
+/// Default: object lock diagnostics are disabled.
+pub const DEFAULT_OBJECT_LOCK_DIAG_ENABLE: bool = false;
+
+/// Environment variable for the slow object lock acquisition threshold in milliseconds.
+///
+/// When a read or write namespace lock takes at least this long to acquire,
+/// RustFS emits a warning with the operation name and object key.
+///
+/// Default: 500 milliseconds.
+pub const ENV_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS: &str = "RUSTFS_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS";
+
+/// Default slow object lock acquisition threshold: 500 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS: u64 = 500;
+
+/// Environment variable for the long object lock hold threshold in milliseconds.
+///
+/// When a namespace lock guard is held for at least this long, RustFS emits
+/// a warning when the guard is dropped.
+///
+/// Default: 1000 milliseconds.
+pub const ENV_OBJECT_LOCK_DIAG_SLOW_HOLD_MS: &str = "RUSTFS_OBJECT_LOCK_DIAG_SLOW_HOLD_MS";
+
+/// Default long object lock hold threshold: 1000 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_DIAG_SLOW_HOLD_MS: u64 = 1000;
+
 // ============================================================================
 // I/O priority scheduling configuration
 // ============================================================================
