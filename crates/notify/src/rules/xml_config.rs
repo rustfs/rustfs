@@ -207,7 +207,7 @@ impl<'de> Deserialize<'de> for S3KeyFilter {
                             self.filter_rules = s3key_content.get_filter_rules();
                         }
                         _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                            return Err(serde::de::Error::unknown_field(&key, &["S3Key"]));
                         }
                     }
                 }

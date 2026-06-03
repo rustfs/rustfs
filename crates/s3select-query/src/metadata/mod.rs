@@ -17,7 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
-use datafusion::datasource::listing::ListingTable;
+use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::var_provider::is_system_variables;
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
 use datafusion::variable::VarType;
@@ -39,11 +39,11 @@ pub trait ContextProviderExtension: ContextProvider {
 pub type TableHandleProviderRef = Arc<dyn TableHandleProvider + Send + Sync>;
 
 pub trait TableHandleProvider {
-    fn build_table_handle(&self, provider: Arc<ListingTable>) -> DFResult<TableHandle>;
+    fn build_table_handle(&self, provider: Arc<dyn TableProvider>) -> DFResult<TableHandle>;
 }
 
 pub struct MetadataProvider {
-    provider: Arc<ListingTable>,
+    provider: Arc<dyn TableProvider>,
     session: SessionCtx,
     config_options: ConfigOptions,
     func_manager: FuncMetaManagerRef,
@@ -53,7 +53,7 @@ pub struct MetadataProvider {
 impl MetadataProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        provider: Arc<ListingTable>,
+        provider: Arc<dyn TableProvider>,
         current_session_table_provider: TableHandleProviderRef,
         func_manager: FuncMetaManagerRef,
         session: SessionCtx,

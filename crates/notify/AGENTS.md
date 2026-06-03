@@ -31,7 +31,7 @@ shared plugin/runtime primitives from `rustfs-targets`.
 ## Concurrency
 
 - `runtime_view.rs` acquires locks in order: `stream_cancellers` → `target_list`.
-- `runtime_facade.rs` acquires locks in order: `target_list` → `replay_workers`.
+- `runtime_facade.rs` acquires locks in order: `replay_workers` → `target_list`.
 - These orders must not be reversed in new code. When adding a function that needs both `target_list` and `stream_cancellers`, acquire `stream_cancellers` first (matching `runtime_view.rs` order).
 - Do not hold write guards across `.await` points unless the hold time is bounded and the operation is unavoidably async.
 

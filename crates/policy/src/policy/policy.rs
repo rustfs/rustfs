@@ -55,6 +55,7 @@ impl Args<'_> {
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     #[serde(default, rename = "ID")]
     pub id: ID,
@@ -192,6 +193,7 @@ pub struct BucketPolicyArgs<'a> {
 /// Bucket Policy with AWS S3-compatible JSON serialization.
 /// Empty optional fields are omitted from output to match AWS format.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct BucketPolicy {
     #[serde(default, rename = "Id", skip_serializing_if = "ID::is_empty")]
     pub id: ID,

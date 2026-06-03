@@ -23,8 +23,8 @@ use matchit::Params;
 use rustfs_config::oidc::{
     IDENTITY_OPENID_SUB_SYS, OIDC_CLAIM_NAME, OIDC_CLAIM_PREFIX, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_CONFIG_URL,
     OIDC_DEFAULT_CLAIM_NAME, OIDC_DEFAULT_EMAIL_CLAIM, OIDC_DEFAULT_GROUPS_CLAIM, OIDC_DEFAULT_ROLES_CLAIM, OIDC_DEFAULT_SCOPES,
-    OIDC_DEFAULT_USERNAME_CLAIM, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_OTHER_AUDIENCES, OIDC_REDIRECT_URI,
-    OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
+    OIDC_DEFAULT_USERNAME_CLAIM, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_HIDE_FROM_UI, OIDC_OTHER_AUDIENCES,
+    OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
@@ -143,6 +143,7 @@ struct OidcConfigView {
     roles_claim: String,
     email_claim: String,
     username_claim: String,
+    hide_from_ui: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +181,7 @@ struct OidcConfigUpsertRequest {
     roles_claim: String,
     email_claim: String,
     username_claim: String,
+    hide_from_ui: bool,
 }
 
 impl Default for OidcConfigUpsertRequest {
@@ -201,6 +203,7 @@ impl Default for OidcConfigUpsertRequest {
             roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
             email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
             username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
+            hide_from_ui: false,
         }
     }
 }
@@ -225,6 +228,7 @@ struct OidcConfigValidateRequest {
     roles_claim: String,
     email_claim: String,
     username_claim: String,
+    hide_from_ui: bool,
 }
 
 impl Default for OidcConfigValidateRequest {
@@ -247,6 +251,7 @@ impl Default for OidcConfigValidateRequest {
             roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
             email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
             username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
+            hide_from_ui: false,
         }
     }
 }
@@ -260,7 +265,7 @@ impl Operation for ListOidcProvidersHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let oidc_sys = rustfs_iam::get_oidc().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
-        let providers = oidc_sys.list_providers();
+        let providers = oidc_sys.list_visible_providers();
         let json_body = serde_json::to_vec(&providers)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
 
@@ -302,6 +307,7 @@ impl Operation for GetOidcConfigHandler {
                 roles_claim: provider.config.roles_claim.clone(),
                 email_claim: provider.config.email_claim.clone(),
                 username_claim: provider.config.username_claim,
+                hide_from_ui: provider.config.hide_from_ui,
             })
             .collect();
 
@@ -852,60 +858,61 @@ fn validate_provider_config_fields(config: &rustfs_iam::oidc::OidcProviderConfig
     Ok(())
 }
 
+fn or_default(value: &str, default: &str) -> String {
+    if value.trim().is_empty() {
+        default.to_string()
+    } else {
+        value.trim().to_string()
+    }
+}
+
+/// Normalize an `OidcProviderConfig` by trimming strings and applying defaults.
+fn normalize_provider_config(mut config: rustfs_iam::oidc::OidcProviderConfig) -> rustfs_iam::oidc::OidcProviderConfig {
+    config.config_url = config.config_url.trim().to_string();
+    config.client_id = config.client_id.trim().to_string();
+    config.scopes = normalize_scopes(&config.scopes);
+    config.redirect_uri = normalize_optional(config.redirect_uri);
+    config.claim_name = or_default(&config.claim_name, OIDC_DEFAULT_CLAIM_NAME);
+    config.claim_prefix = config.claim_prefix.trim().to_string();
+    config.role_policy = config.role_policy.trim().to_string();
+    config.display_name = or_default(&config.display_name, &config.id);
+    config.groups_claim = or_default(&config.groups_claim, OIDC_DEFAULT_GROUPS_CLAIM);
+    config.roles_claim = or_default(&config.roles_claim, OIDC_DEFAULT_ROLES_CLAIM);
+    config.email_claim = or_default(&config.email_claim, OIDC_DEFAULT_EMAIL_CLAIM);
+    config.username_claim = or_default(&config.username_claim, OIDC_DEFAULT_USERNAME_CLAIM);
+    config
+}
+
 fn build_provider_config_from_upsert(
     provider_id: &str,
     request: OidcConfigUpsertRequest,
     existing_secret: Option<String>,
 ) -> S3Result<rustfs_iam::oidc::OidcProviderConfig> {
-    let scopes = normalize_scopes(&request.scopes);
     let client_secret = match request.client_secret {
         Some(value) if !value.trim().is_empty() => Some(value),
         _ => existing_secret.filter(|value| !value.trim().is_empty()),
     };
 
-    let config = rustfs_iam::oidc::OidcProviderConfig {
+    let config = normalize_provider_config(rustfs_iam::oidc::OidcProviderConfig {
         id: provider_id.to_string(),
         enabled: request.enabled,
-        config_url: request.config_url.trim().to_string(),
-        client_id: request.client_id.trim().to_string(),
+        config_url: request.config_url,
+        client_id: request.client_id,
         client_secret,
-        scopes,
+        scopes: request.scopes,
         other_audiences: request.other_audiences,
-        redirect_uri: normalize_optional(request.redirect_uri),
+        redirect_uri: request.redirect_uri,
         redirect_uri_dynamic: request.redirect_uri_dynamic,
-        claim_name: if request.claim_name.trim().is_empty() {
-            OIDC_DEFAULT_CLAIM_NAME.to_string()
-        } else {
-            request.claim_name.trim().to_string()
-        },
-        claim_prefix: request.claim_prefix.trim().to_string(),
-        role_policy: request.role_policy.trim().to_string(),
-        display_name: if request.display_name.trim().is_empty() {
-            provider_id.to_string()
-        } else {
-            request.display_name.trim().to_string()
-        },
-        groups_claim: if request.groups_claim.trim().is_empty() {
-            OIDC_DEFAULT_GROUPS_CLAIM.to_string()
-        } else {
-            request.groups_claim.trim().to_string()
-        },
-        roles_claim: if request.roles_claim.trim().is_empty() {
-            OIDC_DEFAULT_ROLES_CLAIM.to_string()
-        } else {
-            request.roles_claim.trim().to_string()
-        },
-        email_claim: if request.email_claim.trim().is_empty() {
-            OIDC_DEFAULT_EMAIL_CLAIM.to_string()
-        } else {
-            request.email_claim.trim().to_string()
-        },
-        username_claim: if request.username_claim.trim().is_empty() {
-            OIDC_DEFAULT_USERNAME_CLAIM.to_string()
-        } else {
-            request.username_claim.trim().to_string()
-        },
-    };
+        claim_name: request.claim_name,
+        claim_prefix: request.claim_prefix,
+        role_policy: request.role_policy,
+        display_name: request.display_name,
+        groups_claim: request.groups_claim,
+        roles_claim: request.roles_claim,
+        email_claim: request.email_claim,
+        username_claim: request.username_claim,
+        hide_from_ui: request.hide_from_ui,
+    });
 
     validate_provider_config_fields(&config)?;
     Ok(config)
@@ -915,49 +922,26 @@ fn build_provider_config_from_validate(
     request: OidcConfigValidateRequest,
     provider_id: &str,
 ) -> S3Result<rustfs_iam::oidc::OidcProviderConfig> {
-    let config = rustfs_iam::oidc::OidcProviderConfig {
+    let config = normalize_provider_config(rustfs_iam::oidc::OidcProviderConfig {
         id: provider_id.to_string(),
         enabled: request.enabled,
-        config_url: request.config_url.trim().to_string(),
-        client_id: request.client_id.trim().to_string(),
+        config_url: request.config_url,
+        client_id: request.client_id,
         client_secret: request.client_secret.filter(|value| !value.trim().is_empty()),
-        scopes: normalize_scopes(&request.scopes),
+        scopes: request.scopes,
         other_audiences: request.other_audiences,
-        redirect_uri: normalize_optional(request.redirect_uri),
+        redirect_uri: request.redirect_uri,
         redirect_uri_dynamic: request.redirect_uri_dynamic,
-        claim_name: if request.claim_name.trim().is_empty() {
-            OIDC_DEFAULT_CLAIM_NAME.to_string()
-        } else {
-            request.claim_name.trim().to_string()
-        },
-        claim_prefix: request.claim_prefix.trim().to_string(),
-        role_policy: request.role_policy.trim().to_string(),
-        display_name: if request.display_name.trim().is_empty() {
-            provider_id.to_string()
-        } else {
-            request.display_name.trim().to_string()
-        },
-        groups_claim: if request.groups_claim.trim().is_empty() {
-            OIDC_DEFAULT_GROUPS_CLAIM.to_string()
-        } else {
-            request.groups_claim.trim().to_string()
-        },
-        roles_claim: if request.roles_claim.trim().is_empty() {
-            OIDC_DEFAULT_ROLES_CLAIM.to_string()
-        } else {
-            request.roles_claim.trim().to_string()
-        },
-        email_claim: if request.email_claim.trim().is_empty() {
-            OIDC_DEFAULT_EMAIL_CLAIM.to_string()
-        } else {
-            request.email_claim.trim().to_string()
-        },
-        username_claim: if request.username_claim.trim().is_empty() {
-            OIDC_DEFAULT_USERNAME_CLAIM.to_string()
-        } else {
-            request.username_claim.trim().to_string()
-        },
-    };
+        claim_name: request.claim_name,
+        claim_prefix: request.claim_prefix,
+        role_policy: request.role_policy,
+        display_name: request.display_name,
+        groups_claim: request.groups_claim,
+        roles_claim: request.roles_claim,
+        email_claim: request.email_claim,
+        username_claim: request.username_claim,
+        hide_from_ui: request.hide_from_ui,
+    });
 
     validate_provider_config_fields(&config)?;
     Ok(config)
@@ -1008,6 +992,15 @@ fn upsert_persisted_provider_config(config: &mut ServerConfig, provider_config: 
     set_kvs_value(&mut kvs, OIDC_ROLES_CLAIM, provider_config.roles_claim.clone());
     set_kvs_value(&mut kvs, OIDC_EMAIL_CLAIM, provider_config.email_claim.clone());
     set_kvs_value(&mut kvs, OIDC_USERNAME_CLAIM, provider_config.username_claim.clone());
+    set_kvs_value(
+        &mut kvs,
+        OIDC_HIDE_FROM_UI,
+        if provider_config.hide_from_ui {
+            EnableState::On.to_string()
+        } else {
+            EnableState::Off.to_string()
+        },
+    );
 
     config
         .0
@@ -1285,11 +1278,57 @@ mod tests {
             roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
             email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
             username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
+            hide_from_ui: false,
         };
 
         upsert_persisted_provider_config(&mut persisted_config, &provider_config);
 
         assert!(oidc_restart_required_from_active_config(&persisted_config, Some(&active_config)));
         assert!(!oidc_restart_required_from_active_config(&persisted_config, Some(&persisted_config)));
+    }
+
+    #[test]
+    fn test_upsert_persists_hide_from_ui_on() {
+        let mut config = ServerConfig::new();
+        let mut provider_config = rustfs_iam::oidc::OidcProviderConfig {
+            id: "kubernetes".to_string(),
+            enabled: true,
+            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+            client_id: "test".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string()],
+            other_audiences: vec![],
+            redirect_uri: None,
+            redirect_uri_dynamic: true,
+            claim_name: "sub".to_string(),
+            claim_prefix: String::new(),
+            role_policy: String::new(),
+            display_name: "Kubernetes".to_string(),
+            groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
+            roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
+            email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
+            username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
+            hide_from_ui: true,
+        };
+
+        upsert_persisted_provider_config(&mut config, &provider_config);
+
+        let kvs = config
+            .0
+            .get(IDENTITY_OPENID_SUB_SYS)
+            .and_then(|m| m.get("kubernetes"))
+            .expect("provider KVS should exist");
+        assert_eq!(kvs.get(OIDC_HIDE_FROM_UI), EnableState::On.to_string());
+
+        // Flip to false and verify
+        provider_config.hide_from_ui = false;
+        upsert_persisted_provider_config(&mut config, &provider_config);
+
+        let kvs = config
+            .0
+            .get(IDENTITY_OPENID_SUB_SYS)
+            .and_then(|m| m.get("kubernetes"))
+            .expect("provider KVS should exist");
+        assert_eq!(kvs.get(OIDC_HIDE_FROM_UI), EnableState::Off.to_string());
     }
 }

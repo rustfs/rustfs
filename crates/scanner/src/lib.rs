@@ -23,6 +23,7 @@
 pub mod data_usage_define;
 pub mod error;
 pub mod scanner;
+pub mod scanner_budget;
 pub mod scanner_folder;
 pub mod scanner_io;
 pub mod sleeper;
