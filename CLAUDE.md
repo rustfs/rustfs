@@ -88,7 +88,7 @@ Key suffixes (from `metadata_compat.rs`):
 Path: `{disk}/{bucket}/{object}/xl.meta` — one per erasure shard disk.
 All shards should be identical for a healthy object.
 
-## Known bugs & fixes (branch `mbartsch/fix-tier-recover`)
+## Known bugs & fixes 
 
 ### Bug 1: `NoSuchVersion` on tier GET — nil UUID sent as versionId
 **Root cause**: `transitioned-versionID` metadata key exists with empty string value (0 bytes). Old reading code:
