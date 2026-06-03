@@ -154,7 +154,11 @@ impl WarmBackend for WarmBackendS3 {
         }
 
         if opts.start_offset >= 0 && opts.length > 0 {
-            let end = opts.start_offset + opts.length - 1;
+            let end = opts
+                .start_offset
+                .checked_add(opts.length)
+                .and_then(|v| v.checked_sub(1))
+                .ok_or_else(|| std::io::Error::other("invalid range: overflow"))?;
             req = req.range(format!("bytes={}-{}", opts.start_offset, end));
         }
 
