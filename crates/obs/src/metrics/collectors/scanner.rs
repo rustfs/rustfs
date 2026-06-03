@@ -28,15 +28,18 @@ use crate::metrics::schema::scanner::{
     SCANNER_CURRENT_CYCLE_DIRECTORIES_PER_SECOND_MD, SCANNER_CURRENT_CYCLE_DIRECTORIES_SCANNED_MD,
     SCANNER_CURRENT_CYCLE_HEAL_OBJECTS_MD, SCANNER_CURRENT_CYCLE_ILM_ACTIONS_MD, SCANNER_CURRENT_CYCLE_MD,
     SCANNER_CURRENT_CYCLE_OBJECTS_PER_SECOND_MD, SCANNER_CURRENT_CYCLE_OBJECTS_SCANNED_MD,
-    SCANNER_CURRENT_CYCLE_REPLICATION_CHECKS_MD, SCANNER_CURRENT_CYCLE_USAGE_SAVES_MD,
+    SCANNER_CURRENT_CYCLE_REPLICATION_CHECKS_MD, SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD,
+    SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_EVENTS_MD, SCANNER_CURRENT_CYCLE_USAGE_SAVES_MD,
     SCANNER_CURRENT_CYCLE_YIELD_DURATION_SECONDS_MD, SCANNER_CURRENT_CYCLE_YIELD_EVENTS_MD, SCANNER_CURRENT_SCAN_MODE_MD,
-    SCANNER_CYCLE_INTERVAL_SECONDS_MD, SCANNER_DIRECTORIES_SCANNED_MD, SCANNER_FAILED_CYCLES_MD,
-    SCANNER_LAST_ACTIVITY_SECONDS_MD, SCANNER_LAST_CYCLE_BUCKET_DRIVE_FAILURES_MD, SCANNER_LAST_CYCLE_BUCKET_DRIVE_SCANS_MD,
-    SCANNER_LAST_CYCLE_BUCKET_DRIVE_SCANS_PER_SECOND_MD, SCANNER_LAST_CYCLE_DIRECTORIES_PER_SECOND_MD,
-    SCANNER_LAST_CYCLE_DIRECTORIES_SCANNED_MD, SCANNER_LAST_CYCLE_DURATION_SECONDS_MD, SCANNER_LAST_CYCLE_HEAL_OBJECTS_MD,
-    SCANNER_LAST_CYCLE_ILM_ACTIONS_MD, SCANNER_LAST_CYCLE_OBJECTS_PER_SECOND_MD, SCANNER_LAST_CYCLE_OBJECTS_SCANNED_MD,
-    SCANNER_LAST_CYCLE_REPLICATION_CHECKS_MD, SCANNER_LAST_CYCLE_RESULT_MD, SCANNER_LAST_CYCLE_USAGE_SAVES_MD,
-    SCANNER_LAST_CYCLE_YIELD_DURATION_SECONDS_MD, SCANNER_LAST_CYCLE_YIELD_EVENTS_MD, SCANNER_OBJECTS_SCANNED_MD,
+    SCANNER_CYCLE_INTERVAL_SECONDS_MD, SCANNER_CYCLE_MAX_DURATION_SECONDS_MD, SCANNER_DIRECTORIES_SCANNED_MD,
+    SCANNER_FAILED_CYCLES_MD, SCANNER_LAST_ACTIVITY_SECONDS_MD, SCANNER_LAST_CYCLE_BUCKET_DRIVE_FAILURES_MD,
+    SCANNER_LAST_CYCLE_BUCKET_DRIVE_SCANS_MD, SCANNER_LAST_CYCLE_BUCKET_DRIVE_SCANS_PER_SECOND_MD,
+    SCANNER_LAST_CYCLE_DIRECTORIES_PER_SECOND_MD, SCANNER_LAST_CYCLE_DIRECTORIES_SCANNED_MD,
+    SCANNER_LAST_CYCLE_DURATION_SECONDS_MD, SCANNER_LAST_CYCLE_HEAL_OBJECTS_MD, SCANNER_LAST_CYCLE_ILM_ACTIONS_MD,
+    SCANNER_LAST_CYCLE_OBJECTS_PER_SECOND_MD, SCANNER_LAST_CYCLE_OBJECTS_SCANNED_MD, SCANNER_LAST_CYCLE_REPLICATION_CHECKS_MD,
+    SCANNER_LAST_CYCLE_RESULT_MD, SCANNER_LAST_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD,
+    SCANNER_LAST_CYCLE_THROTTLE_SLEEP_EVENTS_MD, SCANNER_LAST_CYCLE_USAGE_SAVES_MD, SCANNER_LAST_CYCLE_YIELD_DURATION_SECONDS_MD,
+    SCANNER_LAST_CYCLE_YIELD_EVENTS_MD, SCANNER_OBJECTS_SCANNED_MD, SCANNER_PARTIAL_CYCLES_MD,
     SCANNER_THROTTLE_IDLE_MODE_ENABLED_MD, SCANNER_THROTTLE_MAX_SLEEP_SECONDS_MD, SCANNER_THROTTLE_SLEEP_FACTOR_MD,
     SCANNER_VERSIONS_SCANNED_MD, SCANNER_YIELD_EVERY_N_OBJECTS_MD,
 };
@@ -61,7 +64,7 @@ pub struct ScannerStats {
     /// Number of scanner paths currently being processed
     pub active_paths: u64,
     /// Whether scanner idle-mode self-throttling is enabled
-    pub throttle_idle_mode_enabled: u64,
+    pub throttle_idle_mode_enabled: bool,
     /// Effective scanner sleep factor
     pub throttle_sleep_factor: f64,
     /// Effective scanner maximum self-throttle sleep duration in seconds
@@ -70,8 +73,10 @@ pub struct ScannerStats {
     pub yield_every_n_objects: u64,
     /// Effective scanner cycle interval in seconds
     pub cycle_interval_seconds: f64,
+    /// Effective maximum scanner cycle runtime in seconds
+    pub cycle_max_duration_seconds: f64,
     /// Whether periodic scanner bitrot deep scans are enabled
-    pub bitrot_cycle_enabled: u64,
+    pub bitrot_cycle_enabled: bool,
     /// Effective scanner bitrot deep-scan interval in seconds
     pub bitrot_cycle_seconds: f64,
     /// Current scanner cycle number, or zero when idle
@@ -94,10 +99,14 @@ pub struct ScannerStats {
     pub current_cycle_directories_per_second: f64,
     /// Bucket-drive scan rate for the currently running scanner cycle
     pub current_cycle_bucket_drive_scans_per_second: f64,
-    /// Number of scanner self-throttle yield events in the current scanner cycle
+    /// Number of scanner cooperative yield events in the current scanner cycle
     pub current_cycle_yield_events: u64,
-    /// Total scanner self-throttle yield duration in seconds for the current scanner cycle
+    /// Total scanner cooperative yield duration in seconds for the current scanner cycle
     pub current_cycle_yield_duration_seconds: f64,
+    /// Number of scanner self-throttle sleep events in the current scanner cycle
+    pub current_cycle_throttle_sleep_events: u64,
+    /// Total scanner self-throttle sleep duration in seconds for the current scanner cycle
+    pub current_cycle_throttle_sleep_duration_seconds: f64,
     /// Number of lifecycle actions applied by the current scanner cycle
     pub current_cycle_ilm_actions: u64,
     /// Number of object heal candidates enqueued by the current scanner cycle
@@ -108,7 +117,7 @@ pub struct ScannerStats {
     pub current_cycle_usage_saves: u64,
     /// Current scanner mode: 0 unknown or idle, 1 normal, 2 deep bitrot scan
     pub current_scan_mode: u64,
-    /// Last scanner cycle result: 0 unknown, 1 success, 2 error
+    /// Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial
     pub last_cycle_result: u64,
     /// Duration in seconds of the last finished scanner cycle
     pub last_cycle_duration_seconds: f64,
@@ -126,10 +135,14 @@ pub struct ScannerStats {
     pub last_cycle_directories_per_second: f64,
     /// Bucket-drive scan rate for the last finished scanner cycle
     pub last_cycle_bucket_drive_scans_per_second: f64,
-    /// Number of scanner self-throttle yield events in the last finished scanner cycle
+    /// Number of scanner cooperative yield events in the last finished scanner cycle
     pub last_cycle_yield_events: u64,
-    /// Total scanner self-throttle yield duration in seconds for the last finished scanner cycle
+    /// Total scanner cooperative yield duration in seconds for the last finished scanner cycle
     pub last_cycle_yield_duration_seconds: f64,
+    /// Number of scanner self-throttle sleep events in the last finished scanner cycle
+    pub last_cycle_throttle_sleep_events: u64,
+    /// Total scanner self-throttle sleep duration in seconds for the last finished scanner cycle
+    pub last_cycle_throttle_sleep_duration_seconds: f64,
     /// Number of lifecycle actions applied by the last finished scanner cycle
     pub last_cycle_ilm_actions: u64,
     /// Number of object heal candidates enqueued by the last finished scanner cycle
@@ -140,6 +153,8 @@ pub struct ScannerStats {
     pub last_cycle_usage_saves: u64,
     /// Number of scanner cycles that failed since server start
     pub failed_cycles: u64,
+    /// Number of scanner cycles stopped by runtime budget since server start
+    pub partial_cycles: u64,
 }
 
 /// Collects scanner metrics from the given stats.
@@ -156,12 +171,16 @@ pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
         PrometheusMetric::from_descriptor(&SCANNER_VERSIONS_SCANNED_MD, stats.versions_scanned as f64),
         PrometheusMetric::from_descriptor(&SCANNER_LAST_ACTIVITY_SECONDS_MD, stats.last_activity_seconds as f64),
         PrometheusMetric::from_descriptor(&SCANNER_ACTIVE_PATHS_MD, stats.active_paths as f64),
-        PrometheusMetric::from_descriptor(&SCANNER_THROTTLE_IDLE_MODE_ENABLED_MD, stats.throttle_idle_mode_enabled as f64),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_THROTTLE_IDLE_MODE_ENABLED_MD,
+            bool_metric_value(stats.throttle_idle_mode_enabled),
+        ),
         PrometheusMetric::from_descriptor(&SCANNER_THROTTLE_SLEEP_FACTOR_MD, stats.throttle_sleep_factor),
         PrometheusMetric::from_descriptor(&SCANNER_THROTTLE_MAX_SLEEP_SECONDS_MD, stats.throttle_max_sleep_seconds),
         PrometheusMetric::from_descriptor(&SCANNER_YIELD_EVERY_N_OBJECTS_MD, stats.yield_every_n_objects as f64),
         PrometheusMetric::from_descriptor(&SCANNER_CYCLE_INTERVAL_SECONDS_MD, stats.cycle_interval_seconds),
-        PrometheusMetric::from_descriptor(&SCANNER_BITROT_CYCLE_ENABLED_MD, stats.bitrot_cycle_enabled as f64),
+        PrometheusMetric::from_descriptor(&SCANNER_CYCLE_MAX_DURATION_SECONDS_MD, stats.cycle_max_duration_seconds),
+        PrometheusMetric::from_descriptor(&SCANNER_BITROT_CYCLE_ENABLED_MD, bool_metric_value(stats.bitrot_cycle_enabled)),
         PrometheusMetric::from_descriptor(&SCANNER_BITROT_CYCLE_SECONDS_MD, stats.bitrot_cycle_seconds),
         PrometheusMetric::from_descriptor(&SCANNER_CURRENT_CYCLE_MD, stats.current_cycle as f64),
         PrometheusMetric::from_descriptor(&SCANNER_COMPLETED_CYCLES_MD, stats.completed_cycles as f64),
@@ -193,6 +212,14 @@ pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
             &SCANNER_CURRENT_CYCLE_YIELD_DURATION_SECONDS_MD,
             stats.current_cycle_yield_duration_seconds,
         ),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_EVENTS_MD,
+            stats.current_cycle_throttle_sleep_events as f64,
+        ),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD,
+            stats.current_cycle_throttle_sleep_duration_seconds,
+        ),
         PrometheusMetric::from_descriptor(&SCANNER_CURRENT_CYCLE_ILM_ACTIONS_MD, stats.current_cycle_ilm_actions as f64),
         PrometheusMetric::from_descriptor(&SCANNER_CURRENT_CYCLE_HEAL_OBJECTS_MD, stats.current_cycle_heal_objects as f64),
         PrometheusMetric::from_descriptor(
@@ -221,12 +248,25 @@ pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
         ),
         PrometheusMetric::from_descriptor(&SCANNER_LAST_CYCLE_YIELD_EVENTS_MD, stats.last_cycle_yield_events as f64),
         PrometheusMetric::from_descriptor(&SCANNER_LAST_CYCLE_YIELD_DURATION_SECONDS_MD, stats.last_cycle_yield_duration_seconds),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_LAST_CYCLE_THROTTLE_SLEEP_EVENTS_MD,
+            stats.last_cycle_throttle_sleep_events as f64,
+        ),
+        PrometheusMetric::from_descriptor(
+            &SCANNER_LAST_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD,
+            stats.last_cycle_throttle_sleep_duration_seconds,
+        ),
         PrometheusMetric::from_descriptor(&SCANNER_LAST_CYCLE_ILM_ACTIONS_MD, stats.last_cycle_ilm_actions as f64),
         PrometheusMetric::from_descriptor(&SCANNER_LAST_CYCLE_HEAL_OBJECTS_MD, stats.last_cycle_heal_objects as f64),
         PrometheusMetric::from_descriptor(&SCANNER_LAST_CYCLE_REPLICATION_CHECKS_MD, stats.last_cycle_replication_checks as f64),
         PrometheusMetric::from_descriptor(&SCANNER_LAST_CYCLE_USAGE_SAVES_MD, stats.last_cycle_usage_saves as f64),
         PrometheusMetric::from_descriptor(&SCANNER_FAILED_CYCLES_MD, stats.failed_cycles as f64),
+        PrometheusMetric::from_descriptor(&SCANNER_PARTIAL_CYCLES_MD, stats.partial_cycles as f64),
     ]
+}
+
+fn bool_metric_value(enabled: bool) -> f64 {
+    if enabled { 1.0 } else { 0.0 }
 }
 
 #[cfg(test)]
@@ -245,12 +285,13 @@ mod tests {
             versions_scanned: 1500000,
             last_activity_seconds: 30,
             active_paths: 4,
-            throttle_idle_mode_enabled: 1,
+            throttle_idle_mode_enabled: true,
             throttle_sleep_factor: 10.0,
             throttle_max_sleep_seconds: 15.0,
             yield_every_n_objects: 128,
             cycle_interval_seconds: 3600.0,
-            bitrot_cycle_enabled: 1,
+            cycle_max_duration_seconds: 1800.0,
+            bitrot_cycle_enabled: true,
             bitrot_cycle_seconds: 86400.0,
             current_cycle: 12,
             completed_cycles: 11,
@@ -264,6 +305,8 @@ mod tests {
             current_cycle_bucket_drive_scans_per_second: 0.1,
             current_cycle_yield_events: 8,
             current_cycle_yield_duration_seconds: 1.25,
+            current_cycle_throttle_sleep_events: 4,
+            current_cycle_throttle_sleep_duration_seconds: 2.5,
             current_cycle_ilm_actions: 6,
             current_cycle_heal_objects: 2,
             current_cycle_replication_checks: 5,
@@ -280,17 +323,20 @@ mod tests {
             last_cycle_bucket_drive_scans_per_second: 0.12,
             last_cycle_yield_events: 30,
             last_cycle_yield_duration_seconds: 9.5,
+            last_cycle_throttle_sleep_events: 12,
+            last_cycle_throttle_sleep_duration_seconds: 6.75,
             last_cycle_ilm_actions: 44,
             last_cycle_heal_objects: 7,
             last_cycle_replication_checks: 12,
             last_cycle_usage_saves: 9,
             failed_cycles: 3,
+            partial_cycles: 2,
         };
 
         let metrics = collect_scanner_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 48);
+        assert_eq!(metrics.len(), 54);
 
         let objects = metrics.iter().find(|m| m.value == 1000000.0);
         assert!(objects.is_some());
@@ -332,6 +378,11 @@ mod tests {
             .iter()
             .find(|m| m.name == SCANNER_CYCLE_INTERVAL_SECONDS_MD.get_full_metric_name());
         assert_eq!(cycle_interval_seconds.map(|m| m.value), Some(3600.0));
+
+        let cycle_max_duration_seconds = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_CYCLE_MAX_DURATION_SECONDS_MD.get_full_metric_name());
+        assert_eq!(cycle_max_duration_seconds.map(|m| m.value), Some(1800.0));
 
         let bitrot_cycle_enabled = metrics
             .iter()
@@ -402,6 +453,16 @@ mod tests {
             .iter()
             .find(|m| m.name == SCANNER_CURRENT_CYCLE_YIELD_DURATION_SECONDS_MD.get_full_metric_name());
         assert_eq!(current_cycle_yield_duration.map(|m| m.value), Some(1.25));
+
+        let current_cycle_throttle_sleep_events = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_EVENTS_MD.get_full_metric_name());
+        assert_eq!(current_cycle_throttle_sleep_events.map(|m| m.value), Some(4.0));
+
+        let current_cycle_throttle_sleep_duration = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD.get_full_metric_name());
+        assert_eq!(current_cycle_throttle_sleep_duration.map(|m| m.value), Some(2.5));
 
         let current_cycle_ilm_actions = metrics
             .iter()
@@ -483,6 +544,16 @@ mod tests {
             .find(|m| m.name == SCANNER_LAST_CYCLE_YIELD_DURATION_SECONDS_MD.get_full_metric_name());
         assert_eq!(last_cycle_yield_duration.map(|m| m.value), Some(9.5));
 
+        let last_cycle_throttle_sleep_events = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_LAST_CYCLE_THROTTLE_SLEEP_EVENTS_MD.get_full_metric_name());
+        assert_eq!(last_cycle_throttle_sleep_events.map(|m| m.value), Some(12.0));
+
+        let last_cycle_throttle_sleep_duration = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_LAST_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD.get_full_metric_name());
+        assert_eq!(last_cycle_throttle_sleep_duration.map(|m| m.value), Some(6.75));
+
         let last_cycle_ilm_actions = metrics
             .iter()
             .find(|m| m.name == SCANNER_LAST_CYCLE_ILM_ACTIONS_MD.get_full_metric_name());
@@ -507,6 +578,11 @@ mod tests {
             .iter()
             .find(|m| m.name == SCANNER_FAILED_CYCLES_MD.get_full_metric_name());
         assert_eq!(failed_cycles.map(|m| m.value), Some(3.0));
+
+        let partial_cycles = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_PARTIAL_CYCLES_MD.get_full_metric_name());
+        assert_eq!(partial_cycles.map(|m| m.value), Some(2.0));
     }
 
     #[test]
@@ -514,7 +590,7 @@ mod tests {
         let stats = ScannerStats::default();
         let metrics = collect_scanner_metrics(&stats);
 
-        assert_eq!(metrics.len(), 48);
+        assert_eq!(metrics.len(), 54);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());
