@@ -154,44 +154,55 @@ fn spawn_iam_recovery_task(
 }
 
 fn initial_retry_interval() -> Duration {
-    rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_RETRY_INTERVAL_MS)
-        .map(Duration::from_millis)
-        .unwrap_or(IAM_RETRY_INITIAL_INTERVAL)
+    // Only honor the test override in debug builds to prevent accidental
+    // production use via environment configuration.
+    #[cfg(debug_assertions)]
+    if let Some(ms) = rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_RETRY_INTERVAL_MS) {
+        return Duration::from_millis(ms);
+    }
+    IAM_RETRY_INITIAL_INTERVAL
 }
 
 // Sentinel marks "not yet initialized"; env var is read on first call.
 static TEST_REMAINING_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 fn should_fail_test_init_attempt() -> bool {
-    use std::sync::atomic::Ordering;
+    // Only honor the test hook in debug builds to prevent accidental
+    // production use via environment configuration.
+    #[cfg(not(debug_assertions))]
+    return false;
 
-    let mut current = TEST_REMAINING_FAILURES.load(Ordering::SeqCst);
-    if current == u64::MAX {
-        let configured = rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_FAIL_INIT_ATTEMPTS).unwrap_or(0);
-        match TEST_REMAINING_FAILURES.compare_exchange(u64::MAX, configured, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => current = configured,
-            Err(actual) => current = actual,
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::Ordering;
+
+        let mut current = TEST_REMAINING_FAILURES.load(Ordering::SeqCst);
+        if current == u64::MAX {
+            let configured = rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_FAIL_INIT_ATTEMPTS).unwrap_or(0);
+            match TEST_REMAINING_FAILURES.compare_exchange(u64::MAX, configured, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => current = configured,
+                Err(actual) => current = actual,
+            }
         }
-    }
 
-    while current > 0 {
-        match TEST_REMAINING_FAILURES.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return true,
-            Err(actual) => current = actual,
+        while current > 0 {
+            match TEST_REMAINING_FAILURES.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
         }
-    }
 
-    false
+        false
+    }
 }
 
 /// Reset the test failure counter so the next `should_fail_test_init_attempt`
-/// call re-reads the environment variable. No-op when env var is not set.
+/// call re-reads the environment variable by restoring the sentinel value.
 /// Intended for use in integration tests that share a process.
 #[doc(hidden)]
 pub fn reset_test_failure_counter() {
     use std::sync::atomic::Ordering;
-    let configured = rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_FAIL_INIT_ATTEMPTS).unwrap_or(0);
-    TEST_REMAINING_FAILURES.store(configured, Ordering::SeqCst);
+    TEST_REMAINING_FAILURES.store(u64::MAX, Ordering::SeqCst);
 }
 
 async fn attempt_init_iam_sys(store: Arc<ECStore>) -> std::result::Result<(), std::io::Error> {
