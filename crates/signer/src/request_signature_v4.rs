@@ -136,7 +136,7 @@ fn try_get_hashed_payload(req: &request::Request<Body>) -> SignResult<String> {
     Ok(hashed_payload.to_string())
 }
 
-fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&str>) -> SignResult<String> {
+fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&'static str>) -> SignResult<String> {
     let mut headers = Vec::<String>::new();
     let mut vals = HashMap::<String, Vec<String>>::new();
     for k in req.headers().keys() {
@@ -210,7 +210,7 @@ fn header_exists(key: &str, headers: &[String]) -> bool {
     false
 }
 
-fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&str>) -> String {
+fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&'static str>) -> String {
     let mut headers = Vec::<String>::new();
     let headers_ref = req.headers();
     debug!("get_signed_headers headers: {:?}", headers_ref);
@@ -229,7 +229,7 @@ fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&s
 
 fn try_get_canonical_request(
     req: &request::Request<Body>,
-    ignored_headers: &HashSet<&str>,
+    ignored_headers: &HashSet<&'static str>,
     hashed_payload: &str,
 ) -> SignResult<String> {
     let mut canonical_query_string = String::new();
