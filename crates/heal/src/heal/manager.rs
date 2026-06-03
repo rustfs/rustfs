@@ -149,6 +149,50 @@ impl PriorityHealQueue {
         QueuePushOutcome::Accepted
     }
 
+    fn can_displace_lower_priority(&self, priority: HealPriority) -> bool {
+        self.heap.iter().any(|item| item.priority < priority)
+    }
+
+    fn push_displacing_lower_priority(&mut self, request: HealRequest) -> Option<HealRequest> {
+        let mut retained = BinaryHeap::new();
+        let mut displaced: Option<PriorityQueueItem> = None;
+
+        while let Some(item) = self.heap.pop() {
+            if item.priority < request.priority {
+                let should_displace = displaced
+                    .as_ref()
+                    .map(|current| {
+                        item.priority < current.priority
+                            || (item.priority == current.priority && item.sequence > current.sequence)
+                    })
+                    .unwrap_or(true);
+                if should_displace {
+                    if let Some(current) = displaced.replace(item) {
+                        retained.push(current);
+                    }
+                } else {
+                    retained.push(item);
+                }
+            } else {
+                retained.push(item);
+            }
+        }
+
+        self.heap = retained;
+
+        let displaced = displaced.map(|item| {
+            let key = Self::make_dedup_key(&item.request);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+            item.request
+        });
+
+        if displaced.is_some() {
+            debug_assert_eq!(self.push(request), QueuePushOutcome::Accepted);
+        }
+
+        displaced
+    }
+
     /// Get statistics about queue contents by priority
     fn get_priority_stats(&self) -> HashMap<HealPriority, usize> {
         let mut stats = HashMap::new();
@@ -578,6 +622,37 @@ impl HealManager {
         }
 
         if queue_len >= queue_capacity && !request.force_start {
+            if queue.can_displace_lower_priority(request.priority) {
+                let request_id = request.id.clone();
+                let priority = request.priority;
+                if let Some(displaced) = queue.push_displacing_lower_priority(request) {
+                    publish_heal_queue_length(&queue);
+                    warn!(
+                        request_id = %request_id,
+                        priority = ?priority,
+                        displaced_request_id = %displaced.id,
+                        displaced_priority = ?displaced.priority,
+                        queue_len,
+                        queue_capacity,
+                        "Admitted heal request by displacing lower-priority queued work"
+                    );
+                    drop(queue);
+                    if config.event_driven_scheduler_enable {
+                        self.notify.notify_one();
+                    }
+                    return Ok(HealAdmissionResult::Accepted);
+                }
+
+                warn!(
+                    request_id = %request_id,
+                    priority = ?priority,
+                    queue_len,
+                    queue_capacity,
+                    "Heal queue was full and lower-priority work was unavailable for displacement"
+                );
+                return Ok(HealAdmissionResult::Full);
+            }
+
             let admission = Self::classify_full_admission(&request, &config);
             match admission {
                 HealAdmissionResult::Dropped(reason) => {
@@ -2132,6 +2207,59 @@ mod tests {
                 .await
                 .expect("low priority request should be dropped with explicit admission result"),
             HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_high_priority_request_displaces_lower_priority_when_queue_full() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        );
+
+        let low = HealRequest::new(
+            HealType::Bucket {
+                bucket: "background-bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let low_id = low.id.clone();
+        let high = HealRequest::new(
+            HealType::Bucket {
+                bucket: "manual-bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::High,
+        );
+        let high_id = high.id.clone();
+
+        assert_eq!(
+            manager
+                .submit_heal_request(low)
+                .await
+                .expect("low priority request should be accepted first"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(high)
+                .await
+                .expect("high priority request should be admitted by displacing lower priority work"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(manager.get_queue_length().await, 1);
+        assert!(matches!(manager.get_task_status(&low_id).await, Err(Error::TaskNotFound { .. })));
+        assert_eq!(
+            manager
+                .get_task_status(&high_id)
+                .await
+                .expect("high priority request should remain queued"),
+            HealTaskStatus::Pending
         );
     }
 

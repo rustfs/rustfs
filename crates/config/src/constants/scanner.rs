@@ -37,6 +37,16 @@ pub const ENV_SCANNER_CYCLE: &str = "RUSTFS_SCANNER_CYCLE";
 /// - Example: `export RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS=1800`
 pub const ENV_SCANNER_CYCLE_MAX_DURATION_SECS: &str = "RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS";
 
+/// Environment variable that caps objects processed by one scanner cycle.
+/// A value of `0` disables the per-cycle object budget.
+/// - Example: `export RUSTFS_SCANNER_CYCLE_MAX_OBJECTS=1000000`
+pub const ENV_SCANNER_CYCLE_MAX_OBJECTS: &str = "RUSTFS_SCANNER_CYCLE_MAX_OBJECTS";
+
+/// Environment variable that caps directories entered by one scanner cycle.
+/// A value of `0` disables the per-cycle directory budget.
+/// - Example: `export RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES=100000`
+pub const ENV_SCANNER_CYCLE_MAX_DIRECTORIES: &str = "RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES";
+
 /// Environment variable that selects the scanner speed preset.
 /// Valid values: `fastest`, `fast`, `default`, `slow`, `slowest`.
 /// Controls the sleep factor, maximum sleep duration, and cycle interval.
@@ -49,6 +59,14 @@ pub const DEFAULT_SCANNER_SPEED: &str = "default";
 /// Default scanner cycle runtime budget.
 /// `0` keeps the existing unbounded per-cycle behavior.
 pub const DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS: u64 = 0;
+
+/// Default scanner per-cycle object budget.
+/// `0` keeps the existing unbounded per-cycle behavior.
+pub const DEFAULT_SCANNER_CYCLE_MAX_OBJECTS: u64 = 0;
+
+/// Default scanner per-cycle directory budget.
+/// `0` keeps the existing unbounded per-cycle behavior.
+pub const DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES: u64 = 0;
 
 /// Environment variable that specifies the periodic bitrot scan cycle in seconds.
 /// When set to `0`, `true`, `on`, or `yes`, every scanner cycle runs in deep mode.
