@@ -2830,7 +2830,7 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(PreconditionFailed));
         }
 
-        if cp_src_dst_same {
+        if cp_src_dst_same && src_info.transitioned_object.tier.is_empty() {
             src_info.metadata_only = true;
         }
 
