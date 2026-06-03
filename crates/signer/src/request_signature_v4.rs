@@ -16,7 +16,7 @@ use bytes::BytesMut;
 use http::HeaderMap;
 use http::Uri;
 use http::request;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::LazyLock;
 use time::{OffsetDateTime, macros::format_description};
@@ -63,12 +63,12 @@ struct SignFailure {
 type SignOutcome = std::result::Result<request::Request<Body>, Box<SignFailure>>;
 
 #[allow(non_upper_case_globals)] // FIXME
-static v4_ignored_headers: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
-    let mut m = <HashMap<String, bool>>::new();
-    m.insert("accept-encoding".to_string(), true);
-    m.insert("authorization".to_string(), true);
-    m.insert("user-agent".to_string(), true);
-    m
+static v4_ignored_headers: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    let mut s = HashSet::new();
+    s.insert("accept-encoding");
+    s.insert("authorization");
+    s.insert("user-agent");
+    s
 });
 
 fn fail(request: request::Request<Body>, error: SignV4Error) -> SignOutcome {
@@ -136,11 +136,11 @@ fn try_get_hashed_payload(req: &request::Request<Body>) -> SignResult<String> {
     Ok(hashed_payload.to_string())
 }
 
-fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> SignResult<String> {
+fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&str>) -> SignResult<String> {
     let mut headers = Vec::<String>::new();
     let mut vals = HashMap::<String, Vec<String>>::new();
     for k in req.headers().keys() {
-        if ignored_headers.get(&k.to_string()).is_some() {
+        if ignored_headers.contains(k.as_str()) {
             continue;
         }
         headers.push(k.as_str().to_lowercase());
@@ -210,12 +210,12 @@ fn header_exists(key: &str, headers: &[String]) -> bool {
     false
 }
 
-fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> String {
+fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&str>) -> String {
     let mut headers = Vec::<String>::new();
     let headers_ref = req.headers();
     debug!("get_signed_headers headers: {:?}", headers_ref);
     for (k, _) in headers_ref {
-        if ignored_headers.get(&k.to_string()).is_some() {
+        if ignored_headers.contains(k.as_str()) {
             continue;
         }
         headers.push(k.as_str().to_lowercase());
@@ -229,43 +229,52 @@ fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashMap<St
 
 fn try_get_canonical_request(
     req: &request::Request<Body>,
-    ignored_headers: &HashMap<String, bool>,
+    ignored_headers: &HashSet<&str>,
     hashed_payload: &str,
 ) -> SignResult<String> {
-    let mut canonical_query_string = "".to_string();
+    let mut canonical_query_string = String::new();
     if let Some(q) = req.uri().query() {
-        // Parse query string into key-value pairs
-        let mut query_params: Vec<(String, String)> = Vec::new();
+        // Parse query string into key-value pairs (zero-copy slices)
+        let mut query_params: Vec<(&str, &str)> = Vec::new();
         if !q.is_empty() {
             for param in q.split('&') {
                 if let Some((key, value)) = param.split_once('=') {
-                    query_params.push((key.to_string(), value.to_string()));
+                    query_params.push((key, value));
                 } else {
-                    query_params.push((param.to_string(), "".to_string()));
+                    query_params.push((param, ""));
                 }
             }
         }
 
         // Sort by key name
-        query_params.sort_by(|a, b| a.0.cmp(&b.0));
+        query_params.sort_by(|a, b| a.0.cmp(b.0));
 
-        // Build canonical query string
-        //println!("query_params: {query_params:?}");
-        let sorted_params: Vec<String> = query_params.iter().map(|(k, v)| format!("{k}={v}")).collect();
-
-        canonical_query_string = sorted_params.join("&");
+        // Build canonical query string with push_str (no intermediate allocations)
+        for (i, (k, v)) in query_params.iter().enumerate() {
+            if i > 0 {
+                canonical_query_string.push('&');
+            }
+            canonical_query_string.push_str(k);
+            canonical_query_string.push('=');
+            canonical_query_string.push_str(v);
+        }
         canonical_query_string = canonical_query_string.replace("+", "%20");
     }
 
-    let canonical_request = [
-        req.method().to_string(),
-        req.uri().path().to_string(),
-        canonical_query_string,
-        try_get_canonical_headers(req, ignored_headers)?,
-        get_signed_headers(req, ignored_headers),
-        hashed_payload.to_string(),
-    ];
-    Ok(canonical_request.join("\n"))
+    // Build canonical request with a single allocation
+    let mut canonical_request = String::with_capacity(256);
+    canonical_request.push_str(req.method().as_str());
+    canonical_request.push('\n');
+    canonical_request.push_str(req.uri().path());
+    canonical_request.push('\n');
+    canonical_request.push_str(&canonical_query_string);
+    canonical_request.push('\n');
+    canonical_request.push_str(&try_get_canonical_headers(req, ignored_headers)?);
+    canonical_request.push('\n');
+    canonical_request.push_str(&get_signed_headers(req, ignored_headers));
+    canonical_request.push('\n');
+    canonical_request.push_str(hashed_payload);
+    Ok(canonical_request)
 }
 
 fn try_get_string_to_sign_v4(
