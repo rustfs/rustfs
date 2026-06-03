@@ -16,6 +16,7 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use reqwest::StatusCode;
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
+use rustfs_config::{ENV_TEST_IAM_FAIL_INIT_ATTEMPTS, ENV_TEST_IAM_RETRY_INTERVAL_MS};
 use std::time::Duration;
 use temp_env::async_with_vars;
 
@@ -35,8 +36,8 @@ fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
 async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
     async_with_vars(
         [
-            ("RUSTFS_TEST_IAM_FAIL_INIT_ATTEMPTS", Some("1")),
-            ("RUSTFS_TEST_IAM_RETRY_INTERVAL_MS", Some("500")),
+            (ENV_TEST_IAM_FAIL_INIT_ATTEMPTS, Some("1")),
+            (ENV_TEST_IAM_RETRY_INTERVAL_MS, Some("500")),
         ],
         async {
             let port = find_available_port().expect("find free port");

@@ -604,7 +604,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         jiff::Zoned::now()
     );
     if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
-        rustfs::server::publish_ready_when_runtime_ready(readiness.as_ref(), Some(&state_manager)).await?;
+        rustfs::server::publish_ready_when_runtime_ready(readiness.as_ref(), Some(state_manager.as_ref())).await?;
     }
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;

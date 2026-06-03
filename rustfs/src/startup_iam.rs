@@ -29,8 +29,6 @@ const IAM_RETRY_INITIAL_INTERVAL: Duration = Duration::from_secs(5);
 const IAM_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 /// After this many retries (~5 min at initial interval), escalate log level to ERROR.
 const IAM_RETRY_ESCALATION_THRESHOLD: u64 = 12;
-const TEST_ENV_IAM_FAIL_INIT_ATTEMPTS: &str = "RUSTFS_TEST_IAM_FAIL_INIT_ATTEMPTS";
-const TEST_ENV_IAM_RETRY_INTERVAL_MS: &str = "RUSTFS_TEST_IAM_RETRY_INTERVAL_MS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IamBootstrapDisposition {
@@ -207,7 +205,7 @@ fn initial_retry_interval() -> Duration {
     // Only honor the test override in debug builds to prevent accidental
     // production use via environment configuration.
     #[cfg(debug_assertions)]
-    if let Some(ms) = rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_RETRY_INTERVAL_MS) {
+    if let Some(ms) = rustfs_utils::get_env_opt_u64(rustfs_config::ENV_TEST_IAM_RETRY_INTERVAL_MS) {
         return Duration::from_millis(ms);
     }
     IAM_RETRY_INITIAL_INTERVAL
@@ -228,7 +226,7 @@ fn should_fail_test_init_attempt() -> bool {
 
         let mut current = TEST_REMAINING_FAILURES.load(Ordering::SeqCst);
         if current == u64::MAX {
-            let configured = rustfs_utils::get_env_opt_u64(TEST_ENV_IAM_FAIL_INIT_ATTEMPTS).unwrap_or(0);
+            let configured = rustfs_utils::get_env_opt_u64(rustfs_config::ENV_TEST_IAM_FAIL_INIT_ATTEMPTS).unwrap_or(0);
             match TEST_REMAINING_FAILURES.compare_exchange(u64::MAX, configured, Ordering::SeqCst, Ordering::SeqCst) {
                 Ok(_) => current = configured,
                 Err(actual) => current = actual,
