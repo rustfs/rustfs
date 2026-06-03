@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary, hash_path};
 use crate::error::ScannerError;
+use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_io::ScannerIODisk as _;
 use crate::sleeper::{DynamicSleeper, scanner_yield_every_n_objects};
 use metrics::{counter, describe_counter};
@@ -708,6 +709,7 @@ pub struct FolderScanner {
 
     update_current_path: UpdateCurrentPathFn,
 
+    budget: Arc<ScannerCycleBudget>,
     skip_heal: Arc<std::sync::atomic::AtomicBool>,
     local_disk: Arc<Disk>,
 }
@@ -876,6 +878,9 @@ impl FolderScanner {
         let done_folder = Metrics::time(Metric::ScanFolder);
 
         if ctx.is_cancelled() {
+            return Err(ScannerError::Other("Operation cancelled".to_string()));
+        }
+        if !self.budget.try_start_directory() {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
         }
 
@@ -1105,14 +1110,23 @@ impl FolderScanner {
                 apply_scanner_size_summary(into, &sz);
                 into.objects += 1;
                 object_count += 1;
+                self.budget.record_object_scanned();
 
                 timer.sleep().await;
+
+                if ctx.is_cancelled() {
+                    return Err(ScannerError::Other("Operation cancelled".to_string()));
+                }
 
                 if should_yield_after_object(object_count, yield_every_objects) {
                     let yield_start = Instant::now();
                     tokio::task::yield_now().await;
                     global_metrics().record_scanner_yield(yield_start.elapsed());
                 }
+            }
+
+            if ctx.is_cancelled() {
+                return Err(ScannerError::Other("Operation cancelled".to_string()));
             }
 
             if found_objects && is_erasure().await {
@@ -1194,6 +1208,9 @@ impl FolderScanner {
                     // Use Box::pin for recursive async call
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
                     if let Err(e) = fut.await {
+                        if ctx.is_cancelled() {
+                            return Err(e);
+                        }
                         warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
                         continue;
                     }
@@ -1247,6 +1264,9 @@ impl FolderScanner {
                     // Use Box::pin for recursive async call
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
                     if let Err(e) = fut.await {
+                        if ctx.is_cancelled() {
+                            return Err(e);
+                        }
                         warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
                         continue;
                     }
@@ -1483,6 +1503,9 @@ impl FolderScanner {
                         // Use Box::pin for recursive async call
                         let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
                         if let Err(e) = fut.await {
+                            if ctx.is_cancelled() {
+                                return Err(e);
+                            }
                             warn!("scan_folder: failed to scan child folder {}: {}", folder_item.name, e);
                             continue;
                         }
@@ -1570,6 +1593,7 @@ impl FolderScanner {
 #[allow(clippy::too_many_arguments)]
 pub async fn scan_data_folder(
     ctx: CancellationToken,
+    budget: Arc<ScannerCycleBudget>,
     disks: Vec<Arc<Disk>>,
     local_disk: Arc<Disk>,
     cache: DataUsageCache,
@@ -1630,6 +1654,7 @@ pub async fn scan_data_folder(
         updates,
         last_update: SystemTime::UNIX_EPOCH,
         update_current_path,
+        budget,
         skip_heal,
         local_disk,
     };
@@ -1648,7 +1673,7 @@ pub async fn scan_data_folder(
     };
 
     // Scan the folder
-    match scanner.scan_folder(ctx, folder, &mut root).await {
+    match scanner.scan_folder(ctx.clone(), folder, &mut root).await {
         Ok(()) => {
             // Get the new cache and finalize it
             let new_cache = scanner.as_mut_new_cache();
@@ -1660,6 +1685,26 @@ pub async fn scan_data_folder(
             Ok(new_cache.clone())
         }
         Err(e) => {
+            if ctx.is_cancelled() {
+                let root_has_progress = !root.children.is_empty()
+                    || root.size > 0
+                    || root.objects > 0
+                    || root.versions > 0
+                    || root.delete_markers > 0
+                    || root.failed_objects > 0
+                    || root.replication_stats.is_some();
+                let new_cache = scanner.as_mut_new_cache();
+                if root_has_progress {
+                    new_cache.replace_hashed(&hash_path(&cache.info.name), &None, &root);
+                }
+                if new_cache.root().is_some() {
+                    new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
+                    new_cache.info.last_update = Some(SystemTime::now());
+                    new_cache.info.next_cycle = cache.info.next_cycle;
+                    close_disk().await;
+                    return Err(ScannerError::PartialCache(Box::new(new_cache.clone())));
+                }
+            }
             close_disk().await;
             // No useful information, return original cache
             Err(e)
@@ -1716,6 +1761,7 @@ mod tests {
             updates: None,
             last_update: SystemTime::UNIX_EPOCH,
             update_current_path,
+            budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
             skip_heal: Arc::new(AtomicBool::new(false)),
             local_disk: disk,
         };
@@ -2136,6 +2182,102 @@ mod tests {
         .await
         .expect("scan_folder should not hang after list_path_raw finishes")
         .expect("scan_folder should finish successfully");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_folder_directory_budget_cancels_after_limit() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+
+        let bucket_dir = temp_dir.join("bucket");
+        tokio::fs::create_dir_all(bucket_dir.join("child"))
+            .await
+            .expect("failed to create child directory");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(
+            &parent,
+            crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_directories: Some(1),
+                ..Default::default()
+            },
+        );
+        let ctx = budget.token();
+        scanner.budget = budget.clone();
+
+        let folder = CachedFolder {
+            name: "bucket".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+
+        let mut into = DataUsageEntry::default();
+        let result = scanner.scan_folder(ctx, folder, &mut into).await;
+
+        assert!(result.is_err(), "directory budget cancellation should make the scan partial");
+        assert!(budget.budget_elapsed());
+        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
+        assert!(budget.token().is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+
+        let bucket_dir = temp_dir.join("bucket");
+        tokio::fs::create_dir_all(bucket_dir.join("child-a"))
+            .await
+            .expect("failed to create first child directory");
+        tokio::fs::create_dir_all(bucket_dir.join("child-b"))
+            .await
+            .expect("failed to create second child directory");
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(
+            &parent,
+            crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_directories: Some(2),
+                ..Default::default()
+            },
+        );
+        let cache = DataUsageCache {
+            info: crate::data_usage_define::DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = scan_data_folder(
+            budget.token(),
+            budget.clone(),
+            vec![scanner.local_disk.clone()],
+            scanner.local_disk.clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await;
+
+        let partial_cache = match result {
+            Err(ScannerError::PartialCache(partial_cache)) => partial_cache,
+            other => panic!("expected partial cache after directory budget cancellation, got {other:?}"),
+        };
+
+        assert!(partial_cache.info.last_update.is_some());
+        assert_eq!(partial_cache.info.next_cycle, 7);
+        assert!(partial_cache.root().is_some(), "partial cache should keep completed scan progress");
+        assert!(budget.budget_elapsed());
+        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
     }
 
     #[tokio::test]
