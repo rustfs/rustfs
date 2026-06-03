@@ -28,6 +28,7 @@ pub const OIDC_GROUPS_CLAIM: &str = "groups_claim";
 pub const OIDC_ROLES_CLAIM: &str = "roles_claim";
 pub const OIDC_EMAIL_CLAIM: &str = "email_claim";
 pub const OIDC_USERNAME_CLAIM: &str = "username_claim";
+pub const OIDC_HIDE_FROM_UI: &str = "hide_from_ui";
 
 // Environment variable names for OIDC
 pub const ENV_IDENTITY_OPENID_ENABLE: &str = "RUSTFS_IDENTITY_OPENID_ENABLE";
@@ -46,9 +47,10 @@ pub const ENV_IDENTITY_OPENID_GROUPS_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_GROUP
 pub const ENV_IDENTITY_OPENID_ROLES_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_ROLES_CLAIM";
 pub const ENV_IDENTITY_OPENID_EMAIL_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_EMAIL_CLAIM";
 pub const ENV_IDENTITY_OPENID_USERNAME_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_USERNAME_CLAIM";
+pub const ENV_IDENTITY_OPENID_HIDE_FROM_UI: &str = "RUSTFS_IDENTITY_OPENID_HIDE_FROM_UI";
 
 /// List of all environment variable keys for an OIDC provider.
-pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 16] = &[
+pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 17] = &[
     ENV_IDENTITY_OPENID_ENABLE,
     ENV_IDENTITY_OPENID_CONFIG_URL,
     ENV_IDENTITY_OPENID_CLIENT_ID,
@@ -65,6 +67,7 @@ pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 16] = &[
     ENV_IDENTITY_OPENID_ROLES_CLAIM,
     ENV_IDENTITY_OPENID_EMAIL_CLAIM,
     ENV_IDENTITY_OPENID_USERNAME_CLAIM,
+    ENV_IDENTITY_OPENID_HIDE_FROM_UI,
 ];
 
 /// A list of all valid configuration keys for an OIDC provider.
@@ -85,6 +88,7 @@ pub const IDENTITY_OPENID_KEYS: &[&str] = &[
     OIDC_ROLES_CLAIM,
     OIDC_EMAIL_CLAIM,
     OIDC_USERNAME_CLAIM,
+    OIDC_HIDE_FROM_UI,
     crate::COMMENT_KEY,
 ];
 

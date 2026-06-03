@@ -244,6 +244,8 @@ pub const BUCKET_ACCELERATE_CONFIG: &str = "accelerate.xml";
 pub const BUCKET_REQUEST_PAYMENT_CONFIG: &str = "request-payment.xml";
 pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
+pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
+pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
 
 #[derive(Debug, Clone)]
 pub struct BucketMetadata {
@@ -268,6 +270,7 @@ pub struct BucketMetadata {
     pub request_payment_config_xml: Vec<u8>,
     pub public_access_block_config_xml: Vec<u8>,
     pub bucket_acl_config_json: Vec<u8>,
+    pub table_bucket_config_json: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -287,6 +290,7 @@ pub struct BucketMetadata {
     pub request_payment_config_updated_at: OffsetDateTime,
     pub public_access_block_config_updated_at: OffsetDateTime,
     pub bucket_acl_config_updated_at: OffsetDateTime,
+    pub table_bucket_config_updated_at: OffsetDateTime,
 
     pub new_field_updated_at: OffsetDateTime,
 
@@ -334,6 +338,7 @@ impl Default for BucketMetadata {
             request_payment_config_xml: Default::default(),
             public_access_block_config_xml: Default::default(),
             bucket_acl_config_json: Default::default(),
+            table_bucket_config_json: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -352,6 +357,7 @@ impl Default for BucketMetadata {
             request_payment_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             public_access_block_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             bucket_acl_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            table_bucket_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -395,6 +401,10 @@ impl BucketMetadata {
 
     pub fn object_locking(&self) -> bool {
         self.lock_enabled || (self.versioning_config.as_ref().is_some_and(|v| v.enabled()))
+    }
+
+    pub fn table_bucket_enabled(&self) -> bool {
+        !self.table_bucket_config_json.is_empty()
     }
 
     /// Decode from msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
@@ -447,6 +457,7 @@ impl BucketMetadata {
                     self.public_access_block_config_xml = read_msgp_bin(rd)?
                 }
                 "BucketAclConfigJSON" | "BucketAclConfigJson" => self.bucket_acl_config_json = read_msgp_bin(rd)?,
+                "TableBucketConfigJSON" | "TableBucketConfigJson" => self.table_bucket_config_json = read_msgp_bin(rd)?,
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
                 "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,
@@ -454,6 +465,7 @@ impl BucketMetadata {
                 "RequestPaymentConfigUpdatedAt" => self.request_payment_config_updated_at = read_msgp_time_value(rd)?,
                 "PublicAccessBlockConfigUpdatedAt" => self.public_access_block_config_updated_at = read_msgp_time_value(rd)?,
                 "BucketAclConfigUpdatedAt" => self.bucket_acl_config_updated_at = read_msgp_time_value(rd)?,
+                "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
                     skip_msgp_value(rd)?;
@@ -466,8 +478,8 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (14)
-        let map_len: u32 = 39;
+        // Map size: MinIO fields (25) + RustFS extensions (16)
+        let map_len: u32 = 41;
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -523,6 +535,7 @@ impl BucketMetadata {
         write_bin_field(wr, "RequestPaymentConfigXML", &self.request_payment_config_xml)?;
         write_bin_field(wr, "PublicAccessBlockConfigXML", &self.public_access_block_config_xml)?;
         write_bin_field(wr, "BucketAclConfigJSON", &self.bucket_acl_config_json)?;
+        write_bin_field(wr, "TableBucketConfigJSON", &self.table_bucket_config_json)?;
         rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
         write_msgp_time(wr, self.cors_config_updated_at)?;
         rmp::encode::write_str(wr, "LoggingConfigUpdatedAt")?;
@@ -537,6 +550,8 @@ impl BucketMetadata {
         write_msgp_time(wr, self.public_access_block_config_updated_at)?;
         rmp::encode::write_str(wr, "BucketAclConfigUpdatedAt")?;
         write_msgp_time(wr, self.bucket_acl_config_updated_at)?;
+        rmp::encode::write_str(wr, "TableBucketConfigUpdatedAt")?;
+        write_msgp_time(wr, self.table_bucket_config_updated_at)?;
 
         Ok(())
     }
@@ -632,6 +647,9 @@ impl BucketMetadata {
         if self.bucket_acl_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.bucket_acl_config_updated_at = self.created
         }
+        if self.table_bucket_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.table_bucket_config_updated_at = self.created
+        }
     }
 
     pub fn update_config(&mut self, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
@@ -708,6 +726,10 @@ impl BucketMetadata {
             BUCKET_ACL_CONFIG => {
                 self.bucket_acl_config_json = data;
                 self.bucket_acl_config_updated_at = updated;
+            }
+            BUCKET_TABLE_CONFIG => {
+                self.table_bucket_config_json = data;
+                self.table_bucket_config_updated_at = updated;
             }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
@@ -1028,6 +1050,10 @@ mod test {
         bm.bucket_acl_config_json = bucket_acl.as_bytes().to_vec();
         bm.bucket_acl_config_updated_at = OffsetDateTime::now_utc();
 
+        let table_bucket_marker = r#"{"enabled":true}"#;
+        bm.table_bucket_config_json = table_bucket_marker.as_bytes().to_vec();
+        bm.table_bucket_config_updated_at = OffsetDateTime::now_utc();
+
         // Test serialization
         let buf = bm.marshal_msg().unwrap();
         assert!(!buf.is_empty(), "Serialized buffer should not be empty");
@@ -1049,6 +1075,7 @@ mod test {
         assert_eq!(bm.quota_config_json, deserialized_bm.quota_config_json);
         assert_eq!(bm.public_access_block_config_xml, deserialized_bm.public_access_block_config_xml);
         assert_eq!(bm.bucket_acl_config_json, deserialized_bm.bucket_acl_config_json);
+        assert_eq!(bm.table_bucket_config_json, deserialized_bm.table_bucket_config_json);
         assert_eq!(bm.object_lock_config_xml, deserialized_bm.object_lock_config_xml);
         assert_eq!(bm.notification_config_xml, deserialized_bm.notification_config_xml);
         assert_eq!(bm.replication_config_xml, deserialized_bm.replication_config_xml);
@@ -1100,6 +1127,11 @@ mod test {
             bm.bucket_targets_config_meta_updated_at.unix_timestamp(),
             deserialized_bm.bucket_targets_config_meta_updated_at.unix_timestamp()
         );
+        assert_eq!(
+            bm.table_bucket_config_updated_at.unix_timestamp(),
+            deserialized_bm.table_bucket_config_updated_at.unix_timestamp()
+        );
+        assert!(deserialized_bm.table_bucket_enabled());
 
         // Test that the serialized data contains expected content
         let buf_str = String::from_utf8_lossy(&buf);
@@ -1114,6 +1146,20 @@ mod test {
         println!("   - Policy config size: {} bytes", deserialized_bm.policy_config_json.len());
         println!("   - Lifecycle config size: {} bytes", deserialized_bm.lifecycle_config_xml.len());
         println!("   - Serialized buffer size: {} bytes", buf.len());
+    }
+
+    #[test]
+    fn table_bucket_marker_tracks_config_presence() {
+        let mut bm = BucketMetadata::new("table-bucket");
+        assert!(!bm.table_bucket_enabled());
+
+        bm.update_config(BUCKET_TABLE_CONFIG, br#"{"enabled":true}"#.to_vec())
+            .unwrap();
+        assert!(bm.table_bucket_enabled());
+        assert!(!bm.table_bucket_config_json.is_empty());
+
+        bm.update_config(BUCKET_TABLE_CONFIG, Vec::new()).unwrap();
+        assert!(!bm.table_bucket_enabled());
     }
 
     /// After policy deletion (policy_config_json cleared), parse_policy_config sets policy_config to None.

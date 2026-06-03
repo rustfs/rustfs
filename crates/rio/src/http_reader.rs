@@ -248,22 +248,24 @@ impl HttpReader {
 
         let resp = request.send().await.map_err(|e| {
             record_internode_error(track_internode_metrics, internode_operation);
-            Error::other(format!("HttpReader HTTP request error: {e}"))
+            Error::other(format!("HttpReader HTTP request error for {method} {url}: {e}"))
         })?;
 
         if resp.status().is_success().not() {
             record_internode_error(track_internode_metrics, internode_operation);
             return Err(Error::other(format!(
-                "HttpReader HTTP request failed with non-200 status {}",
-                resp.status()
+                "HttpReader HTTP request failed for {method} {url} with non-200 status {}",
+                resp.status(),
             )));
         }
 
         record_internode_outgoing_request(track_internode_metrics, internode_operation);
 
+        let stream_error_url = url.clone();
+        let stream_error_method = method.clone();
         let stream = resp.bytes_stream().map_err(move |e| {
             record_internode_error(track_internode_metrics, internode_operation);
-            Error::other(format!("HttpReader stream error: {e}"))
+            Error::other(format!("HttpReader stream error for {stream_error_method} {stream_error_url}: {e}"))
         });
 
         Ok(Self {
@@ -837,10 +839,13 @@ mod tests {
         assert_eq!(&first, b"hello");
 
         let mut next = [0u8; 1];
-        let err = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut next))
+        let read_result = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut next))
             .await
-            .expect("stall timeout should wake reader")
-            .expect_err("reader should return a timeout error");
+            .expect("stall timeout should wake reader");
+        let err = match read_result {
+            Ok(_) => panic!("reader should return a timeout error"),
+            Err(err) => err,
+        };
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 
         handle.abort();
@@ -896,6 +901,23 @@ mod tests {
         assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"hello world".to_vec()]);
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_reader_request_error_includes_method_and_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let url = format!("http://{addr}/stream");
+        let err = match HttpReader::new(url.clone(), Method::GET, HeaderMap::new(), None).await {
+            Ok(_) => panic!("closed listener should trigger request error"),
+            Err(err) => err,
+        };
+
+        let err_text = err.to_string();
+        assert!(err_text.contains("HttpReader HTTP request error for GET"));
+        assert!(err_text.contains(&url));
     }
 
     #[test]

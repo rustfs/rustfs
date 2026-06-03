@@ -20,7 +20,7 @@ use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report,
-    is_admin_path,
+    has_path_prefix, is_admin_path,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
@@ -852,12 +852,12 @@ fn is_object_attributes_request(req: &HttpRequest<Incoming>) -> bool {
     }
 
     let path = req.uri().path();
-    if path.starts_with(ADMIN_PREFIX)
-        || path.starts_with(MINIO_ADMIN_PREFIX)
-        || path.starts_with(RUSTFS_ADMIN_PREFIX)
-        || path.starts_with(MINIO_ADMIN_V3_PREFIX)
-        || path.starts_with(CONSOLE_PREFIX)
-        || path.starts_with(RPC_PREFIX)
+    if has_path_prefix(path, ADMIN_PREFIX)
+        || has_path_prefix(path, MINIO_ADMIN_PREFIX)
+        || has_path_prefix(path, RUSTFS_ADMIN_PREFIX)
+        || has_path_prefix(path, MINIO_ADMIN_V3_PREFIX)
+        || has_path_prefix(path, CONSOLE_PREFIX)
+        || has_path_prefix(path, RPC_PREFIX)
     {
         return false;
     }
@@ -898,9 +898,9 @@ impl ConditionalCorsLayer {
 
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
-        !path.starts_with(ADMIN_PREFIX)
-            && !path.starts_with(MINIO_ADMIN_PREFIX)
-            && !path.starts_with(RPC_PREFIX)
+        !has_path_prefix(path, ADMIN_PREFIX)
+            && !has_path_prefix(path, MINIO_ADMIN_PREFIX)
+            && !has_path_prefix(path, RPC_PREFIX)
             && !is_console_path(path)
             && !Self::EXCLUDED_EXACT_PATHS.contains(&path)
     }
@@ -1819,6 +1819,7 @@ mod tests {
         assert!(ConditionalCorsLayer::is_s3_path("/"));
         assert!(!ConditionalCorsLayer::is_s3_path("/rustfs/admin/v3/info"));
         assert!(!ConditionalCorsLayer::is_s3_path("/minio/admin/v3/info"));
+        assert!(ConditionalCorsLayer::is_s3_path("/minio/adminx/object"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health/ready"));
     }

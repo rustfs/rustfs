@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::server::MINIO_ADMIN_PREFIX;
+use crate::server::{MINIO_ADMIN_PREFIX, has_path_prefix};
 use rustfs_crypto::{decrypt_data, decrypt_stream_io, encrypt_stream_io};
 use s3s::{Body, S3Result, s3_error};
 
@@ -21,7 +21,7 @@ pub(crate) fn has_space_be(s: &str) -> bool {
 }
 
 pub(crate) fn is_compat_admin_request(path: &str) -> bool {
-    path.starts_with(MINIO_ADMIN_PREFIX)
+    has_path_prefix(path, MINIO_ADMIN_PREFIX)
 }
 
 pub(crate) async fn read_compatible_admin_body(
@@ -63,6 +63,7 @@ mod tests {
     #[test]
     fn detects_compat_admin_paths_only_for_external_prefix() {
         assert!(is_compat_admin_request("/minio/admin/v3/list-users"));
+        assert!(!is_compat_admin_request("/minio/adminx/list-users"));
         assert!(!is_compat_admin_request("/rustfs/admin/v3/list-users"));
     }
 
