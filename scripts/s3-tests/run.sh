@@ -202,7 +202,12 @@ ARTIFACTS_DIR="${PROJECT_ROOT}/artifacts/s3tests-${TEST_MODE}"
 CONTAINER_NAME="rustfs-${TEST_MODE}"
 NETWORK_NAME="rustfs-net"
 DATA_ROOT="${DATA_ROOT:-target}"
-DATA_DIR="${PROJECT_ROOT}/${DATA_ROOT}/test-data/${CONTAINER_NAME}"
+if [[ "${DATA_ROOT}" = /* ]]; then
+    DATA_BASE="${DATA_ROOT}"
+else
+    DATA_BASE="${PROJECT_ROOT}/${DATA_ROOT}"
+fi
+DATA_DIR="${DATA_BASE}/test-data/${CONTAINER_NAME}"
 RUSTFS_PID=""
 
 show_usage() {
@@ -661,8 +666,16 @@ log_info "Generating s3tests config..."
 mkdir -p "${ARTIFACTS_DIR}"
 
 # Resolve template and output paths (relative to PROJECT_ROOT)
-TEMPLATE_PATH="${PROJECT_ROOT}/${S3TESTS_CONF_TEMPLATE}"
-CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+if [[ "${S3TESTS_CONF_TEMPLATE}" = /* ]]; then
+    TEMPLATE_PATH="${S3TESTS_CONF_TEMPLATE}"
+else
+    TEMPLATE_PATH="${PROJECT_ROOT}/${S3TESTS_CONF_TEMPLATE}"
+fi
+if [[ "${S3TESTS_CONF}" = /* ]]; then
+    CONF_OUTPUT_PATH="${S3TESTS_CONF}"
+else
+    CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+fi
 
 # Check if template exists
 if [ ! -f "${TEMPLATE_PATH}" ]; then
@@ -687,9 +700,10 @@ fi
 
 log_info "Using template: ${TEMPLATE_PATH}"
 log_info "Generating config: ${CONF_OUTPUT_PATH}"
+mkdir -p "$(dirname "${CONF_OUTPUT_PATH}")"
 
 # Export all required variables for envsubst
-export S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_ALT_ACCESS_KEY S3_ALT_SECRET_KEY
+export S3_HOST S3_PORT S3_ACCESS_KEY S3_SECRET_KEY S3_ALT_ACCESS_KEY S3_ALT_SECRET_KEY
 envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
     log_error "Failed to generate s3tests config"
     exit 1
@@ -831,7 +845,11 @@ if [ "${XDIST}" != "0" ]; then
 fi
 
 # Resolve config path (absolute path for tox)
-CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+if [[ "${S3TESTS_CONF}" = /* ]]; then
+    CONF_OUTPUT_PATH="${S3TESTS_CONF}"
+else
+    CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+fi
 
 PYTEST_SELECTION_ARGS=()
 if [[ "${USE_FILE_TEST_NODES}" == "true" ]]; then

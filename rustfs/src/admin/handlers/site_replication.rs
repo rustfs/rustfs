@@ -536,8 +536,12 @@ async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
     built
 }
 
-fn runtime_tls_enabled() -> bool {
-    if let Some(tls_enabled) = get_global_endpoints_opt().and_then(|endpoints| {
+fn runtime_tls_enabled_with(endpoints: Option<&rustfs_ecstore::endpoints::EndpointServerPools>) -> bool {
+    if !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty() {
+        return true;
+    }
+
+    if let Some(tls_enabled) = endpoints.and_then(|endpoints| {
         endpoints
             .as_ref()
             .iter()
@@ -548,7 +552,12 @@ fn runtime_tls_enabled() -> bool {
         return tls_enabled;
     }
 
-    !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty()
+    false
+}
+
+fn runtime_tls_enabled() -> bool {
+    let endpoints = get_global_endpoints_opt();
+    runtime_tls_enabled_with(endpoints.as_ref())
 }
 
 fn query_pairs(uri: &Uri) -> HashMap<String, String> {
@@ -3030,6 +3039,8 @@ mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
+    use rustfs_ecstore::disk::endpoint::Endpoint;
+    use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use serial_test::serial;
     use temp_env::with_var;
 
@@ -3226,6 +3237,28 @@ mod tests {
             let endpoint = request_endpoint(&uri, &headers);
 
             assert!(endpoint.starts_with("https://"));
+        });
+    }
+
+    #[test]
+    fn test_runtime_tls_enabled_prefers_explicit_tls_over_http_runtime_endpoint() {
+        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![Endpoint {
+                url: Url::parse("http://127.0.0.1:9000/tmp").unwrap(),
+                is_local: true,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: 0,
+            }]),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+
+        with_var(ENV_RUSTFS_TLS_PATH, Some("/tmp/tls"), || {
+            assert!(runtime_tls_enabled_with(Some(&endpoints)));
         });
     }
 

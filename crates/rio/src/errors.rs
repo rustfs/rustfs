@@ -62,6 +62,13 @@ pub struct ChecksumMismatch {
     pub got: String,
 }
 
+/// Request body ended before the declared size was fully read.
+#[derive(Error, Debug, Clone, PartialEq)]
+#[error("Incomplete body: {remaining} bytes were still expected")]
+pub struct IncompleteBody {
+    pub remaining: i64,
+}
+
 /// Invalid checksum error
 #[derive(Error, Debug, Clone, PartialEq)]
 #[error("invalid checksum")]
