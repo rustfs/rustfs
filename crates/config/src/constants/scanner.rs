@@ -31,6 +31,12 @@ pub const ENV_DATA_SCANNER_START_DELAY_SECS: &str = "RUSTFS_DATA_SCANNER_START_D
 /// - Example: `export RUSTFS_SCANNER_CYCLE=3600` (1 hour)
 pub const ENV_SCANNER_CYCLE: &str = "RUSTFS_SCANNER_CYCLE";
 
+/// Environment variable that caps one scanner cycle's runtime in seconds.
+/// A value of `0` disables the cycle runtime budget.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS=1800`
+pub const ENV_SCANNER_CYCLE_MAX_DURATION_SECS: &str = "RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS";
+
 /// Environment variable that selects the scanner speed preset.
 /// Valid values: `fastest`, `fast`, `default`, `slow`, `slowest`.
 /// Controls the sleep factor, maximum sleep duration, and cycle interval.
@@ -39,6 +45,10 @@ pub const ENV_SCANNER_SPEED: &str = "RUSTFS_SCANNER_SPEED";
 
 /// Default scanner speed preset.
 pub const DEFAULT_SCANNER_SPEED: &str = "default";
+
+/// Default scanner cycle runtime budget.
+/// `0` keeps the existing unbounded per-cycle behavior.
+pub const DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS: u64 = 0;
 
 /// Environment variable that specifies the periodic bitrot scan cycle in seconds.
 /// When set to `0`, `true`, `on`, or `yes`, every scanner cycle runs in deep mode.

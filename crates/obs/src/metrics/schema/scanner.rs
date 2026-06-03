@@ -134,6 +134,15 @@ pub static SCANNER_CYCLE_INTERVAL_SECONDS_MD: LazyLock<MetricDescriptor> = LazyL
     )
 });
 
+pub static SCANNER_CYCLE_MAX_DURATION_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCycleMaxDurationSeconds,
+        "Effective maximum scanner cycle runtime in seconds; zero means unlimited.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
 pub static SCANNER_BITROT_CYCLE_ENABLED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerBitrotCycleEnabled,
@@ -245,7 +254,7 @@ pub static SCANNER_CURRENT_CYCLE_BUCKET_DRIVE_SCANS_PER_SECOND_MD: LazyLock<Metr
 pub static SCANNER_CURRENT_CYCLE_YIELD_EVENTS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerCurrentCycleYieldEvents,
-        "Number of scanner self-throttle yield events in the currently running scanner cycle.",
+        "Number of scanner cooperative yield events in the currently running scanner cycle.",
         &[],
         subsystems::SCANNER,
     )
@@ -254,7 +263,25 @@ pub static SCANNER_CURRENT_CYCLE_YIELD_EVENTS_MD: LazyLock<MetricDescriptor> = L
 pub static SCANNER_CURRENT_CYCLE_YIELD_DURATION_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerCurrentCycleYieldDurationSeconds,
-        "Total scanner self-throttle yield duration in seconds for the currently running scanner cycle.",
+        "Total scanner cooperative yield duration in seconds for the currently running scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_EVENTS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycleThrottleSleepEvents,
+        "Number of scanner self-throttle sleep events in the currently running scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CURRENT_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerCurrentCycleThrottleSleepDurationSeconds,
+        "Total scanner self-throttle sleep duration in seconds for the currently running scanner cycle.",
         &[],
         subsystems::SCANNER,
     )
@@ -308,7 +335,7 @@ pub static SCANNER_CURRENT_SCAN_MODE_MD: LazyLock<MetricDescriptor> = LazyLock::
 pub static SCANNER_LAST_CYCLE_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerLastCycleResult,
-        "Last scanner cycle result: 0 unknown, 1 success, 2 error.",
+        "Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial.",
         &[],
         subsystems::SCANNER,
     )
@@ -389,7 +416,7 @@ pub static SCANNER_LAST_CYCLE_BUCKET_DRIVE_SCANS_PER_SECOND_MD: LazyLock<MetricD
 pub static SCANNER_LAST_CYCLE_YIELD_EVENTS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerLastCycleYieldEvents,
-        "Number of scanner self-throttle yield events in the last finished scanner cycle.",
+        "Number of scanner cooperative yield events in the last finished scanner cycle.",
         &[],
         subsystems::SCANNER,
     )
@@ -398,7 +425,25 @@ pub static SCANNER_LAST_CYCLE_YIELD_EVENTS_MD: LazyLock<MetricDescriptor> = Lazy
 pub static SCANNER_LAST_CYCLE_YIELD_DURATION_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerLastCycleYieldDurationSeconds,
-        "Total scanner self-throttle yield duration in seconds for the last finished scanner cycle.",
+        "Total scanner cooperative yield duration in seconds for the last finished scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_THROTTLE_SLEEP_EVENTS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleThrottleSleepEvents,
+        "Number of scanner self-throttle sleep events in the last finished scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_LAST_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::ScannerLastCycleThrottleSleepDurationSeconds,
+        "Total scanner self-throttle sleep duration in seconds for the last finished scanner cycle.",
         &[],
         subsystems::SCANNER,
     )
@@ -444,6 +489,15 @@ pub static SCANNER_FAILED_CYCLES_MD: LazyLock<MetricDescriptor> = LazyLock::new(
     new_counter_md(
         MetricName::ScannerFailedCycles,
         "Total number of scanner cycles that failed since server start.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_PARTIAL_CYCLES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::ScannerPartialCycles,
+        "Total number of scanner cycles stopped before completion by runtime budget.",
         &[],
         subsystems::SCANNER,
     )

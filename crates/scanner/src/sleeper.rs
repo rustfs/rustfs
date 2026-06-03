@@ -134,7 +134,7 @@ impl DynamicSleeper {
         let sleep_dur = Duration::from_secs_f64(MIN_SLEEP.as_secs_f64() * factor).min(max_sleep);
         if !sleep_dur.is_zero() {
             tokio::time::sleep(sleep_dur).await;
-            global_metrics().record_scanner_yield(sleep_dur);
+            global_metrics().record_scanner_throttle_sleep(sleep_dur);
         }
     }
 
@@ -199,7 +199,7 @@ impl SleepTimer {
             .min(max_sleep);
         if !sleep_dur.is_zero() {
             tokio::time::sleep(sleep_dur).await;
-            global_metrics().record_scanner_yield(sleep_dur);
+            global_metrics().record_scanner_throttle_sleep(sleep_dur);
         }
     }
 }
