@@ -33,7 +33,6 @@ pub enum UpdateCheckError {
 
 /// Version information structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VersionInfo {
     /// Version number
     pub version: String,
