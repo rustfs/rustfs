@@ -81,8 +81,9 @@ impl NotifyRuntimeFacade {
     }
 
     pub async fn replace_targets(&self, activation: RuntimeActivation<Event>) -> Result<(), NotificationError> {
-        let mut target_list = self.target_list.write().await;
+        // Lock order: replay_workers -> target_list (matches notify AGENTS.md).
         let mut replay_workers = self.replay_workers.write().await;
+        let mut target_list = self.target_list.write().await;
         self.runtime_adapter
             .replace_runtime_targets(target_list.runtime_mut(), &mut replay_workers, activation)
             .await
@@ -102,8 +103,9 @@ impl NotifyRuntimeFacade {
         info!("Stops {} active event stream processing tasks", active_targets);
 
         {
-            let mut target_list = self.target_list.write().await;
+            // Lock order: replay_workers -> target_list (matches notify AGENTS.md).
             let mut replay_workers = self.replay_workers.write().await;
+            let mut target_list = self.target_list.write().await;
             if let Err(err) = self
                 .runtime_adapter
                 .shutdown(target_list.runtime_mut(), &mut replay_workers)
