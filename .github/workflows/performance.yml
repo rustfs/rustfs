@@ -40,7 +40,7 @@ env:
 jobs:
   performance-profile:
     name: Performance Profiling
-    runs-on: rustfs
+    runs-on: ubicloud-standard-2
     timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -117,7 +117,7 @@ jobs:
 
   benchmark:
     name: Benchmark Tests
-    runs-on: rustfs
+    runs-on: ubicloud-standard-2
     timeout-minutes: 45
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
