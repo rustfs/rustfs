@@ -30,7 +30,7 @@ use datafusion::{
     object_store::{ObjectStoreExt, path::Path},
     parquet::{
         arrow::{ParquetRecordBatchStreamBuilder, async_reader::ParquetObjectReader},
-        file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData},
+        file::metadata::{ParquetMetaData, RowGroupMetaData},
     },
     physical_plan::ExecutionPlan,
 };
@@ -148,79 +148,27 @@ fn parquet_access_plan(
 fn access_plan_for_scan_range(scan_range: SelectScanRange, metadata: &ParquetMetaData) -> ParquetAccessPlan {
     let mut access_plan = ParquetAccessPlan::new_none(metadata.num_row_groups());
     for (idx, row_group) in metadata.row_groups().iter().enumerate() {
-        // S3 Select parquet ScanRange semantics apply to byte ranges; include any
-        // row group whose on-disk byte span overlaps the requested range.
-        if let Some((start, end)) = row_group_byte_range(row_group) {
-            if spans_overlap(start, end, scan_range.start(), scan_range.end()) {
+        // S3 Select processes a parquet row group when its on-disk start offset
+        // falls inside the requested scan range.
+        if let Some(start) = row_group_start_offset(row_group) {
+            if start >= scan_range.start() && start <= scan_range.end() {
                 access_plan.scan(idx);
             }
         } else {
-            // If row-group byte span is unavailable, fall back to current behavior
-            // and keep compatibility by scanning conservatively.
+            // If row-group start offset is unavailable, keep existing behavior and
+            // scan conservatively.
             access_plan.scan(idx);
         }
     }
     access_plan
 }
 
-fn row_group_byte_range(row_group: &RowGroupMetaData) -> Option<(u64, u64)> {
-    let mut start: Option<u64> = None;
-    let mut end: Option<u64> = None;
-
-    for column in row_group.columns() {
-        if let Some((column_start, column_end)) = column_byte_range(column) {
-            start = Some(start.map_or(column_start, |value| value.min(column_start)));
-            end = Some(end.map_or(column_end, |value| value.max(column_end)));
-        }
-    }
-
-    if let (Some(start), Some(end)) = (start, end) {
-        return Some((start, end));
-    }
-
-    let fallback_start = row_group.file_offset().and_then(non_negative_offset);
-    let fallback_len = non_negative_size(row_group.compressed_size());
-    fallback_start.zip(fallback_len).map(|(start, len)| {
-        let end = if len == 0 {
-            start
-        } else {
-            start.saturating_add(len.saturating_sub(1))
-        };
-        (start, end)
-    })
-}
-
-fn column_byte_range(column: &ColumnChunkMetaData) -> Option<(u64, u64)> {
-    let start = column_start_offset(column)?;
-    let size = non_negative_size(column.compressed_size())?;
-    let end = if size == 0 {
-        start
-    } else {
-        start.saturating_add(size.saturating_sub(1))
-    };
-    Some((start, end))
-}
-
-fn spans_overlap(range_start: u64, range_end: u64, scan_start: u64, scan_end: u64) -> bool {
-    range_start <= scan_end && range_end >= scan_start
-}
-
-fn column_start_offset(column: &ColumnChunkMetaData) -> Option<u64> {
-    [
-        column.dictionary_page_offset().and_then(non_negative_offset),
-        non_negative_offset(column.data_page_offset()),
-    ]
-    .into_iter()
-    .flatten()
-    .min()
+fn row_group_start_offset(row_group: &RowGroupMetaData) -> Option<u64> {
+    row_group.file_offset().and_then(non_negative_offset)
 }
 
 fn non_negative_offset(offset: i64) -> Option<u64> {
     u64::try_from(offset).ok()
-}
-
-fn non_negative_size(size: i64) -> Option<u64> {
-    u64::try_from(size).ok()
 }
 
 fn query_store_error(err: impl fmt::Display) -> QueryError {
@@ -245,64 +193,43 @@ mod tests {
     };
 
     #[test]
-    fn access_plan_selects_row_group_by_overlapping_offsets() {
+    fn access_plan_selects_row_group_by_row_group_start() {
         let metadata = two_row_group_metadata();
-        assert_eq!(metadata.num_row_groups(), 2);
+        let first_start = row_group_start_offset(&metadata.row_groups()[0]).expect("first row group should have start offset");
+        let second_start = row_group_start_offset(&metadata.row_groups()[1]).expect("second row group should have start offset");
 
-        let ranges = metadata
-            .row_groups()
-            .iter()
-            .map(row_group_byte_range)
-            .collect::<Option<Vec<_>>>()
-            .expect("test parquet row groups should have byte ranges");
-        assert!(ranges[0].0 <= ranges[0].1);
-        assert!(ranges[0].1 <= ranges[1].0);
-
-        let (first_start, first_end) = ranges[0];
-        let (second_start, second_end) = ranges[1];
-
-        let overlap_scan = access_plan_for_scan_range(SelectScanRange::new(second_start, second_start), metadata.as_ref());
-        assert!(!overlap_scan.should_scan(0));
-        assert!(overlap_scan.should_scan(1));
-
-        let overlap_inside_plan = access_plan_for_scan_range(
-            SelectScanRange::new(second_start.saturating_add(1), second_start.saturating_add(1)),
-            metadata.as_ref(),
-        );
-        if second_start < second_end {
-            assert!(overlap_inside_plan.should_scan(1));
-            assert!(!overlap_inside_plan.should_scan(0));
+        let first_start_plan = access_plan_for_scan_range(SelectScanRange::new(first_start, first_start), metadata.as_ref());
+        assert!(first_start_plan.should_scan(0));
+        let second_start_plan = access_plan_for_scan_range(SelectScanRange::new(second_start, second_start), metadata.as_ref());
+        assert!(second_start_plan.should_scan(1));
+        if first_start != second_start {
+            assert!(!first_start_plan.should_scan(1));
+            assert!(!second_start_plan.should_scan(0));
         }
 
-        let fallback_plan = access_plan_for_scan_range(SelectScanRange::new(first_start, first_start), metadata.as_ref());
-        assert!(fallback_plan.should_scan(0));
+        let ((lower_start, lower_idx), (higher_start, higher_idx)) = if first_start <= second_start {
+            ((first_start, 0usize), (second_start, 1usize))
+        } else {
+            ((second_start, 1usize), (first_start, 0usize))
+        };
 
-        let boundary_on_first_end = access_plan_for_scan_range(SelectScanRange::new(first_end, first_end), metadata.as_ref());
-        assert!(boundary_on_first_end.should_scan(0));
-
-        if first_end < second_start {
-            assert!(!boundary_on_first_end.should_scan(1));
+        if let Some(before_higher) = higher_start.checked_sub(1)
+            && lower_start <= before_higher
+        {
+            let boundary_plan = access_plan_for_scan_range(SelectScanRange::new(lower_start, before_higher), metadata.as_ref());
+            assert!(boundary_plan.should_scan(lower_idx));
+            assert!(!boundary_plan.should_scan(higher_idx));
         }
+    }
 
-        let boundary_after_first_end = access_plan_for_scan_range(
-            SelectScanRange::new(first_end.saturating_add(1), first_end.saturating_add(1)),
-            metadata.as_ref(),
-        );
-        if first_end < second_start {
-            assert!(!boundary_after_first_end.should_scan(0));
-            if second_start <= first_end.saturating_add(1) {
-                assert!(boundary_after_first_end.should_scan(1));
-            }
-        }
-
-        if second_start < second_end {
-            let boundary_on_second_end =
-                access_plan_for_scan_range(SelectScanRange::new(second_end, second_end), metadata.as_ref());
-            assert!(boundary_on_second_end.should_scan(1));
-            if first_end < second_end {
-                assert!(!boundary_on_second_end.should_scan(0));
-            }
-        }
+    #[test]
+    fn access_plan_uses_row_group_start_not_column_span_overlap() {
+        let metadata = synthetic_overlap_metadata();
+        // Range ends inside the first row group byte span, but should only include
+        // the row group whose start offset is within the requested range.
+        let plan = access_plan_for_scan_range(SelectScanRange::new(100, 190), metadata.as_ref());
+        assert!(plan.should_scan(0));
+        assert!(!plan.should_scan(1));
     }
 
     fn two_row_group_metadata() -> Arc<ParquetMetaData> {
@@ -337,5 +264,44 @@ mod tests {
 
     fn single_i32_batch(schema: SchemaRef, value: i32) -> RecordBatch {
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![value]))]).expect("create test record batch")
+    }
+
+    fn synthetic_overlap_metadata() -> Arc<ParquetMetaData> {
+        let metadata = two_row_group_metadata();
+        let mut metadata_builder = metadata.as_ref().clone().into_builder();
+        let mut row_groups = metadata_builder.take_row_groups();
+        assert_eq!(row_groups.len(), 2, "test metadata should contain two row groups");
+
+        let first = row_group_with_offsets(row_groups.remove(0), 100, 100, 250);
+        let second = row_group_with_offsets(row_groups.remove(0), 500, 160, 90);
+        let row_groups = vec![first, second];
+
+        metadata_builder = metadata_builder.set_row_groups(row_groups);
+        Arc::new(metadata_builder.build())
+    }
+
+    fn row_group_with_offsets(
+        row_group: RowGroupMetaData,
+        file_offset: i64,
+        column_offset: i64,
+        column_len: i64,
+    ) -> RowGroupMetaData {
+        let mut builder = row_group.into_builder().set_file_offset(file_offset);
+        let columns = builder
+            .take_columns()
+            .into_iter()
+            .map(|column| {
+                column
+                    .into_builder()
+                    .set_data_page_offset(column_offset)
+                    .set_total_compressed_size(column_len)
+                    .build()
+                    .expect("rewrite test column metadata")
+            })
+            .collect::<Vec<_>>();
+        builder
+            .set_column_metadata(columns)
+            .build()
+            .expect("rewrite test row-group metadata")
     }
 }
