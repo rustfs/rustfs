@@ -70,6 +70,7 @@ pub mod server;
 pub mod startup_fs_guard;
 pub mod startup_iam;
 pub mod storage;
+pub(crate) mod table_catalog;
 pub mod tls;
 pub mod update;
 pub mod version;
