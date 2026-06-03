@@ -250,8 +250,10 @@ mod tests {
         assert_eq!(IAM_RETRY_INITIAL_INTERVAL.as_secs(), 5);
         assert!(IAM_RETRY_MAX_INTERVAL > IAM_RETRY_INITIAL_INTERVAL);
         assert_eq!(IAM_RETRY_MAX_INTERVAL.as_secs(), 30);
-        assert!(IAM_RETRY_ESCALATION_THRESHOLD > 0);
-        assert_eq!(IAM_RETRY_ESCALATION_THRESHOLD, 12);
+        const {
+            assert!(IAM_RETRY_ESCALATION_THRESHOLD > 0);
+            assert!(IAM_RETRY_ESCALATION_THRESHOLD == 12);
+        }
     }
 
     #[test]
