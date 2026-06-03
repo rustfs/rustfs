@@ -16,7 +16,7 @@ use s3s::dto::BucketLifecycleConfiguration;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    future::{Future, pending},
+    future::Future,
     sync::{Arc, LazyLock, Once},
     time::SystemTime,
 };
@@ -1377,7 +1377,7 @@ mod tests {
             let attempts = attempts_clone.clone();
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                pending::<StorageResult<()>>().await
+                std::future::pending::<StorageResult<()>>().await
             }
         })
         .await;
