@@ -57,8 +57,11 @@ async fn finalize_iam_recovery(
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
 ) -> Result<()> {
+    if !init_app_context_if_needed(store, kms_interface) && get_global_app_context().is_none() {
+        return Err(std::io::Error::other("IAM recovered but app context is still unavailable"));
+    }
+
     readiness.mark_stage(SystemStage::IamReady);
-    init_app_context_if_needed(store, kms_interface);
     publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
 }
 
@@ -104,7 +107,7 @@ fn spawn_iam_recovery_task(
     });
 }
 
-type RecoveryFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+type RecoveryFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
     initial_interval: Duration,
@@ -113,8 +116,8 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
     mut init_fn: InitFn,
     mut finalize_fn: FinalizeFn,
 ) where
-    InitFn: FnMut() -> RecoveryFuture<'static>,
-    FinalizeFn: FnMut() -> RecoveryFuture<'static>,
+    InitFn: FnMut() -> RecoveryFuture,
+    FinalizeFn: FnMut() -> RecoveryFuture,
 {
     let mut attempts: u64 = 0;
     let degraded_since = std::time::Instant::now();
@@ -257,23 +260,20 @@ async fn attempt_init_iam_sys(store: Arc<ECStore>) -> std::result::Result<(), st
         return Err(std::io::Error::other("forced test IAM bootstrap failure"));
     }
 
-    init_iam_sys(store)
-        .await
-        .map(|_| ())
-        .map_err(|err| std::io::Error::other(err.to_string()))
+    init_iam_sys(store).await.map_err(std::io::Error::other)
 }
 
 /// Attempt IAM bootstrap at startup. If it fails, enter degraded mode and
 /// spawn a background recovery task with exponential backoff.
 ///
-/// This function always returns `Ok`. A failure to initialize IAM is not
-/// fatal — the process continues in degraded mode where:
+/// A failure to initialize IAM is not fatal — the process continues in degraded mode where:
 /// - `/health/ready` returns 503
 /// - IAM-dependent operations return `IamSysNotInitialized`
 /// - A background task retries IAM initialization until it succeeds
 ///
-/// Returns `ReadyInline` if IAM initialized immediately, `Deferred` if
-/// recovery is happening in the background.
+/// Returns `Ok(ReadyInline)` if IAM initialized immediately, `Ok(Deferred)` if
+/// recovery is happening in the background, or `Err` if IAM succeeded but
+/// app context initialization failed (unexpected, indicates a bug).
 pub async fn bootstrap_or_defer_iam_init(
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
@@ -283,10 +283,10 @@ pub async fn bootstrap_or_defer_iam_init(
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(()) => {
-            readiness.mark_stage(SystemStage::IamReady);
-            if !init_app_context_if_needed(store, kms_interface) {
-                warn!("IAM bootstrap succeeded but app context initialization deferred");
+            if !init_app_context_if_needed(store, kms_interface) && get_global_app_context().is_none() {
+                return Err(std::io::Error::other("IAM bootstrap succeeded but app context is still unavailable"));
             }
+            readiness.mark_stage(SystemStage::IamReady);
             return Ok(IamBootstrapDisposition::ReadyInline);
         }
         Err(err) => {

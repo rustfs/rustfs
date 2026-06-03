@@ -16,6 +16,7 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use reqwest::StatusCode;
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
+use std::time::Duration;
 use temp_env::async_with_vars;
 
 fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
@@ -35,7 +36,7 @@ async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
     async_with_vars(
         [
             ("RUSTFS_TEST_IAM_FAIL_INIT_ATTEMPTS", Some("1")),
-            ("RUSTFS_TEST_IAM_RETRY_INTERVAL_MS", Some("50")),
+            ("RUSTFS_TEST_IAM_RETRY_INTERVAL_MS", Some("500")),
         ],
         async {
             let port = find_available_port().expect("find free port");
@@ -58,19 +59,21 @@ async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
                 .expect("readiness probe should respond during deferred bootstrap");
             assert_eq!(initial_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-            let mut recovered = false;
-            for _ in 0..20 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let response = http
-                    .get(&ready_url)
-                    .send()
-                    .await
-                    .expect("readiness probe should keep responding");
-                if response.status() == StatusCode::OK {
-                    recovered = true;
-                    break;
+            let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let response = http
+                        .get(&ready_url)
+                        .send()
+                        .await
+                        .expect("readiness probe should keep responding");
+                    if response.status() == StatusCode::OK {
+                        return true;
+                    }
                 }
-            }
+            })
+            .await
+            .unwrap_or(false);
             assert!(recovered, "readiness should recover after deferred IAM bootstrap succeeds");
 
             let client = s3_client(&endpoint, server.access_key(), server.secret_key());

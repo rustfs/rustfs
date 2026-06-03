@@ -15,6 +15,7 @@
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
 use crate::license::has_valid_license;
 use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, RUSTFS_ADMIN_PREFIX, VERSION};
+use crate::server::has_path_prefix;
 use crate::version::build;
 use axum::{
     Json, Router,
@@ -436,7 +437,7 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
 /// # Returns:
 /// - `true` if the path is for console access, `false` otherwise.
 pub fn is_console_path(path: &str) -> bool {
-    path == FAVICON_PATH || crate::server::has_path_prefix(path, CONSOLE_PREFIX)
+    path == FAVICON_PATH || has_path_prefix(path, CONSOLE_PREFIX)
 }
 
 /// Setup comprehensive middleware stack with tower-http features
