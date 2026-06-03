@@ -112,7 +112,8 @@ pub use deadlock_metrics::{
 // Lock metrics exports
 pub use lock_metrics::{
     LockMetricsSummary, record_contention_event, record_early_release, record_lock_hold_time, record_lock_optimization_enabled,
-    record_spin_attempt, record_spin_count_change,
+    record_object_lock_diag_acquire_duration, record_object_lock_diag_enabled, record_object_lock_diag_hold_duration,
+    record_object_lock_diag_slow_acquire, record_object_lock_diag_slow_hold, record_spin_attempt, record_spin_count_change,
 };
 
 pub use process_lock_metrics::{
