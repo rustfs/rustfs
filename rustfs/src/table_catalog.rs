@@ -20,7 +20,7 @@
 
 #![allow(dead_code)]
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use rustfs_ecstore::bucket::{
     metadata::{BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX},
@@ -36,6 +36,7 @@ pub(crate) const DEFAULT_WAREHOUSE_ID: &str = "default";
 pub(crate) const TABLE_NAMESPACE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
+pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
@@ -106,6 +107,173 @@ impl Default for TableBucketMarker {
 
 pub(crate) fn table_bucket_marker_json() -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&TableBucketMarker::default())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogEntryState {
+    Active,
+    Deleting,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableBucketEntry {
+    pub version: u16,
+    pub table_bucket: String,
+    pub catalog_type: String,
+    pub warehouse_root: String,
+    pub state: TableCatalogEntryState,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NamespaceEntry {
+    pub version: u16,
+    pub table_bucket: String,
+    pub namespace: String,
+    pub namespace_id: String,
+    pub state: TableCatalogEntryState,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableEntry {
+    pub version: u16,
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub table_id: String,
+    pub table_uuid: String,
+    pub format: String,
+    pub format_version: u16,
+    pub warehouse_location: String,
+    pub metadata_location: String,
+    pub version_token: String,
+    pub generation: u64,
+    pub state: TableCatalogEntryState,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum CommitLogStatus {
+    Committed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CommitLogEntry {
+    pub version: u16,
+    pub commit_id: String,
+    pub idempotency_key: Option<String>,
+    pub table_id: String,
+    pub operation: String,
+    pub expected_version_token: String,
+    pub new_version_token: String,
+    pub previous_metadata_location: String,
+    pub new_metadata_location: String,
+    #[serde(default)]
+    pub requirements: Vec<serde_json::Value>,
+    pub status: CommitLogStatus,
+    pub writer: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableCommitRequest {
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub commit_id: String,
+    pub idempotency_key: Option<String>,
+    pub operation: String,
+    pub expected_version_token: String,
+    pub expected_metadata_location: String,
+    pub new_metadata_location: String,
+    #[serde(default)]
+    pub requirements: Vec<serde_json::Value>,
+    pub writer: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableCommitResult {
+    pub table: TableEntry,
+    pub commit_log: CommitLogEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TableCatalogStoreError {
+    NotFound(String),
+    Conflict(String),
+    Invalid(String),
+    Internal(String),
+}
+
+impl fmt::Display for TableCatalogStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(message) => write!(f, "table catalog entry not found: {message}"),
+            Self::Conflict(message) => write!(f, "table catalog conflict: {message}"),
+            Self::Invalid(message) => write!(f, "invalid table catalog entry: {message}"),
+            Self::Internal(message) => write!(f, "table catalog store error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for TableCatalogStoreError {}
+
+pub(crate) type TableCatalogStoreResult<T> = Result<T, TableCatalogStoreError>;
+
+#[async_trait::async_trait]
+pub(crate) trait TableCatalogStore: Send + Sync {
+    async fn get_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>>;
+
+    async fn put_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()>;
+
+    async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()>;
+
+    async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>>;
+
+    async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>>;
+
+    async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()>;
+
+    async fn create_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
+
+    async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
+
+    async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
+
+    async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>>;
+
+    async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult>;
+
+    async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()>;
+
+    async fn get_commit_by_id(&self, table_id: &str, commit_id: &str) -> TableCatalogStoreResult<Option<CommitLogEntry>>;
+
+    async fn get_commit_by_idempotency_key(
+        &self,
+        table_id: &str,
+        idempotency_key: &str,
+    ) -> TableCatalogStoreResult<Option<CommitLogEntry>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -511,6 +679,256 @@ mod tests {
         assert_eq!(marker["catalog_type"], TABLE_BUCKET_CATALOG_TYPE);
         assert_eq!(marker["reserved_prefix"], TABLE_RESERVED_PREFIX);
         assert!(!table_bucket_marker_json().unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_entry_structures_serialize_stable_fields() {
+        use std::collections::BTreeMap;
+
+        let bucket = TableBucketEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "analytics".to_string(),
+            catalog_type: TABLE_BUCKET_CATALOG_TYPE.to_string(),
+            warehouse_root: "s3://analytics/".to_string(),
+            state: TableCatalogEntryState::Active,
+            properties: BTreeMap::from([("owner".to_string(), "platform".to_string())]),
+            created_at: Some("2026-05-23T00:00:00Z".to_string()),
+            updated_at: Some("2026-05-23T00:00:00Z".to_string()),
+        };
+        let namespace = NamespaceEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "analytics".to_string(),
+            namespace: "sales".to_string(),
+            namespace_id: "sales".to_string(),
+            state: TableCatalogEntryState::Active,
+            properties: BTreeMap::from([("purpose".to_string(), "orders".to_string())]),
+            created_at: Some("2026-05-23T00:00:00Z".to_string()),
+            updated_at: Some("2026-05-23T00:00:00Z".to_string()),
+        };
+        let table = TableEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "analytics".to_string(),
+            namespace: "sales".to_string(),
+            table: "orders".to_string(),
+            table_id: "table-id".to_string(),
+            table_uuid: "table-uuid".to_string(),
+            format: "ICEBERG".to_string(),
+            format_version: 2,
+            warehouse_location: "s3://analytics/tables/table-id".to_string(),
+            metadata_location: "s3://analytics/tables/table-id/metadata/v1.metadata.json".to_string(),
+            version_token: "token-v1".to_string(),
+            generation: 1,
+            state: TableCatalogEntryState::Active,
+            properties: BTreeMap::from([("write.format.default".to_string(), "parquet".to_string())]),
+            created_at: Some("2026-05-23T00:00:00Z".to_string()),
+            updated_at: Some("2026-05-23T00:00:00Z".to_string()),
+        };
+        let commit = CommitLogEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            commit_id: "commit-id".to_string(),
+            idempotency_key: Some("client-request-id".to_string()),
+            table_id: "table-id".to_string(),
+            operation: "append".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            new_version_token: "token-v2".to_string(),
+            previous_metadata_location: "s3://analytics/tables/table-id/metadata/v1.metadata.json".to_string(),
+            new_metadata_location: "s3://analytics/tables/table-id/metadata/v2.metadata.json".to_string(),
+            requirements: vec![serde_json::json!({"type": "assert-table-uuid", "uuid": "table-uuid"})],
+            status: CommitLogStatus::Committed,
+            writer: Some("pyiceberg/test".to_string()),
+            created_at: Some("2026-05-23T00:01:00Z".to_string()),
+            updated_at: Some("2026-05-23T00:01:00Z".to_string()),
+        };
+
+        let bucket_json = serde_json::to_value(&bucket).unwrap();
+        let namespace_json = serde_json::to_value(&namespace).unwrap();
+        let table_json = serde_json::to_value(&table).unwrap();
+        let commit_json = serde_json::to_value(&commit).unwrap();
+
+        assert_eq!(bucket_json["state"], "ACTIVE");
+        assert_eq!(bucket_json["properties"]["owner"], "platform");
+        assert_eq!(namespace_json["namespace_id"], "sales");
+        assert_eq!(table_json["version_token"], "token-v1");
+        assert_eq!(table_json["generation"], 1);
+        assert_eq!(table_json["state"], "ACTIVE");
+        assert_eq!(commit_json["status"], "COMMITTED");
+        assert_eq!(commit_json["requirements"][0]["type"], "assert-table-uuid");
+    }
+
+    #[test]
+    fn catalog_entry_deserialization_rejects_unknown_fields() {
+        use std::collections::BTreeMap;
+
+        let table = TableEntry {
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "analytics".to_string(),
+            namespace: "sales".to_string(),
+            table: "orders".to_string(),
+            table_id: "table-id".to_string(),
+            table_uuid: "table-uuid".to_string(),
+            format: "ICEBERG".to_string(),
+            format_version: 2,
+            warehouse_location: "s3://analytics/tables/table-id".to_string(),
+            metadata_location: "s3://analytics/tables/table-id/metadata/v1.metadata.json".to_string(),
+            version_token: "token-v1".to_string(),
+            generation: 1,
+            state: TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        };
+        let mut value = serde_json::to_value(table).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), serde_json::json!(true));
+
+        assert!(serde_json::from_value::<TableEntry>(value).is_err());
+    }
+
+    struct NoopTableCatalogStore;
+
+    #[async_trait::async_trait]
+    impl TableCatalogStore for NoopTableCatalogStore {
+        async fn get_table_bucket(&self, _table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>> {
+            Ok(None)
+        }
+
+        async fn put_table_bucket(&self, _entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+            Ok(())
+        }
+
+        async fn create_namespace(&self, _entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
+            Ok(())
+        }
+
+        async fn list_namespaces(&self, _table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_namespace(&self, _table_bucket: &str, _namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
+            Ok(None)
+        }
+
+        async fn drop_namespace(&self, _table_bucket: &str, _namespace: &str) -> TableCatalogStoreResult<()> {
+            Ok(())
+        }
+
+        async fn create_table(&self, _entry: TableEntry) -> TableCatalogStoreResult<()> {
+            Ok(())
+        }
+
+        async fn register_table(&self, _entry: TableEntry) -> TableCatalogStoreResult<()> {
+            Ok(())
+        }
+
+        async fn list_tables(&self, _table_bucket: &str, _namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn load_table(
+            &self,
+            _table_bucket: &str,
+            _namespace: &str,
+            _table: &str,
+        ) -> TableCatalogStoreResult<Option<TableEntry>> {
+            Ok(None)
+        }
+
+        async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
+            let table = TableEntry {
+                version: TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: request.table_bucket,
+                namespace: request.namespace,
+                table: request.table,
+                table_id: "table-id".to_string(),
+                table_uuid: "table-uuid".to_string(),
+                format: "ICEBERG".to_string(),
+                format_version: 2,
+                warehouse_location: "s3://analytics/tables/table-id".to_string(),
+                metadata_location: request.new_metadata_location.clone(),
+                version_token: "token-v2".to_string(),
+                generation: 2,
+                state: TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            };
+            let commit_log = CommitLogEntry {
+                version: TABLE_CATALOG_ENTRY_VERSION,
+                commit_id: request.commit_id,
+                idempotency_key: request.idempotency_key,
+                table_id: table.table_id.clone(),
+                operation: request.operation,
+                expected_version_token: request.expected_version_token,
+                new_version_token: table.version_token.clone(),
+                previous_metadata_location: request.expected_metadata_location,
+                new_metadata_location: table.metadata_location.clone(),
+                requirements: request.requirements,
+                status: CommitLogStatus::Committed,
+                writer: request.writer,
+                created_at: None,
+                updated_at: None,
+            };
+
+            Ok(TableCommitResult { table, commit_log })
+        }
+
+        async fn drop_table(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> TableCatalogStoreResult<()> {
+            Ok(())
+        }
+
+        async fn get_commit_by_id(&self, _table_id: &str, _commit_id: &str) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
+            Ok(None)
+        }
+
+        async fn get_commit_by_idempotency_key(
+            &self,
+            _table_id: &str,
+            _idempotency_key: &str,
+        ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn table_catalog_store_trait_covers_entry_read_write_shapes() {
+        let store: &dyn TableCatalogStore = &NoopTableCatalogStore;
+
+        assert!(store.get_table_bucket("analytics").await.unwrap().is_none());
+        assert!(store.list_namespaces("analytics").await.unwrap().is_empty());
+        assert!(store.get_commit_by_id("table-id", "commit-id").await.unwrap().is_none());
+        assert!(
+            store
+                .get_commit_by_idempotency_key("table-id", "client-request-id")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn table_catalog_store_trait_has_atomic_commit_shape() {
+        let store: &dyn TableCatalogStore = &NoopTableCatalogStore;
+        let request = TableCommitRequest {
+            table_bucket: "analytics".to_string(),
+            namespace: "sales".to_string(),
+            table: "orders".to_string(),
+            commit_id: "commit-id".to_string(),
+            idempotency_key: Some("client-request-id".to_string()),
+            operation: "append".to_string(),
+            expected_version_token: "token-v1".to_string(),
+            expected_metadata_location: "s3://analytics/tables/table-id/metadata/v1.metadata.json".to_string(),
+            new_metadata_location: "s3://analytics/tables/table-id/metadata/v2.metadata.json".to_string(),
+            requirements: vec![serde_json::json!({"type": "assert-table-uuid", "uuid": "table-uuid"})],
+            writer: Some("pyiceberg/test".to_string()),
+        };
+
+        let result = store.commit_table(request).await.unwrap();
+
+        assert_eq!(result.table.version_token, "token-v2");
+        assert_eq!(result.table.generation, 2);
+        assert_eq!(result.commit_log.status, CommitLogStatus::Committed);
     }
 
     #[test]
