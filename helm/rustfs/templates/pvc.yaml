@@ -23,7 +23,7 @@ spec:
 {{- end }}
 {{- end }}
 
-{{- if and .Values.mode.standalone.enabled (not .Values.mode.standalone.existingClaim.logsClaim) }}
+{{- if and .Values.mode.standalone.enabled .Values.config.rustfs.obs_log_directory (not .Values.mode.standalone.existingClaim.logsClaim) }}
 {{- with .Values.storageclass }}
 ---
 apiVersion: v1
