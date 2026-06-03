@@ -46,14 +46,13 @@
 //! storage engine uses process-global singletons (`OnceLock`). Attempting to
 //! start a second server will return an error.
 
-use crate::app::context::{AppContext, init_global_app_context};
 use crate::config::Config;
 use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
 use crate::server::{
-    ShutdownHandle, init_event_notifier, publish_ready_when_runtime_ready, shutdown_event_notifier, start_audit_system,
-    start_http_server, stop_audit_system,
+    ShutdownHandle, init_event_notifier, shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system,
 };
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
+use crate::startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -74,7 +73,6 @@ use rustfs_ecstore::{
     store_api::BucketOptions,
     update_erasure_type,
 };
-use rustfs_iam::init_iam_sys;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::crypto::aws_lc_rs::default_provider;
@@ -433,21 +431,14 @@ impl RustFSServerBuilder {
         try_migrate_iam_config(store.clone()).await;
 
         // IAM.
-        init_iam_sys(store.clone()).await.map_err(|e| {
-            shutdown_embedded_server();
-            ServerError::Init(format!("IAM: {e}"))
-        })?;
-        readiness.mark_stage(SystemStage::IamReady);
-
-        // App context.
-        let iam_interface = rustfs_iam::get().map_err(|e| {
-            shutdown_embedded_server();
-            ServerError::Init(format!("IAM get: {e}"))
-        })?;
         let kms_interface =
             rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-        let _app_context =
-            init_global_app_context(AppContext::with_default_interfaces(store.clone(), iam_interface, kms_interface));
+        let iam_bootstrap = bootstrap_or_defer_iam_init(store.clone(), kms_interface, readiness.clone(), None, Some(ctx.clone()))
+            .await
+            .map_err(|e| {
+                shutdown_embedded_server();
+                ServerError::Init(format!("IAM bootstrap setup: {e}"))
+            })?;
 
         // Bucket notifications.
         add_bucket_notification_configuration(buckets.clone()).await;
@@ -457,12 +448,15 @@ impl RustFSServerBuilder {
             warn!("notification system: {e}");
         }
 
-        publish_ready_when_runtime_ready(readiness.as_ref(), None)
-            .await
-            .map_err(|e| {
-                shutdown_embedded_server();
-                ServerError::Init(format!("runtime readiness: {e}"))
-            })?;
+        if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
+            crate::server::publish_ready_when_runtime_ready(readiness.as_ref(), None)
+                .await
+                .map_err(|e| {
+                    shutdown_embedded_server();
+                    ServerError::Init(format!("runtime readiness: {e}"))
+                })?;
+        }
+
         rustfs_common::set_global_init_time_now().await;
 
         let server = RustFSServer {
