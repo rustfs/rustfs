@@ -43,6 +43,15 @@ pub(crate) const ADMIN_PREFIX: &str = "/rustfs/admin";
 /// This alias allows stock MinIO admin tooling to reach RustFS handlers.
 pub(crate) const MINIO_ADMIN_PREFIX: &str = "/minio/admin";
 
+/// Returns true for the admin prefix itself or slash-delimited children.
+pub(crate) fn is_admin_path(path: &str) -> bool {
+    has_path_prefix(path, ADMIN_PREFIX) || has_path_prefix(path, MINIO_ADMIN_PREFIX)
+}
+
+fn has_path_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix || path.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 /// Environment variable name for overriding the default
 /// administrative prefix path.
 pub(crate) const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
