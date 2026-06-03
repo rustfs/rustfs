@@ -14,21 +14,25 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 
 use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
+use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::ScannerIO;
 use crate::sleeper::{SCANNER_SLEEPER, scanner_speed_from_env_or_default, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, emit_scan_cycle_partial, global_metrics};
+use rustfs_common::metrics::{
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, emit_scan_cycle_complete, emit_scan_cycle_partial, global_metrics,
+};
 use rustfs_config::ScannerSpeed;
 use rustfs_config::{
-    DEFAULT_SCANNER_BITROT_CYCLE_SECS, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE,
-    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
+    DEFAULT_SCANNER_BITROT_CYCLE_SECS, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS,
+    DEFAULT_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
+    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
 };
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle as _;
@@ -91,6 +95,30 @@ fn scanner_cycle_max_duration() -> Option<Duration> {
     match rustfs_utils::get_env_u64(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS) {
         0 => None,
         secs => Some(Duration::from_secs(secs)),
+    }
+}
+
+fn scanner_cycle_count_budget(env: &str, default: u64) -> Option<u64> {
+    match rustfs_utils::get_env_u64(env, default) {
+        0 => None,
+        count => Some(count),
+    }
+}
+
+fn scanner_cycle_budget_config() -> ScannerCycleBudgetConfig {
+    ScannerCycleBudgetConfig {
+        max_duration: scanner_cycle_max_duration(),
+        max_objects: scanner_cycle_count_budget(ENV_SCANNER_CYCLE_MAX_OBJECTS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS),
+        max_directories: scanner_cycle_count_budget(ENV_SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES),
+    }
+}
+
+fn scan_cycle_partial_reason(reason: Option<ScannerCycleBudgetReason>) -> ScanCyclePartialReason {
+    match reason {
+        Some(ScannerCycleBudgetReason::Runtime) => ScanCyclePartialReason::Runtime,
+        Some(ScannerCycleBudgetReason::Objects) => ScanCyclePartialReason::Objects,
+        Some(ScannerCycleBudgetReason::Directories) => ScanCyclePartialReason::Directories,
+        None => ScanCyclePartialReason::Unknown,
     }
 }
 
@@ -439,60 +467,6 @@ fn get_lock_acquire_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
 }
 
-struct ScannerCycleBudget {
-    token: CancellationToken,
-    elapsed: Arc<AtomicBool>,
-    max_duration: Option<Duration>,
-}
-
-impl ScannerCycleBudget {
-    fn new(parent: &CancellationToken, max_duration: Option<Duration>) -> Self {
-        let token = parent.child_token();
-        let elapsed = Arc::new(AtomicBool::new(false));
-
-        if let Some(duration) = max_duration {
-            let parent = parent.clone();
-            let token_wait = token.clone();
-            let token_cancel = token.clone();
-            let elapsed = elapsed.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = parent.cancelled() => {}
-                    _ = token_wait.cancelled() => {}
-                    _ = tokio::time::sleep(duration) => {
-                        elapsed.store(true, Ordering::Relaxed);
-                        token_cancel.cancel();
-                    }
-                }
-            });
-        }
-
-        Self {
-            token,
-            elapsed,
-            max_duration,
-        }
-    }
-
-    fn token(&self) -> CancellationToken {
-        self.token.clone()
-    }
-
-    fn budget_elapsed(&self) -> bool {
-        self.elapsed.load(Ordering::Relaxed)
-    }
-
-    fn max_duration(&self) -> Option<Duration> {
-        self.max_duration
-    }
-}
-
-impl Drop for ScannerCycleBudget {
-    fn drop(&mut self) {
-        self.token.cancel();
-    }
-}
-
 async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
     cycle_info.current = 0;
     global_metrics().clear_current_scan_mode();
@@ -505,11 +479,13 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     SCANNER_SLEEPER.refresh_from_env();
     let configured_cycle_interval = cycle_interval();
     let configured_bitrot_cycle = bitrot_scan_cycle();
-    let configured_cycle_max_duration = scanner_cycle_max_duration();
+    let cycle_budget_config = scanner_cycle_budget_config();
     global_metrics().record_scanner_cycle_config(
         configured_cycle_interval,
         configured_bitrot_cycle,
-        configured_cycle_max_duration,
+        cycle_budget_config.max_duration,
+        cycle_budget_config.max_objects,
+        cycle_budget_config.max_directories,
     );
     info!("Start run data scanner cycle");
     cycle_info.current = cycle_info.next;
@@ -548,10 +524,10 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     let done_cycle = Metrics::time(Metric::ScanCycle);
     let cycle_start = std::time::Instant::now();
     let cycle_work_start = global_metrics().start_scan_cycle_work();
-    let cycle_budget = ScannerCycleBudget::new(ctx, configured_cycle_max_duration);
+    let cycle_budget = ScannerCycleBudget::new(ctx, cycle_budget_config);
     if let Err(e) = storeapi
         .clone()
-        .nsscanner(cycle_budget.token(), sender, cycle_info.current, scan_mode)
+        .nsscanner(cycle_budget.token(), cycle_budget.clone(), sender, cycle_info.current, scan_mode)
         .await
     {
         let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
@@ -559,10 +535,13 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
         if budget_elapsed {
             warn!(
                 duration = ?now.elapsed(),
+                reason = ?cycle_budget.reason(),
                 max_duration = ?cycle_budget.max_duration(),
-                "Data scanner cycle stopped after reaching its runtime budget"
+                max_objects = ?cycle_budget.max_objects(),
+                max_directories = ?cycle_budget.max_directories(),
+                "Data scanner cycle stopped after reaching its cycle budget"
             );
-            emit_scan_cycle_partial(cycle_start.elapsed());
+            emit_scan_cycle_partial(cycle_start.elapsed(), scan_cycle_partial_reason(cycle_budget.reason()));
             mark_scan_cycle_idle(cycle_info).await;
             return;
         }
@@ -576,11 +555,14 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     if cycle_budget.budget_elapsed() && !ctx.is_cancelled() {
         warn!(
             duration = ?now.elapsed(),
+            reason = ?cycle_budget.reason(),
             max_duration = ?cycle_budget.max_duration(),
-            "Data scanner cycle stopped after reaching its runtime budget"
+            max_objects = ?cycle_budget.max_objects(),
+            max_directories = ?cycle_budget.max_directories(),
+            "Data scanner cycle stopped after reaching its cycle budget"
         );
         global_metrics().finish_scan_cycle_work(cycle_work_start);
-        emit_scan_cycle_partial(cycle_start.elapsed());
+        emit_scan_cycle_partial(cycle_start.elapsed(), scan_cycle_partial_reason(cycle_budget.reason()));
         mark_scan_cycle_idle(cycle_info).await;
         return;
     }
@@ -833,7 +815,13 @@ mod tests {
     #[tokio::test]
     async fn test_scanner_cycle_budget_cancels_after_duration() {
         let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(&parent, Some(Duration::from_millis(1)));
+        let budget = ScannerCycleBudget::new(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_duration: Some(Duration::from_millis(1)),
+                ..Default::default()
+            },
+        );
 
         tokio::time::timeout(Duration::from_secs(5), budget.token().cancelled())
             .await
@@ -846,12 +834,59 @@ mod tests {
     #[tokio::test]
     async fn test_scanner_cycle_budget_drop_cancels_child_without_elapsed() {
         let parent = CancellationToken::new();
-        let budget = ScannerCycleBudget::new(&parent, Some(Duration::from_secs(60)));
+        let budget = ScannerCycleBudget::new(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_duration: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+        );
         let token = budget.token();
 
         drop(budget);
 
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scanner_cycle_budget_config_uses_work_budget_env() {
+        with_var(ENV_SCANNER_CYCLE_MAX_OBJECTS, Some("100"), || {
+            with_var(ENV_SCANNER_CYCLE_MAX_DIRECTORIES, Some("25"), || {
+                let config = scanner_cycle_budget_config();
+                assert_eq!(config.max_objects, Some(100));
+                assert_eq!(config.max_directories, Some(25));
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_scanner_cycle_budget_config_disables_zero_work_budgets() {
+        with_var(ENV_SCANNER_CYCLE_MAX_OBJECTS, Some("0"), || {
+            with_var(ENV_SCANNER_CYCLE_MAX_DIRECTORIES, Some("0"), || {
+                let config = scanner_cycle_budget_config();
+                assert_eq!(config.max_objects, None);
+                assert_eq!(config.max_directories, None);
+            });
+        });
+    }
+
+    #[test]
+    fn test_scan_cycle_partial_reason_maps_budget_reason() {
+        assert_eq!(
+            scan_cycle_partial_reason(Some(ScannerCycleBudgetReason::Runtime)),
+            ScanCyclePartialReason::Runtime
+        );
+        assert_eq!(
+            scan_cycle_partial_reason(Some(ScannerCycleBudgetReason::Objects)),
+            ScanCyclePartialReason::Objects
+        );
+        assert_eq!(
+            scan_cycle_partial_reason(Some(ScannerCycleBudgetReason::Directories)),
+            ScanCyclePartialReason::Directories
+        );
+        assert_eq!(scan_cycle_partial_reason(None), ScanCyclePartialReason::Unknown);
     }
 
     #[tokio::test]
