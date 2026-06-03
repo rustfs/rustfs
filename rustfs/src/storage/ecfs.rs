@@ -21,6 +21,7 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::acl;
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
+use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
 use rustfs_ecstore::{
@@ -152,6 +153,12 @@ pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Op
     } else {
         Ok(None)
     }
+}
+
+async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
+    table_catalog::validate_bucket_object_mutation(bucket, key)
+        .await
+        .map_err(|_| s3_error!(InvalidRequest, "{}", table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE))
 }
 
 const MAXIMUM_RETENTION_DAYS: i32 = 36_500;
@@ -382,6 +389,8 @@ impl S3 for FS {
             version_id,
             ..
         } = req.input.clone();
+
+        validate_table_catalog_object_mutation(&bucket, &object).await?;
 
         let Some(store) = new_object_layer_fn() else {
             error!("Store not initialized");
@@ -1176,6 +1185,8 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -1298,6 +1309,8 @@ impl S3 for FS {
             ..
         } = req.input.clone();
 
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -1371,6 +1384,8 @@ impl S3 for FS {
             tagging,
             ..
         } = req.input.clone();
+
+        validate_table_catalog_object_mutation(&bucket, &object).await?;
 
         crate::storage::s3_api::tagging::validate_object_tag_set(&tagging.tag_set)?;
 

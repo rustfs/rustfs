@@ -13,11 +13,46 @@
 // limitations under the License.
 
 use super::*;
-use crate::bucket::utils::is_meta_bucketname;
+use crate::bucket::{metadata::BUCKET_TABLE_RESERVED_PREFIX, utils::is_meta_bucketname};
 use crate::set_disk::get_lock_acquire_timeout;
 
 fn should_override_created_from_metadata(created: OffsetDateTime) -> bool {
     created != OffsetDateTime::UNIX_EPOCH
+}
+
+fn validate_table_bucket_delete_allowed(
+    bucket: &str,
+    table_bucket_enabled: bool,
+    table_catalog_metadata_exists: bool,
+) -> Result<()> {
+    if table_bucket_enabled && table_catalog_metadata_exists {
+        return Err(StorageError::BucketNotEmpty(bucket.to_string()));
+    }
+
+    Ok(())
+}
+
+async fn table_catalog_metadata_exists(bucket: &str) -> bool {
+    let local_disks = all_local_disk().await;
+    for disk in local_disks.iter() {
+        let catalog_path = disk.path().join(bucket).join(BUCKET_TABLE_RESERVED_PREFIX);
+        if has_xlmeta_files(&catalog_path).await {
+            return true;
+        }
+    }
+
+    false
+}
+
+async fn validate_table_bucket_delete_guard(bucket: &str) -> Result<()> {
+    let table_bucket_enabled = metadata_sys::get(bucket)
+        .await
+        .is_ok_and(|metadata| metadata.table_bucket_enabled());
+    if table_bucket_enabled {
+        validate_table_bucket_delete_allowed(bucket, true, table_catalog_metadata_exists(bucket).await)?;
+    }
+
+    Ok(())
 }
 
 impl ECStore {
@@ -167,6 +202,8 @@ impl ECStore {
             return Err(to_object_err(storage_err, vec![bucket]));
         }
 
+        validate_table_bucket_delete_guard(bucket).await?;
+
         // Check bucket is empty before deletion (per S3 API spec)
         // If bucket is not empty (contains actual objects with xl.meta files) and force
         // is not set, return BucketNotEmpty error.
@@ -203,7 +240,8 @@ impl ECStore {
 
 #[cfg(test)]
 mod tests {
-    use super::should_override_created_from_metadata;
+    use super::{should_override_created_from_metadata, validate_table_bucket_delete_allowed};
+    use crate::error::StorageError;
     use time::OffsetDateTime;
 
     #[test]
@@ -215,5 +253,14 @@ mod tests {
     fn should_override_when_metadata_created_is_valid_time() {
         let created = OffsetDateTime::from_unix_timestamp(1704067200).expect("valid timestamp");
         assert!(should_override_created_from_metadata(created));
+    }
+
+    #[test]
+    fn table_bucket_delete_guard_rejects_remaining_catalog_metadata() {
+        let err = validate_table_bucket_delete_allowed("table-bucket", true, true).unwrap_err();
+
+        assert!(matches!(err, StorageError::BucketNotEmpty(bucket) if bucket == "table-bucket"));
+        assert!(validate_table_bucket_delete_allowed("table-bucket", true, false).is_ok());
+        assert!(validate_table_bucket_delete_allowed("regular-bucket", false, true).is_ok());
     }
 }
