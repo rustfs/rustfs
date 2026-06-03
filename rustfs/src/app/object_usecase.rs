@@ -129,6 +129,28 @@ const ACCEPT_RANGES_BYTES: &str = "bytes";
 const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
 static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
 
+fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
+    let Some(val) = headers.get(AMZ_DECODED_CONTENT_LENGTH) else {
+        return Ok(None);
+    };
+
+    match atoi::atoi::<i64>(val.as_bytes()) {
+        Some(x) => Ok(Some(x)),
+        None => Err(s3_error!(UnexpectedContent)),
+    }
+}
+
+fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
+    let has_aws_chunked = |header_name: &str| {
+        headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case("aws-chunked")))
+    };
+
+    has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
+}
+
 struct DeadlockRequestGuard {
     deadlock_detector: Arc<deadlock_detector::DeadlockDetector>,
     request_id: String,
@@ -1728,18 +1750,12 @@ impl DefaultObjectUsecase {
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
-        let mut size = match content_length {
-            Some(c) => c,
-            None => {
-                if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
-                    match atoi::atoi::<i64>(val.as_bytes()) {
-                        Some(x) => x,
-                        None => return Err(s3_error!(UnexpectedContent)),
-                    }
-                } else {
-                    return Err(s3_error!(UnexpectedContent));
-                }
-            }
+        let decoded_content_length = decoded_content_length_from_headers(&req.headers)?;
+        let mut size = match (request_uses_aws_chunked(&req.headers), decoded_content_length, content_length) {
+            (true, Some(decoded), _) => decoded,
+            (_, _, Some(c)) => c,
+            (_, Some(decoded), None) => decoded,
+            _ => return Err(s3_error!(UnexpectedContent)),
         };
 
         if size == -1 {
@@ -4631,6 +4647,26 @@ mod tests {
         headers.insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("AES256"));
 
         assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn aws_chunked_put_prefers_decoded_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("aws-chunked"));
+        headers.insert(AMZ_DECODED_CONTENT_LENGTH, HeaderValue::from_static("71680"));
+
+        let decoded = decoded_content_length_from_headers(&headers).expect("decoded content length should parse");
+        assert!(request_uses_aws_chunked(&headers));
+        assert_eq!(decoded, Some(71680));
+
+        let resolved = match (request_uses_aws_chunked(&headers), decoded, Some(99999)) {
+            (true, Some(decoded), _) => decoded,
+            (_, _, Some(c)) => c,
+            (_, Some(decoded), None) => decoded,
+            _ => unreachable!("test provides a valid size source"),
+        };
+
+        assert_eq!(resolved, 71680);
     }
 
     #[test]
