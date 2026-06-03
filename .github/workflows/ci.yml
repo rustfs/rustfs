@@ -78,7 +78,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    runs-on: rustfs
+    runs-on: ubuntu-latest
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
@@ -95,7 +95,7 @@ jobs:
     name: Typos
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: rustfs
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -106,7 +106,7 @@ jobs:
     name: Test and Lint
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: rustfs
+    runs-on: ubicloud-standard-4
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -143,7 +143,7 @@ jobs:
     name: Build RustFS Debug Binary
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: rustfs
+    runs-on: ubicloud-standard-4
     timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -176,16 +176,11 @@ jobs:
     name: End-to-End Tests
     needs: [ skip-check, build-rustfs-debug-binary ]
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: rustfs
+    runs-on: ubicloud-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Clean up previous test run
-        run: |
-          rm -rf /tmp/rustfs
-          rm -f /tmp/rustfs.log
 
       - name: Download debug binary
         uses: actions/download-artifact@v7
@@ -209,21 +204,26 @@ jobs:
       - name: Run end-to-end tests
         run: |
           s3s-e2e --version
-          ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
+          RUN_ROOT="${RUNNER_TEMP}/rustfs-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          mkdir -p "${RUN_ROOT}"
+          RUSTFS_TEST_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+          RUSTFS_TEST_PORT="${RUSTFS_TEST_PORT}" \
+          RUSTFS_TEST_LOG="${RUN_ROOT}/rustfs.log" \
+          ./scripts/e2e-run.sh ./target/debug/rustfs "${RUN_ROOT}/data"
 
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v6
         with:
           name: e2e-test-logs-${{ github.run_number }}
-          path: /tmp/rustfs.log
+          path: ${{ runner.temp }}/rustfs-e2e-*/rustfs.log
           retention-days: 3
 
   s3-implemented-tests:
     name: S3 Implemented Tests
     needs: [ skip-check, build-rustfs-debug-binary ]
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: rustfs
+    runs-on: ubicloud-standard-4
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -240,10 +240,16 @@ jobs:
 
       - name: Run implemented s3-tests
         run: |
+          RUN_ROOT="${RUNNER_TEMP}/rustfs-s3tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          mkdir -p "${RUN_ROOT}"
+          S3_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
           DEPLOY_MODE=binary \
           RUSTFS_BINARY=./target/debug/rustfs \
           TEST_MODE=single \
           MAXFAIL=1 \
+          S3_PORT="${S3_PORT}" \
+          DATA_ROOT="${RUN_ROOT}" \
+          S3TESTS_CONF=artifacts/s3tests-single/s3tests.conf \
           ./scripts/s3-tests/run.sh
 
       - name: Upload s3 test artifacts
