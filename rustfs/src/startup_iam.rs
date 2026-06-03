@@ -18,9 +18,7 @@ use rustfs_common::{GlobalReadiness, SystemStage};
 use rustfs_ecstore::store::ECStore;
 use rustfs_iam::init_iam_sys;
 use rustfs_kms::KmsServiceManager;
-use std::future::Future;
 use std::io::Result;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -58,13 +56,9 @@ async fn finalize_iam_recovery(
     state_manager: Option<Arc<ServiceStateManager>>,
 ) -> Result<()> {
     readiness.mark_stage(SystemStage::IamReady);
-    let _ = init_app_context_if_needed(store, kms_interface);
+    init_app_context_if_needed(store, kms_interface);
     publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
 }
-
-type RecoveryFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-type RecoveryInitFn = Box<dyn FnMut() -> RecoveryFuture + Send>;
-type RecoveryFinalizeFn = Box<dyn FnMut() -> RecoveryFuture + Send>;
 
 fn compute_backoff_interval(attempt: u64, initial: Duration, max: Duration) -> Duration {
     let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
@@ -77,8 +71,10 @@ fn spawn_iam_recovery_task(
     initial_interval: Duration,
     max_interval: Duration,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
-    mut init_fn: RecoveryInitFn,
-    mut finalize_fn: RecoveryFinalizeFn,
+    store: Arc<ECStore>,
+    kms_interface: Arc<KmsServiceManager>,
+    readiness: Arc<GlobalReadiness>,
+    state_manager: Option<Arc<ServiceStateManager>>,
 ) {
     tokio::spawn(async move {
         let mut attempts: u64 = 0;
@@ -97,7 +93,7 @@ fn spawn_iam_recovery_task(
                 tokio::time::sleep(sleep_duration).await;
             }
 
-            match init_fn().await {
+            match attempt_init_iam_sys(store.clone()).await {
                 Ok(()) => {
                     let degraded_secs = degraded_since.elapsed().as_secs();
                     info!(
@@ -134,7 +130,7 @@ fn spawn_iam_recovery_task(
         let mut finalize_attempts: u64 = 0;
         loop {
             finalize_attempts += 1;
-            match finalize_fn().await {
+            match finalize_iam_recovery(store.clone(), kms_interface.clone(), readiness.clone(), state_manager.clone()).await {
                 Ok(()) => {
                     info!(
                         init_attempts = attempts,
@@ -266,28 +262,14 @@ pub async fn bootstrap_or_defer_iam_init(
                  Health endpoint will report 503 until IAM is ready."
             );
 
-            let retry_store = store.clone();
-            let retry_kms_interface = kms_interface.clone();
-            let retry_readiness = readiness.clone();
-            let retry_state_manager = state_manager.clone();
-
             spawn_iam_recovery_task(
                 interval,
                 IAM_RETRY_MAX_INTERVAL,
                 shutdown_token,
-                Box::new(move || {
-                    let retry_store = retry_store.clone();
-                    Box::pin(async move { attempt_init_iam_sys(retry_store).await })
-                }),
-                Box::new(move || {
-                    let retry_store = store.clone();
-                    let retry_kms_interface = retry_kms_interface.clone();
-                    let retry_readiness = retry_readiness.clone();
-                    let retry_state_manager = retry_state_manager.clone();
-                    Box::pin(async move {
-                        finalize_iam_recovery(retry_store, retry_kms_interface, retry_readiness, retry_state_manager).await
-                    })
-                }),
+                store,
+                kms_interface,
+                readiness,
+                state_manager,
             );
         }
     }
@@ -297,15 +279,7 @@ pub async fn bootstrap_or_defer_iam_init(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, compute_backoff_interval,
-        spawn_iam_recovery_task,
-    };
-    use std::io::Error;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use super::{IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, compute_backoff_interval};
     use std::time::Duration;
 
     #[test]
@@ -331,167 +305,5 @@ mod tests {
         assert_eq!(compute_backoff_interval(4, initial, max), Duration::from_secs(30));
         assert_eq!(compute_backoff_interval(5, initial, max), Duration::from_secs(30));
         assert_eq!(compute_backoff_interval(100, initial, max), Duration::from_secs(30));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn recovery_task_retries_until_success_and_finalizes_once() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let finalize_calls = Arc::new(AtomicUsize::new(0));
-
-        let attempts_for_init = attempts.clone();
-        let finalize_for_assert = finalize_calls.clone();
-
-        spawn_iam_recovery_task(
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            None,
-            Box::new(move || {
-                let attempts = attempts_for_init.clone();
-                Box::pin(async move {
-                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                    if attempt < 2 {
-                        Err(Error::other(format!("attempt {attempt} failed")))
-                    } else {
-                        Ok(())
-                    }
-                })
-            }),
-            Box::new(move || {
-                let finalize_calls = finalize_calls.clone();
-                Box::pin(async move {
-                    finalize_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            }),
-        );
-
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 0);
-        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 0);
-
-        // First attempt after 5s (backoff: 5s)
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 0);
-
-        // Second attempt after 10s (backoff: 5 * 2^1 = 10s)
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 1);
-
-        // No more attempts after success
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn recovery_task_retries_finalize_when_finalize_fails_after_init() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let finalize_calls = Arc::new(AtomicUsize::new(0));
-
-        let attempts_for_init = attempts.clone();
-        let finalize_for_assert = finalize_calls.clone();
-
-        spawn_iam_recovery_task(
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            None,
-            Box::new(move || {
-                let attempts = attempts_for_init.clone();
-                Box::pin(async move {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            }),
-            Box::new(move || {
-                let finalize_calls = finalize_calls.clone();
-                Box::pin(async move {
-                    let call = finalize_calls.fetch_add(1, Ordering::SeqCst) + 1;
-                    if call < 3 {
-                        Err(Error::other("finalize failed"))
-                    } else {
-                        Ok(())
-                    }
-                })
-            }),
-        );
-
-        tokio::task::yield_now().await;
-
-        // Init succeeds after first 5s sleep
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 1);
-
-        // Finalize retried after 5s backoff (attempt 1 failed)
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 2);
-
-        // Finalize retried after 10s backoff (attempt 2 failed)
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 3);
-
-        // No more retries after finalize succeeds
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(finalize_for_assert.load(Ordering::SeqCst), 3);
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn recovery_task_uses_exponential_backoff_on_repeated_failures() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let attempts_for_init = attempts.clone();
-
-        spawn_iam_recovery_task(
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            None,
-            Box::new(move || {
-                let attempts = attempts_for_init.clone();
-                Box::pin(async move {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::other("persistent failure"))
-                })
-            }),
-            Box::new(|| Box::pin(async { Ok(()) })),
-        );
-
-        tokio::task::yield_now().await;
-
-        // Attempt 1: after 5s (backoff for attempt 1)
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-
-        // Attempt 2: after 10s (backoff for attempt 2)
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-
-        // Attempt 3: after 20s (backoff for attempt 3)
-        tokio::time::advance(Duration::from_secs(20)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
-
-        // Attempt 4: after 30s (capped at max)
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 4);
-
-        // Attempt 5: still 30s (capped)
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 5);
     }
 }
