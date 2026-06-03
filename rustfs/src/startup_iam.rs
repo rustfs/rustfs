@@ -58,9 +58,7 @@ async fn finalize_iam_recovery(
     state_manager: Option<Arc<ServiceStateManager>>,
 ) -> Result<()> {
     readiness.mark_stage(SystemStage::IamReady);
-    if !init_app_context_if_needed(store, kms_interface) {
-        warn!("IAM recovered but app context initialization deferred; IAM singleton may not be available yet");
-    }
+    let _ = init_app_context_if_needed(store, kms_interface);
     publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
 }
 
@@ -78,6 +76,7 @@ fn compute_backoff_interval(attempt: u64, initial: Duration, max: Duration) -> D
 fn spawn_iam_recovery_task(
     initial_interval: Duration,
     max_interval: Duration,
+    shutdown_token: Option<tokio_util::sync::CancellationToken>,
     mut init_fn: RecoveryInitFn,
     mut finalize_fn: RecoveryFinalizeFn,
 ) {
@@ -89,7 +88,14 @@ fn spawn_iam_recovery_task(
         loop {
             attempts += 1;
             let sleep_duration = compute_backoff_interval(attempts, initial_interval, max_interval);
-            tokio::time::sleep(sleep_duration).await;
+            if let Some(token) = shutdown_token.as_ref() {
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = tokio::time::sleep(sleep_duration) => {}
+                }
+            } else {
+                tokio::time::sleep(sleep_duration).await;
+            }
 
             match init_fn().await {
                 Ok(()) => {
@@ -146,7 +152,14 @@ fn spawn_iam_recovery_task(
                         error = %err,
                         "IAM recovered, but readiness publication failed; retrying"
                     );
-                    tokio::time::sleep(retry_interval).await;
+                    if let Some(token) = shutdown_token.as_ref() {
+                        tokio::select! {
+                            _ = token.cancelled() => return,
+                            _ = tokio::time::sleep(retry_interval) => {}
+                        }
+                    } else {
+                        tokio::time::sleep(retry_interval).await;
+                    }
                 }
             }
         }
@@ -232,6 +245,7 @@ pub async fn bootstrap_or_defer_iam_init(
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
+    shutdown_token: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(()) => {
@@ -260,6 +274,7 @@ pub async fn bootstrap_or_defer_iam_init(
             spawn_iam_recovery_task(
                 interval,
                 IAM_RETRY_MAX_INTERVAL,
+                shutdown_token,
                 Box::new(move || {
                     let retry_store = retry_store.clone();
                     Box::pin(async move { attempt_init_iam_sys(retry_store).await })
@@ -329,6 +344,7 @@ mod tests {
         spawn_iam_recovery_task(
             Duration::from_secs(5),
             Duration::from_secs(30),
+            None,
             Box::new(move || {
                 let attempts = attempts_for_init.clone();
                 Box::pin(async move {
@@ -383,6 +399,7 @@ mod tests {
         spawn_iam_recovery_task(
             Duration::from_secs(5),
             Duration::from_secs(30),
+            None,
             Box::new(move || {
                 let attempts = attempts_for_init.clone();
                 Box::pin(async move {
@@ -439,6 +456,7 @@ mod tests {
         spawn_iam_recovery_task(
             Duration::from_secs(5),
             Duration::from_secs(30),
+            None,
             Box::new(move || {
                 let attempts = attempts_for_init.clone();
                 Box::pin(async move {

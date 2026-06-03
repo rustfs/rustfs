@@ -523,8 +523,14 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     // 3. Initialize IAM System (Blocking load)
     // This ensures data is in memory before moving forward
     let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-    let iam_bootstrap =
-        bootstrap_or_defer_iam_init(store.clone(), kms_interface, readiness.clone(), Some(state_manager.clone())).await?;
+    let iam_bootstrap = bootstrap_or_defer_iam_init(
+        store.clone(),
+        kms_interface,
+        readiness.clone(),
+        Some(state_manager.clone()),
+        Some(ctx.clone()),
+    )
+    .await?;
 
     // 3a. Initialize Keystone authentication if enabled
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;

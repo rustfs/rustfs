@@ -433,7 +433,7 @@ impl RustFSServerBuilder {
         // IAM.
         let kms_interface =
             rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-        let iam_bootstrap = bootstrap_or_defer_iam_init(store.clone(), kms_interface, readiness.clone(), None)
+        let iam_bootstrap = bootstrap_or_defer_iam_init(store.clone(), kms_interface, readiness.clone(), None, Some(ctx.clone()))
             .await
             .map_err(|e| {
                 shutdown_embedded_server();

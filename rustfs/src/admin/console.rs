@@ -436,7 +436,7 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
 /// # Returns:
 /// - `true` if the path is for console access, `false` otherwise.
 pub fn is_console_path(path: &str) -> bool {
-    path == FAVICON_PATH || path.starts_with(CONSOLE_PREFIX)
+    path == FAVICON_PATH || crate::server::has_path_prefix(path, CONSOLE_PREFIX)
 }
 
 /// Setup comprehensive middleware stack with tower-http features
