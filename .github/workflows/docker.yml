@@ -263,7 +263,7 @@ jobs:
     name: Build Docker Images
     needs: build-check
     if: needs.build-check.outputs.should_build == 'true'
-    runs-on: rustfs
+    runs-on: ubicloud-standard-2
     timeout-minutes: 60
     strategy:
           fail-fast: false
