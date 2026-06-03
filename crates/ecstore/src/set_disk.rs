@@ -106,6 +106,7 @@ use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OB
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem::{self};
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
@@ -253,6 +254,7 @@ pub fn get_duplex_buffer_size() -> usize {
 }
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
+static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod heal;
 mod list;
@@ -273,10 +275,14 @@ pub fn get_lock_acquire_timeout() -> Duration {
 }
 
 pub fn is_object_lock_diag_enabled() -> bool {
-    let enabled =
-        rustfs_utils::get_env_bool(rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE, rustfs_config::DEFAULT_OBJECT_LOCK_DIAG_ENABLE);
-    record_object_lock_diag_enabled(enabled);
-    enabled
+    *OBJECT_LOCK_DIAG_ENABLED.get_or_init(|| {
+        let enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_LOCK_DIAG_ENABLE,
+        );
+        record_object_lock_diag_enabled(enabled);
+        enabled
+    })
 }
 
 pub fn get_object_lock_diag_slow_acquire_threshold() -> Duration {
