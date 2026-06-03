@@ -1,3 +1,17 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Integration test demonstrating the embedded RustFS server API.
 //
 // This test starts a RustFS server in-process and exercises it via the
@@ -39,7 +53,6 @@ async fn test_embedded_server_basic_s3_operations() {
     // 2. Create an S3 client and perform basic operations.
     let client = s3_client(&endpoint, server.access_key(), server.secret_key());
 
-    // Create bucket
     client
         .create_bucket()
         .bucket("test-bucket")
@@ -47,7 +60,6 @@ async fn test_embedded_server_basic_s3_operations() {
         .await
         .expect("create bucket");
 
-    // Put object
     let body = ByteStream::from_static(b"hello rustfs embedded!");
     client
         .put_object()
@@ -58,7 +70,6 @@ async fn test_embedded_server_basic_s3_operations() {
         .await
         .expect("put object");
 
-    // Get object
     let resp = client
         .get_object()
         .bucket("test-bucket")
@@ -70,7 +81,6 @@ async fn test_embedded_server_basic_s3_operations() {
     let data = resp.body.collect().await.expect("read body").into_bytes();
     assert_eq!(data.as_ref(), b"hello rustfs embedded!");
 
-    // List objects
     let list = client
         .list_objects_v2()
         .bucket("test-bucket")
@@ -79,7 +89,6 @@ async fn test_embedded_server_basic_s3_operations() {
         .expect("list objects");
     assert_eq!(list.key_count(), Some(1));
 
-    // Delete object
     client
         .delete_object()
         .bucket("test-bucket")
@@ -88,7 +97,6 @@ async fn test_embedded_server_basic_s3_operations() {
         .await
         .expect("delete object");
 
-    // Delete bucket
     client
         .delete_bucket()
         .bucket("test-bucket")
@@ -96,6 +104,5 @@ async fn test_embedded_server_basic_s3_operations() {
         .await
         .expect("delete bucket");
 
-    // 3. Shut down.
     server.shutdown().await;
 }

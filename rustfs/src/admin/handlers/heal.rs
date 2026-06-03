@@ -164,6 +164,15 @@ struct HealTaskStatus {
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundHealStatus<'a> {
+    #[serde(flatten)]
+    info: &'a BackgroundHealInfo,
+    heal_queue_length: u64,
+    heal_active_tasks: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct HealTaskStatusPayload {
     summary: String,
@@ -230,7 +239,7 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
             Some(hip.obj_prefix.clone())
         },
         hip.force_start,
-        Some(HealChannelPriority::Normal),
+        Some(HealChannelPriority::High),
     );
 
     heal_request.pool_index = hip.hs.pool;
@@ -278,7 +287,12 @@ fn heal_channel_response_items(
 }
 
 fn encode_background_heal_status(info: &BackgroundHealInfo) -> S3Result<Vec<u8>> {
-    serde_json::to_vec(info).map_err(|e| s3_error!(InternalError, "failed to serialize background heal status: {e}"))
+    let status = BackgroundHealStatus {
+        info,
+        heal_queue_length: rustfs_heal::current_heal_queue_length(),
+        heal_active_tasks: rustfs_heal::current_heal_active_tasks(),
+    };
+    serde_json::to_vec(&status).map_err(|e| s3_error!(InternalError, "failed to serialize background heal status: {e}"))
 }
 
 fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
@@ -569,7 +583,7 @@ mod tests {
     use http::StatusCode;
     use http::Uri;
     use matchit::Router;
-    use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+    use rustfs_common::heal_channel::{HealChannelPriority, HealOpts, HealScanMode};
     use rustfs_ecstore::error::StorageError;
     use rustfs_scanner::scanner::BackgroundHealInfo;
     use s3s::{
@@ -686,6 +700,7 @@ mod tests {
 
         assert_eq!(request.bucket, "bucket");
         assert_eq!(request.object_prefix.as_deref(), Some("prefix"));
+        assert_eq!(request.priority, HealChannelPriority::High);
         assert!(request.force_start);
         assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
         assert_eq!(request.recursive, Some(true));
@@ -858,6 +873,8 @@ mod tests {
         assert_eq!(json["bitrotStartCycle"], 42);
         assert_eq!(json["currentScanMode"], 2);
         assert!(json["bitrotStartTime"].is_null());
+        assert!(json["healQueueLength"].is_u64());
+        assert!(json["healActiveTasks"].is_u64());
     }
 
     #[test]
@@ -911,6 +928,7 @@ mod tests {
 
         assert_eq!(request.bucket, "bucket-a");
         assert_eq!(request.object_prefix.as_deref(), Some("prefix-a"));
+        assert_eq!(request.priority, HealChannelPriority::High);
         assert!(request.force_start);
         assert_eq!(request.pool_index, Some(1));
         assert_eq!(request.set_index, Some(2));

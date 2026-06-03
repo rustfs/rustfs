@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo,
-    DataUsageInfo, SizeSummary, TierStats,
+    DataUsageInfo, ScannerError, SizeSummary, TierStats,
 };
 use futures::future::join_all;
 use metrics::counter;
@@ -66,6 +67,41 @@ const METRIC_SCANNER_SET_SCANS_QUEUED: &str = "rustfs_scanner_set_scans_queued";
 const METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE: &str = "rustfs_scanner_disk_bucket_scans_active";
 const METRIC_SCANNER_DISK_BUCKET_SCANS_QUEUED: &str = "rustfs_scanner_disk_bucket_scans_queued";
 
+fn record_set_scan_concurrency_limit(limit: usize) {
+    metrics::gauge!(METRIC_SCANNER_SET_SCAN_CONCURRENCY_LIMIT).set(limit as f64);
+    global_metrics().record_scanner_set_scan_state(Some(limit), None, None);
+}
+
+fn record_set_scans_queued(count: usize) {
+    metrics::gauge!(METRIC_SCANNER_SET_SCANS_QUEUED).set(count as f64);
+    global_metrics().record_scanner_set_scan_state(None, Some(count), None);
+}
+
+fn record_set_scans_active(count: usize) {
+    metrics::gauge!(METRIC_SCANNER_SET_SCANS_ACTIVE).set(count as f64);
+    global_metrics().record_scanner_set_scan_state(None, None, Some(count));
+}
+
+fn record_disk_scan_concurrency_limit(pool: &str, set: &str, limit: usize) {
+    metrics::gauge!(
+        METRIC_SCANNER_DISK_SCAN_CONCURRENCY_LIMIT,
+        "pool" => pool.to_owned(),
+        "set" => set.to_owned()
+    )
+    .set(limit as f64);
+    global_metrics().record_scanner_disk_bucket_scan_state(pool, set, Some(limit), None, None);
+}
+
+fn record_disk_bucket_scans_active(count: usize, pool: &str, set: &str) {
+    metrics::gauge!(
+        METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE,
+        "pool" => pool.to_owned(),
+        "set" => set.to_owned()
+    )
+    .set(count as f64);
+    global_metrics().record_scanner_disk_bucket_scan_state(pool, set, None, None, Some(count));
+}
+
 struct SetScanActiveGuard {
     active: Arc<AtomicUsize>,
 }
@@ -73,7 +109,7 @@ struct SetScanActiveGuard {
 impl SetScanActiveGuard {
     fn new(active: Arc<AtomicUsize>) -> Self {
         let active_count = active.fetch_add(1, Ordering::Relaxed) + 1;
-        metrics::gauge!(METRIC_SCANNER_SET_SCANS_ACTIVE).set(active_count as f64);
+        record_set_scans_active(active_count);
         Self { active }
     }
 }
@@ -81,7 +117,7 @@ impl SetScanActiveGuard {
 impl Drop for SetScanActiveGuard {
     fn drop(&mut self) {
         let active_count = decrement_atomic_usize(&self.active);
-        metrics::gauge!(METRIC_SCANNER_SET_SCANS_ACTIVE).set(active_count as f64);
+        record_set_scans_active(active_count);
     }
 }
 
@@ -94,12 +130,7 @@ struct DiskBucketScanActiveGuard {
 impl DiskBucketScanActiveGuard {
     fn new(active: Arc<AtomicUsize>, pool: String, set: String) -> Self {
         let active_count = active.fetch_add(1, Ordering::Relaxed) + 1;
-        metrics::gauge!(
-            METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE,
-            "pool" => pool.clone(),
-            "set" => set.clone()
-        )
-        .set(active_count as f64);
+        record_disk_bucket_scans_active(active_count, &pool, &set);
         Self { active, pool, set }
     }
 }
@@ -107,12 +138,7 @@ impl DiskBucketScanActiveGuard {
 impl Drop for DiskBucketScanActiveGuard {
     fn drop(&mut self) {
         let active_count = decrement_atomic_usize(&self.active);
-        metrics::gauge!(
-            METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE,
-            "pool" => self.pool.clone(),
-            "set" => self.set.clone()
-        )
-        .set(active_count as f64);
+        record_disk_bucket_scans_active(active_count, &self.pool, &self.set);
     }
 }
 
@@ -138,6 +164,23 @@ impl Drop for BucketDriveFailureGuard {
     }
 }
 
+struct DiskBucketScanGaugeReset {
+    pool: String,
+    set: String,
+}
+
+impl DiskBucketScanGaugeReset {
+    fn new(pool: String, set: String) -> Self {
+        Self { pool, set }
+    }
+}
+
+impl Drop for DiskBucketScanGaugeReset {
+    fn drop(&mut self) {
+        reset_disk_bucket_scan_gauges(&self.pool, &self.set);
+    }
+}
+
 fn decrement_atomic_usize(counter: &AtomicUsize) -> usize {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(1)))
@@ -152,6 +195,7 @@ fn record_disk_bucket_scans_queued(count: usize, pool: &str, set: &str) {
         "set" => set.to_owned()
     )
     .set(count as f64);
+    global_metrics().record_scanner_disk_bucket_scan_state(pool, set, None, Some(count), None);
 }
 
 fn decrement_disk_bucket_scans_queued(counter: &AtomicUsize, pool: &str, set: &str) {
@@ -160,25 +204,16 @@ fn decrement_disk_bucket_scans_queued(counter: &AtomicUsize, pool: &str, set: &s
 }
 
 fn reset_set_scan_gauges() {
-    metrics::gauge!(METRIC_SCANNER_SET_SCAN_CONCURRENCY_LIMIT).set(0.0);
-    metrics::gauge!(METRIC_SCANNER_SET_SCANS_QUEUED).set(0.0);
-    metrics::gauge!(METRIC_SCANNER_SET_SCANS_ACTIVE).set(0.0);
+    record_set_scan_concurrency_limit(0);
+    record_set_scans_queued(0);
+    record_set_scans_active(0);
+    global_metrics().reset_scanner_set_scan_state();
 }
 
 fn reset_disk_bucket_scan_gauges(pool: &str, set: &str) {
-    metrics::gauge!(
-        METRIC_SCANNER_DISK_SCAN_CONCURRENCY_LIMIT,
-        "pool" => pool.to_owned(),
-        "set" => set.to_owned()
-    )
-    .set(0.0);
+    record_disk_scan_concurrency_limit(pool, set, 0);
     record_disk_bucket_scans_queued(0, pool, set);
-    metrics::gauge!(
-        METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE,
-        "pool" => pool.to_owned(),
-        "set" => set.to_owned()
-    )
-    .set(0.0);
+    record_disk_bucket_scans_active(0, pool, set);
 }
 
 fn scanner_concurrency_limit(configured: usize, available: usize) -> usize {
@@ -232,6 +267,23 @@ fn is_xl_meta_path(path: &str) -> bool {
         .is_some_and(|name| name == STORAGE_FORMAT_FILE)
 }
 
+fn cache_root_entry_info(cache: &DataUsageCache) -> DataUsageEntryInfo {
+    let entry = cache.root().map(|root| cache.flatten(&root)).unwrap_or_default();
+
+    DataUsageEntryInfo {
+        name: cache.info.name.clone(),
+        parent: DATA_USAGE_ROOT.to_string(),
+        entry,
+    }
+}
+
+async fn send_cache_root_entry_info(
+    bucket_result_tx: &Arc<Mutex<mpsc::Sender<DataUsageEntryInfo>>>,
+    cache: &DataUsageCache,
+) -> std::result::Result<(), mpsc::error::SendError<DataUsageEntryInfo>> {
+    bucket_result_tx.lock().await.send(cache_root_entry_info(cache)).await
+}
+
 async fn persist_and_publish_cache_snapshot<S: StorageAPI>(
     store: Arc<S>,
     updates: &mpsc::Sender<DataUsageCache>,
@@ -257,6 +309,7 @@ pub trait ScannerIO: Send + Sync + Debug + 'static {
     async fn nsscanner(
         &self,
         ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
         updates: mpsc::Sender<DataUsageInfo>,
         want_cycle: u64,
         scan_mode: HealScanMode,
@@ -268,6 +321,7 @@ pub trait ScannerIOCache: Send + Sync + Debug + 'static {
     async fn nsscanner_cache(
         self: Arc<Self>,
         ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
         buckets: Vec<BucketInfo>,
         updates: mpsc::Sender<DataUsageCache>,
         want_cycle: u64,
@@ -280,20 +334,28 @@ pub trait ScannerIODisk: Send + Sync + Debug + 'static {
     async fn nsscanner_disk(
         &self,
         ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
         cache: DataUsageCache,
         updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
-    ) -> Result<DataUsageCache>;
+    ) -> Result<ScannerDiskScanOutcome>;
 
     async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary>;
 }
 
+#[derive(Debug)]
+pub enum ScannerDiskScanOutcome {
+    Complete(DataUsageCache),
+    Partial(DataUsageCache),
+}
+
 #[async_trait::async_trait]
 impl ScannerIO for ECStore {
-    #[tracing::instrument(skip(self, updates))]
+    #[tracing::instrument(skip(self, budget, updates))]
     async fn nsscanner(
         &self,
         ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
         updates: mpsc::Sender<DataUsageInfo>,
         want_cycle: u64,
         scan_mode: HealScanMode,
@@ -321,7 +383,7 @@ impl ScannerIO for ECStore {
         }
 
         let set_scan_limit = scanner_max_concurrent_set_scans(total_results);
-        metrics::gauge!(METRIC_SCANNER_SET_SCAN_CONCURRENCY_LIMIT).set(set_scan_limit as f64);
+        record_set_scan_concurrency_limit(set_scan_limit);
         debug!(
             total_sets = total_results,
             concurrency_limit = set_scan_limit,
@@ -330,8 +392,8 @@ impl ScannerIO for ECStore {
         let set_scan_semaphore = Arc::new(Semaphore::new(set_scan_limit));
         let queued_set_scans = Arc::new(AtomicUsize::new(total_results));
         let active_set_scans = Arc::new(AtomicUsize::new(0));
-        metrics::gauge!(METRIC_SCANNER_SET_SCANS_QUEUED).set(total_results as f64);
-        metrics::gauge!(METRIC_SCANNER_SET_SCANS_ACTIVE).set(0.0);
+        record_set_scans_queued(total_results);
+        record_set_scans_active(0);
 
         let results = vec![DataUsageCache::default(); total_results];
         let results_mutex: Arc<Mutex<Vec<DataUsageCache>>> = Arc::new(Mutex::new(results));
@@ -350,6 +412,7 @@ impl ScannerIO for ECStore {
                 let set_label = set.set_index.to_string();
 
                 let child_token_clone = child_token.clone();
+                let budget_clone = budget.clone();
                 let want_cycle_clone = want_cycle;
                 let scan_mode_clone = scan_mode;
                 let results_mutex_clone = results_mutex.clone();
@@ -388,11 +451,18 @@ impl ScannerIO for ECStore {
                     )
                     .record(permit_wait_start.elapsed().as_secs_f64());
                     let queued_count = decrement_atomic_usize(&queued_set_scans_clone);
-                    metrics::gauge!(METRIC_SCANNER_SET_SCANS_QUEUED).set(queued_count as f64);
+                    record_set_scans_queued(queued_count);
                     let _active_guard = SetScanActiveGuard::new(active_set_scans_clone);
 
                     if let Err(e) = set_clone
-                        .nsscanner_cache(child_token_clone.clone(), all_buckets_clone, tx, want_cycle_clone, scan_mode_clone)
+                        .nsscanner_cache(
+                            child_token_clone.clone(),
+                            budget_clone,
+                            all_buckets_clone,
+                            tx,
+                            want_cycle_clone,
+                            scan_mode_clone,
+                        )
                         .await
                     {
                         if child_token_clone.is_cancelled() {
@@ -488,8 +558,9 @@ impl ScannerIO for ECStore {
         });
 
         let _ = join_all(wait_futs).await;
-        metrics::gauge!(METRIC_SCANNER_SET_SCANS_QUEUED).set(0.0);
-        metrics::gauge!(METRIC_SCANNER_SET_SCANS_ACTIVE).set(0.0);
+        record_set_scan_concurrency_limit(0);
+        record_set_scans_queued(0);
+        record_set_scans_active(0);
 
         let _ = update_tx.send(());
 
@@ -501,10 +572,11 @@ impl ScannerIO for ECStore {
 
 #[async_trait::async_trait]
 impl ScannerIOCache for SetDisks {
-    #[tracing::instrument(skip(self, updates))]
+    #[tracing::instrument(skip(self, budget, updates))]
     async fn nsscanner_cache(
         self: Arc<Self>,
         ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
         buckets: Vec<BucketInfo>,
         updates: mpsc::Sender<DataUsageCache>,
         want_cycle: u64,
@@ -525,12 +597,7 @@ impl ScannerIOCache for SetDisks {
             return Ok(());
         }
         let disk_scan_limit = scanner_max_concurrent_disk_scans(disks.len());
-        metrics::gauge!(
-            METRIC_SCANNER_DISK_SCAN_CONCURRENCY_LIMIT,
-            "pool" => self.pool_index.to_string(),
-            "set" => self.set_index.to_string()
-        )
-        .set(disk_scan_limit as f64);
+        record_disk_scan_concurrency_limit(&pool_label, &set_label, disk_scan_limit);
         debug!(
             pool = self.pool_index,
             set = self.set_index,
@@ -542,12 +609,8 @@ impl ScannerIOCache for SetDisks {
         let queued_disk_bucket_scans = Arc::new(AtomicUsize::new(buckets.len()));
         let active_disk_bucket_scans = Arc::new(AtomicUsize::new(0));
         record_disk_bucket_scans_queued(buckets.len(), &pool_label, &set_label);
-        metrics::gauge!(
-            METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE,
-            "pool" => pool_label.clone(),
-            "set" => set_label.clone()
-        )
-        .set(0.0);
+        record_disk_bucket_scans_active(0, &pool_label, &set_label);
+        let _reset_disk_bucket_scan_gauges = DiskBucketScanGaugeReset::new(pool_label.clone(), set_label.clone());
 
         let mut old_cache = DataUsageCache::default();
         old_cache.load(self.clone(), DATA_USAGE_CACHE_NAME).await?;
@@ -597,13 +660,14 @@ impl ScannerIOCache for SetDisks {
             let mut ticker = tokio::time::interval(Duration::from_secs(3 + rand::random::<u64>() % 10));
 
             let mut last_update = None;
+            let mut cancelled = false;
 
             loop {
                 tokio::select! {
-                    _ = ctx_clone.cancelled() => {
-                        break;
+                    _ = ctx_clone.cancelled(), if !cancelled => {
+                        cancelled = true;
                     }
-                    _ = ticker.tick() => {
+                    _ = ticker.tick(), if !cancelled => {
                         let cache_snapshot = {
                             let cache = cache_mutex_clone.lock().await;
                             if cache.info.last_update == last_update {
@@ -648,6 +712,7 @@ impl ScannerIOCache for SetDisks {
         for disk in disks.into_iter() {
             let bucket_rx_mutex_clone = bucket_rx_mutex.clone();
             let ctx_clone = ctx.clone();
+            let budget_clone = budget.clone();
             let store_clone_clone = self.clone();
             let bucket_result_tx_clone_clone = bucket_result_tx_clone.clone();
             let disk_clone = disk.clone();
@@ -756,11 +821,11 @@ impl ScannerIOCache for SetDisks {
 
                     let before = cache.info.last_update;
 
-                    cache = match disk_clone
-                        .nsscanner_disk(ctx_clone.clone(), cache.clone(), Some(updates_tx), scan_mode)
+                    let scan_outcome = match disk_clone
+                        .nsscanner_disk(ctx_clone.clone(), budget_clone.clone(), cache.clone(), Some(updates_tx), scan_mode)
                         .await
                     {
-                        Ok(cache) => cache,
+                        Ok(scan_outcome) => scan_outcome,
                         Err(e) => {
                             if ctx_clone.is_cancelled() {
                                 debug!("Scanner disk scan stopped after cancellation: {}", e);
@@ -785,17 +850,31 @@ impl ScannerIOCache for SetDisks {
                         }
                     };
 
+                    cache = match scan_outcome {
+                        ScannerDiskScanOutcome::Complete(cache) => cache,
+                        ScannerDiskScanOutcome::Partial(cache) => {
+                            let done_save = Metrics::time(Metric::SaveUsage);
+                            if let Err(e) = cache.save(store_clone_clone.clone(), cache_name.as_str()).await {
+                                error!("Failed to save partial data usage cache: {}", e);
+                            }
+                            done_save();
+
+                            if let Err(e) = update_fut.await {
+                                error!("Failed to update partial data usage cache: {}", e);
+                            }
+
+                            if let Err(e) = send_cache_root_entry_info(&bucket_result_tx_clone_clone, &cache).await {
+                                error!("Failed to send partial data usage entry info: {}", e);
+                            }
+                            continue;
+                        }
+                    };
+
                     debug!("nsscanner_disk: got cache: {}", cache.info.name);
 
                     if let Err(e) = update_fut.await {
                         error!("nsscanner_disk: Failed to update data usage cache: {}", e);
                     }
-
-                    let root = if let Some(r) = cache.root() {
-                        cache.flatten(&r)
-                    } else {
-                        DataUsageEntry::default()
-                    };
 
                     if ctx_clone.is_cancelled() {
                         break;
@@ -803,16 +882,7 @@ impl ScannerIOCache for SetDisks {
 
                     debug!("nsscanner_disk: sending data usage entry info: {}", cache.info.name);
 
-                    if let Err(e) = bucket_result_tx_clone_clone
-                        .lock()
-                        .await
-                        .send(DataUsageEntryInfo {
-                            name: cache.info.name.clone(),
-                            parent: DATA_USAGE_ROOT.to_string(),
-                            entry: root,
-                        })
-                        .await
-                    {
+                    if let Err(e) = send_cache_root_entry_info(&bucket_result_tx_clone_clone, &cache).await {
                         error!("nsscanner_disk: Failed to send data usage entry info: {}", e);
                     }
 
@@ -826,13 +896,9 @@ impl ScannerIOCache for SetDisks {
         }
 
         let _ = join_all(futs).await;
+        record_disk_scan_concurrency_limit(&pool_label, &set_label, 0);
         record_disk_bucket_scans_queued(0, &pool_label, &set_label);
-        metrics::gauge!(
-            METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE,
-            "pool" => pool_label.clone(),
-            "set" => set_label.clone()
-        )
-        .set(0.0);
+        record_disk_bucket_scans_active(0, &pool_label, &set_label);
 
         drop(bucket_result_tx_clone);
 
@@ -931,14 +997,15 @@ impl ScannerIODisk for Disk {
         Ok(size_summary)
     }
 
-    #[tracing::instrument(skip(self, updates, cache))]
+    #[tracing::instrument(skip(self, budget, updates, cache))]
     async fn nsscanner_disk(
         &self,
         ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
         cache: DataUsageCache,
         updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
-    ) -> Result<DataUsageCache> {
+    ) -> Result<ScannerDiskScanOutcome> {
         let done_drive = Metrics::time(Metric::ScanBucketDrive);
         let drive_start = std::time::Instant::now();
         let bucket = cache.info.name.clone();
@@ -1004,7 +1071,8 @@ impl ScannerIODisk for Disk {
 
         let disks = disks_result.into_iter().flatten().collect::<Vec<Arc<Disk>>>();
 
-        let result = scan_data_folder(ctx.clone(), disks, local_disk, cache, updates, scan_mode, SCANNER_SLEEPER.clone()).await;
+        let result =
+            scan_data_folder(ctx.clone(), budget, disks, local_disk, cache, updates, scan_mode, SCANNER_SLEEPER.clone()).await;
 
         match result {
             Ok(mut data_usage_info) => {
@@ -1012,7 +1080,14 @@ impl ScannerIODisk for Disk {
                 emit_scan_bucket_drive_complete(true, &bucket, &disk_path, drive_start.elapsed());
                 data_usage_info.info.last_update = Some(SystemTime::now());
                 failure_guard.mark_not_failed();
-                Ok(data_usage_info)
+                Ok(ScannerDiskScanOutcome::Complete(data_usage_info))
+            }
+            Err(ScannerError::PartialCache(mut partial_cache)) => {
+                done_drive();
+                emit_scan_bucket_drive_partial(&bucket, &disk_path, drive_start.elapsed());
+                partial_cache.info.last_update.get_or_insert_with(SystemTime::now);
+                failure_guard.mark_not_failed();
+                Ok(ScannerDiskScanOutcome::Partial(*partial_cache))
             }
             Err(e) => {
                 if ctx.is_cancelled() {
@@ -1114,5 +1189,79 @@ mod tests {
     #[test]
     fn is_xl_meta_path_accepts_forward_separator() {
         assert!(is_xl_meta_path("/data/bucket/object/xl.meta"));
+    }
+
+    #[test]
+    fn cache_root_entry_info_flattens_bucket_children() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: 10,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.replace(
+            "bucket/prefix",
+            "bucket",
+            DataUsageEntry {
+                size: 20,
+                objects: 2,
+                ..Default::default()
+            },
+        );
+
+        let info = cache_root_entry_info(&cache);
+
+        assert_eq!(info.name, "bucket");
+        assert_eq!(info.parent, DATA_USAGE_ROOT);
+        assert_eq!(info.entry.size, 30);
+        assert_eq!(info.entry.objects, 3);
+        assert!(info.entry.children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_cache_root_entry_info_sends_after_budget_cancellation() {
+        let ctx = CancellationToken::new();
+        ctx.cancel();
+        assert!(ctx.is_cancelled());
+
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: 10,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let tx = Arc::new(Mutex::new(tx));
+
+        send_cache_root_entry_info(&tx, &cache)
+            .await
+            .expect("partial cache should be sent even after budget cancellation");
+
+        let info = rx.recv().await.expect("partial cache entry should be received");
+        assert_eq!(info.name, "bucket");
+        assert_eq!(info.parent, DATA_USAGE_ROOT);
+        assert_eq!(info.entry.size, 10);
+        assert_eq!(info.entry.objects, 1);
     }
 }
