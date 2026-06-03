@@ -199,11 +199,11 @@ arc-swap = "1.9.1"
 astral-tokio-tar = "0.6.2"
 atoi = "2.0.0"
 atomic_enum = "0.3.0"
-aws-config = { version = "1.8.17" }
+aws-config = { version = "1.8.18" }
 aws-credential-types = { version = "1.2.14" }
-aws-sdk-s3 = { version = "1.134.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
-aws-smithy-http-client = { version = "1.1.12", default-features = false, features = ["default-client", "rustls-aws-lc"] }
-aws-smithy-types = { version = "1.4.8" }
+aws-sdk-s3 = { version = "1.135.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client", "rustls-aws-lc"] }
+aws-smithy-types = { version = "1.4.9" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.3"
