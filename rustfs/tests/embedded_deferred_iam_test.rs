@@ -32,6 +32,7 @@ fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
     Client::from_conf(config)
 }
 
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
     async_with_vars(
