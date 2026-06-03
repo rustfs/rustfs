@@ -18,7 +18,9 @@ use rustfs_common::{GlobalReadiness, SystemStage};
 use rustfs_ecstore::store::ECStore;
 use rustfs_iam::init_iam_sys;
 use rustfs_kms::KmsServiceManager;
+use std::future::Future;
 use std::io::Result;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -76,90 +78,126 @@ fn spawn_iam_recovery_task(
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
 ) {
+    let init_store = store.clone();
+    let finalize_store = store;
+    let finalize_kms_interface = kms_interface;
+    let finalize_readiness = readiness;
+    let finalize_state_manager = state_manager;
     tokio::spawn(async move {
-        let mut attempts: u64 = 0;
-        let degraded_since = std::time::Instant::now();
-
-        // Phase 1: retry init until it succeeds
-        loop {
-            attempts += 1;
-            let sleep_duration = compute_backoff_interval(attempts, initial_interval, max_interval);
-            if let Some(token) = shutdown_token.as_ref() {
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    _ = tokio::time::sleep(sleep_duration) => {}
-                }
-            } else {
-                tokio::time::sleep(sleep_duration).await;
-            }
-
-            match attempt_init_iam_sys(store.clone()).await {
-                Ok(()) => {
-                    let degraded_secs = degraded_since.elapsed().as_secs();
-                    info!(
-                        attempts,
-                        degraded_duration_secs = degraded_secs,
-                        "IAM bootstrap recovered after startup; publishing IAM readiness"
-                    );
-                    break;
-                }
-                Err(err) => {
-                    let next_interval = compute_backoff_interval(attempts + 1, initial_interval, max_interval);
-                    if attempts >= IAM_RETRY_ESCALATION_THRESHOLD {
-                        error!(
-                            attempts,
-                            next_retry_secs = next_interval.as_secs(),
-                            degraded_duration_secs = degraded_since.elapsed().as_secs(),
-                            error = %err,
-                            "IAM bootstrap retry failed after {} attempts; service remains degraded",
-                            attempts
-                        );
-                    } else {
-                        warn!(
-                            attempts,
-                            next_retry_secs = next_interval.as_secs(),
-                            error = %err,
-                            "IAM bootstrap retry failed; service remains degraded"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Phase 2: retry finalize until readiness is published
-        let mut finalize_attempts: u64 = 0;
-        loop {
-            finalize_attempts += 1;
-            match finalize_iam_recovery(store.clone(), kms_interface.clone(), readiness.clone(), state_manager.clone()).await {
-                Ok(()) => {
-                    info!(
-                        init_attempts = attempts,
-                        finalize_attempts,
-                        degraded_duration_secs = degraded_since.elapsed().as_secs(),
-                        "IAM readiness published successfully"
-                    );
-                    break;
-                }
-                Err(err) => {
-                    let retry_interval = compute_backoff_interval(finalize_attempts, initial_interval, max_interval);
-                    warn!(
-                        finalize_attempts,
-                        retry_secs = retry_interval.as_secs(),
-                        error = %err,
-                        "IAM recovered, but readiness publication failed; retrying"
-                    );
-                    if let Some(token) = shutdown_token.as_ref() {
-                        tokio::select! {
-                            _ = token.cancelled() => return,
-                            _ = tokio::time::sleep(retry_interval) => {}
-                        }
-                    } else {
-                        tokio::time::sleep(retry_interval).await;
-                    }
-                }
-            }
-        }
+        run_iam_recovery_loop(
+            initial_interval,
+            max_interval,
+            shutdown_token,
+            move || {
+                let store = init_store.clone();
+                Box::pin(async move { attempt_init_iam_sys(store).await })
+            },
+            move || {
+                let store = finalize_store.clone();
+                let kms_interface = finalize_kms_interface.clone();
+                let readiness = finalize_readiness.clone();
+                let state_manager = finalize_state_manager.clone();
+                Box::pin(async move { finalize_iam_recovery(store, kms_interface, readiness, state_manager).await })
+            },
+        )
+        .await;
     });
+}
+
+type RecoveryFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
+    initial_interval: Duration,
+    max_interval: Duration,
+    shutdown_token: Option<tokio_util::sync::CancellationToken>,
+    mut init_fn: InitFn,
+    mut finalize_fn: FinalizeFn,
+) where
+    InitFn: FnMut() -> RecoveryFuture<'static>,
+    FinalizeFn: FnMut() -> RecoveryFuture<'static>,
+{
+    let mut attempts: u64 = 0;
+    let degraded_since = std::time::Instant::now();
+
+    // Phase 1: retry init until it succeeds
+    loop {
+        attempts += 1;
+        let sleep_duration = compute_backoff_interval(attempts, initial_interval, max_interval);
+        if let Some(token) = shutdown_token.as_ref() {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(sleep_duration) => {}
+            }
+        } else {
+            tokio::time::sleep(sleep_duration).await;
+        }
+
+        match init_fn().await {
+            Ok(()) => {
+                let degraded_secs = degraded_since.elapsed().as_secs();
+                info!(
+                    attempts,
+                    degraded_duration_secs = degraded_secs,
+                    "IAM bootstrap recovered after startup; publishing IAM readiness"
+                );
+                break;
+            }
+            Err(err) => {
+                let next_interval = compute_backoff_interval(attempts + 1, initial_interval, max_interval);
+                if attempts >= IAM_RETRY_ESCALATION_THRESHOLD {
+                    error!(
+                        attempts,
+                        next_retry_secs = next_interval.as_secs(),
+                        degraded_duration_secs = degraded_since.elapsed().as_secs(),
+                        error = %err,
+                        "IAM bootstrap retry failed after {} attempts; service remains degraded",
+                        attempts
+                    );
+                } else {
+                    warn!(
+                        attempts,
+                        next_retry_secs = next_interval.as_secs(),
+                        error = %err,
+                        "IAM bootstrap retry failed; service remains degraded"
+                    );
+                }
+            }
+        }
+    }
+
+    // Phase 2: retry finalize until readiness is published
+    let mut finalize_attempts: u64 = 0;
+    loop {
+        finalize_attempts += 1;
+        match finalize_fn().await {
+            Ok(()) => {
+                info!(
+                    init_attempts = attempts,
+                    finalize_attempts,
+                    degraded_duration_secs = degraded_since.elapsed().as_secs(),
+                    "IAM readiness published successfully"
+                );
+                break;
+            }
+            Err(err) => {
+                let retry_interval = compute_backoff_interval(finalize_attempts, initial_interval, max_interval);
+                warn!(
+                    finalize_attempts,
+                    retry_secs = retry_interval.as_secs(),
+                    error = %err,
+                    "IAM recovered, but readiness publication failed; retrying"
+                );
+                if let Some(token) = shutdown_token.as_ref() {
+                    tokio::select! {
+                        _ = token.cancelled() => return,
+                        _ = tokio::time::sleep(retry_interval) => {}
+                    }
+                } else {
+                    tokio::time::sleep(retry_interval).await;
+                }
+            }
+        }
+    }
 }
 
 fn initial_retry_interval() -> Duration {
@@ -279,7 +317,15 @@ pub async fn bootstrap_or_defer_iam_init(
 
 #[cfg(test)]
 mod tests {
-    use super::{IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, compute_backoff_interval};
+    use super::{
+        IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, compute_backoff_interval,
+        run_iam_recovery_loop,
+    };
+    use std::io::Error;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
 
     #[test]
@@ -305,5 +351,76 @@ mod tests {
         assert_eq!(compute_backoff_interval(4, initial, max), Duration::from_secs(30));
         assert_eq!(compute_backoff_interval(5, initial, max), Duration::from_secs(30));
         assert_eq!(compute_backoff_interval(100, initial, max), Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_loop_retries_finalize_until_success() {
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let finalize_calls = Arc::new(AtomicUsize::new(0));
+
+        let init_calls_for_assert = init_calls.clone();
+        let finalize_calls_for_assert = finalize_calls.clone();
+
+        run_iam_recovery_loop(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            None,
+            move || {
+                let init_calls = init_calls.clone();
+                Box::pin(async move {
+                    init_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            },
+            move || {
+                let finalize_calls = finalize_calls.clone();
+                Box::pin(async move {
+                    let call = finalize_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if call < 3 {
+                        Err(Error::other("finalize failed"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(init_calls_for_assert.load(Ordering::SeqCst), 1);
+        assert_eq!(finalize_calls_for_assert.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_loop_stops_after_shutdown_cancellation() {
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let task = tokio::spawn({
+            let init_calls = init_calls.clone();
+            let cancel = cancel.clone();
+            async move {
+                run_iam_recovery_loop(
+                    Duration::from_secs(5),
+                    Duration::from_secs(30),
+                    Some(cancel),
+                    move || {
+                        let init_calls = init_calls.clone();
+                        Box::pin(async move {
+                            init_calls.fetch_add(1, Ordering::SeqCst);
+                            Err(Error::other("keep retrying"))
+                        })
+                    },
+                    move || Box::pin(async { Ok(()) }),
+                )
+                .await;
+            }
+        });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        task.await.expect("recovery task should exit after cancellation");
+
+        assert_eq!(init_calls.load(Ordering::SeqCst), 0);
     }
 }
