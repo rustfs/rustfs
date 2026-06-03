@@ -14,6 +14,8 @@ make pre-commit                           # full pre-PR gate (fmt + clippy + tes
 make build-docker BUILD_OS=ubuntu22.04    # Docker cross-build
 ```
 
+> **Docker build note**: `buildx build` without `--load` keeps the image in the buildx cache only — `docker run` will use a stale local image. The Makefile already includes `--load`; if you suspect a stale binary, add `--no-cache` to the `buildx build` invocation inside `.config/make/build-docker.mak`.
+
 > Agent/PR rules: see `.github/copilot-instructions.md`.
 > Crate membership: `Cargo.toml` `[workspace].members`.
 > CI gates: `.github/workflows/ci.yml`.
@@ -88,7 +90,7 @@ Key suffixes (from `metadata_compat.rs`):
 Path: `{disk}/{bucket}/{object}/xl.meta` — one per erasure shard disk.
 All shards should be identical for a healthy object.
 
-## Known bugs & fixes 
+## Known bugs & fixes
 
 ### Bug 1: `NoSuchVersion` on tier GET — nil UUID sent as versionId
 **Root cause**: `transitioned-versionID` metadata key exists with empty string value (0 bytes). Old reading code:
@@ -103,6 +105,7 @@ get_bytes(…)
     .and_then(|v| Uuid::from_slice(v.as_slice()).ok())  // None for wrong-length bytes
     .filter(|u| !u.is_nil())                            // None for nil UUID (old write-back)
 ```
+**Regression tests** (`crates/filemeta/src/filemeta/version.rs` `mod tests`): 6 tests cover absent key, empty bytes, nil UUID, and valid UUID round-trip for both `MetaObject` and `MetaDeleteMarker` paths.
 
 ### Bug 2: `warm_backend_s3sdk.rs` ignored rv and range opts
 **Fix**: added `req.version_id(rv)` and `req.range(…)` to GET; `req.version_id(rv)` to DELETE.
@@ -136,7 +139,7 @@ Log line: `tier GET failed` (ERROR on failure, includes `tier_version_id`).
 x-minio-internal-transitioned-versionID=   ← empty string = will cause NoSuchVersion with old code
 x-rustfs-internal-transitioned-versionID=  ← same
 ```
-If both are empty string, the object was transitioned to a non-versioned tier bucket. The versionId should NOT be sent (fixed in this branch).
+If both are empty string, the object was transitioned to a non-versioned tier bucket. The versionId should NOT be sent — fixed by Bug 1 above.
 
 ## Common patterns
 
