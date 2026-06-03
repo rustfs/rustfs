@@ -83,9 +83,23 @@ pub struct EcObjectStore {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SelectScanRange {
+pub struct SelectScanRange {
     start: u64,
     end: u64,
+}
+
+impl SelectScanRange {
+    pub const fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    pub const fn end(&self) -> u64 {
+        self.end
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -305,7 +319,7 @@ fn http_range_spec_from_start(start: u64) -> HTTPRangeSpec {
 }
 
 fn scan_range_read_start(scan_range: SelectScanRange, delimiter: &[u8]) -> u64 {
-    scan_range.start.saturating_sub(delimiter.len() as u64)
+    scan_range.start().saturating_sub(delimiter.len() as u64)
 }
 
 fn find_delimiter(bytes: &[u8], delimiter: &[u8]) -> Option<usize> {
@@ -328,7 +342,7 @@ fn map_storage_error(bucket: &str, object: &str, err: StorageError) -> o_Error {
     }
 }
 
-fn scan_range_from_bounds(start: Option<i64>, end: Option<i64>, object_size: u64) -> Result<Option<SelectScanRange>> {
+pub fn scan_range_from_bounds(start: Option<i64>, end: Option<i64>, object_size: u64) -> Result<Option<SelectScanRange>> {
     parse_scan_range_from_bounds(start, end, object_size).map_err(|_| invalid_scan_range_store_error())
 }
 
@@ -362,14 +376,14 @@ fn parse_scan_range_from_bounds(
             if start > 0 {
                 return Err(InvalidScanRange);
             }
-            return Ok(Some(SelectScanRange { start: 0, end: 0 }));
+            return Ok(Some(SelectScanRange::new(0, 0)));
         }
         if start >= object_size {
             return Err(InvalidScanRange);
         }
     }
     if object_size == 0 {
-        return Ok(Some(SelectScanRange { start: 0, end: 0 }));
+        return Ok(Some(SelectScanRange::new(0, 0)));
     }
 
     let last_byte = object_size - 1;
@@ -382,7 +396,7 @@ fn parse_scan_range_from_bounds(
         }
         (None, None) => return Ok(None),
     };
-    Ok(Some(SelectScanRange { start, end }))
+    Ok(Some(SelectScanRange::new(start, end)))
 }
 
 fn invalid_scan_range_store_error() -> o_Error {
@@ -477,7 +491,7 @@ impl ObjectStore for EcObjectStore {
             let delimiter = self.record_delimiter();
             let include_header = self.csv_has_header();
             let read_start = scan_range_read_start(scan_range, &delimiter);
-            let header = if include_header && scan_range.start > 0 {
+            let header = if include_header && scan_range.start() > 0 {
                 Some(self.read_header_record(original_size, &delimiter, &opts).await?)
             } else {
                 None
@@ -827,11 +841,11 @@ impl<S> ScanRangeState<S> {
 
     fn push_record(&mut self, record: Vec<u8>, record_start: u64) {
         let include_header = self.include_header && record_start == 0;
-        let include_record = record_start >= self.range.start && record_start <= self.range.end;
+        let include_record = record_start >= self.range.start() && record_start <= self.range.end();
         if include_header || include_record {
             self.pending.push_back(Bytes::from(record));
         } else {
-            if record_start > self.range.end {
+            if record_start > self.range.end() {
                 self.done = true;
             }
         }
@@ -1103,7 +1117,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_range_stream_keeps_header_and_selected_record() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"h1,h2\n1,a\n2,b\n3,c\n"))]);
-        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 10, end: 11 }, true, 0);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(10, 11), true, 0);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1114,7 +1128,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_range_stream_skips_record_when_start_is_in_middle() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"1,a\n2,b\n3,c\n"))]);
-        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 2, end: 7 }, false, 0);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(2, 7), false, 0);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1125,7 +1139,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_range_stream_keeps_record_when_end_is_in_middle() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"1,a\n2,b\n3,c\n"))]);
-        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 0, end: 5 }, false, 0);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, 5), false, 0);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1136,7 +1150,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_range_stream_uses_base_offset_for_range_reader() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"\n2,b\n3,c\n"))]);
-        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 4, end: 7 }, false, 3);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(4, 7), false, 3);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1151,7 +1165,7 @@ mod test {
             Ok::<_, std::io::Error>(Bytes::from_static(b"\n1,a\r\n2,b\r")),
             Ok::<_, std::io::Error>(Bytes::from_static(b"\n3,c\r\n")),
         ]);
-        let mut stream = scan_range_stream(chunks, b"\r\n".to_vec(), SelectScanRange { start: 12, end: 14 }, true, 0);
+        let mut stream = scan_range_stream(chunks, b"\r\n".to_vec(), SelectScanRange::new(12, 14), true, 0);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1161,7 +1175,7 @@ mod test {
 
     #[test]
     fn test_scan_range_read_start_keeps_full_delimiter_boundary() {
-        let range = SelectScanRange { start: 10, end: 20 };
+        let range = SelectScanRange::new(10, 20);
         assert_eq!(scan_range_read_start(range, b"\n"), 9);
         assert_eq!(scan_range_read_start(range, b"\r\n"), 8);
         assert_eq!(scan_range_read_start(range, b"abcdef"), 4);
@@ -1176,8 +1190,8 @@ mod test {
     #[test]
     fn test_scan_range_end_only_uses_aws_suffix_semantics() {
         let range = scan_range_from_bounds(None, Some(35), 100).unwrap().unwrap();
-        assert_eq!(range.start, 65);
-        assert_eq!(range.end, 99);
+        assert_eq!(range.start(), 65);
+        assert_eq!(range.end(), 99);
     }
 
     #[test]
@@ -1234,7 +1248,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_range_output_can_convert_field_delimiter() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"a&&1\nb&&2\n"))]);
-        let stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange { start: 0, end: 10 }, false, 0);
+        let stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, 10), false, 0);
         let mut stream = convert_field_delimiter_stream(stream, Some("&&".to_string()));
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
