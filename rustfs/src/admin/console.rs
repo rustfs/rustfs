@@ -14,8 +14,8 @@
 
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
 use crate::license::has_valid_license;
-use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, RUSTFS_ADMIN_PREFIX, VERSION};
 use crate::server::has_path_prefix;
+use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, RUSTFS_ADMIN_PREFIX, VERSION};
 use crate::version::build;
 use axum::{
     Json, Router,
