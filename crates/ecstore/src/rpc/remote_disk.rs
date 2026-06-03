@@ -1272,26 +1272,7 @@ impl DiskAPI for RemoteDisk {
 
                     match copy_stream_with_buffer(&mut reader, wr, DEFAULT_READ_BUFFER_SIZE).await {
                         Ok(_) => return Ok(()),
-                        Err(io_err) => {
-                            let err = DiskError::Io(io_err);
-                            if attempt == 1 && Self::is_retryable_walk_dir_error(&err) {
-                                warn!(
-                                    endpoint = %self.endpoint,
-                                    addr = %self.addr,
-                                    disk = %disk_for_log,
-                                    bucket = %bucket,
-                                    base_dir = %base_dir,
-                                    attempt,
-                                    stall_timeout_ms = stall_timeout.as_millis(),
-                                    error = %err,
-                                    "remote walk_dir stream failed with retryable transport error; retrying"
-                                );
-                                last_err = Some(err);
-                                continue;
-                            }
-
-                            return Err(err);
-                        }
+                        Err(io_err) => return Err(DiskError::Io(io_err)),
                     }
                 }
 
@@ -1821,10 +1802,11 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     enum WalkDirTestStep {
         Error(DiskError),
         Data(Vec<u8>),
+        PartialDataThenError { data: Vec<u8>, error: io::Error },
     }
 
     #[derive(Debug, Clone, Default)]
@@ -1918,6 +1900,10 @@ mod tests {
             match step {
                 WalkDirTestStep::Error(err) => Err(err),
                 WalkDirTestStep::Data(data) => Ok(Box::new(Cursor::new(data))),
+                WalkDirTestStep::PartialDataThenError { data, error } => Ok(Box::new(PartialThenErrorReader {
+                    cursor: Cursor::new(data),
+                    error: Some(error),
+                })),
             }
         }
 
@@ -1944,6 +1930,32 @@ mod tests {
         };
 
         RemoteDisk::new(&endpoint, &disk_option, data_transport).await.unwrap()
+    }
+
+    #[derive(Debug)]
+    struct PartialThenErrorReader {
+        cursor: Cursor<Vec<u8>>,
+        error: Option<io::Error>,
+    }
+
+    impl AsyncRead for PartialThenErrorReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let filled_before = buf.filled().len();
+            match Pin::new(&mut self.cursor).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    if buf.filled().len() > filled_before {
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    if let Some(err) = self.error.take() {
+                        return Poll::Ready(Err(err));
+                    }
+
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
     }
 
     fn init_tracing(filter_level: Level) {
@@ -2330,6 +2342,38 @@ mod tests {
 
         assert_eq!(writer, b"walk-dir-retry-ok");
         assert_eq!(transport.calls().len(), 2, "walk_dir should retry exactly once");
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_walk_dir_does_not_retry_after_partial_stream_failure() {
+        let transport = RetryingWalkDirInternodeDataTransport::with_steps(vec![
+            WalkDirTestStep::PartialDataThenError {
+                data: b"partial-walk-dir".to_vec(),
+                error: io::Error::new(io::ErrorKind::ConnectionReset, "connection reset"),
+            },
+            WalkDirTestStep::Data(b"walk-dir-retry-ok".to_vec()),
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let opts = WalkDirOptions {
+            bucket: "bucket".to_string(),
+            base_dir: "config/iam".to_string(),
+            recursive: true,
+            report_notfound: false,
+            filter_prefix: None,
+            forward_to: None,
+            limit: 10,
+            disk_id: String::new(),
+        };
+        let mut writer = Vec::new();
+
+        let err = remote_disk
+            .walk_dir(opts, &mut writer)
+            .await
+            .expect_err("partial stream failure should be returned without retry");
+
+        assert!(matches!(err, DiskError::Io(ref io_err) if io_err.kind() == io::ErrorKind::ConnectionReset));
+        assert_eq!(writer, b"partial-walk-dir");
+        assert_eq!(transport.calls().len(), 1, "walk_dir should not retry after writing partial bytes");
     }
 
     #[tokio::test]
