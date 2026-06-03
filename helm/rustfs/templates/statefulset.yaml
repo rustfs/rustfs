@@ -185,7 +185,9 @@ spec:
         {{- end }}
       {{- end }}
   volumeClaimTemplates:
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: logs
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}
@@ -199,7 +201,9 @@ spec:
             storage: {{ .Values.storageclass.logStorageSize }}
     {{- if eq (int .Values.replicaCount) 4 }}
     {{- range $i := until (int .Values.replicaCount) }}
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: data-rustfs-{{ $i }}
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
@@ -213,7 +217,9 @@ spec:
             storage: {{ $.Values.storageclass.dataStorageSize }}
     {{- end }}
     {{- else if eq (int .Values.replicaCount) 16 }}
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: data
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}
