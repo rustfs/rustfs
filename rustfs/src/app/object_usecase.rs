@@ -1037,7 +1037,7 @@ pub(crate) async fn build_put_like_object_lock_metadata(
 }
 
 fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
-    opts.versioned && opts.version_id.is_none()
+    opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
 pub(crate) fn validate_existing_object_lock_for_write(existing_obj_info: &ObjectInfo, opts: &ObjectOptions) -> S3Result<()> {
@@ -2728,7 +2728,7 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let mut dst_opts = copy_dst_opts(&bucket, &key, version_id, &req.headers, HashMap::new())
+        let mut dst_opts = copy_dst_opts(&bucket, &key, dest_version_id.clone(), &req.headers, HashMap::new())
             .await
             .map_err(ApiError::from)?;
 
@@ -2758,7 +2758,7 @@ impl DefaultObjectUsecase {
         }
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info, &current_opts)?;
+                validate_existing_object_lock_for_write(&existing_obj_info, &dst_opts)?;
                 Some(existing_obj_info.size.max(0) as u64)
             }
             Err(err) => {
@@ -4614,6 +4614,20 @@ mod tests {
     fn validate_existing_object_lock_blocks_unversioned_compliance_overwrite() {
         let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &ObjectOptions::default())
             .expect_err("unversioned overwrite should still be blocked");
+
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn validate_existing_object_lock_blocks_suspended_version_compliance_overwrite() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_suspended: true,
+            version_id: None,
+            ..Default::default()
+        };
+        let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+            .expect_err("suspended versioning overwrite should still be blocked");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
