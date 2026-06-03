@@ -5992,38 +5992,38 @@ mod tests {
                 (rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, Some("1")),
             ],
             async {
-            let mut writer = PendingWriter;
-            let walk_err = disk
-                .walk_dir(
-                    WalkDirOptions {
-                        bucket: bucket.to_string(),
-                        recursive: true,
-                        ..Default::default()
-                    },
-                    &mut writer,
-                )
-                .await
-                .expect_err("walk_dir should time out");
-            assert_eq!(walk_err, DiskError::Timeout);
-            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+                let mut writer = PendingWriter;
+                let walk_err = disk
+                    .walk_dir(
+                        WalkDirOptions {
+                            bucket: bucket.to_string(),
+                            recursive: true,
+                            ..Default::default()
+                        },
+                        &mut writer,
+                    )
+                    .await
+                    .expect_err("walk_dir should time out");
+                assert_eq!(walk_err, DiskError::Timeout);
+                assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
 
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
-            set_disks
-                .list_path(
-                    CancellationToken::new(),
-                    ListPathOptions {
-                        bucket: bucket.to_string(),
-                        recursive: true,
-                        ..Default::default()
-                    },
-                    tx,
-                )
-                .await
-                .expect("list_path should still succeed after prior walk timeout");
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
+                set_disks
+                    .list_path(
+                        CancellationToken::new(),
+                        ListPathOptions {
+                            bucket: bucket.to_string(),
+                            recursive: true,
+                            ..Default::default()
+                        },
+                        tx,
+                    )
+                    .await
+                    .expect("list_path should still succeed after prior walk timeout");
 
-            let entry = rx.recv().await.expect("listing should yield the object entry");
-            assert_eq!(entry.name, object);
-            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+                let entry = rx.recv().await.expect("listing should yield the object entry");
+                assert_eq!(entry.name, object);
+                assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
             },
         )
         .await;
@@ -6081,41 +6081,44 @@ mod tests {
                 (rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, Some("1")),
             ],
             async {
-            let mut writer = PendingWriter;
-            let walk_err = disk
-                .walk_dir(
-                    WalkDirOptions {
-                        bucket: RUSTFS_META_BUCKET.to_string(),
-                        base_dir: "config/iam/".to_string(),
-                        recursive: true,
-                        ..Default::default()
-                    },
-                    &mut writer,
-                )
-                .await
-                .expect_err("walk_dir should time out");
-            assert_eq!(walk_err, DiskError::Timeout);
-            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+                let mut writer = PendingWriter;
+                let walk_err = disk
+                    .walk_dir(
+                        WalkDirOptions {
+                            bucket: RUSTFS_META_BUCKET.to_string(),
+                            base_dir: "config/iam/".to_string(),
+                            recursive: true,
+                            ..Default::default()
+                        },
+                        &mut writer,
+                    )
+                    .await
+                    .expect_err("walk_dir should time out");
+                assert_eq!(walk_err, DiskError::Timeout);
+                assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
 
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
-            set_disks
-                .list_path(
-                    CancellationToken::new(),
-                    ListPathOptions {
-                        bucket: RUSTFS_META_BUCKET.to_string(),
-                        base_dir: "config/iam/".to_string(),
-                        recursive: true,
-                        ..Default::default()
-                    },
-                    tx,
-                )
-                .await
-                .expect("system prefix list_path should still succeed after prior walk timeout");
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
+                set_disks
+                    .list_path(
+                        CancellationToken::new(),
+                        ListPathOptions {
+                            bucket: RUSTFS_META_BUCKET.to_string(),
+                            base_dir: "config/iam/".to_string(),
+                            recursive: true,
+                            ..Default::default()
+                        },
+                        tx,
+                    )
+                    .await
+                    .expect("system prefix list_path should still succeed after prior walk timeout");
 
-            let entry = rx.recv().await.expect("listing should yield the system-path entry");
-            assert_eq!(entry.name, "config/iam/sts/");
-            assert!(entry.is_dir(), "system prefix listing should still yield a directory entry after timeout recovery");
-            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+                let entry = rx.recv().await.expect("listing should yield the system-path entry");
+                assert_eq!(entry.name, "config/iam/sts/");
+                assert!(
+                    entry.is_dir(),
+                    "system prefix listing should still yield a directory entry after timeout recovery"
+                );
+                assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
             },
         )
         .await;
