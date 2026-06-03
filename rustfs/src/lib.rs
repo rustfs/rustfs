@@ -68,6 +68,7 @@ pub mod profiling;
 pub mod protocols;
 pub mod server;
 pub mod startup_fs_guard;
+pub mod startup_iam;
 pub mod storage;
 pub mod tls;
 pub mod update;
