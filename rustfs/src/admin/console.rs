@@ -130,7 +130,7 @@ impl Config {
         // Collect OIDC provider info if available
         let oidc = rustfs_iam::get_oidc()
             .map(|sys| {
-                sys.list_providers()
+                sys.list_visible_providers()
                     .into_iter()
                     .map(|p| OidcProviderInfo {
                         provider_id: p.provider_id,
