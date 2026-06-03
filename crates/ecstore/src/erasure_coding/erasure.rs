@@ -308,7 +308,6 @@ where
 /// - `encoder`: Optional ReedSolomon encoder instance.
 /// - `block_size`: Block size for each shard.
 /// - `_id`: Unique identifier for the erasure instance.
-
 ///
 /// # Example
 /// ```ignore
