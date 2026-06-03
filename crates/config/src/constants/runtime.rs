@@ -69,6 +69,10 @@ pub const DEFAULT_TRANSITION_QUEUE_CAPACITY: usize = 1000;
 pub const DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS: usize = 100;
 /// Test-only fault injection env var that forces the immediate transition enqueue timeout path.
 pub const ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT: &str = "RUSTFS_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT";
+/// Test-only fault injection env var that forces a number of IAM bootstrap failures.
+pub const ENV_TEST_IAM_FAIL_INIT_ATTEMPTS: &str = "RUSTFS_TEST_IAM_FAIL_INIT_ATTEMPTS";
+/// Test-only env var that overrides the deferred IAM retry interval in debug builds.
+pub const ENV_TEST_IAM_RETRY_INTERVAL_MS: &str = "RUSTFS_TEST_IAM_RETRY_INTERVAL_MS";
 /// Runtime env var controlling the transition worker count.
 pub const ENV_TRANSITION_WORKERS: &str = "RUSTFS_MAX_TRANSITION_WORKERS";
 /// Runtime env var controlling the absolute maximum transition workers.

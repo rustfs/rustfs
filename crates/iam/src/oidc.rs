@@ -295,6 +295,7 @@ pub struct OidcProviderConfig {
     pub roles_claim: String,
     pub email_claim: String,
     pub username_claim: String,
+    pub hide_from_ui: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -422,10 +423,22 @@ impl OidcSys {
         !self.configs.is_empty()
     }
 
-    /// Return provider summaries for the console UI.
+    /// List all providers (including hidden ones). Used by site-replication and admin config.
     pub fn list_providers(&self) -> Vec<OidcProviderSummary> {
         self.configs
             .values()
+            .map(|c| OidcProviderSummary {
+                provider_id: c.id.clone(),
+                display_name: c.display_name.clone(),
+            })
+            .collect()
+    }
+
+    /// List only visible providers (excludes those with `hide_from_ui = true`).
+    pub fn list_visible_providers(&self) -> Vec<OidcProviderSummary> {
+        self.configs
+            .values()
+            .filter(|c| !c.hide_from_ui)
             .map(|c| OidcProviderSummary {
                 provider_id: c.id.clone(),
                 display_name: c.display_name.clone(),
@@ -918,6 +931,19 @@ impl OidcSys {
         configs
     }
 
+    /// Parse a string as an `EnableState` boolean.
+    /// Returns `default_if_empty` when the input is empty, and `default_on_error`
+    /// when parsing fails.
+    fn parse_enable_state(value: &str, default_if_empty: bool, default_on_error: bool) -> bool {
+        if value.is_empty() {
+            return default_if_empty;
+        }
+        value
+            .parse::<EnableState>()
+            .map(|s| s.is_enabled())
+            .unwrap_or(default_on_error)
+    }
+
     /// Parse a single provider's config from env vars with the given suffix.
     fn parse_single_provider(env_suffix: &str, id: &str) -> Option<OidcProviderConfig> {
         let get_env = |base: &str| -> String { std::env::var(format!("{base}{env_suffix}")).unwrap_or_default() };
@@ -930,11 +956,7 @@ impl OidcSys {
             return None;
         }
 
-        let enabled = enable_val.is_empty()
-            || enable_val
-                .parse::<rustfs_config::EnableState>()
-                .map(|s| s.is_enabled())
-                .unwrap_or(false);
+        let enabled = Self::parse_enable_state(&enable_val, true, false);
 
         let scopes_str = get_env(ENV_IDENTITY_OPENID_SCOPES);
         let scopes = if scopes_str.is_empty() {
@@ -951,12 +973,7 @@ impl OidcSys {
             .map(|s| s.to_string())
             .collect();
 
-        let redirect_uri_dynamic_str = get_env(ENV_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC);
-        let redirect_uri_dynamic = redirect_uri_dynamic_str.is_empty()
-            || redirect_uri_dynamic_str
-                .parse::<rustfs_config::EnableState>()
-                .map(|s| s.is_enabled())
-                .unwrap_or(true);
+        let redirect_uri_dynamic = Self::parse_enable_state(&get_env(ENV_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC), true, true);
 
         let claim_name = {
             let v = get_env(ENV_IDENTITY_OPENID_CLAIM_NAME);
@@ -1003,6 +1020,7 @@ impl OidcSys {
             let v = get_env(ENV_IDENTITY_OPENID_CLIENT_SECRET);
             if v.is_empty() { None } else { Some(v) }
         };
+        let hide_from_ui = Self::parse_enable_state(&get_env(ENV_IDENTITY_OPENID_HIDE_FROM_UI), false, false);
 
         Some(OidcProviderConfig {
             id: id.to_string(),
@@ -1022,6 +1040,7 @@ impl OidcSys {
             roles_claim,
             email_claim,
             username_claim,
+            hide_from_ui,
         })
     }
 
@@ -1031,12 +1050,7 @@ impl OidcSys {
             return None;
         }
 
-        let enabled = kvs
-            .lookup(ENABLE_KEY)
-            .unwrap_or_else(|| EnableState::Off.to_string())
-            .parse::<EnableState>()
-            .map(|s| s.is_enabled())
-            .unwrap_or(false);
+        let enabled = Self::parse_enable_state(&kvs.lookup(ENABLE_KEY).unwrap_or_default(), false, false);
 
         let scopes_str = kvs.get(OIDC_SCOPES);
         let scopes = if scopes_str.is_empty() {
@@ -1053,12 +1067,8 @@ impl OidcSys {
             .map(|s| s.to_string())
             .collect();
 
-        let redirect_uri_dynamic = kvs
-            .lookup(OIDC_REDIRECT_URI_DYNAMIC)
-            .unwrap_or_else(|| EnableState::On.to_string())
-            .parse::<EnableState>()
-            .map(|s| s.is_enabled())
-            .unwrap_or(true);
+        let redirect_uri_dynamic =
+            Self::parse_enable_state(&kvs.lookup(OIDC_REDIRECT_URI_DYNAMIC).unwrap_or_default(), true, true);
 
         let claim_name = kvs
             .lookup(OIDC_CLAIM_NAME)
@@ -1078,6 +1088,7 @@ impl OidcSys {
         let display_name = kvs.lookup(OIDC_DISPLAY_NAME).unwrap_or_else(|| id.to_string());
         let redirect_uri = kvs.lookup(OIDC_REDIRECT_URI).filter(|v| !v.is_empty());
         let client_secret = kvs.lookup(OIDC_CLIENT_SECRET).filter(|v| !v.is_empty());
+        let hide_from_ui = Self::parse_enable_state(&kvs.lookup(OIDC_HIDE_FROM_UI).unwrap_or_default(), false, false);
 
         Some(OidcProviderConfig {
             id: id.to_string(),
@@ -1097,6 +1108,7 @@ impl OidcSys {
             roles_claim,
             email_claim,
             username_claim,
+            hide_from_ui,
         })
     }
 
@@ -1582,6 +1594,7 @@ mod tests {
             roles_claim: String::new(),
             email_claim: "email".to_string(),
             username_claim: "username".to_string(),
+            hide_from_ui: false,
         }
     }
 
@@ -1961,7 +1974,196 @@ mod tests {
             roles_claim: String::new(),
             email_claim: "email".to_string(),
             username_claim: "preferred_username".to_string(),
+            hide_from_ui: false,
         }
+    }
+
+    #[test]
+    fn test_parse_enable_state_on() {
+        assert!(OidcSys::parse_enable_state("on", false, false));
+    }
+
+    #[test]
+    fn test_parse_enable_state_off() {
+        assert!(!OidcSys::parse_enable_state("off", true, true));
+    }
+
+    #[test]
+    fn test_parse_enable_state_empty_returns_default() {
+        assert!(OidcSys::parse_enable_state("", true, false));
+        assert!(!OidcSys::parse_enable_state("", false, true));
+    }
+
+    #[test]
+    fn test_parse_enable_state_invalid_returns_error_default() {
+        assert!(!OidcSys::parse_enable_state("garbage", true, false));
+        assert!(OidcSys::parse_enable_state("garbage", false, true));
+    }
+
+    #[test]
+    fn test_list_visible_providers_hides_hidden_provider() {
+        let visible = test_config("dex");
+        let mut hidden = test_config("kubernetes");
+        hidden.hide_from_ui = true;
+
+        let sys = make_test_sys(vec![visible, hidden]);
+        let listed = sys.list_visible_providers();
+
+        assert_eq!(listed.len(), 1);
+        assert!(listed.iter().any(|p| p.provider_id == "dex"));
+        assert!(!listed.iter().any(|p| p.provider_id == "kubernetes"));
+    }
+
+    #[test]
+    fn test_hidden_provider_still_resolvable_for_sts() {
+        let visible = test_config("dex");
+        let mut hidden = test_config("kubernetes");
+        hidden.hide_from_ui = true;
+
+        let sys = make_test_sys(vec![visible, hidden]);
+
+        assert!(sys.get_provider_config("kubernetes").is_some());
+        assert!(sys.get_provider_config("dex").is_some());
+    }
+
+    #[test]
+    fn test_list_providers_includes_hidden_for_replication() {
+        let visible = test_config("dex");
+        let mut hidden = test_config("kubernetes");
+        hidden.hide_from_ui = true;
+
+        let sys = make_test_sys(vec![visible, hidden]);
+
+        // Unfiltered list returns all (used by site-replication)
+        assert_eq!(sys.list_providers().len(), 2);
+        // UI-filtered list hides the hidden one
+        assert_eq!(sys.list_visible_providers().len(), 1);
+    }
+
+    #[test]
+    fn test_list_providers_all_visible_by_default() {
+        let a = test_config("okta");
+        let b = test_config("dex");
+
+        let sys = make_test_sys(vec![a, b]);
+        let listed = sys.list_visible_providers();
+
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[test]
+    fn test_list_visible_providers_all_hidden() {
+        let mut a = test_config("k8s-a");
+        a.hide_from_ui = true;
+        let mut b = test_config("k8s-b");
+        b.hide_from_ui = true;
+
+        let sys = make_test_sys(vec![a, b]);
+        let listed = sys.list_visible_providers();
+
+        assert!(listed.is_empty());
+        assert!(sys.has_providers());
+    }
+
+    #[test]
+    fn test_hide_from_ui_default_is_false() {
+        let config = test_config("default");
+        assert!(!config.hide_from_ui);
+    }
+
+    #[test]
+    fn test_parse_persisted_hide_from_ui_off_is_false() {
+        let mut cfg = ServerConfig::new();
+        let mut kvs = KVS(vec![
+            rustfs_ecstore::config::KV {
+                key: ENABLE_KEY.to_string(),
+                value: EnableState::On.to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CONFIG_URL.to_string(),
+                value: "https://example.com/.well-known/openid-configuration".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CLIENT_ID.to_string(),
+                value: "console".to_string(),
+                hidden_if_empty: false,
+            },
+        ]);
+        kvs.insert(OIDC_HIDE_FROM_UI.to_string(), EnableState::Off.to_string());
+
+        cfg.0
+            .entry(IDENTITY_OPENID_SUB_SYS.to_string())
+            .or_default()
+            .insert(DEFAULT_DELIMITER.to_string(), kvs);
+
+        let parsed = OidcSys::parse_persisted_configs(&cfg);
+        assert_eq!(parsed.len(), 1);
+        assert!(!parsed[0].hide_from_ui);
+    }
+
+    #[test]
+    fn test_parse_persisted_hide_from_ui_missing_defaults_false() {
+        let mut cfg = ServerConfig::new();
+        let kvs = KVS(vec![
+            rustfs_ecstore::config::KV {
+                key: ENABLE_KEY.to_string(),
+                value: EnableState::On.to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CONFIG_URL.to_string(),
+                value: "https://example.com/.well-known/openid-configuration".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CLIENT_ID.to_string(),
+                value: "console".to_string(),
+                hidden_if_empty: false,
+            },
+        ]);
+
+        cfg.0
+            .entry(IDENTITY_OPENID_SUB_SYS.to_string())
+            .or_default()
+            .insert(DEFAULT_DELIMITER.to_string(), kvs);
+
+        let parsed = OidcSys::parse_persisted_configs(&cfg);
+        assert_eq!(parsed.len(), 1);
+        assert!(!parsed[0].hide_from_ui);
+    }
+
+    #[test]
+    fn test_parse_persisted_hide_from_ui() {
+        let mut cfg = ServerConfig::new();
+        let mut kvs = KVS(vec![
+            rustfs_ecstore::config::KV {
+                key: ENABLE_KEY.to_string(),
+                value: EnableState::On.to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CONFIG_URL.to_string(),
+                value: "https://example.com/.well-known/openid-configuration".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_ecstore::config::KV {
+                key: OIDC_CLIENT_ID.to_string(),
+                value: "console".to_string(),
+                hidden_if_empty: false,
+            },
+        ]);
+        kvs.insert(OIDC_HIDE_FROM_UI.to_string(), EnableState::On.to_string());
+
+        cfg.0
+            .entry(IDENTITY_OPENID_SUB_SYS.to_string())
+            .or_default()
+            .insert(DEFAULT_DELIMITER.to_string(), kvs);
+
+        let parsed = OidcSys::parse_persisted_configs(&cfg);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].hide_from_ui);
     }
 
     #[test]
@@ -2056,6 +2258,7 @@ mod tests {
             roles_claim: String::new(),
             email_claim: "email".to_string(),
             username_claim: "preferred_username".to_string(),
+            hide_from_ui: false,
         };
 
         assert_eq!(config.id, "test");
