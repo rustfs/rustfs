@@ -84,7 +84,7 @@ runs:
       uses: taiki-e/install-action@cargo-zigbuild
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@nextest
+      uses: taiki-e/install-action@cargo-nextest
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2
