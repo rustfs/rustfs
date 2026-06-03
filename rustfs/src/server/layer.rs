@@ -20,6 +20,7 @@ use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report,
+    is_admin_path,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
@@ -289,6 +290,7 @@ fn should_force_zero_content_length_for_empty_body_route<B>(req: &HttpRequest<B>
 fn is_empty_body_admin_path(method: &Method, uri: &http::Uri) -> bool {
     let path = uri.path();
     match *method {
+        Method::GET => is_admin_path(path),
         Method::PUT => matches!(
             path,
             "/minio/admin/v3/set-user-status"
@@ -1426,6 +1428,68 @@ mod tests {
                 "{path} should force Content-Length: 0"
             );
         }
+    }
+
+    #[test]
+    fn admin_empty_body_get_without_content_length_is_normalized() {
+        let paths = [
+            format!("{MINIO_ADMIN_PREFIX}/v3/is-admin"),
+            format!("{MINIO_ADMIN_PREFIX}/v3/accountinfo"),
+            format!("{MINIO_ADMIN_PREFIX}/v3/info"),
+            format!("{ADMIN_PREFIX}/v3/is-admin"),
+            format!("{ADMIN_PREFIX}/v3/accountinfo"),
+            format!("{ADMIN_PREFIX}/v3/info"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path.as_str())
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
+    fn non_admin_get_without_content_length_is_not_normalized() {
+        let paths = [
+            "/bucket/object",
+            "/rustfs/administrator/object",
+            "/minio/administrator/object",
+            "/rustfs/adminx/object",
+            "/minio/adminx/object",
+        ];
+
+        for path in paths {
+            let request = Request::builder().method(Method::GET).uri(path).body(()).expect("request");
+
+            assert!(
+                !should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should not force Content-Length: 0"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_body_layer_inserts_zero_content_length_for_admin_get() {
+        let capture = HeaderCaptureService::default();
+        let headers = capture.headers();
+        let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/rustfs/admin/v3/accountinfo")
+            .body(())
+            .expect("request");
+
+        let _ = service.call(request).await.expect("service call");
+
+        let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+        assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
@@ -24,11 +24,11 @@ use crate::sleeper::{SCANNER_SLEEPER, scanner_speed_from_env_or_default, set_sca
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, global_metrics};
+use rustfs_common::metrics::{CurrentCycle, Metric, Metrics, emit_scan_cycle_complete, emit_scan_cycle_partial, global_metrics};
 use rustfs_config::ScannerSpeed;
 use rustfs_config::{
-    DEFAULT_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED,
-    ENV_SCANNER_START_DELAY_SECS,
+    DEFAULT_SCANNER_BITROT_CYCLE_SECS, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE,
+    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
 };
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle as _;
@@ -85,6 +85,13 @@ fn set_scanner_default_cycle_secs(secs: Option<u64>) {
 fn scanner_start_delay_secs() -> Option<u64> {
     let deprecated = [ENV_SCANNER_START_DELAY_SECS_DEPRECATED];
     rustfs_utils::get_env_opt_u64_with_aliases(ENV_SCANNER_START_DELAY_SECS, &deprecated)
+}
+
+fn scanner_cycle_max_duration() -> Option<Duration> {
+    match rustfs_utils::get_env_u64(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
 }
 
 /// Compute a randomized inter-cycle sleep.
@@ -432,13 +439,78 @@ fn get_lock_acquire_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
 }
 
+struct ScannerCycleBudget {
+    token: CancellationToken,
+    elapsed: Arc<AtomicBool>,
+    max_duration: Option<Duration>,
+}
+
+impl ScannerCycleBudget {
+    fn new(parent: &CancellationToken, max_duration: Option<Duration>) -> Self {
+        let token = parent.child_token();
+        let elapsed = Arc::new(AtomicBool::new(false));
+
+        if let Some(duration) = max_duration {
+            let parent = parent.clone();
+            let token_wait = token.clone();
+            let token_cancel = token.clone();
+            let elapsed = elapsed.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = parent.cancelled() => {}
+                    _ = token_wait.cancelled() => {}
+                    _ = tokio::time::sleep(duration) => {
+                        elapsed.store(true, Ordering::Relaxed);
+                        token_cancel.cancel();
+                    }
+                }
+            });
+        }
+
+        Self {
+            token,
+            elapsed,
+            max_duration,
+        }
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    fn budget_elapsed(&self) -> bool {
+        self.elapsed.load(Ordering::Relaxed)
+    }
+
+    fn max_duration(&self) -> Option<Duration> {
+        self.max_duration
+    }
+}
+
+impl Drop for ScannerCycleBudget {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
+async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
+    cycle_info.current = 0;
+    global_metrics().clear_current_scan_mode();
+    global_metrics().set_cycle(Some(cycle_info.clone())).await;
+}
+
 #[instrument(skip_all)]
 async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
     let _activity_guard = ScannerActivityGuard::new();
     SCANNER_SLEEPER.refresh_from_env();
     let configured_cycle_interval = cycle_interval();
     let configured_bitrot_cycle = bitrot_scan_cycle();
-    global_metrics().record_scanner_cycle_config(configured_cycle_interval, configured_bitrot_cycle);
+    let configured_cycle_max_duration = scanner_cycle_max_duration();
+    global_metrics().record_scanner_cycle_config(
+        configured_cycle_interval,
+        configured_bitrot_cycle,
+        configured_cycle_max_duration,
+    );
     info!("Start run data scanner cycle");
     cycle_info.current = cycle_info.next;
     let now = Instant::now();
@@ -476,17 +548,40 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     let done_cycle = Metrics::time(Metric::ScanCycle);
     let cycle_start = std::time::Instant::now();
     let cycle_work_start = global_metrics().start_scan_cycle_work();
+    let cycle_budget = ScannerCycleBudget::new(ctx, configured_cycle_max_duration);
     if let Err(e) = storeapi
         .clone()
-        .nsscanner(ctx.clone(), sender, cycle_info.current, scan_mode)
+        .nsscanner(cycle_budget.token(), sender, cycle_info.current, scan_mode)
         .await
     {
-        error!(duration = ?now.elapsed(), "Fail run data scanner cycle: {e}");
+        let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
         global_metrics().finish_scan_cycle_work(cycle_work_start);
+        if budget_elapsed {
+            warn!(
+                duration = ?now.elapsed(),
+                max_duration = ?cycle_budget.max_duration(),
+                "Data scanner cycle stopped after reaching its runtime budget"
+            );
+            emit_scan_cycle_partial(cycle_start.elapsed());
+            mark_scan_cycle_idle(cycle_info).await;
+            return;
+        }
+        error!(duration = ?now.elapsed(), "Fail run data scanner cycle: {e}");
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
             save_background_heal_info(storeapi.clone(), new_heal_info).await;
         }
+        return;
+    }
+    if cycle_budget.budget_elapsed() && !ctx.is_cancelled() {
+        warn!(
+            duration = ?now.elapsed(),
+            max_duration = ?cycle_budget.max_duration(),
+            "Data scanner cycle stopped after reaching its runtime budget"
+        );
+        global_metrics().finish_scan_cycle_work(cycle_work_start);
+        emit_scan_cycle_partial(cycle_start.elapsed());
+        mark_scan_cycle_idle(cycle_info).await;
         return;
     }
     done_cycle();
@@ -504,7 +599,6 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     info!(duration = ?now.elapsed(), cycles_total=cycle_info.cycle_completed.len(), "Success run data scanner cycle");
 
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
-
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 
     let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
@@ -718,6 +812,75 @@ mod tests {
             assert!(delay >= Duration::from_secs(108));
             assert!(delay <= Duration::from_secs(132));
         });
+    }
+
+    #[test]
+    #[serial]
+    fn test_scanner_cycle_max_duration_uses_env() {
+        with_var(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, Some("42"), || {
+            assert_eq!(scanner_cycle_max_duration(), Some(Duration::from_secs(42)));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_scanner_cycle_max_duration_default_is_disabled() {
+        with_var_unset(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, || {
+            assert_eq!(scanner_cycle_max_duration(), None);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_scanner_cycle_budget_cancels_after_duration() {
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&parent, Some(Duration::from_millis(1)));
+
+        tokio::time::timeout(Duration::from_secs(5), budget.token().cancelled())
+            .await
+            .expect("scanner cycle budget should cancel after max duration");
+
+        assert!(budget.budget_elapsed());
+        assert!(budget.token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_scanner_cycle_budget_drop_cancels_child_without_elapsed() {
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&parent, Some(Duration::from_secs(60)));
+        let token = budget.token();
+
+        drop(budget);
+
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
+        let mut cycle_info = CurrentCycle {
+            current: 12,
+            next: 13,
+            cycle_completed: vec![Utc::now()],
+            started: Utc::now(),
+        };
+
+        global_metrics().set_current_scan_mode(HealScanMode::Deep);
+        global_metrics().set_cycle(Some(cycle_info.clone())).await;
+
+        mark_scan_cycle_idle(&mut cycle_info).await;
+
+        let published = global_metrics()
+            .get_cycle()
+            .await
+            .expect("scanner cycle state should remain published");
+
+        assert_eq!(cycle_info.current, 0);
+        assert_eq!(cycle_info.next, 13);
+        assert_eq!(published.current, 0);
+        assert_eq!(published.next, 13);
+        assert_eq!(global_metrics().current_scan_mode(), HealScanMode::Unknown);
+
+        global_metrics().set_cycle(None).await;
     }
 
     #[test]
