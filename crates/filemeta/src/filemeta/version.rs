@@ -3368,8 +3368,12 @@ mod tests {
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
         insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, Uuid::nil().as_bytes().to_vec());
-        let fi = MetaDeleteMarker { version_id: None, mod_time: None, meta_sys: sys }
-            .into_fileinfo("b", "k", false);
+        let fi = MetaDeleteMarker {
+            version_id: None,
+            mod_time: None,
+            meta_sys: sys,
+        }
+        .into_fileinfo("b", "k", false);
         assert_eq!(fi.transition_version_id, None);
     }
 
@@ -3379,8 +3383,12 @@ mod tests {
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
         insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, id.as_bytes().to_vec());
-        let fi = MetaDeleteMarker { version_id: None, mod_time: None, meta_sys: sys }
-            .into_fileinfo("b", "k", false);
+        let fi = MetaDeleteMarker {
+            version_id: None,
+            mod_time: None,
+            meta_sys: sys,
+        }
+        .into_fileinfo("b", "k", false);
         assert_eq!(fi.transition_version_id, Some(id));
     }
 }

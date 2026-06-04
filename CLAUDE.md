@@ -110,6 +110,26 @@ get_bytes(…)
 ### Bug 2: `warm_backend_s3sdk.rs` ignored rv and range opts
 **Fix**: added `req.version_id(rv)` and `req.range(…)` to GET; `req.version_id(rv)` to DELETE.
 
+### Bug 4: `set_disk::copy_object` returns 501 for tiered objects (storage class restore)
+**Root cause**: `set_disk::copy_object` immediately returns `StorageError::NotImplemented` when `src_info.metadata_only = false`. For tiered objects, `metadata_only` is never set to `true` (guarded by `transitioned_object.tier.is_empty()`). So `mc cp --storage-class STANDARD obj obj` on a tiered object always returns 501.
+**Fix** (`crates/ecstore/src/set_disk.rs`, `copy_object`):
+```rust
+if !src_info.metadata_only {
+    if path_join_buf(&[src_bucket, src_object]) == path_join_buf(&[dst_bucket, dst_object]) {
+        if let Some(mut put_reader) = src_info.put_object_reader.take() {
+            return self.put_object(dst_bucket, dst_object, &mut put_reader, dst_opts).await;
+        }
+    }
+    return Err(StorageError::NotImplemented);
+}
+```
+When a self-copy has a `put_object_reader` (data already fetched from tier in `execute_copy_object`), writes it back locally via `put_object`, effectively de-tiering the object.
+**How `mc cp --storage-class STANDARD` flows**:
+1. mc sends `PUT /bucket/key` with `x-amz-copy-source`, `x-amz-metadata-directive: REPLACE`, `x-amz-storage-class: STANDARD`
+2. `execute_copy_object` → `get_object_reader` fetches data from tier backend → stores in `src_info.put_object_reader`
+3. `store.copy_object(...)` → now calls `put_object` with tier data and STANDARD storage class in `dst_opts`
+4. New xl.meta written locally with STANDARD class, no tier metadata → object de-tiered
+
 ### Bug 3 (open): race in `expire_transitioned_object`
 Order is: delete remote tier version → delete local object.
 A concurrent GET between those two steps fetches a valid stored version_id but the tier version is already gone → `NoSuchVersion`.

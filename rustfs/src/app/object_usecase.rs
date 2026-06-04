@@ -2694,6 +2694,7 @@ impl DefaultObjectUsecase {
             object_lock_legal_hold_status,
             object_lock_mode,
             object_lock_retain_until_date,
+            storage_class,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -2706,14 +2707,22 @@ impl DefaultObjectUsecase {
             } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
         };
 
+        if let Some(ref sc) = storage_class
+            && !is_valid_storage_class(sc.as_str())
+        {
+            return Err(s3_error!(InvalidStorageClass));
+        }
+
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        // AWS S3 allows self-copy when metadata directive is REPLACE (used to update metadata in-place).
-        // Reject only when the directive is not REPLACE.
+        // AWS S3 allows self-copy when metadata directive is REPLACE (used to update metadata in-place),
+        // or when an explicit storage class change is requested.
+        // Reject only when neither condition applies.
         if metadata_directive.as_ref().map(|d| d.as_str()) != Some(MetadataDirective::REPLACE)
+            && storage_class.is_none()
             && src_bucket == bucket
             && src_key == key
         {
@@ -2847,6 +2856,11 @@ impl DefaultObjectUsecase {
         let mut user_defined = (*src_info.user_defined).clone();
 
         strip_managed_encryption_metadata(&mut user_defined);
+
+        if let Some(ref sc) = storage_class {
+            src_info.storage_class = Some(sc.as_str().to_string());
+            user_defined.insert(AMZ_STORAGE_CLASS.to_string(), sc.as_str().to_string());
+        }
 
         let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
 
@@ -5255,6 +5269,74 @@ mod tests {
 
         let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_rejects_invalid_storage_class() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "src-bucket".into(),
+                key: "src-key".into(),
+                version_id: None,
+            })
+            .bucket("dst-bucket".to_string())
+            .key("dst-key".to_string())
+            .storage_class(Some(StorageClass::from_static("INVALID")))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_allows_self_copy_with_storage_class_change() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "test-bucket".into(),
+                key: "test-key".into(),
+                version_id: None,
+            })
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .storage_class(Some(StorageClass::from_static(storageclass::STANDARD_IA)))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        // Self-copy with explicit storage class change must pass the self-copy guard.
+        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_allows_tiered_self_copy_with_storage_class_change() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "test-bucket".into(),
+                key: "test-key".into(),
+                version_id: None,
+            })
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .storage_class(Some(StorageClass::from_static(storageclass::STANDARD)))
+            .metadata_directive(Some(MetadataDirective::from_static(MetadataDirective::REPLACE)))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        // Tiered self-copy with STANDARD storage class must pass all validation checks.
+        // The call fails at store init (no store in unit tests), not at validation.
+        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_ne!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
