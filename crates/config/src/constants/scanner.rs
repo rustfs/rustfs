@@ -24,6 +24,9 @@ pub const SCANNER_SPEED: &str = "speed";
 pub const SCANNER_CYCLE: &str = "cycle";
 
 /// Scanner config key setting the startup delay in seconds.
+///
+/// For compatibility, this also acts as the scanner cycle interval when
+/// `cycle` is unset.
 pub const SCANNER_START_DELAY: &str = "start_delay";
 
 /// Scanner config key capping one cycle's runtime in seconds.

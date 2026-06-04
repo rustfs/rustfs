@@ -200,7 +200,7 @@ const SCANNER_HELP_KEYS: &[HelpKeyMetadata] = &[
     HelpKeyMetadata {
         key: SCANNER_START_DELAY,
         type_name: "seconds",
-        description: "set scanner startup delay in seconds",
+        description: "set scanner startup delay in seconds; used as legacy cycle interval when cycle is unset",
         optional: true,
     },
     HelpKeyMetadata {
@@ -1940,6 +1940,16 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.keys_help.len(), 1);
         assert_eq!(response.keys_help[0].key, "speed");
         assert_eq!(response.keys_help[0].type_name, "fastest|fast|default|slow|slowest");
+    }
+
+    #[test]
+    fn build_help_response_reports_scanner_start_delay_legacy_cycle_behavior() {
+        let response = build_help_response(Some("scanner"), Some("start_delay"), false).expect("scanner help response");
+
+        assert_eq!(response.sub_sys, "scanner");
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].key, "start_delay");
+        assert!(response.keys_help[0].description.contains("cycle"));
     }
 
     #[test]
