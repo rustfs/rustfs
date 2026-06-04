@@ -41,10 +41,13 @@ use crate::error::{
 };
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, get_global_bucket_monitor,
-    get_global_deployment_id, get_global_endpoints, init_global_bucket_monitor, is_dist_erasure, is_erasure_sd,
-    set_global_deployment_id, set_object_layer,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, TypeLocalDiskSetDrives,
+    get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints, init_global_bucket_monitor,
+    is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer,
 };
+use crate::event_notification::EventNotifier;
+use crate::bucket::bandwidth::monitor::Monitor;
+use crate::tier::tier::TierConfigMgr;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
@@ -165,7 +168,6 @@ pub use peer::{
     has_space_for, init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
 };
 
-#[derive(Debug)]
 pub struct ECStore {
     pub id: Uuid,
     // pub disks: Vec<DiskStore>,
@@ -176,6 +178,38 @@ pub struct ECStore {
     pub pool_meta: RwLock<PoolMeta>,
     pub rebalance_meta: RwLock<Option<RebalanceMeta>>,
     pub decommission_cancelers: RwLock<Vec<Option<CancellationToken>>>,
+
+    // --- Phase 1: Migrated from global singletons ---
+    /// Erasure type flags (migrated from GLOBAL_IsErasure/IsDistErasure/IsErasureSD)
+    pub is_erasure: RwLock<bool>,
+    pub is_dist_erasure: RwLock<bool>,
+    pub is_erasure_sd: RwLock<bool>,
+    /// Local disk maps (migrated from GLOBAL_LOCAL_DISK_MAP/ID_MAP/SET_DRIVES)
+    pub local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
+    pub local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
+    pub local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
+    /// Root disk threshold (migrated from GLOBAL_RootDiskThreshold)
+    pub root_disk_threshold: RwLock<u64>,
+    /// Tier config manager (migrated from GLOBAL_TierConfigMgr)
+    pub tier_config_mgr: Arc<RwLock<TierConfigMgr>>,
+    /// Event notifier (migrated from GLOBAL_EventNotifier)
+    pub event_notifier: Arc<RwLock<EventNotifier>>,
+    /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
+    pub bucket_monitor: Option<Arc<Monitor>>,
+}
+
+impl std::fmt::Debug for ECStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ECStore")
+            .field("id", &self.id)
+            .field("disk_map", &self.disk_map)
+            .field("pools", &self.pools)
+            .field("pool_meta", &self.pool_meta)
+            .field("is_erasure", &self.is_erasure)
+            .field("is_dist_erasure", &self.is_dist_erasure)
+            .field("is_erasure_sd", &self.is_erasure_sd)
+            .finish_non_exhaustive()
+    }
 }
 
 // impl Clone for ECStore {
@@ -246,6 +280,46 @@ impl Clone for PoolObjInfo {
 //     // Limit the number of results.
 //     pub limit: i32,
 // }
+
+/// Phase 1: Accessor methods for migrated globals
+impl ECStore {
+    /// Check if this is an erasure-coded deployment
+    pub async fn is_erasure(&self) -> bool {
+        *self.is_erasure.read().await
+    }
+
+    /// Check if this is a distributed erasure deployment
+    pub async fn is_dist_erasure(&self) -> bool {
+        *self.is_dist_erasure.read().await
+    }
+
+    /// Check if this is a single-disk deployment
+    pub async fn is_erasure_sd(&self) -> bool {
+        *self.is_erasure_sd.read().await
+    }
+
+    /// Update erasure type flags
+    pub async fn update_erasure_type(&self, is_erasure: bool, is_dist: bool, is_sd: bool) {
+        *self.is_erasure.write().await = is_erasure;
+        *self.is_dist_erasure.write().await = is_dist;
+        *self.is_erasure_sd.write().await = is_sd;
+    }
+
+    /// Get tier config manager
+    pub fn tier_config_mgr(&self) -> Arc<RwLock<TierConfigMgr>> {
+        self.tier_config_mgr.clone()
+    }
+
+    /// Get event notifier
+    pub fn event_notifier(&self) -> Arc<RwLock<EventNotifier>> {
+        self.event_notifier.clone()
+    }
+
+    /// Get bucket monitor
+    pub fn bucket_monitor(&self) -> Option<Arc<Monitor>> {
+        self.bucket_monitor.clone()
+    }
+}
 
 #[async_trait::async_trait]
 impl ObjectIO for ECStore {

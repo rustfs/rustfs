@@ -244,6 +244,18 @@ impl ECStore {
             pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
+
+            // Phase 1: Migrated from global singletons
+            is_erasure: RwLock::new(false),
+            is_dist_erasure: RwLock::new(false),
+            is_erasure_sd: RwLock::new(false),
+            local_disk_map: Arc::new(RwLock::new(HashMap::new())),
+            local_disk_id_map: Arc::new(RwLock::new(HashMap::new())),
+            local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
+            root_disk_threshold: RwLock::new(0),
+            tier_config_mgr: TierConfigMgr::new(),
+            event_notifier: EventNotifier::new(),
+            bucket_monitor: None,
         });
 
         // Only set it when the global deployment ID is not yet configured
