@@ -2477,6 +2477,48 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_scan_data_folder_success_clears_resume_hint() {
+        let (scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir.clone()),
+        };
+
+        tokio::fs::create_dir_all(temp_dir.join("bucket").join("child-a"))
+            .await
+            .expect("failed to create child directory");
+
+        let cache = DataUsageCache {
+            info: crate::data_usage_define::DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 11,
+                scan_resume_after: Some("bucket/child-a".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&parent, Default::default());
+
+        let result = scan_data_folder(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            scanner.local_disk.clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await
+        .expect("scan should complete successfully");
+
+        assert!(result.info.scan_resume_after.is_none());
+        assert_eq!(result.info.next_cycle, 11);
+    }
+
+    #[tokio::test]
+    #[serial]
     #[cfg(unix)]
     async fn test_scan_folder_ignores_symlinked_child_directory() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
