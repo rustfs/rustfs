@@ -85,7 +85,7 @@ use std::net::SocketAddr;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::{Arc, OnceLock}, time::Duration};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::RwLock;
@@ -195,7 +195,7 @@ pub struct ECStore {
     /// Event notifier (migrated from GLOBAL_EventNotifier)
     pub event_notifier: Arc<RwLock<EventNotifier>>,
     /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
-    pub bucket_monitor: Option<Arc<Monitor>>,
+    pub bucket_monitor: OnceLock<Arc<Monitor>>,
 }
 
 impl std::fmt::Debug for ECStore {
@@ -300,7 +300,7 @@ impl ECStore {
 
     /// Update erasure type flags
     pub async fn update_erasure_type(&self, is_erasure: bool, is_dist: bool, is_sd: bool) {
-        *self.is_erasure.write().await = is_erasure;
+        *self.is_erasure.write().await = is_erasure || is_dist;
         *self.is_dist_erasure.write().await = is_dist;
         *self.is_erasure_sd.write().await = is_sd;
     }
@@ -315,9 +315,14 @@ impl ECStore {
         self.event_notifier.clone()
     }
 
+    /// Set bucket monitor (can only be called once)
+    pub fn set_bucket_monitor(&self, monitor: Arc<Monitor>) -> std::result::Result<(), Arc<Monitor>> {
+        self.bucket_monitor.set(monitor)
+    }
+
     /// Get bucket monitor
     pub fn bucket_monitor(&self) -> Option<Arc<Monitor>> {
-        self.bucket_monitor.clone()
+        self.bucket_monitor.get().cloned()
     }
 }
 

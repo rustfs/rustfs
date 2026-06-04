@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::error::is_err_decommission_running;
-use crate::global::is_first_cluster_node_local;
+use crate::global::{is_erasure, is_first_cluster_node_local};
 
 fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
@@ -255,7 +255,7 @@ impl ECStore {
             root_disk_threshold: RwLock::new(0),
             tier_config_mgr: TierConfigMgr::new(),
             event_notifier: EventNotifier::new(),
-            bucket_monitor: None,
+            bucket_monitor: OnceLock::new(),
         });
 
         // Only set it when the global deployment ID is not yet configured
@@ -286,6 +286,11 @@ impl ECStore {
         }
 
         set_object_layer(ec.clone()).await;
+
+        // Sync migrated fields from globals
+        *ec.is_erasure.write().await = is_erasure().await;
+        *ec.is_dist_erasure.write().await = is_dist_erasure().await;
+        *ec.is_erasure_sd.write().await = is_erasure_sd().await;
 
         Ok(ec)
     }
