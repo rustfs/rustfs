@@ -14,7 +14,10 @@
 
 use super::*;
 use crate::error::is_err_decommission_running;
-use crate::global::{is_erasure, is_first_cluster_node_local};
+use crate::global::{
+    GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_TierConfigMgr, get_global_bucket_monitor, is_erasure,
+    is_first_cluster_node_local,
+};
 
 fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
@@ -249,12 +252,12 @@ impl ECStore {
             is_erasure: RwLock::new(false),
             is_dist_erasure: RwLock::new(false),
             is_erasure_sd: RwLock::new(false),
-            local_disk_map: Arc::new(RwLock::new(HashMap::new())),
-            local_disk_id_map: Arc::new(RwLock::new(HashMap::new())),
-            local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
+            local_disk_map: GLOBAL_LOCAL_DISK_MAP.clone(),
+            local_disk_id_map: GLOBAL_LOCAL_DISK_ID_MAP.clone(),
+            local_disk_set_drives: GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
             root_disk_threshold: RwLock::new(0),
-            tier_config_mgr: TierConfigMgr::new(),
-            event_notifier: EventNotifier::new(),
+            tier_config_mgr: GLOBAL_TierConfigMgr.clone(),
+            event_notifier: GLOBAL_EventNotifier.clone(),
             bucket_monitor: OnceLock::new(),
         });
 
@@ -291,6 +294,9 @@ impl ECStore {
         *ec.is_erasure.write().await = is_erasure().await;
         *ec.is_dist_erasure.write().await = is_dist_erasure().await;
         *ec.is_erasure_sd.write().await = is_erasure_sd().await;
+        if let Some(monitor) = get_global_bucket_monitor() {
+            let _ = ec.bucket_monitor.set(monitor);
+        }
 
         Ok(ec)
     }

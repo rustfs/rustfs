@@ -42,10 +42,10 @@ use crate::error::{
 };
 use crate::event_notification::EventNotifier;
 use crate::global::{
-    DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, TypeLocalDiskSetDrives, get_global_bucket_monitor,
-    get_global_deployment_id, get_global_endpoints, init_global_bucket_monitor, is_dist_erasure, is_erasure_sd,
-    set_global_deployment_id, set_object_layer,
+    DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_EventNotifier,
+    GLOBAL_IsDistErasure, GLOBAL_IsErasure, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
+    GLOBAL_TierConfigMgr, TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
+    init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -185,21 +185,21 @@ pub struct ECStore {
 
     // --- Phase 1: Migrated from global singletons ---
     /// Erasure type flags (migrated from GLOBAL_IsErasure/IsDistErasure/IsErasureSD)
-    pub is_erasure: RwLock<bool>,
-    pub is_dist_erasure: RwLock<bool>,
-    pub is_erasure_sd: RwLock<bool>,
+    pub(crate) is_erasure: RwLock<bool>,
+    pub(crate) is_dist_erasure: RwLock<bool>,
+    pub(crate) is_erasure_sd: RwLock<bool>,
     /// Local disk maps (migrated from GLOBAL_LOCAL_DISK_MAP/ID_MAP/SET_DRIVES)
-    pub local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
-    pub local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
-    pub local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
+    pub(crate) local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
+    pub(crate) local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
+    pub(crate) local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
     /// Root disk threshold (migrated from GLOBAL_RootDiskThreshold)
-    pub root_disk_threshold: RwLock<u64>,
+    pub(crate) root_disk_threshold: RwLock<u64>,
     /// Tier config manager (migrated from GLOBAL_TierConfigMgr)
-    pub tier_config_mgr: Arc<RwLock<TierConfigMgr>>,
+    pub(crate) tier_config_mgr: Arc<RwLock<TierConfigMgr>>,
     /// Event notifier (migrated from GLOBAL_EventNotifier)
-    pub event_notifier: Arc<RwLock<EventNotifier>>,
+    pub(crate) event_notifier: Arc<RwLock<EventNotifier>>,
     /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
-    pub bucket_monitor: OnceLock<Arc<Monitor>>,
+    pub(crate) bucket_monitor: OnceLock<Arc<Monitor>>,
 }
 
 impl std::fmt::Debug for ECStore {
@@ -289,44 +289,45 @@ impl Clone for PoolObjInfo {
 impl ECStore {
     /// Check if this is an erasure-coded deployment
     pub async fn is_erasure(&self) -> bool {
-        *self.is_erasure.read().await
+        is_erasure().await
     }
 
     /// Check if this is a distributed erasure deployment
     pub async fn is_dist_erasure(&self) -> bool {
-        *self.is_dist_erasure.read().await
+        is_dist_erasure().await
     }
 
     /// Check if this is a single-disk deployment
     pub async fn is_erasure_sd(&self) -> bool {
-        *self.is_erasure_sd.read().await
+        is_erasure_sd().await
     }
 
     /// Update erasure type flags
     pub async fn update_erasure_type(&self, is_erasure: bool, is_dist: bool, is_sd: bool) {
-        *self.is_erasure.write().await = is_erasure || is_dist;
+        let is_erasure = is_erasure || is_dist;
+
+        *self.is_erasure.write().await = is_erasure;
         *self.is_dist_erasure.write().await = is_dist;
         *self.is_erasure_sd.write().await = is_sd;
+
+        *GLOBAL_IsErasure.write().await = is_erasure;
+        *GLOBAL_IsDistErasure.write().await = is_dist;
+        *GLOBAL_IsErasureSD.write().await = is_sd;
     }
 
     /// Get tier config manager
     pub fn tier_config_mgr(&self) -> Arc<RwLock<TierConfigMgr>> {
-        self.tier_config_mgr.clone()
+        GLOBAL_TierConfigMgr.clone()
     }
 
     /// Get event notifier
     pub fn event_notifier(&self) -> Arc<RwLock<EventNotifier>> {
-        self.event_notifier.clone()
-    }
-
-    /// Set bucket monitor (can only be called once)
-    pub fn set_bucket_monitor(&self, monitor: Arc<Monitor>) -> std::result::Result<(), Arc<Monitor>> {
-        self.bucket_monitor.set(monitor)
+        GLOBAL_EventNotifier.clone()
     }
 
     /// Get bucket monitor
     pub fn bucket_monitor(&self) -> Option<Arc<Monitor>> {
-        self.bucket_monitor.get().cloned()
+        get_global_bucket_monitor()
     }
 }
 
