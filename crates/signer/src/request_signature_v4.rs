@@ -595,7 +595,10 @@ fn sign_v4_inner(
         }
         return match streaming_unsigned_v4(req, session_token, content_len, t) {
             Ok(req) => Ok(req),
-            Err((req, err)) => fail(req, err),
+            Err(failure) => {
+                let (req, err) = *failure;
+                fail(req, err)
+            }
         };
     }
     Ok(req)

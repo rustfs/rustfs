@@ -23,20 +23,20 @@ pub fn streaming_unsigned_v4(
     session_token: &str,
     _data_len: i64,
     req_time: OffsetDateTime,
-) -> Result<request::Request<Body>, (request::Request<Body>, SignV4Error)> {
+) -> Result<request::Request<Body>, Box<(request::Request<Body>, SignV4Error)>> {
     let token_value = if session_token.is_empty() {
         None
     } else {
         match HeaderValue::from_str(session_token) {
             Ok(value) => Some(value),
             Err(err) => {
-                return Err((
+                return Err(Box::new((
                     req,
                     SignV4Error::HeaderValueParse {
                         name: "X-Amz-Security-Token".to_string(),
                         reason: err.to_string(),
                     },
-                ));
+                )));
             }
         }
     };
@@ -44,18 +44,18 @@ pub fn streaming_unsigned_v4(
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
     let date = match req_time.format(&format) {
         Ok(value) => value,
-        Err(err) => return Err((req, SignV4Error::TimeFormat { reason: err.to_string() })),
+        Err(err) => return Err(Box::new((req, SignV4Error::TimeFormat { reason: err.to_string() }))),
     };
     let date_value = match HeaderValue::from_str(&date) {
         Ok(value) => value,
         Err(err) => {
-            return Err((
+            return Err(Box::new((
                 req,
                 SignV4Error::HeaderValueParse {
                     name: "X-Amz-Date".to_string(),
                     reason: err.to_string(),
                 },
-            ));
+            )));
         }
     };
 
@@ -81,8 +81,9 @@ mod tests {
             .body(Body::empty())
             .expect("request should build");
 
-        let (_, err) = streaming_unsigned_v4(req, "bad\nsession", 0, OffsetDateTime::UNIX_EPOCH)
+        let failure = streaming_unsigned_v4(req, "bad\nsession", 0, OffsetDateTime::UNIX_EPOCH)
             .expect_err("invalid session token should fail");
+        let (_, err) = *failure;
 
         assert!(matches!(
             err,
