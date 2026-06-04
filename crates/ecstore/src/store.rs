@@ -14,6 +14,7 @@
 
 #![allow(clippy::map_entry)]
 
+use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
@@ -39,11 +40,11 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
+use crate::event_notification::EventNotifier;
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, get_global_bucket_monitor,
-    get_global_deployment_id, get_global_endpoints, init_global_bucket_monitor, is_dist_erasure, is_erasure_sd,
-    set_global_deployment_id, set_object_layer,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives, get_global_deployment_id, get_global_endpoints,
+    init_global_bucket_monitor, is_erasure_sd, set_global_deployment_id, set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -53,6 +54,7 @@ use crate::store_api::{
     ListMultipartsInfo, ListObjectVersionsInfo, ListPartsInfo, MultipartInfo, ObjectIO, ObjectInfoOrErr, WalkOptions,
 };
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
+use crate::tier::tier::TierConfigMgr;
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
@@ -82,7 +84,11 @@ use std::net::SocketAddr;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::RwLock;
@@ -165,7 +171,6 @@ pub use peer::{
     has_space_for, init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
 };
 
-#[derive(Debug)]
 pub struct ECStore {
     pub id: Uuid,
     // pub disks: Vec<DiskStore>,
@@ -176,6 +181,29 @@ pub struct ECStore {
     pub pool_meta: RwLock<PoolMeta>,
     pub rebalance_meta: RwLock<Option<RebalanceMeta>>,
     pub decommission_cancelers: RwLock<Vec<Option<CancellationToken>>>,
+
+    // Phase 2 migration pending - do not use directly.
+    /// Local disk maps (migrated from GLOBAL_LOCAL_DISK_MAP/ID_MAP/SET_DRIVES)
+    pub(crate) local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
+    pub(crate) local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
+    pub(crate) local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
+    /// Tier config manager (migrated from GLOBAL_TierConfigMgr)
+    pub(crate) tier_config_mgr: Arc<RwLock<TierConfigMgr>>,
+    /// Event notifier (migrated from GLOBAL_EventNotifier)
+    pub(crate) event_notifier: Arc<RwLock<EventNotifier>>,
+    /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
+    pub(crate) bucket_monitor: OnceLock<Arc<Monitor>>,
+}
+
+impl std::fmt::Debug for ECStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ECStore")
+            .field("id", &self.id)
+            .field("disk_map", &self.disk_map)
+            .field("pools", &self.pools)
+            .field("pool_meta", &self.pool_meta)
+            .finish_non_exhaustive()
+    }
 }
 
 // impl Clone for ECStore {
