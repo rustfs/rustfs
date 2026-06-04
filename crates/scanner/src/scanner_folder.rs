@@ -21,9 +21,12 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary, hash_path};
 use crate::error::ScannerError;
+use crate::runtime_config::{
+    scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
+};
 use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_io::ScannerIODisk as _;
-use crate::sleeper::{DynamicSleeper, scanner_yield_every_n_objects};
+use crate::sleeper::DynamicSleeper;
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode,
@@ -124,24 +127,15 @@ fn ensure_scanner_alert_metrics_registered() {
 }
 
 fn scanner_excess_versions_threshold() -> u64 {
-    rustfs_utils::get_env_u64(
-        rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSIONS,
-        rustfs_config::DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS,
-    )
+    scanner_alert_excess_versions()
 }
 
 fn scanner_excess_version_size_threshold() -> u64 {
-    rustfs_utils::get_env_u64(
-        rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE,
-        rustfs_config::DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE,
-    )
+    scanner_alert_excess_version_size()
 }
 
 fn scanner_excess_folders_threshold() -> u64 {
-    rustfs_utils::get_env_u64(
-        rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS,
-        rustfs_config::DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS,
-    )
+    scanner_alert_excess_folders()
 }
 
 fn should_yield_after_object(object_count: u64, yield_every: u64) -> bool {
@@ -1850,44 +1844,54 @@ mod tests {
     fn test_excessive_version_alert_thresholds_use_env() {
         with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSIONS, Some("3"), || {
             with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, Some("100"), || {
+                crate::runtime_config::refresh_scanner_runtime_config_for_tests();
                 assert_eq!(should_alert_excessive_versions(2, 99), (false, false));
                 assert_eq!(should_alert_excessive_versions(3, 99), (true, false));
                 assert_eq!(should_alert_excessive_versions(2, 100), (false, true));
                 assert_eq!(should_alert_excessive_versions(3, 100), (true, true));
             });
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
     #[serial]
     fn test_excessive_folders_threshold_uses_env() {
         with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, Some("3"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(scanner_excess_folders_threshold(), 3);
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
     #[serial]
     fn test_excessive_folders_threshold_default_supports_pbs_layout() {
         with_var_unset(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(scanner_excess_folders_threshold(), 65_538);
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
     #[serial]
     fn test_scanner_yield_every_n_objects_uses_env() {
         with_var(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, Some("32"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(scanner_yield_every_n_objects(), 32);
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
     #[serial]
     fn test_scanner_yield_every_n_objects_uses_default() {
         with_var_unset(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(scanner_yield_every_n_objects(), rustfs_config::DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS);
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]

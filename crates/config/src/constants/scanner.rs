@@ -14,6 +14,76 @@
 
 use std::time::Duration;
 
+/// Scanner admin config subsystem name.
+pub const SCANNER_SUB_SYS: &str = "scanner";
+
+/// Scanner config key selecting the speed preset.
+pub const SCANNER_SPEED: &str = "speed";
+
+/// Scanner config key overriding the cycle interval in seconds.
+pub const SCANNER_CYCLE: &str = "cycle";
+
+/// Scanner config key setting the startup delay in seconds.
+///
+/// For compatibility, this also acts as the scanner cycle interval when
+/// `cycle` is unset.
+pub const SCANNER_START_DELAY: &str = "start_delay";
+
+/// Scanner config key capping one cycle's runtime in seconds.
+pub const SCANNER_CYCLE_MAX_DURATION: &str = "cycle_max_duration";
+
+/// Scanner config key capping objects processed by one cycle.
+pub const SCANNER_CYCLE_MAX_OBJECTS: &str = "cycle_max_objects";
+
+/// Scanner config key capping directories entered by one cycle.
+pub const SCANNER_CYCLE_MAX_DIRECTORIES: &str = "cycle_max_directories";
+
+/// Scanner config key setting the periodic bitrot scan cycle in seconds.
+pub const SCANNER_BITROT_CYCLE: &str = "bitrot_cycle";
+
+/// Scanner config key controlling whether scanner throttling is enabled.
+pub const SCANNER_IDLE_MODE: &str = "idle_mode";
+
+/// Scanner config key controlling scanner cache save timeout in seconds.
+pub const SCANNER_CACHE_SAVE_TIMEOUT: &str = "cache_save_timeout";
+
+/// Scanner config key capping concurrent scanner set tasks.
+pub const SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "max_concurrent_set_scans";
+
+/// Scanner config key capping concurrent scanner disk bucket walks per set.
+pub const SCANNER_MAX_CONCURRENT_DISK_SCANS: &str = "max_concurrent_disk_scans";
+
+/// Scanner config key controlling how often object loops yield.
+pub const SCANNER_YIELD_EVERY_N_OBJECTS: &str = "yield_every_n_objects";
+
+/// Scanner config key controlling object version count alerts.
+pub const SCANNER_ALERT_EXCESS_VERSIONS: &str = "alert_excess_versions";
+
+/// Scanner config key controlling retained version size alerts.
+pub const SCANNER_ALERT_EXCESS_VERSION_SIZE: &str = "alert_excess_version_size";
+
+/// Scanner config key controlling direct subfolder count alerts.
+pub const SCANNER_ALERT_EXCESS_FOLDERS: &str = "alert_excess_folders";
+
+/// Scanner config keys supported by the admin config subsystem.
+pub const SCANNER_KEYS: &[&str] = &[
+    SCANNER_SPEED,
+    SCANNER_CYCLE,
+    SCANNER_START_DELAY,
+    SCANNER_CYCLE_MAX_DURATION,
+    SCANNER_CYCLE_MAX_OBJECTS,
+    SCANNER_CYCLE_MAX_DIRECTORIES,
+    SCANNER_BITROT_CYCLE,
+    SCANNER_IDLE_MODE,
+    SCANNER_CACHE_SAVE_TIMEOUT,
+    SCANNER_MAX_CONCURRENT_SET_SCANS,
+    SCANNER_MAX_CONCURRENT_DISK_SCANS,
+    SCANNER_YIELD_EVERY_N_OBJECTS,
+    SCANNER_ALERT_EXCESS_VERSIONS,
+    SCANNER_ALERT_EXCESS_VERSION_SIZE,
+    SCANNER_ALERT_EXCESS_FOLDERS,
+];
+
 /// Canonical environment variable name that specifies the scanner start delay in seconds.
 /// If set, this overrides the cycle interval derived from `RUSTFS_SCANNER_SPEED`.
 /// - Unit: seconds (u64).
@@ -111,6 +181,9 @@ pub const ENV_SCANNER_IDLE_MODE: &str = "RUSTFS_SCANNER_IDLE_MODE";
 /// - Example: `export RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS=30`
 pub const ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS: &str = "RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS";
 
+/// Default scanner cache save timeout in seconds.
+pub const DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS: u64 = 30;
+
 /// Environment variable that caps concurrent scanner set tasks.
 /// A value of `0` keeps the existing topology-based concurrency.
 /// - Example: `export RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS=2`
@@ -203,14 +276,19 @@ impl ScannerSpeed {
         }
     }
 
-    pub fn from_env_str(s: &str) -> Self {
+    pub fn parse_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "fastest" => Self::Fastest,
-            "fast" => Self::Fast,
-            "slow" => Self::Slow,
-            "slowest" => Self::Slowest,
-            _ => Self::Default,
+            "fastest" => Some(Self::Fastest),
+            "fast" => Some(Self::Fast),
+            "default" => Some(Self::Default),
+            "slow" => Some(Self::Slow),
+            "slowest" => Some(Self::Slowest),
+            _ => None,
         }
+    }
+
+    pub fn from_env_str(s: &str) -> Self {
+        Self::parse_str(s).unwrap_or_default()
     }
 }
 
