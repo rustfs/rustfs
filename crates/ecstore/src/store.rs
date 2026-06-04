@@ -14,6 +14,7 @@
 
 #![allow(clippy::map_entry)]
 
+use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
@@ -39,15 +40,13 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
+use crate::event_notification::EventNotifier;
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, TypeLocalDiskSetDrives,
-    get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints, init_global_bucket_monitor,
-    is_dist_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, TypeLocalDiskSetDrives, get_global_bucket_monitor,
+    get_global_deployment_id, get_global_endpoints, init_global_bucket_monitor, is_dist_erasure, is_erasure_sd,
+    set_global_deployment_id, set_object_layer,
 };
-use crate::event_notification::EventNotifier;
-use crate::bucket::bandwidth::monitor::Monitor;
-use crate::tier::tier::TierConfigMgr;
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
@@ -56,6 +55,7 @@ use crate::store_api::{
     ListMultipartsInfo, ListObjectVersionsInfo, ListPartsInfo, MultipartInfo, ObjectIO, ObjectInfoOrErr, WalkOptions,
 };
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
+use crate::tier::tier::TierConfigMgr;
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
@@ -85,7 +85,11 @@ use std::net::SocketAddr;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
-use std::{collections::HashMap, sync::{Arc, OnceLock}, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::RwLock;
