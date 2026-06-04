@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use rustfs_audit::reload_audit_config;
+use rustfs_config::SCANNER_SUB_SYS;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
@@ -34,7 +35,10 @@ use tracing::warn;
 use url::Url;
 
 pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
-    matches!(sub_system, STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS)
+    matches!(
+        sub_system,
+        STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS | SCANNER_SUB_SYS
+    )
 }
 
 fn internal_error(message: impl Into<String>) -> S3Error {
@@ -231,6 +235,8 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
         Some(AUDIT_WEBHOOK_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS),
         Some(AUDIT_MQTT_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_MQTT_SUB_SYS),
         Some(IDENTITY_OPENID_SUB_SYS) => validate_identity_openid_config(config),
+        Some(SCANNER_SUB_SYS) => rustfs_scanner::validate_scanner_runtime_config(config)
+            .map_err(|err| invalid_request(format!("invalid scanner config: {err}"))),
         Some(_) => Ok(()),
         None => {
             validate_storage_class_config(config).await?;
@@ -239,6 +245,8 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
             validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS)?;
             validate_audit_subsystem_config(config, AUDIT_MQTT_SUB_SYS)?;
             validate_identity_openid_config(config)?;
+            rustfs_scanner::validate_scanner_runtime_config(config)
+                .map_err(|err| invalid_request(format!("invalid scanner config: {err}")))?;
             Ok(())
         }
     }
@@ -254,6 +262,8 @@ pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_syste
         AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS => reload_audit_config(config.clone())
             .await
             .map_err(|err| internal_error(format!("failed to reload audit config: {err}")))?,
+        SCANNER_SUB_SYS => rustfs_scanner::apply_scanner_runtime_config(config)
+            .map_err(|err| internal_error(format!("failed to reload scanner config: {err}")))?,
         _ => return Ok(false),
     }
 
@@ -292,7 +302,12 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
 
     // Re-apply dynamic subsystems before publishing the snapshot, so that
     // runtime state (e.g. GLOBAL_STORAGE_CLASS) is refreshed on this peer.
-    for sub_system in [STORAGE_CLASS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS, AUDIT_MQTT_SUB_SYS] {
+    for sub_system in [
+        STORAGE_CLASS_SUB_SYS,
+        AUDIT_WEBHOOK_SUB_SYS,
+        AUDIT_MQTT_SUB_SYS,
+        SCANNER_SUB_SYS,
+    ] {
         if let Err(err) = apply_dynamic_config_for_subsystem(&config, sub_system).await {
             warn!("peer reload_runtime_config_snapshot: failed to apply {sub_system}: {err}");
         }
@@ -333,6 +348,7 @@ pub async fn signal_config_snapshot_reload() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_config::SCANNER_SUB_SYS;
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{MQTT_BROKER, MQTT_QUEUE_DIR, MQTT_TOPIC, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
@@ -341,6 +357,7 @@ mod tests {
     fn dynamic_config_subsystems_match_runtime_apply_support() {
         assert!(is_dynamic_config_subsystem(AUDIT_WEBHOOK_SUB_SYS));
         assert!(is_dynamic_config_subsystem(AUDIT_MQTT_SUB_SYS));
+        assert!(is_dynamic_config_subsystem(SCANNER_SUB_SYS));
         assert!(is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
         assert!(!is_dynamic_config_subsystem("identity_openid"));
         assert!(!is_dynamic_config_subsystem("notify_webhook"));

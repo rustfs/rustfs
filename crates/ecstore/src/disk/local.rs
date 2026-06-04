@@ -26,7 +26,7 @@ use crate::disk::{
     format::FormatV3,
     fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
     os,
-    os::{check_path_length, is_empty_dir, is_root_disk, rename_all},
+    os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
 use crate::erasure_coding::bitrot_verify;
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
@@ -929,19 +929,20 @@ impl LocalDisk {
         // }
 
         let err = if recursive {
-            rename_all(delete_path, trash_path, self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?)
+            rename_all_ignore_missing_source(delete_path, trash_path, self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?)
                 .await
                 .err()
         } else {
-            rename(&delete_path, &trash_path)
-                .await
-                .map_err(|e| to_file_error(e).into())
-                .err()
+            match rename(&delete_path, &trash_path).await {
+                Ok(()) => None,
+                Err(err) if err.kind() == ErrorKind::NotFound => None,
+                Err(err) => Some(to_file_error(err).into()),
+            }
         };
 
         if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR) {
             let trash_path2 = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
-            let _ = rename_all(
+            let _ = rename_all_ignore_missing_source(
                 encode_dir_object(delete_path.to_string_lossy().as_ref()),
                 trash_path2,
                 self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,

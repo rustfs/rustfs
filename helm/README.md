@@ -152,6 +152,8 @@ uer. `ClusterIssuer` or `Issuer`. |
 | storageclass.pvcAnnotations.data | map | `{}` | Data pvc customized annotations. |
 | storageclass.pvcAnnotations.logs | map | `{}` | Logs pvc customized annotations. |
 | tolerations | list | `[]` |  |
+| topologySpreadConstraints.enabled | bool | `false` | Enable custom topology spread constraints on distributed-mode StatefulSet pods. |
+| topologySpreadConstraints.constraints | list | `[]` | Raw `spec.template.spec.topologySpreadConstraints` entries applied to the distributed StatefulSet when enabled. |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
 | gatewayApi.listeners.http.name | string | `web` | Gateway API http listener name. |
