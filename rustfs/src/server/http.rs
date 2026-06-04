@@ -937,7 +937,7 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
     let s = err.to_string();
     if s.contains("connection reset") || s.contains("broken pipe") {
         warn!(
-            peer_addr = peer_addr.unwrap_or("unknown"),
+            peer_addr = %peer_addr.unwrap_or("unknown"),
             "The connection was reset by the peer or broken pipe: {}", s
         );
         // Ignore common non-fatal errors
@@ -947,32 +947,32 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
         if hyper_err.is_incomplete_message() {
             warn!(
-                peer_addr = peer_addr.unwrap_or("unknown"),
+                peer_addr = %peer_addr.unwrap_or("unknown"),
                 "The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err
             );
         } else if hyper_err.is_closed() {
-            warn!(peer_addr = peer_addr.unwrap_or("unknown"), "The HTTP connection is closed:{}", hyper_err);
+            warn!(peer_addr = %peer_addr.unwrap_or("unknown"), "The HTTP connection is closed:{}", hyper_err);
         } else if hyper_err.is_parse() {
-            error!(peer_addr = peer_addr.unwrap_or("unknown"), "HTTP message parsing failed:{}", hyper_err);
+            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "HTTP message parsing failed:{}", hyper_err);
         } else if hyper_err.is_user() {
-            error!(peer_addr = peer_addr.unwrap_or("unknown"), "HTTP user-custom error:{}", hyper_err);
+            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "HTTP user-custom error:{}", hyper_err);
         } else if hyper_err.is_canceled() {
             warn!(
-                peer_addr = peer_addr.unwrap_or("unknown"),
+                peer_addr = %peer_addr.unwrap_or("unknown"),
                 "The HTTP connection is canceled:{}", hyper_err
             );
         } else if format!("{:?}", hyper_err).contains("HeaderTimeout") {
             info!(
-                peer_addr = peer_addr.unwrap_or("unknown"),
+                peer_addr = %peer_addr.unwrap_or("unknown"),
                 "The HTTP connection timed out while reading request headers (HeaderTimeout): {}", hyper_err
             );
         } else {
-            error!(peer_addr = peer_addr.unwrap_or("unknown"), "Unknown hyper error:{:?}", hyper_err);
+            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown hyper error:{:?}", hyper_err);
         }
     } else if let Some(io_err) = err.downcast_ref::<Error>() {
-        error!(peer_addr = peer_addr.unwrap_or("unknown"), "Unknown connection IO error:{}", io_err);
+        error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown connection IO error:{}", io_err);
     } else {
-        error!(peer_addr = peer_addr.unwrap_or("unknown"), "Unknown connection error type:{:?}", err);
+        error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown connection error type:{:?}", err);
     }
 }
 
