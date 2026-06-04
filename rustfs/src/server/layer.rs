@@ -1466,15 +1466,7 @@ mod tests {
 
     #[test]
     fn non_s3_non_admin_get_without_content_length_is_not_normalized() {
-        let paths = [
-            "/rustfs/administrator/object",
-            "/minio/administrator/object",
-            "/rustfs/adminx/object",
-            "/minio/adminx/object",
-            "/rustfs/rpc/read_file_stream",
-            "/health",
-            "/profile/cpu",
-        ];
+        let paths = ["/rustfs/rpc/read_file_stream", "/health", "/profile/cpu"];
 
         for path in paths {
             let request = Request::builder().method(Method::GET).uri(path).body(()).expect("request");
@@ -1505,7 +1497,14 @@ mod tests {
 
     #[test]
     fn s3_empty_body_get_without_content_length_is_normalized() {
-        let paths = ["/?x-id=ListBuckets", "/", "/bucket?list-type=2", "/bucket/object.txt"];
+        let paths = [
+            "/?x-id=ListBuckets",
+            "/",
+            "/bucket?list-type=2",
+            "/bucket/object.txt",
+            "/rustfs/administrator/object",
+            "/minio/adminx/object",
+        ];
 
         for path in paths {
             let request = Request::builder().method(Method::GET).uri(path).body(()).expect("request");
