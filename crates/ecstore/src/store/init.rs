@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use super::*;
+use crate::config::storageclass;
 use crate::error::is_err_decommission_running;
 use crate::global::{
     GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
     get_global_bucket_monitor, is_dist_erasure, is_first_cluster_node_local,
 };
-use crate::config::storageclass;
 
 fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
