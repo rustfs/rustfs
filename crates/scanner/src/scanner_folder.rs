@@ -19,12 +19,15 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
-use crate::data_usage_define::{DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, SizeSummary, hash_path};
+use crate::data_usage_define::{
+    DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageScanCheckpoint, DataUsageScanCheckpointReason,
+    SizeSummary, hash_path,
+};
 use crate::error::ScannerError;
 use crate::runtime_config::{
     scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
 };
-use crate::scanner_budget::ScannerCycleBudget;
+use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetReason};
 use crate::scanner_io::ScannerIODisk as _;
 use crate::sleeper::DynamicSleeper;
 use metrics::{counter, describe_counter};
@@ -204,6 +207,31 @@ fn order_folders_for_resume(folders: &mut [CachedFolder], resume_after: Option<&
 
 fn order_queued_folders_for_resume(folders: &mut [QueuedFolder], resume_after: Option<&str>) {
     order_items_for_resume(folders, resume_after, |folder| folder.folder.name.as_str());
+}
+
+fn checkpoint_reason_from_budget(reason: Option<ScannerCycleBudgetReason>) -> DataUsageScanCheckpointReason {
+    match reason {
+        Some(ScannerCycleBudgetReason::Runtime) => DataUsageScanCheckpointReason::Runtime,
+        Some(ScannerCycleBudgetReason::Objects) => DataUsageScanCheckpointReason::Objects,
+        Some(ScannerCycleBudgetReason::Directories) => DataUsageScanCheckpointReason::Directories,
+        None => DataUsageScanCheckpointReason::Unknown,
+    }
+}
+
+fn set_scan_checkpoint(cache: &mut DataUsageCache, reason: DataUsageScanCheckpointReason) {
+    let resume_after = cache.info.scan_resume_after.clone().or_else(|| {
+        cache
+            .info
+            .scan_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.resume_after.clone())
+    });
+
+    if let Some(resume_after) = resume_after {
+        cache.info.scan_checkpoint = Some(DataUsageScanCheckpoint::new(resume_after, reason));
+    } else {
+        cache.info.scan_checkpoint = None;
+    }
 }
 
 fn should_alert_excessive_versions(remaining_versions: usize, cumulative_size: i64) -> (bool, bool) {
@@ -848,6 +876,9 @@ impl FolderScanner {
     fn record_scan_resume_hint(&mut self, folder: &str) {
         self.new_cache.info.scan_resume_after = Some(folder.to_string());
         self.update_cache.info.scan_resume_after = Some(folder.to_string());
+        let checkpoint = DataUsageScanCheckpoint::new(folder.to_string(), DataUsageScanCheckpointReason::Unknown);
+        self.new_cache.info.scan_checkpoint = Some(checkpoint.clone());
+        self.update_cache.info.scan_checkpoint = Some(checkpoint);
     }
 
     fn alert_excessive_folders(&self, folder: &str, total_folders: usize) {
@@ -1224,7 +1255,13 @@ impl FolderScanner {
                 }
             }
 
-            let scan_resume_after = self.old_cache.info.scan_resume_after.as_deref();
+            let scan_resume_after = self
+                .old_cache
+                .info
+                .scan_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.resume_after.as_str())
+                .or(self.old_cache.info.scan_resume_after.as_deref());
             let mut queued_folders = Vec::with_capacity(new_folders.len() + existing_folders.len());
             queued_folders.extend(new_folders.into_iter().map(|folder| QueuedFolder {
                 folder,
@@ -1704,7 +1741,7 @@ pub async fn scan_data_folder(
         updates,
         last_update: SystemTime::UNIX_EPOCH,
         update_current_path,
-        budget,
+        budget: budget.clone(),
         skip_heal,
         local_disk,
     };
@@ -1731,6 +1768,7 @@ pub async fn scan_data_folder(
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
             new_cache.info.scan_resume_after = None;
+            new_cache.info.scan_checkpoint = None;
 
             close_disk().await;
             Ok(new_cache.clone())
@@ -1752,6 +1790,7 @@ pub async fn scan_data_folder(
                     new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
                     new_cache.info.last_update = Some(SystemTime::now());
                     new_cache.info.next_cycle = cache.info.next_cycle;
+                    set_scan_checkpoint(new_cache, checkpoint_reason_from_budget(budget.reason()));
                     close_disk().await;
                     return Err(ScannerError::PartialCache(Box::new(new_cache.clone())));
                 }
@@ -1956,6 +1995,26 @@ mod tests {
         assert!(!should_yield_after_object(127, 128));
         assert!(should_yield_after_object(128, 128));
         assert!(!should_yield_after_object(128, 0));
+    }
+
+    #[test]
+    fn test_checkpoint_reason_from_budget_maps_all_budget_reasons() {
+        assert_eq!(
+            checkpoint_reason_from_budget(Some(crate::scanner_budget::ScannerCycleBudgetReason::Runtime)),
+            crate::data_usage_define::DataUsageScanCheckpointReason::Runtime
+        );
+        assert_eq!(
+            checkpoint_reason_from_budget(Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects)),
+            crate::data_usage_define::DataUsageScanCheckpointReason::Objects
+        );
+        assert_eq!(
+            checkpoint_reason_from_budget(Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories)),
+            crate::data_usage_define::DataUsageScanCheckpointReason::Directories
+        );
+        assert_eq!(
+            checkpoint_reason_from_budget(None),
+            crate::data_usage_define::DataUsageScanCheckpointReason::Unknown
+        );
     }
 
     #[test]
@@ -2468,6 +2527,10 @@ mod tests {
         };
 
         assert_eq!(partial_cache.info.scan_resume_after.as_deref(), Some("bucket/child-b"));
+        let checkpoint = partial_cache.info.scan_checkpoint.as_ref().expect("partial scan checkpoint");
+        assert_eq!(checkpoint.version, crate::data_usage_define::DATA_USAGE_SCAN_CHECKPOINT_VERSION);
+        assert_eq!(checkpoint.resume_after, "bucket/child-b");
+        assert_eq!(checkpoint.reason, crate::data_usage_define::DataUsageScanCheckpointReason::Directories);
         assert!(
             partial_cache
                 .root()
@@ -2585,6 +2648,7 @@ mod tests {
         .expect("scan should complete successfully");
 
         assert!(result.info.scan_resume_after.is_none());
+        assert!(result.info.scan_checkpoint.is_none());
         assert_eq!(result.info.next_cycle, 11);
     }
 
