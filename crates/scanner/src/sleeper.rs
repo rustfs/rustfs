@@ -56,10 +56,14 @@ pub(crate) fn set_scanner_default_speed(speed: ScannerSpeed) {
     SCANNER_DEFAULT_SPEED_PRESET.store(scanner_speed_code(speed), Ordering::Relaxed);
 }
 
+pub(crate) fn scanner_default_speed() -> ScannerSpeed {
+    scanner_speed_from_code(SCANNER_DEFAULT_SPEED_PRESET.load(Ordering::Relaxed))
+}
+
 pub(crate) fn scanner_speed_from_env_or_default() -> ScannerSpeed {
     rustfs_utils::get_env_opt_str(ENV_SCANNER_SPEED)
         .map(|speed| ScannerSpeed::from_env_str(&speed))
-        .unwrap_or_else(|| scanner_speed_from_code(SCANNER_DEFAULT_SPEED_PRESET.load(Ordering::Relaxed)))
+        .unwrap_or_else(scanner_default_speed)
 }
 
 fn scanner_env_config() -> (ScannerSpeed, bool) {
@@ -159,18 +163,26 @@ impl DynamicSleeper {
     /// Reload speed and idle-mode settings from the current environment.
     pub fn refresh_from_env(&self) {
         let (speed, idle_mode) = scanner_env_config();
+        self.update_from_runtime_config(speed, idle_mode, scanner_yield_every_n_objects());
+    }
+
+    pub(crate) fn update_from_runtime_config(&self, speed: ScannerSpeed, idle_mode: bool, yield_every_n_objects: u64) {
         self.update(speed);
         SCANNER_IDLE_MODE.store(idle_mode, Ordering::Relaxed);
-        self.record_throttle_config();
+        self.record_throttle_config_with_yield(yield_every_n_objects);
     }
 
     fn record_throttle_config(&self) {
+        self.record_throttle_config_with_yield(scanner_yield_every_n_objects());
+    }
+
+    fn record_throttle_config_with_yield(&self, yield_every_n_objects: u64) {
         let (factor, max_sleep) = self.read_params();
         global_metrics().record_scanner_throttle_config(
             SCANNER_IDLE_MODE.load(Ordering::Relaxed),
             factor,
             max_sleep,
-            scanner_yield_every_n_objects(),
+            yield_every_n_objects,
         );
     }
 }

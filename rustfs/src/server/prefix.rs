@@ -48,7 +48,7 @@ pub(crate) fn is_admin_path(path: &str) -> bool {
     has_path_prefix(path, ADMIN_PREFIX) || has_path_prefix(path, MINIO_ADMIN_PREFIX)
 }
 
-fn has_path_prefix(path: &str, prefix: &str) -> bool {
+pub(crate) fn has_path_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with('/'))
 }
 

@@ -834,8 +834,27 @@ impl<T: Store> IamSys<T> {
         self.store.policy_db_get(name, groups).await
     }
 
+    /// Check whether a policy name from a JWT claim is safe to resolve against the IAM store.
+    ///
+    /// Allowed characters: `[a-zA-Z0-9_:.-]`
+    /// - Colons: K8s service account `sub` claims (`system:serviceaccount:ns:sa`)
+    /// - Dots: OIDC group names from providers like Okta/Entra (`org.team.role`)
+    ///
+    /// Requirements:
+    /// - At least one ASCII alphanumeric character (prevents meaningless names
+    ///   like `.`, `..`, `-`, `___`, or `:.:`).
+    /// - No characters outside the allowed set (helps mitigate path traversal
+    ///   and injection when names are used in storage keys or log output).
     fn is_safe_claim_policy_name(policy: &str) -> bool {
-        !policy.is_empty() && policy.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        let mut has_alnum = false;
+        for c in policy.bytes() {
+            if c.is_ascii_alphanumeric() {
+                has_alnum = true;
+            } else if !matches!(c, b'_' | b'-' | b':' | b'.') {
+                return false;
+            }
+        }
+        has_alnum
     }
 
     // JWT policy claims carry canned policy names only; policy documents are resolved by IAM store.
@@ -2666,5 +2685,65 @@ mod tests {
             "policy object should contain Statement field; got: {}",
             policy_info.policy
         );
+    }
+
+    #[test]
+    fn test_is_safe_claim_policy_name_allows_k8s_sa_sub() {
+        assert!(IamSys::<StsTestMockStore>::is_safe_claim_policy_name(
+            "system:serviceaccount:my-namespace:my-sa"
+        ));
+    }
+
+    #[test]
+    fn test_is_safe_claim_policy_name_allows_dotted_names() {
+        assert!(IamSys::<StsTestMockStore>::is_safe_claim_policy_name("org.team.policy-name"));
+    }
+
+    #[test]
+    fn test_is_safe_claim_policy_name_allows_simple_names() {
+        assert!(IamSys::<StsTestMockStore>::is_safe_claim_policy_name("readwrite"));
+        assert!(IamSys::<StsTestMockStore>::is_safe_claim_policy_name("my-custom_policy"));
+        assert!(IamSys::<StsTestMockStore>::is_safe_claim_policy_name("Policy123"));
+    }
+
+    #[test]
+    fn test_is_safe_claim_policy_name_rejects_empty() {
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name(""));
+    }
+
+    #[test]
+    fn test_is_safe_claim_policy_name_rejects_path_traversal() {
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("../etc/passwd"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("policy/name"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("policy\\name"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("..\\etc\\passwd"));
+    }
+
+    #[test]
+    fn test_is_safe_claim_policy_name_rejects_whitespace() {
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("my policy"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("policy\tname"));
+    }
+
+    #[test]
+    fn test_is_safe_claim_policy_name_rejects_special_chars() {
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("policy;drop"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("pol$icy"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("name{bad}"));
+    }
+
+    #[test]
+    fn test_is_safe_claim_policy_name_rejects_no_alphanumeric() {
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("."));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name(".."));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name(":"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("..."));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name(".:.:"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("-"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("_"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("__"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("---"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("-_-"));
+        assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("-.:_"));
     }
 }

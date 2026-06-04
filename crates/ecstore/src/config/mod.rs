@@ -18,6 +18,7 @@ pub mod com;
 pub mod heal;
 mod notify;
 mod oidc;
+mod scanner;
 pub mod storageclass;
 
 use crate::error::Result;
@@ -254,6 +255,7 @@ pub fn init() {
     let mut kvs = HashMap::new();
     // Load storageclass default configuration
     kvs.insert(STORAGE_CLASS_SUB_SYS.to_owned(), storageclass::DEFAULT_KVS.clone());
+    kvs.insert(rustfs_config::SCANNER_SUB_SYS.to_owned(), scanner::DEFAULT_KVS.clone());
     // New: Loading default configurations for notify_webhook and notify_mqtt
     // Referring subsystem names through constants to improve the readability and maintainability of the code
     kvs.insert(NOTIFY_WEBHOOK_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_WEBHOOK_KVS.clone());
@@ -283,6 +285,7 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_config::{DEFAULT_DELIMITER, DEFAULT_SCANNER_SPEED, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_SPEED, SCANNER_SUB_SYS};
 
     #[test]
     fn global_server_config_set_and_get_roundtrip() {
@@ -299,5 +302,17 @@ mod tests {
             .get_value(STORAGE_CLASS_SUB_SYS, "_")
             .expect("storage_class should exist");
         assert_eq!(sc_kvs.get("standard"), "EC:4");
+    }
+
+    #[test]
+    fn scanner_defaults_are_registered_for_admin_config() {
+        init();
+        let cfg = Config::new();
+        let scanner_kvs = cfg
+            .get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("scanner defaults should exist");
+
+        assert_eq!(scanner_kvs.get(SCANNER_SPEED), DEFAULT_SCANNER_SPEED);
+        assert_eq!(scanner_kvs.get(SCANNER_CYCLE_MAX_OBJECTS), "0");
     }
 }
