@@ -21,7 +21,7 @@ mod integration_tests {
     };
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput, JSONType,
-        OutputSerialization, ParquetInput, SelectObjectContentInput, SelectObjectContentRequest,
+        OutputSerialization, ParquetInput, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use std::sync::Arc;
 
@@ -54,8 +54,7 @@ mod integration_tests {
     }
 
     /// Build a `SelectObjectContentInput` targeting a JSON DOCUMENT file.
-    /// Uses `JSONType::DOCUMENT` so the NDJSON-flattening path in
-    /// `EcObjectStore` is exercised.
+    /// Uses `JSONType::DOCUMENT`, which keeps the document-style validation path.
     fn create_test_json_input(sql: &str) -> SelectObjectContentInput {
         SelectObjectContentInput {
             bucket: "test-bucket".to_string(),
@@ -70,6 +69,33 @@ mod integration_tests {
                 input_serialization: InputSerialization {
                     json: Some(JSONInput {
                         type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+                    }),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    json: Some(JSONOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        }
+    }
+
+    fn create_test_json_lines_input(sql: &str) -> SelectObjectContentInput {
+        SelectObjectContentInput {
+            bucket: "test-bucket".to_string(),
+            expected_bucket_owner: None,
+            key: "test.json".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: sql.to_string(),
+                expression_type: ExpressionType::from_static("SQL"),
+                input_serialization: InputSerialization {
+                    json: Some(JSONInput {
+                        type_: Some(JSONType::from_static(JSONType::LINES)),
                     }),
                     ..Default::default()
                 },
@@ -132,7 +158,7 @@ mod integration_tests {
     async fn test_simple_select_query() {
         let sql = "SELECT * FROM S3Object";
         let input = create_test_input(sql);
-        let db = get_global_db(input.clone(), true).await.unwrap();
+        let db = get_global_db(input.clone(), true).await.expect("create csv test database");
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
         let result = db.execute(&query).await;
@@ -283,7 +309,6 @@ mod integration_tests {
 
     // ──────────────────────────────────────────────
     // JSON-input variants of all the above tests
-    // These exercise the JSONType::LINES (JSON lines) code path
     // ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -328,6 +353,110 @@ mod integration_tests {
         let output = result.unwrap().result().chunk_result().await.unwrap();
         let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_simple_select_query_parquet_with_scan_range_filters_row_groups() {
+        let sql = "SELECT name, age FROM S3Object WHERE age > 25";
+        let mut input = create_test_parquet_input(sql);
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(1),
+        });
+        let db = get_global_db(input.clone(), true)
+            .await
+            .expect("create parquet scan range test database");
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result
+            .expect("execute parquet scan range query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect parquet scan range query output");
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_simple_select_query_parquet_with_full_scan_range() {
+        let sql = "SELECT * FROM S3Object";
+        let mut input = create_test_parquet_input(sql);
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(1024),
+        });
+        let db = get_global_db(input.clone(), true)
+            .await
+            .expect("create parquet full scan range database");
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result
+            .expect("execute parquet full scan range query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect parquet full scan range output");
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+    }
+
+    #[tokio::test]
+    async fn test_simple_select_query_csv_with_scan_range() {
+        let sql = "SELECT name, age FROM S3Object LIMIT 20";
+        let mut input = create_test_input(sql);
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(1024),
+        });
+        let db = get_global_db(input.clone(), true)
+            .await
+            .expect("create csv scan range test database");
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result
+            .expect("execute csv scan range query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect csv scan range output");
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert!(total_rows > 0);
+    }
+
+    #[tokio::test]
+    async fn test_simple_select_query_json_with_scan_range() {
+        let sql = "SELECT name, age FROM S3Object LIMIT 20";
+        let mut input = create_test_json_lines_input(sql);
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(1024),
+        });
+        let db = get_global_db(input.clone(), true)
+            .await
+            .expect("create json scan range test database");
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result
+            .expect("execute json scan range query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect json scan range output");
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert!(total_rows > 0);
     }
 
     #[tokio::test]

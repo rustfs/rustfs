@@ -16,12 +16,10 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::write;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result as DFResult;
-use datafusion::datasource::listing::ListingTable;
 use datafusion::datasource::{TableProvider, provider_as_source};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableSource};
@@ -48,21 +46,11 @@ impl TableSourceAdapter {
         let table_name: String = table_name.into();
 
         let table_handle = table_handle.into();
-        let plan = match &table_handle {
-            // TableScan
-            TableHandle::External(t) => {
-                let table_source = provider_as_source(t.clone());
-                LogicalPlanBuilder::scan(table_ref, table_source, None)?.build()?
-            }
-            // TableScan
-            TableHandle::TableProvider(t) => {
-                let table_source = provider_as_source(t.clone());
-                if let Some(plan) = table_source.get_logical_plan() {
-                    LogicalPlanBuilder::from(plan.into_owned()).build()?
-                } else {
-                    LogicalPlanBuilder::scan(table_ref, table_source, None)?.build()?
-                }
-            }
+        let table_source = provider_as_source(table_handle.provider());
+        let plan = if let Some(plan) = table_source.get_logical_plan() {
+            LogicalPlanBuilder::from(plan.into_owned()).build()?
+        } else {
+            LogicalPlanBuilder::scan(table_ref, table_source, None)?.build()?
         };
 
         debug!("Table source logical plan node of {}:\n{}", table_name, plan.display_indent_schema());
@@ -109,44 +97,32 @@ impl TableSource for TableSourceAdapter {
 }
 
 #[derive(Clone)]
-pub enum TableHandle {
-    TableProvider(Arc<dyn TableProvider>),
-    External(Arc<ListingTable>),
-}
+pub struct TableHandle(Arc<dyn TableProvider>);
 
 impl TableHandle {
+    fn provider(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.0)
+    }
+
     pub fn schema(&self) -> SchemaRef {
-        match self {
-            Self::External(t) => t.schema(),
-            Self::TableProvider(t) => t.schema(),
-        }
+        self.0.schema()
     }
 
     pub fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        match self {
-            Self::External(t) => t.supports_filters_pushdown(filter),
-            Self::TableProvider(t) => t.supports_filters_pushdown(filter),
-        }
+        self.0.supports_filters_pushdown(filter)
     }
 }
 
 impl From<Arc<dyn TableProvider>> for TableHandle {
     fn from(value: Arc<dyn TableProvider>) -> Self {
-        TableHandle::TableProvider(value)
-    }
-}
-
-impl From<Arc<ListingTable>> for TableHandle {
-    fn from(value: Arc<ListingTable>) -> Self {
-        TableHandle::External(value)
+        Self(value)
     }
 }
 
 impl Display for TableHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::External(e) => write!(f, "External({:?})", e.table_paths()),
-            Self::TableProvider(_) => write!(f, "TableProvider"),
-        }
+        let provider_name = std::any::type_name_of_val(self.0.as_ref());
+        let short_name = provider_name.rsplit("::").next().unwrap_or(provider_name);
+        f.write_str(short_name)
     }
 }

@@ -68,6 +68,7 @@ enum PrincipalFormat {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PrincipalObject {
     #[serde(rename = "AWS", default)]
     aws: Option<PrincipalValues>,

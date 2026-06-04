@@ -308,7 +308,6 @@ where
 /// - `encoder`: Optional ReedSolomon encoder instance.
 /// - `block_size`: Block size for each shard.
 /// - `_id`: Unique identifier for the erasure instance.
-/// - `_buf`: Internal buffer for block operations.
 ///
 /// # Example
 /// ```ignore
@@ -326,7 +325,6 @@ pub struct Erasure {
     pub block_size: usize,
     uses_legacy: bool,
     _id: Uuid,
-    _buf: Vec<u8>,
 }
 
 impl Default for Erasure {
@@ -339,7 +337,6 @@ impl Default for Erasure {
             block_size: 0,
             uses_legacy: false,
             _id: Uuid::nil(),
-            _buf: vec![],
         }
     }
 }
@@ -354,7 +351,6 @@ impl Clone for Erasure {
             block_size: self.block_size,
             uses_legacy: self.uses_legacy,
             _id: Uuid::new_v4(), // Generate new ID for clone
-            _buf: vec![0u8; self.block_size],
         }
     }
 }
@@ -399,7 +395,6 @@ impl Erasure {
             legacy_encoder,
             uses_legacy,
             _id: Uuid::new_v4(),
-            _buf: vec![0u8; block_size],
         }
     }
 
