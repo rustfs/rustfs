@@ -15,6 +15,7 @@
 use http::{HeaderValue, request};
 use time::{OffsetDateTime, macros::format_description};
 
+use super::request_signature_v4::SignV4Error;
 use s3s::Body;
 
 pub fn streaming_unsigned_v4(
@@ -22,25 +23,70 @@ pub fn streaming_unsigned_v4(
     session_token: &str,
     _data_len: i64,
     req_time: OffsetDateTime,
-) -> request::Request<Body> {
-    let headers = req.headers_mut();
-
-    let chunked_value = HeaderValue::from_str("aws-chunked").expect("aws-chunked is a valid header value");
-    headers.insert(http::header::TRANSFER_ENCODING, chunked_value);
-    if !session_token.is_empty() {
-        headers.insert(
-            "X-Amz-Security-Token",
-            HeaderValue::from_str(session_token).expect("streaming_unsigned_v4: invalid session token header value"),
-        );
-    }
+) -> Result<request::Request<Body>, (request::Request<Body>, SignV4Error)> {
+    let token_value = if session_token.is_empty() {
+        None
+    } else {
+        match HeaderValue::from_str(session_token) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                return Err((
+                    req,
+                    SignV4Error::HeaderValueParse {
+                        name: "X-Amz-Security-Token".to_string(),
+                        reason: err.to_string(),
+                    },
+                ));
+            }
+        }
+    };
 
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
-    headers.insert(
-        "X-Amz-Date",
-        HeaderValue::from_str(&req_time.format(&format).expect("streaming_unsigned_v4: time format failed"))
-            .expect("streaming_unsigned_v4: formatted date is not a valid header value"),
-    );
+    let date = match req_time.format(&format) {
+        Ok(value) => value,
+        Err(err) => return Err((req, SignV4Error::TimeFormat { reason: err.to_string() })),
+    };
+    let date_value = match HeaderValue::from_str(&date) {
+        Ok(value) => value,
+        Err(err) => {
+            return Err((
+                req,
+                SignV4Error::HeaderValueParse {
+                    name: "X-Amz-Date".to_string(),
+                    reason: err.to_string(),
+                },
+            ));
+        }
+    };
+
+    let headers = req.headers_mut();
+    headers.insert(http::header::TRANSFER_ENCODING, HeaderValue::from_static("aws-chunked"));
+    if let Some(token_value) = token_value {
+        headers.insert("X-Amz-Security-Token", token_value);
+    }
+    headers.insert("X-Amz-Date", date_value);
     //req.content_length = 100；
 
-    req
+    Ok(req)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_unsigned_v4_rejects_invalid_session_token_header() {
+        let req = request::Request::builder()
+            .uri("https://bucket.example.com/object")
+            .body(Body::empty())
+            .expect("request should build");
+
+        let (_, err) = streaming_unsigned_v4(req, "bad\nsession", 0, OffsetDateTime::UNIX_EPOCH)
+            .expect_err("invalid session token should fail");
+
+        assert!(matches!(
+            err,
+            SignV4Error::HeaderValueParse { name, .. } if name == "X-Amz-Security-Token"
+        ));
+    }
 }
