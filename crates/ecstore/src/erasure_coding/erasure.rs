@@ -350,7 +350,7 @@ impl Clone for Erasure {
             legacy_encoder: self.legacy_encoder.clone(),
             block_size: self.block_size,
             uses_legacy: self.uses_legacy,
-            _id: self._id, // Reuse ID — field is unused in hot path
+            _id: self._id, // Shared by clones; this field is unused in hot paths.
         }
     }
 }
@@ -413,6 +413,9 @@ impl Erasure {
             calc_shard_size
         };
         let per_shard_size = shard_size_fn(data.len(), self.data_shards);
+        if per_shard_size == 0 {
+            return Ok(vec![Bytes::new(); self.total_shard_count()]);
+        }
         let need_total_size = per_shard_size * self.total_shard_count();
 
         let mut data_buffer = BytesMut::with_capacity(need_total_size);
@@ -449,7 +452,7 @@ impl Erasure {
     }
 
     /// Encode owned data, avoiding a copy when the caller already has a heap buffer.
-    /// Falls back to the borrowing path if zero-copy conversion fails.
+    /// Falls back to copying into a new buffer if zero-copy conversion fails.
     pub fn encode_data_owned(&self, data: Vec<u8>) -> io::Result<Vec<Bytes>> {
         let shard_size_fn = if self.uses_legacy {
             calc_shard_size_legacy
@@ -457,6 +460,9 @@ impl Erasure {
             calc_shard_size
         };
         let per_shard_size = shard_size_fn(data.len(), self.data_shards);
+        if per_shard_size == 0 {
+            return Ok(vec![Bytes::new(); self.total_shard_count()]);
+        }
         let need_total_size = per_shard_size * self.total_shard_count();
 
         // Try zero-copy: Vec<u8> -> Bytes -> BytesMut (succeeds when refcount == 1)
@@ -689,6 +695,24 @@ mod tests {
 
     fn optional_shards(shards: &[Bytes]) -> Vec<Option<Vec<u8>>> {
         shards.iter().map(|shard| Some(shard.to_vec())).collect()
+    }
+
+    fn assert_owned_encode_matches_borrowed(erasure: &Erasure, data: Vec<u8>) {
+        let borrowed = erasure.encode_data(&data).expect("borrowed encode should succeed");
+        let owned = erasure.encode_data_owned(data).expect("owned encode should succeed");
+
+        assert_eq!(owned, borrowed);
+    }
+
+    #[test]
+    fn encode_data_owned_matches_borrowed_path() {
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(4, 2, 64, uses_legacy);
+
+            assert_owned_encode_matches_borrowed(&erasure, Vec::new());
+            assert_owned_encode_matches_borrowed(&erasure, b"small payload".to_vec());
+            assert_owned_encode_matches_borrowed(&erasure, (0_u8..37).collect());
+        }
     }
 
     #[test]
