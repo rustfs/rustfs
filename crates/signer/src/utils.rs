@@ -46,15 +46,7 @@ pub fn try_get_host_addr(req: &request::Request<Body>) -> Result<String, HostAdd
 }
 
 pub fn get_host_addr(req: &request::Request<Body>) -> String {
-    match try_get_host_addr(req) {
-        Ok(host) => host,
-        Err(HostAddrError::MissingUriHost) => match req.headers().get("host").map(|host| host.to_str()) {
-            Some(Ok(host)) => host.to_string(),
-            Some(Err(_)) => panic!("failed to resolve request host: invalid UTF-8 header value for `host`"),
-            None => panic!("failed to resolve request host: request uri has no host"),
-        },
-        Err(err) => panic!("failed to resolve request host: {err}"),
-    }
+    try_get_host_addr(req).unwrap_or_default()
 }
 
 pub fn sign_v4_trim_all(input: &str) -> String {
@@ -103,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn get_host_addr_uses_host_header_for_relative_uri() {
+    fn get_host_addr_returns_empty_for_relative_uri() {
         let mut req = request::Request::builder()
             .method(http::Method::GET)
             .uri("/object")
@@ -112,7 +104,7 @@ mod tests {
         req.headers_mut()
             .insert("host", HeaderValue::from_static("bucket.example.com"));
 
-        assert_eq!(get_host_addr(&req), "bucket.example.com");
+        assert_eq!(get_host_addr(&req), "");
     }
 
     #[test]

@@ -25,14 +25,21 @@ pub fn streaming_unsigned_v4(
 ) -> request::Request<Body> {
     let headers = req.headers_mut();
 
-    let chunked_value = HeaderValue::from_str(&["aws-chunked"].join(",")).expect("err");
+    let chunked_value = HeaderValue::from_str("aws-chunked").expect("aws-chunked is a valid header value");
     headers.insert(http::header::TRANSFER_ENCODING, chunked_value);
     if !session_token.is_empty() {
-        headers.insert("X-Amz-Security-Token", HeaderValue::from_str(session_token).expect("err"));
+        headers.insert(
+            "X-Amz-Security-Token",
+            HeaderValue::from_str(session_token).expect("streaming_unsigned_v4: invalid session token header value"),
+        );
     }
 
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
-    headers.insert("X-Amz-Date", HeaderValue::from_str(&req_time.format(&format).unwrap()).expect("err"));
+    headers.insert(
+        "X-Amz-Date",
+        HeaderValue::from_str(&req_time.format(&format).expect("streaming_unsigned_v4: time format failed"))
+            .expect("streaming_unsigned_v4: formatted date is not a valid header value"),
+    );
     //req.content_length = 100；
 
     req
