@@ -140,10 +140,32 @@ pub async fn rename_all(
     Ok(())
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn rename_all_ignore_missing_source(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+) -> Result<()> {
+    match reliable_rename_inner(src_file_path, dst_file_path.as_ref(), base_dir, false).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(to_file_error(err).into()),
+    }
+}
+
 async fn reliable_rename(
     src_file_path: impl AsRef<Path>,
     dst_file_path: impl AsRef<Path>,
     base_dir: impl AsRef<Path>,
+) -> io::Result<()> {
+    reliable_rename_inner(src_file_path, dst_file_path, base_dir, true).await
+}
+
+async fn reliable_rename_inner(
+    src_file_path: impl AsRef<Path>,
+    dst_file_path: impl AsRef<Path>,
+    base_dir: impl AsRef<Path>,
+    warn_on_failure: bool,
 ) -> io::Result<()> {
     if let Some(parent) = dst_file_path.as_ref().parent()
         && !file_exists(parent)
@@ -158,13 +180,15 @@ async fn reliable_rename(
                 i += 1;
                 continue;
             }
-            warn!(
-                "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
-                src_file_path.as_ref(),
-                dst_file_path.as_ref(),
-                base_dir.as_ref(),
-                e
-            );
+            if warn_on_failure {
+                warn!(
+                    "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
+                    src_file_path.as_ref(),
+                    dst_file_path.as_ref(),
+                    base_dir.as_ref(),
+                    e
+                );
+            }
             return Err(e);
         }
 
@@ -261,6 +285,19 @@ mod tests {
             .expect_err("missing source must fail");
 
         assert!(matches!(err, DiskError::FileNotFound));
+        assert!(!dst.exists());
+    }
+
+    #[tokio::test]
+    async fn rename_all_ignore_missing_source_returns_ok() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let src = temp_dir.path().join("missing");
+        let dst = temp_dir.path().join("dst");
+
+        rename_all_ignore_missing_source(&src, &dst, temp_dir.path())
+            .await
+            .expect("missing cleanup source must be ignored");
+
         assert!(!dst.exists());
     }
 }
