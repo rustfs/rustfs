@@ -15,8 +15,8 @@
 use super::*;
 use crate::error::is_err_decommission_running;
 use crate::global::{
-    GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_TierConfigMgr, get_global_bucket_monitor, is_erasure,
-    is_first_cluster_node_local,
+    GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
+    get_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd, is_first_cluster_node_local,
 };
 
 fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {

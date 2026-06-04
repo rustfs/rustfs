@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::bucket::{metadata::BUCKET_TABLE_RESERVED_PREFIX, utils::is_meta_bucketname};
+use crate::global::get_global_bucket_monitor;
 use crate::set_disk::get_lock_acquire_timeout;
 
 fn should_override_created_from_metadata(created: OffsetDateTime) -> bool {

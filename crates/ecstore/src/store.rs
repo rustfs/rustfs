@@ -42,10 +42,9 @@ use crate::error::{
 };
 use crate::event_notification::EventNotifier;
 use crate::global::{
-    DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_EventNotifier,
-    GLOBAL_IsDistErasure, GLOBAL_IsErasure, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
-    GLOBAL_TierConfigMgr, TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
-    init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd, set_global_deployment_id, set_object_layer,
+    DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives, get_global_deployment_id, get_global_endpoints,
+    init_global_bucket_monitor, is_erasure_sd, set_global_deployment_id, set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -284,52 +283,6 @@ impl Clone for PoolObjInfo {
 //     // Limit the number of results.
 //     pub limit: i32,
 // }
-
-/// Phase 1: Accessor methods for migrated globals
-impl ECStore {
-    /// Check if this is an erasure-coded deployment
-    pub async fn is_erasure(&self) -> bool {
-        is_erasure().await
-    }
-
-    /// Check if this is a distributed erasure deployment
-    pub async fn is_dist_erasure(&self) -> bool {
-        is_dist_erasure().await
-    }
-
-    /// Check if this is a single-disk deployment
-    pub async fn is_erasure_sd(&self) -> bool {
-        is_erasure_sd().await
-    }
-
-    /// Update erasure type flags
-    pub async fn update_erasure_type(&self, is_erasure: bool, is_dist: bool, is_sd: bool) {
-        let is_erasure = is_erasure || is_dist;
-
-        *self.is_erasure.write().await = is_erasure;
-        *self.is_dist_erasure.write().await = is_dist;
-        *self.is_erasure_sd.write().await = is_sd;
-
-        *GLOBAL_IsErasure.write().await = is_erasure;
-        *GLOBAL_IsDistErasure.write().await = is_dist;
-        *GLOBAL_IsErasureSD.write().await = is_sd;
-    }
-
-    /// Get tier config manager
-    pub fn tier_config_mgr(&self) -> Arc<RwLock<TierConfigMgr>> {
-        GLOBAL_TierConfigMgr.clone()
-    }
-
-    /// Get event notifier
-    pub fn event_notifier(&self) -> Arc<RwLock<EventNotifier>> {
-        GLOBAL_EventNotifier.clone()
-    }
-
-    /// Get bucket monitor
-    pub fn bucket_monitor(&self) -> Option<Arc<Monitor>> {
-        get_global_bucket_monitor()
-    }
-}
 
 #[async_trait::async_trait]
 impl ObjectIO for ECStore {
