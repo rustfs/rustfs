@@ -242,7 +242,7 @@ pub async fn update_erasure_type(setup_type: SetupType) {
 //     }
 // }
 
-type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
+pub(crate) type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
 
 /// Set the global region
 ///
