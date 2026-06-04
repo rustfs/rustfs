@@ -18,6 +18,7 @@ use crate::global::{
     GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
     get_global_bucket_monitor, is_dist_erasure, is_first_cluster_node_local,
 };
+use crate::config::storageclass;
 
 fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
@@ -254,6 +255,10 @@ impl ECStore {
             tier_config_mgr: GLOBAL_TierConfigMgr.clone(),
             event_notifier: GLOBAL_EventNotifier.clone(),
             bucket_monitor: OnceLock::new(),
+
+            // Phase 2: Config globals — initialized with defaults, synced after init
+            server_config: RwLock::new(None),
+            storage_class: RwLock::new(storageclass::Config::default()),
         });
 
         // Only set it when the global deployment ID is not yet configured
@@ -374,6 +379,14 @@ impl ECStore {
 
         if let Err(err) = GLOBAL_TierConfigMgr.write().await.init(self.clone()).await {
             info!("TierConfigMgr init error: {}", err);
+        }
+
+        // Phase 2: Sync config globals into ECStore fields
+        if let Some(cfg) = crate::config::get_global_server_config() {
+            *self.server_config.write().await = Some(cfg);
+        }
+        if let Some(sc) = crate::config::get_global_storage_class() {
+            *self.storage_class.write().await = sc;
         }
 
         Ok(())

@@ -193,6 +193,12 @@ pub struct ECStore {
     pub(crate) event_notifier: Arc<RwLock<EventNotifier>>,
     /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
     pub(crate) bucket_monitor: OnceLock<Arc<Monitor>>,
+
+    // Phase 2: Config globals
+    /// Server configuration (migrated from GLOBAL_SERVER_CONFIG)
+    pub(crate) server_config: RwLock<Option<crate::config::Config>>,
+    /// Storage class configuration (migrated from GLOBAL_STORAGE_CLASS)
+    pub(crate) storage_class: RwLock<crate::config::storageclass::Config>,
 }
 
 impl std::fmt::Debug for ECStore {
@@ -203,6 +209,29 @@ impl std::fmt::Debug for ECStore {
             .field("pools", &self.pools)
             .field("pool_meta", &self.pool_meta)
             .finish_non_exhaustive()
+    }
+}
+
+/// Phase 2: Accessor methods for config globals
+impl ECStore {
+    /// Get server configuration
+    pub async fn get_server_config(&self) -> Option<crate::config::Config> {
+        self.server_config.read().await.clone()
+    }
+
+    /// Set server configuration
+    pub async fn set_server_config(&self, cfg: crate::config::Config) {
+        *self.server_config.write().await = Some(cfg);
+    }
+
+    /// Get storage class configuration
+    pub async fn get_storage_class(&self) -> crate::config::storageclass::Config {
+        self.storage_class.read().await.clone()
+    }
+
+    /// Set storage class configuration
+    pub async fn set_storage_class(&self, cfg: crate::config::storageclass::Config) {
+        *self.storage_class.write().await = cfg;
     }
 }
 
