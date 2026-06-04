@@ -22,6 +22,7 @@
 
 pub mod data_usage_define;
 pub mod error;
+pub mod runtime_config;
 pub mod scanner;
 pub mod scanner_budget;
 pub mod scanner_folder;
@@ -30,6 +31,7 @@ pub mod sleeper;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
+pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
 pub use rustfs_common::last_minute;
 pub use scanner::init_data_scanner;
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};

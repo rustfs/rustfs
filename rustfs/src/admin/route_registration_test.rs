@@ -15,7 +15,7 @@
 use crate::admin::{
     handlers::{
         audit, bucket_meta, config_admin, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools,
-        profile_admin, quota, rebalance, replication, site_replication, sts, system, tier, tls_debug, user,
+        profile_admin, quota, rebalance, replication, scanner, site_replication, sts, system, tier, tls_debug, user,
     },
     router::{AdminOperation, S3Router},
 };
@@ -53,6 +53,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     quota::register_quota_route(router).expect("register quota route");
     bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
     config_admin::register_config_route(router).expect("register config admin route");
+    scanner::register_scanner_route(router).expect("register scanner route");
     audit::register_audit_target_route(router).expect("register audit target route");
     module_switch::register_module_switch_route(router).expect("register module switch route");
     plugins_catalog::register_plugin_catalog_route(router).expect("register plugin catalog route");
@@ -123,6 +124,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/restore-config-history-kv"));
     assert_route(&router, Method::GET, &admin_path("/v3/config"));
     assert_route(&router, Method::PUT, &admin_path("/v3/config"));
+    assert_route(&router, Method::GET, &admin_path("/v3/scanner/status"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));
@@ -257,6 +259,7 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::PUT, compat_admin_alias_path("/v3/restore-config-history-kv")),
         (Method::GET, compat_admin_alias_path("/v3/config")),
         (Method::PUT, compat_admin_alias_path("/v3/config")),
+        (Method::GET, compat_admin_alias_path("/v3/scanner/status")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),

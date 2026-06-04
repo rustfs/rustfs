@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
 use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
+use crate::runtime_config::{
+    current_scanner_runtime_config, lookup_scanner_runtime_config, refresh_scanner_runtime_config_from_global,
+    scanner_bitrot_cycle, scanner_cycle_interval, scanner_start_delay, set_scanner_default_cycle_secs,
+};
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::ScannerIO;
-use crate::sleeper::{SCANNER_SLEEPER, scanner_speed_from_env_or_default, set_scanner_default_speed};
+use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
@@ -29,11 +30,12 @@ use rustfs_common::metrics::{
     CurrentCycle, Metric, Metrics, ScanCyclePartialReason, emit_scan_cycle_complete, emit_scan_cycle_partial, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
+#[cfg(test)]
 use rustfs_config::{
-    DEFAULT_SCANNER_BITROT_CYCLE_SECS, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS,
-    DEFAULT_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
-    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
+    ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CYCLE_MAX_DIRECTORIES, ENV_SCANNER_CYCLE_MAX_DURATION_SECS,
+    ENV_SCANNER_CYCLE_MAX_OBJECTS,
 };
+use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
 use rustfs_ecstore::StorageAPI as _;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle as _;
 use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_replication_config};
@@ -50,11 +52,9 @@ use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 const SINGLE_DISK_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
-const NO_DEFAULT_CYCLE_OVERRIDE: u64 = 0;
-
-static SCANNER_DEFAULT_CYCLE_SECS: AtomicU64 = AtomicU64::new(NO_DEFAULT_CYCLE_OVERRIDE);
+#[cfg(test)]
+const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
 /// Returns the base cycle interval.
 /// Priority order:
@@ -62,54 +62,28 @@ static SCANNER_DEFAULT_CYCLE_SECS: AtomicU64 = AtomicU64::new(NO_DEFAULT_CYCLE_O
 /// 2. RUSTFS_SCANNER_START_DELAY_SECS (for backward compatibility)
 /// 3. Deployment-specific default cycle override
 /// 4. RUSTFS_SCANNER_SPEED preset
+#[cfg(test)]
 fn cycle_interval() -> Duration {
-    if let Some(secs) = rustfs_utils::get_env_opt_u64(ENV_SCANNER_CYCLE) {
-        return Duration::from_secs(secs);
-    }
-    if let Some(secs) = scanner_start_delay_secs() {
-        return Duration::from_secs(secs);
-    }
-    if let Some(secs) = scanner_default_cycle_secs() {
-        return Duration::from_secs(secs);
-    }
-    scanner_speed_from_env_or_default().cycle_interval()
-}
-
-fn scanner_default_cycle_secs() -> Option<u64> {
-    match SCANNER_DEFAULT_CYCLE_SECS.load(Ordering::Relaxed) {
-        NO_DEFAULT_CYCLE_OVERRIDE => None,
-        secs => Some(secs),
-    }
-}
-
-fn set_scanner_default_cycle_secs(secs: Option<u64>) {
-    SCANNER_DEFAULT_CYCLE_SECS.store(secs.unwrap_or(NO_DEFAULT_CYCLE_OVERRIDE), Ordering::Relaxed);
-}
-
-fn scanner_start_delay_secs() -> Option<u64> {
-    let deprecated = [ENV_SCANNER_START_DELAY_SECS_DEPRECATED];
-    rustfs_utils::get_env_opt_u64_with_aliases(ENV_SCANNER_START_DELAY_SECS, &deprecated)
-}
-
-fn scanner_cycle_max_duration() -> Option<Duration> {
-    match rustfs_utils::get_env_u64(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS) {
-        0 => None,
-        secs => Some(Duration::from_secs(secs)),
-    }
-}
-
-fn scanner_cycle_count_budget(env: &str, default: u64) -> Option<u64> {
-    match rustfs_utils::get_env_u64(env, default) {
-        0 => None,
-        count => Some(count),
-    }
+    resolve_scanner_runtime_config().cycle_interval
 }
 
 fn scanner_cycle_budget_config() -> ScannerCycleBudgetConfig {
-    ScannerCycleBudgetConfig {
-        max_duration: scanner_cycle_max_duration(),
-        max_objects: scanner_cycle_count_budget(ENV_SCANNER_CYCLE_MAX_OBJECTS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS),
-        max_directories: scanner_cycle_count_budget(ENV_SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES),
+    resolve_scanner_runtime_config().cycle_budget
+}
+
+#[cfg(test)]
+fn scanner_cycle_max_duration() -> Option<Duration> {
+    resolve_scanner_runtime_config().cycle_budget.max_duration
+}
+
+fn resolve_scanner_runtime_config() -> crate::runtime_config::ScannerRuntimeConfig {
+    let config = rustfs_ecstore::config::get_global_server_config();
+    match lookup_scanner_runtime_config(config.as_ref()) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(error = %err, "Failed to resolve scanner runtime config, using last applied config");
+            current_scanner_runtime_config()
+        }
     }
 }
 
@@ -125,7 +99,7 @@ fn scan_cycle_partial_reason(reason: Option<ScannerCycleBudgetReason>) -> ScanCy
 /// Compute a randomized inter-cycle sleep.
 // Delay is scan interval +- 10%, with a floor of 1 second.
 fn randomized_cycle_delay() -> Duration {
-    randomized_cycle_delay_for(cycle_interval())
+    randomized_cycle_delay_for(scanner_cycle_interval())
 }
 
 fn randomized_cycle_delay_for(interval: Duration) -> Duration {
@@ -137,7 +111,7 @@ fn randomized_cycle_delay_for(interval: Duration) -> Duration {
 }
 
 fn initial_scanner_delay() -> Duration {
-    initial_scanner_delay_for(scanner_start_delay_secs())
+    initial_scanner_delay_for(scanner_start_delay().map(|duration| duration.as_secs()))
 }
 
 fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
@@ -150,6 +124,9 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     configure_scanner_defaults(&storeapi).await;
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
+    if let Err(err) = refresh_scanner_runtime_config_from_global() {
+        warn!(error = %err, "Failed to apply scanner runtime config at startup");
+    }
 
     let ctx_clone = ctx;
     let storeapi_clone = storeapi;
@@ -281,24 +258,9 @@ async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) {
     }
 }
 
+#[cfg(test)]
 fn bitrot_scan_cycle() -> Option<Duration> {
-    let Ok(value) = std::env::var(ENV_SCANNER_BITROT_CYCLE_SECS) else {
-        return Some(Duration::from_secs(DEFAULT_SCANNER_BITROT_CYCLE_SECS));
-    };
-
-    match value.trim().to_ascii_lowercase().as_str() {
-        "0" | "true" | "on" | "yes" => Some(Duration::ZERO),
-        "false" | "off" | "no" | "disabled" => None,
-        value => value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
-            warn!(
-                env = ENV_SCANNER_BITROT_CYCLE_SECS,
-                value,
-                default_secs = DEFAULT_SCANNER_BITROT_CYCLE_SECS,
-                "Invalid scanner bitrot cycle, using default"
-            );
-            Some(Duration::from_secs(DEFAULT_SCANNER_BITROT_CYCLE_SECS))
-        }),
-    }
+    resolve_scanner_runtime_config().bitrot_cycle
 }
 
 fn get_cycle_scan_mode(
@@ -476,9 +438,11 @@ async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
 #[instrument(skip_all)]
 async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
     let _activity_guard = ScannerActivityGuard::new();
-    SCANNER_SLEEPER.refresh_from_env();
-    let configured_cycle_interval = cycle_interval();
-    let configured_bitrot_cycle = bitrot_scan_cycle();
+    if let Err(err) = refresh_scanner_runtime_config_from_global() {
+        warn!(error = %err, "Failed to refresh scanner runtime config, using last applied config");
+    }
+    let configured_cycle_interval = scanner_cycle_interval();
+    let configured_bitrot_cycle = scanner_bitrot_cycle();
     let cycle_budget_config = scanner_cycle_budget_config();
     global_metrics().record_scanner_cycle_config(
         configured_cycle_interval,

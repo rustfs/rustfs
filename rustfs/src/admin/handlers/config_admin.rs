@@ -49,10 +49,18 @@ use rustfs_config::oidc::{
     OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
 use rustfs_config::{
-    COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL,
-    MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME,
-    WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT,
-    WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
+    COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
+    ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, ENV_SCANNER_ALERT_EXCESS_VERSIONS, ENV_SCANNER_BITROT_CYCLE_SECS,
+    ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
+    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_IDLE_MODE,
+    ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
+    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD,
+    MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, SCANNER_ALERT_EXCESS_FOLDERS,
+    SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT,
+    SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_IDLE_MODE,
+    SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS,
+    SCANNER_YIELD_EVERY_N_OBJECTS, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY,
+    WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
 };
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS;
@@ -172,6 +180,99 @@ const STORAGE_CLASS_HELP_KEYS: &[HelpKeyMetadata] = &[
         key: "inline_block",
         type_name: "string",
         description: "set the shard size threshold considered for inline blocks",
+        optional: true,
+    },
+];
+
+const SCANNER_HELP_KEYS: &[HelpKeyMetadata] = &[
+    HelpKeyMetadata {
+        key: SCANNER_SPEED,
+        type_name: "fastest|fast|default|slow|slowest",
+        description: "set scanner throttling preset",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_CYCLE,
+        type_name: "seconds",
+        description: "override scanner cycle interval in seconds",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_START_DELAY,
+        type_name: "seconds",
+        description: "set scanner startup delay in seconds",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_CYCLE_MAX_DURATION,
+        type_name: "seconds",
+        description: "cap one scanner cycle runtime in seconds, 0 disables the cap",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_CYCLE_MAX_OBJECTS,
+        type_name: "number",
+        description: "cap objects processed by one scanner cycle, 0 disables the cap",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_CYCLE_MAX_DIRECTORIES,
+        type_name: "number",
+        description: "cap directories entered by one scanner cycle, 0 disables the cap",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_BITROT_CYCLE,
+        type_name: "seconds|off",
+        description: "set periodic deep bitrot scan cycle, 0 scans deeply every cycle, off disables periodic deep scans",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_IDLE_MODE,
+        type_name: "on|off",
+        description: "enable scanner throttling sleeps between operations",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_CACHE_SAVE_TIMEOUT,
+        type_name: "seconds",
+        description: "set scanner data-usage cache save timeout in seconds",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_MAX_CONCURRENT_SET_SCANS,
+        type_name: "number",
+        description: "cap concurrent scanner set tasks, 0 uses topology defaults",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_MAX_CONCURRENT_DISK_SCANS,
+        type_name: "number",
+        description: "cap concurrent disk bucket walks per set, 0 uses disk-count defaults",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_YIELD_EVERY_N_OBJECTS,
+        type_name: "number",
+        description: "yield to the async runtime after this many scanned objects, 0 disables extra object-count yields",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_ALERT_EXCESS_VERSIONS,
+        type_name: "number",
+        description: "object version count threshold for scanner alerts",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_ALERT_EXCESS_VERSION_SIZE,
+        type_name: "bytes",
+        description: "retained object version size threshold for scanner alerts",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_ALERT_EXCESS_FOLDERS,
+        type_name: "number",
+        description: "direct subfolder count threshold for scanner alerts",
         optional: true,
     },
 ];
@@ -422,6 +523,12 @@ const HELP_SUBSYSTEMS: &[HelpSubSystemMetadata] = &[
         description: "define object level redundancy",
         multiple_targets: false,
         keys: STORAGE_CLASS_HELP_KEYS,
+    },
+    HelpSubSystemMetadata {
+        key: SCANNER_SUB_SYS,
+        description: "configure background data scanner scheduling, throttling, bitrot, and observability thresholds",
+        multiple_targets: false,
+        keys: SCANNER_HELP_KEYS,
     },
     HelpSubSystemMetadata {
         key: IDENTITY_OPENID_SUB_SYS,
@@ -1200,6 +1307,21 @@ fn env_help_key(sub_system: &str, key: &str) -> String {
         (STORAGE_CLASS_SUB_SYS, "rrs") => RRS_ENV.to_string(),
         (STORAGE_CLASS_SUB_SYS, "optimize") => OPTIMIZE_ENV.to_string(),
         (STORAGE_CLASS_SUB_SYS, "inline_block") => INLINE_BLOCK_ENV.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_SPEED) => ENV_SCANNER_SPEED.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_CYCLE) => ENV_SCANNER_CYCLE.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_START_DELAY) => ENV_SCANNER_START_DELAY_SECS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_CYCLE_MAX_DURATION) => ENV_SCANNER_CYCLE_MAX_DURATION_SECS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_CYCLE_MAX_OBJECTS) => ENV_SCANNER_CYCLE_MAX_OBJECTS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_CYCLE_MAX_DIRECTORIES) => ENV_SCANNER_CYCLE_MAX_DIRECTORIES.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_BITROT_CYCLE) => ENV_SCANNER_BITROT_CYCLE_SECS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_IDLE_MODE) => ENV_SCANNER_IDLE_MODE.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_CACHE_SAVE_TIMEOUT) => ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_MAX_CONCURRENT_SET_SCANS) => ENV_SCANNER_MAX_CONCURRENT_SET_SCANS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_MAX_CONCURRENT_DISK_SCANS) => ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_YIELD_EVERY_N_OBJECTS) => ENV_SCANNER_YIELD_EVERY_N_OBJECTS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_ALERT_EXCESS_VERSIONS) => ENV_SCANNER_ALERT_EXCESS_VERSIONS.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_ALERT_EXCESS_VERSION_SIZE) => ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_ALERT_EXCESS_FOLDERS) => ENV_SCANNER_ALERT_EXCESS_FOLDERS.to_string(),
         (IDENTITY_OPENID_SUB_SYS, ENABLE_KEY) => ENV_IDENTITY_OPENID_ENABLE.to_string(),
         (IDENTITY_OPENID_SUB_SYS, OIDC_CONFIG_URL) => ENV_IDENTITY_OPENID_CONFIG_URL.to_string(),
         (IDENTITY_OPENID_SUB_SYS, OIDC_CLIENT_ID) => ENV_IDENTITY_OPENID_CLIENT_ID.to_string(),
@@ -1388,7 +1510,12 @@ fn build_help_response(sub_system: Option<&str>, key: Option<&str>, env_only: bo
 /// the entire config and must ensure runtime state (e.g. GLOBAL_STORAGE_CLASS) is
 /// refreshed on both the leader and all peers.
 async fn apply_and_signal_dynamic_subsystems(config: &ServerConfig) {
-    for sub_system in [STORAGE_CLASS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS, AUDIT_MQTT_SUB_SYS] {
+    for sub_system in [
+        STORAGE_CLASS_SUB_SYS,
+        AUDIT_WEBHOOK_SUB_SYS,
+        AUDIT_MQTT_SUB_SYS,
+        SCANNER_SUB_SYS,
+    ] {
         if apply_dynamic_config_for_subsystem(config, sub_system).await.unwrap_or(false) {
             signal_dynamic_config_reload(sub_system).await;
         }
@@ -1802,6 +1929,17 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.sub_sys, "notify_webhook");
         assert_eq!(response.keys_help.len(), 2);
         assert_eq!(response.keys_help[1].key, "endpoint");
+    }
+
+    #[test]
+    fn build_help_response_reports_scanner_keys() {
+        let response = build_help_response(Some("scanner"), Some("speed"), false).expect("scanner help response");
+
+        assert_eq!(response.sub_sys, "scanner");
+        assert!(!response.multiple_targets);
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].key, "speed");
+        assert_eq!(response.keys_help[0].type_name, "fastest|fast|default|slow|slowest");
     }
 
     #[test]

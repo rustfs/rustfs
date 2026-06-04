@@ -24,10 +24,8 @@ use metrics::counter;
 use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics};
-use rustfs_config::{
-    DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS,
-    ENV_SCANNER_MAX_CONCURRENT_SET_SCANS,
-};
+#[cfg(test)]
+use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
@@ -229,17 +227,11 @@ fn scanner_concurrency_limit(configured: usize, available: usize) -> usize {
 }
 
 fn scanner_max_concurrent_set_scans(available: usize) -> usize {
-    scanner_concurrency_limit(
-        rustfs_utils::get_env_usize(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS),
-        available,
-    )
+    scanner_concurrency_limit(crate::runtime_config::scanner_max_concurrent_set_scans_configured(), available)
 }
 
 fn scanner_max_concurrent_disk_scans(available: usize) -> usize {
-    scanner_concurrency_limit(
-        rustfs_utils::get_env_usize(ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS),
-        available,
-    )
+    scanner_concurrency_limit(crate::runtime_config::scanner_max_concurrent_disk_scans_configured(), available)
 }
 
 fn record_set_scan_failure(first_err: &mut Option<Error>, err: Error) {
@@ -1168,16 +1160,20 @@ mod tests {
     #[serial]
     fn scanner_max_concurrent_set_scans_uses_env_cap() {
         with_var(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("2"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(scanner_max_concurrent_set_scans(4), 2);
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
     #[serial]
     fn scanner_max_concurrent_disk_scans_uses_env_cap() {
         with_var(ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, Some("1"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(scanner_max_concurrent_disk_scans(4), 1);
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]

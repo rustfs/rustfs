@@ -23,6 +23,7 @@ use std::{
 
 use http::HeaderMap;
 use metrics::{counter, describe_counter, describe_histogram, histogram};
+#[cfg(test)]
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, hash_path,
@@ -47,7 +48,6 @@ const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
-const DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT: u64 = 30;
 const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
 const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX: u64 = 5;
 const DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES: u32 = 0;
@@ -749,9 +749,7 @@ impl DataUsageCache {
     }
 
     fn cache_save_timeout() -> Duration {
-        Duration::from_secs(
-            rustfs_utils::get_env_u64(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT).max(1),
-        )
+        crate::runtime_config::scanner_cache_save_timeout()
     }
 
     fn backup_cache_save_timeout(timeout_duration: Duration) -> Duration {
@@ -1138,22 +1136,27 @@ mod tests {
     #[test]
     fn test_cache_save_timeout_uses_default_when_env_missing() {
         with_var_unset(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(
                 DataUsageCache::cache_save_timeout(),
-                Duration::from_secs(DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT)
+                Duration::from_secs(rustfs_config::DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)
             );
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
     fn test_cache_save_timeout_respects_env_and_minimum_bound() {
         with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(7));
         });
 
         with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("0"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(1));
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[tokio::test]
