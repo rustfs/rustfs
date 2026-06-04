@@ -19,8 +19,8 @@ use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report,
-    has_path_prefix, is_admin_path,
+    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TABLE_CATALOG_PREFIX, active_http_requests,
+    collect_dependency_readiness_report, has_path_prefix, is_admin_path,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
@@ -856,6 +856,7 @@ fn is_object_attributes_request(req: &HttpRequest<Incoming>) -> bool {
         || has_path_prefix(path, MINIO_ADMIN_PREFIX)
         || has_path_prefix(path, RUSTFS_ADMIN_PREFIX)
         || has_path_prefix(path, MINIO_ADMIN_V3_PREFIX)
+        || has_path_prefix(path, TABLE_CATALOG_PREFIX)
         || has_path_prefix(path, CONSOLE_PREFIX)
         || has_path_prefix(path, RPC_PREFIX)
     {
@@ -900,6 +901,7 @@ impl ConditionalCorsLayer {
         // Exclude Admin, Console, RPC, and configured special paths
         !has_path_prefix(path, ADMIN_PREFIX)
             && !has_path_prefix(path, MINIO_ADMIN_PREFIX)
+            && !has_path_prefix(path, TABLE_CATALOG_PREFIX)
             && !has_path_prefix(path, RPC_PREFIX)
             && !is_console_path(path)
             && !Self::EXCLUDED_EXACT_PATHS.contains(&path)
@@ -1819,6 +1821,7 @@ mod tests {
         assert!(ConditionalCorsLayer::is_s3_path("/"));
         assert!(!ConditionalCorsLayer::is_s3_path("/rustfs/admin/v3/info"));
         assert!(!ConditionalCorsLayer::is_s3_path("/minio/admin/v3/info"));
+        assert!(!ConditionalCorsLayer::is_s3_path(&format!("{TABLE_CATALOG_PREFIX}/config")));
         assert!(ConditionalCorsLayer::is_s3_path("/minio/adminx/object"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health/ready"));

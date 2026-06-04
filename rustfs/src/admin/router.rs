@@ -19,7 +19,8 @@ use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
-    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
+    TABLE_CATALOG_PREFIX, is_admin_path,
 };
 use crate::storage::access::{ReqInfo, authorize_request};
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
@@ -2458,6 +2459,7 @@ mod tests {
     fn is_admin_path_accepts_rustfs_and_compat_prefixes() {
         assert!(is_admin_path("/rustfs/admin/v3/info"));
         assert!(is_admin_path("/minio/admin/v3/info"));
+        assert!(is_admin_path(&format!("{TABLE_CATALOG_PREFIX}/config")));
         assert!(!is_admin_path("/bucket/object"));
         assert!(!is_admin_path("/rustfs/administrator/object"));
         assert!(!is_admin_path("/minio/administrator/object"));
