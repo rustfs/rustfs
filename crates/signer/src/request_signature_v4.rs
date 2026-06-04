@@ -593,13 +593,7 @@ fn sign_v4_inner(
         for (_, v) in &trailer {
             headers.append(http::header::TRAILER, v.clone());
         }
-        return match streaming_unsigned_v4(req, session_token, content_len, t) {
-            Ok(req) => Ok(req),
-            Err(failure) => {
-                let (req, err) = *failure;
-                fail(req, err)
-            }
-        };
+        return Ok(streaming_unsigned_v4(req, session_token, content_len, t));
     }
     Ok(req)
 }

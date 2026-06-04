@@ -16,7 +16,7 @@ use super::*;
 use crate::error::is_err_decommission_running;
 use crate::global::{
     GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
-    get_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd, is_first_cluster_node_local,
+    get_global_bucket_monitor, is_dist_erasure, is_first_cluster_node_local,
 };
 
 fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
@@ -248,14 +248,9 @@ impl ECStore {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
 
-            // Phase 1: Migrated from global singletons
-            is_erasure: RwLock::new(false),
-            is_dist_erasure: RwLock::new(false),
-            is_erasure_sd: RwLock::new(false),
             local_disk_map: GLOBAL_LOCAL_DISK_MAP.clone(),
             local_disk_id_map: GLOBAL_LOCAL_DISK_ID_MAP.clone(),
             local_disk_set_drives: GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
-            root_disk_threshold: RwLock::new(0),
             tier_config_mgr: GLOBAL_TierConfigMgr.clone(),
             event_notifier: GLOBAL_EventNotifier.clone(),
             bucket_monitor: OnceLock::new(),
@@ -290,13 +285,6 @@ impl ECStore {
 
         set_object_layer(ec.clone()).await;
 
-        // Sync migrated fields from globals
-        let is_erasure = is_erasure().await;
-        let is_dist_erasure = is_dist_erasure().await;
-        let is_erasure_sd = is_erasure_sd().await;
-        *ec.is_erasure.write().await = is_erasure;
-        *ec.is_dist_erasure.write().await = is_dist_erasure;
-        *ec.is_erasure_sd.write().await = is_erasure_sd;
         if let Some(monitor) = get_global_bucket_monitor() {
             let _ = ec.bucket_monitor.set(monitor);
         }

@@ -182,17 +182,11 @@ pub struct ECStore {
     pub rebalance_meta: RwLock<Option<RebalanceMeta>>,
     pub decommission_cancelers: RwLock<Vec<Option<CancellationToken>>>,
 
-    // --- Phase 1: Migrated from global singletons ---
-    /// Erasure type flags (migrated from GLOBAL_IsErasure/IsDistErasure/IsErasureSD)
-    pub(crate) is_erasure: RwLock<bool>,
-    pub(crate) is_dist_erasure: RwLock<bool>,
-    pub(crate) is_erasure_sd: RwLock<bool>,
+    // Phase 2 migration pending - do not use directly.
     /// Local disk maps (migrated from GLOBAL_LOCAL_DISK_MAP/ID_MAP/SET_DRIVES)
     pub(crate) local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
     pub(crate) local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
     pub(crate) local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
-    /// Root disk threshold (migrated from GLOBAL_RootDiskThreshold)
-    pub(crate) root_disk_threshold: RwLock<u64>,
     /// Tier config manager (migrated from GLOBAL_TierConfigMgr)
     pub(crate) tier_config_mgr: Arc<RwLock<TierConfigMgr>>,
     /// Event notifier (migrated from GLOBAL_EventNotifier)
@@ -208,9 +202,6 @@ impl std::fmt::Debug for ECStore {
             .field("disk_map", &self.disk_map)
             .field("pools", &self.pools)
             .field("pool_meta", &self.pool_meta)
-            .field("is_erasure", &self.is_erasure)
-            .field("is_dist_erasure", &self.is_dist_erasure)
-            .field("is_erasure_sd", &self.is_erasure_sd)
             .finish_non_exhaustive()
     }
 }
