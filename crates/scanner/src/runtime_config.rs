@@ -183,6 +183,19 @@ fn scanner_kvs(config: Option<&ServerConfig>) -> Option<KVS> {
     config.and_then(|config| config.get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER))
 }
 
+fn validate_default_scanner_target(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
+    let Some(targets) = config.0.get(SCANNER_SUB_SYS) else {
+        return Ok(());
+    };
+
+    for target in targets.keys() {
+        if target != DEFAULT_DELIMITER {
+            return Err(invalid_value("target", target.clone(), "scanner config only supports the default target"));
+        }
+    }
+    Ok(())
+}
+
 fn invalid_value(key: &'static str, value: impl Into<String>, reason: &'static str) -> ScannerRuntimeConfigError {
     ScannerRuntimeConfigError::InvalidValue {
         key,
@@ -237,6 +250,59 @@ fn parse_env_bitrot_cycle(value: String) -> Option<Duration> {
             Some(Duration::from_secs(DEFAULT_SCANNER_BITROT_CYCLE_SECS))
         }),
     }
+}
+
+fn validate_optional_config_u64(
+    kvs: Option<&KVS>,
+    key: &'static str,
+    default: impl fmt::Display,
+) -> Result<(), ScannerRuntimeConfigError> {
+    if let Some(value) = config_value(kvs, key, default) {
+        parse_config_u64(key, value)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_config_usize(
+    kvs: Option<&KVS>,
+    key: &'static str,
+    default: impl fmt::Display,
+) -> Result<(), ScannerRuntimeConfigError> {
+    if let Some(value) = config_value(kvs, key, default) {
+        parse_config_usize(key, value)?;
+    }
+    Ok(())
+}
+
+fn validate_persisted_scanner_runtime_config(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
+    validate_default_scanner_target(config)?;
+
+    let kvs = scanner_kvs(Some(config));
+    let kvs = kvs.as_ref();
+
+    if let Some(value) = config_value(kvs, SCANNER_SPEED, DEFAULT_SCANNER_SPEED) {
+        parse_config_speed(value)?;
+    }
+    if let Some(value) = config_value(kvs, SCANNER_IDLE_MODE, DEFAULT_SCANNER_IDLE_MODE) {
+        parse_config_bool(SCANNER_IDLE_MODE, value)?;
+    }
+    validate_optional_config_u64(kvs, SCANNER_START_DELAY, "")?;
+    validate_optional_config_u64(kvs, SCANNER_CYCLE, "")?;
+    validate_optional_config_u64(kvs, SCANNER_CYCLE_MAX_DURATION, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS)?;
+    validate_optional_config_u64(kvs, SCANNER_CYCLE_MAX_OBJECTS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS)?;
+    validate_optional_config_u64(kvs, SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES)?;
+    if let Some(value) = config_value(kvs, SCANNER_BITROT_CYCLE, DEFAULT_SCANNER_BITROT_CYCLE_SECS) {
+        parse_config_bitrot_cycle(value)?;
+    }
+    validate_optional_config_u64(kvs, SCANNER_CACHE_SAVE_TIMEOUT, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)?;
+    validate_optional_config_usize(kvs, SCANNER_MAX_CONCURRENT_SET_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS)?;
+    validate_optional_config_usize(kvs, SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS)?;
+    validate_optional_config_u64(kvs, SCANNER_YIELD_EVERY_N_OBJECTS, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS)?;
+    validate_optional_config_u64(kvs, SCANNER_ALERT_EXCESS_VERSIONS, DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS)?;
+    validate_optional_config_u64(kvs, SCANNER_ALERT_EXCESS_VERSION_SIZE, DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE)?;
+    validate_optional_config_u64(kvs, SCANNER_ALERT_EXCESS_FOLDERS, DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS)?;
+
+    Ok(())
 }
 
 fn lookup_speed(kvs: Option<&KVS>) -> Result<(ScannerSpeed, ScannerRuntimeConfigSource), ScannerRuntimeConfigError> {
@@ -481,10 +547,11 @@ fn apply_resolved_runtime_config(config: ScannerRuntimeConfig) {
 }
 
 pub fn validate_scanner_runtime_config(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
-    lookup_scanner_runtime_config(Some(config)).map(|_| ())
+    validate_persisted_scanner_runtime_config(config)
 }
 
 pub fn apply_scanner_runtime_config(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
+    validate_scanner_runtime_config(config)?;
     let resolved = lookup_scanner_runtime_config(Some(config))?;
     apply_resolved_runtime_config(resolved);
     Ok(())
@@ -616,7 +683,7 @@ pub(crate) fn scanner_alert_excess_folders() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScannerRuntimeConfigSource, lookup_scanner_runtime_config};
+    use super::{ScannerRuntimeConfigSource, lookup_scanner_runtime_config, validate_scanner_runtime_config};
     use rustfs_config::{
         DEFAULT_DELIMITER, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_OBJECTS,
         ENV_SCANNER_SPEED, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
@@ -638,6 +705,21 @@ mod tests {
         config
             .0
             .insert(SCANNER_SUB_SYS.to_string(), HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]));
+        config.set_defaults();
+        config
+    }
+
+    fn server_config_with_scanner_target(target: &str, entries: &[(&str, &str)]) -> ServerConfig {
+        let mut config = server_config_with_scanner(&[]);
+        let mut kvs = KVS::new();
+        for (key, value) in entries {
+            kvs.insert((*key).to_string(), (*value).to_string());
+        }
+        config
+            .0
+            .entry(SCANNER_SUB_SYS.to_string())
+            .or_default()
+            .insert(target.to_string(), kvs);
         config.set_defaults();
         config
     }
@@ -693,6 +775,25 @@ mod tests {
 
         let err = lookup_scanner_runtime_config(Some(&config)).expect_err("invalid scanner speed should fail");
         assert!(err.to_string().contains("speed"));
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_config_validation_rejects_invalid_persisted_speed_with_env_override() {
+        let config = server_config_with_scanner(&[(SCANNER_SPEED, "warp")]);
+
+        with_var(ENV_SCANNER_SPEED, Some("fast"), || {
+            let err = validate_scanner_runtime_config(&config).expect_err("persisted scanner speed should be validated");
+            assert!(err.to_string().contains("speed"));
+        });
+    }
+
+    #[test]
+    fn scanner_runtime_config_validation_rejects_non_default_target() {
+        let config = server_config_with_scanner_target("analytics", &[(SCANNER_SPEED, "slow")]);
+
+        let err = validate_scanner_runtime_config(&config).expect_err("scanner targets should be rejected");
+        assert!(err.to_string().contains("target"));
     }
 
     #[test]

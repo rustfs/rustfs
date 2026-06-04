@@ -754,10 +754,12 @@ mod tests {
     #[serial]
     fn test_initial_scanner_delay_uses_cycle_without_explicit_start_delay() {
         with_var(ENV_SCANNER_CYCLE, Some("120"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             let delay = initial_scanner_delay_for(None);
             assert!(delay >= Duration::from_secs(108));
             assert!(delay <= Duration::from_secs(132));
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
