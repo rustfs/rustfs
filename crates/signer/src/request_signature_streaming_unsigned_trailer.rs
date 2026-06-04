@@ -13,16 +13,16 @@
 // limitations under the License.
 
 use http::{HeaderValue, request};
-use time::{OffsetDateTime, macros::format_description};
+use time::OffsetDateTime;
 
 use super::request_signature_v4::SignV4Error;
 use s3s::Body;
 
-pub fn streaming_unsigned_v4(
+pub(crate) fn streaming_unsigned_v4(
     mut req: request::Request<Body>,
     session_token: &str,
     _data_len: i64,
-    req_time: OffsetDateTime,
+    _req_time: OffsetDateTime,
 ) -> Result<request::Request<Body>, Box<(request::Request<Body>, SignV4Error)>> {
     let token_value = if session_token.is_empty() {
         None
@@ -41,30 +41,11 @@ pub fn streaming_unsigned_v4(
         }
     };
 
-    let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
-    let date = match req_time.format(&format) {
-        Ok(value) => value,
-        Err(err) => return Err(Box::new((req, SignV4Error::TimeFormat { reason: err.to_string() }))),
-    };
-    let date_value = match HeaderValue::from_str(&date) {
-        Ok(value) => value,
-        Err(err) => {
-            return Err(Box::new((
-                req,
-                SignV4Error::HeaderValueParse {
-                    name: "X-Amz-Date".to_string(),
-                    reason: err.to_string(),
-                },
-            )));
-        }
-    };
-
     let headers = req.headers_mut();
     headers.insert(http::header::TRANSFER_ENCODING, HeaderValue::from_static("aws-chunked"));
     if let Some(token_value) = token_value {
         headers.insert("X-Amz-Security-Token", token_value);
     }
-    headers.insert("X-Amz-Date", date_value);
     //req.content_length = 100；
 
     Ok(req)

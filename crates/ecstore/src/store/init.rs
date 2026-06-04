@@ -291,9 +291,12 @@ impl ECStore {
         set_object_layer(ec.clone()).await;
 
         // Sync migrated fields from globals
-        *ec.is_erasure.write().await = is_erasure().await;
-        *ec.is_dist_erasure.write().await = is_dist_erasure().await;
-        *ec.is_erasure_sd.write().await = is_erasure_sd().await;
+        let is_erasure = is_erasure().await;
+        let is_dist_erasure = is_dist_erasure().await;
+        let is_erasure_sd = is_erasure_sd().await;
+        *ec.is_erasure.write().await = is_erasure;
+        *ec.is_dist_erasure.write().await = is_dist_erasure;
+        *ec.is_erasure_sd.write().await = is_erasure_sd;
         if let Some(monitor) = get_global_bucket_monitor() {
             let _ = ec.bucket_monitor.set(monitor);
         }
