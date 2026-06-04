@@ -18,8 +18,8 @@ use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
-    ADMIN_PREFIX, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, VERSION, active_http_requests, collect_dependency_readiness_report,
+    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
+    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report,
     has_path_prefix, is_admin_path,
 };
 use crate::storage::apply_cors_headers;
@@ -1143,6 +1143,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::{FAVICON_PATH, LICENSE, VERSION};
     use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::BodyExt;
