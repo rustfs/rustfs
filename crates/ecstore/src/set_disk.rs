@@ -1204,12 +1204,46 @@ impl ObjectIO for SetDisks {
 
             fi.is_latest = true;
 
+            if issue3031_diag_enabled() {
+                let online_success_count = online_disks.iter().filter(|disk| disk.is_some()).count();
+                warn!(
+                    target: "rustfs_ecstore::set_disk",
+                    bucket = %bucket,
+                    object = %object,
+                    tmp_dir = %tmp_dir,
+                    data_dir = ?fi.data_dir,
+                    write_quorum,
+                    online_success_count,
+                    op_old_dir = ?op_old_dir,
+                    "issue3031_put_object_commit_succeeded"
+                );
+            }
+
             Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
         }
         .await;
 
+        if issue3031_diag_enabled() {
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                bucket = %bucket,
+                object = %object,
+                tmp_dir = %tmp_dir,
+                result = ?result.as_ref().map(|_| ()).map_err(|err| err.to_string()),
+                "issue3031_put_object_tmp_cleanup_start"
+            );
+        }
+
         if let Err(err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
             warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+        } else if issue3031_diag_enabled() {
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                bucket = %bucket,
+                object = %object,
+                tmp_dir = %tmp_dir,
+                "issue3031_put_object_tmp_cleanup_done"
+            );
         }
 
         result
