@@ -350,7 +350,7 @@ impl Clone for Erasure {
             legacy_encoder: self.legacy_encoder.clone(),
             block_size: self.block_size,
             uses_legacy: self.uses_legacy,
-            _id: Uuid::new_v4(), // Generate new ID for clone
+            _id: self._id, // Reuse ID — field is unused in hot path
         }
     }
 }
@@ -438,6 +438,60 @@ impl Erasure {
         }
 
         // Zero-copy split, all shards reference data_buffer
+        let mut data_buffer = data_buffer.freeze();
+        let mut shards = Vec::with_capacity(self.total_shard_count());
+        for _ in 0..self.total_shard_count() {
+            let shard = data_buffer.split_to(per_shard_size);
+            shards.push(shard);
+        }
+
+        Ok(shards)
+    }
+
+    /// Encode owned data, avoiding a copy when the caller already has a heap buffer.
+    /// Falls back to the borrowing path if zero-copy conversion fails.
+    pub fn encode_data_owned(&self, data: Vec<u8>) -> io::Result<Vec<Bytes>> {
+        let shard_size_fn = if self.uses_legacy {
+            calc_shard_size_legacy
+        } else {
+            calc_shard_size
+        };
+        let per_shard_size = shard_size_fn(data.len(), self.data_shards);
+        let need_total_size = per_shard_size * self.total_shard_count();
+
+        // Try zero-copy: Vec<u8> -> Bytes -> BytesMut (succeeds when refcount == 1)
+        let mut data_buffer = match Bytes::from(data).try_into_mut() {
+            Ok(mut bm) => {
+                bm.resize(need_total_size, 0u8);
+                bm
+            }
+            Err(b) => {
+                // Rare path: refcount != 1, fall back to copy
+                let mut bm = BytesMut::with_capacity(need_total_size);
+                bm.extend_from_slice(&b);
+                bm.resize(need_total_size, 0u8);
+                bm
+            }
+        };
+
+        {
+            let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(per_shard_size).collect();
+
+            if self.parity_shards > 0 {
+                if self.uses_legacy {
+                    if let Some(encoder) = self.legacy_encoder.as_ref() {
+                        encoder.encode(data_slices)?;
+                    } else {
+                        warn!("parity_shards > 0, uses_legacy but legacy_encoder is None");
+                    }
+                } else if let Some(encoder) = self.encoder.as_ref() {
+                    encoder.encode(data_slices)?;
+                } else {
+                    warn!("parity_shards > 0, but encoder is None");
+                }
+            }
+        }
+
         let mut data_buffer = data_buffer.freeze();
         let mut shards = Vec::with_capacity(self.total_shard_count());
         for _ in 0..self.total_shard_count() {
