@@ -18,7 +18,7 @@ use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
-    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
+    ADMIN_PREFIX, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, VERSION, active_http_requests, collect_dependency_readiness_report,
     has_path_prefix, is_admin_path,
 };
@@ -343,7 +343,7 @@ fn is_empty_body_s3_path(method: &Method, uri: &http::Uri) -> bool {
 }
 
 fn is_empty_body_console_path(method: &Method, uri: &http::Uri) -> bool {
-    *method == Method::GET && uri.path().strip_prefix(CONSOLE_PREFIX) == Some(VERSION)
+    matches!(*method, Method::GET | Method::HEAD) && is_console_path(uri.path())
 }
 
 #[derive(Clone)]
@@ -1471,7 +1471,6 @@ mod tests {
             "/rustfs/adminx/object",
             "/minio/adminx/object",
             "/rustfs/rpc/read_file_stream",
-            "/rustfs/console/index.html",
             "/health",
             "/profile/cpu",
         ];
@@ -1529,19 +1528,58 @@ mod tests {
     }
 
     #[test]
-    fn console_version_get_without_content_length_is_normalized() {
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(format!("{CONSOLE_PREFIX}{VERSION}"))
-            .body(())
-            .expect("request");
+    fn console_empty_body_get_without_content_length_is_normalized() {
+        let paths = [
+            FAVICON_PATH.to_string(),
+            format!("{CONSOLE_PREFIX}{LICENSE}"),
+            format!("{CONSOLE_PREFIX}{VERSION}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_COMPAT_LIVE_PATH}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+            format!("{CONSOLE_PREFIX}/index.html"),
+            format!("{CONSOLE_PREFIX}/assets/app.js"),
+        ];
 
-        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path.as_str())
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
+    fn console_empty_body_head_without_content_length_is_normalized() {
+        let paths = [
+            format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_COMPAT_LIVE_PATH}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+            format!("{CONSOLE_PREFIX}/index.html"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::HEAD)
+                .uri(path.as_str())
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
     }
 
     #[tokio::test]
     async fn empty_body_layer_inserts_zero_content_length_for_s3_and_console_get() {
-        for path in ["/?x-id=ListBuckets".to_string(), format!("{CONSOLE_PREFIX}{VERSION}")] {
+        for path in ["/?x-id=ListBuckets".to_string(), format!("{CONSOLE_PREFIX}/index.html")] {
             let capture = HeaderCaptureService::default();
             let headers = capture.headers();
             let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
@@ -1765,6 +1803,29 @@ mod tests {
             .method(Method::GET)
             .uri("/?x-id=ListBuckets")
             .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn console_get_with_transfer_encoding_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("{CONSOLE_PREFIX}/index.html"))
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn console_post_without_content_length_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{CONSOLE_PREFIX}/upload"))
             .body(())
             .expect("request");
 
