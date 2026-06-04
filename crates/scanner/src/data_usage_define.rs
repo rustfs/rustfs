@@ -227,6 +227,8 @@ pub struct DataUsageCacheInfo {
     pub replication: Option<Arc<ReplicationConfig>>,
     #[serde(default)]
     pub failed_objects: HashMap<String, u64>,
+    #[serde(default)]
+    pub scan_resume_after: Option<String>,
 }
 
 /// Data usage cache
@@ -1020,6 +1022,61 @@ mod tests {
 
         let decoded: DataUsageEntry = serde_json::from_value(value).expect("Failed to deserialize entry");
         assert_eq!(decoded.failed_objects, 0);
+    }
+
+    #[test]
+    fn test_data_usage_cache_info_deserialize_defaults_scan_resume_after() {
+        let value = serde_json::json!({
+            "name": "bucket",
+            "next_cycle": 7,
+            "last_update": null,
+            "skip_healing": false,
+            "lifecycle": null,
+            "replication": null,
+            "failed_objects": {}
+        });
+
+        let decoded: DataUsageCacheInfo = serde_json::from_value(value).expect("Failed to deserialize cache info");
+
+        assert_eq!(decoded.name, "bucket");
+        assert_eq!(decoded.next_cycle, 7);
+        assert!(decoded.scan_resume_after.is_none());
+    }
+
+    #[test]
+    fn test_data_usage_cache_info_unmarshal_old_msgpack_defaults_scan_resume_after() {
+        #[derive(Serialize)]
+        struct OldDataUsageCacheInfo {
+            name: String,
+            next_cycle: u64,
+            last_update: Option<SystemTime>,
+            skip_healing: bool,
+            lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
+            replication: Option<Arc<ReplicationConfig>>,
+            failed_objects: HashMap<String, u64>,
+        }
+
+        let old_info = OldDataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            last_update: None,
+            skip_healing: true,
+            lifecycle: None,
+            replication: None,
+            failed_objects: HashMap::from([("bad-object".to_string(), 11)]),
+        };
+        let mut buf = Vec::new();
+        old_info
+            .serialize(&mut rmp_serde::Serializer::new(&mut buf))
+            .expect("Failed to serialize old cache info");
+
+        let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&buf).expect("Failed to deserialize old cache info");
+
+        assert_eq!(decoded.name, "bucket");
+        assert_eq!(decoded.next_cycle, 7);
+        assert!(decoded.skip_healing);
+        assert_eq!(decoded.failed_objects.get("bad-object"), Some(&11));
+        assert!(decoded.scan_resume_after.is_none());
     }
 
     #[test]

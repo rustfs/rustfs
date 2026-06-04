@@ -142,6 +142,46 @@ fn should_yield_after_object(object_count: u64, yield_every: u64) -> bool {
     yield_every > 0 && object_count.is_multiple_of(yield_every)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderResumeMatch {
+    Exact,
+    Descendant,
+}
+
+fn folder_resume_match(folder_name: &str, resume_after: &str) -> Option<FolderResumeMatch> {
+    if resume_after == folder_name {
+        return Some(FolderResumeMatch::Exact);
+    }
+    resume_after
+        .strip_prefix(folder_name)
+        .filter(|suffix| suffix.starts_with(SLASH_SEPARATOR))
+        .map(|_| FolderResumeMatch::Descendant)
+}
+
+fn order_folders_for_resume(folders: &mut [CachedFolder], resume_after: Option<&str>) {
+    folders.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let Some(resume_after) = resume_after.filter(|resume_after| !resume_after.is_empty()) else {
+        return;
+    };
+
+    let Some((resume_index, resume_match)) = folders
+        .iter()
+        .enumerate()
+        .find_map(|(index, folder)| folder_resume_match(&folder.name, resume_after).map(|resume_match| (index, resume_match)))
+    else {
+        return;
+    };
+
+    let rotate_by = match resume_match {
+        FolderResumeMatch::Exact => resume_index + 1,
+        FolderResumeMatch::Descendant => resume_index,
+    };
+    if rotate_by < folders.len() {
+        folders.rotate_left(rotate_by);
+    }
+}
+
 fn should_alert_excessive_versions(remaining_versions: usize, cumulative_size: i64) -> (bool, bool) {
     let too_many_versions = remaining_versions as u64 >= scanner_excess_versions_threshold();
     let too_large_versions = cumulative_size > 0 && cumulative_size as u64 >= scanner_excess_version_size_threshold();
@@ -781,6 +821,11 @@ impl FolderScanner {
         }
     }
 
+    fn record_scan_resume_hint(&mut self, folder: &str) {
+        self.new_cache.info.scan_resume_after = Some(folder.to_string());
+        self.update_cache.info.scan_resume_after = Some(folder.to_string());
+    }
+
     fn alert_excessive_folders(&self, folder: &str, total_folders: usize) {
         let threshold = scanner_excess_folders_threshold();
         if total_folders as u64 <= threshold {
@@ -1155,6 +1200,10 @@ impl FolderScanner {
                 }
             }
 
+            let scan_resume_after = self.old_cache.info.scan_resume_after.as_deref();
+            order_folders_for_resume(&mut new_folders, scan_resume_after);
+            order_folders_for_resume(&mut existing_folders, scan_resume_after);
+
             // Scan new folders
             for folder_item in new_folders {
                 if ctx.is_cancelled() {
@@ -1195,6 +1244,7 @@ impl FolderScanner {
                     // In compacted mode child totals are accumulated directly into the parent entry.
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
                     fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                    self.record_scan_resume_hint(&folder_item.name);
                     tokio::task::yield_now().await;
                 } else {
                     let mut dst = DataUsageEntry::default();
@@ -1212,6 +1262,7 @@ impl FolderScanner {
 
                     let h = DataUsageHash(folder_item.name.clone());
                     into.add_child(&h);
+                    self.record_scan_resume_hint(&folder_item.name);
                     // We scanned a folder, optionally send update.
                     self.update_cache.delete_recursive(&h);
                     self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
@@ -1239,6 +1290,7 @@ impl FolderScanner {
                         // Transfer and add as child...
                         self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
                         into.add_child(&h);
+                        self.record_scan_resume_hint(&folder_item.name);
                         continue;
                     }
 
@@ -1251,6 +1303,7 @@ impl FolderScanner {
                     // In compacted mode child totals are accumulated directly into the parent entry.
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
                     fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                    self.record_scan_resume_hint(&folder_item.name);
                     tokio::task::yield_now().await;
                 } else {
                     let mut dst = DataUsageEntry::default();
@@ -1268,6 +1321,7 @@ impl FolderScanner {
 
                     let h = DataUsageHash(folder_item.name.clone());
                     into.add_child(&h);
+                    self.record_scan_resume_hint(&folder_item.name);
                     // We scanned a folder, optionally send update.
                     self.update_cache.delete_recursive(&h);
                     self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
@@ -1674,6 +1728,7 @@ pub async fn scan_data_folder(
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
+            new_cache.info.scan_resume_after = None;
 
             close_disk().await;
             Ok(new_cache.clone())
@@ -1899,6 +1954,72 @@ mod tests {
         assert!(!should_yield_after_object(127, 128));
         assert!(should_yield_after_object(128, 128));
         assert!(!should_yield_after_object(128, 0));
+    }
+
+    #[test]
+    fn test_order_folders_for_resume_rotates_after_exact_resume_hint() {
+        let mut folders = vec![
+            CachedFolder {
+                name: "bucket/child-c".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            CachedFolder {
+                name: "bucket/child-a".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            CachedFolder {
+                name: "bucket/child-b".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+        ];
+
+        order_folders_for_resume(&mut folders, Some("bucket/child-b"));
+
+        let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "bucket/child-c".to_string(),
+                "bucket/child-a".to_string(),
+                "bucket/child-b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_order_folders_for_resume_prioritizes_descendant_resume_hint() {
+        let mut folders = vec![
+            CachedFolder {
+                name: "bucket/child-c".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            CachedFolder {
+                name: "bucket/child-a".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            CachedFolder {
+                name: "bucket/child-b".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+        ];
+
+        order_folders_for_resume(&mut folders, Some("bucket/child-b/grandchild"));
+
+        let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "bucket/child-b".to_string(),
+                "bucket/child-c".to_string(),
+                "bucket/child-a".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2281,6 +2402,76 @@ mod tests {
         assert_eq!(partial_cache.info.next_cycle, 7);
         assert!(partial_cache.root().is_some(), "partial cache should keep completed scan progress");
         assert!(budget.budget_elapsed());
+        assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_data_folder_resume_hint_prioritizes_next_existing_folder() {
+        let (scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir.clone()),
+        };
+
+        let bucket_dir = temp_dir.join("bucket");
+        for child in ["child-a", "child-b", "child-c"] {
+            tokio::fs::create_dir_all(bucket_dir.join(child))
+                .await
+                .expect("failed to create child directory");
+        }
+
+        let root_hash = hash_path("bucket");
+        let mut cache = DataUsageCache {
+            info: crate::data_usage_define::DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 9,
+                scan_resume_after: Some("bucket/child-a".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+        for child in ["child-a", "child-b", "child-c"] {
+            cache.replace_hashed(
+                &hash_path(&format!("bucket/{child}")),
+                &Some(root_hash.clone()),
+                &DataUsageEntry::default(),
+            );
+        }
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(
+            &parent,
+            crate::scanner_budget::ScannerCycleBudgetConfig {
+                max_directories: Some(2),
+                ..Default::default()
+            },
+        );
+
+        let result = scan_data_folder(
+            budget.token(),
+            budget.clone(),
+            vec![scanner.local_disk.clone()],
+            scanner.local_disk.clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await;
+
+        let partial_cache = match result {
+            Err(ScannerError::PartialCache(partial_cache)) => partial_cache,
+            other => panic!("expected partial cache after directory budget cancellation, got {other:?}"),
+        };
+
+        assert_eq!(partial_cache.info.scan_resume_after.as_deref(), Some("bucket/child-b"));
+        assert!(
+            partial_cache
+                .root()
+                .is_some_and(|root| root.children.contains(&hash_path("bucket/child-b").key()))
+        );
+        assert_eq!(partial_cache.info.next_cycle, 9);
         assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
     }
 
