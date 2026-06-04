@@ -256,9 +256,9 @@ impl ECStore {
             event_notifier: GLOBAL_EventNotifier.clone(),
             bucket_monitor: OnceLock::new(),
 
-            // Phase 2: Config globals — initialized with defaults, synced after init
-            server_config: RwLock::new(None),
-            storage_class: RwLock::new(storageclass::Config::default()),
+            // Phase 2: Config globals — initialized with defaults
+            server_config: std::sync::RwLock::new(None),
+            storage_class: std::sync::RwLock::new(storageclass::Config::default()),
         });
 
         // Only set it when the global deployment ID is not yet configured
@@ -381,13 +381,8 @@ impl ECStore {
             info!("TierConfigMgr init error: {}", err);
         }
 
-        // Phase 2: Sync config globals into ECStore fields
-        if let Some(cfg) = crate::config::get_global_server_config() {
-            *self.server_config.write().await = Some(cfg);
-        }
-        if let Some(sc) = crate::config::get_global_storage_class() {
-            *self.storage_class.write().await = sc;
-        }
+        // Phase 2: Config fields are synced via accessor methods that delegate to globals.
+        // No explicit sync needed here.
 
         Ok(())
     }

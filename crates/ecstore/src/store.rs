@@ -194,11 +194,11 @@ pub struct ECStore {
     /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
     pub(crate) bucket_monitor: OnceLock<Arc<Monitor>>,
 
-    // Phase 2: Config globals
+    // Phase 2: Config globals (using std::sync::RwLock for sync access)
     /// Server configuration (migrated from GLOBAL_SERVER_CONFIG)
-    pub(crate) server_config: RwLock<Option<crate::config::Config>>,
+    pub(crate) server_config: std::sync::RwLock<Option<crate::config::Config>>,
     /// Storage class configuration (migrated from GLOBAL_STORAGE_CLASS)
-    pub(crate) storage_class: RwLock<crate::config::storageclass::Config>,
+    pub(crate) storage_class: std::sync::RwLock<crate::config::storageclass::Config>,
 }
 
 impl std::fmt::Debug for ECStore {
@@ -213,25 +213,33 @@ impl std::fmt::Debug for ECStore {
 }
 
 /// Phase 2: Accessor methods for config globals
+/// These delegate to the process-global statics to avoid state drift.
+/// Once all callers migrate, the globals can be removed.
 impl ECStore {
-    /// Get server configuration
-    pub async fn get_server_config(&self) -> Option<crate::config::Config> {
-        self.server_config.read().await.clone()
+    /// Get server configuration (delegates to global)
+    pub fn get_server_config(&self) -> Option<crate::config::Config> {
+        crate::config::get_global_server_config()
     }
 
-    /// Set server configuration
-    pub async fn set_server_config(&self, cfg: crate::config::Config) {
-        *self.server_config.write().await = Some(cfg);
+    /// Set server configuration (updates both global and local field)
+    pub fn set_server_config(&self, cfg: crate::config::Config) {
+        crate::config::set_global_server_config(cfg.clone());
+        if let Ok(mut guard) = self.server_config.write() {
+            *guard = Some(cfg);
+        }
     }
 
-    /// Get storage class configuration
-    pub async fn get_storage_class(&self) -> crate::config::storageclass::Config {
-        self.storage_class.read().await.clone()
+    /// Get storage class configuration (delegates to global)
+    pub fn get_storage_class(&self) -> Option<crate::config::storageclass::Config> {
+        crate::config::get_global_storage_class()
     }
 
-    /// Set storage class configuration
-    pub async fn set_storage_class(&self, cfg: crate::config::storageclass::Config) {
-        *self.storage_class.write().await = cfg;
+    /// Set storage class configuration (updates both global and local field)
+    pub fn set_storage_class(&self, cfg: crate::config::storageclass::Config) {
+        crate::config::set_global_storage_class(cfg.clone());
+        if let Ok(mut guard) = self.storage_class.write() {
+            *guard = cfg;
+        }
     }
 }
 
