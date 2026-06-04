@@ -46,7 +46,16 @@ pub fn try_get_host_addr(req: &request::Request<Body>) -> Result<String, HostAdd
 }
 
 pub fn get_host_addr(req: &request::Request<Body>) -> String {
-    try_get_host_addr(req).unwrap_or_default()
+    match try_get_host_addr(req) {
+        Ok(host) => host,
+        Err(HostAddrError::MissingUriHost) => req
+            .headers()
+            .get("host")
+            .and_then(|host| host.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+        Err(HostAddrError::InvalidHostHeader) => String::new(),
+    }
 }
 
 pub fn sign_v4_trim_all(input: &str) -> String {
@@ -95,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn get_host_addr_returns_empty_for_relative_uri() {
+    fn get_host_addr_uses_host_header_for_relative_uri() {
         let mut req = request::Request::builder()
             .method(http::Method::GET)
             .uri("/object")
@@ -104,7 +113,7 @@ mod tests {
         req.headers_mut()
             .insert("host", HeaderValue::from_static("bucket.example.com"));
 
-        assert_eq!(get_host_addr(&req), "");
+        assert_eq!(get_host_addr(&req), "bucket.example.com");
     }
 
     #[test]

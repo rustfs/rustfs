@@ -25,7 +25,7 @@ pub fn streaming_unsigned_v4(
 ) -> request::Request<Body> {
     let headers = req.headers_mut();
 
-    let chunked_value = HeaderValue::from_str("aws-chunked").expect("aws-chunked is a valid header value");
+    let chunked_value = HeaderValue::from_static("aws-chunked");
     headers.insert(http::header::TRANSFER_ENCODING, chunked_value);
     if !session_token.is_empty() {
         headers.insert(
