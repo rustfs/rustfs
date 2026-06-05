@@ -30,19 +30,7 @@ use std::collections::BTreeMap;
 const JSON_CONTENT_TYPE: &str = "application/json";
 const WAREHOUSE_PROPERTY: &str = "warehouse";
 const UNSUPPORTED_OPERATION_TYPE: &str = "UnsupportedOperationException";
-const CONFIG_ENDPOINTS: &[&str] = &[
-    "GET /config",
-    "GET /{prefix}/namespaces",
-    "POST /{prefix}/namespaces",
-    "GET /{prefix}/namespaces/{namespace}",
-    "DELETE /{prefix}/namespaces/{namespace}",
-    "GET /{prefix}/namespaces/{namespace}/tables",
-    "POST /{prefix}/namespaces/{namespace}/tables",
-    "POST /{prefix}/namespaces/{namespace}/register",
-    "GET /{prefix}/namespaces/{namespace}/tables/{table}",
-    "POST /{prefix}/namespaces/{namespace}/tables/{table}",
-    "DELETE /{prefix}/namespaces/{namespace}/tables/{table}",
-];
+const UNSUPPORTED_OPERATION_STATUS: StatusCode = StatusCode::NOT_ACCEPTABLE;
 
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static LIST_NAMESPACES_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
@@ -170,7 +158,7 @@ fn catalog_config_response() -> CatalogConfigResponse {
     CatalogConfigResponse {
         defaults: BTreeMap::from([(WAREHOUSE_PROPERTY, DEFAULT_WAREHOUSE_ID)]),
         overrides: BTreeMap::new(),
-        endpoints: CONFIG_ENDPOINTS.to_vec(),
+        endpoints: Vec::new(),
     }
 }
 
@@ -202,12 +190,12 @@ async fn authorize_table_catalog_request(req: &S3Request<Body>, action: AdminAct
 
 fn unsupported_response(operation: &str) -> S3Result<S3Response<(StatusCode, Body)>> {
     build_json_response(
-        StatusCode::NOT_IMPLEMENTED,
+        UNSUPPORTED_OPERATION_STATUS,
         &ErrorResponse {
             error: RestCatalogError {
                 message: format!("Iceberg REST Catalog {operation} is not implemented yet"),
                 error_type: UNSUPPORTED_OPERATION_TYPE,
-                code: StatusCode::NOT_IMPLEMENTED.as_u16(),
+                code: UNSUPPORTED_OPERATION_STATUS.as_u16(),
             },
         },
     )
@@ -241,12 +229,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_config_response_uses_default_warehouse_and_mvp_endpoints() {
+    fn catalog_config_response_uses_default_warehouse_without_unsupported_endpoints() {
         let response = catalog_config_response();
 
         assert_eq!(response.defaults.get(WAREHOUSE_PROPERTY), Some(&DEFAULT_WAREHOUSE_ID));
         assert!(response.overrides.is_empty());
-        assert_eq!(response.endpoints, CONFIG_ENDPOINTS);
+        assert!(response.endpoints.is_empty());
+    }
+
+    #[test]
+    fn unsupported_response_uses_rest_catalog_unsupported_status() {
+        let response = unsupported_response("create table").expect("unsupported response should build");
+
+        assert_eq!(response.output.0, UNSUPPORTED_OPERATION_STATUS);
     }
 
     #[test]
