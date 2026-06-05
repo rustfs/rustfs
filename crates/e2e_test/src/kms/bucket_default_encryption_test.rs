@@ -544,6 +544,7 @@ async fn test_sse_kms_without_key_id_populates_default() -> Result<(), Box<dyn s
                 .apply_server_side_encryption_by_default(
                     ServerSideEncryptionByDefault::builder()
                         .sse_algorithm(ServerSideEncryption::AwsKms)
+                        .kms_master_key_id("")
                         .build()
                         .unwrap(),
                 )
