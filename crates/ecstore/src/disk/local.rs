@@ -1451,12 +1451,9 @@ impl LocalDisk {
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
-                // if opts.limit > 0
-                //     && let Ok(meta) = FileMeta::load(&metadata)
-                //     && !meta.all_hidden(true)
-                // {
-                *objs_returned += 1;
-                // }
+                if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
+                    *objs_returned += 1;
+                }
 
                 out.write_obj(&MetaCacheEntry {
                     name: name.clone(),
@@ -1559,15 +1556,19 @@ impl LocalDisk {
 
                     out.write_obj(&meta).await?;
 
-                    // if let Ok(meta) = FileMeta::load(&meta.metadata)
-                    //     && !meta.all_hidden(true)
-                    // {
-                    *objs_returned += 1;
-                    // }
+                    let file_meta = if opts.limit > 0 || opts.recursive {
+                        FileMeta::load(&res).ok()
+                    } else {
+                        None
+                    };
+
+                    if opts.limit <= 0 || file_meta.as_ref().is_none_or(|meta| !meta.all_hidden(true)) {
+                        *objs_returned += 1;
+                    }
 
                     if opts.recursive {
                         let mut dir_to_skip = HashSet::new();
-                        if let Ok(file_meta) = FileMeta::load(&res)
+                        if let Some(file_meta) = file_meta.as_ref()
                             && let Ok(data_dirs) = file_meta.get_data_dirs()
                         {
                             for data_dir in data_dirs.iter().flatten() {
@@ -1634,6 +1635,10 @@ impl Drop for ScanGuard {
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {
     path.as_ref().components().count() == 1 && path.as_ref().has_root()
+}
+
+fn metadata_counts_toward_limit(metadata: &[u8]) -> bool {
+    FileMeta::load(metadata).map_or(true, |meta| !meta.all_hidden(true))
 }
 
 // Filter std::io::ErrorKind::NotFound
@@ -3639,6 +3644,90 @@ mod test {
             "forward_to must not skip a child directory whose name repeats the base prefix"
         );
         assert_eq!(double_count as usize, double_names.len());
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_hidden_delete_markers_do_not_exhaust_limit() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn delete_marker_metadata(version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version(FileInfo {
+                deleted: true,
+                version_id: Some(Uuid::parse_str(version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("delete marker metadata should encode")
+        }
+
+        fn object_metadata(version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new("visible", 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("object metadata should encode")
+        }
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        for (name, version_id) in [
+            ("shard/aaa-trash-0000", "11111111-1111-1111-1111-111111111111"),
+            ("shard/aaa-trash-0001", "22222222-2222-2222-2222-222222222222"),
+            ("shard/aaa-trash-0002", "33333333-3333-3333-3333-333333333333"),
+        ] {
+            let object_dir = bucket_dir.join(name);
+            fs::create_dir_all(&object_dir).await.unwrap();
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), delete_marker_metadata(version_id))
+                .await
+                .unwrap();
+        }
+
+        let visible_dir = bucket_dir.join("shard/bbb-visible-0000");
+        fs::create_dir_all(&visible_dir).await.unwrap();
+        fs::write(
+            visible_dir.join(STORAGE_FORMAT_FILE),
+            object_metadata("44444444-4444-4444-4444-444444444444"),
+        )
+        .await
+        .unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: true,
+            limit: 1,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+        drop(out);
+        drop(writer);
+
+        let mut reader = MetacacheReader::new(reader);
+        let has_visible_object = reader
+            .read_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|entry| !entry.metadata.is_empty() && entry.name == "shard/bbb-visible-0000");
+
+        assert!(has_visible_object);
+        assert_eq!(objs_returned, 1);
     }
 
     #[tokio::test]
