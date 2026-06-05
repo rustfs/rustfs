@@ -2458,6 +2458,7 @@ mod tests {
     fn is_admin_path_accepts_rustfs_and_compat_prefixes() {
         assert!(is_admin_path("/rustfs/admin/v3/info"));
         assert!(is_admin_path("/minio/admin/v3/info"));
+        assert!(is_admin_path(&format!("{}/config", crate::server::TABLE_CATALOG_PREFIX)));
         assert!(!is_admin_path("/bucket/object"));
         assert!(!is_admin_path("/rustfs/administrator/object"));
         assert!(!is_admin_path("/minio/administrator/object"));

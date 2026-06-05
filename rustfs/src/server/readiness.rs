@@ -140,6 +140,7 @@ fn is_probe_path(path: &str) -> bool {
 
     let is_prefix_probe = has_path_prefix(path, crate::server::RUSTFS_ADMIN_PREFIX)
         || has_path_prefix(path, crate::server::MINIO_ADMIN_V3_PREFIX)
+        || has_path_prefix(path, crate::server::TABLE_CATALOG_PREFIX)
         || has_path_prefix(path, crate::server::CONSOLE_PREFIX)
         || has_path_prefix(path, crate::server::RPC_PREFIX)
         || has_path_prefix(path, crate::server::ADMIN_PREFIX)
@@ -719,6 +720,7 @@ mod tests {
     fn probe_path_checks_admin_boundaries() {
         assert!(is_probe_path("/minio/admin/v3/info"));
         assert!(is_probe_path("/rustfs/admin/v3/info"));
+        assert!(is_probe_path(&format!("{}/config", crate::server::TABLE_CATALOG_PREFIX)));
         assert!(is_probe_path("/rustfs/console/"));
         assert!(!is_probe_path("/minio/adminx/object"));
         assert!(!is_probe_path("/rustfs/adminx/object"));
