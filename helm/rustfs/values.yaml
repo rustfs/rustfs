@@ -143,7 +143,7 @@ config:
       # size: 100 # Default value: 100 MB
       # time: hour # Default value: hour, eg: day,hour,minute,second
       # keep_files: 30 # number of rotated log files to keep
-    ## If obs_log_directory is set, a separate volume for logs will be created and the logs will NOT be sent to stdout
+    ## If obs_log_directory is not empty, a separate volume for logs will be created and the logs will NOT be sent to stdout. If not set, will default to default chart value "/logs"
     obs_log_directory: "/logs"
     ## Supported values include `production`, `development`, `test`, and `staging`;
     ## refer to the RustFS configuration documentation/source for the authoritative list.
