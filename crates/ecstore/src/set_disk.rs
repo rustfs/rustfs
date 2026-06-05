@@ -1636,14 +1636,17 @@ impl ObjectOperations for SetDisks {
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         if !src_info.metadata_only {
+            if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object])
+            {
+                return Err(StorageError::NotImplemented);
+            }
             // Self-copy with a data reader: write tier data back locally (de-tiering).
             // Handles `mc cp --storage-class STANDARD obj obj` on a transitioned object.
-            if path_join_buf(&[src_bucket, src_object]) == path_join_buf(&[dst_bucket, dst_object])
-                && let Some(mut put_reader) = src_info.put_object_reader.take()
-            {
+            if let Some(mut put_reader) = src_info.put_object_reader.take() {
                 return self.put_object(dst_bucket, dst_object, &mut put_reader, dst_opts).await;
             }
-            return Err(StorageError::NotImplemented);
+            // Same-key tiered copy without a pre-fetched reader: fall through to the metadata
+            // path so the caller gets a disk/quorum error rather than NotImplemented.
         }
 
         if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object]) {
