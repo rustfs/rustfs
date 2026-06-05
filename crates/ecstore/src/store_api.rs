@@ -17,7 +17,7 @@ use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
 use crate::disk::DiskStore;
 use crate::error::{Error, Result};
-use crate::rio::{DecompressReader, HashReader, LimitReader};
+use crate::rio::{HashReader, LimitReader};
 use crate::store_utils::clean_metadata;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent,

@@ -64,6 +64,27 @@ pub fn compression_scheme_to_algorithm(scheme: &str) -> std::io::Result<Compress
     CompressionAlgorithm::from_str(scheme)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadCompressionBackend {
+    Legacy,
+    V2,
+}
+
+pub fn compression_scheme_to_read_plan(scheme: &str) -> std::io::Result<(CompressionAlgorithm, ReadCompressionBackend)> {
+    #[cfg(feature = "rio-v2")]
+    if scheme.eq_ignore_ascii_case(MINIO_S2_COMPRESSION_SCHEME) {
+        return Ok((CompressionAlgorithm::default(), ReadCompressionBackend::V2));
+    }
+
+    Ok((CompressionAlgorithm::from_str(scheme)?, ReadCompressionBackend::Legacy))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadEncryptionBackend {
+    Legacy,
+    V2,
+}
+
 pub fn compression_index_storage_bytes(index: &Index) -> Bytes {
     #[cfg(feature = "rio-v2")]
     {
@@ -116,6 +137,140 @@ where
     let _ = encrypted;
 
     CompressReader::new(reader, algorithm)
+}
+
+pub fn decompression_reader<R>(
+    reader: R,
+    algorithm: CompressionAlgorithm,
+    backend: ReadCompressionBackend,
+) -> Box<dyn AsyncRead + Unpin + Send + Sync>
+where
+    R: AsyncRead + Unpin + Send + Sync + 'static,
+{
+    #[cfg(feature = "rio-v2")]
+    {
+        match backend {
+            ReadCompressionBackend::Legacy => Box::new(rustfs_rio::DecompressReader::new(reader, algorithm)),
+            ReadCompressionBackend::V2 => Box::new(rustfs_rio_v2::DecompressReader::new(reader, algorithm)),
+        }
+    }
+
+    #[cfg(not(feature = "rio-v2"))]
+    {
+        let _ = backend;
+        Box::new(rustfs_rio::DecompressReader::new(reader, algorithm))
+    }
+}
+
+pub fn decrypt_reader<R>(
+    reader: R,
+    key: [u8; 32],
+    base_nonce: [u8; 12],
+    backend: ReadEncryptionBackend,
+    sequence_number: u32,
+) -> Box<dyn AsyncRead + Unpin + Send + Sync>
+where
+    R: AsyncRead + Unpin + Send + Sync + 'static,
+{
+    #[cfg(feature = "rio-v2")]
+    {
+        match backend {
+            ReadEncryptionBackend::Legacy => Box::new(rustfs_rio::DecryptReader::new(reader, key, base_nonce)),
+            ReadEncryptionBackend::V2 => {
+                Box::new(rustfs_rio_v2::DecryptReader::new_with_sequence(reader, key, base_nonce, sequence_number))
+            }
+        }
+    }
+
+    #[cfg(not(feature = "rio-v2"))]
+    {
+        let _ = (backend, sequence_number);
+        Box::new(rustfs_rio::DecryptReader::new(reader, key, base_nonce))
+    }
+}
+
+pub fn decrypt_reader_with_object_key<R>(
+    reader: R,
+    object_key: [u8; 32],
+    sequence_number: u32,
+) -> Box<dyn AsyncRead + Unpin + Send + Sync>
+where
+    R: AsyncRead + Unpin + Send + Sync + 'static,
+{
+    #[cfg(feature = "rio-v2")]
+    {
+        Box::new(rustfs_rio_v2::DecryptReader::new_with_object_key_and_sequence(
+            reader,
+            object_key,
+            sequence_number,
+        ))
+    }
+
+    #[cfg(not(feature = "rio-v2"))]
+    {
+        let _ = sequence_number;
+        Box::new(rustfs_rio::DecryptReader::new(reader, object_key, [0u8; 12]))
+    }
+}
+
+pub fn decrypt_multipart_reader<R>(
+    reader: R,
+    key: [u8; 32],
+    base_nonce: [u8; 12],
+    multipart_parts: Vec<usize>,
+    backend: ReadEncryptionBackend,
+    sequence_number: u32,
+) -> Box<dyn AsyncRead + Unpin + Send + Sync>
+where
+    R: AsyncRead + Unpin + Send + Sync + 'static,
+{
+    #[cfg(feature = "rio-v2")]
+    {
+        match backend {
+            ReadEncryptionBackend::Legacy => {
+                Box::new(rustfs_rio::DecryptReader::new_multipart(reader, key, base_nonce, multipart_parts))
+            }
+            ReadEncryptionBackend::V2 => Box::new(rustfs_rio_v2::DecryptReader::new_multipart_with_sequence(
+                reader,
+                key,
+                base_nonce,
+                multipart_parts,
+                sequence_number,
+            )),
+        }
+    }
+
+    #[cfg(not(feature = "rio-v2"))]
+    {
+        let _ = (backend, sequence_number);
+        Box::new(rustfs_rio::DecryptReader::new_multipart(reader, key, base_nonce, multipart_parts))
+    }
+}
+
+pub fn decrypt_multipart_reader_with_object_key<R>(
+    reader: R,
+    object_key: [u8; 32],
+    multipart_parts: Vec<usize>,
+    sequence_number: u32,
+) -> Box<dyn AsyncRead + Unpin + Send + Sync>
+where
+    R: AsyncRead + Unpin + Send + Sync + 'static,
+{
+    #[cfg(feature = "rio-v2")]
+    {
+        Box::new(rustfs_rio_v2::DecryptReader::new_multipart_with_object_key_and_sequence(
+            reader,
+            object_key,
+            multipart_parts,
+            sequence_number,
+        ))
+    }
+
+    #[cfg(not(feature = "rio-v2"))]
+    {
+        let _ = sequence_number;
+        Box::new(rustfs_rio::DecryptReader::new_multipart(reader, object_key, [0u8; 12], multipart_parts))
+    }
 }
 
 #[cfg(feature = "rio-v2")]

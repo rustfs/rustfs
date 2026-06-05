@@ -15,7 +15,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
 
-use crate::rio::{DecryptReader, Index};
+use crate::rio::Index;
 
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
@@ -250,6 +250,7 @@ struct EncryptionMaterial {
     key_bytes: [u8; 32],
     base_nonce: [u8; 12],
     key_kind: EncryptionKeyKind,
+    reader_backend: crate::rio::ReadEncryptionBackend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +267,7 @@ enum ReadTransform {
     },
     Compressed {
         algorithm: CompressionAlgorithm,
+        backend: crate::rio::ReadCompressionBackend,
         decompressed_offset: usize,
         decompressed_length: i64,
         total_plaintext_size: usize,
@@ -279,7 +281,7 @@ enum ReadTransform {
         plaintext_offset: usize,
         plaintext_length: i64,
         total_plaintext_size: usize,
-        compression: Option<CompressionAlgorithm>,
+        compression: Option<(CompressionAlgorithm, crate::rio::ReadCompressionBackend)>,
     },
 }
 
@@ -301,7 +303,7 @@ impl ReadPlan {
         }
 
         let mut is_encrypted = oi.is_encrypted();
-        let (algo, mut is_compressed) = oi.is_compressed_ok()?;
+        let (algo, compression_backend, mut is_compressed) = oi.compression_read_plan()?;
 
         if restore_request_active(opts) {
             is_encrypted = false;
@@ -329,6 +331,7 @@ impl ReadPlan {
                 object_size: decompressed_length,
                 transform: ReadTransform::Compressed {
                     algorithm: algo,
+                    backend: compression_backend,
                     decompressed_offset,
                     decompressed_length,
                     total_plaintext_size,
@@ -338,6 +341,7 @@ impl ReadPlan {
 
         if is_encrypted {
             let material = resolve_encryption_material(oi, h).await?;
+            let encryption_backend = material.reader_backend;
             let is_multipart = is_multipart_encrypted_object(&oi.parts, oi.etag.as_deref());
             let plaintext_size = encrypted_plaintext_size(oi, is_multipart, is_compressed)?;
             let full_plaintext_size =
@@ -355,7 +359,18 @@ impl ReadPlan {
                 let (requested_offset, requested_length) = rs.get_offset_length(plaintext_size)?;
                 #[cfg(feature = "rio-v2")]
                 {
-                    if is_compressed {
+                    if encryption_backend == crate::rio::ReadEncryptionBackend::Legacy {
+                        (
+                            0,
+                            oi.size,
+                            0,
+                            requested_offset,
+                            requested_length,
+                            full_plaintext_size,
+                            0,
+                            multipart_part_numbers(&oi.parts),
+                        )
+                    } else if is_compressed {
                         let (physical_off, decompressed_skip, first_part_idx, decrypt_skip, seq_num) =
                             get_compressed_offsets(oi, requested_offset as i64);
                         (
@@ -429,7 +444,7 @@ impl ReadPlan {
                     plaintext_offset,
                     plaintext_length,
                     total_plaintext_size,
-                    compression: is_compressed.then_some(algo),
+                    compression: is_compressed.then_some((algo, compression_backend)),
                 },
             });
         }
@@ -467,11 +482,12 @@ impl ReadPlan {
             )),
             ReadTransform::Compressed {
                 algorithm,
+                backend,
                 decompressed_offset,
                 decompressed_length,
                 total_plaintext_size,
             } => {
-                let dec_reader = DecompressReader::new(reader, algorithm);
+                let dec_reader = crate::rio::decompression_reader(reader, algorithm, backend);
                 #[cfg(feature = "rio-v2")]
                 let dec_reader = StreamConsumer::new(dec_reader);
                 let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if decompressed_offset > 0
@@ -532,91 +548,78 @@ impl ReadPlan {
                 #[cfg(not(feature = "rio-v2"))]
                 let _ = sequence_number;
                 let decrypted_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_multipart {
-                    #[cfg(feature = "rio-v2")]
-                    {
-                        match material.key_kind {
-                            EncryptionKeyKind::Object => Box::new(DecryptReader::new_multipart_with_object_key_and_sequence(
-                                reader,
-                                material.key_bytes,
-                                part_numbers,
-                                sequence_number,
-                            )),
-                            EncryptionKeyKind::Direct => Box::new(DecryptReader::new_multipart_with_sequence(
-                                reader,
-                                material.key_bytes,
-                                material.base_nonce,
-                                part_numbers,
-                                sequence_number,
-                            )),
-                        }
+                    match material.key_kind {
+                        EncryptionKeyKind::Object => crate::rio::decrypt_multipart_reader_with_object_key(
+                            reader,
+                            material.key_bytes,
+                            part_numbers,
+                            sequence_number,
+                        ),
+                        EncryptionKeyKind::Direct => crate::rio::decrypt_multipart_reader(
+                            reader,
+                            material.key_bytes,
+                            material.base_nonce,
+                            part_numbers,
+                            material.reader_backend,
+                            sequence_number,
+                        ),
                     }
-                    #[cfg(not(feature = "rio-v2"))]
-                    Box::new(DecryptReader::new_multipart(
-                        reader,
-                        material.key_bytes,
-                        material.base_nonce,
-                        part_numbers,
-                    ))
                 } else {
-                    #[cfg(feature = "rio-v2")]
-                    {
-                        match material.key_kind {
-                            EncryptionKeyKind::Object => Box::new(DecryptReader::new_with_object_key_and_sequence(
-                                reader,
-                                material.key_bytes,
-                                sequence_number,
-                            )),
-                            EncryptionKeyKind::Direct => Box::new(DecryptReader::new_with_sequence(
-                                reader,
-                                material.key_bytes,
-                                material.base_nonce,
-                                sequence_number,
-                            )),
+                    match material.key_kind {
+                        EncryptionKeyKind::Object => {
+                            crate::rio::decrypt_reader_with_object_key(reader, material.key_bytes, sequence_number)
                         }
+                        EncryptionKeyKind::Direct => crate::rio::decrypt_reader(
+                            reader,
+                            material.key_bytes,
+                            material.base_nonce,
+                            material.reader_backend,
+                            sequence_number,
+                        ),
                     }
-                    #[cfg(not(feature = "rio-v2"))]
-                    Box::new(DecryptReader::new(reader, material.key_bytes, material.base_nonce))
                 };
-
                 let decrypted_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if decrypt_skip > 0 {
                     Box::new(SkipReader::new(decrypted_reader, decrypt_skip))
                 } else {
                     decrypted_reader
                 };
+                let total_plaintext_size_i64 = i64::try_from(total_plaintext_size)
+                    .map_err(|_| Error::other(format!("invalid plaintext size {total_plaintext_size}")))?;
 
-                let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if let Some(algo) = compression {
-                    let decompressed_reader = DecompressReader::new(decrypted_reader, algo);
-                    #[cfg(feature = "rio-v2")]
-                    let decompressed_reader = StreamConsumer::new(decompressed_reader);
-                    if plaintext_offset > 0 || plaintext_length != total_plaintext_size as i64 {
+                let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> =
+                    if let Some((algo, compression_backend)) = compression {
+                        let decompressed_reader = crate::rio::decompression_reader(decrypted_reader, algo, compression_backend);
                         #[cfg(feature = "rio-v2")]
-                        let ranged_reader = RangedDecompressReader::new_draining(
-                            decompressed_reader,
+                        let decompressed_reader = StreamConsumer::new(decompressed_reader);
+                        if plaintext_offset > 0 || plaintext_length != total_plaintext_size_i64 {
+                            #[cfg(feature = "rio-v2")]
+                            let ranged_reader = RangedDecompressReader::new_draining(
+                                decompressed_reader,
+                                plaintext_offset,
+                                plaintext_length,
+                                total_plaintext_size,
+                            )?;
+                            #[cfg(not(feature = "rio-v2"))]
+                            let ranged_reader = RangedDecompressReader::new(
+                                decompressed_reader,
+                                plaintext_offset,
+                                plaintext_length,
+                                total_plaintext_size,
+                            )?;
+                            Box::new(ranged_reader)
+                        } else {
+                            Box::new(LimitReader::new(decompressed_reader, total_plaintext_size))
+                        }
+                    } else if plaintext_offset > 0 || plaintext_length != total_plaintext_size_i64 {
+                        Box::new(RangedDecompressReader::new(
+                            decrypted_reader,
                             plaintext_offset,
                             plaintext_length,
                             total_plaintext_size,
-                        )?;
-                        #[cfg(not(feature = "rio-v2"))]
-                        let ranged_reader = RangedDecompressReader::new(
-                            decompressed_reader,
-                            plaintext_offset,
-                            plaintext_length,
-                            total_plaintext_size,
-                        )?;
-                        Box::new(ranged_reader)
+                        )?)
                     } else {
-                        Box::new(LimitReader::new(decompressed_reader, total_plaintext_size))
-                    }
-                } else if plaintext_offset > 0 || plaintext_length != total_plaintext_size as i64 {
-                    Box::new(RangedDecompressReader::new(
-                        decrypted_reader,
-                        plaintext_offset,
-                        plaintext_length,
-                        total_plaintext_size,
-                    )?)
-                } else {
-                    Box::new(LimitReader::new(decrypted_reader, total_plaintext_size))
-                };
+                        Box::new(LimitReader::new(decrypted_reader, total_plaintext_size))
+                    };
 
                 let mut object_info = oi.clone();
                 object_info.size = self.object_size;
@@ -1314,6 +1317,7 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
             key_bytes: object_key,
             base_nonce: [0u8; 12],
             key_kind: EncryptionKeyKind::Object,
+            reader_backend: crate::rio::ReadEncryptionBackend::V2,
         });
     }
 
@@ -1321,6 +1325,7 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
         key_bytes,
         base_nonce: generate_ssec_nonce(&oi.bucket, &oi.name),
         key_kind: EncryptionKeyKind::Direct,
+        reader_backend: crate::rio::ReadEncryptionBackend::Legacy,
     })
 }
 
@@ -1360,6 +1365,7 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
             key_bytes: object_key,
             base_nonce: [0u8; 12],
             key_kind: EncryptionKeyKind::Object,
+            reader_backend: crate::rio::ReadEncryptionBackend::V2,
         });
     }
 
@@ -1377,6 +1383,7 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
         key_bytes: decrypted_key,
         base_nonce,
         key_kind: EncryptionKeyKind::Direct,
+        reader_backend: crate::rio::ReadEncryptionBackend::Legacy,
     })
 }
 
@@ -1946,7 +1953,7 @@ mod tests {
             .await
             .expect("compress plaintext into rio_v2 stream");
 
-        let decompress_reader = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
+        let decompress_reader = crate::rio::DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
         let mut ranged_reader =
             RangedDecompressReader::new(decompress_reader, 5, 7, plaintext.len()).expect("create ranged reader");
 
