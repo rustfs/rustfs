@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
-    DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageScanCheckpoint, DataUsageScanCheckpointReason,
-    SizeSummary, hash_path,
+    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageScanCheckpoint,
+    DataUsageScanCheckpointReason, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
 use crate::runtime_config::{
@@ -35,7 +35,9 @@ use rustfs_common::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode,
     send_heal_request_with_admission,
 };
-use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater, global_metrics};
+use rustfs_common::metrics::{
+    IlmAction, Metric, Metrics, ScannerWorkSource, UpdateCurrentPathFn, current_path_updater, global_metrics,
+};
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_expiry_rule};
 use rustfs_ecstore::bucket::lifecycle::evaluator::Evaluator;
@@ -152,6 +154,13 @@ enum FolderResumeMatch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderResumeOrder {
+    NoHint,
+    Used,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FolderScanSource {
     New,
     Existing,
@@ -173,14 +182,14 @@ fn folder_resume_match(folder_name: &str, resume_after: &str) -> Option<FolderRe
         .map(|_| FolderResumeMatch::Descendant)
 }
 
-fn order_items_for_resume<T, F>(items: &mut [T], resume_after: Option<&str>, name: F)
+fn order_items_for_resume<T, F>(items: &mut [T], resume_after: Option<&str>, name: F) -> FolderResumeOrder
 where
     F: Fn(&T) -> &str,
 {
     items.sort_by(|left, right| name(left).cmp(name(right)));
 
     let Some(resume_after) = resume_after.filter(|resume_after| !resume_after.is_empty()) else {
-        return;
+        return FolderResumeOrder::NoHint;
     };
 
     let Some((resume_index, resume_match)) = items
@@ -188,7 +197,7 @@ where
         .enumerate()
         .find_map(|(index, item)| folder_resume_match(name(item), resume_after).map(|resume_match| (index, resume_match)))
     else {
-        return;
+        return FolderResumeOrder::Stale;
     };
 
     let rotate_by = match resume_match {
@@ -198,15 +207,16 @@ where
     if rotate_by < items.len() {
         items.rotate_left(rotate_by);
     }
+    FolderResumeOrder::Used
 }
 
 #[cfg(test)]
-fn order_folders_for_resume(folders: &mut [CachedFolder], resume_after: Option<&str>) {
-    order_items_for_resume(folders, resume_after, |folder| folder.name.as_str());
+fn order_folders_for_resume(folders: &mut [CachedFolder], resume_after: Option<&str>) -> FolderResumeOrder {
+    order_items_for_resume(folders, resume_after, |folder| folder.name.as_str())
 }
 
-fn order_queued_folders_for_resume(folders: &mut [QueuedFolder], resume_after: Option<&str>) {
-    order_items_for_resume(folders, resume_after, |folder| folder.folder.name.as_str());
+fn order_queued_folders_for_resume(folders: &mut [QueuedFolder], resume_after: Option<&str>) -> FolderResumeOrder {
+    order_items_for_resume(folders, resume_after, |folder| folder.folder.name.as_str())
 }
 
 fn checkpoint_reason_from_budget(reason: Option<ScannerCycleBudgetReason>) -> DataUsageScanCheckpointReason {
@@ -228,7 +238,13 @@ fn set_scan_checkpoint(cache: &mut DataUsageCache, reason: DataUsageScanCheckpoi
     });
 
     if let Some(resume_after) = resume_after {
-        cache.info.scan_checkpoint = Some(DataUsageScanCheckpoint::new(resume_after, reason));
+        let checkpoint = DataUsageScanCheckpoint::new(resume_after, reason);
+        global_metrics().record_scanner_checkpoint_set(
+            checkpoint.version,
+            checkpoint.resume_after.clone(),
+            checkpoint.reason.as_str(),
+        );
+        cache.info.scan_checkpoint = Some(checkpoint);
     } else {
         cache.info.scan_checkpoint = None;
     }
@@ -740,6 +756,7 @@ impl ScannerItem {
         ensure_scanner_alert_metrics_registered();
         let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
         if too_many_versions {
+            global_metrics().record_scanner_source_work(ScannerWorkSource::Alerts, 0, 0, 1, 0, 0);
             counter!(
                 METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL,
                 "bucket" => self.bucket.clone()
@@ -754,6 +771,7 @@ impl ScannerItem {
             );
         }
         if too_large_versions {
+            global_metrics().record_scanner_source_work(ScannerWorkSource::Alerts, 0, 0, 1, 0, 0);
             counter!(
                 METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL,
                 "bucket" => self.bucket.clone()
@@ -877,17 +895,23 @@ impl FolderScanner {
         self.new_cache.info.scan_resume_after = Some(folder.to_string());
         self.update_cache.info.scan_resume_after = Some(folder.to_string());
         let checkpoint = DataUsageScanCheckpoint::new(folder.to_string(), DataUsageScanCheckpointReason::Unknown);
+        global_metrics().record_scanner_checkpoint_set(
+            checkpoint.version,
+            checkpoint.resume_after.clone(),
+            checkpoint.reason.as_str(),
+        );
         self.new_cache.info.scan_checkpoint = Some(checkpoint.clone());
         self.update_cache.info.scan_checkpoint = Some(checkpoint);
     }
 
     fn alert_excessive_folders(&self, folder: &str, total_folders: usize) {
         let threshold = scanner_excess_folders_threshold();
-        if total_folders as u64 <= threshold {
+        if u64::try_from(total_folders).unwrap_or(u64::MAX) <= threshold {
             return;
         }
 
         ensure_scanner_alert_metrics_registered();
+        global_metrics().record_scanner_source_work(ScannerWorkSource::Alerts, 0, 0, 1, 0, 0);
         counter!(
             METRIC_SCANNER_EXCESS_FOLDERS_TOTAL,
             "root" => self.root.clone()
@@ -1255,13 +1279,24 @@ impl FolderScanner {
                 }
             }
 
-            let scan_resume_after = self
-                .old_cache
-                .info
-                .scan_checkpoint
-                .as_ref()
-                .map(|checkpoint| checkpoint.resume_after.as_str())
-                .or(self.old_cache.info.scan_resume_after.as_deref());
+            let scan_checkpoint = self.old_cache.info.scan_checkpoint.as_ref();
+            let checkpoint_resume_after = scan_checkpoint.and_then(|checkpoint| {
+                global_metrics().record_scanner_checkpoint_set(
+                    checkpoint.version,
+                    checkpoint.resume_after.clone(),
+                    checkpoint.reason.as_str(),
+                );
+                if checkpoint.version != DATA_USAGE_SCAN_CHECKPOINT_VERSION || checkpoint.resume_after.is_empty() {
+                    global_metrics().record_scanner_checkpoint_ignored();
+                    None
+                } else {
+                    Some(checkpoint.resume_after.as_str())
+                }
+            });
+            let checkpoint_tracks_child_order = checkpoint_resume_after
+                .and_then(|resume_after| folder_resume_match(&folder.name, resume_after))
+                .is_some_and(|resume_match| matches!(resume_match, FolderResumeMatch::Descendant));
+            let scan_resume_after = checkpoint_resume_after.or(self.old_cache.info.scan_resume_after.as_deref());
             let mut queued_folders = Vec::with_capacity(new_folders.len() + existing_folders.len());
             queued_folders.extend(new_folders.into_iter().map(|folder| QueuedFolder {
                 folder,
@@ -1271,7 +1306,15 @@ impl FolderScanner {
                 folder,
                 source: FolderScanSource::Existing,
             }));
-            order_queued_folders_for_resume(&mut queued_folders, scan_resume_after);
+            let has_queued_folders = !queued_folders.is_empty();
+            let resume_order = order_queued_folders_for_resume(&mut queued_folders, scan_resume_after);
+            if checkpoint_tracks_child_order && has_queued_folders {
+                match resume_order {
+                    FolderResumeOrder::Used => global_metrics().record_scanner_checkpoint_used(),
+                    FolderResumeOrder::Stale => global_metrics().record_scanner_checkpoint_stale(),
+                    FolderResumeOrder::NoHint => {}
+                }
+            }
 
             // Scan child folders in the combined resume order.
             for queued_folder in queued_folders {
@@ -1767,8 +1810,12 @@ pub async fn scan_data_folder(
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
+            let had_scan_checkpoint = cache.info.scan_checkpoint.is_some() || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
             new_cache.info.scan_checkpoint = None;
+            if had_scan_checkpoint {
+                global_metrics().record_scanner_checkpoint_cleared();
+            }
 
             close_disk().await;
             Ok(new_cache.clone())
@@ -2037,9 +2084,10 @@ mod tests {
             },
         ];
 
-        order_folders_for_resume(&mut folders, Some("bucket/child-b"));
+        let outcome = order_folders_for_resume(&mut folders, Some("bucket/child-b"));
 
         let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
+        assert_eq!(outcome, FolderResumeOrder::Used);
         assert_eq!(
             names,
             vec![
@@ -2070,9 +2118,10 @@ mod tests {
             },
         ];
 
-        order_folders_for_resume(&mut folders, Some("bucket/child-b/grandchild"));
+        let outcome = order_folders_for_resume(&mut folders, Some("bucket/child-b/grandchild"));
 
         let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
+        assert_eq!(outcome, FolderResumeOrder::Used);
         assert_eq!(
             names,
             vec![
@@ -2081,6 +2130,28 @@ mod tests {
                 "bucket/child-a".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_order_folders_for_resume_reports_stale_hint() {
+        let mut folders = vec![
+            CachedFolder {
+                name: "bucket/child-c".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            CachedFolder {
+                name: "bucket/child-a".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+        ];
+
+        let outcome = order_folders_for_resume(&mut folders, Some("bucket/child-b"));
+
+        let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
+        assert_eq!(outcome, FolderResumeOrder::Stale);
+        assert_eq!(names, vec!["bucket/child-a".to_string(), "bucket/child-c".to_string()]);
     }
 
     #[tokio::test]
