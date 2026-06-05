@@ -240,6 +240,7 @@ service:
   loadBalancerIP: ""           # Request a specific IP from the load balancer (e.g. for Cilium LB-IPAM or MetalLB)
   loadBalancerClass: ""        # Specify a load balancer implementation (e.g. "io.cilium/bgp", "metallb")
   loadBalancerSourceRanges: [] # Restrict client IPs (e.g. ["10.0.0.0/8"])
+  externalIPs: []             # Expose service via specific external IPs (e.g. ["203.0.113.1"])
   endpoint:
     port: 9000
     nodePort: 32000
