@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::*;
-use crate::config::storageclass;
 use crate::error::is_err_decommission_running;
 use crate::global::{
     GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
@@ -255,10 +254,6 @@ impl ECStore {
             tier_config_mgr: GLOBAL_TierConfigMgr.clone(),
             event_notifier: GLOBAL_EventNotifier.clone(),
             bucket_monitor: OnceLock::new(),
-
-            // Phase 2: Config globals — initialized with defaults
-            server_config: std::sync::RwLock::new(None),
-            storage_class: std::sync::RwLock::new(storageclass::Config::default()),
         });
 
         // Only set it when the global deployment ID is not yet configured
@@ -380,9 +375,6 @@ impl ECStore {
         if let Err(err) = GLOBAL_TierConfigMgr.write().await.init(self.clone()).await {
             info!("TierConfigMgr init error: {}", err);
         }
-
-        // Phase 2: Config fields are synced via accessor methods that delegate to globals.
-        // No explicit sync needed here.
 
         Ok(())
     }

@@ -193,12 +193,6 @@ pub struct ECStore {
     pub(crate) event_notifier: Arc<RwLock<EventNotifier>>,
     /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
     pub(crate) bucket_monitor: OnceLock<Arc<Monitor>>,
-
-    // Phase 2: Config globals (using std::sync::RwLock for sync access)
-    /// Server configuration (migrated from GLOBAL_SERVER_CONFIG)
-    pub(crate) server_config: std::sync::RwLock<Option<crate::config::Config>>,
-    /// Storage class configuration (migrated from GLOBAL_STORAGE_CLASS)
-    pub(crate) storage_class: std::sync::RwLock<crate::config::storageclass::Config>,
 }
 
 impl std::fmt::Debug for ECStore {
@@ -213,20 +207,17 @@ impl std::fmt::Debug for ECStore {
 }
 
 /// Phase 2: Accessor methods for config globals
-/// These delegate to the process-global statics to avoid state drift.
-/// Once all callers migrate, the globals can be removed.
+/// These delegate to the process-global statics. No local state — the globals
+/// remain the single source of truth until the migration is complete.
 impl ECStore {
     /// Get server configuration (delegates to global)
     pub fn get_server_config(&self) -> Option<crate::config::Config> {
         crate::config::get_global_server_config()
     }
 
-    /// Set server configuration (updates both global and local field)
+    /// Set server configuration (delegates to global)
     pub fn set_server_config(&self, cfg: crate::config::Config) {
-        crate::config::set_global_server_config(cfg.clone());
-        if let Ok(mut guard) = self.server_config.write() {
-            *guard = Some(cfg);
-        }
+        crate::config::set_global_server_config(cfg);
     }
 
     /// Get storage class configuration (delegates to global)
@@ -234,12 +225,9 @@ impl ECStore {
         crate::config::get_global_storage_class()
     }
 
-    /// Set storage class configuration (updates both global and local field)
+    /// Set storage class configuration (delegates to global)
     pub fn set_storage_class(&self, cfg: crate::config::storageclass::Config) {
-        crate::config::set_global_storage_class(cfg.clone());
-        if let Ok(mut guard) = self.storage_class.write() {
-            *guard = cfg;
-        }
+        crate::config::set_global_storage_class(cfg);
     }
 }
 
