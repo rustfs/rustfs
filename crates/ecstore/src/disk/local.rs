@@ -1562,7 +1562,7 @@ impl LocalDisk {
                         None
                     };
 
-                    if opts.limit <= 0 || file_meta.as_ref().is_none_or(|meta| !meta.all_hidden(true)) {
+                    if opts.limit <= 0 || file_meta.as_ref().is_none_or(file_meta_counts_toward_limit) {
                         *objs_returned += 1;
                     }
 
@@ -1638,7 +1638,15 @@ fn is_root_path(path: impl AsRef<Path>) -> bool {
 }
 
 fn metadata_counts_toward_limit(metadata: &[u8]) -> bool {
-    FileMeta::load(metadata).map_or(true, |meta| !meta.all_hidden(true))
+    FileMeta::load(metadata).map_or(true, |meta| file_meta_counts_toward_limit(&meta))
+}
+
+fn file_meta_counts_toward_limit(meta: &FileMeta) -> bool {
+    meta.list_versions("", "", false).map_or(true, |versions| {
+        versions
+            .first()
+            .is_none_or(|latest| !latest.deleted && !latest.tier_free_version())
+    })
 }
 
 // Filter std::io::ErrorKind::NotFound
@@ -3663,6 +3671,25 @@ mod test {
             fm.marshal_msg().expect("delete marker metadata should encode")
         }
 
+        fn delete_marker_with_old_object_metadata(delete_version_id: &str, object_version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version({
+                let mut fi = FileInfo::new("hidden", 1, 1);
+                fi.version_id = Some(Uuid::parse_str(object_version_id).expect("test version id should parse"));
+                fi.mod_time = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
+                fi
+            })
+            .expect("object metadata should be valid");
+            fm.add_version(FileInfo {
+                deleted: true,
+                version_id: Some(Uuid::parse_str(delete_version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("delete marker metadata should encode")
+        }
+
         fn object_metadata(version_id: &str) -> Vec<u8> {
             let mut fm = FileMeta::default();
             let mut fi = FileInfo::new("visible", 1, 1);
@@ -3688,11 +3715,23 @@ mod test {
                 .unwrap();
         }
 
+        let hidden_versioned_dir = bucket_dir.join("shard/aaa-trash-0003");
+        fs::create_dir_all(&hidden_versioned_dir).await.unwrap();
+        fs::write(
+            hidden_versioned_dir.join(STORAGE_FORMAT_FILE),
+            delete_marker_with_old_object_metadata(
+                "44444444-4444-4444-4444-444444444444",
+                "55555555-5555-5555-5555-555555555555",
+            ),
+        )
+        .await
+        .unwrap();
+
         let visible_dir = bucket_dir.join("shard/bbb-visible-0000");
         fs::create_dir_all(&visible_dir).await.unwrap();
         fs::write(
             visible_dir.join(STORAGE_FORMAT_FILE),
-            object_metadata("44444444-4444-4444-4444-444444444444"),
+            object_metadata("66666666-6666-6666-6666-666666666666"),
         )
         .await
         .unwrap();
