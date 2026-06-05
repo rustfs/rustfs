@@ -93,12 +93,12 @@ spec:
               chmod 755 /mnt/rustfs/logs
               {{- end }}
           volumeMounts:
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
+            {{- if gt $drivesPerNode 1 }}
+            {{- range $i := until $drivesPerNode }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else }}
             - name: data
               mountPath: /data
             {{- end }}
@@ -159,12 +159,12 @@ spec:
               mountPath: {{ $logDir }}
               subPath: logs
             {{- end }}
-            {{- if eq (int .Values.replicaCount) 4 }}
-            {{- range $i := until (int .Values.replicaCount) }}
+            {{- if gt $drivesPerNode 1 }}
+            {{- range $i := until $drivesPerNode }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int .Values.replicaCount) 16 }}
+            {{- else }}
             - name: data
               mountPath: /data
             {{- end }}
@@ -213,8 +213,8 @@ spec:
           requests:
             storage: {{ .Values.storageclass.logStorageSize }}
     {{- end }}
-    {{- if eq (int .Values.replicaCount) 4 }}
-    {{- range $i := until (int .Values.replicaCount) }}
+    {{- if gt $drivesPerNode 1 }}
+    {{- range $i := until $drivesPerNode }}
     - apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
@@ -230,7 +230,7 @@ spec:
           requests:
             storage: {{ $.Values.storageclass.dataStorageSize }}
     {{- end }}
-    {{- else if eq (int .Values.replicaCount) 16 }}
+    {{- else }}
     - apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
