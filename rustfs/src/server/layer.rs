@@ -284,6 +284,10 @@ fn should_force_zero_content_length_for_empty_body_route<B>(req: &HttpRequest<B>
         return false;
     }
 
+    if is_empty_body_console_path(req.method(), req.uri()) {
+        return true;
+    }
+
     is_empty_body_s3_path(req.method(), req.uri())
 }
 
@@ -335,7 +339,11 @@ fn is_heal_status_query(path: &str, query: Option<&str>) -> bool {
 }
 
 fn is_empty_body_s3_path(method: &Method, uri: &http::Uri) -> bool {
-    *method == Method::DELETE && ConditionalCorsLayer::is_s3_path(uri.path())
+    matches!(*method, Method::GET | Method::HEAD | Method::DELETE) && ConditionalCorsLayer::is_s3_path(uri.path())
+}
+
+fn is_empty_body_console_path(method: &Method, uri: &http::Uri) -> bool {
+    matches!(*method, Method::GET | Method::HEAD) && is_console_path(uri.path())
 }
 
 #[derive(Clone)]
@@ -1137,6 +1145,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::{FAVICON_PATH, LICENSE, VERSION};
     use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::BodyExt;
@@ -1458,14 +1467,8 @@ mod tests {
     }
 
     #[test]
-    fn non_admin_get_without_content_length_is_not_normalized() {
-        let paths = [
-            "/bucket/object",
-            "/rustfs/administrator/object",
-            "/minio/administrator/object",
-            "/rustfs/adminx/object",
-            "/minio/adminx/object",
-        ];
+    fn non_s3_non_admin_get_without_content_length_is_not_normalized() {
+        let paths = ["/rustfs/rpc/read_file_stream", "/health", "/profile/cpu"];
 
         for path in paths {
             let request = Request::builder().method(Method::GET).uri(path).body(()).expect("request");
@@ -1492,6 +1495,107 @@ mod tests {
 
         let headers = headers.lock().expect("captured headers").take().expect("captured headers");
         assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
+    }
+
+    #[test]
+    fn s3_empty_body_get_without_content_length_is_normalized() {
+        let paths = [
+            "/?x-id=ListBuckets",
+            "/",
+            "/bucket?list-type=2",
+            "/bucket/object.txt",
+            "/rustfs/administrator/object",
+            "/minio/adminx/object",
+        ];
+
+        for path in paths {
+            let request = Request::builder().method(Method::GET).uri(path).body(()).expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_empty_body_head_without_content_length_is_normalized() {
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri("/bucket/object.txt")
+            .body(())
+            .expect("request");
+
+        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn console_empty_body_get_without_content_length_is_normalized() {
+        let paths = [
+            FAVICON_PATH.to_string(),
+            format!("{CONSOLE_PREFIX}{LICENSE}"),
+            format!("{CONSOLE_PREFIX}{VERSION}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_COMPAT_LIVE_PATH}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+            format!("{CONSOLE_PREFIX}/index.html"),
+            format!("{CONSOLE_PREFIX}/assets/app.js"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path.as_str())
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
+    fn console_empty_body_head_without_content_length_is_normalized() {
+        let paths = [
+            format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_COMPAT_LIVE_PATH}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+            format!("{CONSOLE_PREFIX}/index.html"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::HEAD)
+                .uri(path.as_str())
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_body_layer_inserts_zero_content_length_for_s3_and_console_get() {
+        for path in ["/?x-id=ListBuckets".to_string(), format!("{CONSOLE_PREFIX}/index.html")] {
+            let capture = HeaderCaptureService::default();
+            let headers = capture.headers();
+            let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path.as_str())
+                .body(())
+                .expect("request");
+
+            let _ = service.call(request).await.expect("service call");
+
+            let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+            assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
+        }
     }
 
     #[tokio::test]
@@ -1689,6 +1793,41 @@ mod tests {
             .method(Method::DELETE)
             .uri("/bucket/object?versionId=3HL4kqtJlcpXrof3Gj0OmxJnVBH40Nrjfkd")
             .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn s3_get_with_transfer_encoding_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/?x-id=ListBuckets")
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn console_get_with_transfer_encoding_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("{CONSOLE_PREFIX}/index.html"))
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn console_post_without_content_length_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{CONSOLE_PREFIX}/upload"))
             .body(())
             .expect("request");
 
