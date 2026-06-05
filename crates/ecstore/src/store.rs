@@ -206,6 +206,31 @@ impl std::fmt::Debug for ECStore {
     }
 }
 
+/// Phase 2: Accessor methods for config globals
+/// These delegate to the process-global statics. No local state — the globals
+/// remain the single source of truth until the migration is complete.
+impl ECStore {
+    /// Get server configuration (delegates to global)
+    pub fn get_server_config(&self) -> Option<crate::config::Config> {
+        crate::config::get_global_server_config()
+    }
+
+    /// Set server configuration (delegates to global)
+    pub fn set_server_config(&self, cfg: crate::config::Config) {
+        crate::config::set_global_server_config(cfg);
+    }
+
+    /// Get storage class configuration (delegates to global)
+    pub fn get_storage_class(&self) -> Option<crate::config::storageclass::Config> {
+        crate::config::get_global_storage_class()
+    }
+
+    /// Set storage class configuration (delegates to global)
+    pub fn set_storage_class(&self, cfg: crate::config::storageclass::Config) {
+        crate::config::set_global_storage_class(cfg);
+    }
+}
+
 // impl Clone for ECStore {
 //     fn clone(&self) -> Self {
 //         let pool_meta = match self.pool_meta.read() {
