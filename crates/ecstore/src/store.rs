@@ -231,6 +231,46 @@ impl ECStore {
     }
 }
 
+/// Phase 3: Accessor methods for service globals
+/// These provide a unified API through ECStore for accessing cross-cutting
+/// service singletons. The globals remain the source of truth.
+impl ECStore {
+    /// Get the notification system
+    pub fn notification_system(&self) -> Option<&'static crate::notification_sys::NotificationSys> {
+        crate::notification_sys::get_global_notification_sys()
+    }
+
+    /// Get the bucket metadata system
+    pub fn bucket_metadata_sys(&self) -> Option<Arc<tokio::sync::RwLock<crate::bucket::metadata_sys::BucketMetadataSys>>> {
+        crate::bucket::metadata_sys::get_global_bucket_metadata_sys()
+    }
+
+    /// Get the global endpoints
+    pub fn endpoints(&self) -> EndpointServerPools {
+        crate::global::get_global_endpoints()
+    }
+
+    /// Get the global region
+    pub fn region(&self) -> Option<s3s::region::Region> {
+        crate::global::get_global_region()
+    }
+
+    /// Get the tier config manager
+    pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::tier::tier::TierConfigMgr>> {
+        crate::global::get_global_tier_config_mgr()
+    }
+
+    /// Get the server configuration
+    pub fn server_config(&self) -> Option<crate::config::Config> {
+        crate::config::get_global_server_config()
+    }
+
+    /// Get the storage class configuration
+    pub fn storage_class(&self) -> Option<crate::config::storageclass::Config> {
+        crate::config::get_global_storage_class()
+    }
+}
+
 // impl Clone for ECStore {
 //     fn clone(&self) -> Self {
 //         let pool_meta = match self.pool_meta.read() {
