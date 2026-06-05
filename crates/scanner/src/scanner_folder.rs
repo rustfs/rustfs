@@ -1279,15 +1279,20 @@ impl FolderScanner {
                 }
             }
 
+            let is_scan_root = folder.name == self.old_cache.info.name;
             let scan_checkpoint = self.old_cache.info.scan_checkpoint.as_ref();
             let checkpoint_resume_after = scan_checkpoint.and_then(|checkpoint| {
-                global_metrics().record_scanner_checkpoint_set(
-                    checkpoint.version,
-                    checkpoint.resume_after.clone(),
-                    checkpoint.reason.as_str(),
-                );
+                if is_scan_root {
+                    global_metrics().record_scanner_checkpoint_set(
+                        checkpoint.version,
+                        checkpoint.resume_after.clone(),
+                        checkpoint.reason.as_str(),
+                    );
+                }
                 if checkpoint.version != DATA_USAGE_SCAN_CHECKPOINT_VERSION || checkpoint.resume_after.is_empty() {
-                    global_metrics().record_scanner_checkpoint_ignored();
+                    if is_scan_root {
+                        global_metrics().record_scanner_checkpoint_ignored();
+                    }
                     None
                 } else {
                     Some(checkpoint.resume_after.as_str())
@@ -2535,6 +2540,51 @@ mod tests {
         assert!(partial_cache.root().is_some(), "partial cache should keep completed scan progress");
         assert!(budget.budget_elapsed());
         assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_data_folder_reports_invalid_checkpoint_ignored_once() {
+        let (scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir.clone()),
+        };
+
+        tokio::fs::create_dir_all(temp_dir.join("bucket").join("child-a").join("grandchild"))
+            .await
+            .expect("failed to create nested child directory");
+
+        let before = global_metrics().report().await.scan_checkpoint_ignored;
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&parent, Default::default());
+        let cache = DataUsageCache {
+            info: crate::data_usage_define::DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                scan_checkpoint: Some(crate::data_usage_define::DataUsageScanCheckpoint {
+                    version: crate::data_usage_define::DATA_USAGE_SCAN_CHECKPOINT_VERSION + 1,
+                    resume_after: "bucket/child-a".to_string(),
+                    reason: crate::data_usage_define::DataUsageScanCheckpointReason::Unknown,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = scan_data_folder(
+            budget.token(),
+            budget.clone(),
+            vec![scanner.local_disk.clone()],
+            scanner.local_disk.clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "scan should complete with an ignored checkpoint");
+        let after = global_metrics().report().await.scan_checkpoint_ignored;
+        assert_eq!(after.saturating_sub(before), 1);
     }
 
     #[tokio::test]
