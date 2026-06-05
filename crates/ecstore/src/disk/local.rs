@@ -1642,11 +1642,8 @@ fn metadata_counts_toward_limit(metadata: &[u8]) -> bool {
 }
 
 fn file_meta_counts_toward_limit(meta: &FileMeta) -> bool {
-    meta.list_versions("", "", false).map_or(true, |versions| {
-        versions
-            .first()
-            .is_none_or(|latest| !latest.deleted && !latest.tier_free_version())
-    })
+    meta.into_fileinfo("", "", "", false, true, false)
+        .map_or_else(|_| !meta.all_hidden(true), |latest| !latest.deleted && !latest.tier_free_version())
 }
 
 // Filter std::io::ErrorKind::NotFound
