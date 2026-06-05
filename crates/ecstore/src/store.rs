@@ -45,10 +45,9 @@ use crate::error::{
 use crate::event_notification::EventNotifier;
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, TypeLocalDiskSetDrives,
-    get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints, get_global_region,
-    get_global_tier_config_mgr, init_global_bucket_monitor, is_dist_erasure, is_erasure_sd,
-    set_global_deployment_id, set_object_layer,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives, get_global_deployment_id, get_global_endpoints,
+    get_global_region, get_global_tier_config_mgr, init_global_bucket_monitor, is_erasure_sd, set_global_deployment_id,
+    set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
