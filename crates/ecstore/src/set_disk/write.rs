@@ -92,6 +92,34 @@ impl SetDisks {
             }
         }
 
+        if issue3031_diag_enabled() {
+            let success_count = errs.iter().filter(|err| err.is_none()).count();
+            let failure_count = errs.len().saturating_sub(success_count);
+            let ignored_failure_count = errs
+                .iter()
+                .filter(|err| err.as_ref().is_some_and(|err| OBJECT_OP_IGNORED_ERRS.contains(err)))
+                .count();
+            let data_dir_vote_count = data_dirs.iter().filter(|data_dir| data_dir.is_some()).count();
+            let reduced_data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                src_bucket = %src_bucket,
+                src_object = %src_object,
+                dst_bucket = %dst_bucket,
+                dst_object = %dst_object,
+                write_quorum,
+                disk_count = errs.len(),
+                success_count,
+                failure_count,
+                ignored_failure_count,
+                data_dir_vote_count,
+                reduced_data_dir = ?reduced_data_dir,
+                errs = ?errs,
+                data_dirs = ?data_dirs,
+                "issue3031_rename_data_quorum_context"
+            );
+        }
+
         let mut futures = Vec::with_capacity(disks.len());
         if let Some(ret_err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
             // TODO: add concurrency
@@ -126,6 +154,21 @@ impl SetDisks {
                             });
                     }));
                 }
+            }
+
+            if issue3031_diag_enabled() {
+                warn!(
+                    target: "rustfs_ecstore::set_disk",
+                    src_bucket = %src_bucket,
+                    src_object = %src_object,
+                    dst_bucket = %dst_bucket,
+                    dst_object = %dst_object,
+                    write_quorum,
+                    ret_err = %ret_err,
+                    errs = ?errs,
+                    data_dirs = ?data_dirs,
+                    "issue3031_rename_data_quorum_failed"
+                );
             }
 
             let _ = join_all(futures).await;

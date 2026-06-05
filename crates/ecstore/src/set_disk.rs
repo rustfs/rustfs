@@ -1204,12 +1204,46 @@ impl ObjectIO for SetDisks {
 
             fi.is_latest = true;
 
+            if issue3031_diag_enabled() {
+                let online_success_count = online_disks.iter().filter(|disk| disk.is_some()).count();
+                warn!(
+                    target: "rustfs_ecstore::set_disk",
+                    bucket = %bucket,
+                    object = %object,
+                    tmp_dir = %tmp_dir,
+                    data_dir = ?fi.data_dir,
+                    write_quorum,
+                    online_success_count,
+                    op_old_dir = ?op_old_dir,
+                    "issue3031_put_object_commit_succeeded"
+                );
+            }
+
             Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
         }
         .await;
 
+        if issue3031_diag_enabled() {
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                bucket = %bucket,
+                object = %object,
+                tmp_dir = %tmp_dir,
+                result = ?result.as_ref().map(|_| ()).map_err(|err| err.to_string()),
+                "issue3031_put_object_tmp_cleanup_start"
+            );
+        }
+
         if let Err(err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
             warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+        } else if issue3031_diag_enabled() {
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                bucket = %bucket,
+                object = %object,
+                tmp_dir = %tmp_dir,
+                "issue3031_put_object_tmp_cleanup_done"
+            );
         }
 
         result
@@ -1339,6 +1373,33 @@ impl SetDisks {
                     unresolved_objects -= 1;
                 }
             }
+        }
+
+        if issue3031_diag_enabled() {
+            let succeeded_count = resolution_by_object
+                .iter()
+                .filter(|resolution| matches!(resolution, ObjectLockResolution::Succeeded))
+                .count();
+            let failed_count = resolution_by_object
+                .iter()
+                .filter(|resolution| matches!(resolution, ObjectLockResolution::Failed))
+                .count();
+            let pending_count = resolution_by_object
+                .iter()
+                .filter(|resolution| matches!(resolution, ObjectLockResolution::Pending))
+                .count();
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                request_count = requests.len(),
+                locker_count = self.lockers.len(),
+                write_quorum,
+                succeeded_count,
+                failed_count,
+                pending_count,
+                pending_clients,
+                errors_by_object = ?errors_by_object,
+                "issue3031_delete_objects_dist_batch_lock_summary"
+            );
         }
 
         if !pending.is_empty() {
@@ -1775,6 +1836,7 @@ impl ObjectOperations for SetDisks {
                 batch = batch.add_write_lock(ObjectKey::new(bucket, dobj.object_name.clone()));
             }
         }
+        let unique_lock_count = batch.requests.len();
 
         let mut failed_map = HashMap::new();
         let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
@@ -1796,6 +1858,24 @@ impl ObjectOperations for SetDisks {
             for (key, err) in batch_result.failed_locks {
                 failed_map.insert((key.bucket.as_ref().to_string(), key.object.as_ref().to_string()), format!("{err:?}"));
             }
+        }
+
+        if issue3031_diag_enabled() {
+            let failed_lock_count = failed_map.len();
+            let locked_object_count = locked_objects.len();
+            let dist_lock_id_count = dist_batch_lock_ids.iter().map(Vec::len).sum::<usize>();
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                bucket = %bucket,
+                requested_object_count = objects.len(),
+                unique_lock_count,
+                locked_object_count,
+                failed_lock_count,
+                dist_erasure,
+                dist_lock_id_count,
+                failed_objects = ?failed_map.keys().collect::<Vec<_>>(),
+                "issue3031_delete_objects_lock_batch_context"
+            );
         }
 
         // Mark failures for objects that could not be locked
