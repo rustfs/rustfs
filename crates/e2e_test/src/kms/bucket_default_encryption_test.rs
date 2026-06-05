@@ -572,7 +572,7 @@ async fn test_sse_kms_without_key_id_populates_default() -> Result<(), Box<dyn s
 
     let config = get_response.server_side_encryption_configuration();
     let rule = config
-        .and_then(|c| c.rules.first())
+        .and_then(|c| c.rules().first())
         .expect("Should have at least one encryption rule");
     let by_default = rule
         .apply_server_side_encryption_by_default()
