@@ -366,16 +366,15 @@ pub(crate) async fn migrate_object(
                 )
                 .await
             {
-                if let Some(target_pool_idx) = target_pool_idx
-                    && should_treat_data_movement_overwrite_as_complete(
-                        store.as_ref(),
-                        pool_idx,
-                        target_pool_idx,
-                        bucket.as_str(),
-                        &object_info,
-                        &err,
-                    )
-                    .await?
+                if should_treat_data_movement_overwrite_as_complete(
+                    store.as_ref(),
+                    pool_idx,
+                    target_pool_idx,
+                    bucket.as_str(),
+                    &object_info,
+                    &err,
+                )
+                .await?
                 {
                     mark_multipart_upload_completed(&abort_multipart_flag);
                     return Ok(());

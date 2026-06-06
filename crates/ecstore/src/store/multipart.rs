@@ -125,14 +125,14 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
-    ) -> Result<(MultipartUploadResult, Option<usize>)> {
+    ) -> Result<(MultipartUploadResult, usize)> {
         check_new_multipart_args(bucket, object)?;
 
         if self.single_pool() {
             return self.pools[0]
                 .new_multipart_upload(bucket, object, opts)
                 .await
-                .map(|res| (res, Some(0)));
+                .map(|res| (res, 0));
         }
 
         for (idx, pool) in self.pools.iter().enumerate() {
@@ -145,7 +145,7 @@ impl ECStore {
 
             if !res.uploads.is_empty() {
                 let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
-                return Ok((res, Some(idx)));
+                return Ok((res, idx));
             }
         }
         let idx = self.get_pool_idx(bucket, object, -1).await?;
@@ -158,7 +158,7 @@ impl ECStore {
         }
 
         let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
-        Ok((res, Some(idx)))
+        Ok((res, idx))
     }
 
     #[instrument(skip(self))]
