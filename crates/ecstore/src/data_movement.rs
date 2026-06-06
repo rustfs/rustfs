@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
 use crate::store::ECStore;
-use crate::store_api::{CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::store_api::{
+    CompletePart, GetObjectReader, MultipartOperations, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, PutObjReader,
+};
 use bytes::Bytes;
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
+use rustfs_utils::path::encode_dir_object;
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{
@@ -102,13 +105,14 @@ fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usiz
     }
 }
 
-fn data_movement_complete_multipart_opts(object_info: &ObjectInfo) -> ObjectOptions {
+fn data_movement_complete_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usize) -> ObjectOptions {
     ObjectOptions {
         versioned: object_info.version_id.is_some(),
         version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
         data_movement: true,
         mod_time: object_info.mod_time,
         preserve_etag: object_info.etag.clone(),
+        src_pool_idx,
         ..Default::default()
     }
 }
@@ -139,6 +143,98 @@ fn resolve_data_movement_abort_result(
     ))
 }
 
+fn data_movement_stage_error(op_label: &str, stage: &str, bucket: &str, object: &str, err: impl std::fmt::Display) -> Error {
+    Error::other(format!("{op_label}: {stage} failed for {bucket}/{object}: {err}"))
+}
+
+fn should_check_data_movement_overwrite_resume(err: &Error) -> bool {
+    is_err_data_movement_overwrite(err)
+}
+
+fn effective_actual_size(info: &ObjectInfo) -> Option<i64> {
+    info.get_actual_size().ok()
+}
+
+fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+    source.version_id == target.version_id
+        && source.delete_marker == target.delete_marker
+        && source.size == target.size
+        && effective_actual_size(source) == effective_actual_size(target)
+        && source.etag == target.etag
+        && source.checksum == target.checksum
+        && source.mod_time == target.mod_time
+}
+
+async fn find_data_movement_target_info(
+    store: &ECStore,
+    src_pool_idx: usize,
+    bucket: &str,
+    object_info: &ObjectInfo,
+) -> Result<Option<ObjectInfo>> {
+    let opts = ObjectOptions {
+        versioned: object_info.version_id.is_some(),
+        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        no_lock: true,
+        ..Default::default()
+    };
+    let object = encode_dir_object(object_info.name.as_str());
+
+    for (pool_idx, pool) in store.pools.iter().enumerate() {
+        if pool_idx == src_pool_idx {
+            continue;
+        }
+
+        match pool.get_object_info(bucket, object.as_str(), &opts).await {
+            Ok(target_info) => return Ok(Some(target_info)),
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_data_movement_overwrite_resume_result(
+    err: &Error,
+    target_result: Result<Option<ObjectInfo>>,
+    source: &ObjectInfo,
+) -> Result<bool> {
+    if !should_check_data_movement_overwrite_resume(err) {
+        return Ok(false);
+    }
+
+    let Some(target) = target_result? else {
+        return Ok(false);
+    };
+
+    Ok(is_equivalent_data_movement_object(source, &target))
+}
+
+async fn should_treat_data_movement_overwrite_as_complete(
+    store: &ECStore,
+    src_pool_idx: usize,
+    bucket: &str,
+    object_info: &ObjectInfo,
+    err: &Error,
+) -> Result<bool> {
+    resolve_data_movement_overwrite_resume_result(
+        err,
+        find_data_movement_target_info(store, src_pool_idx, bucket, object_info).await,
+        object_info,
+    )
+}
+
+fn data_movement_part_stage_error(
+    op_label: &str,
+    stage: &str,
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    err: impl std::fmt::Display,
+) -> Error {
+    Error::other(format!("{op_label}: {stage} failed for {bucket}/{object} part {part_number}: {err}"))
+}
+
 pub(crate) async fn migrate_object(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -156,7 +252,13 @@ pub(crate) async fn migrate_object(
             Ok(res) => res,
             Err(err) => {
                 error!("{op_label}: new_multipart_upload err {:?}", &err);
-                return Err(err);
+                return Err(data_movement_stage_error(
+                    op_label,
+                    "new_multipart_upload",
+                    bucket.as_str(),
+                    object_info.name.as_str(),
+                    err,
+                ));
             }
         };
 
@@ -167,12 +269,39 @@ pub(crate) async fn migrate_object(
 
             for (i, part) in object_info.parts.iter().enumerate() {
                 let mut chunk = vec![0u8; part.size];
-                reader.read_exact(&mut chunk).await?;
+                reader.read_exact(&mut chunk).await.map_err(|err| {
+                    data_movement_part_stage_error(
+                        op_label,
+                        "read_part",
+                        bucket.as_str(),
+                        object_info.name.as_str(),
+                        part.number,
+                        Error::other(err.to_string()),
+                    )
+                })?;
 
-                let part_size = i64::try_from(part.size).map_err(|_| Error::other("part size overflow"))?;
+                let part_size = i64::try_from(part.size).map_err(|_| {
+                    data_movement_part_stage_error(
+                        op_label,
+                        "prepare_part",
+                        bucket.as_str(),
+                        object_info.name.as_str(),
+                        part.number,
+                        Error::other("part size overflow"),
+                    )
+                })?;
                 let part_actual_size = if part.actual_size > 0 { part.actual_size } else { part_size };
                 let index = decode_part_index(part.index.as_ref());
-                let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index)?;
+                let mut data = put_obj_reader_from_chunk(chunk, part_size, part_actual_size, index).map_err(|err| {
+                    data_movement_part_stage_error(
+                        op_label,
+                        "prepare_part",
+                        bucket.as_str(),
+                        object_info.name.as_str(),
+                        part.number,
+                        err,
+                    )
+                })?;
 
                 let pi = match store
                     .put_object_part(
@@ -191,7 +320,14 @@ pub(crate) async fn migrate_object(
                     Ok(pi) => pi,
                     Err(err) => {
                         error!("{op_label}: put_object_part {i} err {:?}", &err);
-                        return Err(err);
+                        return Err(data_movement_part_stage_error(
+                            op_label,
+                            "put_object_part",
+                            bucket.as_str(),
+                            object_info.name.as_str(),
+                            part.number,
+                            err,
+                        ));
                     }
                 };
 
@@ -209,12 +345,25 @@ pub(crate) async fn migrate_object(
                     &object_info.name,
                     &res.upload_id,
                     parts,
-                    &data_movement_complete_multipart_opts(&object_info),
+                    &data_movement_complete_multipart_opts(&object_info, pool_idx),
                 )
                 .await
             {
+                if should_treat_data_movement_overwrite_as_complete(store.as_ref(), pool_idx, bucket.as_str(), &object_info, &err)
+                    .await?
+                {
+                    mark_multipart_upload_completed(&abort_multipart_flag);
+                    return Ok(());
+                }
+
                 error!("{op_label}: complete_multipart_upload err {:?}", &err);
-                return Err(err);
+                return Err(data_movement_stage_error(
+                    op_label,
+                    "complete_multipart_upload",
+                    bucket.as_str(),
+                    object_info.name.as_str(),
+                    err,
+                ));
             }
 
             mark_multipart_upload_completed(&abort_multipart_flag);
@@ -248,13 +397,18 @@ pub(crate) async fn migrate_object(
         return Ok(());
     }
 
-    let actual_size = object_info.get_actual_size()?;
+    let actual_size = object_info.get_actual_size().map_err(|err| {
+        data_movement_stage_error(op_label, "prepare_put_object", bucket.as_str(), object_info.name.as_str(), err)
+    })?;
     let index = object_info
         .parts
         .first()
         .and_then(|part| decode_part_index(part.index.as_ref()));
     let reader = IndexedDataMovementReader::new(BufReader::new(rd.stream), index);
-    let hrd = HashReader::from_stream(reader, object_info.size, actual_size, object_info.etag.clone(), None, false)?;
+    let hrd =
+        HashReader::from_stream(reader, object_info.size, actual_size, object_info.etag.clone(), None, false).map_err(|err| {
+            data_movement_stage_error(op_label, "prepare_put_object", bucket.as_str(), object_info.name.as_str(), err)
+        })?;
     let mut data = PutObjReader::new(hrd);
 
     if let Err(err) = store
@@ -266,8 +420,19 @@ pub(crate) async fn migrate_object(
         )
         .await
     {
+        if should_treat_data_movement_overwrite_as_complete(store.as_ref(), pool_idx, bucket.as_str(), &object_info, &err).await?
+        {
+            return Ok(());
+        }
+
         error!("{op_label}: put_object err {:?}", &err);
-        return Err(err);
+        return Err(data_movement_stage_error(
+            op_label,
+            "put_object",
+            bucket.as_str(),
+            object_info.name.as_str(),
+            err,
+        ));
     }
 
     Ok(())
@@ -307,6 +472,33 @@ mod tests {
         assert!(message.contains("bucket-a/object-a"));
         assert!(message.contains("upload upload-1"));
         assert!(message.contains(Error::SlowDown.to_string().as_str()));
+    }
+
+    #[test]
+    fn test_data_movement_stage_error_includes_stage_and_object() {
+        let err = data_movement_stage_error("rebalance_object", "put_object", "bucket-a", "object-a", Error::SlowDown);
+        let message = err.to_string();
+        assert!(message.contains("rebalance_object: put_object failed for bucket-a/object-a"));
+        assert!(message.contains(Error::SlowDown.to_string().as_str()));
+    }
+
+    #[test]
+    fn test_data_movement_part_stage_error_includes_stage_object_and_part() {
+        let err =
+            data_movement_part_stage_error("rebalance_object", "put_object_part", "bucket-a", "object-a", 7, Error::SlowDown);
+        let message = err.to_string();
+        assert!(message.contains("rebalance_object: put_object_part failed for bucket-a/object-a part 7"));
+        assert!(message.contains(Error::SlowDown.to_string().as_str()));
+    }
+
+    #[test]
+    fn test_should_check_data_movement_overwrite_resume_only_for_overwrite_error() {
+        assert!(should_check_data_movement_overwrite_resume(&Error::DataMovementOverwriteErr(
+            "bucket-a".to_string(),
+            "object-a".to_string(),
+            "version-a".to_string(),
+        )));
+        assert!(!should_check_data_movement_overwrite_resume(&Error::SlowDown));
     }
 
     #[test]
@@ -366,13 +558,14 @@ mod tests {
             ..Default::default()
         };
 
-        let opts = data_movement_complete_multipart_opts(&object_info);
+        let opts = data_movement_complete_multipart_opts(&object_info, 7);
 
         assert!(opts.versioned);
         assert!(opts.data_movement);
         assert_eq!(opts.mod_time, Some(mod_time));
         assert_eq!(opts.version_id.as_deref(), Some(version_id.to_string().as_str()));
         assert_eq!(opts.preserve_etag.as_deref(), Some("etag-value"));
+        assert_eq!(opts.src_pool_idx, 7);
     }
 
     #[test]
@@ -395,5 +588,114 @@ mod tests {
         assert_eq!(opts.src_pool_idx, 9);
         assert!(opts.data_movement);
         assert_eq!(opts.mod_time, object_info.mod_time);
+    }
+
+    #[test]
+    fn test_is_equivalent_data_movement_object_accepts_matching_metadata() {
+        let version_id = Uuid::nil();
+        let info = ObjectInfo {
+            version_id: Some(version_id),
+            size: 128,
+            actual_size: 96,
+            etag: Some("etag-value".to_string()),
+            checksum: Some(Bytes::from_static(b"checksum")),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+
+        assert!(is_equivalent_data_movement_object(&info, &info.clone()));
+    }
+
+    #[test]
+    fn test_is_equivalent_data_movement_object_rejects_content_mismatch() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            size: 128,
+            actual_size: 96,
+            etag: Some("etag-source".to_string()),
+            checksum: Some(Bytes::from_static(b"checksum-source")),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            etag: Some("etag-target".to_string()),
+            checksum: Some(Bytes::from_static(b"checksum-target")),
+            ..source.clone()
+        };
+
+        assert!(!is_equivalent_data_movement_object(&source, &target));
+    }
+
+    #[test]
+    fn test_is_equivalent_data_movement_object_uses_effective_actual_size() {
+        let source = ObjectInfo {
+            size: 128,
+            actual_size: 0,
+            etag: Some("etag-value".to_string()),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            size: 128,
+            actual_size: 128,
+            etag: Some("etag-value".to_string()),
+            ..Default::default()
+        };
+
+        assert!(is_equivalent_data_movement_object(&source, &target));
+    }
+
+    #[test]
+    fn test_resolve_data_movement_overwrite_resume_result_accepts_equivalent_target() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            size: 128,
+            etag: Some("etag-value".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(source.clone())), &source)
+            .expect("equivalent overwrite target should be evaluated");
+
+        assert!(should_resume);
+    }
+
+    #[test]
+    fn test_resolve_data_movement_overwrite_resume_result_rejects_non_equivalent_target() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            size: 128,
+            etag: Some("etag-source".to_string()),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            etag: Some("etag-target".to_string()),
+            ..source.clone()
+        };
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(target)), &source)
+            .expect("non-equivalent overwrite target should be evaluated");
+
+        assert!(!should_resume);
+    }
+
+    #[test]
+    fn test_resolve_data_movement_overwrite_resume_result_propagates_target_lookup_error() {
+        let source = ObjectInfo::default();
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+        let result = resolve_data_movement_overwrite_resume_result(&err, Err(Error::SlowDown), &source);
+
+        assert!(matches!(result, Err(Error::SlowDown)));
+    }
+
+    #[test]
+    fn test_resolve_data_movement_overwrite_resume_result_ignores_non_overwrite_error() {
+        let source = ObjectInfo::default();
+        let result = resolve_data_movement_overwrite_resume_result(&Error::SlowDown, Err(Error::FileAccessDenied), &source)
+            .expect("non-overwrite errors should not query target equivalence");
+
+        assert!(!result);
     }
 }

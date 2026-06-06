@@ -233,6 +233,61 @@ fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> Object
     lookup_opts
 }
 
+fn effective_object_actual_size(info: &ObjectInfo) -> Option<i64> {
+    info.get_actual_size().ok()
+}
+
+fn is_equivalent_data_movement_delete_marker(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+    is_data_movement_delete_marker(source)
+        && is_data_movement_delete_marker(target)
+        && source.version_id == target.version_id
+        && source.mod_time == target.mod_time
+}
+
+fn is_data_movement_delete_marker(info: &ObjectInfo) -> bool {
+    info.delete_marker
+}
+
+fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo, target: &ObjectInfo) -> bool {
+    source.version_id == target.version_id
+        && !target.delete_marker
+        && source.size == target.size
+        && source.get_etag() == target.etag
+        && source.checksum == target.checksum
+        && source.mod_time == target.mod_time
+        && source.transition_status == target.transitioned_object.status
+        && source.transitioned_objname == target.transitioned_object.name
+        && source.transition_tier == target.transitioned_object.tier
+        && source
+            .transition_version_id
+            .map(|version_id| version_id.to_string())
+            .unwrap_or_default()
+            == target.transitioned_object.version_id
+        && effective_object_actual_size(target) == Some(source.size)
+}
+
+fn resolve_data_movement_delete_marker_resume_result(
+    target_result: Result<Option<ObjectInfo>>,
+    source: &ObjectInfo,
+) -> Result<bool> {
+    let Some(target) = target_result? else {
+        return Ok(false);
+    };
+
+    Ok(is_equivalent_data_movement_delete_marker(source, &target))
+}
+
+fn resolve_data_movement_tiered_resume_result(
+    target_result: Result<Option<ObjectInfo>>,
+    source: &rustfs_filemeta::FileInfo,
+) -> Result<bool> {
+    let Some(target) = target_result? else {
+        return Ok(false);
+    };
+
+    Ok(is_equivalent_data_movement_tiered_object(source, &target))
+}
+
 impl ECStore {
     fn map_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
         match err {
@@ -377,6 +432,58 @@ impl ECStore {
         }
     }
 
+    async fn find_data_movement_target_info(
+        &self,
+        bucket: &str,
+        object: &str,
+        src_pool_idx: usize,
+        opts: &ObjectOptions,
+    ) -> Result<Option<ObjectInfo>> {
+        let lookup_opts = version_aware_lookup_opts(opts, true);
+
+        for (pool_idx, pool) in self.pools.iter().enumerate() {
+            if pool_idx == src_pool_idx {
+                continue;
+            }
+
+            match pool.get_object_info(bucket, object, &lookup_opts).await {
+                Ok(info) => return Ok(Some(info)),
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn has_equivalent_data_movement_delete_marker(
+        &self,
+        bucket: &str,
+        object: &str,
+        source: &ObjectInfo,
+        opts: &ObjectOptions,
+    ) -> Result<bool> {
+        resolve_data_movement_delete_marker_resume_result(
+            self.find_data_movement_target_info(bucket, object, opts.src_pool_idx, opts)
+                .await,
+            source,
+        )
+    }
+
+    async fn has_equivalent_data_movement_tiered_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        source: &rustfs_filemeta::FileInfo,
+        opts: &ObjectOptions,
+    ) -> Result<bool> {
+        resolve_data_movement_tiered_resume_result(
+            self.find_data_movement_target_info(bucket, object, opts.src_pool_idx, opts)
+                .await,
+            source,
+        )
+    }
+
     fn resolve_decommission_target_pool_idx_result(result: Result<usize>, bucket: &str, object: &str) -> Result<usize> {
         result.map_err(|err| Error::other(format!("failed to select decommission target pool for {bucket}/{object}: {err}")))
     }
@@ -419,6 +526,13 @@ impl ECStore {
             )?
         };
         if opts.data_movement && idx == opts.src_pool_idx {
+            if self
+                .has_equivalent_data_movement_tiered_object(bucket, &object, fi, opts)
+                .await?
+            {
+                return Ok(());
+            }
+
             return Err(StorageError::DataMovementOverwriteErr(
                 bucket.to_owned(),
                 object.to_owned(),
@@ -643,10 +757,11 @@ impl ECStore {
         let gopts = version_aware_lookup_opts(&opts, true);
 
         if opts.data_movement {
-            let existing_pool_idx = self
-                .get_pool_info_existing_with_opts(bucket, object, &gopts)
-                .await
-                .map(|(pinfo, _)| pinfo.index);
+            let existing_pool_info = self.get_pool_info_existing_with_opts(bucket, object, &gopts).await;
+            let existing_pool_idx = existing_pool_info
+                .as_ref()
+                .map(|(pinfo, _)| pinfo.index)
+                .map_err(Clone::clone);
             let target_pool_idx =
                 match select_data_movement_target_pool(existing_pool_idx, opts.src_pool_idx, opts.delete_marker)? {
                     Some(pool_idx) => pool_idx,
@@ -654,6 +769,18 @@ impl ECStore {
                 };
 
             if opts.src_pool_idx == target_pool_idx {
+                if let Ok((source_pool_info, _)) = existing_pool_info
+                    && opts.delete_marker
+                    && is_data_movement_delete_marker(&source_pool_info.object_info)
+                    && self
+                        .has_equivalent_data_movement_delete_marker(bucket, object, &source_pool_info.object_info, &opts)
+                        .await?
+                {
+                    let mut obj = source_pool_info.object_info;
+                    obj.name = decode_dir_object(object);
+                    return Ok(obj);
+                }
+
                 return Err(StorageError::DataMovementOverwriteErr(
                     bucket.to_owned(),
                     object.to_owned(),
@@ -1063,6 +1190,9 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject;
+    use crate::bucket::lifecycle::core::TRANSITION_COMPLETE;
+    use bytes::Bytes;
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
 
@@ -1083,6 +1213,176 @@ mod tests {
     fn non_delete_marker_data_movement_keeps_existing_pool() {
         let target = select_data_movement_target_pool(Ok(0), 1, false).unwrap();
         assert_eq!(target, Some(0));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_requires_same_version_and_mod_time() {
+        let version_id = Uuid::nil();
+        let mod_time = OffsetDateTime::UNIX_EPOCH;
+        let source = ObjectInfo {
+            version_id: Some(version_id),
+            delete_marker: true,
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+        let target = source.clone();
+
+        assert!(is_equivalent_data_movement_delete_marker(&source, &target));
+
+        let mismatched = ObjectInfo {
+            mod_time: Some(mod_time + Duration::from_secs(1)),
+            ..target
+        };
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &mismatched));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_rejects_live_object() {
+        let source = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            delete_marker: false,
+            ..source.clone()
+        };
+
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+    }
+
+    #[test]
+    fn data_movement_delete_marker_resume_accepts_equivalent_target() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+
+        let should_resume = resolve_data_movement_delete_marker_resume_result(Ok(Some(source.clone())), &source)
+            .expect("equivalent delete marker target should be evaluated");
+
+        assert!(should_resume);
+    }
+
+    #[test]
+    fn data_movement_delete_marker_resume_propagates_target_lookup_error() {
+        let source = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        let result = resolve_data_movement_delete_marker_resume_result(Err(Error::SlowDown), &source);
+
+        assert!(matches!(result, Err(Error::SlowDown)));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_accepts_matching_transition_metadata() {
+        let version_id = Uuid::nil();
+        let transition_version_id = Uuid::new_v4();
+        let mod_time = OffsetDateTime::UNIX_EPOCH;
+        let source = FileInfo {
+            version_id: Some(version_id),
+            size: 1024,
+            mod_time: Some(mod_time),
+            checksum: Some(Bytes::from_static(b"checksum")),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_tier: "WARM".to_string(),
+            transition_version_id: Some(transition_version_id),
+            metadata: HashMap::from([("etag".to_string(), "etag-value".to_string())]),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            version_id: Some(version_id),
+            size: 1024,
+            mod_time: Some(mod_time),
+            checksum: Some(Bytes::from_static(b"checksum")),
+            etag: Some("etag-value".to_string()),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: transition_version_id.to_string(),
+                tier: "WARM".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_transition_mismatch() {
+        let source = FileInfo {
+            version_id: Some(Uuid::nil()),
+            size: 1024,
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/source".to_string(),
+            transition_tier: "WARM".to_string(),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            version_id: source.version_id,
+            size: 1024,
+            transitioned_object: TransitionedObject {
+                name: "remote/target".to_string(),
+                tier: "WARM".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn data_movement_tiered_resume_accepts_equivalent_target() {
+        let version_id = Uuid::nil();
+        let transition_version_id = Uuid::new_v4();
+        let source = FileInfo {
+            version_id: Some(version_id),
+            size: 1024,
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_tier: "WARM".to_string(),
+            transition_version_id: Some(transition_version_id),
+            metadata: HashMap::from([("etag".to_string(), "etag-value".to_string())]),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            version_id: Some(version_id),
+            size: 1024,
+            etag: Some("etag-value".to_string()),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: transition_version_id.to_string(),
+                tier: "WARM".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let should_resume = resolve_data_movement_tiered_resume_result(Ok(Some(target)), &source)
+            .expect("equivalent tiered target should be evaluated");
+
+        assert!(should_resume);
+    }
+
+    #[test]
+    fn data_movement_tiered_resume_rejects_missing_target() {
+        let source = FileInfo {
+            version_id: Some(Uuid::nil()),
+            size: 1024,
+            ..Default::default()
+        };
+
+        let should_resume =
+            resolve_data_movement_tiered_resume_result(Ok(None), &source).expect("missing tiered target should be evaluated");
+
+        assert!(!should_resume);
     }
 
     #[test]
