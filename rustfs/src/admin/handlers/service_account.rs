@@ -124,18 +124,21 @@ fn parse_service_account_policy(policy: &serde_json::Value) -> S3Result<Policy> 
     let policy_bytes = serde_json::to_vec(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
     Policy::parse_config(&policy_bytes).map_err(|e| {
         debug!("parse service account policy failed, e: {:?}", e);
-        // Provide user-friendly error messages instead of exposing internal details
-        let error_msg = e.to_string();
-        let user_friendly_msg = if error_msg.contains("invalid type") || error_msg.contains("expected") {
-            "Policy format is invalid. Please check the JSON structure and ensure it follows the IAM policy format."
-        } else if error_msg.contains("missing field") {
-            "Policy is missing required fields. A valid policy must include Version and Statement."
-        } else if error_msg.contains("'Resource' is empty") {
-            "invalid service account policy: Resource is empty"
-        } else {
-            "Policy format is invalid. Please check the JSON structure."
-        };
-        s3_error!(InvalidArgument, "{}", user_friendly_msg)
+        match e {
+            rustfs_policy::error::Error::PolicyError(rustfs_policy::policy::Error::NonResource) => {
+                s3_error!(InvalidArgument, "invalid service account policy: Resource is empty")
+            }
+            rustfs_policy::error::Error::PolicyError(err) => {
+                s3_error!(InvalidArgument, "invalid service account policy: {}", err)
+            }
+            rustfs_policy::error::Error::Io(err) if err.get_ref().is_some_and(|source| source.is::<serde_json::Error>()) => {
+                s3_error!(
+                    InvalidArgument,
+                    "Policy format is invalid. Please check the JSON structure and ensure it follows the IAM policy format."
+                )
+            }
+            err => s3_error!(InvalidArgument, "invalid service account policy: {}", err),
+        }
     })
 }
 
@@ -1559,6 +1562,27 @@ mod tests {
 
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("invalid service account policy: Resource is empty"));
+    }
+
+    #[test]
+    fn parse_service_account_policy_preserves_policy_validation_details() {
+        let err = parse_service_account_policy(&json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "admin:ServerInfo"],
+                    "Resource": ["arn:aws:s3:::bucket/*"]
+                }
+            ]
+        }))
+        .expect_err("policy with mixed action families should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            Some("invalid service account policy: 'Action' contains mixed action families in the same statement")
+        );
     }
 
     #[test]
