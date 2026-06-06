@@ -124,8 +124,21 @@ fn parse_service_account_policy(policy: &serde_json::Value) -> S3Result<Policy> 
     let policy_bytes = serde_json::to_vec(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
     Policy::parse_config(&policy_bytes).map_err(|e| {
         debug!("parse service account policy failed, e: {:?}", e);
-        let message = e.to_string().replace('\'', "");
-        s3_error!(InvalidArgument, "invalid service account policy: {}", message)
+        match e {
+            rustfs_policy::error::Error::PolicyError(rustfs_policy::policy::Error::NonResource) => {
+                s3_error!(InvalidArgument, "invalid service account policy: Resource is empty")
+            }
+            rustfs_policy::error::Error::PolicyError(err) => {
+                s3_error!(InvalidArgument, "invalid service account policy: {}", err)
+            }
+            rustfs_policy::error::Error::Io(err) if err.get_ref().is_some_and(|source| source.is::<serde_json::Error>()) => {
+                s3_error!(
+                    InvalidArgument,
+                    "Policy format is invalid. Please check the JSON structure and ensure it follows the IAM policy format."
+                )
+            }
+            err => s3_error!(InvalidArgument, "invalid service account policy: {}", err),
+        }
     })
 }
 
@@ -428,7 +441,7 @@ async fn build_info_service_account_resp<T: IamStore>(
 
     let policy = effective_policy
         .map(|policy| {
-            serde_json::to_string(&policy).map_err(|e| {
+            serde_json::to_string_pretty(&policy).map_err(|e| {
                 debug!("marshal policy failed, e: {:?}", e);
                 s3_error!(InternalError, "marshal policy failed")
             })
@@ -1549,6 +1562,27 @@ mod tests {
 
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("invalid service account policy: Resource is empty"));
+    }
+
+    #[test]
+    fn parse_service_account_policy_preserves_policy_validation_details() {
+        let err = parse_service_account_policy(&json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "admin:ServerInfo"],
+                    "Resource": ["arn:aws:s3:::bucket/*"]
+                }
+            ]
+        }))
+        .expect_err("policy with mixed action families should be rejected");
+
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            Some("invalid service account policy: 'Action' contains mixed action families in the same statement")
+        );
     }
 
     #[test]
