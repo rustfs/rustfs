@@ -239,6 +239,13 @@ pub(crate) struct TableCommitResult {
     pub commit_log: CommitLogEntry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableMetadataMaintenanceReport {
+    pub current_metadata_location: String,
+    pub retained_metadata_locations: Vec<String>,
+    pub cleanup_candidate_locations: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TableCatalogStoreError {
     NotFound(String),
@@ -503,6 +510,75 @@ where
                 .await?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn plan_table_metadata_maintenance(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        retain_recent_metadata_files: usize,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(&namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(table_bucket, &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "current metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
+
+        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "current metadata object {}",
+                entry.metadata_location
+            )));
+        };
+        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
+            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
+        })?;
+        if !current_metadata.is_object() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "current metadata {} must be a JSON object",
+                entry.metadata_location
+            )));
+        }
+
+        let mut retained = metadata_log_locations(&current_metadata, &namespace, &table);
+        retained.insert(entry.metadata_location.clone());
+
+        let mut metadata_locations = Vec::new();
+        let metadata_prefix = format!("{}/", default_table_metadata_dir_path(&namespace, &table));
+        for object in self.backend.list_objects(table_bucket, &metadata_prefix).await? {
+            if let Some(metadata_location) = metadata_location_from_metadata_file_path(&namespace, &table, &object) {
+                metadata_locations.push(metadata_location);
+            }
+        }
+        metadata_locations.sort();
+        metadata_locations.dedup();
+
+        for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
+            retained.insert(metadata_location.clone());
+        }
+
+        let cleanup_candidate_locations = metadata_locations
+            .into_iter()
+            .filter(|metadata_location| !retained.contains(metadata_location))
+            .collect();
+
+        Ok(TableMetadataMaintenanceReport {
+            current_metadata_location: entry.metadata_location,
+            retained_metadata_locations: retained.into_iter().collect(),
+            cleanup_candidate_locations,
+        })
     }
 }
 
@@ -950,6 +1026,28 @@ fn parse_namespace_for_store(namespace: &str) -> TableCatalogStoreResult<Namespa
 
 fn parse_table_for_store(table: &str) -> TableCatalogStoreResult<IdentifierSegment> {
     IdentifierSegment::parse(table).map_err(|err| TableCatalogStoreError::Invalid(format!("invalid table name: {err}")))
+}
+
+fn metadata_log_locations(
+    current_metadata: &serde_json::Value,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+) -> BTreeSet<String> {
+    let mut locations = BTreeSet::new();
+    let Some(metadata_log) = current_metadata.get("metadata-log").and_then(serde_json::Value::as_array) else {
+        return locations;
+    };
+
+    for entry in metadata_log {
+        let Some(metadata_location) = entry.get("metadata-file").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if is_valid_table_metadata_location(namespace, table, metadata_location) {
+            locations.insert(metadata_location.to_string());
+        }
+    }
+
+    locations
 }
 
 fn catalog_path_hash(value: &str) -> String {
@@ -1898,6 +1996,125 @@ mod tests {
             created_at: None,
             updated_at: None,
         }
+    }
+
+    async fn seed_table_for_metadata_maintenance(
+        store: &ObjectTableCatalogStore<TestCatalogObjectBackend>,
+        bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        current_metadata: String,
+    ) {
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store.create_namespace(test_namespace_entry(bucket, namespace)).await.unwrap();
+        store
+            .create_table(test_table_entry(bucket, namespace, table, current_metadata))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn maintenance_dry_run_keeps_current_metadata() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let v1 = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let v2 = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &v1, b"{}".to_vec()).await;
+        backend.seed_object(bucket, &v2, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+
+        assert_eq!(report.current_metadata_location, current);
+        assert!(report.retained_metadata_locations.contains(&report.current_metadata_location));
+        assert!(!report.cleanup_candidate_locations.contains(&report.current_metadata_location));
+        assert_eq!(report.cleanup_candidate_locations, vec![v1, v2]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_dry_run_keeps_metadata_log_references() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let v1 = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let logged = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let v3 = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        for metadata in [&v1, &logged, &v3] {
+            backend.seed_object(bucket, metadata, b"{}".to_vec()).await;
+        }
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [
+                        {
+                            "timestamp-ms": 1,
+                            "metadata-file": logged
+                        }
+                    ]
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+
+        assert!(report.retained_metadata_locations.contains(&current));
+        assert!(report.retained_metadata_locations.contains(&logged));
+        assert_eq!(report.cleanup_candidate_locations, vec![v1, v3]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_dry_run_keeps_recent_metadata_files_and_ignores_non_metadata_objects() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let v1 = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let v2 = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let recent = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+        let manifest = format!("{}/snap-1.avro", default_table_metadata_dir_path(&namespace, &table));
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        for metadata in [&v1, &v2, &recent] {
+            backend.seed_object(bucket, metadata, b"{}".to_vec()).await;
+        }
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        backend.seed_object(bucket, &manifest, b"manifest".to_vec()).await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 2)
+            .await
+            .unwrap();
+
+        assert!(report.retained_metadata_locations.contains(&recent));
+        assert!(report.retained_metadata_locations.contains(&current));
+        assert_eq!(report.cleanup_candidate_locations, vec![v1, v2]);
+        assert!(!report.cleanup_candidate_locations.contains(&manifest));
     }
 
     #[tokio::test]
