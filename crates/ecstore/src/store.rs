@@ -178,6 +178,61 @@ pub struct ECStore {
     pub decommission_cancelers: RwLock<Vec<Option<CancellationToken>>>,
 }
 
+/// Phase 4: Server configuration accessors
+/// These provide a unified API through ECStore for accessing server-level
+/// configuration globals. The globals remain the source of truth.
+impl ECStore {
+    /// Get the server port
+    pub fn port(&self) -> u16 {
+        crate::global::global_rustfs_port()
+    }
+
+    /// Get the server host
+    pub fn host(&self) -> String {
+        rustfs_common::GLOBAL_RUSTFS_HOST.blocking_read().clone()
+    }
+
+    /// Get the server address (host:port)
+    pub fn addr(&self) -> String {
+        rustfs_common::GLOBAL_RUSTFS_ADDR.blocking_read().clone()
+    }
+
+    /// Get the global region
+    pub fn region(&self) -> Option<s3s::region::Region> {
+        crate::global::get_global_region()
+    }
+
+    /// Get the global endpoints
+    pub fn endpoints(&self) -> EndpointServerPools {
+        crate::global::get_global_endpoints()
+    }
+
+    /// Get the server configuration
+    pub fn server_config(&self) -> Option<crate::config::Config> {
+        crate::config::get_global_server_config()
+    }
+
+    /// Get the storage class configuration
+    pub fn storage_class(&self) -> Option<crate::config::storageclass::Config> {
+        crate::config::get_global_storage_class()
+    }
+
+    /// Get the tier config manager
+    pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::tier::tier::TierConfigMgr>> {
+        crate::global::get_global_tier_config_mgr()
+    }
+
+    /// Get the notification system
+    pub fn notification_system(&self) -> Option<&'static crate::notification_sys::NotificationSys> {
+        crate::notification_sys::get_global_notification_sys()
+    }
+
+    /// Get the bucket metadata system
+    pub fn bucket_metadata_sys(&self) -> Option<Arc<tokio::sync::RwLock<crate::bucket::metadata_sys::BucketMetadataSys>>> {
+        crate::bucket::metadata_sys::get_global_bucket_metadata_sys()
+    }
+}
+
 // impl Clone for ECStore {
 //     fn clone(&self) -> Self {
 //         let pool_meta = match self.pool_meta.read() {
