@@ -302,6 +302,16 @@ affinity:
     topologyKey: kubernetes.io/hostname
   nodeAffinity: {}
 
+topologySpreadConstraints:
+  enabled: false
+  constraints: []
+    # - maxSkew: 1
+    #   topologyKey: topology.kubernetes.io/zone
+    #   whenUnsatisfiable: ScheduleAnyway
+    #   labelSelector:
+    #     matchLabels:
+    #       app.kubernetes.io/name: rustfs
+
 storageclass:
   name: local-path
   dataStorageSize: 256Mi

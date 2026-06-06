@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::server::has_path_prefix;
 use crate::server::{ServiceState, ServiceStateManager};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
@@ -126,6 +127,29 @@ pub struct ReadinessGateService<S> {
     readiness: Arc<GlobalReadiness>,
 }
 
+fn is_probe_path(path: &str) -> bool {
+    let is_exact_probe = matches!(
+        path,
+        crate::server::PROFILE_MEMORY_PATH
+            | crate::server::PROFILE_CPU_PATH
+            | crate::server::HEALTH_PREFIX
+            | crate::server::HEALTH_COMPAT_LIVE_PATH
+            | crate::server::HEALTH_READY_PATH
+            | crate::server::FAVICON_PATH
+    );
+
+    let is_prefix_probe = has_path_prefix(path, crate::server::RUSTFS_ADMIN_PREFIX)
+        || has_path_prefix(path, crate::server::MINIO_ADMIN_V3_PREFIX)
+        || has_path_prefix(path, crate::server::TABLE_CATALOG_PREFIX)
+        || has_path_prefix(path, crate::server::CONSOLE_PREFIX)
+        || has_path_prefix(path, crate::server::RPC_PREFIX)
+        || has_path_prefix(path, crate::server::ADMIN_PREFIX)
+        || has_path_prefix(path, crate::server::MINIO_ADMIN_PREFIX)
+        || has_path_prefix(path, crate::server::TONIC_PREFIX);
+
+    is_exact_probe || is_prefix_probe
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 impl<S, B> Service<HttpRequest<Incoming>> for ReadinessGateService<S>
@@ -150,27 +174,7 @@ where
         Box::pin(async move {
             let path = req.uri().path();
             debug!("ReadinessGateService: Received request for path: {}", path);
-            // 1) Exact match: fixed probe/resource path
-            let is_exact_probe = matches!(
-                path,
-                crate::server::PROFILE_MEMORY_PATH
-                    | crate::server::PROFILE_CPU_PATH
-                    | crate::server::HEALTH_PREFIX
-                    | crate::server::HEALTH_COMPAT_LIVE_PATH
-                    | crate::server::HEALTH_READY_PATH
-                    | crate::server::FAVICON_PATH
-            );
-
-            // 2) Prefix matching: the entire set of route prefixes (including their subpaths)
-            let is_prefix_probe = path.starts_with(crate::server::RUSTFS_ADMIN_PREFIX)
-                || path.starts_with(crate::server::MINIO_ADMIN_V3_PREFIX)
-                || path.starts_with(crate::server::CONSOLE_PREFIX)
-                || path.starts_with(crate::server::RPC_PREFIX)
-                || path.starts_with(crate::server::ADMIN_PREFIX)
-                || path.starts_with(crate::server::MINIO_ADMIN_PREFIX)
-                || path.starts_with(crate::server::TONIC_PREFIX);
-
-            let is_probe = is_exact_probe || is_prefix_probe;
+            let is_probe = is_probe_path(path);
             if !is_probe && !readiness.is_ready() {
                 let body: BoxBody = Full::new(Bytes::from_static(b"Service not ready"))
                     .map_err(|e| -> BoxError { Box::new(e) })
@@ -710,6 +714,17 @@ mod tests {
         assert!(err.to_string().contains("lock_quorum_ready=false"));
         assert!(!readiness.is_ready());
         assert_eq!(state_manager.current_state(), ServiceState::Starting);
+    }
+
+    #[test]
+    fn probe_path_checks_admin_boundaries() {
+        assert!(is_probe_path("/minio/admin/v3/info"));
+        assert!(is_probe_path("/rustfs/admin/v3/info"));
+        assert!(is_probe_path(&format!("{}/config", crate::server::TABLE_CATALOG_PREFIX)));
+        assert!(is_probe_path("/rustfs/console/"));
+        assert!(!is_probe_path("/minio/adminx/object"));
+        assert!(!is_probe_path("/rustfs/adminx/object"));
+        assert!(!is_probe_path("/bucket/object"));
     }
 
     #[test]

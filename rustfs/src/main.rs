@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // Ensure the correct path for parse_license is imported
-use rustfs::app::context::{AppContext, init_global_app_context};
 use rustfs::init::{
     add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
 };
@@ -31,10 +30,11 @@ use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::license::{current_license, init_license, license_status};
 use rustfs::server::{
-    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, publish_ready_when_runtime_ready,
-    shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
+    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
+    start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
+use rustfs::startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
@@ -57,7 +57,7 @@ use rustfs_ecstore::{
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
-use rustfs_iam::{init_iam_sys, init_oidc_sys};
+use rustfs_iam::init_oidc_sys;
 use rustfs_obs::{init_metrics_runtime, init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
 use rustfs_utils::{
@@ -73,11 +73,11 @@ const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -349,7 +349,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     }
     // Initialize capacity management system
     init_capacity_management().await;
-    let state_manager = ServiceStateManager::new();
+    let state_manager = Arc::new(ServiceStateManager::new());
     // Update service status to Starting
     state_manager.update(ServiceState::Starting);
 
@@ -522,8 +522,15 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // 3. Initialize IAM System (Blocking load)
     // This ensures data is in memory before moving forward
-    init_iam_sys(store.clone()).await.map_err(Error::other)?;
-    readiness.mark_stage(SystemStage::IamReady);
+    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
+    let iam_bootstrap = bootstrap_or_defer_iam_init(
+        store.clone(),
+        kms_interface,
+        readiness.clone(),
+        Some(state_manager.clone()),
+        Some(ctx.clone()),
+    )
+    .await?;
 
     // 3a. Initialize Keystone authentication if enabled
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
@@ -541,11 +548,6 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     if let Err(e) = init_oidc_sys().await {
         warn!("OIDC initialization failed (non-fatal): {}", e);
     }
-
-    let iam_interface =
-        rustfs_iam::get().map_err(|e| Error::other(format!("initialize app context IAM dependency failed: {e}")))?;
-    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-    let _app_context = init_global_app_context(AppContext::with_default_interfaces(store.clone(), iam_interface, kms_interface));
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
@@ -601,8 +603,9 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         &server_address,
         jiff::Zoned::now()
     );
-    publish_ready_when_runtime_ready(readiness.as_ref(), Some(&state_manager)).await?;
-
+    if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
+        rustfs::server::publish_ready_when_runtime_ready(readiness.as_ref(), Some(state_manager.as_ref())).await?;
+    }
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
 

@@ -520,3 +520,75 @@ async fn test_explicit_encryption_overrides_bucket_default() -> Result<(), Box<d
 
     Ok(())
 }
+
+/// Test 5: Setting SSE-KMS without a specific key ID should auto-populate the
+/// default KMS key ID so that GetBucketEncryption returns it (issue #3039).
+#[tokio::test]
+#[serial]
+async fn test_sse_kms_without_key_id_populates_default() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    info!("Testing SSE-KMS without explicit key ID populates default key");
+
+    let mut kms_env = LocalKMSTestEnvironment::new().await?;
+    let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+    let s3_client = kms_env.base_env.create_s3_client();
+    kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
+
+    // Set bucket encryption to SSE-KMS WITHOUT specifying a key ID
+    info!("Setting bucket default encryption to SSE-KMS without key ID");
+    let encryption_config = ServerSideEncryptionConfiguration::builder()
+        .rules(
+            ServerSideEncryptionRule::builder()
+                .apply_server_side_encryption_by_default(
+                    ServerSideEncryptionByDefault::builder()
+                        .sse_algorithm(ServerSideEncryption::AwsKms)
+                        .kms_master_key_id("")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .build()
+        .unwrap();
+
+    s3_client
+        .put_bucket_encryption()
+        .bucket(TEST_BUCKET)
+        .server_side_encryption_configuration(encryption_config)
+        .send()
+        .await
+        .expect("Failed to set bucket SSE-KMS encryption without key ID");
+
+    // GetBucketEncryption should return the default KMS key ID
+    info!("Verifying GetBucketEncryption returns default KMS key ID");
+    let get_response = s3_client
+        .get_bucket_encryption()
+        .bucket(TEST_BUCKET)
+        .send()
+        .await
+        .expect("Failed to get bucket encryption");
+
+    let config = get_response.server_side_encryption_configuration();
+    let rule = config
+        .and_then(|c| c.rules().first())
+        .expect("Should have at least one encryption rule");
+    let by_default = rule
+        .apply_server_side_encryption_by_default()
+        .expect("Should have ApplyServerSideEncryptionByDefault");
+
+    assert_eq!(by_default.sse_algorithm(), &ServerSideEncryption::AwsKms, "Algorithm should be aws:kms");
+    assert!(
+        by_default.kms_master_key_id().is_some(),
+        "KMS key ID should be populated with the default key (was None)"
+    );
+    assert_eq!(
+        by_default.kms_master_key_id().unwrap(),
+        &default_key_id,
+        "KMS key ID should match the configured default key"
+    );
+
+    info!("Test passed: SSE-KMS without key ID correctly populates default key '{}'", default_key_id);
+    Ok(())
+}

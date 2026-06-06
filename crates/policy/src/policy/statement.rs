@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Statement {
     #[serde(rename = "Sid", default)]
     pub sid: ID,
@@ -284,7 +285,7 @@ impl PartialEq for Statement {
 /// Bucket Policy Statement with AWS S3-compatible JSON serialization.
 /// Empty optional fields are omitted from output to match AWS format.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "PascalCase", default, deny_unknown_fields)]
 pub struct BPStatement {
     #[serde(rename = "Sid", default, skip_serializing_if = "ID::is_empty")]
     pub sid: ID,

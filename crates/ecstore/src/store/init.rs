@@ -14,7 +14,10 @@
 
 use super::*;
 use crate::error::is_err_decommission_running;
-use crate::global::is_first_cluster_node_local;
+use crate::global::{
+    GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
+    get_global_bucket_monitor, is_dist_erasure, is_first_cluster_node_local,
+};
 
 fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
@@ -244,6 +247,13 @@ impl ECStore {
             pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
+
+            local_disk_map: GLOBAL_LOCAL_DISK_MAP.clone(),
+            local_disk_id_map: GLOBAL_LOCAL_DISK_ID_MAP.clone(),
+            local_disk_set_drives: GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
+            tier_config_mgr: GLOBAL_TierConfigMgr.clone(),
+            event_notifier: GLOBAL_EventNotifier.clone(),
+            bucket_monitor: OnceLock::new(),
         });
 
         // Only set it when the global deployment ID is not yet configured
@@ -274,6 +284,10 @@ impl ECStore {
         }
 
         set_object_layer(ec.clone()).await;
+
+        if let Some(monitor) = get_global_bucket_monitor() {
+            let _ = ec.bucket_monitor.set(monitor);
+        }
 
         Ok(ec)
     }
