@@ -376,10 +376,8 @@ storageclass:
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
   pvcAnnotations:
-    data:
-      # key: value
-    logs:
-      # key: value
+    data: {}
+    logs: {}
 
 pdb:
   create: false
