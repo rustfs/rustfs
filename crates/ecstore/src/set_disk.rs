@@ -1636,8 +1636,7 @@ impl ObjectOperations for SetDisks {
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         if !src_info.metadata_only {
-            if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object])
-            {
+            if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object]) {
                 return Err(StorageError::NotImplemented);
             }
             // Self-copy with a data reader: write tier data back locally (de-tiering).
