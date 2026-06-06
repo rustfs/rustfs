@@ -43,6 +43,19 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{/*
+Render extra labels for the main Service resource.
+Merges (in order of increasing precedence):
+  - commonLabels
+  - service.labels
+*/}}
+{{- define "rustfs.serviceLabels" -}}
+{{- $labels := mergeOverwrite (dict) (default (dict) .Values.commonLabels) (default (dict) .Values.service.labels) }}
+{{- if $labels }}
+{{- toYaml $labels }}
+{{- end }}
+{{- end }}
+
+{{/*
 Selector labels
 */}}
 {{- define "rustfs.selectorLabels" -}}
