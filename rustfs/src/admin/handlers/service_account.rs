@@ -124,8 +124,18 @@ fn parse_service_account_policy(policy: &serde_json::Value) -> S3Result<Policy> 
     let policy_bytes = serde_json::to_vec(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
     Policy::parse_config(&policy_bytes).map_err(|e| {
         debug!("parse service account policy failed, e: {:?}", e);
-        let message = e.to_string().replace('\'', "");
-        s3_error!(InvalidArgument, "invalid service account policy: {}", message)
+        // Provide user-friendly error messages instead of exposing internal details
+        let error_msg = e.to_string();
+        let user_friendly_msg = if error_msg.contains("invalid type") || error_msg.contains("expected") {
+            "Policy format is invalid. Please check the JSON structure and ensure it follows the IAM policy format."
+        } else if error_msg.contains("missing field") {
+            "Policy is missing required fields. A valid policy must include Version and Statement."
+        } else if error_msg.contains("'Resource' is empty") {
+            "invalid service account policy: Resource is empty"
+        } else {
+            "Policy format is invalid. Please check the JSON structure."
+        };
+        s3_error!(InvalidArgument, "{}", user_friendly_msg)
     })
 }
 
@@ -428,7 +438,7 @@ async fn build_info_service_account_resp<T: IamStore>(
 
     let policy = effective_policy
         .map(|policy| {
-            serde_json::to_string(&policy).map_err(|e| {
+            serde_json::to_string_pretty(&policy).map_err(|e| {
                 debug!("marshal policy failed, e: {:?}", e);
                 s3_error!(InternalError, "marshal policy failed")
             })
