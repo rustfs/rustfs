@@ -18,12 +18,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 pub fn allocator_backend() -> &'static str {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     {
         "jemalloc"
     }
 
-    #[cfg(all(not(target_os = "windows"), not(any(target_os = "linux", target_os = "macos"))))]
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+    ))]
     {
         "mimalloc"
     }
@@ -82,7 +85,10 @@ fn reclaimable_work_snapshot() -> ReclaimableWorkSnapshot {
     }
 }
 
-#[cfg(all(not(target_os = "windows"), not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
 #[allow(unsafe_code)]
 fn collect_allocator_memory(force: bool) -> Result<(), String> {
     // SAFETY: `mi_collect` is provided by the active global allocator backend
@@ -94,7 +100,7 @@ fn collect_allocator_memory(force: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 fn collect_allocator_memory(_force: bool) -> Result<(), String> {
     let _ = tikv_jemalloc_ctl::background_thread::write(true);
     tikv_jemalloc_ctl::epoch::advance().map_err(|err| err.to_string())?;

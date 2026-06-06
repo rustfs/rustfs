@@ -164,10 +164,10 @@ pub(super) fn init_observability_http(
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     let profiling_agent = init_profiler(config);
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     let memory_profiling_agent = init_memory_profiler(config);
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
@@ -210,7 +210,7 @@ pub(super) fn init_observability_http(
         let file_logging_result = (|| -> Result<_, TelemetryError> {
             fs::create_dir_all(log_directory).map_err(|e| TelemetryError::Io(e.to_string()))?;
 
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
             crate::telemetry::local::ensure_dir_permissions(log_directory)?;
 
             let rotation_str = config
@@ -317,9 +317,9 @@ pub(super) fn init_observability_http(
         tracer_provider,
         meter_provider,
         logger_provider,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         profiling_agent,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         memory_profiling_agent,
         tracing_guard,
         stdout_guard,
@@ -496,7 +496,7 @@ fn build_logger_provider(
 /// Returns `None` when profiling export is disabled, when no usable
 /// profiling endpoint is configured, or when building or starting the agent
 /// fails.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
@@ -541,7 +541,7 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
 ///
 /// Returns `None` when profiling export is disabled, the endpoint is missing,
 /// jemalloc profiling is not activated, or the agent fails to build/start.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 fn init_memory_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
     use pyroscope::backend::jemalloc_backend;
     use pyroscope::pyroscope::PyroscopeAgentBuilder;

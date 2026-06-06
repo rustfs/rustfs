@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 mod unsupported_impl {
     use std::path::PathBuf;
     use std::time::Duration;
@@ -57,10 +57,10 @@ mod unsupported_impl {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 pub use unsupported_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 mod linux_impl {
     use jemalloc_pprof::PROF_CTL;
     use pprof::protos::Message;
@@ -369,5 +369,5 @@ mod linux_impl {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 pub use linux_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};
