@@ -42,6 +42,9 @@ metadata:
     {{- with .Values.commonLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   {{- if eq $serviceType "ClusterIP" }}
   type: ClusterIP
