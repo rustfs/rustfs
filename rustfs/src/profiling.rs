@@ -377,6 +377,7 @@ mod linux_impl {
         }
     }
 
+    #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
     fn memory_profiling_unsupported_message() -> String {
         let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
         format!(
