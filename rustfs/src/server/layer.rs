@@ -19,8 +19,8 @@ use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report,
-    is_admin_path,
+    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TABLE_CATALOG_PREFIX, active_http_requests,
+    collect_dependency_readiness_report, has_path_prefix, is_admin_path,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
@@ -284,6 +284,10 @@ fn should_force_zero_content_length_for_empty_body_route<B>(req: &HttpRequest<B>
         return false;
     }
 
+    if is_empty_body_console_path(req.method(), req.uri()) {
+        return true;
+    }
+
     is_empty_body_s3_path(req.method(), req.uri())
 }
 
@@ -335,7 +339,11 @@ fn is_heal_status_query(path: &str, query: Option<&str>) -> bool {
 }
 
 fn is_empty_body_s3_path(method: &Method, uri: &http::Uri) -> bool {
-    *method == Method::DELETE && ConditionalCorsLayer::is_s3_path(uri.path())
+    matches!(*method, Method::GET | Method::HEAD | Method::DELETE) && ConditionalCorsLayer::is_s3_path(uri.path())
+}
+
+fn is_empty_body_console_path(method: &Method, uri: &http::Uri) -> bool {
+    matches!(*method, Method::GET | Method::HEAD) && is_console_path(uri.path())
 }
 
 #[derive(Clone)]
@@ -852,12 +860,13 @@ fn is_object_attributes_request(req: &HttpRequest<Incoming>) -> bool {
     }
 
     let path = req.uri().path();
-    if path.starts_with(ADMIN_PREFIX)
-        || path.starts_with(MINIO_ADMIN_PREFIX)
-        || path.starts_with(RUSTFS_ADMIN_PREFIX)
-        || path.starts_with(MINIO_ADMIN_V3_PREFIX)
-        || path.starts_with(CONSOLE_PREFIX)
-        || path.starts_with(RPC_PREFIX)
+    if has_path_prefix(path, ADMIN_PREFIX)
+        || has_path_prefix(path, MINIO_ADMIN_PREFIX)
+        || has_path_prefix(path, RUSTFS_ADMIN_PREFIX)
+        || has_path_prefix(path, MINIO_ADMIN_V3_PREFIX)
+        || has_path_prefix(path, TABLE_CATALOG_PREFIX)
+        || has_path_prefix(path, CONSOLE_PREFIX)
+        || has_path_prefix(path, RPC_PREFIX)
     {
         return false;
     }
@@ -898,9 +907,10 @@ impl ConditionalCorsLayer {
 
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
-        !path.starts_with(ADMIN_PREFIX)
-            && !path.starts_with(MINIO_ADMIN_PREFIX)
-            && !path.starts_with(RPC_PREFIX)
+        !has_path_prefix(path, ADMIN_PREFIX)
+            && !has_path_prefix(path, MINIO_ADMIN_PREFIX)
+            && !has_path_prefix(path, TABLE_CATALOG_PREFIX)
+            && !has_path_prefix(path, RPC_PREFIX)
             && !is_console_path(path)
             && !Self::EXCLUDED_EXACT_PATHS.contains(&path)
     }
@@ -1135,6 +1145,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::{FAVICON_PATH, LICENSE, VERSION};
     use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::BodyExt;
@@ -1456,14 +1467,8 @@ mod tests {
     }
 
     #[test]
-    fn non_admin_get_without_content_length_is_not_normalized() {
-        let paths = [
-            "/bucket/object",
-            "/rustfs/administrator/object",
-            "/minio/administrator/object",
-            "/rustfs/adminx/object",
-            "/minio/adminx/object",
-        ];
+    fn non_s3_non_admin_get_without_content_length_is_not_normalized() {
+        let paths = ["/rustfs/rpc/read_file_stream", "/health", "/profile/cpu"];
 
         for path in paths {
             let request = Request::builder().method(Method::GET).uri(path).body(()).expect("request");
@@ -1490,6 +1495,107 @@ mod tests {
 
         let headers = headers.lock().expect("captured headers").take().expect("captured headers");
         assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
+    }
+
+    #[test]
+    fn s3_empty_body_get_without_content_length_is_normalized() {
+        let paths = [
+            "/?x-id=ListBuckets",
+            "/",
+            "/bucket?list-type=2",
+            "/bucket/object.txt",
+            "/rustfs/administrator/object",
+            "/minio/adminx/object",
+        ];
+
+        for path in paths {
+            let request = Request::builder().method(Method::GET).uri(path).body(()).expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_empty_body_head_without_content_length_is_normalized() {
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri("/bucket/object.txt")
+            .body(())
+            .expect("request");
+
+        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn console_empty_body_get_without_content_length_is_normalized() {
+        let paths = [
+            FAVICON_PATH.to_string(),
+            format!("{CONSOLE_PREFIX}{LICENSE}"),
+            format!("{CONSOLE_PREFIX}{VERSION}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_COMPAT_LIVE_PATH}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+            format!("{CONSOLE_PREFIX}/index.html"),
+            format!("{CONSOLE_PREFIX}/assets/app.js"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path.as_str())
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
+    fn console_empty_body_head_without_content_length_is_normalized() {
+        let paths = [
+            format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_COMPAT_LIVE_PATH}"),
+            format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+            format!("{CONSOLE_PREFIX}/index.html"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::HEAD)
+                .uri(path.as_str())
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_body_layer_inserts_zero_content_length_for_s3_and_console_get() {
+        for path in ["/?x-id=ListBuckets".to_string(), format!("{CONSOLE_PREFIX}/index.html")] {
+            let capture = HeaderCaptureService::default();
+            let headers = capture.headers();
+            let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path.as_str())
+                .body(())
+                .expect("request");
+
+            let _ = service.call(request).await.expect("service call");
+
+            let headers = headers.lock().expect("captured headers").take().expect("captured headers");
+            assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
+        }
     }
 
     #[tokio::test]
@@ -1694,6 +1800,41 @@ mod tests {
     }
 
     #[test]
+    fn s3_get_with_transfer_encoding_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/?x-id=ListBuckets")
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn console_get_with_transfer_encoding_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("{CONSOLE_PREFIX}/index.html"))
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
+    fn console_post_without_content_length_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{CONSOLE_PREFIX}/upload"))
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
+    }
+
+    #[test]
     fn non_s3_delete_paths_are_not_normalized() {
         let paths = [
             "/minio/admin/v3/pools/cancel?versionId=unused",
@@ -1819,6 +1960,8 @@ mod tests {
         assert!(ConditionalCorsLayer::is_s3_path("/"));
         assert!(!ConditionalCorsLayer::is_s3_path("/rustfs/admin/v3/info"));
         assert!(!ConditionalCorsLayer::is_s3_path("/minio/admin/v3/info"));
+        assert!(!ConditionalCorsLayer::is_s3_path(&format!("{TABLE_CATALOG_PREFIX}/config")));
+        assert!(ConditionalCorsLayer::is_s3_path("/minio/adminx/object"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health"));
         assert!(!ConditionalCorsLayer::is_s3_path("/health/ready"));
     }

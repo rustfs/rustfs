@@ -884,7 +884,7 @@ fn process_connection(
                     let stream = TokioIo::new(tls_socket);
                     let conn = http_server.serve_connection(stream, hybrid_service);
                     if let Err(err) = graceful.watch(conn).await {
-                        handle_connection_error(&*err);
+                        handle_connection_error(Some(peer_addr.as_str()), &*err);
                     }
                 }
                 Err(err) => {
@@ -921,10 +921,11 @@ fn process_connection(
             debug!("TLS handshake success");
         } else {
             debug!("Http handshake start");
+            let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
             let stream = TokioIo::new(socket);
             let conn = http_server.serve_connection(stream, hybrid_service);
             if let Err(err) = graceful.watch(conn).await {
-                handle_connection_error(&*err);
+                handle_connection_error(peer_addr.as_deref(), &*err);
             }
             debug!("Http handshake success");
         };
@@ -932,34 +933,46 @@ fn process_connection(
 }
 
 /// Handles connection errors by logging them with appropriate severity
-fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
+fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error + 'static)) {
     let s = err.to_string();
     if s.contains("connection reset") || s.contains("broken pipe") {
-        warn!("The connection was reset by the peer or broken pipe: {}", s);
+        warn!(
+            peer_addr = %peer_addr.unwrap_or("unknown"),
+            "The connection was reset by the peer or broken pipe: {}", s
+        );
         // Ignore common non-fatal errors
         return;
     }
 
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
         if hyper_err.is_incomplete_message() {
-            warn!("The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err);
+            warn!(
+                peer_addr = %peer_addr.unwrap_or("unknown"),
+                "The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err
+            );
         } else if hyper_err.is_closed() {
-            warn!("The HTTP connection is closed:{}", hyper_err);
+            warn!(peer_addr = %peer_addr.unwrap_or("unknown"), "The HTTP connection is closed:{}", hyper_err);
         } else if hyper_err.is_parse() {
-            error!("HTTP message parsing failed:{}", hyper_err);
+            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "HTTP message parsing failed:{}", hyper_err);
         } else if hyper_err.is_user() {
-            error!("HTTP user-custom error:{}", hyper_err);
+            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "HTTP user-custom error:{}", hyper_err);
         } else if hyper_err.is_canceled() {
-            warn!("The HTTP connection is canceled:{}", hyper_err);
+            warn!(
+                peer_addr = %peer_addr.unwrap_or("unknown"),
+                "The HTTP connection is canceled:{}", hyper_err
+            );
         } else if format!("{:?}", hyper_err).contains("HeaderTimeout") {
-            warn!("The HTTP connection timed out (HeaderTimeout): {}", hyper_err);
+            info!(
+                peer_addr = %peer_addr.unwrap_or("unknown"),
+                "The HTTP connection timed out while reading request headers (HeaderTimeout): {}", hyper_err
+            );
         } else {
-            error!("Unknown hyper error:{:?}", hyper_err);
+            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown hyper error:{:?}", hyper_err);
         }
     } else if let Some(io_err) = err.downcast_ref::<Error>() {
-        error!("Unknown connection IO error:{}", io_err);
+        error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown connection IO error:{}", io_err);
     } else {
-        error!("Unknown connection error type:{:?}", err);
+        error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown connection error type:{:?}", err);
     }
 }
 

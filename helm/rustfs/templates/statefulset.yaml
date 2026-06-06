@@ -60,6 +60,10 @@ spec:
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       {{- end }}
+      {{- if and .Values.topologySpreadConstraints.enabled .Values.topologySpreadConstraints.constraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.topologySpreadConstraints.constraints | nindent 8 }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:

@@ -37,6 +37,7 @@ use crate::storage::sse::{
 };
 use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use crate::storage::*;
+use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -152,6 +153,12 @@ fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
     };
 
     has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
+}
+
+async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
+    table_catalog::validate_bucket_object_mutation(bucket, key)
+        .await
+        .map_err(|_| s3_error!(InvalidRequest, "{}", table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE))
 }
 
 struct DeadlockRequestGuard {
@@ -1772,6 +1779,7 @@ impl DefaultObjectUsecase {
 
         // Validate object key
         validate_object_key(&key, request_method_name)?;
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         if let Some(size) = content_length {
             self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
@@ -2735,6 +2743,7 @@ impl DefaultObjectUsecase {
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         // AWS S3 allows self-copy when metadata directive is REPLACE (used to update metadata in-place).
         // Reject only when the directive is not REPLACE.
@@ -3116,6 +3125,16 @@ impl DefaultObjectUsecase {
                 }
             }
 
+            if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await {
+                delete_results[idx].error = Some(Error {
+                    code: Some("InvalidRequest".to_string()),
+                    key: Some(obj_id.key.clone()),
+                    message: Some(err.to_string()),
+                    version_id: version_id.clone(),
+                });
+                continue;
+            }
+
             let mut object = ObjectToDelete {
                 object_name: obj_id.key.clone(),
                 version_id: version_uuid,
@@ -3355,6 +3374,7 @@ impl DefaultObjectUsecase {
 
         // Validate object key
         validate_object_key(&key, "DELETE")?;
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let replica = req
             .headers
@@ -3910,6 +3930,8 @@ impl DefaultObjectUsecase {
             ..
         } = req.input.clone();
 
+        validate_table_catalog_object_mutation(&bucket, &object).await?;
+
         let rreq = rreq.ok_or_else(|| {
             S3Error::with_message(S3ErrorCode::Custom("ErrValidRestoreObject".into()), "restore request is required")
         })?;
@@ -4204,6 +4226,7 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(UnexpectedContent));
         }
         validate_object_key(&key, "PUT")?;
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
         self.check_bucket_quota(&bucket, QuotaOperation::PutObject, size as u64)
             .await?;
 
@@ -4310,6 +4333,7 @@ impl DefaultObjectUsecase {
                     return Err(err);
                 }
             };
+            validate_table_catalog_object_mutation(&bucket, &fpath).await?;
 
             let mut auth_req = S3Request {
                 input: PutObjectInput::default(),

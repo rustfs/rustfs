@@ -14,10 +14,12 @@
 
 #![allow(clippy::map_entry)]
 
+use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
 };
+use crate::bucket::metadata_sys::get_global_bucket_metadata_sys;
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::check_abort_multipart_args;
 use crate::bucket::utils::check_complete_multipart_args;
@@ -32,6 +34,7 @@ use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::config::storageclass;
+use crate::config::{get_global_server_config, get_global_storage_class};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -39,11 +42,12 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
+use crate::event_notification::EventNotifier;
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, get_global_bucket_monitor,
-    get_global_deployment_id, get_global_endpoints, init_global_bucket_monitor, is_dist_erasure, is_erasure_sd,
-    set_global_deployment_id, set_object_layer,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives, get_global_deployment_id, get_global_endpoints,
+    get_global_region, get_global_tier_config_mgr, init_global_bucket_monitor, is_erasure_sd, set_global_deployment_id,
+    set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -53,6 +57,7 @@ use crate::store_api::{
     ListMultipartsInfo, ListObjectVersionsInfo, ListPartsInfo, MultipartInfo, ObjectIO, ObjectInfoOrErr, WalkOptions,
 };
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
+use crate::tier::tier::TierConfigMgr;
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
@@ -82,7 +87,11 @@ use std::net::SocketAddr;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::RwLock;
@@ -165,7 +174,6 @@ pub use peer::{
     has_space_for, init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
 };
 
-#[derive(Debug)]
 pub struct ECStore {
     pub id: Uuid,
     // pub disks: Vec<DiskStore>,
@@ -176,6 +184,94 @@ pub struct ECStore {
     pub pool_meta: RwLock<PoolMeta>,
     pub rebalance_meta: RwLock<Option<RebalanceMeta>>,
     pub decommission_cancelers: RwLock<Vec<Option<CancellationToken>>>,
+
+    // Phase 2 migration pending - do not use directly.
+    /// Local disk maps (migrated from GLOBAL_LOCAL_DISK_MAP/ID_MAP/SET_DRIVES)
+    pub(crate) local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
+    pub(crate) local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
+    pub(crate) local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
+    /// Tier config manager (migrated from GLOBAL_TierConfigMgr)
+    pub(crate) tier_config_mgr: Arc<RwLock<TierConfigMgr>>,
+    /// Event notifier (migrated from GLOBAL_EventNotifier)
+    pub(crate) event_notifier: Arc<RwLock<EventNotifier>>,
+    /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
+    pub(crate) bucket_monitor: OnceLock<Arc<Monitor>>,
+}
+
+impl std::fmt::Debug for ECStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ECStore")
+            .field("id", &self.id)
+            .field("disk_map", &self.disk_map)
+            .field("pools", &self.pools)
+            .field("pool_meta", &self.pool_meta)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Phase 2: Accessor methods for config globals
+/// These delegate to the process-global statics. No local state — the globals
+/// remain the single source of truth until the migration is complete.
+impl ECStore {
+    /// Get server configuration (delegates to global)
+    pub fn get_server_config(&self) -> Option<crate::config::Config> {
+        crate::config::get_global_server_config()
+    }
+
+    /// Set server configuration (delegates to global)
+    pub fn set_server_config(&self, cfg: crate::config::Config) {
+        crate::config::set_global_server_config(cfg);
+    }
+
+    /// Get storage class configuration (delegates to global)
+    pub fn get_storage_class(&self) -> Option<crate::config::storageclass::Config> {
+        crate::config::get_global_storage_class()
+    }
+
+    /// Set storage class configuration (delegates to global)
+    pub fn set_storage_class(&self, cfg: crate::config::storageclass::Config) {
+        crate::config::set_global_storage_class(cfg);
+    }
+}
+
+/// Phase 3: Accessor methods for service globals
+/// These provide a unified API through ECStore for accessing cross-cutting
+/// service singletons. The globals remain the source of truth.
+impl ECStore {
+    /// Get the notification system
+    pub fn notification_system(&self) -> Option<&'static crate::notification_sys::NotificationSys> {
+        get_global_notification_sys()
+    }
+
+    /// Get the bucket metadata system
+    pub fn bucket_metadata_sys(&self) -> Option<Arc<tokio::sync::RwLock<crate::bucket::metadata_sys::BucketMetadataSys>>> {
+        get_global_bucket_metadata_sys()
+    }
+
+    /// Get the global endpoints
+    pub fn endpoints(&self) -> EndpointServerPools {
+        get_global_endpoints()
+    }
+
+    /// Get the global region
+    pub fn region(&self) -> Option<s3s::region::Region> {
+        get_global_region()
+    }
+
+    /// Get the tier config manager
+    pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::tier::tier::TierConfigMgr>> {
+        get_global_tier_config_mgr()
+    }
+
+    /// Get the server configuration
+    pub fn server_config(&self) -> Option<crate::config::Config> {
+        get_global_server_config()
+    }
+
+    /// Get the storage class configuration
+    pub fn storage_class(&self) -> Option<crate::config::storageclass::Config> {
+        get_global_storage_class()
+    }
 }
 
 // impl Clone for ECStore {

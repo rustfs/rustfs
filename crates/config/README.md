@@ -70,6 +70,9 @@ Current guidance:
 - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
 - `RUSTFS_SCANNER_IDLE_MODE` (canonical)
 - `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (canonical)
+- `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (canonical)
+- `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
+- `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
 
 ## Health compatibility switches
 

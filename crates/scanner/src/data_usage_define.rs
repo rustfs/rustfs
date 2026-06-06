@@ -23,6 +23,7 @@ use std::{
 
 use http::HeaderMap;
 use metrics::{counter, describe_counter, describe_histogram, histogram};
+#[cfg(test)]
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, hash_path,
@@ -47,7 +48,6 @@ const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
-const DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT: u64 = 30;
 const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
 const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX: u64 = 5;
 const DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES: u32 = 0;
@@ -56,6 +56,8 @@ const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout
 const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_total";
 const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
 static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
+
+pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
 
 // Data usage paths (computed at runtime)
 pub static DATA_USAGE_BUCKET: LazyLock<String> =
@@ -209,6 +211,32 @@ pub struct ReplTargetSizeSummary {
 
 // ===== Cache-related data structures =====
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataUsageScanCheckpointReason {
+    Runtime,
+    Objects,
+    Directories,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageScanCheckpoint {
+    pub version: u16,
+    pub resume_after: String,
+    pub reason: DataUsageScanCheckpointReason,
+}
+
+impl DataUsageScanCheckpoint {
+    pub fn new(resume_after: String, reason: DataUsageScanCheckpointReason) -> Self {
+        Self {
+            version: DATA_USAGE_SCAN_CHECKPOINT_VERSION,
+            resume_after,
+            reason,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageEntryInfo {
     pub name: String,
@@ -227,6 +255,10 @@ pub struct DataUsageCacheInfo {
     pub replication: Option<Arc<ReplicationConfig>>,
     #[serde(default)]
     pub failed_objects: HashMap<String, u64>,
+    #[serde(default)]
+    pub scan_resume_after: Option<String>,
+    #[serde(default)]
+    pub scan_checkpoint: Option<DataUsageScanCheckpoint>,
 }
 
 /// Data usage cache
@@ -749,9 +781,7 @@ impl DataUsageCache {
     }
 
     fn cache_save_timeout() -> Duration {
-        Duration::from_secs(
-            rustfs_utils::get_env_u64(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT).max(1),
-        )
+        crate::runtime_config::scanner_cache_save_timeout()
     }
 
     fn backup_cache_save_timeout(timeout_duration: Duration) -> Duration {
@@ -1025,6 +1055,63 @@ mod tests {
     }
 
     #[test]
+    fn test_data_usage_cache_info_deserialize_defaults_scan_resume_after() {
+        let value = serde_json::json!({
+            "name": "bucket",
+            "next_cycle": 7,
+            "last_update": null,
+            "skip_healing": false,
+            "lifecycle": null,
+            "replication": null,
+            "failed_objects": {}
+        });
+
+        let decoded: DataUsageCacheInfo = serde_json::from_value(value).expect("Failed to deserialize cache info");
+
+        assert_eq!(decoded.name, "bucket");
+        assert_eq!(decoded.next_cycle, 7);
+        assert!(decoded.scan_resume_after.is_none());
+        assert!(decoded.scan_checkpoint.is_none());
+    }
+
+    #[test]
+    fn test_data_usage_cache_info_unmarshal_old_msgpack_defaults_scan_resume_after() {
+        #[derive(Serialize)]
+        struct OldDataUsageCacheInfo {
+            name: String,
+            next_cycle: u64,
+            last_update: Option<SystemTime>,
+            skip_healing: bool,
+            lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
+            replication: Option<Arc<ReplicationConfig>>,
+            failed_objects: HashMap<String, u64>,
+        }
+
+        let old_info = OldDataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            last_update: None,
+            skip_healing: true,
+            lifecycle: None,
+            replication: None,
+            failed_objects: HashMap::from([("bad-object".to_string(), 11)]),
+        };
+        let mut buf = Vec::new();
+        old_info
+            .serialize(&mut rmp_serde::Serializer::new(&mut buf))
+            .expect("Failed to serialize old cache info");
+
+        let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&buf).expect("Failed to deserialize old cache info");
+
+        assert_eq!(decoded.name, "bucket");
+        assert_eq!(decoded.next_cycle, 7);
+        assert!(decoded.skip_healing);
+        assert_eq!(decoded.failed_objects.get("bad-object"), Some(&11));
+        assert!(decoded.scan_resume_after.is_none());
+        assert!(decoded.scan_checkpoint.is_none());
+    }
+
+    #[test]
     fn test_data_usage_cache_mutations_update_in_place() {
         let mut cache = DataUsageCache {
             info: DataUsageCacheInfo {
@@ -1138,22 +1225,27 @@ mod tests {
     #[test]
     fn test_cache_save_timeout_uses_default_when_env_missing() {
         with_var_unset(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(
                 DataUsageCache::cache_save_timeout(),
-                Duration::from_secs(DATA_USAGE_CACHE_SAVE_TIMEOUT_SECS_DEFAULT)
+                Duration::from_secs(rustfs_config::DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)
             );
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
     fn test_cache_save_timeout_respects_env_and_minimum_bound() {
         with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(7));
         });
 
         with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("0"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
             assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(1));
         });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[tokio::test]

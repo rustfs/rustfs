@@ -33,6 +33,7 @@ use crate::storage::sse::{
     extract_ssekms_context_from_headers, map_get_object_reader_error, mark_encrypted_multipart_metadata,
 };
 use crate::storage::*;
+use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, Uri};
@@ -142,6 +143,12 @@ fn normalize_complete_multipart_parts(parts: Vec<CompletePart>) -> S3Result<Vec<
 
     validate_complete_multipart_parts(&deduped_reversed)?;
     Ok(deduped_reversed)
+}
+
+async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
+    table_catalog::validate_bucket_object_mutation(bucket, key)
+        .await
+        .map_err(|_| s3_error!(InvalidRequest, "{}", table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE))
 }
 
 fn has_complete_multipart_object_lock_headers(headers: &HeaderMap) -> bool {
@@ -277,6 +284,8 @@ impl DefaultMultipartUsecase {
             if_none_match,
             ..
         } = input;
+
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         if if_match.is_some() || if_none_match.is_some() {
             let Some(store) = new_object_layer_fn() else {
@@ -537,6 +546,8 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
 
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -686,6 +697,8 @@ impl DefaultMultipartUsecase {
         } = input;
 
         let part_id = parse_upload_part_number(part_number)?;
+
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let mut size = content_length;
         let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
@@ -1019,6 +1032,8 @@ impl DefaultMultipartUsecase {
         };
 
         let part_id = parse_upload_part_number(part_number)?;
+
+        validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
