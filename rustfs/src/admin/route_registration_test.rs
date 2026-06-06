@@ -15,11 +15,15 @@
 use crate::admin::{
     handlers::{
         audit, bucket_meta, config_admin, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools,
-        profile_admin, quota, rebalance, replication, scanner, site_replication, sts, system, tier, tls_debug, user,
+        profile_admin, quota, rebalance, replication, scanner, site_replication, sts, system, table_catalog, tier, tls_debug,
+        user,
     },
     router::{AdminOperation, S3Router},
 };
-use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
+use crate::server::{
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
+    TABLE_CATALOG_PREFIX,
+};
 use hyper::Method;
 use serial_test::serial;
 use temp_env::with_var;
@@ -30,6 +34,10 @@ fn admin_path(path: &str) -> String {
 
 fn compat_admin_alias_path(path: &str) -> String {
     format!("{}{}", MINIO_ADMIN_PREFIX, path)
+}
+
+fn table_catalog_path(path: &str) -> String {
+    format!("{}{}", TABLE_CATALOG_PREFIX, path)
 }
 
 fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
@@ -64,6 +72,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     tls_debug::register_tls_debug_route(router).expect("register tls debug route");
     kms::register_kms_route(router).expect("register kms route");
     oidc::register_oidc_route(router).expect("register oidc route");
+    table_catalog::register_table_catalog_route(router).expect("register table catalog route");
 }
 
 // register_admin_routes reads ENV_HEALTH_ENDPOINT_ENABLE to decide whether
@@ -125,6 +134,18 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/config"));
     assert_route(&router, Method::PUT, &admin_path("/v3/config"));
     assert_route(&router, Method::GET, &admin_path("/v3/scanner/status"));
+
+    assert_route(&router, Method::GET, &table_catalog_path("/config"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales"));
+    assert_route(&router, Method::DELETE, &table_catalog_path("/analytics/namespaces/sales"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/register"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(&router, Method::DELETE, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));

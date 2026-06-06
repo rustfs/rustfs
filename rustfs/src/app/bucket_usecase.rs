@@ -1501,9 +1501,28 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
         let PutBucketEncryptionInput {
             bucket,
-            server_side_encryption_configuration,
+            mut server_side_encryption_configuration,
             ..
         } = req.input;
+
+        // When SSE-KMS is set without a specific key ID, populate the default
+        // KMS key so that GetBucketEncryption responses include it. Clients like
+        // mc rely on the presence of KMSMasterKeyID to distinguish SSE-KMS from
+        // SSE-S3 in their display logic.
+        if let Some(rule) = server_side_encryption_configuration.rules.first_mut()
+            && let Some(ref mut by_default) = rule.apply_server_side_encryption_by_default
+            && by_default.sse_algorithm.as_str() == ServerSideEncryption::AWS_KMS
+            && by_default.kms_master_key_id.as_deref().is_none_or(str::is_empty)
+        {
+            let service = rustfs_kms::service_manager::get_global_encryption_service()
+                .await
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "KMS service not initialized".to_string()))?;
+            let default_key = service
+                .get_default_key_id()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "KMS default key not configured".to_string()))?;
+            by_default.kms_master_key_id = Some(default_key.clone());
+        }
 
         info!("sse_config {:?}", &server_side_encryption_configuration);
 

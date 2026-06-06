@@ -57,6 +57,8 @@ const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_tot
 const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
 static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
 
+pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
+
 // Data usage paths (computed at runtime)
 pub static DATA_USAGE_BUCKET: LazyLock<String> =
     LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{BUCKET_META_PREFIX}"));
@@ -209,6 +211,32 @@ pub struct ReplTargetSizeSummary {
 
 // ===== Cache-related data structures =====
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataUsageScanCheckpointReason {
+    Runtime,
+    Objects,
+    Directories,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageScanCheckpoint {
+    pub version: u16,
+    pub resume_after: String,
+    pub reason: DataUsageScanCheckpointReason,
+}
+
+impl DataUsageScanCheckpoint {
+    pub fn new(resume_after: String, reason: DataUsageScanCheckpointReason) -> Self {
+        Self {
+            version: DATA_USAGE_SCAN_CHECKPOINT_VERSION,
+            resume_after,
+            reason,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageEntryInfo {
     pub name: String,
@@ -229,6 +257,8 @@ pub struct DataUsageCacheInfo {
     pub failed_objects: HashMap<String, u64>,
     #[serde(default)]
     pub scan_resume_after: Option<String>,
+    #[serde(default)]
+    pub scan_checkpoint: Option<DataUsageScanCheckpoint>,
 }
 
 /// Data usage cache
@@ -1041,6 +1071,7 @@ mod tests {
         assert_eq!(decoded.name, "bucket");
         assert_eq!(decoded.next_cycle, 7);
         assert!(decoded.scan_resume_after.is_none());
+        assert!(decoded.scan_checkpoint.is_none());
     }
 
     #[test]
@@ -1077,6 +1108,7 @@ mod tests {
         assert!(decoded.skip_healing);
         assert_eq!(decoded.failed_objects.get("bad-object"), Some(&11));
         assert!(decoded.scan_resume_after.is_none());
+        assert!(decoded.scan_checkpoint.is_none());
     }
 
     #[test]

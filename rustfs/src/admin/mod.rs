@@ -28,7 +28,7 @@ mod route_registration_test;
 
 use handlers::{
     audit, bucket_meta, config_admin, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools,
-    profile_admin, quota, rebalance, replication, scanner, site_replication, sts, system, tier, tls_debug, user,
+    profile_admin, quota, rebalance, replication, scanner, site_replication, sts, system, table_catalog, tier, tls_debug, user,
 };
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;
@@ -70,6 +70,7 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
     tls_debug::register_tls_debug_route(&mut r)?;
     kms::register_kms_route(&mut r)?;
     oidc::register_oidc_route(&mut r)?;
+    table_catalog::register_table_catalog_route(&mut r)?;
 
     Ok(r)
 }
