@@ -22,57 +22,44 @@ use crate::table_catalog::DEFAULT_WAREHOUSE_ID;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_ecstore::{bucket::metadata_sys, new_object_layer_fn, store::ECStore};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
-use serde::Serialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const WAREHOUSE_PROPERTY: &str = "warehouse";
 const UNSUPPORTED_OPERATION_TYPE: &str = "UnsupportedOperationException";
 const UNSUPPORTED_OPERATION_STATUS: StatusCode = StatusCode::NOT_ACCEPTABLE;
+const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
+    "GET /{warehouse}/namespaces",
+    "POST /{warehouse}/namespaces",
+    "GET /{warehouse}/namespaces/{namespace}",
+    "DELETE /{warehouse}/namespaces/{namespace}",
+    "GET /{warehouse}/namespaces/{namespace}/tables",
+    "POST /{warehouse}/namespaces/{namespace}/tables",
+    "POST /{warehouse}/namespaces/{namespace}/register",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}",
+    "DELETE /{warehouse}/namespaces/{namespace}/tables/{table}",
+];
 
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
-static LIST_NAMESPACES_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::GetTableNamespaceAction,
-    operation: "list namespaces",
-};
-static CREATE_NAMESPACE_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::SetTableNamespaceAction,
-    operation: "create namespace",
-};
-static GET_NAMESPACE_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::GetTableNamespaceAction,
-    operation: "get namespace",
-};
-static DROP_NAMESPACE_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::DeleteTableNamespaceAction,
-    operation: "drop namespace",
-};
-static LIST_TABLES_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::GetTableAction,
-    operation: "list tables",
-};
-static CREATE_TABLE_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::CreateTableAction,
-    operation: "create table",
-};
-static REGISTER_TABLE_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::RegisterTableAction,
-    operation: "register table",
-};
-static LOAD_TABLE_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::GetTableAction,
-    operation: "load table",
-};
+static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
+static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
+static GET_NAMESPACE_HANDLER: RestGetNamespaceHandler = RestGetNamespaceHandler {};
+static DROP_NAMESPACE_HANDLER: RestDropNamespaceHandler = RestDropNamespaceHandler {};
+static LIST_TABLES_HANDLER: RestListTablesHandler = RestListTablesHandler {};
+static CREATE_TABLE_HANDLER: RestCreateTableHandler = RestCreateTableHandler {};
+static REGISTER_TABLE_HANDLER: RestRegisterTableHandler = RestRegisterTableHandler {};
+static LOAD_TABLE_HANDLER: RestLoadTableHandler = RestLoadTableHandler {};
 static COMMIT_TABLE_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
     action: AdminAction::CommitTableAction,
     operation: "commit table",
 };
-static DROP_TABLE_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::DeleteTableAction,
-    operation: "drop table",
-};
+static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
 
 #[derive(Debug, Serialize)]
 struct CatalogConfigResponse {
@@ -92,6 +79,64 @@ struct RestCatalogError {
     #[serde(rename = "type")]
     error_type: &'static str,
     code: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateNamespaceRequest {
+    namespace: Vec<String>,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterTableRequest {
+    name: String,
+    #[serde(rename = "metadata-location")]
+    metadata_location: String,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateTableRequest {
+    name: String,
+    #[serde(rename = "metadata-location")]
+    metadata_location: String,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestNamespaceResponse {
+    namespace: Vec<String>,
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestListNamespacesResponse {
+    namespaces: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestTableIdentifier {
+    namespace: Vec<String>,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RestListTablesResponse {
+    identifiers: Vec<RestTableIdentifier>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestLoadTableResponse {
+    #[serde(rename = "metadata-location")]
+    metadata_location: String,
+    metadata: serde_json::Value,
+    config: BTreeMap<String, String>,
 }
 
 pub fn register_table_catalog_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -158,7 +203,7 @@ fn catalog_config_response() -> CatalogConfigResponse {
     CatalogConfigResponse {
         defaults: BTreeMap::from([(WAREHOUSE_PROPERTY, DEFAULT_WAREHOUSE_ID)]),
         overrides: BTreeMap::new(),
-        endpoints: Vec::new(),
+        endpoints: TABLE_CATALOG_ENDPOINTS.to_vec(),
     }
 }
 
@@ -201,6 +246,349 @@ fn unsupported_response(operation: &str) -> S3Result<S3Response<(StatusCode, Bod
     )
 }
 
+async fn read_json_body<T: DeserializeOwned>(mut input: Body) -> S3Result<T> {
+    let body = input
+        .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+        .await
+        .map_err(|err| s3_error!(InvalidRequest, "failed to read request body: {}", err))?;
+    if body.is_empty() {
+        return Err(s3_error!(InvalidRequest, "request body is required"));
+    }
+    serde_json::from_slice(&body).map_err(|err| s3_error!(InvalidRequest, "invalid JSON: {}", err))
+}
+
+fn warehouse_from_params(params: &Params<'_, '_>) -> S3Result<String> {
+    let warehouse = params.get("warehouse").unwrap_or("");
+    if warehouse.is_empty() {
+        return Err(s3_error!(InvalidRequest, "warehouse is required"));
+    }
+    Ok(warehouse.to_string())
+}
+
+fn namespace_from_params(params: &Params<'_, '_>) -> S3Result<crate::table_catalog::Namespace> {
+    let namespace = params.get("namespace").unwrap_or("");
+    crate::table_catalog::Namespace::parse(namespace).map_err(|err| s3_error!(InvalidRequest, "invalid namespace: {}", err))
+}
+
+fn table_name_from_params(params: &Params<'_, '_>) -> S3Result<String> {
+    let table = params.get("table").unwrap_or("");
+    crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    Ok(table.to_string())
+}
+
+fn table_catalog_store() -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
+    let store = new_object_layer_fn().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    Ok(crate::table_catalog::ObjectTableCatalogStore::new(
+        crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store),
+    ))
+}
+
+async fn table_bucket_enabled_from_metadata(bucket: &str) -> S3Result<bool> {
+    let metadata = metadata_sys::get(bucket)
+        .await
+        .map_err(|err| s3_error!(InvalidRequest, "failed to load table bucket metadata for {bucket}: {}", err))?;
+    Ok(metadata.table_bucket_enabled())
+}
+
+fn table_bucket_entry_from_metadata_marker(bucket: &str) -> crate::table_catalog::TableBucketEntry {
+    crate::table_catalog::TableBucketEntry {
+        version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: bucket.to_string(),
+        catalog_type: crate::table_catalog::TABLE_BUCKET_CATALOG_TYPE.to_string(),
+        warehouse_root: format!("s3://{bucket}/"),
+        state: crate::table_catalog::TableCatalogEntryState::Active,
+        properties: BTreeMap::new(),
+        created_at: None,
+        updated_at: None,
+    }
+}
+
+async fn ensure_table_bucket_entry<S>(store: &S, bucket: &str, table_bucket_enabled: bool) -> S3Result<()>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    if !table_bucket_enabled {
+        return Err(s3_error!(InvalidRequest, "bucket {bucket} is not table-enabled"));
+    }
+    if store.get_table_bucket(bucket).await.map_err(catalog_store_error)?.is_some() {
+        return Ok(());
+    }
+    store
+        .put_table_bucket(table_bucket_entry_from_metadata_marker(bucket))
+        .await
+        .map_err(catalog_store_error)
+}
+
+fn namespace_segments(namespace: &crate::table_catalog::Namespace) -> Vec<String> {
+    namespace
+        .segments()
+        .iter()
+        .map(|segment| segment.as_str().to_string())
+        .collect()
+}
+
+fn namespace_from_segments(segments: &[String]) -> S3Result<crate::table_catalog::Namespace> {
+    if segments.is_empty() {
+        return Err(s3_error!(InvalidRequest, "namespace cannot be empty"));
+    }
+
+    let namespace = segments.join(".");
+    crate::table_catalog::Namespace::parse(&namespace).map_err(|err| s3_error!(InvalidRequest, "invalid namespace: {}", err))
+}
+
+fn namespace_response_from_entry(entry: crate::table_catalog::NamespaceEntry) -> S3Result<RestNamespaceResponse> {
+    let namespace = crate::table_catalog::Namespace::parse(&entry.namespace)
+        .map_err(|err| s3_error!(InternalError, "persisted namespace entry is invalid: {}", err))?;
+    Ok(RestNamespaceResponse {
+        namespace: namespace_segments(&namespace),
+        properties: entry.properties,
+    })
+}
+
+fn list_namespaces_response_from_entries(
+    entries: Vec<crate::table_catalog::NamespaceEntry>,
+) -> S3Result<RestListNamespacesResponse> {
+    let namespaces = entries
+        .into_iter()
+        .map(|entry| {
+            let namespace = crate::table_catalog::Namespace::parse(&entry.namespace)
+                .map_err(|err| s3_error!(InternalError, "persisted namespace entry is invalid: {}", err))?;
+            Ok(namespace_segments(&namespace))
+        })
+        .collect::<S3Result<Vec<_>>>()?;
+    Ok(RestListNamespacesResponse { namespaces })
+}
+
+fn list_tables_response_from_entries(entries: Vec<crate::table_catalog::TableEntry>) -> S3Result<RestListTablesResponse> {
+    let identifiers = entries
+        .into_iter()
+        .map(|entry| {
+            let namespace = crate::table_catalog::Namespace::parse(&entry.namespace)
+                .map_err(|err| s3_error!(InternalError, "persisted table entry namespace is invalid: {}", err))?;
+            Ok(RestTableIdentifier {
+                namespace: namespace_segments(&namespace),
+                name: entry.table,
+            })
+        })
+        .collect::<S3Result<Vec<_>>>()?;
+    Ok(RestListTablesResponse { identifiers })
+}
+
+fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry) -> RestLoadTableResponse {
+    RestLoadTableResponse {
+        metadata_location: entry.metadata_location,
+        metadata: serde_json::Value::Null,
+        config: BTreeMap::from([("warehouse-location".to_string(), entry.warehouse_location)]),
+    }
+}
+
+fn table_entry_from_register_request(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    request: RegisterTableRequest,
+) -> S3Result<crate::table_catalog::TableEntry> {
+    let table = crate::table_catalog::IdentifierSegment::parse(request.name)
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &request.metadata_location) {
+        return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
+    }
+
+    let table_id = Uuid::new_v4().to_string();
+    Ok(crate::table_catalog::TableEntry {
+        version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        table_id: table_id.clone(),
+        table_uuid: Uuid::new_v4().to_string(),
+        format: "ICEBERG".to_string(),
+        format_version: 2,
+        warehouse_location: format!("s3://{bucket}/tables/{table_id}"),
+        metadata_location: request.metadata_location,
+        version_token: format!("token-{}", Uuid::new_v4()),
+        generation: 1,
+        state: crate::table_catalog::TableCatalogEntryState::Active,
+        properties: request.properties,
+        created_at: None,
+        updated_at: None,
+    })
+}
+
+fn table_entry_from_create_table_request(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    request: CreateTableRequest,
+) -> S3Result<crate::table_catalog::TableEntry> {
+    table_entry_from_register_request(
+        bucket,
+        namespace,
+        RegisterTableRequest {
+            name: request.name,
+            metadata_location: request.metadata_location,
+            properties: request.properties,
+        },
+    )
+}
+
+fn namespace_entry_from_create_request(
+    bucket: &str,
+    request: CreateNamespaceRequest,
+) -> S3Result<crate::table_catalog::NamespaceEntry> {
+    let namespace = namespace_from_segments(&request.namespace)?;
+    Ok(crate::table_catalog::NamespaceEntry {
+        version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        namespace_id: namespace.storage_id(),
+        state: crate::table_catalog::TableCatalogEntryState::Active,
+        properties: request.properties,
+        created_at: None,
+        updated_at: None,
+    })
+}
+
+fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> s3s::S3Error {
+    match err {
+        crate::table_catalog::TableCatalogStoreError::NotFound(message) => {
+            s3_error!(InvalidRequest, "{message}")
+        }
+        crate::table_catalog::TableCatalogStoreError::Conflict(message) => {
+            s3_error!(PreconditionFailed, "{message}")
+        }
+        crate::table_catalog::TableCatalogStoreError::Invalid(message) => {
+            s3_error!(InvalidRequest, "{message}")
+        }
+        crate::table_catalog::TableCatalogStoreError::Internal(message) => {
+            s3_error!(InternalError, "{message}")
+        }
+    }
+}
+
+async fn create_namespace_response<S>(
+    store: &S,
+    bucket: &str,
+    request: CreateNamespaceRequest,
+    table_bucket_enabled: bool,
+) -> S3Result<RestNamespaceResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let entry = namespace_entry_from_create_request(bucket, request)?;
+    ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
+    store.create_namespace(entry.clone()).await.map_err(catalog_store_error)?;
+    namespace_response_from_entry(entry)
+}
+
+async fn list_namespaces_response<S>(store: &S, bucket: &str) -> S3Result<RestListNamespacesResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let entries = store.list_namespaces(bucket).await.map_err(catalog_store_error)?;
+    list_namespaces_response_from_entries(entries)
+}
+
+async fn get_namespace_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+) -> S3Result<RestNamespaceResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(entry) = store
+        .get_namespace(bucket, &namespace.public_name())
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "namespace not found"));
+    };
+    namespace_response_from_entry(entry)
+}
+
+async fn drop_namespace_in_store<S>(store: &S, bucket: &str, namespace: &str) -> S3Result<()>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    store.drop_namespace(bucket, namespace).await.map_err(catalog_store_error)
+}
+
+async fn register_table_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    request: RegisterTableRequest,
+    table_bucket_enabled: bool,
+) -> S3Result<RestLoadTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let entry = table_entry_from_register_request(bucket, namespace, request)?;
+    ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
+    store.register_table(entry.clone()).await.map_err(catalog_store_error)?;
+    Ok(load_table_response_from_entry(entry))
+}
+
+async fn create_table_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    request: CreateTableRequest,
+    table_bucket_enabled: bool,
+) -> S3Result<RestLoadTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let entry = table_entry_from_create_table_request(bucket, namespace, request)?;
+    ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
+    store.create_table(entry.clone()).await.map_err(catalog_store_error)?;
+    Ok(load_table_response_from_entry(entry))
+}
+
+async fn list_tables_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+) -> S3Result<RestListTablesResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let entries = store
+        .list_tables(bucket, &namespace.public_name())
+        .await
+        .map_err(catalog_store_error)?;
+    list_tables_response_from_entries(entries)
+}
+
+async fn load_table_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> S3Result<RestLoadTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(entry) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    Ok(load_table_response_from_entry(entry))
+}
+
+async fn drop_table_in_store<S>(store: &S, bucket: &str, namespace: &crate::table_catalog::Namespace, table: &str) -> S3Result<()>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    store
+        .drop_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)
+}
+
 pub struct GetCatalogConfigHandler {}
 
 #[async_trait::async_trait]
@@ -208,6 +596,138 @@ impl Operation for GetCatalogConfigHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_table_catalog_request(&req, AdminAction::GetTableCatalogAction).await?;
         build_json_response(StatusCode::OK, &catalog_config_response())
+    }
+}
+
+pub struct RestListNamespacesHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestListNamespacesHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::GetTableNamespaceAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let store = table_catalog_store()?;
+        let response = list_namespaces_response(&store, &warehouse).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestCreateNamespaceHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestCreateNamespaceHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::SetTableNamespaceAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let request = read_json_body::<CreateNamespaceRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let response = create_namespace_response(&store, &warehouse, request, table_bucket_enabled).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestGetNamespaceHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestGetNamespaceHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::GetTableNamespaceAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let store = table_catalog_store()?;
+        let response = get_namespace_response(&store, &warehouse, &namespace).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestDropNamespaceHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestDropNamespaceHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::DeleteTableNamespaceAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let store = table_catalog_store()?;
+        drop_namespace_in_store(&store, &warehouse, &namespace.public_name()).await?;
+        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::default())))
+    }
+}
+
+pub struct RestListTablesHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestListTablesHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::GetTableAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let store = table_catalog_store()?;
+        let response = list_tables_response(&store, &warehouse, &namespace).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestCreateTableHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestCreateTableHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::CreateTableAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let request = read_json_body::<CreateTableRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let response = create_table_response(&store, &warehouse, &namespace, request, table_bucket_enabled).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestRegisterTableHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestRegisterTableHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::RegisterTableAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let request = read_json_body::<RegisterTableRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let response = register_table_response(&store, &warehouse, &namespace, request, table_bucket_enabled).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestLoadTableHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestLoadTableHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::GetTableAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let store = table_catalog_store()?;
+        let response = load_table_response(&store, &warehouse, &namespace, &table).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestDropTableHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestDropTableHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::DeleteTableAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let store = table_catalog_store()?;
+        drop_table_in_store(&store, &warehouse, &namespace, &table).await?;
+        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::default())))
     }
 }
 
@@ -227,14 +747,26 @@ impl Operation for UnsupportedCatalogOperationHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table_catalog::TableCatalogStore;
 
     #[test]
-    fn catalog_config_response_uses_default_warehouse_without_unsupported_endpoints() {
+    fn catalog_config_response_lists_mvp_rest_endpoints() {
         let response = catalog_config_response();
 
         assert_eq!(response.defaults.get(WAREHOUSE_PROPERTY), Some(&DEFAULT_WAREHOUSE_ID));
         assert!(response.overrides.is_empty());
-        assert!(response.endpoints.is_empty());
+        assert!(response.endpoints.contains(&"GET /{warehouse}/namespaces"));
+        assert!(response.endpoints.contains(&"POST /{warehouse}/namespaces"));
+        assert!(
+            response
+                .endpoints
+                .contains(&"POST /{warehouse}/namespaces/{namespace}/register")
+        );
+        assert!(
+            response
+                .endpoints
+                .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}")
+        );
     }
 
     #[test]
@@ -256,5 +788,428 @@ mod tests {
         assert!(src.contains("AdminAction::RegisterTableAction"));
         assert!(src.contains("AdminAction::CommitTableAction"));
         assert!(src.contains("AdminAction::DeleteTableAction"));
+    }
+
+    #[test]
+    fn rest_catalog_mvp_routes_use_implemented_handlers() {
+        fn assert_operation<T: Operation>() {}
+
+        let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
+        let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
+        let _: &RestGetNamespaceHandler = &GET_NAMESPACE_HANDLER;
+        let _: &RestDropNamespaceHandler = &DROP_NAMESPACE_HANDLER;
+        let _: &RestListTablesHandler = &LIST_TABLES_HANDLER;
+        let _: &RestCreateTableHandler = &CREATE_TABLE_HANDLER;
+        let _: &RestRegisterTableHandler = &REGISTER_TABLE_HANDLER;
+        let _: &RestLoadTableHandler = &LOAD_TABLE_HANDLER;
+        let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
+
+        assert_operation::<RestListNamespacesHandler>();
+        assert_operation::<RestCreateNamespaceHandler>();
+        assert_operation::<RestGetNamespaceHandler>();
+        assert_operation::<RestDropNamespaceHandler>();
+        assert_operation::<RestListTablesHandler>();
+        assert_operation::<RestCreateTableHandler>();
+        assert_operation::<RestRegisterTableHandler>();
+        assert_operation::<RestLoadTableHandler>();
+        assert_operation::<RestDropTableHandler>();
+    }
+
+    #[test]
+    fn create_namespace_request_uses_rest_namespace_segments_and_properties() {
+        let request: CreateNamespaceRequest = serde_json::from_value(serde_json::json!({
+            "namespace": ["analytics", "daily_events"],
+            "properties": {
+                "owner": "lakehouse"
+            }
+        }))
+        .expect("request should parse");
+        let namespace = namespace_from_segments(&request.namespace).expect("namespace should be valid");
+        let response = namespace_response_from_entry(crate::table_catalog::NamespaceEntry {
+            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "warehouse".to_string(),
+            namespace: namespace.public_name(),
+            namespace_id: namespace.storage_id(),
+            state: crate::table_catalog::TableCatalogEntryState::Active,
+            properties: request.properties,
+            created_at: None,
+            updated_at: None,
+        })
+        .expect("namespace response should build");
+
+        assert_eq!(namespace.public_name(), "analytics.daily_events");
+        assert_eq!(response.namespace, vec!["analytics".to_string(), "daily_events".to_string()]);
+        assert_eq!(response.properties.get("owner").map(String::as_str), Some("lakehouse"));
+    }
+
+    #[test]
+    fn list_tables_response_uses_rest_identifier_shape() {
+        let namespace = crate::table_catalog::Namespace::parse("analytics.daily_events").expect("namespace should parse");
+        let response = list_tables_response_from_entries(vec![crate::table_catalog::TableEntry {
+            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: "warehouse".to_string(),
+            namespace: namespace.public_name(),
+            table: "events".to_string(),
+            table_id: "table-id".to_string(),
+            table_uuid: "table-uuid".to_string(),
+            format: "ICEBERG".to_string(),
+            format_version: 2,
+            warehouse_location: "s3://warehouse/tables/table-id".to_string(),
+            metadata_location:
+                ".rustfs-table/warehouses/default/namespaces/analytics/daily_events/tables/events/metadata/00001.metadata.json"
+                    .to_string(),
+            version_token: "token-v1".to_string(),
+            generation: 1,
+            state: crate::table_catalog::TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        }])
+        .expect("table list response should build");
+
+        assert_eq!(
+            response.identifiers[0].namespace,
+            vec!["analytics".to_string(), "daily_events".to_string()]
+        );
+        assert_eq!(response.identifiers[0].name, "events");
+    }
+
+    #[test]
+    fn register_table_request_builds_initial_table_entry() {
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let request: RegisterTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+            "properties": {
+                "write.format.default": "parquet"
+            }
+        }))
+        .expect("request should parse");
+
+        let entry = table_entry_from_register_request("warehouse", &namespace, request).expect("table entry should build");
+
+        assert_eq!(entry.table_bucket, "warehouse");
+        assert_eq!(entry.namespace, "analytics");
+        assert_eq!(entry.table, "events");
+        assert_eq!(
+            entry.metadata_location,
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+        );
+        assert_eq!(entry.properties.get("write.format.default").map(String::as_str), Some("parquet"));
+        assert_eq!(entry.generation, 1);
+        assert!(!entry.version_token.is_empty());
+    }
+
+    #[derive(Default)]
+    struct TestTableCatalogStore {
+        table_buckets: tokio::sync::Mutex<Vec<crate::table_catalog::TableBucketEntry>>,
+        namespaces: tokio::sync::Mutex<Vec<crate::table_catalog::NamespaceEntry>>,
+        tables: tokio::sync::Mutex<Vec<crate::table_catalog::TableEntry>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
+        async fn get_table_bucket(
+            &self,
+            table_bucket: &str,
+        ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableBucketEntry>> {
+            Ok(self
+                .table_buckets
+                .lock()
+                .await
+                .iter()
+                .find(|entry| entry.table_bucket == table_bucket)
+                .cloned())
+        }
+
+        async fn put_table_bucket(
+            &self,
+            entry: crate::table_catalog::TableBucketEntry,
+        ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+            let mut table_buckets = self.table_buckets.lock().await;
+            table_buckets.retain(|existing| existing.table_bucket != entry.table_bucket);
+            table_buckets.push(entry);
+            Ok(())
+        }
+
+        async fn create_namespace(
+            &self,
+            entry: crate::table_catalog::NamespaceEntry,
+        ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+            if self.get_table_bucket(&entry.table_bucket).await?.is_none() {
+                return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
+                    "table bucket {}",
+                    entry.table_bucket
+                )));
+            }
+            self.namespaces.lock().await.push(entry);
+            Ok(())
+        }
+
+        async fn list_namespaces(
+            &self,
+            table_bucket: &str,
+        ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::NamespaceEntry>> {
+            Ok(self
+                .namespaces
+                .lock()
+                .await
+                .iter()
+                .filter(|entry| entry.table_bucket == table_bucket)
+                .cloned()
+                .collect())
+        }
+
+        async fn get_namespace(
+            &self,
+            table_bucket: &str,
+            namespace: &str,
+        ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::NamespaceEntry>> {
+            Ok(self
+                .namespaces
+                .lock()
+                .await
+                .iter()
+                .find(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace)
+                .cloned())
+        }
+
+        async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
+            self.namespaces
+                .lock()
+                .await
+                .retain(|entry| !(entry.table_bucket == table_bucket && entry.namespace == namespace));
+            Ok(())
+        }
+
+        async fn create_table(
+            &self,
+            entry: crate::table_catalog::TableEntry,
+        ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+            if self.get_table_bucket(&entry.table_bucket).await?.is_none() {
+                return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
+                    "table bucket {}",
+                    entry.table_bucket
+                )));
+            }
+            if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
+                return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
+                    "namespace {}/{}",
+                    entry.table_bucket, entry.namespace
+                )));
+            }
+            self.tables.lock().await.push(entry);
+            Ok(())
+        }
+
+        async fn register_table(
+            &self,
+            entry: crate::table_catalog::TableEntry,
+        ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+            if self.get_table_bucket(&entry.table_bucket).await?.is_none() {
+                return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
+                    "table bucket {}",
+                    entry.table_bucket
+                )));
+            }
+            if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
+                return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
+                    "namespace {}/{}",
+                    entry.table_bucket, entry.namespace
+                )));
+            }
+            self.tables.lock().await.push(entry);
+            Ok(())
+        }
+
+        async fn list_tables(
+            &self,
+            table_bucket: &str,
+            namespace: &str,
+        ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::TableEntry>> {
+            Ok(self
+                .tables
+                .lock()
+                .await
+                .iter()
+                .filter(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace)
+                .cloned()
+                .collect())
+        }
+
+        async fn load_table(
+            &self,
+            table_bucket: &str,
+            namespace: &str,
+            table: &str,
+        ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::TableEntry>> {
+            Ok(self
+                .tables
+                .lock()
+                .await
+                .iter()
+                .find(|entry| entry.table_bucket == table_bucket && entry.namespace == namespace && entry.table == table)
+                .cloned())
+        }
+
+        async fn commit_table(
+            &self,
+            _request: crate::table_catalog::TableCommitRequest,
+        ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCommitResult> {
+            Err(crate::table_catalog::TableCatalogStoreError::Invalid(
+                "commit is outside this handler test".to_string(),
+            ))
+        }
+
+        async fn drop_table(
+            &self,
+            table_bucket: &str,
+            namespace: &str,
+            table: &str,
+        ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+            self.tables
+                .lock()
+                .await
+                .retain(|entry| !(entry.table_bucket == table_bucket && entry.namespace == namespace && entry.table == table));
+            Ok(())
+        }
+
+        async fn get_commit_by_id(
+            &self,
+            _table_bucket: &str,
+            _table_id: &str,
+            _commit_id: &str,
+        ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::CommitLogEntry>> {
+            Ok(None)
+        }
+
+        async fn get_commit_by_idempotency_key(
+            &self,
+            _table_bucket: &str,
+            _table_id: &str,
+            _idempotency_key: &str,
+        ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::CommitLogEntry>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_table_bucket_entry_seeds_enabled_bucket_before_namespace_create() {
+        let store = TestTableCatalogStore::default();
+
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        let table_bucket = store
+            .get_table_bucket("warehouse")
+            .await
+            .expect("table bucket lookup should succeed")
+            .expect("table bucket entry should exist");
+
+        assert_eq!(table_bucket.table_bucket, "warehouse");
+        assert_eq!(table_bucket.catalog_type, crate::table_catalog::TABLE_BUCKET_CATALOG_TYPE);
+        assert_eq!(table_bucket.warehouse_root, "s3://warehouse/");
+    }
+
+    #[tokio::test]
+    async fn ensure_table_bucket_entry_rejects_bucket_without_table_marker() {
+        let store = TestTableCatalogStore::default();
+
+        assert!(ensure_table_bucket_entry(&store, "warehouse", false).await.is_err());
+        assert!(
+            store
+                .get_table_bucket("warehouse")
+                .await
+                .expect("table bucket lookup should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_helpers_call_catalog_store() {
+        let store = TestTableCatalogStore::default();
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        let create = create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+
+        assert_eq!(create.namespace, vec!["analytics".to_string()]);
+        assert_eq!(create.properties.get("owner").map(String::as_str), Some("lakehouse"));
+
+        let list = list_namespaces_response(&store, "warehouse")
+            .await
+            .expect("namespace list should load");
+        assert_eq!(list.namespaces, vec![vec!["analytics".to_string()]]);
+
+        drop_namespace_in_store(&store, "warehouse", "analytics")
+            .await
+            .expect("namespace should drop");
+        let list = list_namespaces_response(&store, "warehouse")
+            .await
+            .expect("namespace list should load after drop");
+        assert!(list.namespaces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn table_helpers_call_catalog_store() {
+        let store = TestTableCatalogStore::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+
+        let metadata_location =
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json";
+        let register = register_table_response(
+            &store,
+            "warehouse",
+            &namespace,
+            RegisterTableRequest {
+                name: "events".to_string(),
+                metadata_location: metadata_location.to_string(),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("table should register");
+
+        assert_eq!(register.metadata_location, metadata_location);
+
+        let list = list_tables_response(&store, "warehouse", &namespace)
+            .await
+            .expect("table list should load");
+        assert_eq!(list.identifiers[0].name, "events");
+
+        let load = load_table_response(&store, "warehouse", &namespace, "events")
+            .await
+            .expect("table should load");
+        assert_eq!(load.metadata_location, metadata_location);
+
+        drop_table_in_store(&store, "warehouse", &namespace, "events")
+            .await
+            .expect("table should drop");
+        assert!(load_table_response(&store, "warehouse", &namespace, "events").await.is_err());
     }
 }
