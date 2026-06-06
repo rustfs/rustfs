@@ -41,7 +41,7 @@ pub struct OtelGuard {
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
     pub(crate) profiling_agent: Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
     #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     pub(crate) memory_profiling_agent: Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
@@ -60,7 +60,7 @@ impl std::fmt::Debug for OtelGuard {
         s.field("tracer_provider", &self.tracer_provider.is_some())
             .field("meter_provider", &self.meter_provider.is_some())
             .field("logger_provider", &self.logger_provider.is_some());
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         s.field("profiling_agent", &self.profiling_agent.is_some());
         #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         s.field("memory_profiling_agent", &self.memory_profiling_agent.is_some());
@@ -95,7 +95,7 @@ impl Drop for OtelGuard {
             eprintln!("Logger shutdown error: {err:?}");
         }
 
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         if let Some(agent) = self.profiling_agent.take() {
             match agent.stop() {
                 Err(err) => eprintln!("Profiling agent stop error: {err:?}"),

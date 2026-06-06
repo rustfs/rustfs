@@ -164,7 +164,7 @@ pub(super) fn init_observability_http(
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
 
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
     let profiling_agent = init_profiler(config);
 
     #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
@@ -210,7 +210,7 @@ pub(super) fn init_observability_http(
         let file_logging_result = (|| -> Result<_, TelemetryError> {
             fs::create_dir_all(log_directory).map_err(|e| TelemetryError::Io(e.to_string()))?;
 
-            #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+            #[cfg(unix)]
             crate::telemetry::local::ensure_dir_permissions(log_directory)?;
 
             let rotation_str = config
@@ -317,7 +317,7 @@ pub(super) fn init_observability_http(
         tracer_provider,
         meter_provider,
         logger_provider,
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         profiling_agent,
         #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         memory_profiling_agent,
@@ -496,7 +496,7 @@ fn build_logger_provider(
 /// Returns `None` when profiling export is disabled, when no usable
 /// profiling endpoint is configured, or when building or starting the agent
 /// fails.
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
 fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
