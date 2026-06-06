@@ -2696,7 +2696,7 @@ mod tests {
         base_nonce.copy_from_slice(&nonce[..12]);
 
         let mut encrypted = Vec::new();
-        crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
+        rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt object");
@@ -2814,7 +2814,7 @@ mod tests {
         base_nonce.copy_from_slice(&nonce[..12]);
 
         let mut encrypted = Vec::new();
-        crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
+        rustfs_rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt ranged object");
@@ -2867,15 +2867,14 @@ mod tests {
         const DARE_PACKAGE_SIZE: usize = 64 * 1024 + 32;
 
         let plaintext = vec![0x7Bu8; 2 * 64 * 1024 + 97];
-        let key_bytes = [0x61; 32];
+        let customer_key = [0x61; 32];
+        let object_key = [0x68; 32];
         let bucket = "bucket";
         let object = "large-range-object";
-        let nonce = md5_bytes(format!("{bucket}-{object}").as_bytes());
-        let mut base_nonce = [0u8; 12];
-        base_nonce.copy_from_slice(&nonce[..12]);
+        let (sealing_iv, sealed_key) = seal_ssec_object_key_for_test(bucket, object, customer_key, object_key);
 
         let mut encrypted = Vec::new();
-        crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
+        crate::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt large ranged object");
@@ -2888,11 +2887,20 @@ mod tests {
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                    BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+                    BASE64_STANDARD.encode(md5_bytes(customer_key)),
                 ),
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
+                ),
+                (
+                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+                ),
+                (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
+                (
+                    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
+                    BASE64_STANDARD.encode(sealed_key),
                 ),
             ])),
             ..Default::default()
@@ -2908,7 +2916,7 @@ mod tests {
             Some(range),
             &object_info,
             &ObjectOptions::default(),
-            &ssec_headers_from_key(key_bytes),
+            &ssec_headers_from_key(customer_key),
         )
         .await
         .expect("large ssec range read should be supported");
@@ -2935,13 +2943,13 @@ mod tests {
         base_nonce.copy_from_slice(&nonce[..12]);
 
         let mut compressed = Vec::new();
-        crate::rio::CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default())
+        rustfs_rio::CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default())
             .read_to_end(&mut compressed)
             .await
             .expect("compress plaintext");
 
         let mut encrypted = Vec::new();
-        crate::rio::EncryptReader::new(Cursor::new(compressed.clone()), key_bytes, base_nonce)
+        rustfs_rio::EncryptReader::new(Cursor::new(compressed.clone()), key_bytes, base_nonce)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt compressed plaintext");
@@ -3001,12 +3009,11 @@ mod tests {
         let plaintext: Vec<u8> = (0..(10 * 1024 * 1024 + 123_456))
             .map(|i| (((i as u64).wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 16) & 0xFF) as u8)
             .collect();
-        let key_bytes = [0x73; 32];
+        let customer_key = [0x73; 32];
+        let object_key = [0x74; 32];
         let bucket = "bucket";
         let object = "compressed-large-object";
-        let nonce = md5_bytes(format!("{bucket}-{object}").as_bytes());
-        let mut base_nonce = [0u8; 12];
-        base_nonce.copy_from_slice(&nonce[..12]);
+        let (sealing_iv, sealed_key) = seal_ssec_object_key_for_test(bucket, object, customer_key, object_key);
         let mut compressor =
             crate::rio::CompressReader::with_encrypted_padding(Cursor::new(plaintext.clone()), CompressionAlgorithm::default());
         let mut compressed = Vec::new();
@@ -3044,7 +3051,7 @@ mod tests {
         assert!(expected_decrypt_skip >= 0);
 
         let mut encrypted = Vec::new();
-        crate::rio::EncryptReader::new(Cursor::new(compressed.clone()), key_bytes, base_nonce)
+        crate::rio::EncryptReader::new_with_object_key(Cursor::new(compressed.clone()), object_key)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt compressed plaintext");
@@ -3059,10 +3066,9 @@ mod tests {
         assert!(chunk_offset + 4 + chunk_len <= compressed.len());
 
         let mut decrypted_tail = Vec::new();
-        crate::rio::DecryptReader::new_with_sequence(
+        crate::rio::DecryptReader::new_with_object_key_and_sequence(
             Cursor::new(encrypted[expected_storage_offset..].to_vec()),
-            key_bytes,
-            base_nonce,
+            object_key,
             expected_sequence_number,
         )
         .read_to_end(&mut decrypted_tail)
@@ -3101,11 +3107,20 @@ mod tests {
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                    BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+                    BASE64_STANDARD.encode(md5_bytes(customer_key)),
                 ),
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
                     plaintext.len().to_string(),
+                ),
+                (
+                    MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+                    MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+                ),
+                (MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealing_iv)),
+                (
+                    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
+                    BASE64_STANDARD.encode(sealed_key),
                 ),
                 (
                     "x-minio-internal-compression".to_string(),
@@ -3120,7 +3135,7 @@ mod tests {
             Some(range.clone()),
             &object_info,
             &ObjectOptions::default(),
-            &ssec_headers_from_key(key_bytes),
+            &ssec_headers_from_key(customer_key),
         )
         .await
         .expect("build encrypted+compressed read plan");
@@ -3148,7 +3163,7 @@ mod tests {
             Some(range.clone()),
             &object_info,
             &ObjectOptions::default(),
-            &ssec_headers_from_key(key_bytes),
+            &ssec_headers_from_key(customer_key),
         )
         .await
         .expect("encrypted+compressed indexed range read should be supported");
