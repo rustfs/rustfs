@@ -41,7 +41,6 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/register",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}",
-    "POST /{warehouse}/namespaces/{namespace}/tables/{table}",
     "DELETE /{warehouse}/namespaces/{namespace}/tables/{table}",
 ];
 
@@ -817,7 +816,7 @@ mod tests {
                 .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}")
         );
         assert!(
-            response
+            !response
                 .endpoints
                 .contains(&"POST /{warehouse}/namespaces/{namespace}/tables/{table}")
         );
