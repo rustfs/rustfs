@@ -266,10 +266,20 @@ fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo,
         && effective_object_actual_size(target) == Some(source.size)
 }
 
+fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
+    target_pool_idx != src_pool_idx
+}
+
 fn resolve_data_movement_delete_marker_resume_result(
     target_result: Result<Option<ObjectInfo>>,
     source: &ObjectInfo,
+    src_pool_idx: usize,
+    target_pool_idx: usize,
 ) -> Result<bool> {
+    if !should_check_data_movement_resume_target(src_pool_idx, target_pool_idx) {
+        return Ok(false);
+    }
+
     let Some(target) = target_result? else {
         return Ok(false);
     };
@@ -280,7 +290,13 @@ fn resolve_data_movement_delete_marker_resume_result(
 fn resolve_data_movement_tiered_resume_result(
     target_result: Result<Option<ObjectInfo>>,
     source: &rustfs_filemeta::FileInfo,
+    src_pool_idx: usize,
+    target_pool_idx: usize,
 ) -> Result<bool> {
+    if !should_check_data_movement_resume_target(src_pool_idx, target_pool_idx) {
+        return Ok(false);
+    }
+
     let Some(target) = target_result? else {
         return Ok(false);
     };
@@ -436,24 +452,22 @@ impl ECStore {
         &self,
         bucket: &str,
         object: &str,
-        src_pool_idx: usize,
+        target_pool_idx: usize,
         opts: &ObjectOptions,
     ) -> Result<Option<ObjectInfo>> {
         let lookup_opts = version_aware_lookup_opts(opts, true);
 
-        for (pool_idx, pool) in self.pools.iter().enumerate() {
-            if pool_idx == src_pool_idx {
-                continue;
-            }
+        let Some(pool) = self.pools.get(target_pool_idx) else {
+            return Err(Error::other(format!(
+                "data movement resume target pool {target_pool_idx} is out of range for {bucket}/{object}"
+            )));
+        };
 
-            match pool.get_object_info(bucket, object, &lookup_opts).await {
-                Ok(info) => return Ok(Some(info)),
-                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => continue,
-                Err(err) => return Err(err),
-            }
+        match pool.get_object_info(bucket, object, &lookup_opts).await {
+            Ok(info) => Ok(Some(info)),
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(None),
+            Err(err) => Err(err),
         }
-
-        Ok(None)
     }
 
     async fn has_equivalent_data_movement_delete_marker(
@@ -462,11 +476,14 @@ impl ECStore {
         object: &str,
         source: &ObjectInfo,
         opts: &ObjectOptions,
+        target_pool_idx: usize,
     ) -> Result<bool> {
         resolve_data_movement_delete_marker_resume_result(
-            self.find_data_movement_target_info(bucket, object, opts.src_pool_idx, opts)
+            self.find_data_movement_target_info(bucket, object, target_pool_idx, opts)
                 .await,
             source,
+            opts.src_pool_idx,
+            target_pool_idx,
         )
     }
 
@@ -476,11 +493,14 @@ impl ECStore {
         object: &str,
         source: &rustfs_filemeta::FileInfo,
         opts: &ObjectOptions,
+        target_pool_idx: usize,
     ) -> Result<bool> {
         resolve_data_movement_tiered_resume_result(
-            self.find_data_movement_target_info(bucket, object, opts.src_pool_idx, opts)
+            self.find_data_movement_target_info(bucket, object, target_pool_idx, opts)
                 .await,
             source,
+            opts.src_pool_idx,
+            target_pool_idx,
         )
     }
 
@@ -527,7 +547,7 @@ impl ECStore {
         };
         if opts.data_movement && idx == opts.src_pool_idx {
             if self
-                .has_equivalent_data_movement_tiered_object(bucket, &object, fi, opts)
+                .has_equivalent_data_movement_tiered_object(bucket, &object, fi, opts, idx)
                 .await?
             {
                 return Ok(());
@@ -773,7 +793,13 @@ impl ECStore {
                     && opts.delete_marker
                     && is_data_movement_delete_marker(&source_pool_info.object_info)
                     && self
-                        .has_equivalent_data_movement_delete_marker(bucket, object, &source_pool_info.object_info, &opts)
+                        .has_equivalent_data_movement_delete_marker(
+                            bucket,
+                            object,
+                            &source_pool_info.object_info,
+                            &opts,
+                            target_pool_idx,
+                        )
                         .await?
                 {
                     let mut obj = source_pool_info.object_info;
@@ -1259,10 +1285,25 @@ mod tests {
             ..Default::default()
         };
 
-        let should_resume = resolve_data_movement_delete_marker_resume_result(Ok(Some(source.clone())), &source)
+        let should_resume = resolve_data_movement_delete_marker_resume_result(Ok(Some(source.clone())), &source, 0, 1)
             .expect("equivalent delete marker target should be evaluated");
 
         assert!(should_resume);
+    }
+
+    #[test]
+    fn data_movement_delete_marker_resume_rejects_source_pool_target() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            delete_marker: true,
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+
+        let should_resume = resolve_data_movement_delete_marker_resume_result(Ok(Some(source.clone())), &source, 0, 0)
+            .expect("source-pool target should be rejected before target lookup");
+
+        assert!(!should_resume);
     }
 
     #[test]
@@ -1271,7 +1312,7 @@ mod tests {
             delete_marker: true,
             ..Default::default()
         };
-        let result = resolve_data_movement_delete_marker_resume_result(Err(Error::SlowDown), &source);
+        let result = resolve_data_movement_delete_marker_resume_result(Err(Error::SlowDown), &source, 0, 1);
 
         assert!(matches!(result, Err(Error::SlowDown)));
     }
@@ -1365,10 +1406,41 @@ mod tests {
             ..Default::default()
         };
 
-        let should_resume = resolve_data_movement_tiered_resume_result(Ok(Some(target)), &source)
+        let should_resume = resolve_data_movement_tiered_resume_result(Ok(Some(target)), &source, 0, 1)
             .expect("equivalent tiered target should be evaluated");
 
         assert!(should_resume);
+    }
+
+    #[test]
+    fn data_movement_tiered_resume_rejects_source_pool_target() {
+        let version_id = Uuid::nil();
+        let source = FileInfo {
+            version_id: Some(version_id),
+            size: 1024,
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_tier: "WARM".to_string(),
+            metadata: HashMap::from([("etag".to_string(), "etag-value".to_string())]),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            version_id: Some(version_id),
+            size: 1024,
+            etag: Some("etag-value".to_string()),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                tier: "WARM".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let should_resume = resolve_data_movement_tiered_resume_result(Ok(Some(target)), &source, 0, 0)
+            .expect("source-pool target should be rejected before target lookup");
+
+        assert!(!should_resume);
     }
 
     #[test]
@@ -1379,8 +1451,8 @@ mod tests {
             ..Default::default()
         };
 
-        let should_resume =
-            resolve_data_movement_tiered_resume_result(Ok(None), &source).expect("missing tiered target should be evaluated");
+        let should_resume = resolve_data_movement_tiered_resume_result(Ok(None), &source, 0, 1)
+            .expect("missing tiered target should be evaluated");
 
         assert!(!should_resume);
     }

@@ -165,9 +165,13 @@ fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) 
         && source.mod_time == target.mod_time
 }
 
+fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
+    target_pool_idx != src_pool_idx
+}
+
 async fn find_data_movement_target_info(
     store: &ECStore,
-    src_pool_idx: usize,
+    target_pool_idx: usize,
     bucket: &str,
     object_info: &ObjectInfo,
 ) -> Result<Option<ObjectInfo>> {
@@ -179,27 +183,29 @@ async fn find_data_movement_target_info(
     };
     let object = encode_dir_object(object_info.name.as_str());
 
-    for (pool_idx, pool) in store.pools.iter().enumerate() {
-        if pool_idx == src_pool_idx {
-            continue;
-        }
+    let Some(pool) = store.pools.get(target_pool_idx) else {
+        return Err(Error::other(format!(
+            "data movement resume target pool {target_pool_idx} is out of range for {bucket}/{object}"
+        )));
+    };
 
-        match pool.get_object_info(bucket, object.as_str(), &opts).await {
-            Ok(target_info) => return Ok(Some(target_info)),
-            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => continue,
-            Err(err) => return Err(err),
-        }
+    match pool.get_object_info(bucket, object.as_str(), &opts).await {
+        Ok(target_info) => Ok(Some(target_info)),
+        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(None),
+        Err(err) => Err(err),
     }
-
-    Ok(None)
 }
 
 fn resolve_data_movement_overwrite_resume_result(
     err: &Error,
     target_result: Result<Option<ObjectInfo>>,
     source: &ObjectInfo,
+    src_pool_idx: usize,
+    target_pool_idx: usize,
 ) -> Result<bool> {
-    if !should_check_data_movement_overwrite_resume(err) {
+    if !should_check_data_movement_overwrite_resume(err)
+        || !should_check_data_movement_resume_target(src_pool_idx, target_pool_idx)
+    {
         return Ok(false);
     }
 
@@ -213,14 +219,21 @@ fn resolve_data_movement_overwrite_resume_result(
 async fn should_treat_data_movement_overwrite_as_complete(
     store: &ECStore,
     src_pool_idx: usize,
+    target_pool_idx: usize,
     bucket: &str,
     object_info: &ObjectInfo,
     err: &Error,
 ) -> Result<bool> {
+    if !should_check_data_movement_overwrite_resume(err) {
+        return Ok(false);
+    }
+
     resolve_data_movement_overwrite_resume_result(
         err,
-        find_data_movement_target_info(store, src_pool_idx, bucket, object_info).await,
+        find_data_movement_target_info(store, target_pool_idx, bucket, object_info).await,
         object_info,
+        src_pool_idx,
+        target_pool_idx,
     )
 }
 
@@ -245,8 +258,12 @@ pub(crate) async fn migrate_object(
     let object_info = rd.object_info.clone();
 
     if object_info.is_multipart() {
-        let res = match store
-            .new_multipart_upload(&bucket, &object_info.name, &data_movement_new_multipart_opts(&object_info, pool_idx))
+        let (res, target_pool_idx) = match store
+            .handle_new_multipart_upload_with_pool_idx(
+                &bucket,
+                &object_info.name,
+                &data_movement_new_multipart_opts(&object_info, pool_idx),
+            )
             .await
         {
             Ok(res) => res,
@@ -349,7 +366,15 @@ pub(crate) async fn migrate_object(
                 )
                 .await
             {
-                if should_treat_data_movement_overwrite_as_complete(store.as_ref(), pool_idx, bucket.as_str(), &object_info, &err)
+                if let Some(target_pool_idx) = target_pool_idx
+                    && should_treat_data_movement_overwrite_as_complete(
+                        store.as_ref(),
+                        pool_idx,
+                        target_pool_idx,
+                        bucket.as_str(),
+                        &object_info,
+                        &err,
+                    )
                     .await?
                 {
                     mark_multipart_upload_completed(&abort_multipart_flag);
@@ -420,11 +445,6 @@ pub(crate) async fn migrate_object(
         )
         .await
     {
-        if should_treat_data_movement_overwrite_as_complete(store.as_ref(), pool_idx, bucket.as_str(), &object_info, &err).await?
-        {
-            return Ok(());
-        }
-
         error!("{op_label}: put_object err {:?}", &err);
         return Err(data_movement_stage_error(
             op_label,
@@ -655,10 +675,27 @@ mod tests {
         };
         let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
 
-        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(source.clone())), &source)
+        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(source.clone())), &source, 0, 1)
             .expect("equivalent overwrite target should be evaluated");
 
         assert!(should_resume);
+    }
+
+    #[test]
+    fn test_resolve_data_movement_overwrite_resume_result_rejects_source_pool_target() {
+        let source = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            size: 128,
+            etag: Some("etag-value".to_string()),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+
+        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(source.clone())), &source, 0, 0)
+            .expect("source-pool target should be rejected before target lookup");
+
+        assert!(!should_resume);
     }
 
     #[test]
@@ -675,7 +712,7 @@ mod tests {
         };
         let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
 
-        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(target)), &source)
+        let should_resume = resolve_data_movement_overwrite_resume_result(&err, Ok(Some(target)), &source, 0, 1)
             .expect("non-equivalent overwrite target should be evaluated");
 
         assert!(!should_resume);
@@ -685,7 +722,7 @@ mod tests {
     fn test_resolve_data_movement_overwrite_resume_result_propagates_target_lookup_error() {
         let source = ObjectInfo::default();
         let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
-        let result = resolve_data_movement_overwrite_resume_result(&err, Err(Error::SlowDown), &source);
+        let result = resolve_data_movement_overwrite_resume_result(&err, Err(Error::SlowDown), &source, 0, 1);
 
         assert!(matches!(result, Err(Error::SlowDown)));
     }
@@ -693,7 +730,7 @@ mod tests {
     #[test]
     fn test_resolve_data_movement_overwrite_resume_result_ignores_non_overwrite_error() {
         let source = ObjectInfo::default();
-        let result = resolve_data_movement_overwrite_resume_result(&Error::SlowDown, Err(Error::FileAccessDenied), &source)
+        let result = resolve_data_movement_overwrite_resume_result(&Error::SlowDown, Err(Error::FileAccessDenied), &source, 0, 1)
             .expect("non-overwrite errors should not query target equivalence");
 
         assert!(!result);

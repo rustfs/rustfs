@@ -115,10 +115,24 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<MultipartUploadResult> {
+        self.handle_new_multipart_upload_with_pool_idx(bucket, object, opts)
+            .await
+            .map(|(res, _)| res)
+    }
+
+    pub(crate) async fn handle_new_multipart_upload_with_pool_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(MultipartUploadResult, Option<usize>)> {
         check_new_multipart_args(bucket, object)?;
 
         if self.single_pool() {
-            return self.pools[0].new_multipart_upload(bucket, object, opts).await;
+            return self.pools[0]
+                .new_multipart_upload(bucket, object, opts)
+                .await
+                .map(|res| (res, Some(0)));
         }
 
         for (idx, pool) in self.pools.iter().enumerate() {
@@ -130,7 +144,8 @@ impl ECStore {
                 .await?;
 
             if !res.uploads.is_empty() {
-                return self.pools[idx].new_multipart_upload(bucket, object, opts).await;
+                let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
+                return Ok((res, Some(idx)));
             }
         }
         let idx = self.get_pool_idx(bucket, object, -1).await?;
@@ -142,7 +157,8 @@ impl ECStore {
             ));
         }
 
-        self.pools[idx].new_multipart_upload(bucket, object, opts).await
+        let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
+        Ok((res, Some(idx)))
     }
 
     #[instrument(skip(self))]

@@ -1438,7 +1438,7 @@ fn is_rebalance_listing_timeout_io(err: &std::io::Error) -> bool {
     }
 
     let message = err.to_string();
-    message.eq_ignore_ascii_case("timeout") || message.eq_ignore_ascii_case("Io error: timeout")
+    message.eq_ignore_ascii_case("timeout")
 }
 
 fn should_retry_rebalance_listing(err: &Error, attempt: usize, max_attempts: usize) -> bool {
@@ -3646,8 +3646,8 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_is_transient_rebalance_error_accepts_rendered_disk_timeout() {
-        assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::other("Io error: timeout"))));
+    fn test_is_transient_rebalance_error_accepts_io_timeout_message() {
+        assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::other("timeout"))));
     }
 
     #[test]
