@@ -147,6 +147,13 @@ fn should_yield_after_object(object_count: u64, yield_every: u64) -> bool {
     yield_every > 0 && object_count.is_multiple_of(yield_every)
 }
 
+const SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT: usize = 16;
+const SCANNER_FAILED_OBJECT_LOG_EVERY: usize = 1024;
+
+fn should_log_failed_object(failed_objects: usize) -> bool {
+    failed_objects <= SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT || failed_objects.is_multiple_of(SCANNER_FAILED_OBJECT_LOG_EVERY)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FolderResumeMatch {
     Exact,
@@ -1210,8 +1217,12 @@ impl FolderScanner {
                             into.failed_objects += 1;
                             self.record_failed(&item.path);
 
-                            // Only log non-skip errors to avoid noise
-                            warn!("scan_folder: failed to get size for item {}: {}", item.path, e);
+                            if should_log_failed_object(into.failed_objects) {
+                                warn!(
+                                    failed_objects = into.failed_objects,
+                                    "scan_folder: failed to get size for item {}: {}", item.path, e
+                                );
+                            }
                         }
 
                         timer.sleep().await;
@@ -2802,5 +2813,15 @@ mod tests {
 
         assert!(result.is_ok(), "expected symlinked child directory to be ignored");
         assert_eq!(into.failed_objects, 0, "expected ignored symlink not to count as a failed object");
+    }
+
+    #[test]
+    fn test_should_log_failed_object_samples_after_initial_limit() {
+        assert!(should_log_failed_object(1));
+        assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT));
+        assert!(!should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT + 1));
+        assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY));
+        assert!(!should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY + 1));
+        assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY * 2));
     }
 }

@@ -914,13 +914,11 @@ impl ScannerIODisk for Disk {
         let data = match self.read_metadata(&item.bucket, &item.object_path()).await {
             Ok(data) => data,
             Err(e) => {
-                warn!(
-                    "Failed to read metadata: {e}, bucket={}, object_path={}",
+                return Err(StorageError::other(format!(
+                    "failed to read metadata: {e}, bucket={}, object_path={}",
                     &item.bucket,
                     &item.object_path()
-                );
-
-                return Err(StorageError::other("failed to read metadata".to_string()));
+                )));
             }
         };
 

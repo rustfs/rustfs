@@ -1421,9 +1421,24 @@ fn is_transient_rebalance_error(err: &Error) -> bool {
         | Error::ErasureWriteQuorum
         | Error::InsufficientReadQuorum(_, _)
         | Error::InsufficientWriteQuorum(_, _) => true,
-        Error::Io(io_err) => io_err.kind() == std::io::ErrorKind::TimedOut || is_network_or_host_down(&io_err.to_string(), true),
+        Error::Io(io_err) => is_rebalance_listing_timeout_io(io_err) || is_network_or_host_down(&io_err.to_string(), true),
         _ => is_network_or_host_down(&err.to_string(), true),
     }
+}
+
+fn is_rebalance_listing_timeout_io(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::TimedOut {
+        return true;
+    }
+
+    if let Some(disk_err) = err.get_ref().and_then(|err| err.downcast_ref::<DiskError>())
+        && *disk_err == DiskError::Timeout
+    {
+        return true;
+    }
+
+    let message = err.to_string();
+    message.eq_ignore_ascii_case("timeout") || message.eq_ignore_ascii_case("Io error: timeout")
 }
 
 fn should_retry_rebalance_listing(err: &Error, attempt: usize, max_attempts: usize) -> bool {
@@ -2240,14 +2255,15 @@ mod rebalance_unit_tests {
     use super::percent_free_ratio;
     use super::rebalance_goal_reached;
     use super::{
-        GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions, RebalSaveOpt,
-        RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option,
-        apply_rebalance_terminal_event, apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
-        clone_rebalance_pool_stats, complete_rebalance_pools_at_goal, ensure_rebalance_listing_disks_available,
-        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
-        is_transient_rebalance_error, load_rebalance_bucket_configs, mark_rebalance_bucket_done, merge_rebalance_meta,
-        migrate_entry_version, next_rebal_bucket_from_stat, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
-        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
+        DiskError, GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions,
+        RebalSaveOpt, RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceTerminalEvent,
+        apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at, classify_rebalance_terminal_event,
+        clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats, complete_rebalance_pools_at_goal,
+        ensure_rebalance_listing_disks_available, ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index,
+        is_rebalance_stopped_terminal_event, is_transient_rebalance_error, load_rebalance_bucket_configs,
+        mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version, next_rebal_bucket_from_stat,
+        rebalance_delete_marker_opts, rebalance_listing_retry_delay, rebalance_meta_load_no_data_error,
+        rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
         resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket, resolve_rebalance_bucket_error,
         resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
@@ -3622,6 +3638,16 @@ mod rebalance_unit_tests {
             "timed out",
         ))));
         assert!(is_transient_rebalance_error(&Error::other("i/o timeout")));
+    }
+
+    #[test]
+    fn test_is_transient_rebalance_error_accepts_wrapped_disk_timeout() {
+        assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::other(DiskError::Timeout))));
+    }
+
+    #[test]
+    fn test_is_transient_rebalance_error_accepts_rendered_disk_timeout() {
+        assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::other("Io error: timeout"))));
     }
 
     #[test]
