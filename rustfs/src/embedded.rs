@@ -40,12 +40,11 @@
 //! }
 //! ```
 //!
-//! # Multi-instance Support
+//! # Limitations
 //!
-//! Multiple `RustFSServer` instances may exist per process. Each instance
-//! should use a unique port and volume directory. Global configuration state
-//! (region, endpoints, erasure type) is shared across instances — the last
-//! initialized values take effect.
+//! Only **one `RustFSServer`** may exist per process because the underlying
+//! storage engine uses process-global singletons (`OnceLock`). Attempting to
+//! start a second server will return an error.
 
 use crate::config::Config;
 use crate::init::{add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system};
@@ -79,13 +78,21 @@ use rustfs_utils::net::parse_and_resolve_address;
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// Tracks whether a server has been started in this process.
+static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Error type for embedded server operations.
 #[derive(Debug)]
 pub enum ServerError {
+    /// A server has already been started in this process.
+    AlreadyStarted,
     /// The server failed to initialize.
     Init(String),
     /// An I/O error occurred.
@@ -95,6 +102,11 @@ pub enum ServerError {
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServerError::AlreadyStarted => write!(
+                f,
+                "A RustFS server has already been started in this process. \
+                 Only one embedded server is supported due to global state."
+            ),
             ServerError::Init(msg) => write!(f, "RustFS initialization failed: {msg}"),
             ServerError::Io(e) => write!(f, "I/O error: {e}"),
         }
@@ -230,8 +242,27 @@ impl RustFSServerBuilder {
         self.do_build().await
     }
 
-    /// Inner build implementation.
+    /// Inner build implementation. Separated from [`build`] so the outer
+    /// method can enforce the one-shot process-global startup guard.
     async fn do_build(&mut self) -> Result<RustFSServer, ServerError> {
+        // Build is allowed to fail before irreversible global initialization
+        // (for example on temporary I/O or directory setup errors), and in that
+        // case callers can retry.
+        let mut global_init_started = false;
+        let mut set_global_init_guard = || -> Result<(), ServerError> {
+            if global_init_started {
+                return Ok(());
+            }
+            if SERVER_STARTED
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Err(ServerError::AlreadyStarted);
+            }
+            global_init_started = true;
+            Ok(())
+        };
+
         // Keep a TempDir guard alive so that if build fails the directory is
         // cleaned up automatically. We disarm (keep) on success.
         let mut temp_dir_guard: Option<tempfile::TempDir> = None;
@@ -303,6 +334,8 @@ impl RustFSServerBuilder {
 
         set_global_rustfs_port(server_port);
         set_global_addr(&config.address).await;
+
+        set_global_init_guard()?;
 
         // Endpoints / erasure setup.
         let server_addr_str = server_addr.to_string();
