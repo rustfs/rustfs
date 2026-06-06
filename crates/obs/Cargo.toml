@@ -71,7 +71,7 @@ zstd = { workspace = true, features = ["zstdmt"] }
 sysinfo = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 pyroscope = { workspace = true }
 jemalloc_pprof = { workspace = true }
 
