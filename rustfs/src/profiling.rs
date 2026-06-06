@@ -320,18 +320,18 @@ mod linux_impl {
                 let out = output_dir().join(format!("mem_profile_periodic_{}.pb", ts()));
                 match File::create(&out) {
                     Err(e) => {
-                        error!("periodic mem dump create file failed: {}", e);
+                        tracing::error!("periodic mem dump create file failed: {}", e);
                         continue;
                     }
                     Ok(mut f) => match ctl.dump_pprof() {
                         Ok(bytes) => {
                             if let Err(e) = f.write_all(&bytes) {
-                                error!("periodic mem dump write failed: {}", e);
+                                tracing::error!("periodic mem dump write failed: {}", e);
                             } else {
                                 info!("periodic memory profile dumped to {}", out.display());
                             }
                         }
-                        Err(e) => error!("periodic mem dump failed: {}", e),
+                        Err(e) => tracing::error!("periodic mem dump failed: {}", e),
                     },
                 }
             }
