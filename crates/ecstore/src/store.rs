@@ -76,7 +76,7 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
-use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -271,6 +271,26 @@ impl ECStore {
     /// Get the storage class configuration
     pub fn storage_class(&self) -> Option<crate::config::storageclass::Config> {
         get_global_storage_class()
+    }
+}
+
+/// Phase 4: Server address accessors
+/// These provide a unified API through ECStore for accessing server-level
+/// configuration globals. The globals remain the source of truth.
+impl ECStore {
+    /// Get the server port
+    pub fn port(&self) -> u16 {
+        crate::global::global_rustfs_port()
+    }
+
+    /// Get the server host
+    pub async fn host(&self) -> String {
+        GLOBAL_RUSTFS_HOST.read().await.clone()
+    }
+
+    /// Get the server address (host:port)
+    pub async fn addr(&self) -> String {
+        GLOBAL_RUSTFS_ADDR.read().await.clone()
     }
 }
 
