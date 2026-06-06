@@ -1700,7 +1700,7 @@ fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &RebalanceStat
         return;
     }
 
-    if remote.info.status == RebalStatus::Stopped && local.info.status != RebalStatus::Stopped {
+    if remote.info.status == RebalStatus::Stopped && matches!(local.info.status, RebalStatus::Started | RebalStatus::Completed) {
         return;
     }
 
@@ -3367,7 +3367,7 @@ mod rebalance_unit_tests {
     }
 
     #[test]
-    fn test_merge_rebalance_meta_does_not_overwrite_stopped_with_failed_status() {
+    fn test_merge_rebalance_meta_preserves_failed_status_over_stopped() {
         let stopped_at = OffsetDateTime::from_unix_timestamp(3_000).unwrap();
         let failed_at = OffsetDateTime::from_unix_timestamp(4_000).unwrap();
         let mut remote = RebalanceMeta {
@@ -3399,9 +3399,49 @@ mod rebalance_unit_tests {
 
         merge_rebalance_meta(&mut remote, &local);
 
+        assert_eq!(remote.pool_stats[0].info.status, RebalStatus::Failed);
+        assert_eq!(remote.pool_stats[0].info.end_time, Some(failed_at));
+        assert_eq!(remote.pool_stats[0].info.last_error.as_deref(), Some("late failure"));
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_does_not_overwrite_stopped_with_completed_status() {
+        let stopped_at = OffsetDateTime::from_unix_timestamp(3_000).unwrap();
+        let completed_at = OffsetDateTime::from_unix_timestamp(5_000).unwrap();
+        let mut remote = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            stopped_at: Some(stopped_at),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Stopped,
+                    end_time: Some(stopped_at),
+                    ..Default::default()
+                },
+                num_versions: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let local = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    end_time: Some(completed_at),
+                    ..Default::default()
+                },
+                num_versions: 12,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        assert_eq!(remote.stopped_at, Some(stopped_at));
         assert_eq!(remote.pool_stats[0].info.status, RebalStatus::Stopped);
         assert_eq!(remote.pool_stats[0].info.end_time, Some(stopped_at));
-        assert!(remote.pool_stats[0].info.last_error.is_none());
+        assert_eq!(remote.pool_stats[0].num_versions, 12);
     }
 
     #[test]
