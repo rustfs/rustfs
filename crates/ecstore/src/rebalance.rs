@@ -2200,6 +2200,7 @@ impl SetDisks {
                 bucket: bucket.clone(),
                 recursive: true,
                 min_disks: listing_quorum,
+                skip_walkdir_total_timeout: true,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                     info!("list_objects_to_rebalance: agreed: {:?}", &entry.name);
                     Box::pin(cb1(entry))

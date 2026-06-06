@@ -1231,6 +1231,11 @@ impl DiskAPI for RemoteDisk {
         let bucket = opts.bucket.clone();
         let base_dir = opts.base_dir.clone();
         let disk_for_log = disk.clone();
+        let timeout_duration = if opts.skip_total_timeout {
+            Duration::ZERO
+        } else {
+            get_drive_walkdir_timeout()
+        };
 
         self.execute_with_timeout_for_op_and_health_action(
             "walk_dir",
@@ -1278,7 +1283,7 @@ impl DiskAPI for RemoteDisk {
 
                 Err(last_err.unwrap_or_else(|| DiskError::other("walk_dir retry exhausted without captured error")))
             },
-            get_drive_walkdir_timeout(),
+            timeout_duration,
             FailureHealthAction::IgnoreFailure,
         )
         .await
@@ -2297,6 +2302,7 @@ mod tests {
             forward_to: None,
             limit: 10,
             disk_id: String::new(),
+            ..Default::default()
         };
         let expected_body = serde_json::to_vec(&opts).unwrap();
         let mut writer = Vec::new();
@@ -2310,6 +2316,37 @@ mod tests {
                 assert_eq!(request.endpoint, "http://remote-node:9000");
                 assert_eq!(request.disk, expected_disk);
                 assert_eq!(request.body, expected_body);
+                assert_eq!(request.stall_timeout, Some(get_drive_walkdir_stall_timeout()));
+            }
+            other => panic!("expected walk-dir transport call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_walk_dir_preserves_skip_total_timeout_option() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let opts = WalkDirOptions {
+            bucket: "bucket".to_string(),
+            base_dir: "prefix".to_string(),
+            recursive: true,
+            skip_total_timeout: true,
+            ..Default::default()
+        };
+        let mut writer = Vec::new();
+
+        remote_disk
+            .walk_dir(opts, &mut writer)
+            .await
+            .expect("walk_dir should be sent through configured data transport");
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::WalkDir(request) => {
+                let sent_opts: WalkDirOptions =
+                    serde_json::from_slice(&request.body).expect("walk_dir request body should deserialize");
+                assert!(sent_opts.skip_total_timeout);
                 assert_eq!(request.stall_timeout, Some(get_drive_walkdir_stall_timeout()));
             }
             other => panic!("expected walk-dir transport call, got {other:?}"),
@@ -2332,6 +2369,7 @@ mod tests {
             forward_to: None,
             limit: 10,
             disk_id: String::new(),
+            ..Default::default()
         };
         let mut writer = Vec::new();
 
@@ -2363,6 +2401,7 @@ mod tests {
             forward_to: None,
             limit: 10,
             disk_id: String::new(),
+            ..Default::default()
         };
         let mut writer = Vec::new();
 
