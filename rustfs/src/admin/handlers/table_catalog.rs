@@ -32,8 +32,6 @@ use uuid::Uuid;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const WAREHOUSE_PROPERTY: &str = "warehouse";
-const UNSUPPORTED_OPERATION_TYPE: &str = "UnsupportedOperationException";
-const UNSUPPORTED_OPERATION_STATUS: StatusCode = StatusCode::NOT_ACCEPTABLE;
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces",
     "POST /{warehouse}/namespaces",
@@ -55,10 +53,7 @@ static LIST_TABLES_HANDLER: RestListTablesHandler = RestListTablesHandler {};
 static CREATE_TABLE_HANDLER: RestCreateTableHandler = RestCreateTableHandler {};
 static REGISTER_TABLE_HANDLER: RestRegisterTableHandler = RestRegisterTableHandler {};
 static LOAD_TABLE_HANDLER: RestLoadTableHandler = RestLoadTableHandler {};
-static COMMIT_TABLE_HANDLER: UnsupportedCatalogOperationHandler = UnsupportedCatalogOperationHandler {
-    action: AdminAction::CommitTableAction,
-    operation: "commit table",
-};
+static COMMIT_TABLE_HANDLER: RestCommitTableHandler = RestCommitTableHandler {};
 static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
 
 #[derive(Debug, Serialize)]
@@ -66,19 +61,6 @@ struct CatalogConfigResponse {
     defaults: BTreeMap<&'static str, &'static str>,
     overrides: BTreeMap<&'static str, &'static str>,
     endpoints: Vec<&'static str>,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: RestCatalogError,
-}
-
-#[derive(Debug, Serialize)]
-struct RestCatalogError {
-    message: String,
-    #[serde(rename = "type")]
-    error_type: &'static str,
-    code: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +91,26 @@ struct CreateTableRequest {
     properties: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestCommitTableRequest {
+    #[serde(rename = "commit-id")]
+    commit_id: String,
+    #[serde(default, rename = "idempotency-key")]
+    idempotency_key: Option<String>,
+    operation: String,
+    #[serde(rename = "expected-version-token")]
+    expected_version_token: String,
+    #[serde(rename = "expected-metadata-location")]
+    expected_metadata_location: String,
+    #[serde(rename = "new-metadata-location")]
+    new_metadata_location: String,
+    #[serde(default)]
+    requirements: Vec<serde_json::Value>,
+    #[serde(default)]
+    writer: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct RestNamespaceResponse {
     namespace: Vec<String>,
@@ -137,6 +139,17 @@ struct RestLoadTableResponse {
     metadata_location: String,
     metadata: serde_json::Value,
     config: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestCommitTableResponse {
+    #[serde(rename = "metadata-location")]
+    metadata_location: String,
+    #[serde(rename = "version-token")]
+    version_token: String,
+    generation: u64,
+    #[serde(rename = "commit-id")]
+    commit_id: String,
 }
 
 pub fn register_table_catalog_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -231,19 +244,6 @@ async fn authorize_table_catalog_request(req: &S3Request<Body>, action: AdminAct
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
     )
     .await
-}
-
-fn unsupported_response(operation: &str) -> S3Result<S3Response<(StatusCode, Body)>> {
-    build_json_response(
-        UNSUPPORTED_OPERATION_STATUS,
-        &ErrorResponse {
-            error: RestCatalogError {
-                message: format!("Iceberg REST Catalog {operation} is not implemented yet"),
-                error_type: UNSUPPORTED_OPERATION_TYPE,
-                code: UNSUPPORTED_OPERATION_STATUS.as_u16(),
-            },
-        },
-    )
 }
 
 async fn read_json_body<T: DeserializeOwned>(mut input: Body) -> S3Result<T> {
@@ -380,6 +380,36 @@ fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry) -> Re
         metadata_location: entry.metadata_location,
         metadata: serde_json::Value::Null,
         config: BTreeMap::from([("warehouse-location".to_string(), entry.warehouse_location)]),
+    }
+}
+
+fn commit_table_response_from_result(result: crate::table_catalog::TableCommitResult) -> RestCommitTableResponse {
+    RestCommitTableResponse {
+        metadata_location: result.table.metadata_location,
+        version_token: result.table.version_token,
+        generation: result.table.generation,
+        commit_id: result.commit_log.commit_id,
+    }
+}
+
+fn table_commit_request_from_rest_request(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: RestCommitTableRequest,
+) -> crate::table_catalog::TableCommitRequest {
+    crate::table_catalog::TableCommitRequest {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        commit_id: request.commit_id,
+        idempotency_key: request.idempotency_key,
+        operation: request.operation,
+        expected_version_token: request.expected_version_token,
+        expected_metadata_location: request.expected_metadata_location,
+        new_metadata_location: request.new_metadata_location,
+        requirements: request.requirements,
+        writer: request.writer,
     }
 }
 
@@ -579,6 +609,21 @@ where
     Ok(load_table_response_from_entry(entry))
 }
 
+async fn commit_table_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: RestCommitTableRequest,
+) -> S3Result<RestCommitTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let request = table_commit_request_from_rest_request(bucket, namespace, table, request);
+    let result = store.commit_table(request).await.map_err(catalog_store_error)?;
+    Ok(commit_table_response_from_result(result))
+}
+
 async fn drop_table_in_store<S>(store: &S, bucket: &str, namespace: &crate::table_catalog::Namespace, table: &str) -> S3Result<()>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
@@ -716,6 +761,22 @@ impl Operation for RestLoadTableHandler {
     }
 }
 
+pub struct RestCommitTableHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestCommitTableHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_table_catalog_request(&req, AdminAction::CommitTableAction).await?;
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let request = read_json_body::<RestCommitTableRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = commit_table_response(&store, &warehouse, &namespace, &table, request).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct RestDropTableHandler {}
 
 #[async_trait::async_trait]
@@ -728,19 +789,6 @@ impl Operation for RestDropTableHandler {
         let store = table_catalog_store()?;
         drop_table_in_store(&store, &warehouse, &namespace, &table).await?;
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::default())))
-    }
-}
-
-pub struct UnsupportedCatalogOperationHandler {
-    action: AdminAction,
-    operation: &'static str,
-}
-
-#[async_trait::async_trait]
-impl Operation for UnsupportedCatalogOperationHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, self.action).await?;
-        unsupported_response(self.operation)
     }
 }
 
@@ -767,13 +815,11 @@ mod tests {
                 .endpoints
                 .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}")
         );
-    }
-
-    #[test]
-    fn unsupported_response_uses_rest_catalog_unsupported_status() {
-        let response = unsupported_response("create table").expect("unsupported response should build");
-
-        assert_eq!(response.output.0, UNSUPPORTED_OPERATION_STATUS);
+        assert!(
+            !response
+                .endpoints
+                .contains(&"POST /{warehouse}/namespaces/{namespace}/tables/{table}")
+        );
     }
 
     #[test]
@@ -802,6 +848,7 @@ mod tests {
         let _: &RestCreateTableHandler = &CREATE_TABLE_HANDLER;
         let _: &RestRegisterTableHandler = &REGISTER_TABLE_HANDLER;
         let _: &RestLoadTableHandler = &LOAD_TABLE_HANDLER;
+        let _: &RestCommitTableHandler = &COMMIT_TABLE_HANDLER;
         let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
 
         assert_operation::<RestListNamespacesHandler>();
@@ -812,6 +859,7 @@ mod tests {
         assert_operation::<RestCreateTableHandler>();
         assert_operation::<RestRegisterTableHandler>();
         assert_operation::<RestLoadTableHandler>();
+        assert_operation::<RestCommitTableHandler>();
         assert_operation::<RestDropTableHandler>();
     }
 
@@ -900,11 +948,43 @@ mod tests {
         assert!(!entry.version_token.is_empty());
     }
 
+    #[test]
+    fn commit_table_request_uses_rest_commit_fields() {
+        let request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "commit-id": "commit-1",
+            "idempotency-key": "retry-1",
+            "operation": "append",
+            "expected-version-token": "token-v1",
+            "expected-metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+            "new-metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json",
+            "requirements": [
+                {
+                    "type": "assert-current-snapshot-id",
+                    "snapshot-id": 10
+                }
+            ],
+            "writer": "pyiceberg"
+        }))
+        .expect("commit request should parse");
+
+        assert_eq!(request.commit_id, "commit-1");
+        assert_eq!(request.idempotency_key.as_deref(), Some("retry-1"));
+        assert_eq!(request.operation, "append");
+        assert_eq!(request.expected_version_token, "token-v1");
+        assert_eq!(
+            request.new_metadata_location,
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json"
+        );
+        assert_eq!(request.requirements.len(), 1);
+        assert_eq!(request.writer.as_deref(), Some("pyiceberg"));
+    }
+
     #[derive(Default)]
     struct TestTableCatalogStore {
         table_buckets: tokio::sync::Mutex<Vec<crate::table_catalog::TableBucketEntry>>,
         namespaces: tokio::sync::Mutex<Vec<crate::table_catalog::NamespaceEntry>>,
         tables: tokio::sync::Mutex<Vec<crate::table_catalog::TableEntry>>,
+        commits: tokio::sync::Mutex<Vec<crate::table_catalog::CommitLogEntry>>,
     }
 
     #[async_trait::async_trait]
@@ -1054,11 +1134,56 @@ mod tests {
 
         async fn commit_table(
             &self,
-            _request: crate::table_catalog::TableCommitRequest,
+            request: crate::table_catalog::TableCommitRequest,
         ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCommitResult> {
-            Err(crate::table_catalog::TableCatalogStoreError::Invalid(
-                "commit is outside this handler test".to_string(),
-            ))
+            let mut tables = self.tables.lock().await;
+            let Some(index) = tables.iter().position(|entry| {
+                entry.table_bucket == request.table_bucket && entry.namespace == request.namespace && entry.table == request.table
+            }) else {
+                return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    request.table_bucket, request.namespace, request.table
+                )));
+            };
+
+            let current = tables[index].clone();
+            if current.version_token != request.expected_version_token {
+                return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                    "current table version token does not match expected token".to_string(),
+                ));
+            }
+            if current.metadata_location != request.expected_metadata_location {
+                return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                    "current table metadata location does not match expected location".to_string(),
+                ));
+            }
+
+            let mut next = current.clone();
+            next.metadata_location = request.new_metadata_location.clone();
+            next.version_token = "token-committed".to_string();
+            next.generation = next.generation.saturating_add(1);
+            tables[index] = next.clone();
+            drop(tables);
+
+            let commit_log = crate::table_catalog::CommitLogEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                commit_id: request.commit_id,
+                idempotency_key: request.idempotency_key,
+                table_id: current.table_id,
+                operation: request.operation,
+                expected_version_token: request.expected_version_token,
+                new_version_token: next.version_token.clone(),
+                previous_metadata_location: request.expected_metadata_location,
+                new_metadata_location: request.new_metadata_location,
+                requirements: request.requirements,
+                status: crate::table_catalog::CommitLogStatus::Committed,
+                writer: request.writer,
+                created_at: None,
+                updated_at: None,
+            };
+            self.commits.lock().await.push(commit_log.clone());
+
+            Ok(crate::table_catalog::TableCommitResult { table: next, commit_log })
         }
 
         async fn drop_table(
@@ -1206,6 +1331,43 @@ mod tests {
             .await
             .expect("table should load");
         assert_eq!(load.metadata_location, metadata_location);
+
+        let current = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let next_metadata_location =
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json";
+        let commit = commit_table_response(
+            &store,
+            "warehouse",
+            &namespace,
+            "events",
+            RestCommitTableRequest {
+                commit_id: "commit-1".to_string(),
+                idempotency_key: Some("retry-1".to_string()),
+                operation: "append".to_string(),
+                expected_version_token: current.version_token.clone(),
+                expected_metadata_location: current.metadata_location.clone(),
+                new_metadata_location: next_metadata_location.to_string(),
+                requirements: Vec::new(),
+                writer: Some("pyiceberg".to_string()),
+            },
+        )
+        .await
+        .expect("table commit should succeed");
+        assert_eq!(commit.metadata_location, next_metadata_location);
+        assert_eq!(commit.version_token, "token-committed");
+        assert_eq!(commit.generation, current.generation + 1);
+        assert_eq!(commit.commit_id, "commit-1");
+
+        let committed = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("committed table lookup should succeed")
+            .expect("committed table should exist");
+        assert_eq!(committed.metadata_location, next_metadata_location);
 
         drop_table_in_store(&store, "warehouse", &namespace, "events")
             .await
