@@ -5,13 +5,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-timeline`
-- Baseline: `upstream/main` at `ae9d25879d72bc8977f08e61062c022e2142483b`
+- Branch: `overtrue/arch-admin-route-snapshot`
+- Baseline: `upstream/main` at `0f9584c8d9351c757437405ee69a4e64bbcd94b5`
 - PR type for this branch: `docs-only`
 - Runtime behavior changes: none
 - Rust code changes: none
-- Docs changes: add the binary startup timeline baseline for later
-  runtime/lifecycle migration work.
+- Docs changes: add the admin route/action snapshot baseline for later
+  admin module movement and route-matrix guard work.
 
 ## Phase 0 Tasks
 
@@ -35,6 +35,11 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 - [x] `G-007` Create startup timeline table.
   - Acceptance: [`startup-timeline.md`](startup-timeline.md) records current
     binary startup order, side effects, fatal boundaries, and readiness stages.
+- [x] `G-008` Capture admin route-action snapshot.
+  - Acceptance: [`admin-route-action-snapshot.md`](admin-route-action-snapshot.md)
+    records current route families, handler ownership, authorization actions,
+    public exceptions, table-catalog routes, and `/minio/admin` compatibility
+    alias behavior.
 - [x] `G-009` Enforce pre-push three-expert review.
   - Acceptance: [`crate-boundaries.md`](crate-boundaries.md) requires
     quality/architecture, migration-preservation, and testing/verification review
@@ -46,18 +51,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `docs-only` or `test-only`: capture admin route-action snapshot.
-2. `docs-only`: inventory `ecstore::config::{Config, KV, KVS}` consumers.
-3. `ci-gate`: add focused checks for PR type vocabulary and temporary
+1. `docs-only`: inventory `ecstore::config::{Config, KV, KVS}` consumers.
+2. `ci-gate`: add focused checks for PR type vocabulary and temporary
    compatibility marker/register consistency.
+3. `test-only`: add a mechanical admin route matrix guard from the current
+   snapshot and `route_registration_test.rs`.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Final review confirmed the startup, deferred IAM, readiness, and shutdown tables match current source behavior after blocker fixes |
-| Migration preservation | pass | Final review confirmed this branch is docs-only and does not touch runtime logic, storage hot paths, global-state migration, or compatibility code |
-| Testing/verification | pass | Final review accepted docs-only verification with layer guard, metrics reference guard, diff checks, and staged whitespace check |
+| Quality/architecture | pass | Final review confirmed route/action/public-exception rows are source-backed, including OIDC path-based bypass, console bypass, credential-only metrics/list-remote-targets, notification targets, table-catalog prefix, and site-replication edit |
+| Migration preservation | pass | Final review confirmed this branch is docs-only, aligned with Phase 0, and does not touch runtime logic, storage hot paths, global state, compatibility implementation, or crate boundaries |
+| Testing/verification | pass | Final review accepted docs-only verification with layer guard, metrics reference guard, diff checks, staged diff coverage, and future route-matrix handoff |
 
 ## Verification Notes
 
@@ -67,8 +73,9 @@ Passed:
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
 - `git diff --cached --check`
-- focused source review of `rustfs/src/main.rs`, `rustfs/src/startup_iam.rs`,
-  and `rustfs/src/server/readiness.rs`
+- focused source review of `rustfs/src/admin/mod.rs`,
+  `rustfs/src/admin/router.rs`, `rustfs/src/admin/route_registration_test.rs`,
+  and `rustfs/src/admin/handlers/*.rs` route/action declarations
 
 ## Handoff Notes
 
