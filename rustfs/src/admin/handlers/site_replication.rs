@@ -20,6 +20,7 @@ use crate::admin::site_replication_identity::{
 };
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::auth::{check_key_valid, get_session_token};
+use crate::config::get_config_snapshot;
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use base64::Engine;
@@ -29,7 +30,10 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_config::{DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_TLS_PATH, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::{
+    DEFAULT_CONSOLE_ADDRESS, DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_TLS_PATH,
+    MAX_ADMIN_REQUEST_BODY_SIZE,
+};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -776,8 +780,38 @@ fn request_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
     format!("{scheme}://{host}")
 }
 
+fn runtime_console_port() -> Option<u16> {
+    let console_address = get_config_snapshot()
+        .map(|snapshot| snapshot.console_address.clone())
+        .unwrap_or_else(|| rustfs_utils::get_env_str(ENV_RUSTFS_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ADDRESS));
+
+    let parse_target = if console_address.starts_with(':') {
+        format!("127.0.0.1{console_address}")
+    } else {
+        console_address
+    };
+
+    Url::parse(&format!("http://{parse_target}"))
+        .ok()
+        .and_then(|parsed| parsed.port_or_known_default())
+}
+
+fn site_replication_local_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
+    let endpoint = request_endpoint(uri, headers);
+    match Url::parse(&endpoint) {
+        Ok(mut parsed) => {
+            if parsed.port_or_known_default() == runtime_console_port() && parsed.set_port(Some(global_rustfs_port())).is_ok() {
+                parsed.to_string().trim_end_matches('/').to_string()
+            } else {
+                endpoint
+            }
+        }
+        Err(_) => endpoint,
+    }
+}
+
 fn current_local_runtime_endpoint() -> String {
-    request_endpoint(&Uri::from_static("/"), &HeaderMap::new())
+    site_replication_local_endpoint(&Uri::from_static("/"), &HeaderMap::new())
 }
 
 fn infer_site_name(endpoint: &str) -> String {
@@ -805,7 +839,7 @@ fn non_negative_u64(value: i64) -> u64 {
 }
 
 fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> PeerInfo {
-    let endpoint = request_endpoint(&req.uri, &req.headers);
+    let endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
     let deployment_id = get_global_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
 
@@ -2204,16 +2238,21 @@ fn site_replication_bucket_target_for_peer(
     state: &SiteReplicationState,
     peer: &PeerInfo,
     arn_override: Option<String>,
-) -> Option<BucketTarget> {
+) -> S3Result<Option<BucketTarget>> {
     if state.service_account_access_key.is_empty() || state.service_account_secret_key.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let parsed = Url::parse(&peer.endpoint)
         .ok()
-        .or_else(|| Url::parse(&format!("http://{}", peer.endpoint.trim())).ok())?;
-    let host = parsed.host_str()?;
-    let port = parsed.port_or_known_default()?;
+        .or_else(|| Url::parse(&format!("http://{}", peer.endpoint.trim())).ok())
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {}", peer.endpoint)))?;
+    let host = parsed.host_str().ok_or_else(|| {
+        S3Error::with_message(S3ErrorCode::InvalidRequest, format!("peer endpoint missing host: {}", peer.endpoint))
+    })?;
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        S3Error::with_message(S3ErrorCode::InvalidRequest, format!("peer endpoint missing port: {}", peer.endpoint))
+    })?;
     let arn = arn_override.unwrap_or_else(|| {
         ARN::new(
             BucketTargetType::ReplicationService,
@@ -2224,7 +2263,7 @@ fn site_replication_bucket_target_for_peer(
         .to_string()
     });
 
-    Some(BucketTarget {
+    Ok(Some(BucketTarget {
         source_bucket: bucket.to_string(),
         endpoint: format!("{host}:{port}"),
         credentials: Some(Credentials {
@@ -2239,7 +2278,7 @@ fn site_replication_bucket_target_for_peer(
         target_type: BucketTargetType::ReplicationService,
         deployment_id: peer.deployment_id.clone(),
         ..Default::default()
-    })
+    }))
 }
 
 fn reconcile_site_replication_bucket_targets(
@@ -2248,9 +2287,9 @@ fn reconcile_site_replication_bucket_targets(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     config: Option<&s3s::dto::ReplicationConfiguration>,
-) -> BucketTargets {
+) -> S3Result<BucketTargets> {
     if !state.enabled() || state.service_account_access_key.is_empty() || state.service_account_secret_key.is_empty() {
-        return existing;
+        return Ok(existing);
     }
 
     let configured_arns = site_replication_target_arns_by_peer(config);
@@ -2262,7 +2301,7 @@ fn reconcile_site_replication_bucket_targets(
         }
 
         let Some(mut target) =
-            site_replication_bucket_target_for_peer(bucket, state, peer, configured_arns.get(&peer.deployment_id).cloned())
+            site_replication_bucket_target_for_peer(bucket, state, peer, configured_arns.get(&peer.deployment_id).cloned())?
         else {
             continue;
         };
@@ -2294,7 +2333,7 @@ fn reconcile_site_replication_bucket_targets(
         }
     }
 
-    BucketTargets { targets }
+    Ok(BucketTargets { targets })
 }
 
 fn build_site_replication_rule(arn: &str, priority: i32, rule_id: &str) -> ReplicationRule {
@@ -2330,14 +2369,14 @@ fn build_site_replication_config(
     bucket: &str,
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
-) -> Option<ReplicationConfiguration> {
+) -> S3Result<Option<ReplicationConfiguration>> {
     let mut rules = Vec::new();
     for peer in state.peers.values() {
         if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             continue;
         }
 
-        let Some(target) = site_replication_bucket_target_for_peer(bucket, state, peer, None) else {
+        let Some(target) = site_replication_bucket_target_for_peer(bucket, state, peer, None)? else {
             continue;
         };
         rules.push(build_site_replication_rule(
@@ -2348,12 +2387,12 @@ fn build_site_replication_config(
     }
 
     if rules.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(ReplicationConfiguration {
+        Ok(Some(ReplicationConfiguration {
             role: String::new(),
             rules,
-        })
+        }))
     }
 }
 
@@ -2369,7 +2408,7 @@ async fn ensure_site_replication_bucket_targets(
         Err(err) => return Err(ApiError::from(err).into()),
     };
 
-    let updated = reconcile_site_replication_bucket_targets(existing, bucket, state, local_peer, config);
+    let updated = reconcile_site_replication_bucket_targets(existing, bucket, state, local_peer, config)?;
     if updated.targets.is_empty() {
         return Ok(());
     }
@@ -2395,7 +2434,7 @@ async fn ensure_site_replication_bucket_replication_config(
         Err(err) => return Err(ApiError::from(err).into()),
     }
 
-    let Some(config) = build_site_replication_config(bucket, state, local_peer) else {
+    let Some(config) = build_site_replication_config(bucket, state, local_peer)? else {
         return Ok(());
     };
 
@@ -3868,6 +3907,42 @@ mod tests {
     }
 
     #[test]
+    fn test_site_replication_local_endpoint_uses_api_port_for_console_host_header() {
+        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("host", HeaderValue::from_static("node-a.example.com:9001"));
+
+        let endpoint = site_replication_local_endpoint(&uri, &headers);
+
+        assert_eq!(endpoint, "https://node-a.example.com:9000");
+    }
+
+    #[test]
+    fn test_site_replication_local_endpoint_preserves_ipv6_host() {
+        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("host", HeaderValue::from_static("[::1]:9001"));
+
+        let endpoint = site_replication_local_endpoint(&uri, &headers);
+
+        assert_eq!(endpoint, "https://[::1]:9000");
+    }
+
+    #[test]
+    fn test_site_replication_local_endpoint_preserves_non_console_port() {
+        let uri: Uri = "/rustfs/admin/v3/site-replication/status".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("host", HeaderValue::from_static("lb.example.com:9443"));
+
+        let endpoint = site_replication_local_endpoint(&uri, &headers);
+
+        assert_eq!(endpoint, "https://lb.example.com:9443");
+    }
+
+    #[test]
     fn test_runtime_tls_enabled_prefers_explicit_tls_over_http_runtime_endpoint() {
         let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
             legacy: false,
@@ -4288,7 +4363,8 @@ mod tests {
                 ..peer("local", "https://local.example.com")
             },
             None,
-        );
+        )
+        .expect("reconcile bucket targets");
 
         assert_eq!(targets.targets.len(), 1);
         let target = &targets.targets[0];
@@ -4304,6 +4380,48 @@ mod tests {
             .expect("site replication target should carry credentials");
         assert_eq!(credentials.access_key, "site-replicator-0");
         assert_eq!(credentials.secret_key, "secret");
+    }
+
+    #[test]
+    fn test_reconcile_site_replication_bucket_targets_allows_peer_on_same_port_as_local_console() {
+        with_var("RUSTFS_CONSOLE_ADDRESS", Some(":9001"), || {
+            let mut state = SiteReplicationState {
+                service_account_access_key: "site-replicator-0".to_string(),
+                service_account_secret_key: "secret".to_string(),
+                ..Default::default()
+            };
+            state.peers.insert(
+                "local".to_string(),
+                PeerInfo {
+                    deployment_id: "local".to_string(),
+                    ..peer("local", "https://local.example.com:9000")
+                },
+            );
+            state.peers.insert(
+                "remote".to_string(),
+                PeerInfo {
+                    deployment_id: "remote".to_string(),
+                    ..peer("remote", "https://remote.example.com:9001")
+                },
+            );
+
+            let targets = reconcile_site_replication_bucket_targets(
+                BucketTargets::default(),
+                "photos",
+                &state,
+                &PeerInfo {
+                    deployment_id: "local".to_string(),
+                    ..peer("local", "https://local.example.com:9000")
+                },
+                None,
+            )
+            .expect("peer using same numeric port as local console should remain valid");
+
+            assert_eq!(targets.targets.len(), 1);
+            let target = &targets.targets[0];
+            assert_eq!(target.endpoint, "remote.example.com:9001");
+            assert!(target.secure);
+        });
     }
 
     #[test]
