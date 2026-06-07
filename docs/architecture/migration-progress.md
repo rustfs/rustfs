@@ -5,13 +5,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-route-snapshot`
-- Baseline: `upstream/main` at `0f9584c8d9351c757437405ee69a4e64bbcd94b5`
+- Branch: `overtrue/arch-ecstore-config-inventory`
+- Baseline: `upstream/main` at `241e45d3b040684e5d217d2dd95f84c72f1de316`
 - PR type for this branch: `docs-only`
 - Runtime behavior changes: none
 - Rust code changes: none
-- Docs changes: add the admin route/action snapshot baseline for later
-  admin module movement and route-matrix guard work.
+- Docs changes: add the ECStore config consumer inventory for later config-model
+  contract, pure-move, and global-state migration work.
 
 ## Phase 0 Tasks
 
@@ -44,6 +44,11 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Acceptance: [`crate-boundaries.md`](crate-boundaries.md) requires
     quality/architecture, migration-preservation, and testing/verification review
     before push.
+- [x] `G-010` Inventory `ecstore::config::{Config, KV, KVS}` consumers.
+  - Acceptance:
+    [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md)
+    records the current model definitions, global accessors, persistence helpers,
+    consumer groups, migration risks, and do-not-change contract.
 - [~] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Current branch: not in scope.
   - Next PR: add a mechanical check that all migration docs use the same PR type
@@ -51,36 +56,45 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `docs-only`: inventory `ecstore::config::{Config, KV, KVS}` consumers.
-2. `ci-gate`: add focused checks for PR type vocabulary and temporary
+1. `ci-gate`: add focused checks for PR type vocabulary and temporary
    compatibility marker/register consistency.
-3. `test-only`: add a mechanical admin route matrix guard from the current
+2. `test-only`: add a mechanical admin route matrix guard from the current
    snapshot and `route_registration_test.rs`.
+3. `contract`: define the config-model contract surface while preserving the
+   existing `Config`, `KV`, and `KVS` behavior.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Final review confirmed route/action/public-exception rows are source-backed, including OIDC path-based bypass, console bypass, credential-only metrics/list-remote-targets, notification targets, table-catalog prefix, and site-replication edit |
-| Migration preservation | pass | Final review confirmed this branch is docs-only, aligned with Phase 0, and does not touch runtime logic, storage hot paths, global state, compatibility implementation, or crate boundaries |
-| Testing/verification | pass | Final review accepted docs-only verification with layer guard, metrics reference guard, diff checks, staged diff coverage, and future route-matrix handoff |
+| Quality/architecture | pass | Re-review confirmed dependency/call direction arrows, scanner global readers, adjacent scanner persistence helpers, notify config-manager persistence, narrowed test wording, and `Config model contract` wording are source-backed |
+| Migration preservation | pass | Confirmed this branch is docs-only, aligned with `rustfs/backlog#660`, and does not touch runtime logic, storage hot paths, global state implementation, compatibility code, scripts, or crate boundaries |
+| Testing/verification | pass | Confirmed docs-only verification is sufficient after wording was narrowed and the final staged diff check covers all docs |
 
 ## Verification Notes
 
-Passed:
+Passed locally (docs-only):
 
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
+
+Final pre-push after staging all docs:
+
 - `git diff --cached --check`
-- focused source review of `rustfs/src/admin/mod.rs`,
-  `rustfs/src/admin/router.rs`, `rustfs/src/admin/route_registration_test.rs`,
-  and `rustfs/src/admin/handlers/*.rs` route/action declarations
+- focused source review of `crates/ecstore/src/config/mod.rs`,
+  `crates/ecstore/src/config/com.rs`, `rustfs/src/app/context.rs`,
+  `rustfs/src/server/{event,audit}.rs`, `rustfs/src/admin/**/*.rs`,
+  `crates/{notify,audit,targets,iam,scanner}/**/*.rs`
+- three-expert review: quality/architecture, migration preservation, and
+  testing/verification
 
 ## Handoff Notes
 
-- Keep Phase 0 PRs small. Do not start Config, Storage API, Runtime, or ECStore
-  movement inside this `docs-only` branch.
+- Keep Phase 0 PRs small. Do not move Config, Storage API, Runtime, or ECStore
+  code inside this `docs-only` branch.
 - Keep CI checks in a separate `ci-gate` PR so the PR type rule remains enforceable.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
+- The next config-model PR must preserve the current tuple-struct shapes and
+  persistence behavior before introducing narrower provider contracts.
