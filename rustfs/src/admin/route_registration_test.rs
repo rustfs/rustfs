@@ -26,6 +26,7 @@ use crate::server::{
 };
 use hyper::Method;
 use serial_test::serial;
+use std::collections::BTreeSet;
 use temp_env::with_var;
 
 fn admin_path(path: &str) -> String {
@@ -38,6 +39,54 @@ fn compat_admin_alias_path(path: &str) -> String {
 
 fn table_catalog_path(path: &str) -> String {
     format!("{}{}", TABLE_CATALOG_PREFIX, path)
+}
+
+#[derive(Debug)]
+struct RouteMatrixEntry {
+    method: Method,
+    pattern: String,
+    sample: String,
+}
+
+fn route(method: Method, pattern: impl Into<String>) -> RouteMatrixEntry {
+    let pattern = pattern.into();
+    RouteMatrixEntry {
+        method,
+        sample: pattern.clone(),
+        pattern,
+    }
+}
+
+fn route_sample(method: Method, pattern: impl Into<String>, sample: impl Into<String>) -> RouteMatrixEntry {
+    RouteMatrixEntry {
+        method,
+        pattern: pattern.into(),
+        sample: sample.into(),
+    }
+}
+
+fn admin_route(method: Method, pattern: &str) -> RouteMatrixEntry {
+    route(method, admin_path(pattern))
+}
+
+fn admin_route_sample(method: Method, pattern: &str, sample: &str) -> RouteMatrixEntry {
+    route_sample(method, admin_path(pattern), admin_path(sample))
+}
+
+fn table_route(method: Method, pattern: &str) -> RouteMatrixEntry {
+    route(method, table_catalog_path(pattern))
+}
+
+fn table_route_sample(method: Method, pattern: &str, sample: &str) -> RouteMatrixEntry {
+    route_sample(method, table_catalog_path(pattern), table_catalog_path(sample))
+}
+
+fn route_key(method: &Method, path: &str) -> String {
+    format!("{}|{}", method.as_str(), path)
+}
+
+fn route_key_set(routes: &[RouteMatrixEntry]) -> BTreeSet<String> {
+    routes.iter().map(|route| route_key(&route.method, &route.pattern)).collect()
 }
 
 fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
@@ -75,9 +124,260 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     table_catalog::register_table_catalog_route(router).expect("register table catalog route");
 }
 
+fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
+    vec![
+        route(Method::GET, HEALTH_PREFIX),
+        route(Method::HEAD, HEALTH_PREFIX),
+        route(Method::GET, HEALTH_READY_PATH),
+        route(Method::HEAD, HEALTH_READY_PATH),
+        route(Method::GET, PROFILE_CPU_PATH),
+        route(Method::GET, PROFILE_MEMORY_PATH),
+        route(Method::POST, "/"),
+        admin_route(Method::GET, "/v3/is-admin"),
+        admin_route(Method::GET, "/v3/accountinfo"),
+        admin_route(Method::GET, "/v3/list-users"),
+        admin_route(Method::GET, "/v3/user-info"),
+        admin_route(Method::DELETE, "/v3/remove-user"),
+        admin_route(Method::PUT, "/v3/add-user"),
+        admin_route(Method::PUT, "/v3/set-user-status"),
+        admin_route(Method::GET, "/v3/groups"),
+        admin_route(Method::GET, "/v3/group"),
+        admin_route_sample(Method::DELETE, "/v3/group/{group}", "/v3/group/test-group"),
+        admin_route(Method::PUT, "/v3/set-group-status"),
+        admin_route(Method::PUT, "/v3/update-group-members"),
+        admin_route(Method::POST, "/v3/update-service-account"),
+        admin_route(Method::GET, "/v3/info-service-account"),
+        admin_route(Method::GET, "/v3/temporary-account-info"),
+        admin_route(Method::GET, "/v3/info-access-key"),
+        admin_route(Method::GET, "/v3/list-service-accounts"),
+        admin_route(Method::GET, "/v3/list-access-keys-bulk"),
+        admin_route(Method::DELETE, "/v3/delete-service-accounts"),
+        admin_route(Method::DELETE, "/v3/delete-service-account"),
+        admin_route(Method::PUT, "/v3/add-service-accounts"),
+        admin_route(Method::PUT, "/v3/add-service-account"),
+        admin_route(Method::GET, "/v3/export-iam"),
+        admin_route(Method::PUT, "/v3/import-iam"),
+        admin_route(Method::GET, "/v3/list-canned-policies"),
+        admin_route(Method::GET, "/v3/info-canned-policy"),
+        admin_route(Method::PUT, "/v3/add-canned-policy"),
+        admin_route(Method::DELETE, "/v3/remove-canned-policy"),
+        admin_route(Method::PUT, "/v3/set-user-or-group-policy"),
+        admin_route(Method::PUT, "/v3/set-policy"),
+        admin_route(Method::POST, "/v3/idp/builtin/policy/attach"),
+        admin_route(Method::POST, "/v3/idp/builtin/policy/detach"),
+        admin_route(Method::GET, "/v3/idp/builtin/policy-entities"),
+        admin_route(Method::GET, "/v3/target/list"),
+        admin_route_sample(Method::PUT, "/v3/target/{target_type}/{target_name}", "/v3/target/webhook/test-target"),
+        admin_route_sample(
+            Method::DELETE,
+            "/v3/target/{target_type}/{target_name}/reset",
+            "/v3/target/webhook/test-target/reset",
+        ),
+        admin_route(Method::GET, "/v3/target/arns"),
+        admin_route(Method::POST, "/v3/service"),
+        admin_route(Method::GET, "/v3/info"),
+        admin_route(Method::GET, "/v3/inspect-data"),
+        admin_route(Method::POST, "/v3/inspect-data"),
+        admin_route(Method::GET, "/v3/storageinfo"),
+        admin_route(Method::GET, "/v3/datausageinfo"),
+        admin_route(Method::GET, "/v3/metrics"),
+        admin_route(Method::GET, "/v3/pools/list"),
+        admin_route(Method::GET, "/v3/pools/status"),
+        admin_route(Method::POST, "/v3/pools/decommission"),
+        admin_route(Method::POST, "/v3/pools/cancel"),
+        admin_route(Method::POST, "/v3/rebalance/start"),
+        admin_route(Method::GET, "/v3/rebalance/status"),
+        admin_route(Method::POST, "/v3/rebalance/stop"),
+        admin_route(Method::POST, "/v3/heal/"),
+        admin_route_sample(Method::POST, "/v3/heal/{bucket}", "/v3/heal/test-bucket"),
+        admin_route_sample(Method::POST, "/v3/heal/{bucket}/{prefix}", "/v3/heal/test-bucket/prefix"),
+        admin_route(Method::POST, "/v3/background-heal/status"),
+        admin_route(Method::GET, "/v3/tier"),
+        admin_route(Method::GET, "/v3/tier-stats"),
+        admin_route_sample(Method::GET, "/v3/tier/{tier}", "/v3/tier/HOT"),
+        admin_route_sample(Method::DELETE, "/v3/tier/{tiername}", "/v3/tier/HOT"),
+        admin_route(Method::PUT, "/v3/tier"),
+        admin_route_sample(Method::POST, "/v3/tier/{tiername}", "/v3/tier/HOT"),
+        admin_route(Method::POST, "/v3/tier/clear"),
+        admin_route(Method::PUT, "/v3/set-bucket-quota"),
+        admin_route(Method::GET, "/v3/get-bucket-quota"),
+        admin_route_sample(Method::PUT, "/v3/quota/{bucket}", "/v3/quota/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/quota/{bucket}", "/v3/quota/test-bucket"),
+        admin_route_sample(Method::DELETE, "/v3/quota/{bucket}", "/v3/quota/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/quota-stats/{bucket}", "/v3/quota-stats/test-bucket"),
+        admin_route_sample(Method::POST, "/v3/quota-check/{bucket}", "/v3/quota-check/test-bucket"),
+        admin_route(Method::GET, "/export-bucket-metadata"),
+        admin_route(Method::GET, "/v3/export-bucket-metadata"),
+        admin_route(Method::PUT, "/import-bucket-metadata"),
+        admin_route(Method::PUT, "/v3/import-bucket-metadata"),
+        admin_route(Method::GET, "/v3/get-config-kv"),
+        admin_route(Method::PUT, "/v3/set-config-kv"),
+        admin_route(Method::DELETE, "/v3/del-config-kv"),
+        admin_route(Method::GET, "/v3/help-config-kv"),
+        admin_route(Method::GET, "/v3/list-config-history-kv"),
+        admin_route(Method::DELETE, "/v3/clear-config-history-kv"),
+        admin_route(Method::PUT, "/v3/restore-config-history-kv"),
+        admin_route(Method::GET, "/v3/config"),
+        admin_route(Method::PUT, "/v3/config"),
+        admin_route(Method::GET, "/v3/scanner/status"),
+        admin_route(Method::GET, "/v3/audit/target/list"),
+        admin_route_sample(
+            Method::PUT,
+            "/v3/audit/target/{target_type}/{target_name}",
+            "/v3/audit/target/audit_webhook/test-audit",
+        ),
+        admin_route_sample(
+            Method::DELETE,
+            "/v3/audit/target/{target_type}/{target_name}/reset",
+            "/v3/audit/target/audit_webhook/test-audit/reset",
+        ),
+        admin_route(Method::GET, "/v3/module-switches"),
+        admin_route(Method::PUT, "/v3/module-switches"),
+        admin_route(Method::GET, "/v4/plugins/catalog"),
+        admin_route(Method::GET, "/v4/plugins/instances"),
+        admin_route_sample(Method::GET, "/v4/plugins/instances/{id}", "/v4/plugins/instances/example-id"),
+        admin_route_sample(Method::PUT, "/v4/plugins/instances/{id}", "/v4/plugins/instances/example-id"),
+        admin_route_sample(Method::DELETE, "/v4/plugins/instances/{id}", "/v4/plugins/instances/example-id"),
+        admin_route(Method::GET, "/v3/list-remote-targets"),
+        admin_route(Method::GET, "/v3/replicationmetrics"),
+        admin_route(Method::PUT, "/v3/set-remote-target"),
+        admin_route(Method::DELETE, "/v3/remove-remote-target"),
+        admin_route(Method::PUT, "/v3/site-replication/add"),
+        admin_route(Method::PUT, "/v3/site-replication/remove"),
+        admin_route(Method::GET, "/v3/site-replication/info"),
+        admin_route(Method::GET, "/v3/site-replication/metainfo"),
+        admin_route(Method::GET, "/v3/site-replication/status"),
+        admin_route(Method::POST, "/v3/site-replication/devnull"),
+        admin_route(Method::POST, "/v3/site-replication/netperf"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/join"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/bucket-ops"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/iam-item"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/bucket-meta"),
+        admin_route(Method::GET, "/v3/site-replication/peer/idp-settings"),
+        admin_route(Method::PUT, "/v3/site-replication/edit"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/edit"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/remove"),
+        admin_route(Method::PUT, "/v3/site-replication/resync/op"),
+        admin_route(Method::PUT, "/v3/site-replication/state/edit"),
+        admin_route(Method::GET, "/debug/pprof/profile"),
+        admin_route(Method::GET, "/debug/pprof/status"),
+        admin_route(Method::GET, "/debug/tls/status"),
+        admin_route(Method::POST, "/v3/kms/create-key"),
+        admin_route(Method::POST, "/v3/kms/key/create"),
+        admin_route(Method::GET, "/v3/kms/describe-key"),
+        admin_route(Method::GET, "/v3/kms/key/status"),
+        admin_route(Method::GET, "/v3/kms/list-keys"),
+        admin_route(Method::POST, "/v3/kms/generate-data-key"),
+        admin_route(Method::GET, "/v3/kms/status"),
+        admin_route(Method::POST, "/v3/kms/status"),
+        admin_route(Method::GET, "/v3/kms/config"),
+        admin_route(Method::POST, "/v3/kms/clear-cache"),
+        admin_route(Method::POST, "/v3/kms/configure"),
+        admin_route(Method::POST, "/v3/kms/start"),
+        admin_route(Method::POST, "/v3/kms/stop"),
+        admin_route(Method::GET, "/v3/kms/service-status"),
+        admin_route(Method::POST, "/v3/kms/reconfigure"),
+        admin_route(Method::POST, "/v3/kms/keys"),
+        admin_route(Method::DELETE, "/v3/kms/keys/delete"),
+        admin_route(Method::POST, "/v3/kms/keys/cancel-deletion"),
+        admin_route(Method::GET, "/v3/kms/keys"),
+        admin_route_sample(Method::GET, "/v3/kms/keys/{key_id}", "/v3/kms/keys/test-key"),
+        admin_route(Method::GET, "/v3/oidc/providers"),
+        admin_route_sample(Method::GET, "/v3/oidc/authorize/{provider_id}", "/v3/oidc/authorize/default"),
+        admin_route_sample(Method::GET, "/v3/oidc/callback/{provider_id}", "/v3/oidc/callback/default"),
+        admin_route(Method::GET, "/v3/oidc/logout"),
+        admin_route(Method::GET, "/v3/oidc/config"),
+        admin_route_sample(Method::PUT, "/v3/oidc/config/{provider_id}", "/v3/oidc/config/default"),
+        admin_route_sample(Method::DELETE, "/v3/oidc/config/{provider_id}", "/v3/oidc/config/default"),
+        admin_route(Method::POST, "/v3/oidc/validate"),
+        table_route(Method::GET, "/config"),
+        table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
+        table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
+        table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        table_route_sample(Method::DELETE, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables",
+            "/analytics/namespaces/sales/tables",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables",
+            "/analytics/namespaces/sales/tables",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/register",
+            "/analytics/namespaces/sales/register",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        table_route_sample(
+            Method::DELETE,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+    ]
+}
+
 // register_admin_routes reads ENV_HEALTH_ENDPOINT_ENABLE to decide whether
 // to register /health; serialise with the env-mutating test below to avoid
 // cross-thread leakage of that override.
+#[test]
+#[serial]
+fn test_admin_route_matrix_matches_registered_routes() {
+    let mut router: S3Router<AdminOperation> = S3Router::new(false);
+    register_admin_routes(&mut router);
+
+    let matrix = expected_admin_route_matrix();
+    let actual_routes = router.registered_routes();
+    assert_eq!(
+        actual_routes.len(),
+        matrix.len(),
+        "admin route matrix must account for every registered route"
+    );
+
+    let actual = actual_routes.iter().cloned().collect::<BTreeSet<_>>();
+    let expected = route_key_set(&matrix);
+    assert_eq!(actual, expected, "admin route registration changed without updating the matrix");
+
+    for route in matrix {
+        assert_route(&router, route.method, &route.sample);
+    }
+}
+
+#[test]
+#[serial]
+fn test_admin_route_matrix_preserves_minio_admin_aliases() {
+    let mut router: S3Router<AdminOperation> = S3Router::new(false);
+    register_admin_routes(&mut router);
+
+    for route in expected_admin_route_matrix()
+        .into_iter()
+        .filter(|route| route.sample.starts_with(ADMIN_PREFIX))
+    {
+        let suffix = route
+            .sample
+            .strip_prefix(ADMIN_PREFIX)
+            .expect("matrix route is already filtered by admin prefix");
+        let alias = compat_admin_alias_path(suffix);
+        assert!(
+            router.contains_compatible_route(route.method.clone(), &alias),
+            "expected MinIO admin alias path to match: {} {}",
+            route.method.as_str(),
+            alias
+        );
+    }
+}
+
 #[test]
 #[serial]
 fn test_register_routes_cover_representative_admin_paths() {
