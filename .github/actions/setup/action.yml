@@ -54,6 +54,7 @@ runs:
           build-essential \
           pkg-config \
           libssl-dev \
+          ripgrep \
           unzip \
           protobuf-compiler
 
