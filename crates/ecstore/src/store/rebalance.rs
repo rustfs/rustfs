@@ -271,6 +271,41 @@ impl ECStore {
         None
     }
 
+    pub(super) async fn get_available_pool_idx_excluding(
+        &self,
+        bucket: &str,
+        object: &str,
+        size: i64,
+        excluded_pool_idx: usize,
+    ) -> Option<usize> {
+        let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
+        server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
+
+        if let Some(pool) = server_pools.0.get_mut(excluded_pool_idx) {
+            pool.available = 0;
+        }
+
+        let total = server_pools.total_available();
+        if total == 0 {
+            return None;
+        }
+
+        let mut rng = rand::rng();
+        let random_u64: u64 = rng.random_range(0..total);
+
+        let choose = random_u64 % total;
+        let mut at_total = 0;
+
+        for pool in server_pools.iter() {
+            at_total += pool.available;
+            if at_total > choose && pool.available > 0 {
+                return Some(pool.index);
+            }
+        }
+
+        None
+    }
+
     async fn get_server_pools_available_space(&self, bucket: &str, object: &str, size: i64) -> ServerPoolsAvailableSpace {
         let mut n_sets = vec![0; self.pools.len()];
         let mut infos = vec![Vec::new(); self.pools.len()];

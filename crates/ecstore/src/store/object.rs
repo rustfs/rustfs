@@ -270,6 +270,18 @@ fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx
     target_pool_idx != src_pool_idx
 }
 
+fn resolve_data_movement_resume_target_pool(
+    selected_target_pool_idx: usize,
+    resume_target_pool_idx: Option<usize>,
+    src_pool_idx: usize,
+) -> usize {
+    if should_check_data_movement_resume_target(src_pool_idx, selected_target_pool_idx) {
+        selected_target_pool_idx
+    } else {
+        resume_target_pool_idx.unwrap_or(selected_target_pool_idx)
+    }
+}
+
 fn resolve_data_movement_delete_marker_resume_result(
     target_result: Result<Option<ObjectInfo>>,
     source: &ObjectInfo,
@@ -546,8 +558,12 @@ impl ECStore {
             )?
         };
         if opts.data_movement && idx == opts.src_pool_idx {
+            let resume_target_pool_idx = self
+                .get_available_pool_idx_excluding(bucket, &object, fi.size, opts.src_pool_idx)
+                .await;
+            let target_pool_idx = resolve_data_movement_resume_target_pool(idx, resume_target_pool_idx, opts.src_pool_idx);
             if self
-                .has_equivalent_data_movement_tiered_object(bucket, &object, fi, opts, idx)
+                .has_equivalent_data_movement_tiered_object(bucket, &object, fi, opts, target_pool_idx)
                 .await?
             {
                 return Ok(());
@@ -782,13 +798,21 @@ impl ECStore {
                 .as_ref()
                 .map(|(pinfo, _)| pinfo.index)
                 .map_err(Clone::clone);
-            let target_pool_idx =
+            let selected_target_pool_idx =
                 match select_data_movement_target_pool(existing_pool_idx, opts.src_pool_idx, opts.delete_marker)? {
                     Some(pool_idx) => pool_idx,
                     None => self.get_pool_idx_no_lock(bucket, object, 0).await?,
                 };
+            let resume_target_pool_idx = if selected_target_pool_idx == opts.src_pool_idx {
+                self.get_available_pool_idx_excluding(bucket, object, 0, opts.src_pool_idx)
+                    .await
+            } else {
+                None
+            };
+            let target_pool_idx =
+                resolve_data_movement_resume_target_pool(selected_target_pool_idx, resume_target_pool_idx, opts.src_pool_idx);
 
-            if opts.src_pool_idx == target_pool_idx {
+            if opts.src_pool_idx == selected_target_pool_idx {
                 if let Ok((source_pool_info, _)) = existing_pool_info
                     && opts.delete_marker
                     && is_data_movement_delete_marker(&source_pool_info.object_info)
@@ -814,7 +838,9 @@ impl ECStore {
                 ));
             }
 
-            let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
+            let mut obj = self.pools[selected_target_pool_idx]
+                .delete_object(bucket, object, opts)
+                .await?;
             obj.name = decode_dir_object(obj.name.as_str());
             return Ok(obj);
         }
@@ -1304,6 +1330,24 @@ mod tests {
             .expect("source-pool target should be rejected before target lookup");
 
         assert!(!should_resume);
+    }
+
+    #[test]
+    fn data_movement_resume_target_prefers_selected_non_source_pool() {
+        let target_pool_idx = resolve_data_movement_resume_target_pool(2, Some(3), 1);
+        assert_eq!(target_pool_idx, 2);
+    }
+
+    #[test]
+    fn data_movement_resume_target_uses_resolved_non_source_pool_when_selected_is_source() {
+        let target_pool_idx = resolve_data_movement_resume_target_pool(1, Some(3), 1);
+        assert_eq!(target_pool_idx, 3);
+    }
+
+    #[test]
+    fn data_movement_resume_target_keeps_source_when_no_other_pool_is_available() {
+        let target_pool_idx = resolve_data_movement_resume_target_pool(1, None, 1);
+        assert_eq!(target_pool_idx, 1);
     }
 
     #[test]
