@@ -807,27 +807,6 @@ fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> Pe
     }
 }
 
-fn validate_site_replication_peer_endpoint(peer: &PeerInfo) -> S3Result<()> {
-    let parsed = Url::parse(&peer.endpoint)
-        .ok()
-        .or_else(|| Url::parse(&format!("http://{}", peer.endpoint.trim())).ok())
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {}", peer.endpoint)))?;
-
-    if let Some(console_port) = runtime_console_port()
-        && parsed.port_or_known_default() == Some(console_port)
-    {
-        return Err(s3_error!(
-            InvalidRequest,
-            "peer endpoint {} uses console port {}; site replication requires the S3 API port {}",
-            peer.endpoint,
-            console_port,
-            global_rustfs_port()
-        ));
-    }
-
-    Ok(())
-}
-
 fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
     let endpoint = current_local_runtime_endpoint();
     let deployment_id = get_global_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
@@ -1806,8 +1785,6 @@ fn site_replication_bucket_target_for_peer(
     if state.service_account_access_key.is_empty() || state.service_account_secret_key.is_empty() {
         return Ok(None);
     }
-
-    validate_site_replication_peer_endpoint(peer)?;
 
     let parsed = Url::parse(&peer.endpoint)
         .ok()
@@ -3779,7 +3756,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_site_replication_bucket_targets_rejects_console_peer_port() {
+    fn test_reconcile_site_replication_bucket_targets_allows_peer_on_same_port_as_local_console() {
         with_var("RUSTFS_CONSOLE_ADDRESS", Some(":9001"), || {
             let mut state = SiteReplicationState {
                 service_account_access_key: "site-replicator-0".to_string(),
@@ -3801,7 +3778,7 @@ mod tests {
                 },
             );
 
-            let err = reconcile_site_replication_bucket_targets(
+            let targets = reconcile_site_replication_bucket_targets(
                 BucketTargets::default(),
                 "photos",
                 &state,
@@ -3811,54 +3788,12 @@ mod tests {
                 },
                 None,
             )
-            .expect_err("console port peer should be rejected");
+            .expect("peer using same numeric port as local console should remain valid");
 
-            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
-            let message = err.message().expect("error message");
-            assert!(message.contains("console port 9001"));
-            assert!(message.contains("S3 API port 9000"));
-        });
-    }
-
-    #[test]
-    fn test_reconcile_site_replication_bucket_targets_rejects_configured_console_peer_port() {
-        with_var("RUSTFS_CONSOLE_ADDRESS", Some(":9443"), || {
-            let mut state = SiteReplicationState {
-                service_account_access_key: "site-replicator-0".to_string(),
-                service_account_secret_key: "secret".to_string(),
-                ..Default::default()
-            };
-            state.peers.insert(
-                "local".to_string(),
-                PeerInfo {
-                    deployment_id: "local".to_string(),
-                    ..peer("local", "https://local.example.com:9000")
-                },
-            );
-            state.peers.insert(
-                "remote".to_string(),
-                PeerInfo {
-                    deployment_id: "remote".to_string(),
-                    ..peer("remote", "https://remote.example.com:9443")
-                },
-            );
-
-            let err = reconcile_site_replication_bucket_targets(
-                BucketTargets::default(),
-                "photos",
-                &state,
-                &PeerInfo {
-                    deployment_id: "local".to_string(),
-                    ..peer("local", "https://local.example.com:9000")
-                },
-                None,
-            )
-            .expect_err("configured console port peer should be rejected");
-
-            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
-            let message = err.message().expect("error message");
-            assert!(message.contains("console port 9443"));
-            assert!(message.contains("S3 API port 9000"));
+            assert_eq!(targets.targets.len(), 1);
+            let target = &targets.targets[0];
+            assert_eq!(target.endpoint, "remote.example.com:9001");
+            assert!(target.secure);
         });
     }
 
