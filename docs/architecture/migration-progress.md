@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-migration-ci-rules`
-- Baseline: `upstream/main` at `6f4d0b54a171ff1560b5d892378d2ed407411fb9`
-- PR type for this branch: `ci-gate`
+- Branch: `overtrue/arch-admin-route-matrix-guard`
+- Baseline: `upstream/main` at `dee550a831cbfc24aa5cecd60f6f3a4cfe1a2e30`
+- PR type for this branch: `test-only`
 - Runtime behavior changes: none
-- Rust code changes: none
-- CI/script changes: add a migration rule check for PR type vocabulary and
-  temporary compatibility marker/register consistency, plus a lightweight
-  docs-only workflow so architecture documentation PRs still run the same guard.
-- Docs changes: record the new guardrail in the migration handoff.
+- Rust code changes: add test-only admin route matrix coverage, test-only
+  registered route tracking, and a private shared admin route registration helper
+  so tests exercise the production registration sequence.
+- CI/script changes: none
+- Docs changes: record the route matrix guard handoff.
 
 ## Phase 0 Tasks
 
@@ -31,12 +31,11 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Acceptance: `./scripts/check_layer_dependencies.sh` passes on current
     `upstream/main` while still rejecting new unaccepted layer dependencies.
 - [~] `G-006` Create migration loss-prevention checks.
-  - Current branch: add a migration rule check for PR type vocabulary and
-    temporary compatibility marker/register consistency, with a dedicated
-    architecture-doc trigger that covers `ARCHITECTURE.md` and
-    `docs/architecture/**` docs-only PRs.
-  - Remaining follow-up: add checks for public re-export, route matrix, and
-    storage trait coverage before pure moves.
+  - Current branch: add a mechanical admin route matrix guard from
+    [`admin-route-action-snapshot.md`](admin-route-action-snapshot.md) and
+    `rustfs/src/admin/route_registration_test.rs`.
+  - Remaining follow-up: add checks for public re-export and storage trait
+    coverage before pure moves.
 - [x] `G-007` Create startup timeline table.
   - Acceptance: [`startup-timeline.md`](startup-timeline.md) records current
     binary startup order, side effects, fatal boundaries, and readiness stages.
@@ -66,42 +65,38 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `test-only`: add a mechanical admin route matrix guard from the current
-   snapshot and `route_registration_test.rs`.
-2. `contract`: define the config-model contract surface while preserving the
+1. `contract`: define the config-model contract surface while preserving the
    existing `Config`, `KV`, and `KVS` behavior.
-3. `ci-gate`: add focused checks for public re-export and storage trait coverage
+2. `ci-gate`: add focused checks for public re-export and storage trait coverage
    before pure moves.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the guard script is narrow/readable, fixes single-token PR type detection, and reuses one script across CI/make/docs triggers rather than adding a parallel rule system |
-| Migration preservation | pass | Confirmed this is a `ci-gate` PR with only CI/config/docs/script changes and no runtime logic, storage hot-path, global-state, compatibility implementation, or crate-split changes |
-| Testing/verification | pass | Confirmed positive checks, staged diff check, and temporary negative checks cover unknown PR type and missing cleanup-register entry failure modes |
+| Quality/architecture | pass | Confirmed the matrix helpers keep the snapshot explicit, `S3Router` instrumentation is fully `cfg(test)`, the production registration order is shared through one private helper, and the non-test insertion path keeps existing route construction/insert behavior |
+| Migration preservation | pass | Confirmed this remains `test-only` in effect: no route handler/auth/alias semantics changed, no storage hot-path/global-state/crate-split changes, and MinIO admin alias coverage is expanded across all admin-prefix matrix entries |
+| Testing/verification | pass | Confirmed focused route tests pin `ENV_HEALTH_ENDPOINT_ENABLE=true`, use the production registration helper, and pass with formatting, non-test cargo check, migration guard scripts, diff check, full `make pre-commit`, and temporary unaccounted-route negative coverage |
 
 ## Verification Notes
 
 Passed:
+- `cargo fmt --all --check`
+- `cargo check -p rustfs --lib`
+- `cargo test -p rustfs admin::route_registration_test -- --nocapture`
 - `./scripts/check_architecture_migration_rules.sh`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
-- `git diff --cached --check`
-- `bash -n scripts/check_architecture_migration_rules.sh`
-- `make architecture-migration-check`
-- `ruby -e "require 'yaml'; YAML.load_file('.github/workflows/architecture-migration-rules.yml')"`
-- temporary negative check for unknown single-token PR type
-- temporary negative check for unknown PR type in `ARCHITECTURE.md`
-- temporary negative check for unknown PR type in nested `docs/architecture/**`
-- temporary negative check for source compatibility marker without a register entry
+- temporary negative check for an unaccounted admin route registration
+- `make pre-commit`
 
 ## Handoff Notes
 
 - Keep Phase 0 PRs small. Do not move Config, Storage API, Runtime, or ECStore
-  code inside this `ci-gate` branch.
-- Keep CI checks in a separate `ci-gate` PR so the PR type rule remains enforceable.
+  code inside this `test-only` branch.
+- Route matrix instrumentation must remain test-only and must not alter dispatch
+  or auth behavior.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
 - The next config-model PR must preserve the current tuple-struct shapes and
