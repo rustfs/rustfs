@@ -70,8 +70,8 @@ use rustfs_utils::http::get_source_scheme;
 use rustls_pki_types::pem::PemObject;
 use s3s::dto::{
     BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus,
-    Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, VersioningConfiguration,
+    Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ReplicaModifications, ReplicaModificationsStatus,
+    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria, VersioningConfiguration,
 };
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
@@ -1439,53 +1439,6 @@ fn filter_sr_info(mut info: SRInfo, opts: &SRStatusOptions) -> SRInfo {
     info
 }
 
-fn build_site_summary(info: &SRInfo) -> SRSiteSummary {
-    let replicated_buckets = info.buckets.len();
-    let replicated_tags = info.buckets.values().filter(|bucket| bucket.tags.is_some()).count();
-    let replicated_bucket_policies = info.buckets.values().filter(|bucket| bucket.policy.is_some()).count();
-    let replicated_lock_config = info
-        .buckets
-        .values()
-        .filter(|bucket| bucket.object_lock_config.is_some())
-        .count();
-    let replicated_sse_config = info.buckets.values().filter(|bucket| bucket.sse_config.is_some()).count();
-    let replicated_versioning_config = info.buckets.values().filter(|bucket| bucket.versioning.is_some()).count();
-    let replicated_quota_config = info.buckets.values().filter(|bucket| bucket.quota_config.is_some()).count();
-    let replicated_cors_config = info.buckets.values().filter(|bucket| bucket.cors_config.is_some()).count();
-
-    SRSiteSummary {
-        replicated_buckets,
-        replicated_tags,
-        replicated_bucket_policies,
-        replicated_iam_policies: info.policies.len(),
-        replicated_users: info.user_info_map.len(),
-        replicated_groups: info.group_desc_map.len(),
-        replicated_lock_config,
-        replicated_sse_config,
-        replicated_versioning_config,
-        replicated_quota_config,
-        replicated_user_policy_mappings: info.user_policies.len(),
-        replicated_group_policy_mappings: info.group_policies.len(),
-        replicated_ilm_expiry_rules: info.ilm_expiry_rules.len(),
-        replicated_cors_config,
-        total_buckets_count: info.buckets.len(),
-        total_tags_count: replicated_tags,
-        total_bucket_policies_count: replicated_bucket_policies,
-        total_iam_policies_count: info.policies.len(),
-        total_lock_config_count: replicated_lock_config,
-        total_sse_config_count: replicated_sse_config,
-        total_versioning_config_count: replicated_versioning_config,
-        total_quota_config_count: replicated_quota_config,
-        total_users_count: info.user_info_map.len(),
-        total_groups_count: info.group_desc_map.len(),
-        total_user_policy_mapping_count: info.user_policies.len(),
-        total_group_policy_mapping_count: info.group_policies.len(),
-        total_ilm_expiry_rules_count: info.ilm_expiry_rules.len(),
-        total_cors_config_count: replicated_cors_config,
-        api_version: Some(SITE_REPL_API_VERSION.to_string()),
-    }
-}
-
 async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
     let Some(stats) = GLOBAL_REPLICATION_STATS.get() else {
         return SRMetricsSummary::default();
@@ -1562,56 +1515,333 @@ async fn fetch_peer_sr_info(peer: &PeerInfo, state: &SiteReplicationState, uri: 
     })
 }
 
-fn merge_status_info_for_site(status: &mut SRStatusInfo, deployment_id: &str, info: &SRInfo, opts: &SRStatusOptions) {
-    status
-        .stats_summary
-        .insert(deployment_id.to_string(), build_site_summary(info));
+fn string_config_mismatch<'a>(values: impl Iterator<Item = Option<&'a String>>, total_sites: usize) -> (usize, bool) {
+    let mut present = 0usize;
+    let mut first: Option<&String> = None;
+    let mut mismatch = false;
 
-    if opts.include_all_defaults() || opts.buckets || opts.entity == SREntityType::Bucket {
-        for (bucket_name, bucket_info) in &info.buckets {
+    for value in values.flatten() {
+        present += 1;
+        if let Some(first) = first {
+            mismatch |= first != value;
+        } else {
+            first = Some(value);
+        }
+    }
+
+    (present, present > 0 && (present < total_sites || mismatch))
+}
+
+fn value_config_mismatch<'a>(values: impl Iterator<Item = Option<&'a Value>>, total_sites: usize) -> (usize, bool) {
+    let mut present = 0usize;
+    let mut first: Option<Value> = None;
+    let mut mismatch = false;
+
+    for value in values.flatten() {
+        present += 1;
+        let value = canonical_status_json(value);
+        if let Some(first) = &first {
+            mismatch |= first != &value;
+        } else {
+            first = Some(value);
+        }
+    }
+
+    (present, present > 0 && (present < total_sites || mismatch))
+}
+
+fn canonical_status_json(value: &Value) -> Value {
+    match value {
+        Value::Array(items) if items.iter().all(Value::is_string) => {
+            let mut items = items.clone();
+            items.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+            Value::Array(items)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_status_json).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), canonical_status_json(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn site_replication_rule_complete(rule: &ReplicationRule) -> bool {
+    let delete_marker_enabled = rule
+        .delete_marker_replication
+        .as_ref()
+        .and_then(|delete_marker| delete_marker.status.as_ref())
+        .is_some_and(|status| status == &DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED));
+    let delete_enabled = rule
+        .delete_replication
+        .as_ref()
+        .is_some_and(|delete| delete.status == DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED));
+    let existing_object_enabled = rule.existing_object_replication.as_ref().is_some_and(|existing| {
+        existing.status == ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED)
+    });
+    let replica_modifications_enabled = rule
+        .source_selection_criteria
+        .as_ref()
+        .and_then(|criteria| criteria.replica_modifications.as_ref())
+        .is_some_and(|replica_modifications| {
+            replica_modifications.status == ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED)
+        });
+
+    rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
+        && rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED)
+        && delete_marker_enabled
+        && delete_enabled
+        && existing_object_enabled
+        && replica_modifications_enabled
+}
+
+fn site_replication_config_mismatch<'a>(values: impl Iterator<Item = Option<&'a String>>, total_sites: usize) -> (usize, bool) {
+    let values = values.flatten().collect::<Vec<_>>();
+    let present = values.len();
+    if present == 0 {
+        return (0, false);
+    }
+    if present != total_sites {
+        return (present, true);
+    }
+
+    let expected_rules = total_sites.saturating_sub(1);
+    let replicated = values.iter().all(|raw| {
+        deserialize::<ReplicationConfiguration>(raw.as_bytes())
+            .is_ok_and(|config| config.rules.len() == expected_rules && config.rules.iter().all(site_replication_rule_complete))
+    });
+
+    (present, !replicated)
+}
+
+fn merge_bucket_status_info(status: &mut SRStatusInfo, site_infos: &BTreeMap<String, SRInfo>, opts: &SRStatusOptions) {
+    if !(opts.include_all_defaults() || opts.buckets || opts.entity == SREntityType::Bucket) {
+        return;
+    }
+
+    let total_sites = site_infos.len();
+    let mut bucket_names = BTreeMap::<String, ()>::new();
+    for info in site_infos.values() {
+        for bucket_name in info.buckets.keys() {
             if opts.entity == SREntityType::Bucket && !opts.entity_value.is_empty() && bucket_name != &opts.entity_value {
                 continue;
             }
+            bucket_names.insert(bucket_name.clone(), ());
+        }
+    }
+
+    for bucket_name in bucket_names.keys() {
+        let bucket_values = site_infos.values().map(|info| info.buckets.get(bucket_name));
+        let present_buckets = bucket_values.clone().filter(|bucket| bucket.is_some()).count();
+        let (tag_count, tag_mismatch) = string_config_mismatch(
+            site_infos
+                .values()
+                .map(|info| info.buckets.get(bucket_name).and_then(|bucket| bucket.tags.as_ref())),
+            total_sites,
+        );
+        let (object_lock_count, object_lock_mismatch) = string_config_mismatch(
+            site_infos.values().map(|info| {
+                info.buckets
+                    .get(bucket_name)
+                    .and_then(|bucket| bucket.object_lock_config.as_ref())
+            }),
+            total_sites,
+        );
+        let (sse_count, sse_mismatch) = string_config_mismatch(
+            site_infos
+                .values()
+                .map(|info| info.buckets.get(bucket_name).and_then(|bucket| bucket.sse_config.as_ref())),
+            total_sites,
+        );
+        let (versioning_count, versioning_mismatch) = string_config_mismatch(
+            site_infos
+                .values()
+                .map(|info| info.buckets.get(bucket_name).and_then(|bucket| bucket.versioning.as_ref())),
+            total_sites,
+        );
+        let (_, replication_mismatch) = site_replication_config_mismatch(
+            site_infos.values().map(|info| {
+                info.buckets
+                    .get(bucket_name)
+                    .and_then(|bucket| bucket.replication_config.as_ref())
+            }),
+            total_sites,
+        );
+        let (quota_count, quota_mismatch) = string_config_mismatch(
+            site_infos
+                .values()
+                .map(|info| info.buckets.get(bucket_name).and_then(|bucket| bucket.quota_config.as_ref())),
+            total_sites,
+        );
+        let (cors_count, cors_mismatch) = string_config_mismatch(
+            site_infos
+                .values()
+                .map(|info| info.buckets.get(bucket_name).and_then(|bucket| bucket.cors_config.as_ref())),
+            total_sites,
+        );
+        let (policy_count, policy_mismatch) = value_config_mismatch(
+            site_infos
+                .values()
+                .map(|info| info.buckets.get(bucket_name).and_then(|bucket| bucket.policy.as_ref())),
+            total_sites,
+        );
+
+        for (deployment_id, info) in site_infos {
+            let bucket_info = info.buckets.get(bucket_name);
+            let summary = status
+                .stats_summary
+                .entry(deployment_id.clone())
+                .or_insert_with(|| SRSiteSummary {
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
+                });
+            summary.total_buckets_count += 1;
+            if present_buckets == total_sites {
+                summary.replicated_buckets += 1;
+            }
+            if tag_count > 0 {
+                summary.total_tags_count += 1;
+            }
+            if !tag_mismatch && tag_count == total_sites {
+                summary.replicated_tags += 1;
+            }
+            if object_lock_count > 0 {
+                summary.total_lock_config_count += 1;
+            }
+            if !object_lock_mismatch && object_lock_count == total_sites {
+                summary.replicated_lock_config += 1;
+            }
+            if sse_count > 0 {
+                summary.total_sse_config_count += 1;
+            }
+            if !sse_mismatch && sse_count == total_sites {
+                summary.replicated_sse_config += 1;
+            }
+            if versioning_count > 0 {
+                summary.total_versioning_config_count += 1;
+            }
+            if !versioning_mismatch && versioning_count == total_sites {
+                summary.replicated_versioning_config += 1;
+            }
+            if quota_count > 0 {
+                summary.total_quota_config_count += 1;
+            }
+            if !quota_mismatch && quota_count == total_sites {
+                summary.replicated_quota_config += 1;
+            }
+            if cors_count > 0 {
+                summary.total_cors_config_count += 1;
+            }
+            if !cors_mismatch && cors_count == total_sites {
+                summary.replicated_cors_config += 1;
+            }
+            if policy_count > 0 {
+                summary.total_bucket_policies_count += 1;
+            }
+            if !policy_mismatch && policy_count == total_sites {
+                summary.replicated_bucket_policies += 1;
+            }
+
             status.bucket_stats.entry(bucket_name.clone()).or_default().insert(
-                deployment_id.to_string(),
+                deployment_id.clone(),
                 SRBucketStatsSummary {
-                    deployment_id: deployment_id.to_string(),
-                    has_bucket: true,
-                    has_tags_set: bucket_info.tags.is_some(),
-                    has_object_lock_config_set: bucket_info.object_lock_config.is_some(),
-                    has_policy_set: bucket_info.policy.is_some(),
-                    has_sse_cfg_set: bucket_info.sse_config.is_some(),
-                    has_replication_cfg: bucket_info.replication_config.is_some(),
-                    has_quota_cfg_set: bucket_info.quota_config.is_some(),
-                    has_cors_cfg_set: bucket_info.cors_config.is_some(),
+                    deployment_id: deployment_id.clone(),
+                    has_bucket: bucket_info.is_some(),
+                    has_tags_set: bucket_info.is_some_and(|bucket| bucket.tags.is_some()),
+                    has_object_lock_config_set: bucket_info.is_some_and(|bucket| bucket.object_lock_config.is_some()),
+                    has_policy_set: bucket_info.is_some_and(|bucket| bucket.policy.is_some()),
+                    has_sse_cfg_set: bucket_info.is_some_and(|bucket| bucket.sse_config.is_some()),
+                    has_replication_cfg: bucket_info.is_some_and(|bucket| bucket.replication_config.is_some()),
+                    has_quota_cfg_set: bucket_info.is_some_and(|bucket| bucket.quota_config.is_some()),
+                    has_cors_cfg_set: bucket_info.is_some_and(|bucket| bucket.cors_config.is_some()),
+                    tag_mismatch,
+                    versioning_config_mismatch: versioning_mismatch,
+                    object_lock_config_mismatch: object_lock_mismatch,
+                    policy_mismatch,
+                    sse_config_mismatch: sse_mismatch,
+                    replication_cfg_mismatch: replication_mismatch,
+                    quota_cfg_mismatch: quota_mismatch,
+                    cors_cfg_mismatch: cors_mismatch,
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
                     ..Default::default()
                 },
             );
         }
     }
+}
 
-    if opts.include_all_defaults() || opts.policies || opts.entity == SREntityType::Policy {
-        for name in info.policies.keys() {
-            if opts.entity == SREntityType::Policy && !opts.entity_value.is_empty() && name != &opts.entity_value {
+fn merge_policy_status_info(status: &mut SRStatusInfo, site_infos: &BTreeMap<String, SRInfo>, opts: &SRStatusOptions) {
+    if !(opts.include_all_defaults() || opts.policies || opts.entity == SREntityType::Policy) {
+        return;
+    }
+
+    let total_sites = site_infos.len();
+    let mut policy_names = BTreeMap::<String, ()>::new();
+    for info in site_infos.values() {
+        for policy_name in info.policies.keys() {
+            if opts.entity == SREntityType::Policy && !opts.entity_value.is_empty() && policy_name != &opts.entity_value {
                 continue;
             }
-            status.policy_stats.entry(name.clone()).or_default().insert(
-                deployment_id.to_string(),
-                SRPolicyStatsSummary {
-                    deployment_id: deployment_id.to_string(),
-                    has_policy: true,
+            policy_names.insert(policy_name.clone(), ());
+        }
+    }
+
+    for policy_name in policy_names.keys() {
+        let (policy_count, policy_mismatch) = value_config_mismatch(
+            site_infos
+                .values()
+                .map(|info| info.policies.get(policy_name).and_then(|policy| policy.policy.as_ref())),
+            total_sites,
+        );
+
+        for (deployment_id, info) in site_infos {
+            let policy = info.policies.get(policy_name);
+            let summary = status
+                .stats_summary
+                .entry(deployment_id.clone())
+                .or_insert_with(|| SRSiteSummary {
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
                     ..Default::default()
+                });
+            if policy_count > 0 {
+                summary.total_iam_policies_count += 1;
+            }
+            if !policy_mismatch && policy_count == total_sites {
+                summary.replicated_iam_policies += 1;
+            }
+
+            status.policy_stats.entry(policy_name.clone()).or_default().insert(
+                deployment_id.clone(),
+                SRPolicyStatsSummary {
+                    deployment_id: deployment_id.clone(),
+                    policy_mismatch,
+                    has_policy: policy.is_some_and(|policy| policy.policy.is_some()),
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 },
             );
         }
     }
+}
 
+fn merge_status_info_for_site(status: &mut SRStatusInfo, deployment_id: &str, info: &SRInfo, opts: &SRStatusOptions) {
     if opts.include_all_defaults() || opts.users || opts.entity == SREntityType::User {
         for name in info.user_info_map.keys() {
             if opts.entity == SREntityType::User && !opts.entity_value.is_empty() && name != &opts.entity_value {
                 continue;
+            }
+            let summary = status
+                .stats_summary
+                .entry(deployment_id.to_string())
+                .or_insert_with(|| SRSiteSummary {
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
+                });
+            summary.total_users_count += 1;
+            summary.replicated_users += 1;
+            if info.user_policies.contains_key(name) {
+                summary.total_user_policy_mapping_count += 1;
+                summary.replicated_user_policy_mappings += 1;
             }
             status.user_stats.entry(name.clone()).or_default().insert(
                 deployment_id.to_string(),
@@ -1631,6 +1861,19 @@ fn merge_status_info_for_site(status: &mut SRStatusInfo, deployment_id: &str, in
             if opts.entity == SREntityType::Group && !opts.entity_value.is_empty() && name != &opts.entity_value {
                 continue;
             }
+            let summary = status
+                .stats_summary
+                .entry(deployment_id.to_string())
+                .or_insert_with(|| SRSiteSummary {
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
+                });
+            summary.total_groups_count += 1;
+            summary.replicated_groups += 1;
+            if info.group_policies.contains_key(name) {
+                summary.total_group_policy_mapping_count += 1;
+                summary.replicated_group_policy_mappings += 1;
+            }
             status.group_stats.entry(name.clone()).or_default().insert(
                 deployment_id.to_string(),
                 SRGroupStatsSummary {
@@ -1649,6 +1892,15 @@ fn merge_status_info_for_site(status: &mut SRStatusInfo, deployment_id: &str, in
             if opts.entity == SREntityType::IlmExpiryRule && !opts.entity_value.is_empty() && name != &opts.entity_value {
                 continue;
             }
+            let summary = status
+                .stats_summary
+                .entry(deployment_id.to_string())
+                .or_insert_with(|| SRSiteSummary {
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
+                });
+            summary.total_ilm_expiry_rules_count += 1;
+            summary.replicated_ilm_expiry_rules += 1;
             status.ilm_expiry_stats.entry(name.clone()).or_default().insert(
                 deployment_id.to_string(),
                 SRILMExpiryStatsSummary {
@@ -1662,46 +1914,87 @@ fn merge_status_info_for_site(status: &mut SRStatusInfo, deployment_id: &str, in
     }
 }
 
+fn prune_in_sync_status_details(status: &mut SRStatusInfo, opts: &SRStatusOptions) {
+    if opts.entity != SREntityType::Bucket {
+        status.bucket_stats.retain(|_, deployments| {
+            deployments.values().any(|stats| {
+                !stats.has_bucket
+                    || stats.bucket_marked_deleted
+                    || stats.tag_mismatch
+                    || stats.versioning_config_mismatch
+                    || stats.object_lock_config_mismatch
+                    || stats.policy_mismatch
+                    || stats.sse_config_mismatch
+                    || stats.replication_cfg_mismatch
+                    || stats.quota_cfg_mismatch
+                    || stats.cors_cfg_mismatch
+            })
+        });
+    }
+
+    if opts.entity != SREntityType::Policy {
+        status
+            .policy_stats
+            .retain(|_, deployments| deployments.values().any(|stats| stats.policy_mismatch));
+    }
+}
+
 async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, uri: &Uri) -> S3Result<SRStatusInfo> {
     let opts = sr_status_options(uri);
-    let local_info = filter_sr_info(build_sr_info(state, local_peer).await?, &opts);
+    let mut local_info = Some(filter_sr_info(build_sr_info(state, local_peer).await?, &opts));
     let metrics_requested = opts.metrics || opts.include_all_defaults() || opts.entity == SREntityType::Bucket;
 
-    let mut status = SRStatusInfo {
-        enabled: state.enabled(),
-        max_buckets: local_info.buckets.len(),
-        max_users: local_info.user_info_map.len(),
-        max_groups: local_info.group_desc_map.len(),
-        max_policies: local_info.policies.len(),
-        max_ilm_expiry_rules: local_info.ilm_expiry_rules.len(),
-        sites: state.peers.clone(),
-        api_version: Some(SITE_REPL_API_VERSION.to_string()),
-        ..Default::default()
-    };
-
+    let mut site_infos = BTreeMap::new();
     for (deployment_id, peer) in &state.peers {
         if deployment_id == &local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
-            merge_status_info_for_site(&mut status, deployment_id, &local_info, &opts);
+            site_infos.insert(deployment_id.clone(), local_info.take().unwrap_or_default());
             continue;
         }
 
         match fetch_peer_sr_info(peer, state, uri).await {
             Ok(peer_info) => {
-                let peer_info = filter_sr_info(peer_info, &opts);
-                merge_status_info_for_site(&mut status, deployment_id, &peer_info, &opts);
+                site_infos.insert(deployment_id.clone(), filter_sr_info(peer_info, &opts));
             }
             Err(err) => {
                 warn!(peer = %peer.endpoint, error = ?err, "site replication peer metainfo fetch failed");
-                status.stats_summary.insert(
-                    deployment_id.clone(),
-                    SRSiteSummary {
-                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                        ..Default::default()
-                    },
-                );
+                site_infos.insert(deployment_id.clone(), SRInfo::default());
             }
         }
     }
+
+    let max_buckets = site_infos.values().map(|info| info.buckets.len()).max().unwrap_or(0);
+    let max_users = site_infos.values().map(|info| info.user_info_map.len()).max().unwrap_or(0);
+    let max_groups = site_infos.values().map(|info| info.group_desc_map.len()).max().unwrap_or(0);
+    let max_policies = site_infos.values().map(|info| info.policies.len()).max().unwrap_or(0);
+    let max_ilm_expiry_rules = site_infos.values().map(|info| info.ilm_expiry_rules.len()).max().unwrap_or(0);
+
+    let mut status = SRStatusInfo {
+        enabled: state.enabled(),
+        max_buckets,
+        max_users,
+        max_groups,
+        max_policies,
+        max_ilm_expiry_rules,
+        sites: state.peers.clone(),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    };
+
+    for deployment_id in state.peers.keys() {
+        status.stats_summary.insert(
+            deployment_id.clone(),
+            SRSiteSummary {
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    merge_bucket_status_info(&mut status, &site_infos, &opts);
+    merge_policy_status_info(&mut status, &site_infos, &opts);
+    for (deployment_id, info) in &site_infos {
+        merge_status_info_for_site(&mut status, deployment_id, info, &opts);
+    }
+    prune_in_sync_status_details(&mut status, &opts);
 
     if metrics_requested {
         status.metrics = build_metrics_summary(local_peer).await;
@@ -2023,7 +2316,12 @@ fn build_site_replication_rule(arn: &str, priority: i32, rule_id: &str) -> Repli
         id: Some(rule_id.to_string()),
         prefix: None,
         priority: Some(priority),
-        source_selection_criteria: None,
+        source_selection_criteria: Some(SourceSelectionCriteria {
+            replica_modifications: Some(ReplicaModifications {
+                status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+            }),
+            sse_kms_encrypted_objects: None,
+        }),
         status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
     }
 }
@@ -3328,6 +3626,61 @@ mod tests {
         assert_eq!(
             sr_metainfo_path(&uri),
             "/rustfs/admin/v3/site-replication/metainfo?buckets=true&entity=bucket&entityvalue=photos"
+        );
+    }
+
+    #[test]
+    fn test_site_replication_config_status_accepts_peer_specific_targets() {
+        let site_a_config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![build_site_replication_rule(
+                "arn:rustfs:replication::site-b:test-replication",
+                1,
+                "site-repl-site-b",
+            )],
+        };
+        let site_b_config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![build_site_replication_rule(
+                "arn:rustfs:replication::site-a:test-replication",
+                1,
+                "site-repl-site-a",
+            )],
+        };
+        let site_a_xml = String::from_utf8(serialize(&site_a_config).expect("site replication XML should serialize"))
+            .expect("site replication XML should be UTF-8");
+        let site_b_xml = String::from_utf8(serialize(&site_b_config).expect("site replication XML should serialize"))
+            .expect("site replication XML should be UTF-8");
+
+        assert!(site_replication_rule_complete(&site_a_config.rules[0]));
+        assert_eq!(
+            site_replication_config_mismatch(vec![Some(&site_a_xml), Some(&site_b_xml)].into_iter(), 2),
+            (2, false)
+        );
+    }
+
+    #[test]
+    fn test_status_policy_compare_ignores_string_array_order() {
+        let site_a_policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:GetBucketQuota", "s3:GetBucketLocation", "s3:GetObject"],
+                "Resource": ["arn:aws:s3:::*"]
+            }]
+        });
+        let site_b_policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:GetBucketLocation", "s3:GetBucketQuota"],
+                "Resource": ["arn:aws:s3:::*"]
+            }]
+        });
+
+        assert_eq!(
+            value_config_mismatch(vec![Some(&site_a_policy), Some(&site_b_policy)].into_iter(), 2),
+            (2, false)
         );
     }
 
