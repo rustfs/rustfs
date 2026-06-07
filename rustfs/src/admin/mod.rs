@@ -42,35 +42,39 @@ use s3s::route::S3Route;
 /// An instance of S3Route for admin operations
 pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
-
-    health::register_health_route(&mut r)?;
-    sts::register_admin_auth_route(&mut r)?;
-
-    user::register_user_route(&mut r)?;
-    system::register_system_route(&mut r)?;
-    pools::register_pool_route(&mut r)?;
-    rebalance::register_rebalance_route(&mut r)?;
-
-    heal::register_heal_route(&mut r)?;
-
-    tier::register_tier_route(&mut r)?;
-
-    quota::register_quota_route(&mut r)?;
-    bucket_meta::register_bucket_meta_route(&mut r)?;
-    config_admin::register_config_route(&mut r)?;
-    scanner::register_scanner_route(&mut r)?;
-    audit::register_audit_target_route(&mut r)?;
-    module_switch::register_module_switch_route(&mut r)?;
-    plugins_catalog::register_plugin_catalog_route(&mut r)?;
-    plugins_instances::register_plugin_instance_route(&mut r)?;
-
-    replication::register_replication_route(&mut r)?;
-    site_replication::register_site_replication_route(&mut r)?;
-    profile_admin::register_profiling_route(&mut r)?;
-    tls_debug::register_tls_debug_route(&mut r)?;
-    kms::register_kms_route(&mut r)?;
-    oidc::register_oidc_route(&mut r)?;
-    table_catalog::register_table_catalog_route(&mut r)?;
-
+    register_admin_routes(&mut r)?;
     Ok(r)
+}
+
+fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    health::register_health_route(r)?;
+    sts::register_admin_auth_route(r)?;
+
+    user::register_user_route(r)?;
+    system::register_system_route(r)?;
+    pools::register_pool_route(r)?;
+    rebalance::register_rebalance_route(r)?;
+
+    heal::register_heal_route(r)?;
+
+    tier::register_tier_route(r)?;
+
+    quota::register_quota_route(r)?;
+    bucket_meta::register_bucket_meta_route(r)?;
+    config_admin::register_config_route(r)?;
+    scanner::register_scanner_route(r)?;
+    audit::register_audit_target_route(r)?;
+    module_switch::register_module_switch_route(r)?;
+    plugins_catalog::register_plugin_catalog_route(r)?;
+    plugins_instances::register_plugin_instance_route(r)?;
+
+    replication::register_replication_route(r)?;
+    site_replication::register_site_replication_route(r)?;
+    profile_admin::register_profiling_route(r)?;
+    tls_debug::register_tls_debug_route(r)?;
+    kms::register_kms_route(r)?;
+    oidc::register_oidc_route(r)?;
+    table_catalog::register_table_catalog_route(r)?;
+
+    Ok(())
 }

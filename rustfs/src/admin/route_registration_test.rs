@@ -13,11 +13,7 @@
 // limitations under the License.
 
 use crate::admin::{
-    handlers::{
-        audit, bucket_meta, config_admin, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools,
-        profile_admin, quota, rebalance, replication, scanner, site_replication, sts, system, table_catalog, tier, tls_debug,
-        user,
-    },
+    handlers::health,
     router::{AdminOperation, S3Router},
 };
 use crate::server::{
@@ -98,30 +94,12 @@ fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
     );
 }
 
-fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
-    health::register_health_route(router).expect("register health route");
-    sts::register_admin_auth_route(router).expect("register sts route");
-    user::register_user_route(router).expect("register user route");
-    system::register_system_route(router).expect("register system route");
-    pools::register_pool_route(router).expect("register pool route");
-    rebalance::register_rebalance_route(router).expect("register rebalance route");
-    heal::register_heal_route(router).expect("register heal route");
-    tier::register_tier_route(router).expect("register tier route");
-    quota::register_quota_route(router).expect("register quota route");
-    bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
-    config_admin::register_config_route(router).expect("register config admin route");
-    scanner::register_scanner_route(router).expect("register scanner route");
-    audit::register_audit_target_route(router).expect("register audit target route");
-    module_switch::register_module_switch_route(router).expect("register module switch route");
-    plugins_catalog::register_plugin_catalog_route(router).expect("register plugin catalog route");
-    plugins_instances::register_plugin_instance_route(router).expect("register plugin instances route");
-    replication::register_replication_route(router).expect("register replication route");
-    site_replication::register_site_replication_route(router).expect("register site replication route");
-    profile_admin::register_profiling_route(router).expect("register profile route");
-    tls_debug::register_tls_debug_route(router).expect("register tls debug route");
-    kms::register_kms_route(router).expect("register kms route");
-    oidc::register_oidc_route(router).expect("register oidc route");
-    table_catalog::register_table_catalog_route(router).expect("register table catalog route");
+fn registered_admin_router() -> S3Router<AdminOperation> {
+    with_var(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"), || {
+        let mut router = S3Router::new(false);
+        super::register_admin_routes(&mut router).expect("register production admin routes");
+        router
+    })
 }
 
 fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
@@ -328,14 +306,12 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
     ]
 }
 
-// register_admin_routes reads ENV_HEALTH_ENDPOINT_ENABLE to decide whether
-// to register /health; serialise with the env-mutating test below to avoid
-// cross-thread leakage of that override.
+// registered_admin_router pins ENV_HEALTH_ENDPOINT_ENABLE because the
+// production registration helper intentionally honors that environment switch.
 #[test]
 #[serial]
 fn test_admin_route_matrix_matches_registered_routes() {
-    let mut router: S3Router<AdminOperation> = S3Router::new(false);
-    register_admin_routes(&mut router);
+    let router = registered_admin_router();
 
     let matrix = expected_admin_route_matrix();
     let actual_routes = router.registered_routes();
@@ -357,8 +333,7 @@ fn test_admin_route_matrix_matches_registered_routes() {
 #[test]
 #[serial]
 fn test_admin_route_matrix_preserves_minio_admin_aliases() {
-    let mut router: S3Router<AdminOperation> = S3Router::new(false);
-    register_admin_routes(&mut router);
+    let router = registered_admin_router();
 
     for route in expected_admin_route_matrix()
         .into_iter()
@@ -381,8 +356,7 @@ fn test_admin_route_matrix_preserves_minio_admin_aliases() {
 #[test]
 #[serial]
 fn test_register_routes_cover_representative_admin_paths() {
-    let mut router: S3Router<AdminOperation> = S3Router::new(false);
-    register_admin_routes(&mut router);
+    let router = registered_admin_router();
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
     assert_route(&router, Method::GET, HEALTH_READY_PATH);
@@ -521,8 +495,7 @@ fn test_register_routes_cover_representative_admin_paths() {
 #[test]
 #[serial]
 fn test_admin_alias_paths_match_existing_admin_routes() {
-    let mut router: S3Router<AdminOperation> = S3Router::new(false);
-    register_admin_routes(&mut router);
+    let router = registered_admin_router();
 
     for (method, path) in [
         (Method::GET, compat_admin_alias_path("/v3/is-admin")),

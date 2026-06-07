@@ -9,8 +9,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 - Baseline: `upstream/main` at `dee550a831cbfc24aa5cecd60f6f3a4cfe1a2e30`
 - PR type for this branch: `test-only`
 - Runtime behavior changes: none
-- Rust code changes: add test-only admin route matrix coverage and test-only
-  registered route tracking.
+- Rust code changes: add test-only admin route matrix coverage, test-only
+  registered route tracking, and a private shared admin route registration helper
+  so tests exercise the production registration sequence.
 - CI/script changes: none
 - Docs changes: record the route matrix guard handoff.
 
@@ -73,9 +74,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the matrix helpers keep the snapshot explicit, `S3Router` instrumentation is fully `cfg(test)`, and the non-test insertion path keeps the existing route construction and insert behavior |
-| Migration preservation | pass | Confirmed this remains `test-only`: no route handler/auth/alias semantics changed, no storage hot-path/global-state/crate-split changes, and MinIO admin alias coverage is expanded across all admin-prefix matrix entries |
-| Testing/verification | pass | Confirmed focused route tests, formatting, non-test cargo check, migration guard scripts, diff check, full `make pre-commit`, and temporary unaccounted-route negative coverage all passed |
+| Quality/architecture | pass | Confirmed the matrix helpers keep the snapshot explicit, `S3Router` instrumentation is fully `cfg(test)`, the production registration order is shared through one private helper, and the non-test insertion path keeps existing route construction/insert behavior |
+| Migration preservation | pass | Confirmed this remains `test-only` in effect: no route handler/auth/alias semantics changed, no storage hot-path/global-state/crate-split changes, and MinIO admin alias coverage is expanded across all admin-prefix matrix entries |
+| Testing/verification | pass | Confirmed focused route tests pin `ENV_HEALTH_ENDPOINT_ENABLE=true`, use the production registration helper, and pass with formatting, non-test cargo check, migration guard scripts, diff check, full `make pre-commit`, and temporary unaccounted-route negative coverage |
 
 ## Verification Notes
 
