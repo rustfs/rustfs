@@ -19,9 +19,11 @@ In scope:
 - `rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config}`
 - Consumers that persist, clone, inspect, mutate, or pass these types across
   runtime boundaries.
-- Adjacent users of `rustfs_ecstore::config::com::{read_config, save_config,
-  delete_config}` are listed separately because moving `com.rs` would affect
-  them even when they do not consume `Config`, `KV`, or `KVS`.
+- Selected adjacent users of `rustfs_ecstore::config::com::{read_config,
+  save_config, delete_config}` and related helper variants are listed separately
+  when they appear outside the core `Config`, `KV`, and `KVS` consumer map.
+  This is not a complete `com.rs` move inventory; any future `com.rs` move must
+  first inventory ECStore-internal persistence helper users too.
 
 Out of scope:
 
@@ -123,6 +125,8 @@ behind narrower contracts.
 | `rustfs/src/admin/handlers/kms_dynamic.rs` | Uses generic `read_config` and `save_config` for dynamic KMS config objects. |
 | `rustfs/src/admin/handlers/site_replication.rs` | Uses generic `read_config`, `save_config`, and `delete_config` for site-replication state objects. |
 | `rustfs/src/admin/service/site_replication.rs` | Uses generic `read_config` and `save_config` for site-replication state normalization. |
+| `rustfs/src/server/module_switch.rs` | Uses generic `read_config` and `save_config` for module-switch config objects. |
+| `crates/iam/src/store/object.rs` | Uses generic `read_config_no_lock`, `read_config_with_metadata`, `save_config`, `save_config_with_opts`, and `delete_config` helper variants for IAM object-store persistence paths. |
 | `crates/scanner/src/{scanner,data_usage_define}.rs` | Uses generic `read_config` and `save_config` for scanner metadata and cache persistence paths. |
 
 ### Runtime Target, Notify, And Audit Crates

@@ -53,6 +53,7 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 - Every admin or diagnostic route needs an explicit authn and authz story. Route registration, router whitelist, and handler-level authorization must agree.
 - Match the admin action to the operation exactly. Copy-paste action constants are a known RustFS vulnerability class.
 - Avoid authentication-only helpers for state-changing admin APIs; use `validate_admin_request` or the established equivalent with the right `AdminAction`.
+- Read-only admin APIs such as metrics, server info, and diagnostics still require admin authorization; checking only that credentials exist is not enough.
 - Do not assume admin-action `Resource` scoping constrains blast radius unless the policy engine actually enforces resources for that action.
 
 ### IAM and service accounts
