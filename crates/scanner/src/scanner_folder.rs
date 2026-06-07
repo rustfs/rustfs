@@ -634,7 +634,7 @@ impl ScannerItem {
             GLOBAL_ExpiryState
                 .write()
                 .await
-                .enqueue_by_newer_noncurrent(&self.bucket, to_delete_objs, event)
+                .enqueue_by_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner)
                 .await;
         }
         self.alert_excessive_versions(remaining_versions, cumulative_size);
@@ -756,7 +756,7 @@ impl ScannerItem {
         ensure_scanner_alert_metrics_registered();
         let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
         if too_many_versions {
-            global_metrics().record_scanner_source_work(ScannerWorkSource::Alerts, 0, 0, 1, 0, 0);
+            global_metrics().record_scanner_source_work(ScannerWorkSource::Alerts, 0, 0, 1, 0, 0, 0);
             counter!(
                 METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL,
                 "bucket" => self.bucket.clone()
@@ -771,7 +771,7 @@ impl ScannerItem {
             );
         }
         if too_large_versions {
-            global_metrics().record_scanner_source_work(ScannerWorkSource::Alerts, 0, 0, 1, 0, 0);
+            global_metrics().record_scanner_source_work(ScannerWorkSource::Alerts, 0, 0, 1, 0, 0, 0);
             counter!(
                 METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL,
                 "bucket" => self.bucket.clone()
@@ -911,7 +911,7 @@ impl FolderScanner {
         }
 
         ensure_scanner_alert_metrics_registered();
-        global_metrics().record_scanner_source_work(ScannerWorkSource::Alerts, 0, 0, 1, 0, 0);
+        global_metrics().record_scanner_source_work(ScannerWorkSource::Alerts, 0, 0, 1, 0, 0, 0);
         counter!(
             METRIC_SCANNER_EXCESS_FOLDERS_TOTAL,
             "root" => self.root.clone()
