@@ -5,15 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-route-matrix-guard`
-- Baseline: `upstream/main` at `dee550a831cbfc24aa5cecd60f6f3a4cfe1a2e30`
-- PR type for this branch: `test-only`
+- Branch: `overtrue/arch-security-governance-types`
+- Baseline: `upstream/main` at `c03c0ebc363209a4820e6d6f2267e0342c6a7782`
+- PR type for this branch: `contract`
 - Runtime behavior changes: none
-- Rust code changes: add test-only admin route matrix coverage, test-only
-  registered route tracking, and a private shared admin route registration helper
-  so tests exercise the production registration sequence.
+- Rust code changes: add the pure `rustfs-security-governance` contract crate
+  with admin route matrix metadata types, typed validation errors, and unit tests.
 - CI/script changes: none
-- Docs changes: record the route matrix guard handoff.
+- Docs changes: record the Phase 1 security-governance contract handoff.
 
 ## Phase 0 Tasks
 
@@ -63,43 +62,61 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     when a register entry lacks a source marker, or when a source marker omits a
     removal condition.
 
+## Phase 1 Security Governance Tasks
+
+- [x] `S-001` Add `crates/security-governance`.
+  - Acceptance: the crate is a workspace member and has no dependency on
+    `rustfs`, `ecstore`, admin handlers, Axum, or runtime state.
+  - Verification: `cargo check -p rustfs-security-governance`.
+- [x] `S-002` Add admin route matrix core types.
+  - Acceptance: `AdminRouteSpec`, `AdminRouteAccess`, `AdminActionRef`,
+    `PublicRouteKind`, `RouteRiskLevel`, and validation errors model route
+    governance metadata without registering routes or enforcing auth.
+  - Verification: `cargo test -p rustfs-security-governance`.
+- [ ] `S-003` Add redaction contract types.
+- [ ] `S-004` Add serde policy marker types.
+- [ ] `S-005` Add supply-chain policy contract types.
+- [ ] `S-006` Add `rustfs/src/admin/route_policy.rs` backed by these contract
+  types, without changing route registration or auth behavior.
+
 ## Next PRs
 
-1. `contract`: define the config-model contract surface while preserving the
-   existing `Config`, `KV`, and `KVS` behavior.
-2. `ci-gate`: add focused checks for public re-export and storage trait coverage
-   before pure moves.
+1. `contract`: add redaction, serde policy, or supply-chain governance contract
+   modules inside rustfs-security-governance.
+2. `contract`: add an admin route policy table that consumes the new
+   admin_matrix types while preserving route registration and auth behavior.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the matrix helpers keep the snapshot explicit, `S3Router` instrumentation is fully `cfg(test)`, the production registration order is shared through one private helper, and the non-test insertion path keeps existing route construction/insert behavior |
-| Migration preservation | pass | Confirmed this remains `test-only` in effect: no route handler/auth/alias semantics changed, no storage hot-path/global-state/crate-split changes, and MinIO admin alias coverage is expanded across all admin-prefix matrix entries |
-| Testing/verification | pass | Confirmed focused route tests pin `ENV_HEALTH_ENDPOINT_ENABLE=true`, use the production registration helper, and pass with formatting, non-test cargo check, migration guard scripts, diff check, full `make pre-commit`, and temporary unaccounted-route negative coverage |
+| Quality/architecture | pass | Confirmed this is a pure `contract` PR: the new crate has a narrow admin_matrix module, typed errors via thiserror, no dependency on implementation crates, and no route registration or auth integration |
+| Migration preservation | pass | Confirmed no runtime code paths changed: no admin handler/router edits, no startup/global-state/storage hot-path movement, no compatibility wrappers, and no behavior drift |
+| Testing/verification | pass | Confirmed focused unit tests cover valid admin/public specs, duplicate method/path rejection, empty path rejection, and empty action rejection; focused checks, migration guard scripts, dependency tree review, diff check, and full `make pre-commit` passed |
 
 ## Verification Notes
 
 Passed:
+- `cargo check -p rustfs-security-governance`
+- `cargo test -p rustfs-security-governance`
 - `cargo fmt --all --check`
-- `cargo check -p rustfs --lib`
-- `cargo test -p rustfs admin::route_registration_test -- --nocapture`
+- `cargo tree -p rustfs-security-governance --edges normal`
 - `./scripts/check_architecture_migration_rules.sh`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
-- temporary negative check for an unaccounted admin route registration
 - `make pre-commit`
 
 ## Handoff Notes
 
-- Keep Phase 0 PRs small. Do not move Config, Storage API, Runtime, or ECStore
-  code inside this `test-only` branch.
-- Route matrix instrumentation must remain test-only and must not alter dispatch
-  or auth behavior.
+- Keep this Phase 1 branch as a pure `contract` PR. Do not add
+  `rustfs/src/admin` integration, route registration changes, auth enforcement,
+  Config moves, Storage API moves, Runtime moves, or ECStore moves.
+- The new crate is allowed to depend on generic Rust libraries such as
+  `thiserror`, but must stay independent from implementation crates and runtime
+  state.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
-- The next config-model PR must preserve the current tuple-struct shapes and
-  persistence behavior before introducing narrower provider contracts.
-- Do not move `config::com` until a dedicated helper-user inventory covers
-  ECStore-internal persistence paths as well as adjacent non-model users.
+- The next admin route policy PR may consume the contract types, but must
+  preserve current route registration, alias canonicalization, public
+  exceptions, and handler-level authorization behavior.
