@@ -58,6 +58,40 @@ pub struct Node {
 #[derive(Debug, Default, Clone)]
 pub struct Endpoints(Vec<Endpoint>);
 
+#[derive(Debug, Clone)]
+struct LocalDiskValidationDiagnostic {
+    original_path: String,
+    canonical_path: Option<String>,
+    device_numbers: Option<String>,
+    device_ids: Option<Vec<String>>,
+}
+
+impl LocalDiskValidationDiagnostic {
+    fn new(original_path: &str) -> Self {
+        Self {
+            original_path: original_path.to_string(),
+            canonical_path: None,
+            device_numbers: None,
+            device_ids: None,
+        }
+    }
+
+    fn summary(&self) -> String {
+        let canonical_path = self.canonical_path.as_deref().unwrap_or("(unresolved)");
+        let device_numbers = self.device_numbers.as_deref().unwrap_or("(unavailable)");
+        let device_ids = self
+            .device_ids
+            .as_ref()
+            .map(|ids| ids.join(","))
+            .unwrap_or_else(|| "(unavailable)".to_string());
+
+        format!(
+            "path='{}', canonical='{}', st_dev='{}', device_ids=[{}]",
+            self.original_path, canonical_path, device_numbers, device_ids
+        )
+    }
+}
+
 impl AsRef<Vec<Endpoint>> for Endpoints {
     fn as_ref(&self) -> &Vec<Endpoint> {
         &self.0
@@ -683,10 +717,12 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
     }
 
     let mut device_paths = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut diagnostics = Vec::with_capacity(local_paths.len());
     #[cfg(not(windows))]
     let mut missing_paths = Vec::new();
 
     for path in &local_paths {
+        let mut diagnostic = LocalDiskValidationDiagnostic::new(path);
         let canonical = match rustfs_utils::canonicalize(path) {
             Ok(path) => path,
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -721,6 +757,7 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
                 #[cfg(not(windows))]
                 {
                     missing_paths.push(path.clone());
+                    diagnostics.push(diagnostic);
                     continue;
                 }
             }
@@ -731,9 +768,15 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
             }
         };
         let canonical_path = canonical.to_string_lossy().into_owned();
+        diagnostic.canonical_path = Some(canonical_path.clone());
+        if let Ok(stat) = rustix::fs::stat(canonical.as_path()) {
+            diagnostic.device_numbers = Some(format!("{}:{}", rustix::fs::major(stat.st_dev), rustix::fs::minor(stat.st_dev)));
+        }
         let device_ids = rustfs_utils::os::get_physical_device_ids(&canonical_path).map_err(|err| {
             Error::other(format!("failed to inspect physical disk for local endpoint '{canonical_path}': {err}"))
         })?;
+        diagnostic.device_ids = Some(device_ids.clone());
+        diagnostics.push(diagnostic);
 
         for device_id in device_ids {
             device_paths.entry(device_id).or_default().insert(canonical_path.clone());
@@ -747,6 +790,15 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
             "Excluding non-existent local endpoint paths from physical disk independence validation during endpoint parsing",
         );
     }
+
+    warn!(
+        diagnostics = %diagnostics
+            .iter()
+            .map(LocalDiskValidationDiagnostic::summary)
+            .collect::<Vec<_>>()
+            .join("; "),
+        "Collected local endpoint disk-topology diagnostics before physical disk independence validation",
+    );
 
     let shared_devices = device_paths
         .into_iter()
@@ -768,9 +820,15 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
         .map(|(device_id, paths)| format!("{device_id} => {}", paths.join(", ")))
         .collect::<Vec<_>>()
         .join("; ");
+    let diagnostics_summary = diagnostics
+        .iter()
+        .map(LocalDiskValidationDiagnostic::summary)
+        .collect::<Vec<_>>()
+        .join("; ");
 
     Err(Error::other(format!(
         "local erasure endpoints must use distinct physical disks; detected shared devices [{details}]. \
+validation diagnostics: [{diagnostics_summary}]. \
 Set {ENV_UNSAFE_BYPASS_DISK_CHECK}=true only for local testing or CI to bypass this safety check"
     )))
 }
@@ -1578,6 +1636,9 @@ mod test {
             let err_text = err.to_string();
             assert!(err_text.contains("distinct physical disks"), "unexpected error: {err_text}");
             assert!(err_text.contains(ENV_UNSAFE_BYPASS_DISK_CHECK), "unexpected error: {err_text}");
+            assert!(err_text.contains("validation diagnostics:"), "unexpected error: {err_text}");
+            assert!(err_text.contains("st_dev='"), "unexpected error: {err_text}");
+            assert!(err_text.contains("device_ids=["), "unexpected error: {err_text}");
         })
         .await;
     }
