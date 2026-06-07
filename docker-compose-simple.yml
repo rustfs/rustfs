@@ -31,7 +31,10 @@ services:
       - RUSTFS_ACCESS_KEY=rustfsadmin # CHANGEME
       - RUSTFS_SECRET_KEY=rustfsadmin # CHANGEME
       - RUSTFS_OBS_LOGGER_LEVEL=info
-      - RUSTFS_TLS_PATH=/opt/tls
+      # Optional TLS:
+      # - mount your cert directory to /opt/tls
+      # - set RUSTFS_TLS_PATH=/opt/tls
+      # - when TLS is enabled, health checks automatically switch to HTTPS
       # Keep strict disk topology checks enabled by default.
       # For local testing only, set `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true` explicitly.
       - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-false}
@@ -46,14 +49,32 @@ services:
       - rustfs-network
     restart: unless-stopped
     healthcheck:
-      # Production strict TLS example (SAN/FQDN aligned, no `-k`):
-      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9000:127.0.0.1 https://rustfs-a.example.com:9000/health
-      # curl -f --cacert /opt/tls/ca.crt --resolve rustfs-a.example.com:9001:127.0.0.1 https://rustfs-a.example.com:9001/rustfs/console/health
+      # Default behavior:
+      # - HTTP when RUSTFS_TLS_PATH is unset
+      # - HTTPS when RUSTFS_TLS_PATH is set
+      # - loopback TLS uses `-k` unless strict host+CA values are provided
+      #
+      # Strict TLS example:
+      # - set RUSTFS_HEALTHCHECK_HOST to a SAN-covered hostname
+      # - optionally set RUSTFS_HEALTHCHECK_CA (defaults to /opt/tls/ca.crt when present)
       test:
         [
           "CMD",
-          "sh", "-c",
-          "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health"
+          "sh", "-ec",
+          "host=\"$${RUSTFS_HEALTHCHECK_HOST:-127.0.0.1}\"; scheme=\"http\"; set -- -fsS; \
+          if [ -n \"$${RUSTFS_TLS_PATH:-}\" ]; then \
+            scheme=\"https\"; \
+            ca_path=\"$${RUSTFS_HEALTHCHECK_CA:-}\"; \
+            if [ -z \"$${ca_path}\" ] && [ -f /opt/tls/ca.crt ]; then ca_path=/opt/tls/ca.crt; fi; \
+            case \"$${host}\" in 127.0.0.1|localhost) strict_host=false ;; *) strict_host=true ;; esac; \
+            if [ \"$${strict_host}\" = true ] && [ -n \"$${ca_path}\" ]; then \
+              set -- \"$${@}\" --cacert \"$${ca_path}\" --resolve \"$${host}:9000:127.0.0.1\" --resolve \"$${host}:9001:127.0.0.1\"; \
+            else \
+              set -- \"$${@}\" -k; \
+            fi; \
+          fi; \
+          curl \"$${@}\" \"$${scheme}://$${host}:9000/health\" && \
+          curl \"$${@}\" \"$${scheme}://$${host}:9001/rustfs/console/health\""
         ]
       interval: 30s
       timeout: 10s

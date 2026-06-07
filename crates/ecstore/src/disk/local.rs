@@ -1793,20 +1793,28 @@ impl DiskAPI for LocalDisk {
 
         let id = format_info.id;
 
-        // if format_info.last_check_valid() {
-        //     return Ok(id);
-        // }
-
         if format_info.file_info.is_some() && id.is_some() {
-            // check last check time
+            // Reuse the cached disk id only when the cached format check is fresh.
             if let Some(last_check) = format_info.last_check
-                && last_check.unix_timestamp() + 1 < OffsetDateTime::now_utc().unix_timestamp()
+                && last_check.unix_timestamp() + 1 >= OffsetDateTime::now_utc().unix_timestamp()
             {
                 return Ok(id);
             }
         }
 
-        let file_meta = self.check_format_json().await?;
+        let file_meta = match self.check_format_json().await {
+            Ok(meta) => meta,
+            Err(err) => {
+                if matches!(err, DiskError::UnformattedDisk | DiskError::DiskNotFound) {
+                    let mut format_info = self.format_info.write().await;
+                    format_info.id = None;
+                    format_info.data = Bytes::new();
+                    format_info.file_info = None;
+                    format_info.last_check = None;
+                }
+                return Err(err);
+            }
+        };
 
         if let Some(file_info) = &format_info.file_info
             && super::fs::same_file(&file_meta, file_info)
@@ -3326,6 +3334,52 @@ mod test {
         for p in paths.iter() {
             assert!(skip_access_checks(p.to_str().unwrap()));
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_disk_id_invalidates_cache_after_format_removal() {
+        use crate::disk::FORMAT_CONFIG_FILE;
+        use crate::disk::format::FormatV3;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let mut endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let meta_dir = dir.path().join(RUSTFS_META_BUCKET);
+        fs::create_dir_all(&meta_dir).await.expect("meta dir should be creatable");
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        let format_json = format.to_json().expect("format should serialize");
+        fs::write(meta_dir.join(FORMAT_CONFIG_FILE), format_json)
+            .await
+            .expect("format.json should be writable");
+
+        let disk = LocalDisk::new(&endpoint, false)
+            .await
+            .expect("local disk should open after seeding format");
+
+        let initial_id = disk.get_disk_id().await.expect("disk id lookup should succeed");
+        assert!(initial_id.is_some(), "new disk should expose a disk id");
+
+        fs::remove_file(&disk.format_path)
+            .await
+            .expect("format.json should be removable");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let err = disk
+            .get_disk_id()
+            .await
+            .expect_err("removed format.json should invalidate the cached disk id");
+        assert!(matches!(err, DiskError::UnformattedDisk));
+
+        let format_info = disk.format_info.read().await.clone();
+        assert!(format_info.id.is_none(), "cached disk id should be cleared");
+        assert!(format_info.data.is_empty(), "cached format bytes should be cleared");
+        assert!(format_info.file_info.is_none(), "cached file metadata should be cleared");
+        assert!(format_info.last_check.is_none(), "cached format timestamp should be cleared");
     }
 
     #[tokio::test]
