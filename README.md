@@ -103,7 +103,7 @@ curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 
 ### 2. Docker Quick Start (Option 2)
 
-The RustFS container runs as a non-root user `rustfs` (UID `10001`). If you run Docker with `-v` to mount a host directory, please ensure the host directory owner is set to `10001`, otherwise you will encounter permission denied errors.
+The RustFS container runs as a non-root user `rustfs` (UID/GID `10001:10001`). If you bind-mount host directories with Docker or Compose, every mounted path must be writable by that user, otherwise startup may fail with permission denied errors. This applies to data directories, log directories, and TLS certificate directories when `RUSTFS_TLS_PATH` is enabled.
 
 ```bash
 # Create data and logs directories
@@ -125,11 +125,25 @@ If you use [podman](https://github.com/containers/podman) instead of docker, you
 podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 ```
 
+If you enable TLS with a bind-mounted certificate directory, prepare that mount the same way:
+
+```bash
+mkdir -p certs
+chown -R 10001:10001 certs
+```
+
 You can also use Docker Compose. Using the `docker-compose.yml` file in the root directory:
 
 ```bash
 docker compose --profile observability up -d
 ```
+
+Before running Compose with host bind mounts:
+
+- Ensure every mounted host path is writable by `10001:10001`.
+- If you enable TLS, ensure the certificate mount for `/opt/tls` is also readable by `10001:10001`.
+- If matching host ownership is not practical, run the `rustfs` service with `user: "<host-uid>:<host-gid>"` instead.
+- `docker-compose-simple.yml` includes a `volume-permission-helper` service for named volumes. `docker-compose.yml` relies on you to prepare bind-mounted host paths in advance.
 
 Similarly, you can run the command with podman
 
