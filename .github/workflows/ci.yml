@@ -139,6 +139,9 @@ jobs:
       - name: Check layered dependencies
         run: ./scripts/check_layer_dependencies.sh
 
+      - name: Check architecture migration rules
+        run: ./scripts/check_architecture_migration_rules.sh
+
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
     needs: skip-check

@@ -316,15 +316,73 @@ struct ScannerSourceWorkCounters {
     executed: AtomicU64,
     failed: AtomicU64,
     skipped: AtomicU64,
+    missed: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScannerSourceWorkUpdate {
+    pub checked: u64,
+    pub queued: u64,
+    pub executed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    pub missed: u64,
+}
+
+impl ScannerSourceWorkUpdate {
+    pub const fn checked(count: u64) -> Self {
+        Self {
+            checked: count,
+            queued: 0,
+            executed: 0,
+            failed: 0,
+            skipped: 0,
+            missed: 0,
+        }
+    }
+
+    pub const fn queued(count: u64) -> Self {
+        Self {
+            checked: 0,
+            queued: count,
+            executed: 0,
+            failed: 0,
+            skipped: 0,
+            missed: 0,
+        }
+    }
+
+    pub const fn executed(count: u64) -> Self {
+        Self {
+            checked: 0,
+            queued: 0,
+            executed: count,
+            failed: 0,
+            skipped: 0,
+            missed: 0,
+        }
+    }
+
+    pub const fn missed(count: u64) -> Self {
+        Self {
+            checked: 0,
+            queued: 0,
+            executed: 0,
+            failed: 0,
+            skipped: 0,
+            missed: count,
+        }
+    }
 }
 
 impl ScannerSourceWorkCounters {
-    fn add(&self, checked: u64, queued: u64, executed: u64, failed: u64, skipped: u64) {
-        self.checked.fetch_add(checked, Ordering::Relaxed);
-        self.queued.fetch_add(queued, Ordering::Relaxed);
-        self.executed.fetch_add(executed, Ordering::Relaxed);
-        self.failed.fetch_add(failed, Ordering::Relaxed);
-        self.skipped.fetch_add(skipped, Ordering::Relaxed);
+    fn add(&self, work: ScannerSourceWorkUpdate) {
+        self.checked.fetch_add(work.checked, Ordering::Relaxed);
+        self.queued.fetch_add(work.queued, Ordering::Relaxed);
+        self.executed.fetch_add(work.executed, Ordering::Relaxed);
+        self.failed.fetch_add(work.failed, Ordering::Relaxed);
+        self.skipped.fetch_add(work.skipped, Ordering::Relaxed);
+        self.missed.fetch_add(work.missed, Ordering::Relaxed);
     }
 
     fn store(&self, values: ScannerSourceWorkValues) {
@@ -333,6 +391,7 @@ impl ScannerSourceWorkCounters {
         self.executed.store(values.executed, Ordering::Relaxed);
         self.failed.store(values.failed, Ordering::Relaxed);
         self.skipped.store(values.skipped, Ordering::Relaxed);
+        self.missed.store(values.missed, Ordering::Relaxed);
     }
 
     fn values(&self) -> ScannerSourceWorkValues {
@@ -342,6 +401,7 @@ impl ScannerSourceWorkCounters {
             executed: self.executed.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             skipped: self.skipped.load(Ordering::Relaxed),
+            missed: self.missed.load(Ordering::Relaxed),
         }
     }
 
@@ -357,6 +417,7 @@ struct ScannerSourceWorkValues {
     executed: u64,
     failed: u64,
     skipped: u64,
+    missed: u64,
 }
 
 impl ScannerSourceWorkValues {
@@ -367,6 +428,7 @@ impl ScannerSourceWorkValues {
             executed: self.executed.saturating_sub(start.executed),
             failed: self.failed.saturating_sub(start.failed),
             skipped: self.skipped.saturating_sub(start.skipped),
+            missed: self.missed.saturating_sub(start.missed),
         }
     }
 
@@ -378,6 +440,7 @@ impl ScannerSourceWorkValues {
             executed: self.executed,
             failed: self.failed,
             skipped: self.skipped,
+            missed: self.missed,
         }
     }
 }
@@ -675,6 +738,8 @@ pub struct ScannerSourceWorkSnapshot {
     pub executed: u64,
     pub failed: u64,
     pub skipped: u64,
+    #[serde(default)]
+    pub missed: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1170,7 +1235,15 @@ impl Metrics {
 
     pub fn record_scanner_ilm_action(&self, count: u64) {
         self.scanner_ilm_actions.fetch_add(count, Ordering::Relaxed);
-        self.record_scanner_source_work(ScannerWorkSource::Lifecycle, 0, 0, count, 0, 0);
+        self.record_scanner_source_executed(ScannerWorkSource::Lifecycle, count);
+    }
+
+    pub fn record_scanner_ilm_enqueue_result(&self, count: u64, queued: bool) {
+        if queued {
+            self.record_scanner_source_queued(ScannerWorkSource::Lifecycle, count);
+        } else {
+            self.record_scanner_source_missed(ScannerWorkSource::Lifecycle, count);
+        }
     }
 
     pub fn record_scanner_checkpoint_set(&self, version: u16, resume_after: impl Into<String>, reason: impl Into<String>) {
@@ -1209,18 +1282,26 @@ impl Metrics {
         self.update_scanner_checkpoint_event(SCANNER_CHECKPOINT_EVENT_STALE);
     }
 
-    pub fn record_scanner_source_work(
-        &self,
-        source: ScannerWorkSource,
-        checked: u64,
-        queued: u64,
-        executed: u64,
-        failed: u64,
-        skipped: u64,
-    ) {
+    pub fn record_scanner_source_work(&self, source: ScannerWorkSource, work: ScannerSourceWorkUpdate) {
         if let Some(counters) = self.scanner_source_work.get(source.index()) {
-            counters.add(checked, queued, executed, failed, skipped);
+            counters.add(work);
         }
+    }
+
+    pub fn record_scanner_source_checked(&self, source: ScannerWorkSource, count: u64) {
+        self.record_scanner_source_work(source, ScannerSourceWorkUpdate::checked(count));
+    }
+
+    pub fn record_scanner_source_queued(&self, source: ScannerWorkSource, count: u64) {
+        self.record_scanner_source_work(source, ScannerSourceWorkUpdate::queued(count));
+    }
+
+    pub fn record_scanner_source_executed(&self, source: ScannerWorkSource, count: u64) {
+        self.record_scanner_source_work(source, ScannerSourceWorkUpdate::executed(count));
+    }
+
+    pub fn record_scanner_source_missed(&self, source: ScannerWorkSource, count: u64) {
+        self.record_scanner_source_work(source, ScannerSourceWorkUpdate::missed(count));
     }
 
     fn update_scanner_checkpoint_event(&self, event: &str) {
@@ -1242,19 +1323,19 @@ impl Metrics {
     fn record_source_work_for_metric(&self, metric: Metric, count: u64) {
         match metric {
             Metric::ScanObject | Metric::ScanFolder => {
-                self.record_scanner_source_work(ScannerWorkSource::Usage, count, 0, 0, 0, 0);
+                self.record_scanner_source_checked(ScannerWorkSource::Usage, count);
             }
             Metric::SaveUsage => {
-                self.record_scanner_source_work(ScannerWorkSource::Usage, 0, 0, count, 0, 0);
+                self.record_scanner_source_executed(ScannerWorkSource::Usage, count);
             }
             Metric::CheckReplication => {
-                self.record_scanner_source_work(ScannerWorkSource::BucketReplication, count, 0, 0, 0, 0);
+                self.record_scanner_source_checked(ScannerWorkSource::BucketReplication, count);
             }
             Metric::HealCheck => {
-                self.record_scanner_source_work(ScannerWorkSource::Heal, count, 0, 0, 0, 0);
+                self.record_scanner_source_checked(ScannerWorkSource::Heal, count);
             }
             Metric::HealAbandonedObject => {
-                self.record_scanner_source_work(ScannerWorkSource::Heal, 0, 0, count, 0, 0);
+                self.record_scanner_source_executed(ScannerWorkSource::Heal, count);
             }
             _ => {}
         }
@@ -2011,8 +2092,26 @@ mod tests {
     #[tokio::test]
     async fn report_includes_scanner_source_work() {
         let metrics = Metrics::new();
-        metrics.record_scanner_source_work(ScannerWorkSource::Usage, 3, 0, 1, 0, 0);
-        metrics.record_scanner_source_work(ScannerWorkSource::Lifecycle, 0, 2, 1, 1, 0);
+        metrics.record_scanner_source_work(
+            ScannerWorkSource::Usage,
+            ScannerSourceWorkUpdate {
+                checked: 3,
+                executed: 1,
+                ..Default::default()
+            },
+        );
+        metrics.record_scanner_source_work(
+            ScannerWorkSource::Lifecycle,
+            ScannerSourceWorkUpdate {
+                queued: 2,
+                executed: 1,
+                failed: 1,
+                missed: 3,
+                ..Default::default()
+            },
+        );
+        metrics.record_scanner_ilm_enqueue_result(4, true);
+        metrics.record_scanner_ilm_enqueue_result(5, false);
 
         let report = metrics.report().await;
 
@@ -2029,9 +2128,10 @@ mod tests {
             .iter()
             .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
             .expect("lifecycle source work should be visible");
-        assert_eq!(lifecycle.queued, 2);
+        assert_eq!(lifecycle.queued, 6);
         assert_eq!(lifecycle.executed, 1);
         assert_eq!(lifecycle.failed, 1);
+        assert_eq!(lifecycle.missed, 8);
     }
 
     #[tokio::test]
@@ -2073,11 +2173,33 @@ mod tests {
     #[tokio::test]
     async fn report_includes_scan_cycle_source_work() {
         let metrics = Metrics::new();
-        metrics.record_scanner_source_work(ScannerWorkSource::Usage, 10, 0, 1, 0, 0);
+        metrics.record_scanner_source_work(
+            ScannerWorkSource::Usage,
+            ScannerSourceWorkUpdate {
+                checked: 10,
+                executed: 1,
+                ..Default::default()
+            },
+        );
 
         let start = metrics.start_scan_cycle_work();
-        metrics.record_scanner_source_work(ScannerWorkSource::Usage, 3, 0, 2, 0, 0);
-        metrics.record_scanner_source_work(ScannerWorkSource::Lifecycle, 0, 1, 1, 0, 0);
+        metrics.record_scanner_source_work(
+            ScannerWorkSource::Usage,
+            ScannerSourceWorkUpdate {
+                checked: 3,
+                executed: 2,
+                ..Default::default()
+            },
+        );
+        metrics.record_scanner_source_work(
+            ScannerWorkSource::Lifecycle,
+            ScannerSourceWorkUpdate {
+                queued: 1,
+                executed: 1,
+                missed: 2,
+                ..Default::default()
+            },
+        );
 
         let report = metrics.report().await;
         let usage = report
@@ -2095,6 +2217,7 @@ mod tests {
             .expect("current cycle lifecycle source work should be visible");
         assert_eq!(lifecycle.queued, 1);
         assert_eq!(lifecycle.executed, 1);
+        assert_eq!(lifecycle.missed, 2);
 
         metrics.finish_scan_cycle_work(start);
         let report = metrics.report().await;
@@ -2115,6 +2238,7 @@ mod tests {
             .expect("last cycle lifecycle source work should be visible");
         assert_eq!(lifecycle.queued, 1);
         assert_eq!(lifecycle.executed, 1);
+        assert_eq!(lifecycle.missed, 2);
     }
 
     #[tokio::test]

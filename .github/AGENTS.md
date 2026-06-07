@@ -34,3 +34,4 @@ Current `test-and-lint` gate includes:
 - `cargo fmt --all --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `./scripts/check_layer_dependencies.sh`
+- `./scripts/check_architecture_migration_rules.sh`
