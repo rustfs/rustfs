@@ -147,6 +147,13 @@ fn should_yield_after_object(object_count: u64, yield_every: u64) -> bool {
     yield_every > 0 && object_count.is_multiple_of(yield_every)
 }
 
+fn record_scanner_ilm_action_if_queued(metrics: &Metrics, count: u64, queued: bool) -> bool {
+    if queued {
+        metrics.record_scanner_ilm_action(count);
+    }
+    queued
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FolderResumeMatch {
     Exact,
@@ -574,14 +581,15 @@ impl ScannerItem {
 
                 let mut size = actual_size;
 
-                let done_ilm = Metrics::time_ilm(event.action);
                 match event.action {
                     IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
                         remaining_versions = 0;
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
-                        apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        done_ilm(1)();
-                        global_metrics().record_scanner_ilm_action(1);
+                        let done_ilm = Metrics::time_ilm(event.action);
+                        let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                            done_ilm(1)();
+                        }
                         break 'eventLoop;
                     }
 
@@ -592,9 +600,11 @@ impl ScannerItem {
                         }
 
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
-                        apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        done_ilm(1)();
-                        global_metrics().record_scanner_ilm_action(1);
+                        let done_ilm = Metrics::time_ilm(event.action);
+                        let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                            done_ilm(1)();
+                        }
                     }
                     IlmAction::DeleteVersionAction => {
                         remaining_versions -= 1;
@@ -607,14 +617,14 @@ impl ScannerItem {
                             });
                         }
                         noncurrent_events.push(event.clone());
-                        done_ilm(1)();
-                        global_metrics().record_scanner_ilm_action(1);
                     }
                     IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                         debug!("apply_actions: applying transition rule for object: {} {}", oi.name, event.action);
-                        apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
-                        done_ilm(1)();
-                        global_metrics().record_scanner_ilm_action(1);
+                        let done_ilm = Metrics::time_ilm(event.action);
+                        let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
+                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                            done_ilm(1)();
+                        }
                     }
 
                     IlmAction::NoneAction | IlmAction::ActionCount => {
@@ -631,11 +641,17 @@ impl ScannerItem {
         if !to_delete_objs.is_empty()
             && let Some(event) = noncurrent_events.first().cloned()
         {
-            GLOBAL_ExpiryState
+            let action = event.action;
+            let count = u64::try_from(to_delete_objs.len()).unwrap_or(u64::MAX);
+            let done_ilm = Metrics::time_ilm(action);
+            let queued = GLOBAL_ExpiryState
                 .write()
                 .await
                 .enqueue_by_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner)
                 .await;
+            if record_scanner_ilm_action_if_queued(global_metrics(), count, queued) {
+                done_ilm(count)();
+            }
         }
         self.alert_excessive_versions(remaining_versions, cumulative_size);
     }
@@ -1985,6 +2001,29 @@ mod tests {
             ..Default::default()
         };
         assert!(!ScannerItem::should_account_replication_stats(&purge_version));
+    }
+
+    #[tokio::test]
+    async fn test_scanner_ilm_action_accounting_requires_enqueue_success() {
+        let metrics = Metrics::new();
+
+        record_scanner_ilm_action_if_queued(&metrics, 2, false);
+        let report = metrics.report().await;
+        let lifecycle = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source work should be visible");
+        assert_eq!(lifecycle.executed, 0);
+
+        record_scanner_ilm_action_if_queued(&metrics, 3, true);
+        let report = metrics.report().await;
+        let lifecycle = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source work should be visible");
+        assert_eq!(lifecycle.executed, 3);
     }
 
     #[test]
