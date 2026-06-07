@@ -24,6 +24,9 @@ hot-path behavior must not drift during this migration.
   between StorageCore, ECStore, ClusterControlPlane, and BackgroundControllers.
 - [`crate-boundaries.md`](crate-boundaries.md): PR types, crate direction,
   compatibility rules, and migration guardrails.
+- [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md):
+  current `ecstore::config::{Config, KV, KVS}` definitions, consumers,
+  migration risks, and do-not-change contract.
 - [`migration-progress.md`](migration-progress.md): current task state and context
   handoff.
 - [`compat-cleanup-register.md`](compat-cleanup-register.md): temporary
@@ -34,7 +37,7 @@ hot-path behavior must not drift during this migration.
 ```mermaid
 flowchart LR
     G["Phase 0: Baseline and guardrails"]
-    CFG["Phase 1a: Config model"]
+    CFG["Phase 1a: Config model contract"]
     SEC["Phase 1: Security governance"]
     API["Phase 2: Storage API contracts"]
     RT["Phase 3: Runtime and lifecycle"]
