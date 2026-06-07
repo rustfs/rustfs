@@ -9972,6 +9972,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-security-governance"
+version = "1.0.0-beta.7"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rustfs-signer"
 version = "1.0.0-beta.7"
 dependencies = [
