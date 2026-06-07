@@ -130,6 +130,9 @@ extraEnv: [] # This is for setting extra environment variables in the rustfs con
 #     value: "EC:4"
 
 
+extraVolumes: []
+extraVolumeMounts: []
+
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:
   # Specifies whether a service account should be created
@@ -298,6 +301,16 @@ affinity:
     enabled: true
     topologyKey: kubernetes.io/hostname
   nodeAffinity: {}
+
+topologySpreadConstraints:
+  enabled: false
+  constraints: []
+    # - maxSkew: 1
+    #   topologyKey: topology.kubernetes.io/zone
+    #   whenUnsatisfiable: ScheduleAnyway
+    #   labelSelector:
+    #     matchLabels:
+    #       app.kubernetes.io/name: rustfs
 
 storageclass:
   name: local-path

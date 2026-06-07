@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // Ensure the correct path for parse_license is imported
-use rustfs::app::context::{AppContext, init_global_app_context};
 use rustfs::init::{
     add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
 };
@@ -31,12 +30,12 @@ use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
 use rustfs::license::{current_license, init_license, license_status};
 use rustfs::server::{
-    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, publish_ready_when_runtime_ready,
-    shutdown_event_notifier, start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
+    ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
+    start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use rustfs::startup_fs_guard::enforce_unsupported_fs_policy;
+use rustfs::startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
-use rustfs_config::ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS;
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
@@ -58,11 +57,11 @@ use rustfs_ecstore::{
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
 };
-use rustfs_iam::{init_iam_sys, init_oidc_sys};
+use rustfs_iam::init_oidc_sys;
 use rustfs_obs::{init_metrics_runtime, init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
 use rustfs_utils::{
-    ExternalEnvCompatReport, apply_external_env_compat, get_env_bool, get_env_bool_with_aliases, net::parse_and_resolve_address,
+    ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
 };
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::io::{Error, Result};
@@ -135,12 +134,7 @@ fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
     config.is_using_default_credentials()
 }
 
-const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values, or use RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true only for local development";
-const DEFAULT_CREDENTIALS_ERROR_MESSAGE: &str = "Default root credentials are not allowed on non-loopback listeners; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values, bind to loopback, or set RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true for local development only";
-
-fn allow_insecure_default_credentials() -> bool {
-    get_env_bool(ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS, false)
-}
+const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
 
 async fn async_main() -> Result<()> {
     // Parse command line arguments
@@ -275,11 +269,6 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
-    if !config.default_credentials_allowed_for_addr(server_addr, allow_insecure_default_credentials()) {
-        error!("{DEFAULT_CREDENTIALS_ERROR_MESSAGE}");
-        return Err(Error::other(DEFAULT_CREDENTIALS_ERROR_MESSAGE));
-    }
-
     if is_using_default_credentials(&config) {
         warn!("{}", DEFAULT_CREDENTIALS_WARNING_MESSAGE);
     }
@@ -360,7 +349,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     }
     // Initialize capacity management system
     init_capacity_management().await;
-    let state_manager = ServiceStateManager::new();
+    let state_manager = Arc::new(ServiceStateManager::new());
     // Update service status to Starting
     state_manager.update(ServiceState::Starting);
 
@@ -533,8 +522,15 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // 3. Initialize IAM System (Blocking load)
     // This ensures data is in memory before moving forward
-    init_iam_sys(store.clone()).await.map_err(Error::other)?;
-    readiness.mark_stage(SystemStage::IamReady);
+    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
+    let iam_bootstrap = bootstrap_or_defer_iam_init(
+        store.clone(),
+        kms_interface,
+        readiness.clone(),
+        Some(state_manager.clone()),
+        Some(ctx.clone()),
+    )
+    .await?;
 
     // 3a. Initialize Keystone authentication if enabled
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
@@ -552,11 +548,6 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     if let Err(e) = init_oidc_sys().await {
         warn!("OIDC initialization failed (non-fatal): {}", e);
     }
-
-    let iam_interface =
-        rustfs_iam::get().map_err(|e| Error::other(format!("initialize app context IAM dependency failed: {e}")))?;
-    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-    let _app_context = init_global_app_context(AppContext::with_default_interfaces(store.clone(), iam_interface, kms_interface));
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
@@ -612,8 +603,9 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         &server_address,
         jiff::Zoned::now()
     );
-    publish_ready_when_runtime_ready(readiness.as_ref(), Some(&state_manager)).await?;
-
+    if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
+        rustfs::server::publish_ready_when_runtime_ready(readiness.as_ref(), Some(state_manager.as_ref())).await?;
+    }
     // Set the global RustFS initialization time to now
     rustfs_common::set_global_init_time_now().await;
 
@@ -826,12 +818,9 @@ mod tests {
 
     #[test]
     fn default_credentials_messages_are_actionable_without_exposing_values() {
-        for message in [DEFAULT_CREDENTIALS_WARNING_MESSAGE, DEFAULT_CREDENTIALS_ERROR_MESSAGE] {
-            assert!(message.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
-            assert!(message.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
-            assert!(message.contains(ENV_RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS));
-            assert!(!message.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
-            assert!(!message.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
-        }
+        assert!(DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
+        assert!(DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
+        assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
+        assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
     }
 }

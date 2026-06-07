@@ -102,7 +102,6 @@ fn collect_allocator_memory(force: bool) -> Result<(), String> {
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 fn collect_allocator_memory(_force: bool) -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
     let _ = tikv_jemalloc_ctl::background_thread::write(true);
     tikv_jemalloc_ctl::epoch::advance().map_err(|err| err.to_string())?;
     Ok(())

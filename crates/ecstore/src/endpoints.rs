@@ -683,14 +683,46 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
     }
 
     let mut device_paths = BTreeMap::<String, BTreeSet<String>>::new();
+    #[cfg(not(windows))]
     let mut missing_paths = Vec::new();
 
     for path in &local_paths {
         let canonical = match rustfs_utils::canonicalize(path) {
             Ok(path) => path,
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                missing_paths.push(path.clone());
-                continue;
+                // On Windows, canonicalize can fail for ZFS volumes, junction points,
+                // subst drives, and other non-standard mounts. Try absolutize as fallback.
+                #[cfg(windows)]
+                {
+                    match crate::disk::endpoint::windows_fallback_local_path(path, &err, "disk independence validation") {
+                        Ok(absolute) => {
+                            let abs_path = absolute.to_string_lossy().into_owned();
+                            match rustfs_utils::os::get_physical_device_ids(&abs_path) {
+                                Ok(ids) => {
+                                    for device_id in ids {
+                                        device_paths.entry(device_id).or_default().insert(abs_path.clone());
+                                    }
+                                }
+                                Err(device_err) => {
+                                    return Err(Error::other(format!(
+                                        "failed to inspect physical disk for local endpoint '{abs_path}' after fallback path resolution: {device_err}"
+                                    )));
+                                }
+                            }
+                            continue;
+                        }
+                        Err(fallback_err) => {
+                            return Err(Error::other(format!(
+                                "failed to resolve local endpoint path '{path}' for disk validation: {err}; fallback resolution failed: {fallback_err}"
+                            )));
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    missing_paths.push(path.clone());
+                    continue;
+                }
             }
             Err(err) => {
                 return Err(Error::other(format!(
@@ -708,6 +740,7 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
         }
     }
 
+    #[cfg(not(windows))]
     if !missing_paths.is_empty() {
         warn!(
             missing_paths = ?missing_paths,

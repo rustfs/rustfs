@@ -156,7 +156,7 @@ pub enum TlsCommands {
 #[derive(Args, Clone)]
 pub struct TlsInspectOpts {
     /// TLS directory to inspect
-    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    #[arg(long = "path", alias = "tls-path", value_parser = NonEmptyStringValueParser::new())]
     pub path: String,
 }
 

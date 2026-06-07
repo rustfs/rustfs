@@ -18,8 +18,8 @@ use crate::storage::ecfs::FS;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
-use http::{Extensions, HeaderMap, Method, Uri};
-use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
+use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
+use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_ecstore::{
     bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     bucket::metadata_sys,
@@ -30,8 +30,8 @@ use rustfs_ecstore::{
     global::GLOBAL_TierConfigMgr,
     store::ECStore,
     store_api::{
-        BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions,
-        PutObjReader,
+        BucketOperations, BucketOptions, ListOperations, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations,
+        ObjectOptions, PutObjReader,
     },
     tier::{
         tier_config::{TierConfig, TierType},
@@ -53,7 +53,7 @@ use std::{
 };
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Barrier, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -482,6 +482,305 @@ fn build_request<T>(input: T, method: Method) -> S3Request<T> {
 fn streaming_blob_from_bytes(data: &[u8]) -> StreamingBlob {
     let body = Bytes::copy_from_slice(data);
     StreamingBlob::wrap::<_, Infallible>(stream::once(async move { Ok(body) }))
+}
+
+async fn read_object_bytes(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> Vec<u8> {
+    let mut reader = (**ecstore)
+        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("Failed to read object");
+    let mut buf = Vec::new();
+    reader
+        .stream
+        .read_to_end(&mut buf)
+        .await
+        .expect("Failed to drain object reader");
+    buf
+}
+
+async fn live_object_version_count(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> usize {
+    let versions = ecstore
+        .clone()
+        .list_object_versions(bucket, object, None, None, None, 1000)
+        .await
+        .expect("Failed to list object versions");
+
+    versions
+        .objects
+        .iter()
+        .filter(|info| info.name == object && !info.delete_marker)
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn put_object_if_none_match_existing_object_returns_precondition_failed() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let fs = FS::new();
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let bucket = format!("test-put-if-none-match-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let initial_payload = b"initial conditional put payload";
+    let replacement_payload = b"replacement conditional put payload";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    let initial_input = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .body(Some(streaming_blob_from_bytes(initial_payload)))
+        .content_length(Some(initial_payload.len() as i64))
+        .build()
+        .unwrap();
+    Box::pin(usecase.execute_put_object(&fs, build_request(initial_input, Method::PUT)))
+        .await
+        .expect("Failed to upload initial object through usecase");
+
+    let existing_info = ecstore
+        .get_object_info(bucket.as_str(), object, &ObjectOptions::default())
+        .await
+        .expect("Failed to fetch existing object info");
+    let existing_etag = existing_info.etag.expect("existing object should have an ETag");
+
+    let replacement_input = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .body(Some(streaming_blob_from_bytes(replacement_payload)))
+        .content_length(Some(replacement_payload.len() as i64))
+        .build()
+        .unwrap();
+    let mut req = build_request(replacement_input, Method::PUT);
+    req.headers
+        .insert(IF_NONE_MATCH, HeaderValue::from_str(existing_etag.as_str()).unwrap());
+
+    let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    assert_eq!(
+        read_object_bytes(&ecstore, bucket.as_str(), object).await,
+        initial_payload,
+        "failed conditional PutObject must not overwrite the current object"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn copy_object_if_none_match_existing_destination_returns_precondition_failed() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let src_bucket = format!("test-copy-if-none-match-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let dst_bucket = format!("test-copy-if-none-match-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let src_object = "test/source.txt";
+    let dst_object = "test/destination.txt";
+    let src_payload = b"conditional copy source payload";
+    let dst_payload = b"conditional copy destination payload";
+
+    create_test_bucket(&ecstore, src_bucket.as_str()).await;
+    create_test_bucket(&ecstore, dst_bucket.as_str()).await;
+    let _ = upload_test_object(&ecstore, src_bucket.as_str(), src_object, src_payload).await;
+    let _ = upload_test_object(&ecstore, dst_bucket.as_str(), dst_object, dst_payload).await;
+
+    let dst_info = ecstore
+        .get_object_info(dst_bucket.as_str(), dst_object, &ObjectOptions::default())
+        .await
+        .expect("Failed to fetch destination object info");
+    let dst_etag = dst_info.etag.expect("destination object should have an ETag");
+
+    let copy_input = CopyObjectInput::builder()
+        .copy_source(CopySource::Bucket {
+            bucket: src_bucket.clone().into(),
+            key: src_object.to_string().into(),
+            version_id: None,
+        })
+        .bucket(dst_bucket.clone())
+        .key(dst_object.to_string())
+        .build()
+        .unwrap();
+    let mut req = build_request(copy_input, Method::PUT);
+    req.headers
+        .insert(IF_NONE_MATCH, HeaderValue::from_str(dst_etag.as_str()).unwrap());
+
+    let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    assert_eq!(
+        read_object_bytes(&ecstore, dst_bucket.as_str(), dst_object).await,
+        dst_payload,
+        "failed conditional CopyObject must not overwrite the current destination object"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explicit_overwrite() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let fs = FS::new();
+    let usecase = DefaultObjectUsecase::without_context();
+
+    let bucket = format!("test-copy-object-lock-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let src_object = "test/source.txt";
+    let dst_object = "test/destination.txt";
+    let locked_payload = b"locked destination payload";
+    let source_payload = b"copy source payload";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+    set_bucket_object_lock_enabled(bucket.as_str())
+        .await
+        .expect("Failed to enable object lock for bucket");
+    let _ = upload_test_object(&ecstore, bucket.as_str(), src_object, source_payload).await;
+
+    let retain_until = Timestamp::from(time::OffsetDateTime::now_utc().saturating_add(time::Duration::days(1)));
+    let locked_input = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(dst_object.to_string())
+        .body(Some(streaming_blob_from_bytes(locked_payload)))
+        .content_length(Some(locked_payload.len() as i64))
+        .object_lock_mode(Some(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE)))
+        .object_lock_retain_until_date(Some(retain_until))
+        .build()
+        .unwrap();
+
+    Box::pin(usecase.execute_put_object(&fs, build_request(locked_input, Method::PUT)))
+        .await
+        .expect("Failed to upload locked destination object");
+
+    let locked_info = ecstore
+        .get_object_info(bucket.as_str(), dst_object, &ObjectOptions::default())
+        .await
+        .expect("Failed to fetch locked destination object info");
+    let locked_version_id = locked_info
+        .version_id
+        .expect("locked destination should have a version ID")
+        .to_string();
+
+    let copy_input = CopyObjectInput::builder()
+        .copy_source(CopySource::Bucket {
+            bucket: bucket.clone().into(),
+            key: src_object.to_string().into(),
+            version_id: None,
+        })
+        .bucket(bucket.clone())
+        .key(dst_object.to_string())
+        .build()
+        .unwrap();
+
+    let copy_output = Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
+        .await
+        .expect("CopyObject should create a new version over a locked current version");
+    let copied_version_id = copy_output
+        .output
+        .version_id
+        .expect("versioned CopyObject should return the created version ID");
+
+    assert_ne!(copied_version_id, locked_version_id);
+    assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), dst_object).await, source_payload);
+    assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), dst_object).await, 2);
+
+    let explicit_overwrite_input = CopyObjectInput::builder()
+        .copy_source(CopySource::Bucket {
+            bucket: bucket.clone().into(),
+            key: src_object.to_string().into(),
+            version_id: None,
+        })
+        .bucket(bucket.clone())
+        .key(dst_object.to_string())
+        .version_id(Some(locked_version_id))
+        .build()
+        .unwrap();
+
+    let err = Box::pin(usecase.execute_copy_object(build_request(explicit_overwrite_input, Method::PUT)))
+        .await
+        .expect_err("explicit CopyObject overwrite of a locked version should be blocked");
+
+    assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
+    assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), dst_object).await, source_payload);
+    assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), dst_object).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
+async fn concurrent_reverse_copy_object_does_not_deadlock_with_reader_locks() {
+    temp_env::async_with_vars([(ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+
+        let bucket = format!("test-reverse-copy-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_a = "test/a.bin";
+        let object_b = "test/b.bin";
+        let payload_a = vec![b'a'; 4 * 1024 * 1024];
+        let payload_b = vec![b'b'; 4 * 1024 * 1024];
+
+        create_test_bucket(&ecstore, bucket.as_str()).await;
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object_a, &payload_a).await;
+        let _ = upload_test_object(&ecstore, bucket.as_str(), object_b, &payload_b).await;
+
+        let a_to_b_input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: object_a.to_string().into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key(object_b.to_string())
+            .build()
+            .unwrap();
+        let b_to_a_input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: object_b.to_string().into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key(object_a.to_string())
+            .build()
+            .unwrap();
+
+        let start = Arc::new(Barrier::new(3));
+        let start_a = start.clone();
+        let a_to_b = tokio::spawn(async move {
+            start_a.wait().await;
+            let usecase = DefaultObjectUsecase::without_context();
+            Box::pin(usecase.execute_copy_object(build_request(a_to_b_input, Method::PUT))).await
+        });
+        let start_b = start.clone();
+        let b_to_a = tokio::spawn(async move {
+            start_b.wait().await;
+            let usecase = DefaultObjectUsecase::without_context();
+            Box::pin(usecase.execute_copy_object(build_request(b_to_a_input, Method::PUT))).await
+        });
+
+        start.wait().await;
+
+        let (a_to_b_result, b_to_a_result) = tokio::time::timeout(Duration::from_secs(10), async {
+            let (a_to_b_result, b_to_a_result) = tokio::join!(a_to_b, b_to_a);
+            (
+                a_to_b_result.expect("A-to-B CopyObject task should not panic"),
+                b_to_a_result.expect("B-to-A CopyObject task should not panic"),
+            )
+        })
+        .await
+        .expect("reverse CopyObject operations should not deadlock");
+
+        a_to_b_result.expect("A-to-B CopyObject should succeed");
+        b_to_a_result.expect("B-to-A CopyObject should succeed");
+
+        let final_a = read_object_bytes(&ecstore, bucket.as_str(), object_a).await;
+        let final_b = read_object_bytes(&ecstore, bucket.as_str(), object_b).await;
+        assert!(
+            final_a == payload_a || final_a == payload_b,
+            "object A must contain a complete copied payload"
+        );
+        assert!(
+            final_b == payload_a || final_b == payload_b,
+            "object B must contain a complete copied payload"
+        );
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

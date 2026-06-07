@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported_impl {
     use std::path::PathBuf;
     use std::time::Duration;
@@ -57,12 +57,11 @@ mod unsupported_impl {
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use unsupported_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};
 
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod linux_impl {
-    use jemalloc_pprof::PROF_CTL;
     use pprof::protos::Message;
     use rustfs_config::{
         DEFAULT_CPU_DURATION_SECS, DEFAULT_CPU_FREQ, DEFAULT_CPU_INTERVAL_SECS, DEFAULT_CPU_MODE, DEFAULT_ENABLE_PROFILING,
@@ -78,7 +77,7 @@ mod linux_impl {
     use tokio::sync::Mutex;
     use tokio::time::sleep;
     use tokio_util::sync::CancellationToken;
-    use tracing::{debug, error, info, warn};
+    use tracing::{debug, info, warn};
 
     static CPU_CONT_GUARD: OnceLock<Arc<Mutex<Option<pprof::ProfilerGuard<'static>>>>> = OnceLock::new();
     static PROFILING_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
@@ -153,11 +152,12 @@ mod linux_impl {
     }
 
     // Public API: dump memory pprof now (jemalloc)
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
         let out = output_dir().join(format!("mem_profile_{}.pb", ts()));
         let mut f = File::create(&out).map_err(|e| format!("create file failed: {e}"))?;
 
-        let prof_ctl_cell = PROF_CTL
+        let prof_ctl_cell = jemalloc_pprof::PROF_CTL
             .as_ref()
             .ok_or_else(|| "jemalloc profiling control not available".to_string())?;
         let mut prof_ctl = prof_ctl_cell.lock().await;
@@ -172,7 +172,13 @@ mod linux_impl {
         Ok(out)
     }
 
+    #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+    pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
+        Err(memory_profiling_unsupported_message())
+    }
+
     // Jemalloc status check (No forced placement, only status observation)
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     pub async fn check_jemalloc_profiling() {
         use tikv_jemalloc_ctl::{config, epoch, stats};
 
@@ -190,7 +196,7 @@ mod linux_impl {
             Err(_) => debug!("MALLOC_CONF is not set"),
         }
 
-        if let Some(lock) = PROF_CTL.as_ref() {
+        if let Some(lock) = jemalloc_pprof::PROF_CTL.as_ref() {
             let ctl = lock.lock().await;
             info!(activated = ctl.activated(), "jemalloc profiling status");
         } else {
@@ -211,6 +217,11 @@ mod linux_impl {
         show!("mapped", stats::mapped::read());
         show!("metadata", stats::metadata::read());
         show!("active", stats::active::read());
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+    pub async fn check_jemalloc_profiling() {
+        debug!("jemalloc profiling status check skipped on unsupported target");
     }
 
     // Internal: start continuous CPU profiling
@@ -283,6 +294,7 @@ mod linux_impl {
     }
 
     // Internal: start periodic memory dump when jemalloc profiling is active
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     async fn start_memory_periodic(interval: Duration, token: CancellationToken) {
         info!(?interval, "start periodic memory pprof dump");
         tokio::spawn(async move {
@@ -295,7 +307,7 @@ mod linux_impl {
                     _ = sleep(interval) => {}
                 }
 
-                let Some(lock) = PROF_CTL.as_ref() else {
+                let Some(lock) = jemalloc_pprof::PROF_CTL.as_ref() else {
                     debug!("skip memory dump: PROF_CTL not available");
                     continue;
                 };
@@ -305,26 +317,30 @@ mod linux_impl {
                     debug!("skip memory dump: jemalloc profiling not active");
                     continue;
                 }
-
                 let out = output_dir().join(format!("mem_profile_periodic_{}.pb", ts()));
                 match File::create(&out) {
                     Err(e) => {
-                        error!("periodic mem dump create file failed: {}", e);
+                        tracing::error!("periodic mem dump create file failed: {}", e);
                         continue;
                     }
                     Ok(mut f) => match ctl.dump_pprof() {
                         Ok(bytes) => {
                             if let Err(e) = f.write_all(&bytes) {
-                                error!("periodic mem dump write failed: {}", e);
+                                tracing::error!("periodic mem dump write failed: {}", e);
                             } else {
                                 info!("periodic memory profile dumped to {}", out.display());
                             }
                         }
-                        Err(e) => error!("periodic mem dump failed: {}", e),
+                        Err(e) => tracing::error!("periodic mem dump failed: {}", e),
                     },
                 }
             }
         });
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+    async fn start_memory_periodic(_interval: Duration, _token: CancellationToken) {
+        debug!("periodic memory profiling skipped on unsupported target");
     }
 
     // Public: unified init entry, avoid duplication/conflict
@@ -361,6 +377,16 @@ mod linux_impl {
         }
     }
 
+    #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+    fn memory_profiling_unsupported_message() -> String {
+        let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
+        format!(
+            "Memory profiling is only supported on linux x86_64 gnu. target_os={}, target_env={target_env}, target_arch={}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    }
+
     /// Stop all background profiling tasks
     pub fn shutdown_profiling() {
         if let Some(token) = PROFILING_CANCEL_TOKEN.get() {
@@ -369,5 +395,5 @@ mod linux_impl {
     }
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use linux_impl::{dump_cpu_pprof_for, dump_memory_pprof_now, init_from_env, shutdown_profiling};

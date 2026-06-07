@@ -472,7 +472,7 @@ fn build_list_object_versions_m_output(
                 None
             };
             let user_tags = if permission.tags_allowed && !object.user_tags.is_empty() {
-                Some(object.user_tags.clone())
+                Some((*object.user_tags).clone())
             } else {
                 None
             };
@@ -569,7 +569,7 @@ fn build_list_objects_v2m_output(
                 None
             };
             let user_tags = if permission.tags_allowed && !object.user_tags.is_empty() {
-                Some(object.user_tags.clone())
+                Some((*object.user_tags).clone())
             } else {
                 None
             };
@@ -1501,9 +1501,28 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
         let PutBucketEncryptionInput {
             bucket,
-            server_side_encryption_configuration,
+            mut server_side_encryption_configuration,
             ..
         } = req.input;
+
+        // When SSE-KMS is set without a specific key ID, populate the default
+        // KMS key so that GetBucketEncryption responses include it. Clients like
+        // mc rely on the presence of KMSMasterKeyID to distinguish SSE-KMS from
+        // SSE-S3 in their display logic.
+        if let Some(rule) = server_side_encryption_configuration.rules.first_mut()
+            && let Some(ref mut by_default) = rule.apply_server_side_encryption_by_default
+            && by_default.sse_algorithm.as_str() == ServerSideEncryption::AWS_KMS
+            && by_default.kms_master_key_id.as_deref().is_none_or(str::is_empty)
+        {
+            let service = rustfs_kms::service_manager::get_global_encryption_service()
+                .await
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "KMS service not initialized".to_string()))?;
+            let default_key = service
+                .get_default_key_id()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "KMS default key not configured".to_string()))?;
+            by_default.kms_master_key_id = Some(default_key.clone());
+        }
 
         info!("sse_config {:?}", &server_side_encryption_configuration);
 
@@ -2022,6 +2041,7 @@ impl DefaultBucketUsecase {
         let ListObjectVersionsInput {
             bucket,
             delimiter,
+            encoding_type,
             key_marker,
             version_id_marker,
             max_keys,
@@ -2029,22 +2049,23 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let ListObjectVersionsParams {
-            prefix,
-            delimiter,
-            key_marker,
-            version_id_marker,
-            max_keys,
-        } = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
+        let params = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
 
         let object_infos = store
-            .list_object_versions(&bucket, &prefix, key_marker, version_id_marker, delimiter.clone(), max_keys)
+            .list_object_versions(
+                &bucket,
+                &params.prefix,
+                params.key_marker.clone(),
+                params.version_id_marker.clone(),
+                params.delimiter.clone(),
+                params.max_keys,
+            )
             .await
             .map_err(ApiError::from)?;
 
-        let output = build_list_object_versions_output(object_infos, bucket, prefix, delimiter, max_keys);
+        let output = build_list_object_versions_output(object_infos, bucket, &params, encoding_type.as_ref());
 
         Ok(S3Response::new(output))
     }
@@ -2099,6 +2120,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri};
+    use std::sync::Arc;
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -2715,11 +2737,11 @@ mod tests {
                     name: "obj-a".to_string(),
                     mod_time: Some(datetime!(2025-01-01 00:00 UTC)),
                     size: 11,
-                    user_defined: HashMap::from([("project".to_string(), "alpha".to_string())]),
+                    user_defined: Arc::new(HashMap::from([("project".to_string(), "alpha".to_string())])),
                     parity_blocks: 2,
                     data_blocks: 4,
                     version_id: Some(Uuid::nil()),
-                    user_tags: "env=prod".to_string(),
+                    user_tags: Arc::new("env=prod".to_string()),
                     is_latest: true,
                     etag: Some("0123456789abcdef0123456789abcdef".to_string()),
                     ..Default::default()
@@ -2729,7 +2751,7 @@ mod tests {
                     name: "obj-b".to_string(),
                     mod_time: Some(datetime!(2025-01-02 00:00 UTC)),
                     delete_marker: true,
-                    user_defined: HashMap::from([("marker".to_string(), "true".to_string())]),
+                    user_defined: Arc::new(HashMap::from([("marker".to_string(), "true".to_string())])),
                     version_id: None,
                     ..Default::default()
                 },
@@ -2823,8 +2845,8 @@ mod tests {
                 name: "logs and more/object one.txt".to_string(),
                 mod_time: Some(datetime!(2025-01-04 00:00 UTC)),
                 size: 7,
-                user_defined: HashMap::from([("secret".to_string(), "value".to_string())]),
-                user_tags: "env=prod".to_string(),
+                user_defined: Arc::new(HashMap::from([("secret".to_string(), "value".to_string())])),
+                user_tags: Arc::new("env=prod".to_string()),
                 parity_blocks: 1,
                 data_blocks: 2,
                 ..Default::default()
@@ -2903,10 +2925,10 @@ mod tests {
                 name: "logs/obj a.txt".to_string(),
                 mod_time: Some(datetime!(2025-01-03 00:00 UTC)),
                 size: 11,
-                user_defined: HashMap::from([("project".to_string(), "alpha".to_string())]),
+                user_defined: Arc::new(HashMap::from([("project".to_string(), "alpha".to_string())])),
                 parity_blocks: 2,
                 data_blocks: 4,
-                user_tags: "env=prod".to_string(),
+                user_tags: Arc::new("env=prod".to_string()),
                 etag: Some("0123456789abcdef0123456789abcdef".to_string()),
                 ..Default::default()
             }],
@@ -2979,8 +3001,8 @@ mod tests {
                 name: "logs and more/object one.txt".to_string(),
                 mod_time: Some(datetime!(2025-01-05 00:00 UTC)),
                 size: 13,
-                user_defined: HashMap::from([("secret".to_string(), "value".to_string())]),
-                user_tags: "env=prod".to_string(),
+                user_defined: Arc::new(HashMap::from([("secret".to_string(), "value".to_string())])),
+                user_tags: Arc::new("env=prod".to_string()),
                 parity_blocks: 1,
                 data_blocks: 2,
                 ..Default::default()

@@ -56,6 +56,8 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.kms.vault.vault_mount_path | string | `"transit"`| The vault mount path, only works if `vault_backend` equals `vault-transit` . |
 | config.rustfs.kms.vault.default_key | string | `"transit"`| The master key id for RustFS. |
 | extraEnv | map | `[]` |  Extra environment variables for RustFS container. |
+| extraVolumes | list | `[]` | Extra volumes to add to the pod spec. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
+| extraVolumeMounts | list | `[]` | Extra volume mounts to add to the RustFS container. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
@@ -150,6 +152,8 @@ uer. `ClusterIssuer` or `Issuer`. |
 | storageclass.pvcAnnotations.data | map | `{}` | Data pvc customized annotations. |
 | storageclass.pvcAnnotations.logs | map | `{}` | Logs pvc customized annotations. |
 | tolerations | list | `[]` |  |
+| topologySpreadConstraints.enabled | bool | `false` | Enable custom topology spread constraints on distributed-mode StatefulSet pods. |
+| topologySpreadConstraints.constraints | list | `[]` | Raw `spec.template.spec.topologySpreadConstraints` entries applied to the distributed StatefulSet when enabled. |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
 | gatewayApi.listeners.http.name | string | `web` | Gateway API http listener name. |

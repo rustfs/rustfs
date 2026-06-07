@@ -16,6 +16,7 @@ pub mod account_info;
 pub mod audit;
 mod audit_runtime_config;
 pub mod bucket_meta;
+pub mod config_admin;
 pub mod event;
 pub mod group;
 pub mod heal;
@@ -39,10 +40,12 @@ pub mod profile_admin;
 pub mod quota;
 pub mod rebalance;
 pub mod replication;
+pub mod scanner;
 pub mod service_account;
 pub mod site_replication;
 pub mod sts;
 pub mod system;
+pub mod table_catalog;
 mod target_descriptor;
 pub mod tier;
 pub mod tls_debug;
@@ -60,6 +63,12 @@ mod tests {
     fn test_handler_struct_creation() {
         // Test that handler structs can be created
         let _account_handler = account_info::AccountInfoHandler {};
+        let _get_config_kv_handler = config_admin::GetConfigKVHandler {};
+        let _set_config_kv_handler = config_admin::SetConfigKVHandler {};
+        let _del_config_kv_handler = config_admin::DelConfigKVHandler {};
+        let _help_config_kv_handler = config_admin::HelpConfigKVHandler {};
+        let _get_config_handler = config_admin::GetConfigHandler {};
+        let _set_config_handler = config_admin::SetConfigHandler {};
         let _list_audit_targets = audit::ListAuditTargets {};
         let _get_module_switches = module_switch::GetModuleSwitchesHandler {};
         let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
@@ -83,9 +92,11 @@ mod tests {
         let _set_remote_target_handler = replication::SetRemoteTargetHandler {};
         let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
+        let _scanner_status_handler = scanner::ScannerStatusHandler {};
         let _site_replication_add_handler = site_replication::SiteReplicationAddHandler {};
         let _site_replication_info_handler = site_replication::SiteReplicationInfoHandler {};
         let _site_replication_status_handler = site_replication::SiteReplicationStatusHandler {};
+        let _table_catalog_config_handler = table_catalog::GetCatalogConfigHandler {};
 
         // Just verify they can be created without panicking
         // Test passes if we reach this point without panicking

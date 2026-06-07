@@ -155,8 +155,10 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         tracer_provider: None,
         meter_provider: None,
         logger_provider: None,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         profiling_agent: None,
+        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        memory_profiling_agent: None,
         tracing_guard: Some(guard),
         stdout_guard: None,
         cleanup_handle: None,
@@ -289,8 +291,10 @@ fn init_file_logging_internal(
         tracer_provider: None,
         meter_provider: None,
         logger_provider: None,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         profiling_agent: None,
+        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        memory_profiling_agent: None,
         tracing_guard: Some(guard),
         stdout_guard,
         cleanup_handle: Some(cleanup_handle),

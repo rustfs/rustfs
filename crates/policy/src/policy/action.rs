@@ -502,6 +502,46 @@ pub enum AdminAction {
     ImportBucketMetadataAction,
     #[strum(serialize = "admin:ExportBucketMetadata")]
     ExportBucketMetadataAction,
+    #[strum(serialize = "admin:GetTableCatalog")]
+    GetTableCatalogAction,
+    #[strum(serialize = "admin:GetTableBucket")]
+    GetTableBucketAction,
+    #[strum(serialize = "admin:SetTableBucket")]
+    SetTableBucketAction,
+    #[strum(serialize = "admin:GetTableNamespace")]
+    GetTableNamespaceAction,
+    #[strum(serialize = "admin:SetTableNamespace")]
+    SetTableNamespaceAction,
+    #[strum(serialize = "admin:UpdateTableNamespaceProperties")]
+    UpdateTableNamespacePropertiesAction,
+    #[strum(serialize = "admin:DeleteTableNamespace")]
+    DeleteTableNamespaceAction,
+    #[strum(serialize = "admin:GetTable")]
+    GetTableAction,
+    #[strum(serialize = "admin:SetTable")]
+    SetTableAction,
+    #[strum(serialize = "admin:CreateTable")]
+    CreateTableAction,
+    #[strum(serialize = "admin:RegisterTable")]
+    RegisterTableAction,
+    #[strum(serialize = "admin:CommitTable")]
+    CommitTableAction,
+    #[strum(serialize = "admin:DeleteTable")]
+    DeleteTableAction,
+    #[strum(serialize = "admin:GetTableLifecycle")]
+    GetTableLifecycleAction,
+    #[strum(serialize = "admin:SetTableLifecycle")]
+    SetTableLifecycleAction,
+    #[strum(serialize = "admin:RunTableMaintenance")]
+    RunTableMaintenanceAction,
+    #[strum(serialize = "admin:GetTableMetadataLocation")]
+    GetTableMetadataLocationAction,
+    #[strum(serialize = "admin:SetTableMetadataLocation")]
+    SetTableMetadataLocationAction,
+    #[strum(serialize = "admin:GetTableMetadata")]
+    GetTableMetadataAction,
+    #[strum(serialize = "admin:SetTableMetadata")]
+    SetTableMetadataAction,
     #[strum(serialize = "admin:SetTier")]
     SetTierAction,
     #[strum(serialize = "admin:ListTier")]
@@ -586,6 +626,26 @@ impl AdminAction {
                 | AdminAction::GetReplicationMetricsAction
                 | AdminAction::ImportBucketMetadataAction
                 | AdminAction::ExportBucketMetadataAction
+                | AdminAction::GetTableCatalogAction
+                | AdminAction::GetTableBucketAction
+                | AdminAction::SetTableBucketAction
+                | AdminAction::GetTableNamespaceAction
+                | AdminAction::SetTableNamespaceAction
+                | AdminAction::UpdateTableNamespacePropertiesAction
+                | AdminAction::DeleteTableNamespaceAction
+                | AdminAction::GetTableAction
+                | AdminAction::SetTableAction
+                | AdminAction::CreateTableAction
+                | AdminAction::RegisterTableAction
+                | AdminAction::CommitTableAction
+                | AdminAction::DeleteTableAction
+                | AdminAction::GetTableLifecycleAction
+                | AdminAction::SetTableLifecycleAction
+                | AdminAction::RunTableMaintenanceAction
+                | AdminAction::GetTableMetadataLocationAction
+                | AdminAction::SetTableMetadataLocationAction
+                | AdminAction::GetTableMetadataAction
+                | AdminAction::SetTableMetadataAction
                 | AdminAction::SetTierAction
                 | AdminAction::ListTierAction
                 | AdminAction::ExportIAMAction
@@ -685,5 +745,102 @@ mod tests {
     #[test]
     fn test_get_replication_metrics_admin_action_is_valid() {
         assert!(AdminAction::GetReplicationMetricsAction.is_valid());
+    }
+
+    #[test]
+    fn test_table_catalog_admin_action_is_valid() {
+        let get_action = AdminAction::try_from("admin:GetTableCatalog").expect("Should parse GetTableCatalog action");
+
+        assert_eq!(get_action, AdminAction::GetTableCatalogAction);
+        assert!(get_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_bucket_admin_actions_are_valid() {
+        let get_action = AdminAction::try_from("admin:GetTableBucket").expect("Should parse GetTableBucket action");
+        let set_action = AdminAction::try_from("admin:SetTableBucket").expect("Should parse SetTableBucket action");
+
+        assert_eq!(get_action, AdminAction::GetTableBucketAction);
+        assert_eq!(set_action, AdminAction::SetTableBucketAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_namespace_admin_actions_are_valid() {
+        let get_action = AdminAction::try_from("admin:GetTableNamespace").expect("Should parse GetTableNamespace action");
+        let set_action = AdminAction::try_from("admin:SetTableNamespace").expect("Should parse SetTableNamespace action");
+        let update_properties_action = AdminAction::try_from("admin:UpdateTableNamespaceProperties")
+            .expect("Should parse UpdateTableNamespaceProperties action");
+        let delete_action =
+            AdminAction::try_from("admin:DeleteTableNamespace").expect("Should parse DeleteTableNamespace action");
+
+        assert_eq!(get_action, AdminAction::GetTableNamespaceAction);
+        assert_eq!(set_action, AdminAction::SetTableNamespaceAction);
+        assert_eq!(update_properties_action, AdminAction::UpdateTableNamespacePropertiesAction);
+        assert_eq!(delete_action, AdminAction::DeleteTableNamespaceAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
+        assert!(update_properties_action.is_valid());
+        assert!(delete_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_admin_actions_are_valid() {
+        let get_action = AdminAction::try_from("admin:GetTable").expect("Should parse GetTable action");
+        let set_action = AdminAction::try_from("admin:SetTable").expect("Should parse SetTable action");
+        let create_action = AdminAction::try_from("admin:CreateTable").expect("Should parse CreateTable action");
+        let register_action = AdminAction::try_from("admin:RegisterTable").expect("Should parse RegisterTable action");
+        let commit_action = AdminAction::try_from("admin:CommitTable").expect("Should parse CommitTable action");
+        let delete_action = AdminAction::try_from("admin:DeleteTable").expect("Should parse DeleteTable action");
+        let get_lifecycle_action =
+            AdminAction::try_from("admin:GetTableLifecycle").expect("Should parse GetTableLifecycle action");
+        let set_lifecycle_action =
+            AdminAction::try_from("admin:SetTableLifecycle").expect("Should parse SetTableLifecycle action");
+        let run_maintenance_action =
+            AdminAction::try_from("admin:RunTableMaintenance").expect("Should parse RunTableMaintenance action");
+
+        assert_eq!(get_action, AdminAction::GetTableAction);
+        assert_eq!(set_action, AdminAction::SetTableAction);
+        assert_eq!(create_action, AdminAction::CreateTableAction);
+        assert_eq!(register_action, AdminAction::RegisterTableAction);
+        assert_eq!(commit_action, AdminAction::CommitTableAction);
+        assert_eq!(delete_action, AdminAction::DeleteTableAction);
+        assert_eq!(get_lifecycle_action, AdminAction::GetTableLifecycleAction);
+        assert_eq!(set_lifecycle_action, AdminAction::SetTableLifecycleAction);
+        assert_eq!(run_maintenance_action, AdminAction::RunTableMaintenanceAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
+        assert!(create_action.is_valid());
+        assert!(register_action.is_valid());
+        assert!(commit_action.is_valid());
+        assert!(delete_action.is_valid());
+        assert!(get_lifecycle_action.is_valid());
+        assert!(set_lifecycle_action.is_valid());
+        assert!(run_maintenance_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_metadata_location_admin_actions_are_valid() {
+        let get_action =
+            AdminAction::try_from("admin:GetTableMetadataLocation").expect("Should parse GetTableMetadataLocation action");
+        let set_action =
+            AdminAction::try_from("admin:SetTableMetadataLocation").expect("Should parse SetTableMetadataLocation action");
+
+        assert_eq!(get_action, AdminAction::GetTableMetadataLocationAction);
+        assert_eq!(set_action, AdminAction::SetTableMetadataLocationAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_metadata_admin_actions_are_valid() {
+        let get_action = AdminAction::try_from("admin:GetTableMetadata").expect("Should parse GetTableMetadata action");
+        let set_action = AdminAction::try_from("admin:SetTableMetadata").expect("Should parse SetTableMetadata action");
+
+        assert_eq!(get_action, AdminAction::GetTableMetadataAction);
+        assert_eq!(set_action, AdminAction::SetTableMetadataAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
     }
 }

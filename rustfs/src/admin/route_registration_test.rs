@@ -14,12 +14,16 @@
 
 use crate::admin::{
     handlers::{
-        audit, bucket_meta, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools, profile_admin,
-        quota, rebalance, replication, site_replication, sts, system, tier, tls_debug, user,
+        audit, bucket_meta, config_admin, heal, health, kms, module_switch, oidc, plugins_catalog, plugins_instances, pools,
+        profile_admin, quota, rebalance, replication, scanner, site_replication, sts, system, table_catalog, tier, tls_debug,
+        user,
     },
     router::{AdminOperation, S3Router},
 };
-use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
+use crate::server::{
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
+    TABLE_CATALOG_PREFIX,
+};
 use hyper::Method;
 use serial_test::serial;
 use temp_env::with_var;
@@ -30,6 +34,10 @@ fn admin_path(path: &str) -> String {
 
 fn compat_admin_alias_path(path: &str) -> String {
     format!("{}{}", MINIO_ADMIN_PREFIX, path)
+}
+
+fn table_catalog_path(path: &str) -> String {
+    format!("{}{}", TABLE_CATALOG_PREFIX, path)
 }
 
 fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
@@ -52,6 +60,8 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     tier::register_tier_route(router).expect("register tier route");
     quota::register_quota_route(router).expect("register quota route");
     bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
+    config_admin::register_config_route(router).expect("register config admin route");
+    scanner::register_scanner_route(router).expect("register scanner route");
     audit::register_audit_target_route(router).expect("register audit target route");
     module_switch::register_module_switch_route(router).expect("register module switch route");
     plugins_catalog::register_plugin_catalog_route(router).expect("register plugin catalog route");
@@ -62,6 +72,7 @@ fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
     tls_debug::register_tls_debug_route(router).expect("register tls debug route");
     kms::register_kms_route(router).expect("register kms route");
     oidc::register_oidc_route(router).expect("register oidc route");
+    table_catalog::register_table_catalog_route(router).expect("register table catalog route");
 }
 
 // register_admin_routes reads ENV_HEALTH_ENDPOINT_ENABLE to decide whether
@@ -112,6 +123,29 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
+
+    assert_route(&router, Method::GET, &admin_path("/v3/get-config-kv"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/set-config-kv"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/del-config-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/help-config-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/list-config-history-kv"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/clear-config-history-kv"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/restore-config-history-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/config"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/config"));
+    assert_route(&router, Method::GET, &admin_path("/v3/scanner/status"));
+
+    assert_route(&router, Method::GET, &table_catalog_path("/config"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales"));
+    assert_route(&router, Method::DELETE, &table_catalog_path("/analytics/namespaces/sales"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/register"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(&router, Method::DELETE, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));
@@ -237,6 +271,16 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, compat_admin_alias_path("/v3/kms/status")),
         (Method::POST, compat_admin_alias_path("/v3/kms/status")),
         (Method::GET, compat_admin_alias_path("/v3/kms/key/status")),
+        (Method::GET, compat_admin_alias_path("/v3/get-config-kv")),
+        (Method::PUT, compat_admin_alias_path("/v3/set-config-kv")),
+        (Method::DELETE, compat_admin_alias_path("/v3/del-config-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/help-config-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/list-config-history-kv")),
+        (Method::DELETE, compat_admin_alias_path("/v3/clear-config-history-kv")),
+        (Method::PUT, compat_admin_alias_path("/v3/restore-config-history-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/config")),
+        (Method::PUT, compat_admin_alias_path("/v3/config")),
+        (Method::GET, compat_admin_alias_path("/v3/scanner/status")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),

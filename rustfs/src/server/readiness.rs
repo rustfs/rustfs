@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::server::has_path_prefix;
 use crate::server::{ServiceState, ServiceStateManager};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
@@ -57,6 +58,7 @@ pub enum ReadinessDegradedReason {
     StorageQuorumUnavailable,
     IamNotReady,
     LockQuorumUnavailable,
+    KmsNotReady,
     StorageAndIamUnavailable,
     StorageAndLockUnavailable,
     IamAndLockUnavailable,
@@ -69,6 +71,7 @@ impl ReadinessDegradedReason {
             ReadinessDegradedReason::StorageQuorumUnavailable => "storage_quorum_unavailable",
             ReadinessDegradedReason::IamNotReady => "iam_not_ready",
             ReadinessDegradedReason::LockQuorumUnavailable => "lock_quorum_unavailable",
+            ReadinessDegradedReason::KmsNotReady => "kms_not_ready",
             ReadinessDegradedReason::StorageAndIamUnavailable => "storage_and_iam_unavailable",
             ReadinessDegradedReason::StorageAndLockUnavailable => "storage_and_lock_unavailable",
             ReadinessDegradedReason::IamAndLockUnavailable => "iam_and_lock_unavailable",
@@ -124,6 +127,29 @@ pub struct ReadinessGateService<S> {
     readiness: Arc<GlobalReadiness>,
 }
 
+fn is_probe_path(path: &str) -> bool {
+    let is_exact_probe = matches!(
+        path,
+        crate::server::PROFILE_MEMORY_PATH
+            | crate::server::PROFILE_CPU_PATH
+            | crate::server::HEALTH_PREFIX
+            | crate::server::HEALTH_COMPAT_LIVE_PATH
+            | crate::server::HEALTH_READY_PATH
+            | crate::server::FAVICON_PATH
+    );
+
+    let is_prefix_probe = has_path_prefix(path, crate::server::RUSTFS_ADMIN_PREFIX)
+        || has_path_prefix(path, crate::server::MINIO_ADMIN_V3_PREFIX)
+        || has_path_prefix(path, crate::server::TABLE_CATALOG_PREFIX)
+        || has_path_prefix(path, crate::server::CONSOLE_PREFIX)
+        || has_path_prefix(path, crate::server::RPC_PREFIX)
+        || has_path_prefix(path, crate::server::ADMIN_PREFIX)
+        || has_path_prefix(path, crate::server::MINIO_ADMIN_PREFIX)
+        || has_path_prefix(path, crate::server::TONIC_PREFIX);
+
+    is_exact_probe || is_prefix_probe
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 impl<S, B> Service<HttpRequest<Incoming>> for ReadinessGateService<S>
@@ -148,26 +174,7 @@ where
         Box::pin(async move {
             let path = req.uri().path();
             debug!("ReadinessGateService: Received request for path: {}", path);
-            // 1) Exact match: fixed probe/resource path
-            let is_exact_probe = matches!(
-                path,
-                crate::server::PROFILE_MEMORY_PATH
-                    | crate::server::PROFILE_CPU_PATH
-                    | crate::server::HEALTH_PREFIX
-                    | crate::server::HEALTH_READY_PATH
-                    | crate::server::FAVICON_PATH
-            );
-
-            // 2) Prefix matching: the entire set of route prefixes (including their subpaths)
-            let is_prefix_probe = path.starts_with(crate::server::RUSTFS_ADMIN_PREFIX)
-                || path.starts_with(crate::server::MINIO_ADMIN_V3_PREFIX)
-                || path.starts_with(crate::server::CONSOLE_PREFIX)
-                || path.starts_with(crate::server::RPC_PREFIX)
-                || path.starts_with(crate::server::ADMIN_PREFIX)
-                || path.starts_with(crate::server::MINIO_ADMIN_PREFIX)
-                || path.starts_with(crate::server::TONIC_PREFIX);
-
-            let is_probe = is_exact_probe || is_prefix_probe;
+            let is_probe = is_probe_path(path);
             if !is_probe && !readiness.is_ready() {
                 let body: BoxBody = Full::new(Bytes::from_static(b"Service not ready"))
                     .map_err(|e| -> BoxError { Box::new(e) })
@@ -222,6 +229,12 @@ struct StorageReadinessCacheEntry {
     storage_ready: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LockQuorumCacheEntry {
+    captured_at: Instant,
+    status: LockQuorumStatus,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LockQuorumStatus {
     pub ready: bool,
@@ -243,6 +256,11 @@ fn health_readiness_cache_ttl() -> Duration {
 
 fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry>> {
     static CACHE: OnceLock<Mutex<Option<StorageReadinessCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn lock_quorum_status_cache() -> &'static Mutex<Option<LockQuorumCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<LockQuorumCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
@@ -270,6 +288,33 @@ async fn update_storage_readiness_cache(storage_ready: bool) {
     *cache = Some(StorageReadinessCacheEntry {
         captured_at: Instant::now(),
         storage_ready,
+    });
+}
+
+async fn load_cached_lock_quorum_status() -> Option<LockQuorumStatus> {
+    let ttl = health_readiness_cache_ttl();
+    if ttl.is_zero() {
+        return None;
+    }
+
+    let cache = lock_quorum_status_cache().lock().await;
+    let entry = cache.as_ref()?;
+    if entry.captured_at.elapsed() <= ttl {
+        return Some(entry.status);
+    }
+
+    None
+}
+
+async fn update_lock_quorum_status_cache(status: LockQuorumStatus) {
+    if health_readiness_cache_ttl().is_zero() {
+        return;
+    }
+
+    let mut cache = lock_quorum_status_cache().lock().await;
+    *cache = Some(LockQuorumCacheEntry {
+        captured_at: Instant::now(),
+        status,
     });
 }
 
@@ -399,7 +444,7 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
         update_storage_readiness_cache(computed).await;
         computed
     };
-    let lock_quorum_status = collect_lock_quorum_status_uncached().await;
+    let lock_quorum_status = collect_lock_quorum_status().await;
 
     let readiness = DependencyReadiness {
         storage_ready,
@@ -412,6 +457,16 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
     };
     record_readiness_report(&report);
     report
+}
+
+async fn collect_lock_quorum_status() -> LockQuorumStatus {
+    if let Some(cached) = load_cached_lock_quorum_status().await {
+        cached
+    } else {
+        let computed = collect_lock_quorum_status_uncached().await;
+        update_lock_quorum_status_cache(computed).await;
+        computed
+    }
 }
 
 async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
@@ -662,6 +717,17 @@ mod tests {
     }
 
     #[test]
+    fn probe_path_checks_admin_boundaries() {
+        assert!(is_probe_path("/minio/admin/v3/info"));
+        assert!(is_probe_path("/rustfs/admin/v3/info"));
+        assert!(is_probe_path(&format!("{}/config", crate::server::TABLE_CATALOG_PREFIX)));
+        assert!(is_probe_path("/rustfs/console/"));
+        assert!(!is_probe_path("/minio/adminx/object"));
+        assert!(!is_probe_path("/rustfs/adminx/object"));
+        assert!(!is_probe_path("/bucket/object"));
+    }
+
+    #[test]
     fn storage_ready_from_runtime_state_returns_false_when_all_disks_faulty() {
         let info = StorageInfo {
             backend: BackendInfo {
@@ -892,6 +958,34 @@ mod tests {
         assert_eq!(
             degraded_reasons(false, false, false),
             vec![ReadinessDegradedReason::StorageIamAndLockUnavailable]
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_quorum_status_cache_roundtrip() {
+        let cache = lock_quorum_status_cache();
+        {
+            let mut guard = cache.lock().await;
+            *guard = None;
+        }
+
+        update_lock_quorum_status_cache(LockQuorumStatus {
+            ready: true,
+            connected_clients: 2,
+            total_clients: 3,
+            required_quorum: 2,
+        })
+        .await;
+
+        let cached = load_cached_lock_quorum_status().await;
+        assert_eq!(
+            cached,
+            Some(LockQuorumStatus {
+                ready: true,
+                connected_clients: 2,
+                total_clients: 3,
+                required_quorum: 2,
+            })
         );
     }
 }

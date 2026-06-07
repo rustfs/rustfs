@@ -4551,7 +4551,7 @@
                   "index": 0,
                   "text": "INACTIVE"
                 },
-                "to": 1e-09
+                "to": 1e-9
               },
               "type": "range"
             }
@@ -5281,7 +5281,10 @@
       "id": 102,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom"
         },
@@ -5368,7 +5371,10 @@
       "id": 103,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom"
         },
@@ -5455,7 +5461,10 @@
       "id": 104,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom"
         },
@@ -5533,7 +5542,9 @@
       "id": 105,
       "options": {
         "legend": {
-          "calcs": ["mean"],
+          "calcs": [
+            "mean"
+          ],
           "displayMode": "table",
           "placement": "bottom"
         },
@@ -5629,7 +5640,10 @@
       "id": 106,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom"
         },
@@ -5725,7 +5739,10 @@
       "id": 107,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom"
         },
@@ -5803,7 +5820,10 @@
       "id": 108,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom"
         },
@@ -8071,6 +8091,374 @@
         "x": 0,
         "y": 195
       },
+      "id": 150,
+      "panels": [],
+      "title": "Object Lock Diagnostics",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 196
+      },
+      "id": 151,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (op, mode) (increase(rustfs_object_lock_diag_slow_acquire_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{op}} | {{mode}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Slow Object Lock Acquires",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 196
+      },
+      "id": 152,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (op, mode) (increase(rustfs_object_lock_diag_slow_hold_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{op}} | {{mode}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Slow Object Lock Holds",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 204
+      },
+      "id": 153,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, op, mode) (rate(rustfs_object_lock_diag_acquire_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "{{op}} | {{mode}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Object Lock Acquire Duration P95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 204
+      },
+      "id": 154,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, op, mode) (rate(rustfs_object_lock_diag_hold_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "{{op}} | {{mode}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Object Lock Hold Duration P95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "text": "Disabled"
+                },
+                "1": {
+                  "text": "Enabled"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 212
+      },
+      "id": 155,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(rustfs_object_lock_diag_enabled{job=~\"$job\"})",
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Object Lock Diagnostics Enabled",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 213
+      },
       "id": 137,
       "panels": [],
       "title": "Debug / Raw Explorer",
@@ -8138,7 +8526,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 196
+        "y": 214
       },
       "id": 138,
       "options": {
@@ -8235,7 +8623,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 196
+        "y": 214
       },
       "id": 139,
       "options": {
@@ -8332,7 +8720,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 204
+        "y": 222
       },
       "id": 140,
       "options": {
@@ -8429,7 +8817,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 204
+        "y": 222
       },
       "id": 141,
       "options": {
@@ -8526,7 +8914,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 212
+        "y": 230
       },
       "id": 142,
       "options": {
@@ -8623,7 +9011,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 212
+        "y": 230
       },
       "id": 143,
       "options": {
@@ -8720,7 +9108,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 220
+        "y": 238
       },
       "id": 144,
       "options": {
@@ -8817,7 +9205,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 220
+        "y": 238
       },
       "id": 145,
       "options": {
@@ -8914,7 +9302,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 228
+        "y": 246
       },
       "id": 146,
       "options": {
@@ -9011,7 +9399,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 228
+        "y": 246
       },
       "id": 147,
       "options": {
@@ -9108,7 +9496,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 236
+        "y": 254
       },
       "id": 148,
       "options": {
@@ -9205,7 +9593,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 236
+        "y": 254
       },
       "id": 149,
       "options": {
@@ -9382,5 +9770,5 @@
   "timezone": "browser",
   "title": "RustFS",
   "uid": "rustfs-s3",
-  "version": 13
+  "version": 14
 }

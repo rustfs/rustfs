@@ -60,6 +60,10 @@ spec:
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       {{- end }}
+      {{- if and .Values.topologySpreadConstraints.enabled .Values.topologySpreadConstraints.constraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.topologySpreadConstraints.constraints | nindent 8 }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
@@ -141,6 +145,9 @@ spec:
               mountPath: /opt/tls/ca.crt
               subPath: ca.crt
             {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
             - name: logs
               mountPath: {{ $logDir }}
               subPath: logs
@@ -153,8 +160,9 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
-      {{- if .Values.mtls.enabled }}
+      {{- if or .Values.mtls.enabled .Values.extraVolumes }}
       volumes:
+        {{- if .Values.mtls.enabled }}
         - name: server-cert
           secret:
             secretName: rustfs-server-tls
@@ -175,9 +183,15 @@ spec:
                 path: client_key.pem
               - key: ca.crt
                 path: client_ca.crt
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
   volumeClaimTemplates:
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: logs
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}
@@ -191,7 +205,9 @@ spec:
             storage: {{ .Values.storageclass.logStorageSize }}
     {{- if eq (int .Values.replicaCount) 4 }}
     {{- range $i := until (int .Values.replicaCount) }}
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: data-rustfs-{{ $i }}
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
@@ -205,7 +221,9 @@ spec:
             storage: {{ $.Values.storageclass.dataStorageSize }}
     {{- end }}
     {{- else if eq (int .Values.replicaCount) 16 }}
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: data
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}

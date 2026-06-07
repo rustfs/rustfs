@@ -131,26 +131,50 @@ fn test_parquet_bytes() -> QueryResult<Vec<u8>> {
         Field::new("department", DataType::Utf8, false),
         Field::new("salary", DataType::Int32, false),
     ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Diana", "Eve"])),
-            Arc::new(Int32Array::from(vec![25, 30, 35, 22, 28])),
-            Arc::new(StringArray::from(vec!["HR", "IT", "Finance", "Marketing", "IT"])),
-            Arc::new(Int32Array::from(vec![5000, 6000, 7000, 4500, 5500])),
-        ],
-    )
-    .map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+    let first_batch =
+        test_parquet_batch(Arc::clone(&schema), &[1, 2], &["Alice", "Bob"], &[25, 30], &["HR", "IT"], &[5000, 6000])?;
+    let second_batch = test_parquet_batch(
+        Arc::clone(&schema),
+        &[3, 4, 5],
+        &["Charlie", "Diana", "Eve"],
+        &[35, 22, 28],
+        &["Finance", "Marketing", "IT"],
+        &[7000, 4500, 5500],
+    )?;
 
     let mut bytes = Vec::new();
     {
         let mut writer =
             ArrowWriter::try_new(&mut bytes, schema, None).map_err(|e| QueryError::StoreError { e: e.to_string() })?;
         writer
-            .write(&batch)
+            .write(&first_batch)
+            .map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer.flush().map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer
+            .write(&second_batch)
             .map_err(|e| QueryError::StoreError { e: e.to_string() })?;
         writer.close().map_err(|e| QueryError::StoreError { e: e.to_string() })?;
     }
     Ok(bytes)
+}
+
+fn test_parquet_batch(
+    schema: Arc<Schema>,
+    ids: &[i32],
+    names: &[&str],
+    ages: &[i32],
+    departments: &[&str],
+    salaries: &[i32],
+) -> QueryResult<RecordBatch> {
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(names.to_vec())),
+            Arc::new(Int32Array::from(ages.to_vec())),
+            Arc::new(StringArray::from(departments.to_vec())),
+            Arc::new(Int32Array::from(salaries.to_vec())),
+        ],
+    )
+    .map_err(|e| QueryError::StoreError { e: e.to_string() })
 }

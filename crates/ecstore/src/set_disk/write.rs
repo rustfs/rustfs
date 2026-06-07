@@ -38,7 +38,7 @@ impl SetDisks {
         dst_bucket: &str,
         dst_object: &str,
         write_quorum: usize,
-    ) -> disk::error::Result<(Vec<Option<DiskStore>>, Option<Vec<u8>>, Option<Uuid>)> {
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, Option<Vec<u8>>, Option<Uuid>, Vec<Option<DiskStore>>)> {
         let mut futures = Vec::with_capacity(disks.len());
 
         let mut errs = Vec::with_capacity(disks.len());
@@ -92,6 +92,34 @@ impl SetDisks {
             }
         }
 
+        if issue3031_diag_enabled() {
+            let success_count = errs.iter().filter(|err| err.is_none()).count();
+            let failure_count = errs.len().saturating_sub(success_count);
+            let ignored_failure_count = errs
+                .iter()
+                .filter(|err| err.as_ref().is_some_and(|err| OBJECT_OP_IGNORED_ERRS.contains(err)))
+                .count();
+            let data_dir_vote_count = data_dirs.iter().filter(|data_dir| data_dir.is_some()).count();
+            let reduced_data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
+            warn!(
+                target: "rustfs_ecstore::set_disk",
+                src_bucket = %src_bucket,
+                src_object = %src_object,
+                dst_bucket = %dst_bucket,
+                dst_object = %dst_object,
+                write_quorum,
+                disk_count = errs.len(),
+                success_count,
+                failure_count,
+                ignored_failure_count,
+                data_dir_vote_count,
+                reduced_data_dir = ?reduced_data_dir,
+                errs = ?errs,
+                data_dirs = ?data_dirs,
+                "issue3031_rename_data_quorum_context"
+            );
+        }
+
         let mut futures = Vec::with_capacity(disks.len());
         if let Some(ret_err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
             // TODO: add concurrency
@@ -128,6 +156,21 @@ impl SetDisks {
                 }
             }
 
+            if issue3031_diag_enabled() {
+                warn!(
+                    target: "rustfs_ecstore::set_disk",
+                    src_bucket = %src_bucket,
+                    src_object = %src_object,
+                    dst_bucket = %dst_bucket,
+                    dst_object = %dst_object,
+                    write_quorum,
+                    ret_err = %ret_err,
+                    errs = ?errs,
+                    data_dirs = ?data_dirs,
+                    "issue3031_rename_data_quorum_failed"
+                );
+            }
+
             let _ = join_all(futures).await;
             return Err(ret_err);
         }
@@ -136,6 +179,23 @@ impl SetDisks {
         // TODO: reduceCommonVersions
 
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
+        let online_disks = Self::eval_disks(disks, &errs);
+        let cleanup_disks = if let Some(data_dir) = data_dir {
+            disks
+                .iter()
+                .zip(errs.iter())
+                .zip(data_dirs.iter())
+                .map(|((disk, err), old_data_dir)| {
+                    if err.is_none() && *old_data_dir == Some(data_dir) {
+                        disk.clone()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![None; disks.len()]
+        };
 
         // // TODO: reduce_common_data_dir
         // if let Some(old_dir) = rename_ress
@@ -150,7 +210,7 @@ impl SetDisks {
 
         // self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
 
-        Ok((Self::eval_disks(disks, &errs), versions, data_dir))
+        Ok((online_disks, versions, data_dir, cleanup_disks))
     }
 
     #[allow(dead_code)]
@@ -261,6 +321,11 @@ impl SetDisks {
         let src_object = Arc::new(src_object.to_string());
         let dst_bucket = Arc::new(dst_bucket.to_string());
         let dst_object = Arc::new(dst_object.to_string());
+
+        // Match MinIO's multipart overwrite semantics: clear any stale destination
+        // part payload and metadata before the new per-disk rename fan-out begins.
+        self.cleanup_multipart_path(&[dst_object.to_string(), format!("{dst_object}.meta")])
+            .await;
 
         let mut errs = Vec::with_capacity(disks.len());
 
@@ -378,30 +443,35 @@ impl SetDisks {
         }
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            // TODO: add concurrency
+            let mut revert_futures = Vec::with_capacity(disks.len());
             for (i, err) in errs.iter().enumerate() {
                 if err.is_some() {
                     continue;
                 }
 
                 if let Some(disk) = disks[i].as_ref() {
-                    let _ = disk
-                        .delete(
-                            bucket,
-                            &path_join_buf(&[prefix, STORAGE_FORMAT_FILE]),
-                            DeleteOptions {
-                                recursive: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(|e| {
-                            warn!("write meta revert err {:?}", e);
-                            e
-                        });
+                    let disk = disk.clone();
+                    let bucket = bucket.to_string();
+                    let path = path_join_buf(&[prefix, STORAGE_FORMAT_FILE]);
+                    revert_futures.push(async move {
+                        if let Err(err) = disk
+                            .delete(
+                                &bucket,
+                                &path,
+                                DeleteOptions {
+                                    recursive: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            warn!("write meta revert err {:?}", err);
+                        }
+                    });
                 }
             }
 
+            join_all(revert_futures).await;
             return Err(err);
         }
         Ok(())

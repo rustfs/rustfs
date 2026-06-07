@@ -308,7 +308,6 @@ where
 /// - `encoder`: Optional ReedSolomon encoder instance.
 /// - `block_size`: Block size for each shard.
 /// - `_id`: Unique identifier for the erasure instance.
-/// - `_buf`: Internal buffer for block operations.
 ///
 /// # Example
 /// ```ignore
@@ -326,7 +325,6 @@ pub struct Erasure {
     pub block_size: usize,
     uses_legacy: bool,
     _id: Uuid,
-    _buf: Vec<u8>,
 }
 
 impl Default for Erasure {
@@ -339,7 +337,6 @@ impl Default for Erasure {
             block_size: 0,
             uses_legacy: false,
             _id: Uuid::nil(),
-            _buf: vec![],
         }
     }
 }
@@ -353,8 +350,7 @@ impl Clone for Erasure {
             legacy_encoder: self.legacy_encoder.clone(),
             block_size: self.block_size,
             uses_legacy: self.uses_legacy,
-            _id: Uuid::new_v4(), // Generate new ID for clone
-            _buf: vec![0u8; self.block_size],
+            _id: self._id, // Shared by clones; this field is unused in hot paths.
         }
     }
 }
@@ -399,7 +395,6 @@ impl Erasure {
             legacy_encoder,
             uses_legacy,
             _id: Uuid::new_v4(),
-            _buf: vec![0u8; block_size],
         }
     }
 
@@ -418,6 +413,9 @@ impl Erasure {
             calc_shard_size
         };
         let per_shard_size = shard_size_fn(data.len(), self.data_shards);
+        if per_shard_size == 0 {
+            return Ok(vec![Bytes::new(); self.total_shard_count()]);
+        }
         let need_total_size = per_shard_size * self.total_shard_count();
 
         let mut data_buffer = BytesMut::with_capacity(need_total_size);
@@ -443,6 +441,63 @@ impl Erasure {
         }
 
         // Zero-copy split, all shards reference data_buffer
+        let mut data_buffer = data_buffer.freeze();
+        let mut shards = Vec::with_capacity(self.total_shard_count());
+        for _ in 0..self.total_shard_count() {
+            let shard = data_buffer.split_to(per_shard_size);
+            shards.push(shard);
+        }
+
+        Ok(shards)
+    }
+
+    /// Encode owned data, avoiding a copy when the caller already has a heap buffer.
+    /// Falls back to copying into a new buffer if zero-copy conversion fails.
+    pub fn encode_data_owned(&self, data: Vec<u8>) -> io::Result<Vec<Bytes>> {
+        let shard_size_fn = if self.uses_legacy {
+            calc_shard_size_legacy
+        } else {
+            calc_shard_size
+        };
+        let per_shard_size = shard_size_fn(data.len(), self.data_shards);
+        if per_shard_size == 0 {
+            return Ok(vec![Bytes::new(); self.total_shard_count()]);
+        }
+        let need_total_size = per_shard_size * self.total_shard_count();
+
+        // Try zero-copy: Vec<u8> -> Bytes -> BytesMut (succeeds when refcount == 1)
+        let mut data_buffer = match Bytes::from(data).try_into_mut() {
+            Ok(mut bm) => {
+                bm.resize(need_total_size, 0u8);
+                bm
+            }
+            Err(b) => {
+                // Rare path: refcount != 1, fall back to copy
+                let mut bm = BytesMut::with_capacity(need_total_size);
+                bm.extend_from_slice(&b);
+                bm.resize(need_total_size, 0u8);
+                bm
+            }
+        };
+
+        {
+            let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(per_shard_size).collect();
+
+            if self.parity_shards > 0 {
+                if self.uses_legacy {
+                    if let Some(encoder) = self.legacy_encoder.as_ref() {
+                        encoder.encode(data_slices)?;
+                    } else {
+                        warn!("parity_shards > 0, uses_legacy but legacy_encoder is None");
+                    }
+                } else if let Some(encoder) = self.encoder.as_ref() {
+                    encoder.encode(data_slices)?;
+                } else {
+                    warn!("parity_shards > 0, but encoder is None");
+                }
+            }
+        }
+
         let mut data_buffer = data_buffer.freeze();
         let mut shards = Vec::with_capacity(self.total_shard_count());
         for _ in 0..self.total_shard_count() {
@@ -579,12 +634,22 @@ impl Erasure {
         F: FnMut(std::io::Result<Vec<Bytes>>) -> Fut + Send,
         Fut: std::future::Future<Output = Result<(), E>> + Send,
     {
+        if self.block_size == 0 {
+            on_block(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "erasure block_size must be non-zero",
+            )))
+            .await?;
+            return Ok(0);
+        }
+
         let block_size = self.block_size;
         let mut total = 0;
         let mut buf = vec![0u8; block_size];
         loop {
-            match rustfs_utils::read_full(&mut *reader, &mut buf).await {
-                Ok(n) if n > 0 => {
+            match rustfs_utils::read_full_or_eof(&mut *reader, &mut buf).await {
+                Ok(Some(n)) => {
+                    debug_assert!(n > 0, "non-zero block_size prevents zero-length reads");
                     warn!("encode_stream_callback_async read n={}", n);
                     total += n;
                     let erasure = self.clone();
@@ -604,7 +669,7 @@ impl Erasure {
                     buf = returned_buf;
                     on_block(res).await?
                 }
-                Ok(_) => {
+                Ok(None) => {
                     warn!("encode_stream_callback_async read unexpected ok");
                     break;
                 }
@@ -630,6 +695,24 @@ mod tests {
 
     fn optional_shards(shards: &[Bytes]) -> Vec<Option<Vec<u8>>> {
         shards.iter().map(|shard| Some(shard.to_vec())).collect()
+    }
+
+    fn assert_owned_encode_matches_borrowed(erasure: &Erasure, data: Vec<u8>) {
+        let borrowed = erasure.encode_data(&data).expect("borrowed encode should succeed");
+        let owned = erasure.encode_data_owned(data).expect("owned encode should succeed");
+
+        assert_eq!(owned, borrowed);
+    }
+
+    #[test]
+    fn encode_data_owned_matches_borrowed_path() {
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(4, 2, 64, uses_legacy);
+
+            assert_owned_encode_matches_borrowed(&erasure, Vec::new());
+            assert_owned_encode_matches_borrowed(&erasure, b"small payload".to_vec());
+            assert_owned_encode_matches_borrowed(&erasure, (0_u8..37).collect());
+        }
     }
 
     #[test]
@@ -1030,6 +1113,35 @@ mod tests {
         }
         recovered.truncate(data_clone.len());
         assert_eq!(&recovered, &data_clone);
+    }
+
+    #[tokio::test]
+    async fn test_encode_stream_callback_async_reports_zero_block_size() {
+        use std::io::Cursor;
+        use std::sync::{Arc, Mutex};
+
+        let erasure = Arc::new(Erasure::new(1, 0, 0));
+        let mut reader = Cursor::new(b"payload".to_vec());
+        let observed = Arc::new(Mutex::new(None));
+        let observed_clone = observed.clone();
+
+        let total = erasure
+            .encode_stream_callback_async::<_, _, (), _>(&mut reader, move |res| {
+                let observed = observed_clone.clone();
+                async move {
+                    let err = res.expect_err("zero block size should report an error");
+                    *observed.lock().unwrap() = Some((err.kind(), err.to_string()));
+                    Ok(())
+                }
+            })
+            .await
+            .expect("callback should handle the zero block size error");
+
+        assert_eq!(total, 0);
+        let observed = observed.lock().unwrap();
+        let (kind, message) = observed.as_ref().expect("callback should be invoked once");
+        assert_eq!(*kind, std::io::ErrorKind::InvalidInput);
+        assert!(message.contains("block_size"));
     }
 
     // SIMD mode specific tests

@@ -1868,11 +1868,11 @@ pub async fn put_restore_opts(
             ..Default::default()
         });
     }
-    for (k, v) in &oi.user_defined {
+    for (k, v) in oi.user_defined.iter() {
         meta.insert(k.to_string(), v.clone());
     }
     if !oi.user_tags.is_empty() {
-        meta.insert(AMZ_OBJECT_TAGGING.to_string(), oi.user_tags.clone());
+        meta.insert(AMZ_OBJECT_TAGGING.to_string(), (*oi.user_tags).clone());
     }
     let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
     meta.insert(
@@ -1903,7 +1903,7 @@ impl LifecycleOps for ObjectInfo {
     fn to_lifecycle_opts(&self) -> lifecycle::ObjectOpts {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
-            user_tags: self.user_tags.clone(),
+            user_tags: (*self.user_tags).clone(),
             version_id: self.version_id,
             mod_time: self.mod_time,
             size: self.size as usize,
@@ -3044,6 +3044,52 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
+    #[serial]
+    async fn ecstore_new_succeeds_on_fresh_local_volumes() {
+        let test_base_dir = format!("/tmp/rustfs_ecstore_empty_boot_{}", Uuid::new_v4());
+        let temp_dir = PathBuf::from(&test_base_dir);
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir).await.ok();
+        }
+        fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let disk_paths = vec![
+            temp_dir.join("disk1"),
+            temp_dir.join("disk2"),
+            temp_dir.join("disk3"),
+            temp_dir.join("disk4"),
+        ];
+
+        for disk_path in &disk_paths {
+            fs::create_dir_all(disk_path).await.unwrap();
+        }
+
+        let mut endpoints = Vec::new();
+        for (i, disk_path) in disk_paths.iter().enumerate() {
+            let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(i);
+            endpoints.push(endpoint);
+        }
+
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "fresh-boot-test".to_string(),
+            platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+        }]);
+
+        crate::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+
+        let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new()).await;
+        assert!(ecstore.is_ok(), "fresh local ECStore boot should succeed, got {ecstore:?}");
+    }
+
+    #[tokio::test]
     #[serial]
     async fn stale_multipart_cleanup_uses_default_expiry_without_lifecycle() {
         let (_paths, ecstore) = setup_test_env().await;
@@ -3185,6 +3231,76 @@ mod tests {
             .expect("multipart parts should be readable");
         assert!(!parts.user_defined.contains_key(RUSTFS_MULTIPART_BUCKET_KEY));
         assert!(!parts.user_defined.contains_key(RUSTFS_MULTIPART_OBJECT_KEY));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repeated_upload_part_overwrites_previous_part_state() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("multipart-overwrite-{}", Uuid::new_v4().simple());
+        let object = "overwrite/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        let mut first = PutObjReader::from_vec(vec![1, 2, 3]);
+        let first_part = ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut first, &ObjectOptions::default())
+            .await
+            .expect("first multipart part should be uploaded");
+
+        let mut second = PutObjReader::from_vec(vec![4, 5, 6, 7]);
+        let second_part = ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut second, &ObjectOptions::default())
+            .await
+            .expect("second multipart part should overwrite the previous part");
+
+        assert_ne!(
+            first_part.etag, second_part.etag,
+            "the overwrite path should persist the latest part metadata rather than reusing stale state"
+        );
+
+        let parts = ecstore
+            .list_object_parts(
+                &bucket,
+                object,
+                &upload.upload_id,
+                None,
+                crate::set_disk::MAX_PARTS_COUNT,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("multipart parts should be readable after overwrite");
+
+        assert_eq!(parts.parts.len(), 1, "only the latest version of part 1 should remain visible");
+        assert_eq!(parts.parts[0].part_num, 1);
+        assert_eq!(parts.parts[0].etag, second_part.etag);
+        assert_eq!(parts.parts[0].size, second_part.size);
+        assert_eq!(parts.parts[0].actual_size, second_part.actual_size);
+
+        let completed = ecstore
+            .complete_multipart_upload(
+                &bucket,
+                object,
+                &upload.upload_id,
+                vec![crate::store_api::CompletePart {
+                    part_num: 1,
+                    etag: second_part.etag.clone(),
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    checksum_crc64nvme: None,
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete multipart upload should succeed with the latest overwritten part");
+
+        assert_eq!(completed.size, second_part.size as i64);
     }
 
     #[tokio::test]

@@ -26,7 +26,7 @@ use crate::disk::{
     format::FormatV3,
     fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
     os,
-    os::{check_path_length, is_empty_dir, is_root_disk, rename_all},
+    os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
 use crate::erasure_coding::bitrot_verify;
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
@@ -57,14 +57,15 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
-use tokio::sync::RwLock;
-use tokio::time::interval;
+use tokio::sync::{Notify, RwLock};
+use tokio::time::{Instant, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
+const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -331,6 +332,8 @@ pub struct LocalDisk {
     // pub format_data: Mutex<Vec<u8>>,
     // pub format_file_info: Mutex<Option<Metadata>>,
     // pub format_last_check: Mutex<Option<OffsetDateTime>>,
+    startup_cleanup_ready: Arc<AtomicU32>,
+    startup_cleanup_notify: Arc<Notify>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
@@ -353,24 +356,72 @@ impl Debug for LocalDisk {
     }
 }
 
+/// Resolve the local disk root path from an endpoint path.
+///
+/// Tries `canonicalize` first (fast path). On Windows, if canonicalization reports
+/// `NotFound` for paths that may still be valid mount roots, falls back to
+/// `absolutize` + metadata check to accept valid local directory roots that
+/// don't support full canonicalization.
+fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
+    match rustfs_utils::canonicalize(ep_path) {
+        Ok(path) => Ok(path),
+        Err(err) => {
+            if err.kind() != ErrorKind::NotFound {
+                return Err(to_file_error(err).into());
+            }
+
+            #[cfg(windows)]
+            {
+                // On Windows, canonicalize can fail for ZFS volumes, junction points,
+                // subst drives, and other non-standard filesystem mounts. Try a fallback
+                // path resolution using absolutize + metadata check.
+                let absolute = match crate::disk::endpoint::windows_fallback_local_path(ep_path, &err, "local disk root") {
+                    Ok(path) => path,
+                    Err(_) => {
+                        return Err(DiskError::VolumeNotFound);
+                    }
+                };
+
+                match std::fs::metadata(&absolute) {
+                    Ok(metadata) => {
+                        if !metadata.is_dir() {
+                            return Err(DiskError::DiskNotDir);
+                        }
+                        return Ok(absolute);
+                    }
+                    Err(meta_err) => {
+                        if meta_err.kind() == ErrorKind::NotFound {
+                            return Err(DiskError::VolumeNotFound);
+                        }
+                        return Err(to_file_error(meta_err).into());
+                    }
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                Err(DiskError::VolumeNotFound)
+            }
+        }
+    }
+}
+
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         debug!("Creating local disk");
-        // Use optimized path resolution instead of absolutize() for better performance
-        // Use dunce::canonicalize instead of std::fs::canonicalize to avoid UNC paths on Windows
-        let root = match rustfs_utils::canonicalize(ep.get_file_path()) {
-            Ok(path) => path,
-            Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
-                    return Err(DiskError::VolumeNotFound);
-                }
-                return Err(to_file_error(e).into());
-            }
-        };
+        let root = resolve_local_disk_root(&ep.get_file_path())?;
 
         ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
 
-        if cleanup && let Err(err) = Self::cleanup_tmp_on_startup(&root).await {
+        let startup_cleanup_ready = Arc::new(AtomicU32::new(u32::from(!cleanup)));
+        let startup_cleanup_notify = Arc::new(Notify::new());
+
+        if cleanup
+            && let Err(err) =
+                Self::cleanup_tmp_on_startup(&root, startup_cleanup_ready.clone(), startup_cleanup_notify.clone()).await
+        {
+            startup_cleanup_ready.store(1, Ordering::Release);
+            startup_cleanup_notify.notify_waiters();
             warn!(root = ?root, error = ?err, "failed to cleanup temporary data during disk startup");
         }
 
@@ -466,6 +517,8 @@ impl LocalDisk {
             // format_last_check: Mutex::new(format_last_check),
             path_cache: Arc::new(ParkingLotRwLock::new(HashMap::with_capacity(2048))),
             current_dir: Arc::new(OnceLock::new()),
+            startup_cleanup_ready,
+            startup_cleanup_notify,
             exit_signal: None,
         };
         let (info, _root) = get_disk_info(root).await?;
@@ -497,7 +550,8 @@ impl LocalDisk {
     }
 
     async fn cleanup_deleted_objects_loop(root: PathBuf, mut exit_rx: tokio::sync::broadcast::Receiver<()>) {
-        let mut interval = interval(DELETED_OBJECTS_CLEANUP_INTERVAL);
+        let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
+        let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -525,11 +579,17 @@ impl LocalDisk {
         root.join(meta_path)
     }
 
-    async fn cleanup_tmp_on_startup(root: &Path) -> Result<()> {
+    async fn cleanup_tmp_on_startup(
+        root: &Path,
+        startup_cleanup_ready: Arc<AtomicU32>,
+        startup_cleanup_notify: Arc<Notify>,
+    ) -> Result<()> {
         let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
         let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
 
         rename_all(&tmp_path, &tmp_old_path, root).await?;
+
+        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
 
         let tmp_old_root = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET);
         tokio::spawn(async move {
@@ -538,10 +598,33 @@ impl LocalDisk {
             {
                 warn!(path = ?tmp_old_root, error = ?err, "failed to remove old temporary data");
             }
+            startup_cleanup_ready.store(1, Ordering::Release);
+            startup_cleanup_notify.notify_waiters();
         });
 
-        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
         Ok(())
+    }
+
+    async fn wait_for_startup_cleanup(&self) {
+        if self.startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+            return;
+        }
+
+        if wait_for_startup_cleanup_signal(
+            self.startup_cleanup_ready.as_ref(),
+            self.startup_cleanup_notify.as_ref(),
+            STARTUP_CLEANUP_WAIT_TIMEOUT,
+        )
+        .await
+        {
+            debug!(disk = %self.endpoint, "startup cleanup barrier released before walk_dir");
+        } else {
+            warn!(
+                disk = %self.endpoint,
+                timeout_ms = STARTUP_CLEANUP_WAIT_TIMEOUT.as_millis(),
+                "startup cleanup barrier timed out; continuing walk_dir"
+            );
+        }
     }
 
     async fn cleanup_stale_tmp_objects(root: PathBuf) -> Result<()> {
@@ -846,19 +929,20 @@ impl LocalDisk {
         // }
 
         let err = if recursive {
-            rename_all(delete_path, trash_path, self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?)
+            rename_all_ignore_missing_source(delete_path, trash_path, self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?)
                 .await
                 .err()
         } else {
-            rename(&delete_path, &trash_path)
-                .await
-                .map_err(|e| to_file_error(e).into())
-                .err()
+            match rename(&delete_path, &trash_path).await {
+                Ok(()) => None,
+                Err(err) if err.kind() == ErrorKind::NotFound => None,
+                Err(err) => Some(to_file_error(err).into()),
+            }
         };
 
         if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR) {
             let trash_path2 = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
-            let _ = rename_all(
+            let _ = rename_all_ignore_missing_source(
                 encode_dir_object(delete_path.to_string_lossy().as_ref()),
                 trash_path2,
                 self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
@@ -1367,12 +1451,9 @@ impl LocalDisk {
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
-                // if opts.limit > 0
-                //     && let Ok(meta) = FileMeta::load(&metadata)
-                //     && !meta.all_hidden(true)
-                // {
-                *objs_returned += 1;
-                // }
+                if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
+                    *objs_returned += 1;
+                }
 
                 out.write_obj(&MetaCacheEntry {
                     name: name.clone(),
@@ -1475,15 +1556,19 @@ impl LocalDisk {
 
                     out.write_obj(&meta).await?;
 
-                    // if let Ok(meta) = FileMeta::load(&meta.metadata)
-                    //     && !meta.all_hidden(true)
-                    // {
-                    *objs_returned += 1;
-                    // }
+                    let file_meta = if opts.limit > 0 || opts.recursive {
+                        FileMeta::load(&res).ok()
+                    } else {
+                        None
+                    };
+
+                    if opts.limit <= 0 || file_meta.as_ref().is_none_or(file_meta_counts_toward_limit) {
+                        *objs_returned += 1;
+                    }
 
                     if opts.recursive {
                         let mut dir_to_skip = HashSet::new();
-                        if let Ok(file_meta) = FileMeta::load(&res)
+                        if let Some(file_meta) = file_meta.as_ref()
                             && let Ok(data_dirs) = file_meta.get_data_dirs()
                         {
                             for data_dir in data_dirs.iter().flatten() {
@@ -1550,6 +1635,15 @@ impl Drop for ScanGuard {
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {
     path.as_ref().components().count() == 1 && path.as_ref().has_root()
+}
+
+fn metadata_counts_toward_limit(metadata: &[u8]) -> bool {
+    FileMeta::load(metadata).map_or(true, |meta| file_meta_counts_toward_limit(&meta))
+}
+
+fn file_meta_counts_toward_limit(meta: &FileMeta) -> bool {
+    meta.into_fileinfo("", "", "", false, true, false)
+        .map_or_else(|_| !meta.all_hidden(true), |latest| !latest.deleted && !latest.tier_free_version())
 }
 
 // Filter std::io::ErrorKind::NotFound
@@ -2375,6 +2469,8 @@ impl DiskAPI for LocalDisk {
     // FIXME: TODO: io.writer TODO cancel
     #[tracing::instrument(level = "debug", skip(self, wr))]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        self.wait_for_startup_cleanup().await;
+
         let volume_dir = self.get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket)
@@ -2512,75 +2608,57 @@ impl DiskAPI for LocalDisk {
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
-        // Read the previous xl.meta
-
-        let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
-            Ok(res) => Some(res),
-            Err(e) => {
-                let e: DiskError = to_file_error(e).into();
-
-                if e != DiskError::FileNotFound {
-                    return Err(e);
-                }
-
-                None
-            }
-        };
-
-        let mut xlmeta = FileMeta::new();
-
-        if let Some(dst_buf) = has_dst_buf.as_ref()
-            && FileMeta::is_xl2_v1_format(dst_buf)
-            && let Ok(nmeta) = FileMeta::load(dst_buf)
-        {
-            xlmeta = nmeta
-        }
-
-        let mut skip_parent = dst_volume_dir.clone();
-        if has_dst_buf.as_ref().is_some()
-            && let Some(parent) = dst_file_path.parent()
-        {
-            skip_parent = parent.to_path_buf();
-        }
-
-        // TODO: Healing
-
-        let version_id = fi.version_id.unwrap_or_default();
-        let search_version_id = Some(version_id);
         let no_inline = fi.data.is_none() && fi.size > 0;
 
-        // Check if there's an existing version with the same version_id that has a data_dir to clean up
-        // Reuse one metadata scan to find the version data_dir and determine whether it is shared.
-        let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(search_version_id);
-        if let Some(old_data_dir) = has_old_data_dir.as_ref() {
-            let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
-        }
-
-        xlmeta.add_version(fi)?;
-
-        if xlmeta.versions.len() <= 10 {
-            // TODO: Sign
-        }
-
-        if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
-            let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
-            let meta_skip_parent = if no_inline {
-                src_file_parent
-            } else {
-                src_volume_dir.as_path()
+        if no_inline {
+            // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta
+            let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
+                Ok(res) => Some(res),
+                Err(e) => {
+                    let e: DiskError = to_file_error(e).into();
+                    if e != DiskError::FileNotFound {
+                        return Err(e);
+                    }
+                    None
+                }
             };
+
+            let mut xlmeta = FileMeta::new();
+            if let Some(dst_buf) = has_dst_buf.as_ref()
+                && FileMeta::is_xl2_v1_format(dst_buf)
+                && let Ok(nmeta) = FileMeta::load(dst_buf)
+            {
+                xlmeta = nmeta
+            }
+
+            let mut skip_parent = dst_volume_dir.clone();
+            if has_dst_buf.as_ref().is_some()
+                && let Some(parent) = dst_file_path.parent()
+            {
+                skip_parent = parent.to_path_buf();
+            }
+
+            let version_id = fi.version_id.unwrap_or_default();
+            let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+            if let Some(old_data_dir) = has_old_data_dir.as_ref() {
+                let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
+            }
+            xlmeta.add_version(fi)?;
             let new_dst_buf = xlmeta.marshal_msg()?;
 
+            let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
             self.write_all_private(
                 src_volume,
-                format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(),
+                &format!("{}/{}", &src_path, STORAGE_FORMAT_FILE),
                 new_dst_buf.into(),
                 true,
-                meta_skip_parent,
+                src_file_parent,
             )
             .await?;
 
-            if no_inline && let Err(err) = rename_all(&src_data_path, &dst_data_path, &skip_parent).await {
+            if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
+                && let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await
+            {
                 let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 info!(
                     "rename all failed src_data_path: {:?}, dst_data_path: {:?}, err: {:?}",
@@ -2588,19 +2666,21 @@ impl DiskAPI for LocalDisk {
                 );
                 return Err(err);
             }
-        } else {
-            let new_dst_buf = xlmeta.marshal_msg()?;
-            self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
-                .await?;
-        }
 
-        if let Some(old_data_dir) = has_old_data_dir {
-            // preserve current xl.meta inside the oldDataDir.
-            if let Some(dst_buf) = has_dst_buf
+            if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
+                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
+                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+                }
+                info!("rename all failed err: {:?}", err);
+                return Err(err);
+            }
+
+            if let Some(old_data_dir) = has_old_data_dir
+                && let Some(dst_buf) = has_dst_buf
                 && let Err(err) = self
                     .write_all_private(
                         dst_volume,
-                        format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE).as_str(),
+                        &format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE),
                         dst_buf.into(),
                         true,
                         &skip_parent,
@@ -2610,30 +2690,106 @@ impl DiskAPI for LocalDisk {
                 info!("write_all_private failed err: {:?}", err);
                 return Err(err);
             }
-        }
 
-        if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
-            if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
-                let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+            if let Some(src_file_path_parent) = src_file_path.parent() {
+                if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
+                    let _ = remove_std(src_file_path_parent);
+                } else {
+                    let _ = self
+                        .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)
+                        .await;
+                }
             }
-            info!("rename all failed err: {:?}", err);
-            return Err(err);
-        }
 
-        if let Some(src_file_path_parent) = src_file_path.parent() {
-            if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
-                let _ = remove_std(src_file_path_parent);
+            Ok(RenameDataResp {
+                old_data_dir: has_old_data_dir,
+                sign: None,
+            })
+        } else {
+            // Inline: merge read + parse + write + rename into single spawn_blocking
+            let src = src_file_path.clone();
+            let dst = dst_file_path.clone();
+            let cleanup_path = if src_volume == super::RUSTFS_META_MULTIPART_BUCKET {
+                src_file_path.parent().map(|p| p.to_path_buf())
             } else {
-                let _ = self
-                    .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)
-                    .await;
-            }
-        }
+                None
+            };
 
-        Ok(RenameDataResp {
-            old_data_dir: has_old_data_dir,
-            sign: None, // TODO:
-        })
+            let (old_data_dir, _dst_buf) = tokio::task::spawn_blocking(move || {
+                // Read existing xl.meta
+                let has_dst_buf = match std::fs::read(&dst) {
+                    Ok(buf) => Some(Bytes::from(buf)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(to_file_error(e)),
+                };
+
+                let mut xlmeta = FileMeta::new();
+                if let Some(ref buf) = has_dst_buf
+                    && FileMeta::is_xl2_v1_format(buf)
+                    && let Ok(nmeta) = FileMeta::load(buf)
+                {
+                    xlmeta = nmeta
+                }
+
+                let version_id = fi.version_id.unwrap_or_default();
+                let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+                if let Some(d) = old_data_dir.as_ref() {
+                    let _ = xlmeta.data.remove_two(version_id, *d);
+                }
+                xlmeta.add_version(fi)?;
+                let new_buf = xlmeta.marshal_msg()?;
+
+                // Write new xl.meta + rename
+                if let Some(parent) = src.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&src)?;
+                std::io::Write::write_all(&mut f, &new_buf)?;
+                match std::fs::rename(&src, &dst) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound && !src.exists() => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(parent) = dst.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::rename(&src, &dst).map_err(to_file_error)?;
+                        Ok(())
+                    }
+                    Err(err) => Err(to_file_error(err)),
+                }?;
+
+                if let Some(old_dir) = old_data_dir.as_ref()
+                    && let Some(ref buf) = has_dst_buf
+                    && let Some(dst_parent) = dst.parent()
+                {
+                    let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE);
+                    if let Some(old_parent) = old_path.parent() {
+                        std::fs::create_dir_all(old_parent)?;
+                    }
+                    std::fs::write(&old_path, buf).map_err(to_file_error)?;
+                }
+
+                Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
+            })
+            .await
+            .map_err(DiskError::from)??;
+
+            // Cleanup
+            if let Some(ref cleanup) = cleanup_path {
+                let _ = self.delete_file(&dst_volume_dir, cleanup, true, false).await;
+            } else if let Some(parent) = src_file_path.parent() {
+                let _ = remove_std(parent);
+            }
+
+            Ok(RenameDataResp {
+                old_data_dir,
+                sign: None,
+            })
+        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -3105,6 +3261,31 @@ impl DiskAPI for LocalDisk {
     }
 }
 
+async fn wait_for_startup_cleanup_signal(
+    startup_cleanup_ready: &AtomicU32,
+    startup_cleanup_notify: &Notify,
+    wait_timeout: Duration,
+) -> bool {
+    if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+
+    timeout(wait_timeout, async {
+        loop {
+            if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            let notified = startup_cleanup_notify.notified();
+            if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 #[tracing::instrument]
 async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
@@ -3157,7 +3338,9 @@ mod test {
         fs::create_dir_all(leftover.parent().unwrap()).await.unwrap();
         fs::write(&leftover, b"temporary").await.unwrap();
 
-        LocalDisk::cleanup_tmp_on_startup(dir.path()).await.unwrap();
+        LocalDisk::cleanup_tmp_on_startup(dir.path(), Arc::new(AtomicU32::new(0)), Arc::new(Notify::new()))
+            .await
+            .unwrap();
 
         assert!(!tmp.join("leftover").exists());
         assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
@@ -3211,6 +3394,54 @@ mod test {
 
         let mut entries = fs::read_dir(&trash).await.unwrap();
         assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_loop_interval_does_not_tick_immediately() {
+        let start_at = tokio::time::Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
+        let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
+
+        assert!(tokio::time::timeout(Duration::from_secs(1), interval.tick()).await.is_err());
+
+        tokio::time::advance(DELETED_OBJECTS_CLEANUP_INTERVAL).await;
+        interval.tick().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_cleanup_barrier_waits_for_notification() {
+        let ready = Arc::new(AtomicU32::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let wait = tokio::spawn({
+            let ready = ready.clone();
+            let notify = notify.clone();
+            async move { wait_for_startup_cleanup_signal(ready.as_ref(), notify.as_ref(), Duration::from_secs(2)).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+
+        ready.store(1, Ordering::Release);
+        notify.notify_waiters();
+
+        assert!(wait.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_cleanup_barrier_times_out() {
+        let ready = Arc::new(AtomicU32::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let wait = tokio::spawn({
+            let ready = ready.clone();
+            let notify = notify.clone();
+            async move { wait_for_startup_cleanup_signal(ready.as_ref(), notify.as_ref(), Duration::from_secs(2)).await }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        assert!(!wait.await.unwrap());
     }
 
     #[tokio::test]
@@ -3418,6 +3649,121 @@ mod test {
             "forward_to must not skip a child directory whose name repeats the base prefix"
         );
         assert_eq!(double_count as usize, double_names.len());
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_hidden_delete_markers_do_not_exhaust_limit() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn delete_marker_metadata(version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version(FileInfo {
+                deleted: true,
+                version_id: Some(Uuid::parse_str(version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("delete marker metadata should encode")
+        }
+
+        fn delete_marker_with_old_object_metadata(delete_version_id: &str, object_version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version({
+                let mut fi = FileInfo::new("hidden", 1, 1);
+                fi.version_id = Some(Uuid::parse_str(object_version_id).expect("test version id should parse"));
+                fi.mod_time = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
+                fi
+            })
+            .expect("object metadata should be valid");
+            fm.add_version(FileInfo {
+                deleted: true,
+                version_id: Some(Uuid::parse_str(delete_version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("delete marker metadata should encode")
+        }
+
+        fn object_metadata(version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new("visible", 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("object metadata should encode")
+        }
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        for (name, version_id) in [
+            ("shard/aaa-trash-0000", "11111111-1111-1111-1111-111111111111"),
+            ("shard/aaa-trash-0001", "22222222-2222-2222-2222-222222222222"),
+            ("shard/aaa-trash-0002", "33333333-3333-3333-3333-333333333333"),
+        ] {
+            let object_dir = bucket_dir.join(name);
+            fs::create_dir_all(&object_dir).await.unwrap();
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), delete_marker_metadata(version_id))
+                .await
+                .unwrap();
+        }
+
+        let hidden_versioned_dir = bucket_dir.join("shard/aaa-trash-0003");
+        fs::create_dir_all(&hidden_versioned_dir).await.unwrap();
+        fs::write(
+            hidden_versioned_dir.join(STORAGE_FORMAT_FILE),
+            delete_marker_with_old_object_metadata(
+                "44444444-4444-4444-4444-444444444444",
+                "55555555-5555-5555-5555-555555555555",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let visible_dir = bucket_dir.join("shard/bbb-visible-0000");
+        fs::create_dir_all(&visible_dir).await.unwrap();
+        fs::write(
+            visible_dir.join(STORAGE_FORMAT_FILE),
+            object_metadata("66666666-6666-6666-6666-666666666666"),
+        )
+        .await
+        .unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: true,
+            limit: 1,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+        drop(out);
+        drop(writer);
+
+        let mut reader = MetacacheReader::new(reader);
+        let has_visible_object = reader
+            .read_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|entry| !entry.metadata.is_empty() && entry.name == "shard/bbb-visible-0000");
+
+        assert!(has_visible_object);
+        assert_eq!(objs_returned, 1);
     }
 
     #[tokio::test]

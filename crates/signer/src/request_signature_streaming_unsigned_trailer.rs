@@ -25,15 +25,47 @@ pub fn streaming_unsigned_v4(
 ) -> request::Request<Body> {
     let headers = req.headers_mut();
 
-    let chunked_value = HeaderValue::from_str(&["aws-chunked"].join(",")).expect("err");
+    let chunked_value = HeaderValue::from_static("aws-chunked");
     headers.insert(http::header::TRANSFER_ENCODING, chunked_value);
-    if !session_token.is_empty() {
-        headers.insert("X-Amz-Security-Token", HeaderValue::from_str(session_token).expect("err"));
+    if !session_token.is_empty()
+        && let Ok(token_value) = HeaderValue::from_str(session_token)
+    {
+        headers.insert("X-Amz-Security-Token", token_value);
     }
 
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
-    headers.insert("X-Amz-Date", HeaderValue::from_str(&req_time.format(&format).unwrap()).expect("err"));
+    if let Ok(date) = req_time.format(&format)
+        && let Ok(date_value) = HeaderValue::from_str(&date)
+    {
+        headers.insert("X-Amz-Date", date_value);
+    }
     //req.content_length = 100；
 
     req
+}
+
+#[cfg(test)]
+mod tests {
+    use super::streaming_unsigned_v4;
+    use http::request;
+    use s3s::Body;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn streaming_unsigned_v4_skips_invalid_session_token_header() {
+        let req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://bucket.example.com/object")
+            .body(Body::empty())
+            .expect("request should build");
+
+        let req = streaming_unsigned_v4(req, "invalid\ntoken", 0, OffsetDateTime::UNIX_EPOCH);
+
+        assert!(req.headers().get("X-Amz-Security-Token").is_none());
+        assert_eq!(
+            req.headers().get(http::header::TRANSFER_ENCODING),
+            Some(&http::HeaderValue::from_static("aws-chunked"))
+        );
+        assert!(req.headers().get("X-Amz-Date").is_some());
+    }
 }

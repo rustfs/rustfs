@@ -20,8 +20,12 @@ pub mod request_signature_v4;
 pub mod utils;
 
 pub use request_signature_streaming::streaming_sign_v4;
+pub use request_signature_streaming::try_streaming_sign_v4;
+pub use request_signature_v2::SignV2Error;
 pub use request_signature_v2::pre_sign_v2;
 pub use request_signature_v2::sign_v2;
+pub use request_signature_v2::try_pre_sign_v2;
+pub use request_signature_v2::try_sign_v2;
 pub use request_signature_v4::SignV4Error;
 pub use request_signature_v4::pre_sign_v4;
 pub use request_signature_v4::sign_v4;

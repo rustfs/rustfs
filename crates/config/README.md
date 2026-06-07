@@ -70,6 +70,27 @@ Current guidance:
 - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
 - `RUSTFS_SCANNER_IDLE_MODE` (canonical)
 - `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (canonical)
+- `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (canonical)
+- `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
+- `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
+
+## Health compatibility switches
+
+- `RUSTFS_HEALTH_ENDPOINT_ENABLE`
+  - controls canonical `/health`, `/health/live`, and `/health/ready` endpoint exposure.
+- `RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE`
+  - enables minimal payload mode for GET health responses (`status`, `ready` only).
+- `RUSTFS_HEALTH_READINESS_CACHE_TTL_MS`
+  - TTL for readiness cache evaluation.
+- `RUSTFS_HEALTH_COMPAT_BUSY_CHECK_ENABLE`
+  - enables busy protection behavior for health probes.
+  - default is `false`.
+- `RUSTFS_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS`
+  - max active HTTP requests; health probes return `429` when active requests reach or exceed this value.
+  - `0` disables thresholding even if busy protection is enabled.
+- `RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE`
+  - enables KMS readiness enforcement for `/health/ready`.
+  - default is `false`.
 
 ## Drive timeout environment variables
 

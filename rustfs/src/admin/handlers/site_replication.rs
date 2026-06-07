@@ -64,7 +64,7 @@ use rustfs_policy::policy::{
 };
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
-use rustfs_tls_runtime::load_global_outbound_tls_state;
+use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, load_global_outbound_tls_generation, load_global_outbound_tls_state};
 use rustfs_utils::http::get_source_scheme;
 use rustls_pki_types::pem::PemObject;
 use s3s::dto::{
@@ -79,9 +79,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 use tracing::warn;
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
@@ -102,7 +103,36 @@ const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
 const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
-static SITE_REPLICATION_PEER_CLIENT: OnceCell<Result<reqwest::Client, String>> = OnceCell::const_new();
+#[derive(Clone)]
+enum SiteReplicationPeerClientCacheEntry {
+    Ready(reqwest::Client),
+    Failed(String),
+}
+
+#[derive(Clone)]
+struct SiteReplicationPeerClientCache {
+    generation: u64,
+    entry: SiteReplicationPeerClientCacheEntry,
+}
+
+static SITE_REPLICATION_PEER_CLIENT: LazyLock<Mutex<Option<SiteReplicationPeerClientCache>>> = LazyLock::new(|| Mutex::new(None));
+
+fn site_replication_peer_client_cache_hit(
+    cache: &Option<SiteReplicationPeerClientCache>,
+    generation: u64,
+) -> Option<S3Result<reqwest::Client>> {
+    let cached = cache.as_ref()?;
+    if cached.generation != generation {
+        return None;
+    }
+    Some(match &cached.entry {
+        SiteReplicationPeerClientCacheEntry::Ready(client) => Ok(client.clone()),
+        SiteReplicationPeerClientCacheEntry::Failed(err) => Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("initialize site replication peer client failed: {err}"),
+        )),
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SiteReplicationState {
@@ -447,13 +477,12 @@ async fn persist_site_replication_state(state: &SiteReplicationState) -> S3Resul
     }
 }
 
-async fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
+fn build_site_replication_peer_client(outbound_tls: &GlobalPublishedOutboundTlsState) -> S3Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
         .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
         .pool_idle_timeout(Some(Duration::from_secs(60)));
 
-    let outbound_tls = load_global_outbound_tls_state().await;
     if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
         let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
         let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
@@ -481,20 +510,38 @@ async fn build_site_replication_peer_client() -> S3Result<reqwest::Client> {
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build site replication peer client failed: {e}")))
 }
 
-async fn site_replication_peer_client() -> S3Result<&'static reqwest::Client> {
-    let result = SITE_REPLICATION_PEER_CLIENT
-        .get_or_init(|| async { build_site_replication_peer_client().await.map_err(|e| e.to_string()) })
-        .await;
-    result.as_ref().map_err(|err| {
-        S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("initialize site replication peer client failed: {err}"),
-        )
-    })
+async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
+    let generation = load_global_outbound_tls_generation().0;
+    let cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
+    if let Some(hit) = site_replication_peer_client_cache_hit(&cache, generation) {
+        return hit;
+    }
+    drop(cache);
+
+    let outbound_tls = load_global_outbound_tls_state().await;
+    let built = build_site_replication_peer_client(&outbound_tls);
+    let cache_entry = match &built {
+        Ok(client) => SiteReplicationPeerClientCacheEntry::Ready(client.clone()),
+        Err(err) => SiteReplicationPeerClientCacheEntry::Failed(err.to_string()),
+    };
+
+    let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
+    if cache.as_ref().is_none_or(|cached| cached.generation <= generation) {
+        *cache = Some(SiteReplicationPeerClientCache {
+            generation,
+            entry: cache_entry,
+        });
+    }
+
+    built
 }
 
-fn runtime_tls_enabled() -> bool {
-    if let Some(tls_enabled) = get_global_endpoints_opt().and_then(|endpoints| {
+fn runtime_tls_enabled_with(endpoints: Option<&rustfs_ecstore::endpoints::EndpointServerPools>) -> bool {
+    if !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty() {
+        return true;
+    }
+
+    if let Some(tls_enabled) = endpoints.and_then(|endpoints| {
         endpoints
             .as_ref()
             .iter()
@@ -505,7 +552,12 @@ fn runtime_tls_enabled() -> bool {
         return tls_enabled;
     }
 
-    !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty()
+    false
+}
+
+fn runtime_tls_enabled() -> bool {
+    let endpoints = get_global_endpoints_opt();
+    runtime_tls_enabled_with(endpoints.as_ref())
 }
 
 fn query_pairs(uri: &Uri) -> HashMap<String, String> {
@@ -2986,6 +3038,10 @@ impl Operation for SRStateEditHandler {
 mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue, Uri};
+    use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
+    use rustfs_ecstore::disk::endpoint::Endpoint;
+    use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use serial_test::serial;
     use temp_env::with_var;
 
     fn peer(name: &str, endpoint: &str) -> PeerInfo {
@@ -3181,6 +3237,28 @@ mod tests {
             let endpoint = request_endpoint(&uri, &headers);
 
             assert!(endpoint.starts_with("https://"));
+        });
+    }
+
+    #[test]
+    fn test_runtime_tls_enabled_prefers_explicit_tls_over_http_runtime_endpoint() {
+        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![Endpoint {
+                url: Url::parse("http://127.0.0.1:9000/tmp").unwrap(),
+                is_local: true,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: 0,
+            }]),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+
+        with_var(ENV_RUSTFS_TLS_PATH, Some("/tmp/tls"), || {
+            assert!(runtime_tls_enabled_with(Some(&endpoints)));
         });
     }
 
@@ -3722,6 +3800,77 @@ mod tests {
         assert_eq!(ldap.ldap_group_search_filter, "(&(objectclass=groupOfNames)(member=%s))");
         assert!(ldap_configs.enabled);
         assert!(ldap_configs.configs.contains_key("default"));
+    }
+
+    #[test]
+    fn test_site_replication_peer_client_cache_hit_generation_mismatch_returns_none() {
+        let cache = Some(SiteReplicationPeerClientCache {
+            generation: 7,
+            entry: SiteReplicationPeerClientCacheEntry::Failed("cached error".to_string()),
+        });
+
+        assert!(site_replication_peer_client_cache_hit(&cache, 8).is_none());
+    }
+
+    #[test]
+    fn test_site_replication_peer_client_cache_hit_returns_cached_ready_client() {
+        let cache = Some(SiteReplicationPeerClientCache {
+            generation: 7,
+            entry: SiteReplicationPeerClientCacheEntry::Ready(reqwest::Client::new()),
+        });
+
+        site_replication_peer_client_cache_hit(&cache, 7)
+            .expect("cache hit expected")
+            .expect("ready cache entry should return cached client");
+    }
+
+    #[test]
+    fn test_site_replication_peer_client_cache_hit_returns_cached_error() {
+        let cache = Some(SiteReplicationPeerClientCache {
+            generation: 7,
+            entry: SiteReplicationPeerClientCacheEntry::Failed("cached error".to_string()),
+        });
+
+        let err = site_replication_peer_client_cache_hit(&cache, 7)
+            .expect("cache hit expected")
+            .expect_err("error cache entry should return error");
+        assert!(err.to_string().contains("cached error"), "expected cached error detail, got: {}", err);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_site_replication_peer_client_rebuilds_when_generation_changes() {
+        let previous_generation = get_global_outbound_tls_generation();
+        let previous_cache = {
+            let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
+            let snapshot = cache.clone();
+            *cache = None;
+            snapshot
+        };
+
+        set_global_outbound_tls_generation(101);
+        site_replication_peer_client()
+            .await
+            .expect("initial client build should succeed");
+        let cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
+        let cached = cache.as_ref().expect("cache should be populated");
+        assert_eq!(cached.generation, 101);
+        assert!(matches!(cached.entry, SiteReplicationPeerClientCacheEntry::Ready(_)));
+        drop(cache);
+
+        set_global_outbound_tls_generation(102);
+        site_replication_peer_client()
+            .await
+            .expect("new generation should rebuild client");
+        let cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
+        let cached = cache.as_ref().expect("cache should be populated");
+        assert_eq!(cached.generation, 102);
+        assert!(matches!(cached.entry, SiteReplicationPeerClientCacheEntry::Ready(_)));
+
+        drop(cache);
+        set_global_outbound_tls_generation(previous_generation);
+        let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
+        *cache = previous_cache;
     }
 
     #[test]

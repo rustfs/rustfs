@@ -14,6 +14,8 @@
 
 use thiserror::Error;
 
+use crate::data_usage_define::DataUsageCache;
+
 /// Scanner-related errors
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -33,4 +35,8 @@ pub enum ScannerError {
     /// Generic error
     #[error("Scanner error: {0}")]
     Other(String),
+
+    /// Partial data usage cache produced before the scanner stopped.
+    #[error("Scanner stopped with partial data usage cache")]
+    PartialCache(Box<DataUsageCache>),
 }

@@ -13,3 +13,4 @@
 // limitations under the License.
 
 pub mod manager;
+mod parquet_table;

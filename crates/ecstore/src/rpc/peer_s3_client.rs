@@ -843,12 +843,13 @@ impl PeerS3Client for RemotePeerS3Client {
                 });
                 let response = client.make_bucket(request).await?.into_inner();
 
-                // TODO: deal with error
                 if !response.success {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(Error::other(format!(
+                            "make_bucket({bucket}): peer returned failure without error details"
+                        )))
                     };
                 }
 
@@ -1046,6 +1047,44 @@ async fn clone_drives() -> Vec<Option<DiskStore>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::WalkDirOptions;
+    use crate::disk::disk_store::LocalDiskWrapper;
+    use crate::disk::endpoint::Endpoint;
+    use crate::disk::local::LocalDisk;
+    use crate::endpoints::{Endpoints, PoolEndpoints};
+    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
+    use crate::store::init_local_disks;
+    use rustfs_filemeta::FileInfo;
+    use serial_test::serial;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tempfile::TempDir;
+    use tokio::io::AsyncWrite;
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn reset_local_disk_globals() {
+        GLOBAL_LOCAL_DISK_MAP.write().await.clear();
+        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+        GLOBAL_LOCAL_DISK_SET_DRIVES.write().await.clear();
+    }
 
     #[derive(Debug)]
     struct TestPeerS3Client {
@@ -1150,6 +1189,77 @@ mod tests {
         assert!(!client.health.is_faulty(), "business errors should not mark remote peer faulty");
 
         client.cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_get_bucket_info_survives_prior_walk_timeout() {
+        reset_local_disk_globals().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for local peer listing regression");
+        let disk_path = temp_dir.path().join("disk1");
+        std::fs::create_dir_all(&disk_path).expect("create disk path");
+
+        let mut endpoint = Endpoint::try_from(disk_path.to_str().expect("disk path to str")).expect("endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![endpoint.clone()]),
+            cmd_line: "local-get-bucket-info-survives-prior-walk-timeout".to_string(),
+            platform: "test".to_string(),
+        }]);
+
+        init_local_disks(endpoint_pools).await.expect("init local disks");
+
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = crate::disk::Disk::Local(Box::new(LocalDiskWrapper::new(disk, false)));
+        let disk_store: DiskStore = Arc::new(wrapper);
+        let bucket = "test-bucket";
+        let object = "test-object";
+
+        disk_store.make_volume(bucket).await.expect("bucket should be created");
+
+        let mut file_info = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+        file_info.volume = bucket.to_string();
+        file_info.name = object.to_string();
+        file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+        file_info.erasure.index = 1;
+
+        disk_store
+            .write_metadata("", bucket, object, file_info)
+            .await
+            .expect("object metadata should be written");
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
+            let mut writer = PendingWriter;
+            let walk_err = disk_store
+                .walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        ..Default::default()
+                    },
+                    &mut writer,
+                )
+                .await
+                .expect_err("walk_dir should time out against a non-draining writer");
+
+            assert_eq!(walk_err, DiskError::Timeout);
+
+            let info = LocalPeerS3Client::new(None, Some(vec![0]))
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .expect("bucket info should still succeed after prior walk timeout");
+            assert_eq!(info.name, bucket);
+        })
+        .await;
+
+        reset_local_disk_globals().await;
     }
 
     #[test]

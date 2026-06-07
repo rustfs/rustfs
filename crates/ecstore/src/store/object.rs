@@ -13,6 +13,151 @@
 // limitations under the License.
 
 use super::*;
+use crate::set_disk::{
+    get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
+    is_lock_optimization_enabled, is_object_lock_diag_enabled,
+};
+use rustfs_io_metrics::{
+    record_object_lock_diag_acquire_duration, record_object_lock_diag_hold_duration, record_object_lock_diag_slow_acquire,
+    record_object_lock_diag_slow_hold,
+};
+use std::{
+    fmt,
+    pin::Pin,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+use tokio::io::{AsyncRead, ReadBuf};
+
+struct LockGuardedReader {
+    inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    guard: Option<ObjectLockDiagGuard>,
+}
+
+impl AsyncRead for LockGuardedReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let had_capacity = buf.remaining() > 0;
+        let filled_before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if had_capacity && matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() == filled_before {
+            self.guard.take();
+        }
+        poll
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ObjectLockDiagMode {
+    Read,
+    Write,
+}
+
+impl ObjectLockDiagMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+impl fmt::Display for ObjectLockDiagMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+struct ObjectLockDiagGuard {
+    guard: rustfs_lock::NamespaceLockGuard,
+    enabled: bool,
+    op: &'static str,
+    bucket: Option<String>,
+    object: Option<String>,
+    owner: Option<String>,
+    mode: ObjectLockDiagMode,
+    acquired_at: Instant,
+}
+
+impl ObjectLockDiagGuard {
+    fn new(
+        guard: rustfs_lock::NamespaceLockGuard,
+        enabled: bool,
+        op: &'static str,
+        bucket: Option<String>,
+        object: Option<String>,
+        owner: Option<String>,
+        mode: ObjectLockDiagMode,
+    ) -> Self {
+        Self {
+            guard,
+            enabled,
+            op,
+            bucket,
+            object,
+            owner,
+            mode,
+            acquired_at: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ObjectLockDiagGuard {
+    fn drop(&mut self) {
+        if !self.enabled || self.guard.is_released() {
+            return;
+        }
+
+        let hold = self.acquired_at.elapsed();
+        record_object_lock_diag_hold_duration(self.op, self.mode.as_str(), hold);
+        let threshold = get_object_lock_diag_slow_hold_threshold();
+        if hold >= threshold {
+            record_object_lock_diag_slow_hold(self.op, self.mode.as_str());
+            warn!(
+                target: "rustfs_ecstore::object_lock_diag",
+                op = self.op,
+                bucket = %self.bucket.as_deref().unwrap_or_default(),
+                object = %self.object.as_deref().unwrap_or_default(),
+                mode = %self.mode,
+                owner = %self.owner.as_deref().unwrap_or_default(),
+                hold_ms = hold.as_millis(),
+                threshold_ms = threshold.as_millis(),
+                "object namespace lock held longer than threshold"
+            );
+        }
+    }
+}
+
+fn log_object_lock_acquire_if_slow(
+    op: &'static str,
+    bucket: &str,
+    object: &str,
+    owner: Option<&str>,
+    mode: ObjectLockDiagMode,
+    elapsed: Duration,
+    diag_enabled: bool,
+) {
+    if !diag_enabled {
+        return;
+    }
+
+    let threshold = get_object_lock_diag_slow_acquire_threshold();
+    record_object_lock_diag_acquire_duration(op, mode.as_str(), elapsed);
+    if elapsed >= threshold {
+        record_object_lock_diag_slow_acquire(op, mode.as_str());
+        warn!(
+            target: "rustfs_ecstore::object_lock_diag",
+            op,
+            bucket,
+            object,
+            mode = %mode,
+            owner = owner.unwrap_or_default(),
+            acquire_ms = elapsed.as_millis(),
+            threshold_ms = threshold.as_millis(),
+            "object namespace lock acquisition exceeded threshold"
+        );
+    }
+}
+
 fn select_data_movement_target_pool(
     existing_pool_idx: Result<usize>,
     src_pool_idx: usize,
@@ -89,6 +234,116 @@ fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> Object
 }
 
 impl ECStore {
+    fn map_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
+        match err {
+            rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
+                mode,
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required,
+                achieved,
+            },
+            other => StorageError::other(format!("Failed to acquire {mode} lock on {bucket}/{object}: {other}")),
+        }
+    }
+
+    async fn acquire_object_write_lock_if_needed(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        opts: &mut ObjectOptions,
+    ) -> Result<Option<ObjectLockDiagGuard>> {
+        if opts.no_lock {
+            return Ok(None);
+        }
+
+        let diag_enabled = is_object_lock_diag_enabled();
+        let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
+        let acquire_start = Instant::now();
+        let guard = ns_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(|err| Self::map_namespace_lock_error(bucket, object, "write", err))?;
+        let owner = diag_enabled.then(|| ns_lock.owner().to_string());
+        log_object_lock_acquire_if_slow(
+            op,
+            bucket,
+            object,
+            owner.as_deref(),
+            ObjectLockDiagMode::Write,
+            acquire_start.elapsed(),
+            diag_enabled,
+        );
+        opts.no_lock = true;
+
+        Ok(Some(ObjectLockDiagGuard::new(
+            guard,
+            diag_enabled,
+            op,
+            diag_enabled.then(|| bucket.to_string()),
+            diag_enabled.then(|| object.to_string()),
+            owner,
+            ObjectLockDiagMode::Write,
+        )))
+    }
+
+    async fn acquire_object_read_lock_if_needed(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        opts: &mut ObjectOptions,
+    ) -> Result<Option<ObjectLockDiagGuard>> {
+        if opts.no_lock {
+            return Ok(None);
+        }
+
+        let diag_enabled = is_object_lock_diag_enabled();
+        let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
+        let acquire_start = Instant::now();
+        let guard = ns_lock
+            .get_read_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(|err| Self::map_namespace_lock_error(bucket, object, "read", err))?;
+        let owner = diag_enabled.then(|| ns_lock.owner().to_string());
+        log_object_lock_acquire_if_slow(
+            op,
+            bucket,
+            object,
+            owner.as_deref(),
+            ObjectLockDiagMode::Read,
+            acquire_start.elapsed(),
+            diag_enabled,
+        );
+        opts.no_lock = true;
+
+        Ok(Some(ObjectLockDiagGuard::new(
+            guard,
+            diag_enabled,
+            op,
+            diag_enabled.then(|| bucket.to_string()),
+            diag_enabled.then(|| object.to_string()),
+            owner,
+            ObjectLockDiagMode::Read,
+        )))
+    }
+
+    fn attach_read_lock_guard(mut reader: GetObjectReader, guard: Option<ObjectLockDiagGuard>) -> GetObjectReader {
+        if is_lock_optimization_enabled() {
+            return reader;
+        }
+
+        if let Some(guard) = guard {
+            reader.stream = Box::new(LockGuardedReader {
+                inner: reader.stream,
+                guard: Some(guard),
+            });
+        }
+
+        reader
+    }
+
     async fn get_latest_accessible_object_info_with_idx(
         &self,
         bucket: &str,
@@ -193,23 +448,25 @@ impl ECStore {
         check_get_obj_args(bucket, object)?;
 
         let object = encode_dir_object(object);
-
-        if self.single_pool() {
-            return self.pools[0].get_object_reader(bucket, object.as_str(), range, h, opts).await;
-        }
-
-        // TODO: nslock
-
         let mut opts = opts.clone();
-
-        opts.no_lock = true;
-
-        let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+        let read_lock_guard = self
+            .acquire_object_read_lock_if_needed("get_object", bucket, &object, &mut opts)
             .await?;
-        self.pools[idx]
-            .get_object_reader(bucket, object.as_str(), range, h, &opts)
-            .await
+
+        let reader = if self.single_pool() {
+            self.pools[0]
+                .get_object_reader(bucket, object.as_str(), range, h, &opts)
+                .await?
+        } else {
+            let (_, idx) = self
+                .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+                .await?;
+            self.pools[idx]
+                .get_object_reader(bucket, object.as_str(), range, h, &opts)
+                .await?
+        };
+
+        Ok(Self::attach_read_lock_guard(reader, read_lock_guard))
     }
 
     #[instrument(level = "debug", skip(self, data))]
@@ -224,6 +481,8 @@ impl ECStore {
 
         let object = encode_dir_object(object);
 
+        // Keep PUT atomic-read friendly: SetDisks takes the object write lock only
+        // around precondition checks and the final rename/commit.
         if self.single_pool() {
             return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
         }
@@ -251,16 +510,18 @@ impl ECStore {
         check_object_args(bucket, object)?;
 
         let object = encode_dir_object(object);
-
-        if self.single_pool() {
-            return self.pools[0].get_object_info(bucket, object.as_str(), opts).await;
-        }
-
-        // TODO: nslock
-
-        let (info, _) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+        let mut opts = opts.clone();
+        let _object_lock_guard = self
+            .acquire_object_read_lock_if_needed("get_object_info", bucket, &object, &mut opts)
             .await?;
+
+        let info = if self.single_pool() {
+            self.pools[0].get_object_info(bucket, object.as_str(), &opts).await?
+        } else {
+            self.get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
+                .await?
+                .0
+        };
         opts.precondition_check(&info)?;
         Ok(info)
     }
@@ -285,43 +546,56 @@ impl ECStore {
 
         let cp_src_dst_same = path_join_buf(&[src_bucket, &src_object]) == path_join_buf(&[dst_bucket, &dst_object]);
 
-        // TODO: nslock
-
-        let pool_idx = self
-            .get_pool_info_existing_with_opts(src_bucket, &src_object, &version_aware_lookup_opts(src_opts, true))
-            .await?
-            .0
-            .index;
+        let mut dst_opts = dst_opts.clone();
+        let _dst_lock_guard = if cp_src_dst_same {
+            self.acquire_object_write_lock_if_needed("copy_object", dst_bucket, &dst_object, &mut dst_opts)
+                .await?
+        } else {
+            None
+        };
 
         if cp_src_dst_same {
+            let pool_idx = self
+                .get_pool_info_existing_with_opts(src_bucket, &src_object, &version_aware_lookup_opts(src_opts, true))
+                .await?
+                .0
+                .index;
+
             if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
                 && src_vid == dst_vid
             {
                 return self.pools[pool_idx]
-                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, dst_opts)
+                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, &dst_opts)
                     .await;
             }
 
             if !dst_opts.versioned && src_opts.version_id.is_none() {
                 return self.pools[pool_idx]
-                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, dst_opts)
+                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, &dst_opts)
                     .await;
             }
 
             if dst_opts.versioned && src_opts.version_id != dst_opts.version_id {
                 src_info.version_only = true;
                 return self.pools[pool_idx]
-                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, dst_opts)
+                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, &dst_opts)
                     .await;
             }
         }
 
+        let pool_idx = if dst_opts.no_lock {
+            self.get_pool_idx_no_lock(dst_bucket, &dst_object, src_info.size).await?
+        } else {
+            self.get_pool_idx(dst_bucket, &dst_object, src_info.size).await?
+        };
+
         let put_opts = ObjectOptions {
-            user_defined: src_info.user_defined.clone(),
+            user_defined: (*src_info.user_defined).clone(),
             versioned: dst_opts.versioned,
             version_id: dst_opts.version_id.clone(),
-            no_lock: true,
+            no_lock: dst_opts.no_lock,
             mod_time: dst_opts.mod_time,
+            http_preconditions: dst_opts.http_preconditions.clone(),
             ..Default::default()
         };
 
@@ -342,15 +616,29 @@ impl ECStore {
     pub(super) async fn handle_delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         check_del_obj_args(bucket, object)?;
 
-        if opts.delete_prefix {
-            self.delete_prefix(bucket, object).await?;
+        let object = if opts.delete_prefix && !opts.delete_prefix_object {
+            object.to_owned()
+        } else {
+            encode_dir_object(object)
+        };
+        let object = object.as_str();
+        let mut opts = opts;
+
+        if opts.delete_prefix && !opts.delete_prefix_object {
+            // Prefix deletes cover multiple object keys; an exact lock on the prefix string
+            // would not protect child objects.
+            self.delete_prefix(bucket, object, &opts).await?;
             return Ok(ObjectInfo::default());
         }
 
-        // TODO: nslock
+        let _object_lock_guard = self
+            .acquire_object_write_lock_if_needed("delete_object", bucket, object, &mut opts)
+            .await?;
 
-        let object = encode_dir_object(object);
-        let object = object.as_str();
+        if opts.delete_prefix {
+            self.delete_prefix(bucket, object, &opts).await?;
+            return Ok(ObjectInfo::default());
+        }
 
         let gopts = version_aware_lookup_opts(&opts, true);
 
@@ -704,7 +992,7 @@ impl ECStore {
         }
 
         let (oi, _) = self.get_latest_accessible_object_info_with_idx(bucket, &object, opts).await?;
-        Ok(oi.user_tags)
+        Ok((*oi.user_tags).clone())
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -775,6 +1063,8 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn delete_marker_data_movement_falls_back_when_only_source_pool_has_object() {
@@ -982,5 +1272,81 @@ mod tests {
         assert!(lookup_opts.metadata_chg);
         assert!(lookup_opts.skip_decommissioned);
         assert!(lookup_opts.skip_rebalancing);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reader_lock_is_held_when_optimization_is_disabled() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
+            let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+            let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
+            let key = rustfs_lock::ObjectKey::new("bucket", "object");
+            let read_guard = lock
+                .get_read_lock(key.clone(), "reader", Duration::from_secs(1))
+                .await
+                .expect("read lock should be acquired");
+            let read_guard = ObjectLockDiagGuard::new(
+                read_guard,
+                true,
+                "test_get_object",
+                Some("bucket".to_string()),
+                Some("object".to_string()),
+                Some("reader".to_string()),
+                ObjectLockDiagMode::Read,
+            );
+            let reader = GetObjectReader {
+                stream: Box::new(Cursor::new(Vec::<u8>::new())),
+                object_info: ObjectInfo::default(),
+            };
+
+            let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
+
+            lock.get_write_lock(key.clone(), "writer", Duration::from_millis(20))
+                .await
+                .expect_err("reader should hold the read lock");
+            drop(reader);
+            lock.get_write_lock(key, "writer", Duration::from_secs(1))
+                .await
+                .expect("dropping the reader should release the read lock");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reader_lock_is_released_after_stream_eof() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
+            let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+            let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
+            let key = rustfs_lock::ObjectKey::new("bucket", "object");
+            let read_guard = lock
+                .get_read_lock(key.clone(), "reader", Duration::from_secs(1))
+                .await
+                .expect("read lock should be acquired");
+            let read_guard = ObjectLockDiagGuard::new(
+                read_guard,
+                true,
+                "test_get_object",
+                Some("bucket".to_string()),
+                Some("object".to_string()),
+                Some("reader".to_string()),
+                ObjectLockDiagMode::Read,
+            );
+            let reader = GetObjectReader {
+                stream: Box::new(Cursor::new(vec![1, 2, 3])),
+                object_info: ObjectInfo::default(),
+            };
+
+            let mut reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
+            let mut output = Vec::new();
+            reader.stream.read_to_end(&mut output).await.expect("reader should reach EOF");
+            assert_eq!(output, vec![1, 2, 3]);
+
+            lock.get_write_lock(key, "writer", Duration::from_secs(1))
+                .await
+                .expect("EOF should release the read lock before the reader is dropped");
+            drop(reader);
+        })
+        .await;
     }
 }

@@ -177,12 +177,14 @@ libsystemd.workspace = true
 mimalloc = { workspace = true }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
-# Only enable pprof-based profiling on linux + gnu + x86_64.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+pprof = { workspace = true }
+
+# jemalloc-based allocator and memory profiling are only enabled on validated linux-gnu-x86_64 targets.
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 jemalloc_pprof = { workspace = true }
-pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }

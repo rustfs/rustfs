@@ -110,6 +110,15 @@ pub struct RemoteDisk {
 }
 
 impl RemoteDisk {
+    fn is_retryable_walk_dir_error(err: &DiskError) -> bool {
+        if is_network_like_disk_error(err) {
+            return true;
+        }
+
+        let err_text = err.to_string().to_ascii_lowercase();
+        err_text.contains("httpreader stream error") || err_text.contains("error decoding response body")
+    }
+
     pub(crate) async fn new(ep: &Endpoint, opt: &DiskOption, data_transport: Arc<dyn InternodeDataTransport>) -> Result<Self> {
         let addr = if let Some(port) = ep.url.port() {
             format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), port)
@@ -175,6 +184,10 @@ impl RemoteDisk {
         });
     }
 
+    fn mark_suspect_or_offline(&self, reason: &'static str) -> bool {
+        self.health.mark_failure(&self.endpoint, reason)
+    }
+
     /// Enable health monitoring after disk creation.
     /// Used to defer health checks until after startup format loading completes,
     /// so that remote peers have time to come online.
@@ -202,7 +215,10 @@ impl RemoteDisk {
         let mut interval = time::interval(get_drive_active_check_interval());
 
         // Perform basic connectivity check
-        if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_offline(&endpoint, "connectivity_probe_failed") {
+        let initial_probe_ok = Self::perform_connectivity_check(&addr).await.is_ok();
+        if initial_probe_ok {
+            health.record_operation_success(&endpoint, "connectivity_probe_success");
+        } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
             warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
             // Start recovery monitoring
@@ -245,7 +261,9 @@ impl RemoteDisk {
                     }
 
                     // Perform basic connectivity check
-                    if Self::perform_connectivity_check(&addr).await.is_err() && health.mark_offline(&endpoint, "connectivity_probe_failed") {
+                    if Self::perform_connectivity_check(&addr).await.is_ok() {
+                        health.record_operation_success(&endpoint, "connectivity_probe_success");
+                    } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
                         warn!("Remote disk health check failed for {}: marking as faulty", addr);
 
                         // Start recovery monitoring
@@ -286,7 +304,7 @@ impl RemoteDisk {
                             return;
                         }
                     } else {
-                        health.mark_offline(&endpoint, "connectivity_probe_failed");
+                        health.mark_failure(&endpoint, "connectivity_probe_failed");
                     }
                 }
             }
@@ -440,7 +458,11 @@ impl RemoteDisk {
     }
 
     async fn mark_faulty_and_evict(&self, reason: &'static str) {
-        if self.health.mark_offline(&self.endpoint, reason) {
+        let previous_state = self.runtime_state();
+        let transitioned_to_offline = self.mark_suspect_or_offline(reason);
+        let state = self.runtime_state();
+
+        if state != previous_state {
             self.spawn_recovery_monitor_if_needed();
             counter!(
                 "rustfs_drive_faulty_mark_total",
@@ -448,10 +470,17 @@ impl RemoteDisk {
                 "reason" => reason.to_string()
             )
             .increment(1);
-            warn!(
-                "Remote disk marked faulty after timeout: endpoint={}, addr={}, reason={}",
-                self.endpoint, self.addr, reason
-            );
+            if transitioned_to_offline {
+                warn!(
+                    "Remote disk marked faulty after timeout: endpoint={}, addr={}, reason={}",
+                    self.endpoint, self.addr, reason
+                );
+            } else {
+                warn!(
+                    "Remote disk marked suspect after timeout: endpoint={}, addr={}, reason={}, state={:?}",
+                    self.endpoint, self.addr, reason, state
+                );
+            }
             counter!(
                 "rustfs_drive_connection_evict_total",
                 "endpoint" => self.endpoint.to_string(),
@@ -1128,7 +1157,8 @@ impl DiskAPI for RemoteDisk {
     ) -> Result<RenameDataResp> {
         info!("rename_data {}/{}/{}/{}", self.addr, self.endpoint.to_string(), dst_volume, dst_path);
 
-        self.execute_with_timeout(
+        self.execute_with_timeout_for_op(
+            "rename_data",
             || async {
                 let file_info = serde_json::to_string(&fi)?;
                 let mut client = self
@@ -1195,24 +1225,58 @@ impl DiskAPI for RemoteDisk {
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         info!("walk_dir {}", self.endpoint.to_string());
 
+        let disk = self.disk_ref().await;
+        let body = serde_json::to_vec(&opts)?;
+        let stall_timeout = get_drive_walkdir_stall_timeout();
+        let bucket = opts.bucket.clone();
+        let base_dir = opts.base_dir.clone();
+        let disk_for_log = disk.clone();
+
         self.execute_with_timeout_for_op_and_health_action(
             "walk_dir",
             || async {
-                let disk = self.disk_ref().await;
-                let opts = serde_json::to_vec(&opts)?;
-                let mut reader = self
-                    .data_transport
-                    .open_walk_dir(WalkDirStreamRequest {
-                        endpoint: self.endpoint.grid_host(),
-                        disk,
-                        body: opts,
-                        stall_timeout: Some(get_drive_walkdir_stall_timeout()),
-                    })
-                    .await?;
+                let mut last_err = None;
 
-                copy_stream_with_buffer(&mut reader, wr, DEFAULT_READ_BUFFER_SIZE).await?;
+                for attempt in 1..=2 {
+                    let mut reader = match self
+                        .data_transport
+                        .open_walk_dir(WalkDirStreamRequest {
+                            endpoint: self.endpoint.grid_host(),
+                            disk: disk.clone(),
+                            body: body.clone(),
+                            stall_timeout: Some(stall_timeout),
+                        })
+                        .await
+                    {
+                        Ok(reader) => reader,
+                        Err(err) => {
+                            if attempt == 1 && Self::is_retryable_walk_dir_error(&err) {
+                                warn!(
+                                    endpoint = %self.endpoint,
+                                    addr = %self.addr,
+                                    disk = %disk_for_log,
+                                    bucket = %bucket,
+                                    base_dir = %base_dir,
+                                    attempt,
+                                    stall_timeout_ms = stall_timeout.as_millis(),
+                                    error = %err,
+                                    "remote walk_dir returned retryable transport error; retrying"
+                                );
+                                last_err = Some(err);
+                                continue;
+                            }
 
-                Ok(())
+                            return Err(err);
+                        }
+                    };
+
+                    match copy_stream_with_buffer(&mut reader, wr, DEFAULT_READ_BUFFER_SIZE).await {
+                        Ok(_) => return Ok(()),
+                        Err(io_err) => return Err(DiskError::Io(io_err)),
+                    }
+                }
+
+                Err(last_err.unwrap_or_else(|| DiskError::other("walk_dir retry exhausted without captured error")))
             },
             get_drive_walkdir_timeout(),
             FailureHealthAction::IgnoreFailure,
@@ -1738,6 +1802,36 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    enum WalkDirTestStep {
+        Error(DiskError),
+        Data(Vec<u8>),
+        PartialDataThenError { data: Vec<u8>, error: io::Error },
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RetryingWalkDirInternodeDataTransport {
+        calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
+        steps: Arc<StdMutex<Vec<WalkDirTestStep>>>,
+    }
+
+    impl RetryingWalkDirInternodeDataTransport {
+        fn with_steps(steps: Vec<WalkDirTestStep>) -> Self {
+            Self {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                steps: Arc::new(StdMutex::new(steps)),
+            }
+        }
+
+        fn calls(&self) -> Vec<RecordedTransportCall> {
+            self.calls.lock().expect("recorded transport calls lock poisoned").clone()
+        }
+
+        fn record(&self, call: RecordedTransportCall) {
+            self.calls.lock().expect("recorded transport calls lock poisoned").push(call);
+        }
+    }
+
     #[derive(Debug, Default)]
     struct EmptyTestReader;
 
@@ -1790,6 +1884,38 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for RetryingWalkDirInternodeDataTransport {
+        async fn open_read(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            panic!("open_read should not be used in walk_dir retry test");
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            panic!("open_write should not be used in walk_dir retry test");
+        }
+
+        async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
+            self.record(RecordedTransportCall::WalkDir(request));
+            let step = self.steps.lock().expect("walk_dir retry steps lock poisoned").remove(0);
+            match step {
+                WalkDirTestStep::Error(err) => Err(err),
+                WalkDirTestStep::Data(data) => Ok(Box::new(Cursor::new(data))),
+                WalkDirTestStep::PartialDataThenError { data, error } => Ok(Box::new(PartialThenErrorReader {
+                    cursor: Cursor::new(data),
+                    error: Some(error),
+                })),
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "retrying-walk-dir"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
     async fn new_remote_disk_with_transport(data_transport: Arc<dyn InternodeDataTransport>) -> RemoteDisk {
         let endpoint = Endpoint {
             url: url::Url::parse("http://remote-node:9000/data/rustfs0").unwrap(),
@@ -1804,6 +1930,32 @@ mod tests {
         };
 
         RemoteDisk::new(&endpoint, &disk_option, data_transport).await.unwrap()
+    }
+
+    #[derive(Debug)]
+    struct PartialThenErrorReader {
+        cursor: Cursor<Vec<u8>>,
+        error: Option<io::Error>,
+    }
+
+    impl AsyncRead for PartialThenErrorReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let filled_before = buf.filled().len();
+            match Pin::new(&mut self.cursor).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    if buf.filled().len() > filled_before {
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    if let Some(err) = self.error.take() {
+                        return Poll::Ready(Err(err));
+                    }
+
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
     }
 
     fn init_tracing(filter_level: Level) {
@@ -1951,20 +2103,39 @@ mod tests {
             disk_idx: 0,
         };
 
-        let disk_option = DiskOption {
-            cleanup: false,
-            health_check: true,
-        };
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS, Some("1")),
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1")),
+            ],
+            async {
+                let disk_option = DiskOption {
+                    cleanup: false,
+                    health_check: true,
+                };
 
-        let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
-            .await
-            .unwrap();
-        remote_disk.enable_health_check();
+                let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
+                    .await
+                    .unwrap();
+                remote_disk.enable_health_check();
 
-        // wait for health check connect timeout
-        tokio::time::sleep(Duration::from_secs(6)).await;
-
-        assert!(!remote_disk.is_online().await);
+                // Wait out the initial success-grace window so the active probe loop
+                // actually attempts a connectivity check. Under the new
+                // suspect-first semantics we only need to prove that the drive
+                // transitions away from a clean Online state at least once.
+                tokio::time::sleep(SKIP_IF_SUCCESS_BEFORE + Duration::from_secs(2)).await;
+                assert!(
+                    remote_disk.offline_duration_secs().is_some(),
+                    "missing listener should transition the drive through suspect/offline tracking"
+                );
+                assert_ne!(
+                    remote_disk.runtime_state(),
+                    RuntimeDriveHealthState::Online,
+                    "missing listener should not remain in a clean Online state after probing"
+                );
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -2146,6 +2317,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remote_disk_walk_dir_retries_once_on_retryable_transport_error() {
+        let transport = RetryingWalkDirInternodeDataTransport::with_steps(vec![
+            WalkDirTestStep::Error(DiskError::other("HttpReader stream error: error decoding response body")),
+            WalkDirTestStep::Data(b"walk-dir-retry-ok".to_vec()),
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let opts = WalkDirOptions {
+            bucket: "bucket".to_string(),
+            base_dir: "config/iam".to_string(),
+            recursive: true,
+            report_notfound: false,
+            filter_prefix: None,
+            forward_to: None,
+            limit: 10,
+            disk_id: String::new(),
+        };
+        let mut writer = Vec::new();
+
+        remote_disk
+            .walk_dir(opts, &mut writer)
+            .await
+            .expect("retryable walk_dir error should recover");
+
+        assert_eq!(writer, b"walk-dir-retry-ok");
+        assert_eq!(transport.calls().len(), 2, "walk_dir should retry exactly once");
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_walk_dir_does_not_retry_after_partial_stream_failure() {
+        let transport = RetryingWalkDirInternodeDataTransport::with_steps(vec![
+            WalkDirTestStep::PartialDataThenError {
+                data: b"partial-walk-dir".to_vec(),
+                error: io::Error::new(io::ErrorKind::ConnectionReset, "connection reset"),
+            },
+            WalkDirTestStep::Data(b"walk-dir-retry-ok".to_vec()),
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let opts = WalkDirOptions {
+            bucket: "bucket".to_string(),
+            base_dir: "config/iam".to_string(),
+            recursive: true,
+            report_notfound: false,
+            filter_prefix: None,
+            forward_to: None,
+            limit: 10,
+            disk_id: String::new(),
+        };
+        let mut writer = Vec::new();
+
+        let err = remote_disk
+            .walk_dir(opts, &mut writer)
+            .await
+            .expect_err("partial stream failure should be returned without retry");
+
+        assert!(matches!(err, DiskError::Io(ref io_err) if io_err.kind() == io::ErrorKind::ConnectionReset));
+        assert_eq!(writer, b"partial-walk-dir");
+        assert_eq!(transport.calls().len(), 1, "walk_dir should not retry after writing partial bytes");
+    }
+
+    #[tokio::test]
     async fn test_remote_disk_endpoints_with_different_schemes() {
         let test_cases = vec![
             ("http://server:9000", "server:9000"),
@@ -2284,7 +2515,12 @@ mod tests {
             .expect_err("timeout should fail");
 
         assert!(err.to_string().contains("timeout"));
-        assert!(!remote_disk.is_online().await, "remote disk should be marked faulty after timeout");
+        assert!(remote_disk.is_online().await, "first timeout should keep the remote disk online");
+        assert_eq!(
+            remote_disk.runtime_state(),
+            RuntimeDriveHealthState::Suspect,
+            "first timeout should move the remote disk into suspect state"
+        );
     }
 
     #[tokio::test]
@@ -2450,7 +2686,15 @@ mod tests {
             },
             std::io::ErrorKind::TimedOut
         );
-        assert!(!remote_disk.is_online().await, "timeout-like errors should mark remote disk faulty");
+        assert!(
+            remote_disk.is_online().await,
+            "first timeout-like error should keep the remote disk online"
+        );
+        assert_eq!(
+            remote_disk.runtime_state(),
+            RuntimeDriveHealthState::Suspect,
+            "first timeout-like error should move the remote disk into suspect state"
+        );
         assert!(
             !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
             "timeout-like errors should evict cached connection"
@@ -2503,7 +2747,15 @@ mod tests {
             },
             std::io::ErrorKind::ConnectionRefused
         );
-        assert!(!remote_disk.is_online().await, "network-like errors should mark remote disk faulty");
+        assert!(
+            remote_disk.is_online().await,
+            "first network-like error should keep the remote disk online"
+        );
+        assert_eq!(
+            remote_disk.runtime_state(),
+            RuntimeDriveHealthState::Suspect,
+            "first network-like error should move the remote disk into suspect state"
+        );
         assert!(
             !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
             "network-like errors should evict cached connection"

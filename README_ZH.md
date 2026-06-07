@@ -100,20 +100,27 @@ curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 
 ### 2\. Docker 快速启动 (选项 2)
 
-RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 Docker 的 `-v` 参数挂载宿主机目录，请务必确保宿主机目录的所有者已更改为 `10001`，否则会遇到权限拒绝错误。
+RustFS 容器以非 root 用户 `rustfs` (UID/GID `10001:10001`) 运行。如果您通过 Docker 或 Compose 绑定挂载宿主机目录，请务必确保所有挂载路径都对该用户可写，否则启动时可能出现权限拒绝错误。这不仅适用于数据目录和日志目录，也适用于启用 `RUSTFS_TLS_PATH` 时挂载的 TLS 证书目录。
 
 ```bash
- # 创建数据和日志目录
- mkdir -p data logs
+# 创建数据和日志目录
+mkdir -p data logs
 
- # 更改这两个目录的所有者
- chown -R 10001:10001 data logs
+# 更改这两个目录的所有者
+chown -R 10001:10001 data logs
 
- # 使用最新版本运行
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+# 使用最新版本运行
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
- # 使用指定版本运行
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.6
+# 使用指定版本运行
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.7
+```
+
+如果您通过绑定挂载启用 TLS 证书目录，也请用同样方式准备该目录：
+
+```bash
+mkdir -p certs
+chown -R 10001:10001 certs
 ```
 
 您也可以使用 Docker Compose。使用根目录下的 `docker-compose.yml` 文件：
@@ -121,6 +128,13 @@ RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 
 ```bash
 docker compose --profile observability up -d
 ```
+
+在使用 Compose 且包含宿主机绑定挂载时，请先确认：
+
+- 所有挂载到容器内的宿主机路径都对 `10001:10001` 可写。
+- 如果启用了 TLS，挂载到 `/opt/tls` 的证书目录也需要对 `10001:10001` 可读。
+- 如果不方便调整宿主机目录归属，可以为 `rustfs` 服务显式设置 `user: "<host-uid>:<host-gid>"`。
+- `docker-compose-simple.yml` 为命名 volume 提供了 `volume-permission-helper` 服务；`docker-compose.yml` 使用宿主机绑定挂载，因此需要您在启动前自行准备目录权限。
 
 **注意**: 我们建议您在运行前查看 `docker-compose.yml` 文件。该文件定义了包括 Grafana、Prometheus 和 Jaeger 在内的多个服务，有助于 RustFS 的可观测性监控。如果您还想启动 Redis 或 Nginx 容器，可以指定相应的 profile。
 

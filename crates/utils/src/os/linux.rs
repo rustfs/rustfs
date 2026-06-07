@@ -19,10 +19,13 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, Error, ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use tracing::warn;
+
+static BAVAIL_GT_BFREE_WARNING_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
 /// Returns total and free bytes available in a directory, e.g. `/`.
 pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
-    let path_display = p.as_ref().display();
     // Use statfs on Linux to get access to f_type (filesystem magic number)
     let stat = statfs(p.as_ref())?;
 
@@ -42,34 +45,7 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
     let bfree = stat.f_bfree as u64;
     let bavail = stat.f_bavail as u64;
     let blocks = stat.f_blocks as u64;
-
-    let reserved = match bfree.checked_sub(bavail) {
-        Some(reserved) => reserved,
-        None => {
-            return Err(Error::other(format!(
-                "detected f_bavail space ({bavail}) > f_bfree space ({bfree}), fs corruption at ({path_display}). please run 'fsck'",
-            )));
-        }
-    };
-
-    let total = match blocks.checked_sub(reserved) {
-        Some(total) => total * bsize,
-        None => {
-            return Err(Error::other(format!(
-                "detected reserved space ({reserved}) > blocks space ({blocks}), fs corruption at ({path_display}). please run 'fsck'",
-            )));
-        }
-    };
-
-    let free = bavail * bsize;
-    let used = match total.checked_sub(free) {
-        Some(used) => used,
-        None => {
-            return Err(Error::other(format!(
-                "detected free space ({free}) > total drive space ({total}), fs corruption at ({path_display}). please run 'fsck'"
-            )));
-        }
-    };
+    let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, p.as_ref())?;
 
     let st = rustix::fs::stat(p.as_ref())?;
 
@@ -84,6 +60,59 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         minor: rustix::fs::minor(st.st_dev) as u64,
         ..Default::default()
     })
+}
+
+fn calculate_space_usage(blocks: u64, bfree: u64, bavail: u64, bsize: u64, path: &Path) -> std::io::Result<(u64, u64, u64)> {
+    let available = if bfree < bavail {
+        if should_warn_bavail_greater_than_bfree(path) {
+            warn!(
+                path = %path.display(),
+                f_bfree = bfree,
+                f_bavail = bavail,
+                "detected f_bavail greater than f_bfree, capping available blocks to f_bfree for compatibility"
+            );
+        }
+        bfree
+    } else {
+        bavail
+    };
+    let reserved = bfree - available;
+
+    let total = match blocks.checked_sub(reserved) {
+        Some(total) => total * bsize,
+        None => {
+            return Err(Error::other(format!(
+                "detected reserved space ({reserved}) > blocks space ({blocks}), fs corruption at ({}). please run 'fsck'",
+                path.display(),
+            )));
+        }
+    };
+
+    let free = available * bsize;
+    let used = match total.checked_sub(free) {
+        Some(used) => used,
+        None => {
+            return Err(Error::other(format!(
+                "detected free space ({free}) > total drive space ({total}), fs corruption at ({}). please run 'fsck'",
+                path.display(),
+            )));
+        }
+    };
+
+    Ok((total, free, used))
+}
+
+fn should_warn_bavail_greater_than_bfree(path: &Path) -> bool {
+    let warned_paths = BAVAIL_GT_BFREE_WARNING_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let mut warned_paths = match warned_paths.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if warned_paths.contains(path) {
+        false
+    } else {
+        warned_paths.insert(path.to_path_buf())
+    }
 }
 
 pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
@@ -406,5 +435,83 @@ mod tests {
         let minor = u64::MAX;
         let ids = resolve_block_device_ids(major, minor).unwrap();
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![format!("{major}:{minor}")]);
+    }
+
+    #[test]
+    fn calculate_space_usage_normal_bfree_greater_than_bavail() {
+        // Typical ext4/xfs scenario: bavail < bfree due to reserved blocks
+        let blocks = 1_000_u64;
+        let bfree = 900_u64;
+        let bavail = 850_u64;
+        let bsize = 4_096_u64;
+
+        let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, Path::new("/data")).unwrap();
+        let reserved = bfree - bavail;
+        assert_eq!(total, (blocks - reserved) * bsize);
+        assert_eq!(free, bavail * bsize);
+        assert_eq!(used, total - free);
+    }
+
+    #[test]
+    fn calculate_space_usage_bfree_equals_bavail() {
+        // No reserved blocks: bfree == bavail (e.g. FAT/exFAT or root user)
+        let blocks = 500_u64;
+        let bfree = 400_u64;
+        let bavail = 400_u64;
+        let bsize = 4_096_u64;
+
+        let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, Path::new("/data")).unwrap();
+        assert_eq!(total, blocks * bsize);
+        assert_eq!(free, bfree * bsize);
+        assert_eq!(used, (blocks - bfree) * bsize);
+    }
+
+    #[test]
+    fn calculate_space_usage_all_zero_blocks() {
+        let (total, free, used) = calculate_space_usage(0, 0, 0, 4_096, Path::new("/data")).unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(free, 0);
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn calculate_space_usage_all_blocks_free() {
+        let blocks = 1_000_u64;
+        let bfree = 1_000_u64;
+        let bavail = 1_000_u64;
+        let bsize = 4_096_u64;
+
+        let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, Path::new("/data")).unwrap();
+        assert_eq!(total, blocks * bsize);
+        assert_eq!(free, blocks * bsize);
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn calculate_space_usage_allows_bavail_greater_than_bfree() {
+        let blocks = 1_000_u64;
+        let bfree = 900_u64;
+        let bavail = 920_u64;
+        let bsize = 4_096_u64;
+
+        let (total, free, used) = calculate_space_usage(blocks, bfree, bavail, bsize, Path::new("/data")).unwrap();
+        assert_eq!(total, blocks * bsize);
+        assert_eq!(free, bfree * bsize);
+        assert_eq!(used, total - free);
+    }
+
+    #[test]
+    fn calculate_space_usage_rejects_free_greater_than_total() {
+        let err = calculate_space_usage(100, 120, 120, 4_096, Path::new("/data")).unwrap_err();
+        assert!(err.to_string().contains("detected free space"));
+    }
+
+    #[test]
+    fn bavail_greater_than_bfree_warning_is_once_per_path() {
+        let path = Path::new("/data/rustfs-bavail-warning-once");
+
+        assert!(should_warn_bavail_greater_than_bfree(path));
+        assert!(!should_warn_bavail_greater_than_bfree(path));
+        assert!(should_warn_bavail_greater_than_bfree(Path::new("/data/rustfs-bavail-warning-other")));
     }
 }
