@@ -5,13 +5,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-migration-ci-gates`
-- Baseline: `upstream/main` at `f00898d0703ac94a4a215a54b6666c747ebe6622`
-- PR type for this branch: `ci-gate`
+- Branch: `overtrue/arch-startup-timeline`
+- Baseline: `upstream/main` at `ae9d25879d72bc8977f08e61062c022e2142483b`
+- PR type for this branch: `docs-only`
 - Runtime behavior changes: none
 - Rust code changes: none
-- Script changes: stabilize `scripts/check_layer_dependencies.sh` against the
-  current accepted baseline.
+- Docs changes: add the binary startup timeline baseline for later
+  runtime/lifecycle migration work.
 
 ## Phase 0 Tasks
 
@@ -29,9 +29,12 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Acceptance: `./scripts/check_layer_dependencies.sh` passes on current
     `upstream/main` while still rejecting new unaccepted layer dependencies.
 - [~] `G-006` Create migration loss-prevention checks.
-  - Current branch: keeps the existing layer guard stable.
+  - Current branch: not in scope.
   - Next PR: add checks for public re-export, route matrix, and storage trait
     coverage before pure moves.
+- [x] `G-007` Create startup timeline table.
+  - Acceptance: [`startup-timeline.md`](startup-timeline.md) records current
+    binary startup order, side effects, fatal boundaries, and readiness stages.
 - [x] `G-009` Enforce pre-push three-expert review.
   - Acceptance: [`crate-boundaries.md`](crate-boundaries.md) requires
     quality/architecture, migration-preservation, and testing/verification review
@@ -43,8 +46,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `docs-only` or `test-only`: capture startup timeline and admin route-action
-   snapshot.
+1. `docs-only` or `test-only`: capture admin route-action snapshot.
 2. `docs-only`: inventory `ecstore::config::{Config, KV, KVS}` consumers.
 3. `ci-gate`: add focused checks for PR type vocabulary and temporary
    compatibility marker/register consistency.
@@ -53,9 +55,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Final review confirmed the guard scope, baseline logic, and storage target classification; the segment-level `storage::ecfs` / `storage::s3_api` follow-up passed |
-| Migration preservation | pass | Final review confirmed no Rust, runtime, storage hot-path, or global-state logic changes and no missing `RUSTFS_COMPAT_TODO` marker |
-| Testing/verification | pass | Final review accepted the full gate, focused guard checks, stale-baseline check, and negative baseline-removal check as sufficient for this `ci-gate` PR |
+| Quality/architecture | pass | Final review confirmed the startup, deferred IAM, readiness, and shutdown tables match current source behavior after blocker fixes |
+| Migration preservation | pass | Final review confirmed this branch is docs-only and does not touch runtime logic, storage hot paths, global-state migration, or compatibility code |
+| Testing/verification | pass | Final review accepted docs-only verification with layer guard, metrics reference guard, diff checks, and staged whitespace check |
 
 ## Verification Notes
 
@@ -63,30 +65,15 @@ Passed:
 
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
-- `bash -n scripts/check_layer_dependencies.sh`
-- `make pre-commit`
-- temporary negative check that adds an unaccepted reverse dependency to a copied
-  fixture and confirms the guard fails
-- temporary negative check that adds single-line root grouped
-  `use crate::{admin::bad};` and confirms the guard fails
-- temporary negative check that adds multiline root grouped
-  `use crate::{ ... }` and confirms the guard fails
-- temporary negative check that adds root grouped alias
-  `use crate::{admin as admin_alias};` and confirms the guard fails
-- temporary negative check that adds grouped `self` imports and confirms the
-  guard fails
-- temporary negative check that adds a stale baseline row and confirms the guard
-  fails
-- temporary negative check that removes the accepted
-  `crate::storage::ecfs::FS` baseline row for `rustfs/src/protocols/client.rs`
-  and confirms the guard fails
 - `git diff --check`
-- focused shell review of changed scripts
+- `git diff --cached --check`
+- focused source review of `rustfs/src/main.rs`, `rustfs/src/startup_iam.rs`,
+  and `rustfs/src/server/readiness.rs`
 
 ## Handoff Notes
 
 - Keep Phase 0 PRs small. Do not start Config, Storage API, Runtime, or ECStore
-  movement inside this `ci-gate` branch.
+  movement inside this `docs-only` branch.
 - Keep CI checks in a separate `ci-gate` PR so the PR type rule remains enforceable.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
