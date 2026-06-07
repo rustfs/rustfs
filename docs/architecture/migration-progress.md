@@ -5,13 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-config-inventory`
-- Baseline: `upstream/main` at `241e45d3b040684e5d217d2dd95f84c72f1de316`
+- Branch: `overtrue/arch-config-helper-inventory-followup`
+- Baseline: `upstream/main` at `3c71d5ef1c63bec63780d48caa2a9fe880ea0c64`
 - PR type for this branch: `docs-only`
 - Runtime behavior changes: none
 - Rust code changes: none
-- Docs changes: add the ECStore config consumer inventory for later config-model
-  contract, pure-move, and global-state migration work.
+- Docs changes: add PR-review-raised adjacent config-object helper users for
+  module-switch and IAM persistence without claiming a complete `com.rs` move
+  inventory.
 
 ## Phase 0 Tasks
 
@@ -67,7 +68,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Re-review confirmed dependency/call direction arrows, scanner global readers, adjacent scanner persistence helpers, notify config-manager persistence, narrowed test wording, and `Config model contract` wording are source-backed |
+| Quality/architecture | pass | Re-review confirmed dependency/call direction arrows, scanner global readers, selected adjacent scanner/module-switch/IAM persistence helpers, notify config-manager persistence, narrowed test wording, and `Config model contract` wording are source-backed |
 | Migration preservation | pass | Confirmed this branch is docs-only, aligned with `rustfs/backlog#660`, and does not touch runtime logic, storage hot paths, global state implementation, compatibility code, scripts, or crate boundaries |
 | Testing/verification | pass | Confirmed docs-only verification is sufficient after wording was narrowed and the final staged diff check covers all docs |
 
@@ -98,3 +99,5 @@ Final pre-push after staging all docs:
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
 - The next config-model PR must preserve the current tuple-struct shapes and
   persistence behavior before introducing narrower provider contracts.
+- Do not move `config::com` until a dedicated helper-user inventory covers
+  ECStore-internal persistence paths as well as adjacent non-model users.
