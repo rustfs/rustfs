@@ -5,14 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-config-helper-inventory-followup`
-- Baseline: `upstream/main` at `3c71d5ef1c63bec63780d48caa2a9fe880ea0c64`
-- PR type for this branch: `docs-only`
+- Branch: `overtrue/arch-migration-ci-rules`
+- Baseline: `upstream/main` at `6f4d0b54a171ff1560b5d892378d2ed407411fb9`
+- PR type for this branch: `ci-gate`
 - Runtime behavior changes: none
 - Rust code changes: none
-- Docs changes: add PR-review-raised adjacent config-object helper users for
-  module-switch and IAM persistence without claiming a complete `com.rs` move
-  inventory.
+- CI/script changes: add a migration rule check for PR type vocabulary and
+  temporary compatibility marker/register consistency, plus a lightweight
+  docs-only workflow so architecture documentation PRs still run the same guard.
+- Docs changes: record the new guardrail in the migration handoff.
 
 ## Phase 0 Tasks
 
@@ -30,9 +31,12 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Acceptance: `./scripts/check_layer_dependencies.sh` passes on current
     `upstream/main` while still rejecting new unaccepted layer dependencies.
 - [~] `G-006` Create migration loss-prevention checks.
-  - Current branch: not in scope.
-  - Next PR: add checks for public re-export, route matrix, and storage trait
-    coverage before pure moves.
+  - Current branch: add a migration rule check for PR type vocabulary and
+    temporary compatibility marker/register consistency, with a dedicated
+    architecture-doc trigger that covers `ARCHITECTURE.md` and
+    `docs/architecture/**` docs-only PRs.
+  - Remaining follow-up: add checks for public re-export, route matrix, and
+    storage trait coverage before pure moves.
 - [x] `G-007` Create startup timeline table.
   - Acceptance: [`startup-timeline.md`](startup-timeline.md) records current
     binary startup order, side effects, fatal boundaries, and readiness stages.
@@ -50,50 +54,53 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md)
     records the current model definitions, global accessors, persistence helpers,
     consumer groups, migration risks, and do-not-change contract.
-- [~] `TEST-PRTYPE-001` Check PR type enum consistency.
-  - Current branch: not in scope.
-  - Next PR: add a mechanical check that all migration docs use the same PR type
-    vocabulary.
+- [x] `TEST-PRTYPE-001` Check PR type enum consistency.
+  - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
+    allowed PR types from [`crate-boundaries.md`](crate-boundaries.md) and fails
+    when `ARCHITECTURE.md` or architecture docs reference an unknown PR type.
+- [x] `COMPAT-REG-001` Check temporary compatibility cleanup consistency.
+  - Acceptance: `./scripts/check_architecture_migration_rules.sh` fails when a
+    source `RUSTFS_COMPAT_TODO(<task-id>)` marker lacks a cleanup-register entry,
+    when a register entry lacks a source marker, or when a source marker omits a
+    removal condition.
 
 ## Next PRs
 
-1. `ci-gate`: add focused checks for PR type vocabulary and temporary
-   compatibility marker/register consistency.
-2. `test-only`: add a mechanical admin route matrix guard from the current
+1. `test-only`: add a mechanical admin route matrix guard from the current
    snapshot and `route_registration_test.rs`.
-3. `contract`: define the config-model contract surface while preserving the
+2. `contract`: define the config-model contract surface while preserving the
    existing `Config`, `KV`, and `KVS` behavior.
+3. `ci-gate`: add focused checks for public re-export and storage trait coverage
+   before pure moves.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Re-review confirmed dependency/call direction arrows, scanner global readers, selected adjacent scanner/module-switch/IAM persistence helpers, notify config-manager persistence, narrowed test wording, and `Config model contract` wording are source-backed |
-| Migration preservation | pass | Confirmed this branch is docs-only, aligned with `rustfs/backlog#660`, and does not touch runtime logic, storage hot paths, global state implementation, compatibility code, scripts, or crate boundaries |
-| Testing/verification | pass | Confirmed docs-only verification is sufficient after wording was narrowed and the final staged diff check covers all docs |
+| Quality/architecture | pass | Confirmed the guard script is narrow/readable, fixes single-token PR type detection, and reuses one script across CI/make/docs triggers rather than adding a parallel rule system |
+| Migration preservation | pass | Confirmed this is a `ci-gate` PR with only CI/config/docs/script changes and no runtime logic, storage hot-path, global-state, compatibility implementation, or crate-split changes |
+| Testing/verification | pass | Confirmed positive checks, staged diff check, and temporary negative checks cover unknown PR type and missing cleanup-register entry failure modes |
 
 ## Verification Notes
 
-Passed locally (docs-only):
-
+Passed:
+- `./scripts/check_architecture_migration_rules.sh`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
-
-Final pre-push after staging all docs:
-
 - `git diff --cached --check`
-- focused source review of `crates/ecstore/src/config/mod.rs`,
-  `crates/ecstore/src/config/com.rs`, `rustfs/src/app/context.rs`,
-  `rustfs/src/server/{event,audit}.rs`, `rustfs/src/admin/**/*.rs`,
-  `crates/{notify,audit,targets,iam,scanner}/**/*.rs`
-- three-expert review: quality/architecture, migration preservation, and
-  testing/verification
+- `bash -n scripts/check_architecture_migration_rules.sh`
+- `make architecture-migration-check`
+- `ruby -e "require 'yaml'; YAML.load_file('.github/workflows/architecture-migration-rules.yml')"`
+- temporary negative check for unknown single-token PR type
+- temporary negative check for unknown PR type in `ARCHITECTURE.md`
+- temporary negative check for unknown PR type in nested `docs/architecture/**`
+- temporary negative check for source compatibility marker without a register entry
 
 ## Handoff Notes
 
 - Keep Phase 0 PRs small. Do not move Config, Storage API, Runtime, or ECStore
-  code inside this `docs-only` branch.
+  code inside this `ci-gate` branch.
 - Keep CI checks in a separate `ci-gate` PR so the PR type rule remains enforceable.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.

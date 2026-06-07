@@ -29,8 +29,12 @@ Contract crates must stay below implementation crates. Initial forbidden edges:
 - `extension-schema -> rustfs`
 - `extension-schema -> ecstore`
 
-Existing layer checks live in `scripts/check_layer_dependencies.sh`. The next
-`ci-gate` PR should extend existing guardrails instead of adding a parallel system.
+Existing migration checks live in:
+
+- `scripts/check_layer_dependencies.sh`
+- `scripts/check_architecture_migration_rules.sh`
+
+Extend these guardrails instead of adding a parallel system.
 
 ## Pre-Push Expert Review
 
