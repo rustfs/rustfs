@@ -27,7 +27,8 @@ use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, emit_scan_cycle_complete, emit_scan_cycle_partial, global_metrics,
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerWorkSource, emit_scan_cycle_complete,
+    emit_scan_cycle_partial_with_source, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
 #[cfg(test)]
@@ -93,6 +94,13 @@ fn scan_cycle_partial_reason(reason: Option<ScannerCycleBudgetReason>) -> ScanCy
         Some(ScannerCycleBudgetReason::Objects) => ScanCyclePartialReason::Objects,
         Some(ScannerCycleBudgetReason::Directories) => ScanCyclePartialReason::Directories,
         None => ScanCyclePartialReason::Unknown,
+    }
+}
+
+fn scan_cycle_partial_source(reason: Option<ScannerCycleBudgetReason>) -> Option<ScannerWorkSource> {
+    match reason {
+        Some(ScannerCycleBudgetReason::Objects | ScannerCycleBudgetReason::Directories) => Some(ScannerWorkSource::Usage),
+        Some(ScannerCycleBudgetReason::Runtime) | None => None,
     }
 }
 
@@ -505,7 +513,12 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
                 max_directories = ?cycle_budget.max_directories(),
                 "Data scanner cycle stopped after reaching its cycle budget"
             );
-            emit_scan_cycle_partial(cycle_start.elapsed(), scan_cycle_partial_reason(cycle_budget.reason()));
+            let budget_reason = cycle_budget.reason();
+            emit_scan_cycle_partial_with_source(
+                cycle_start.elapsed(),
+                scan_cycle_partial_reason(budget_reason),
+                scan_cycle_partial_source(budget_reason),
+            );
             mark_scan_cycle_idle(cycle_info).await;
             return;
         }
@@ -526,7 +539,12 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             "Data scanner cycle stopped after reaching its cycle budget"
         );
         global_metrics().finish_scan_cycle_work(cycle_work_start);
-        emit_scan_cycle_partial(cycle_start.elapsed(), scan_cycle_partial_reason(cycle_budget.reason()));
+        let budget_reason = cycle_budget.reason();
+        emit_scan_cycle_partial_with_source(
+            cycle_start.elapsed(),
+            scan_cycle_partial_reason(budget_reason),
+            scan_cycle_partial_source(budget_reason),
+        );
         mark_scan_cycle_idle(cycle_info).await;
         return;
     }
@@ -853,6 +871,20 @@ mod tests {
             ScanCyclePartialReason::Directories
         );
         assert_eq!(scan_cycle_partial_reason(None), ScanCyclePartialReason::Unknown);
+    }
+
+    #[test]
+    fn test_scan_cycle_partial_source_maps_budget_reason() {
+        assert_eq!(scan_cycle_partial_source(Some(ScannerCycleBudgetReason::Runtime)), None);
+        assert_eq!(
+            scan_cycle_partial_source(Some(ScannerCycleBudgetReason::Objects)),
+            Some(ScannerWorkSource::Usage)
+        );
+        assert_eq!(
+            scan_cycle_partial_source(Some(ScannerCycleBudgetReason::Directories)),
+            Some(ScannerWorkSource::Usage)
+        );
+        assert_eq!(scan_cycle_partial_source(None), None);
     }
 
     #[tokio::test]
