@@ -1171,7 +1171,7 @@ impl ObjectIO for SetDisks {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
 
-            let (online_disks, _, op_old_dir) = Self::rename_data(
+            let (online_disks, _, op_old_dir, cleanup_disks) = Self::rename_data(
                 &shuffle_disks,
                 RUSTFS_META_TMP_BUCKET,
                 tmp_dir.as_str(),
@@ -1183,7 +1183,7 @@ impl ObjectIO for SetDisks {
             .await?;
 
             if let Some(old_dir) = op_old_dir {
-                self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
+                self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                     .await?;
             }
 
@@ -3840,7 +3840,7 @@ impl MultipartOperations for SetDisks {
 
         self.cleanup_multipart_path(&parts).await;
 
-        let (online_disks, versions, op_old_dir) = Self::rename_data(
+        let (online_disks, versions, op_old_dir, cleanup_disks) = Self::rename_data(
             &shuffle_disks,
             RUSTFS_META_MULTIPART_BUCKET,
             &upload_id_path,
@@ -3852,7 +3852,7 @@ impl MultipartOperations for SetDisks {
         .await?;
 
         if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
+            self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
         }
 
@@ -6267,6 +6267,10 @@ mod tests {
         let data_dirs = vec![Some(uuid1), Some(uuid2), None];
         let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
         assert_eq!(result, None); // No UUID meets quorum of 2
+
+        let data_dirs = vec![Some(uuid1), Some(uuid1), None, None];
+        let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
+        assert_eq!(result, Some(uuid1)); // Ignore None votes; uuid1 should still meet quorum
     }
 
     #[test]
