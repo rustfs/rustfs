@@ -38,7 +38,7 @@ impl SetDisks {
         dst_bucket: &str,
         dst_object: &str,
         write_quorum: usize,
-    ) -> disk::error::Result<(Vec<Option<DiskStore>>, Option<Vec<u8>>, Option<Uuid>)> {
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, Option<Vec<u8>>, Option<Uuid>, Vec<Option<DiskStore>>)> {
         let mut futures = Vec::with_capacity(disks.len());
 
         let mut errs = Vec::with_capacity(disks.len());
@@ -179,6 +179,23 @@ impl SetDisks {
         // TODO: reduceCommonVersions
 
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
+        let online_disks = Self::eval_disks(disks, &errs);
+        let cleanup_disks = if let Some(data_dir) = data_dir {
+            disks
+                .iter()
+                .zip(errs.iter())
+                .zip(data_dirs.iter())
+                .map(|((disk, err), old_data_dir)| {
+                    if err.is_none() && *old_data_dir == Some(data_dir) {
+                        disk.clone()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![None; disks.len()]
+        };
 
         // // TODO: reduce_common_data_dir
         // if let Some(old_dir) = rename_ress
@@ -193,7 +210,7 @@ impl SetDisks {
 
         // self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
 
-        Ok((Self::eval_disks(disks, &errs), versions, data_dir))
+        Ok((online_disks, versions, data_dir, cleanup_disks))
     }
 
     #[allow(dead_code)]

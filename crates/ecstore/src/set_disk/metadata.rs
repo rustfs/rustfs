@@ -37,10 +37,10 @@ impl SetDisks {
             })
     }
 
-    pub(super) fn reduce_common_data_dir(data_dirs: &Vec<Option<Uuid>>, write_quorum: usize) -> Option<Uuid> {
+    pub(super) fn reduce_common_data_dir(data_dirs: &[Option<Uuid>], write_quorum: usize) -> Option<Uuid> {
         let mut data_dirs_count = HashMap::new();
 
-        for ddir in data_dirs {
+        for ddir in data_dirs.iter().flatten().copied() {
             *data_dirs_count.entry(ddir).or_insert(0) += 1;
         }
 
@@ -49,7 +49,7 @@ impl SetDisks {
         for (ddir, count) in data_dirs_count {
             if count > max {
                 max = count;
-                data_dir = *ddir;
+                data_dir = Some(ddir);
             }
         }
 

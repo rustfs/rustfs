@@ -220,6 +220,17 @@ pub enum DataUsageScanCheckpointReason {
     Unknown,
 }
 
+impl DataUsageScanCheckpointReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::Objects => "objects",
+            Self::Directories => "directories",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DataUsageScanCheckpoint {
     pub version: u16,
