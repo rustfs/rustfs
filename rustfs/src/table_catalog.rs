@@ -580,6 +580,98 @@ where
             cleanup_candidate_locations,
         })
     }
+
+    pub(crate) async fn delete_table_metadata_maintenance_candidates(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        retain_recent_metadata_files: usize,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let report = self
+            .plan_table_metadata_maintenance(table_bucket, namespace, table, retain_recent_metadata_files)
+            .await?;
+        self.delete_table_metadata_maintenance_report(table_bucket, namespace, table, report)
+            .await
+    }
+
+    async fn delete_table_metadata_maintenance_report(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        report: TableMetadataMaintenanceReport,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        if !is_valid_table_metadata_location(&namespace, &table, &report.current_metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "maintenance report current metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
+
+        let table_path = self.paths.table_entry_path(&namespace, &table);
+        let _guard = self.backend.acquire_write_lock(table_bucket, &table_path).await?;
+        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        if entry.metadata_location != report.current_metadata_location {
+            return Err(TableCatalogStoreError::Conflict(
+                "current metadata location changed before maintenance delete".to_string(),
+            ));
+        }
+
+        let Some(current_metadata_object) = self.backend.read_object(table_bucket, &entry.metadata_location).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "current metadata object {}",
+                entry.metadata_location
+            )));
+        };
+        let current_metadata = serde_json::from_slice::<serde_json::Value>(&current_metadata_object.data).map_err(|err| {
+            TableCatalogStoreError::Invalid(format!("failed to parse current metadata {}: {err}", entry.metadata_location))
+        })?;
+        if !current_metadata.is_object() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "current metadata {} must be a JSON object",
+                entry.metadata_location
+            )));
+        }
+
+        let mut protected = metadata_log_locations(&current_metadata, &namespace, &table);
+        protected.insert(entry.metadata_location.clone());
+        protected.extend(report.retained_metadata_locations.iter().cloned());
+
+        let mut cleanup_candidate_locations = BTreeSet::new();
+        for metadata_location in report.cleanup_candidate_locations {
+            if !is_valid_table_metadata_location(&namespace, &table, &metadata_location) {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "cleanup candidate {metadata_location} must be inside the table metadata directory"
+                )));
+            }
+            if protected.contains(&metadata_location) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "cleanup candidate {metadata_location} is retained by current metadata"
+                )));
+            }
+            cleanup_candidate_locations.insert(metadata_location);
+        }
+
+        let cleanup_candidate_locations = cleanup_candidate_locations.into_iter().collect::<Vec<_>>();
+        for metadata_location in &cleanup_candidate_locations {
+            self.backend.delete_object(table_bucket, metadata_location).await?;
+        }
+
+        Ok(TableMetadataMaintenanceReport {
+            current_metadata_location: entry.metadata_location,
+            retained_metadata_locations: protected.into_iter().collect(),
+            cleanup_candidate_locations,
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -2115,6 +2207,100 @@ mod tests {
         assert!(report.retained_metadata_locations.contains(&current));
         assert_eq!(report.cleanup_candidate_locations, vec![v1, v2]);
         assert!(!report.cleanup_candidate_locations.contains(&manifest));
+    }
+
+    #[tokio::test]
+    async fn maintenance_delete_removes_only_dry_run_metadata_candidates() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let retained = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+        let manifest = format!("{}/snap-1.avro", default_table_metadata_dir_path(&namespace, &table));
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend.seed_object(bucket, &retained, b"{}".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [
+                        {
+                            "timestamp-ms": 1,
+                            "metadata-file": retained
+                        }
+                    ]
+                }))
+                .unwrap(),
+            )
+            .await;
+        backend.seed_object(bucket, &manifest, b"manifest".to_vec()).await;
+
+        let report = store
+            .delete_table_metadata_maintenance_candidates(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+
+        assert_eq!(report.cleanup_candidate_locations, vec![old.clone()]);
+        assert!(!backend.object_exists(bucket, &old).await.unwrap());
+        assert!(backend.object_exists(bucket, &retained).await.unwrap());
+        assert!(backend.object_exists(bucket, &current).await.unwrap());
+        assert!(backend.object_exists(bucket, &manifest).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn maintenance_delete_conflicts_when_current_pointer_changes_before_delete() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let next = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+        assert_eq!(report.cleanup_candidate_locations, vec![old.clone()]);
+
+        backend.seed_object(bucket, &next, br#"{"metadata-log":[]}"#.to_vec()).await;
+        store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-id".to_string(),
+                idempotency_key: None,
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current,
+                new_metadata_location: next,
+                requirements: Vec::new(),
+                writer: Some("test".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let err = store
+            .delete_table_metadata_maintenance_report(bucket, "sales", "orders", report)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TableCatalogStoreError::Conflict(_)));
+        assert!(backend.object_exists(bucket, &old).await.unwrap());
     }
 
     #[tokio::test]
