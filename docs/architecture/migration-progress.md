@@ -5,13 +5,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-migration-guardrails`
-- Baseline: `upstream/main` at `61f0dfbc40f748be313be84d834d8259cf3e19c9`
-- PR type for this branch: `docs-only`
+- Branch: `overtrue/arch-migration-ci-gates`
+- Baseline: `upstream/main` at `f00898d0703ac94a4a215a54b6666c747ebe6622`
+- PR type for this branch: `ci-gate`
 - Runtime behavior changes: none
 - Rust code changes: none
-- Repository metadata changes: `.gitignore` now allows tracking only
-  `docs/architecture/` under the otherwise ignored `docs` tree.
+- Script changes: stabilize `scripts/check_layer_dependencies.sh` against the
+  current accepted baseline.
 
 ## Phase 0 Tasks
 
@@ -25,11 +25,11 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     allowed PR type per PR.
 - [x] `G-004` Define re-export and wrapper policy.
   - Acceptance: temporary compatibility code must use `RUSTFS_COMPAT_TODO`.
-- [~] `G-005` Add dependency direction guard.
-  - Current branch: documentation only.
-  - Next PR: add a `ci-gate` check for forbidden dependency edges.
+- [x] `G-005` Add dependency direction guard.
+  - Acceptance: `./scripts/check_layer_dependencies.sh` passes on current
+    `upstream/main` while still rejecting new unaccepted layer dependencies.
 - [~] `G-006` Create migration loss-prevention checks.
-  - Current branch: documentation only.
+  - Current branch: keeps the existing layer guard stable.
   - Next PR: add checks for public re-export, route matrix, and storage trait
     coverage before pure moves.
 - [x] `G-009` Enforce pre-push three-expert review.
@@ -37,48 +37,56 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     quality/architecture, migration-preservation, and testing/verification review
     before push.
 - [~] `TEST-PRTYPE-001` Check PR type enum consistency.
-  - Current branch: documentation only.
+  - Current branch: not in scope.
   - Next PR: add a mechanical check that all migration docs use the same PR type
     vocabulary.
 
 ## Next PRs
 
-1. `ci-gate`: extend `scripts/check_layer_dependencies.sh` or add a nearby check
-   for architecture-migration guardrails.
-2. `docs-only` or `test-only`: capture startup timeline and admin route-action
+1. `docs-only` or `test-only`: capture startup timeline and admin route-action
    snapshot.
-3. `docs-only`: inventory `ecstore::config::{Config, KV, KVS}` consumers.
+2. `docs-only`: inventory `ecstore::config::{Config, KV, KVS}` consumers.
+3. `ci-gate`: add focused checks for PR type vocabulary and temporary
+   compatibility marker/register consistency.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Staged diff is scoped to docs, `.gitignore`, and the root architecture index; no over-abstraction or target drift found |
-| Migration preservation | pass | No runtime files changed; notify/audit and IAM/KMS no-drift bullets were added after review feedback |
-| Testing/verification | pass-with-nonblocking-follow-up | Docs-only verification is sufficient; suggested commands are recorded below |
+| Quality/architecture | pass | Final review confirmed the guard scope, baseline logic, and storage target classification; the segment-level `storage::ecfs` / `storage::s3_api` follow-up passed |
+| Migration preservation | pass | Final review confirmed no Rust, runtime, storage hot-path, or global-state logic changes and no missing `RUSTFS_COMPAT_TODO` marker |
+| Testing/verification | pass | Final review accepted the full gate, focused guard checks, stale-baseline check, and negative baseline-removal check as sufficient for this `ci-gate` PR |
 
 ## Verification Notes
 
 Passed:
 
-- `git diff --cached --check`
-- `git diff --cached --name-only -- '*.rs' 'Cargo.toml' 'Cargo.lock' '.github/**' 'scripts/**' 'Makefile' 'Justfile'`
-- `git diff --cached --exit-code -- '*.rs' 'Cargo.toml' 'Cargo.lock' '.github/**' 'scripts/**' 'Makefile' 'Justfile'`
-- `printf '%s\n' docs/architecture/overview.md docs/foo.md docs/other/file.md | git check-ignore -v --stdin --no-index`
-- `git rev-parse upstream/main`
-- `git log -1 --format='%H %s' upstream/main`
+- `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
-
-Known unrelated baseline issue:
-
-- `./scripts/check_layer_dependencies.sh` currently fails on `upstream/main`
-  because the script output and `scripts/layer-dependency-baseline.txt` format are
-  out of sync. Keep that fix in the next `ci-gate` PR.
+- `bash -n scripts/check_layer_dependencies.sh`
+- `make pre-commit`
+- temporary negative check that adds an unaccepted reverse dependency to a copied
+  fixture and confirms the guard fails
+- temporary negative check that adds single-line root grouped
+  `use crate::{admin::bad};` and confirms the guard fails
+- temporary negative check that adds multiline root grouped
+  `use crate::{ ... }` and confirms the guard fails
+- temporary negative check that adds root grouped alias
+  `use crate::{admin as admin_alias};` and confirms the guard fails
+- temporary negative check that adds grouped `self` imports and confirms the
+  guard fails
+- temporary negative check that adds a stale baseline row and confirms the guard
+  fails
+- temporary negative check that removes the accepted
+  `crate::storage::ecfs::FS` baseline row for `rustfs/src/protocols/client.rs`
+  and confirms the guard fails
+- `git diff --check`
+- focused shell review of changed scripts
 
 ## Handoff Notes
 
 - Keep Phase 0 PRs small. Do not start Config, Storage API, Runtime, or ECStore
-  movement inside this docs branch.
+  movement inside this `ci-gate` branch.
 - Keep CI checks in a separate `ci-gate` PR so the PR type rule remains enforceable.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
