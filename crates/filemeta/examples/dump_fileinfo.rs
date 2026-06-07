@@ -41,6 +41,19 @@ fn main() {
             part.number, part.size, part.actual_size, part.etag
         );
     }
+    // Tier / transition fields
+    if !fi.transition_status.is_empty() {
+        println!("transition_status: {}", fi.transition_status);
+        println!("transition_tier:   {}", fi.transition_tier);
+        println!("transitioned_obj:  {}", fi.transitioned_objname);
+        println!(
+            "transition_ver_id: {}",
+            fi.transition_version_id
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "<none>".into())
+        );
+    }
+
     println!("metadata entries: {}", fi.metadata.len());
     let mut keys = fi.metadata.keys().cloned().collect::<Vec<_>>();
     keys.sort();

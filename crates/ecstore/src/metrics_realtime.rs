@@ -18,7 +18,8 @@ use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::Dr
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{
     DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
-    ScannerMetrics as MadminScannerMetrics, TimedAction as MadminTimedAction,
+    ScannerMetrics as MadminScannerMetrics, ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot,
+    TimedAction as MadminTimedAction,
 };
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
@@ -99,6 +100,16 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
                 .collect(),
         },
         active_paths: metrics.active_paths,
+        last_cycle_partial_source: metrics.last_cycle_partial_source,
+        last_cycle_partial_source_code: metrics.last_cycle_partial_source_code,
+        partial_cycles_by_source: metrics
+            .partial_cycles_by_source
+            .into_iter()
+            .map(|source| MadminScannerSourceCycleSnapshot {
+                source: source.source,
+                cycles: source.cycles,
+            })
+            .collect(),
     }
 }
 
@@ -342,5 +353,27 @@ mod test {
         assert!(rpc.last_ping_ms > 0.0);
 
         metrics.reset_for_test();
+    }
+
+    #[test]
+    fn scanner_metrics_mapping_preserves_partial_source_status() {
+        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
+            last_cycle_partial_source: "usage".to_string(),
+            last_cycle_partial_source_code: 1,
+            partial_cycles_by_source: vec![rustfs_common::metrics::ScannerSourceCycleSnapshot {
+                source: "usage".to_string(),
+                cycles: 2,
+            }],
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.last_cycle_partial_source, "usage");
+        assert_eq!(scanner.last_cycle_partial_source_code, 1);
+        let usage = scanner
+            .partial_cycles_by_source
+            .iter()
+            .find(|source| source.source == "usage")
+            .expect("usage partial source should be mapped");
+        assert_eq!(usage.cycles, 2);
     }
 }

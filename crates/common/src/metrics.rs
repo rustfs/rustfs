@@ -267,6 +267,31 @@ impl ScannerWorkSource {
         }
     }
 
+    fn code(self) -> u8 {
+        match self {
+            Self::Usage => 1,
+            Self::Lifecycle => 2,
+            Self::BucketReplication => 3,
+            Self::SiteReplication => 4,
+            Self::Heal => 5,
+            Self::Bitrot => 6,
+            Self::Alerts => 7,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Usage),
+            2 => Some(Self::Lifecycle),
+            3 => Some(Self::BucketReplication),
+            4 => Some(Self::SiteReplication),
+            5 => Some(Self::Heal),
+            6 => Some(Self::Bitrot),
+            7 => Some(Self::Alerts),
+            _ => None,
+        }
+    }
+
     fn all() -> &'static [Self] {
         &Self::ALL
     }
@@ -521,6 +546,7 @@ pub struct Metrics {
     scanner_disk_bucket_scan_states: Mutex<HashMap<String, ScannerDiskBucketScanState>>,
     last_scan_cycle_result: AtomicU8,
     last_scan_cycle_partial_reason: AtomicU8,
+    last_scan_cycle_partial_source: AtomicU8,
     last_scan_cycle_duration_millis: AtomicU64,
     last_scan_cycle_objects_scanned: AtomicU64,
     last_scan_cycle_directories_scanned: AtomicU64,
@@ -539,6 +565,7 @@ pub struct Metrics {
     partial_scan_cycles_runtime: AtomicU64,
     partial_scan_cycles_objects: AtomicU64,
     partial_scan_cycles_directories: AtomicU64,
+    partial_scan_cycles_by_source: Vec<AtomicU64>,
     scanner_yield_duration_millis: AtomicU64,
     scanner_throttle_sleep_duration_millis: AtomicU64,
     scanner_ilm_actions: AtomicU64,
@@ -650,6 +677,12 @@ pub struct ScannerSourceWorkSnapshot {
     pub skipped: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerSourceCycleSnapshot {
+    pub source: String,
+    pub cycles: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerLastMinute {
     pub actions: HashMap<String, ScannerTimedAction>,
@@ -714,6 +747,10 @@ pub struct ScannerMetricsReport {
     pub last_cycle_partial_reason: String,
     #[serde(default)]
     pub last_cycle_partial_reason_code: u64,
+    #[serde(default)]
+    pub last_cycle_partial_source: String,
+    #[serde(default)]
+    pub last_cycle_partial_source_code: u64,
     pub last_cycle_duration_seconds: f64,
     #[serde(default)]
     pub last_cycle_objects_scanned: u64,
@@ -748,6 +785,8 @@ pub struct ScannerMetricsReport {
     pub partial_cycles_objects: u64,
     #[serde(default)]
     pub partial_cycles_directories: u64,
+    #[serde(default)]
+    pub partial_cycles_by_source: Vec<ScannerSourceCycleSnapshot>,
     #[serde(default)]
     pub throttle_idle_mode_enabled: bool,
     #[serde(default)]
@@ -863,6 +902,15 @@ pub fn emit_scan_cycle_partial(duration: Duration, reason: ScanCyclePartialReaso
     metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_PARTIAL_LABEL).increment(1);
 }
 
+pub fn emit_scan_cycle_partial_with_source(
+    duration: Duration,
+    reason: ScanCyclePartialReason,
+    source: Option<ScannerWorkSource>,
+) {
+    global_metrics().record_scan_cycle_partial_with_source(duration, reason, source);
+    metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_PARTIAL_LABEL).increment(1);
+}
+
 pub fn emit_scan_bucket_drive_complete(success: bool, bucket: &str, disk: &str, duration: Duration) {
     let result = if success { "success" } else { "error" };
     metrics::counter!(
@@ -931,6 +979,7 @@ impl Metrics {
             scanner_disk_bucket_scan_states: Mutex::new(HashMap::new()),
             last_scan_cycle_result: AtomicU8::new(SCAN_CYCLE_RESULT_UNKNOWN),
             last_scan_cycle_partial_reason: AtomicU8::new(ScanCyclePartialReason::Unknown as u8),
+            last_scan_cycle_partial_source: AtomicU8::new(0),
             last_scan_cycle_duration_millis: AtomicU64::new(0),
             last_scan_cycle_objects_scanned: AtomicU64::new(0),
             last_scan_cycle_directories_scanned: AtomicU64::new(0),
@@ -949,6 +998,7 @@ impl Metrics {
             partial_scan_cycles_runtime: AtomicU64::new(0),
             partial_scan_cycles_objects: AtomicU64::new(0),
             partial_scan_cycles_directories: AtomicU64::new(0),
+            partial_scan_cycles_by_source: ScannerWorkSource::all().iter().map(|_| AtomicU64::new(0)).collect(),
             scanner_yield_duration_millis: AtomicU64::new(0),
             scanner_throttle_sleep_duration_millis: AtomicU64::new(0),
             scanner_ilm_actions: AtomicU64::new(0),
@@ -1358,11 +1408,21 @@ impl Metrics {
         self.last_scan_cycle_result.store(result, Ordering::Relaxed);
         self.last_scan_cycle_partial_reason
             .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
+        self.last_scan_cycle_partial_source.store(0, Ordering::Relaxed);
         self.last_scan_cycle_duration_millis
             .store(duration_millis_saturated(duration), Ordering::Relaxed);
     }
 
     pub fn record_scan_cycle_partial(&self, duration: Duration, reason: ScanCyclePartialReason) {
+        self.record_scan_cycle_partial_with_source(duration, reason, None);
+    }
+
+    pub fn record_scan_cycle_partial_with_source(
+        &self,
+        duration: Duration,
+        reason: ScanCyclePartialReason,
+        source: Option<ScannerWorkSource>,
+    ) {
         self.partial_scan_cycles.fetch_add(1, Ordering::Relaxed);
         match reason {
             ScanCyclePartialReason::Unknown => &self.partial_scan_cycles_unknown,
@@ -1374,6 +1434,13 @@ impl Metrics {
         self.last_scan_cycle_result
             .store(SCAN_CYCLE_RESULT_PARTIAL, Ordering::Relaxed);
         self.last_scan_cycle_partial_reason.store(reason as u8, Ordering::Relaxed);
+        self.last_scan_cycle_partial_source
+            .store(source.map(ScannerWorkSource::code).unwrap_or_default(), Ordering::Relaxed);
+        if let Some(source) = source
+            && let Some(cycles) = self.partial_scan_cycles_by_source.get(source.index())
+        {
+            cycles.fetch_add(1, Ordering::Relaxed);
+        }
         self.last_scan_cycle_duration_millis
             .store(duration_millis_saturated(duration), Ordering::Relaxed);
     }
@@ -1647,6 +1714,12 @@ impl Metrics {
         let partial_reason = ScanCyclePartialReason::from_code(self.last_scan_cycle_partial_reason.load(Ordering::Relaxed));
         m.last_cycle_partial_reason = partial_reason.as_str().to_string();
         m.last_cycle_partial_reason_code = partial_reason as u8 as u64;
+        let partial_source = ScannerWorkSource::from_code(self.last_scan_cycle_partial_source.load(Ordering::Relaxed));
+        m.last_cycle_partial_source = partial_source
+            .map(ScannerWorkSource::as_str)
+            .unwrap_or(SCAN_CYCLE_RESULT_UNKNOWN_LABEL)
+            .to_string();
+        m.last_cycle_partial_source_code = partial_source.map(|source| source.code().into()).unwrap_or_default();
         m.last_cycle_duration_seconds = self.last_scan_cycle_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
         m.last_cycle_objects_scanned = self.last_scan_cycle_objects_scanned.load(Ordering::Relaxed);
         m.last_cycle_directories_scanned = self.last_scan_cycle_directories_scanned.load(Ordering::Relaxed);
@@ -1667,6 +1740,17 @@ impl Metrics {
         m.partial_cycles_runtime = self.partial_scan_cycles_runtime.load(Ordering::Relaxed);
         m.partial_cycles_objects = self.partial_scan_cycles_objects.load(Ordering::Relaxed);
         m.partial_cycles_directories = self.partial_scan_cycles_directories.load(Ordering::Relaxed);
+        m.partial_cycles_by_source = ScannerWorkSource::all()
+            .iter()
+            .filter_map(|source| {
+                self.partial_scan_cycles_by_source
+                    .get(source.index())
+                    .map(|cycles| ScannerSourceCycleSnapshot {
+                        source: source.as_str().to_string(),
+                        cycles: cycles.load(Ordering::Relaxed),
+                    })
+            })
+            .collect();
         m.throttle_idle_mode_enabled = self.scanner_throttle_idle_mode_enabled.load(Ordering::Relaxed);
         m.throttle_sleep_factor = self.scanner_throttle_sleep_factor_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         m.throttle_max_sleep_seconds = self.scanner_throttle_max_sleep_millis.load(Ordering::Relaxed) as f64 / 1000.0;
@@ -2081,7 +2165,11 @@ mod tests {
     #[tokio::test]
     async fn report_tracks_successful_scan_cycle_without_failed_increment() {
         let metrics = Metrics::new();
-        metrics.record_scan_cycle_partial(Duration::from_millis(500), ScanCyclePartialReason::Runtime);
+        metrics.record_scan_cycle_partial_with_source(
+            Duration::from_millis(500),
+            ScanCyclePartialReason::Runtime,
+            Some(ScannerWorkSource::Heal),
+        );
         metrics.record_scan_cycle_complete(true, Duration::from_secs(2));
 
         let report = metrics.report().await;
@@ -2090,6 +2178,8 @@ mod tests {
         assert_eq!(report.last_cycle_result_code, SCAN_CYCLE_RESULT_SUCCESS as u64);
         assert_eq!(report.last_cycle_partial_reason, SCAN_CYCLE_RESULT_UNKNOWN_LABEL);
         assert_eq!(report.last_cycle_partial_reason_code, ScanCyclePartialReason::Unknown as u8 as u64);
+        assert_eq!(report.last_cycle_partial_source, SCAN_CYCLE_RESULT_UNKNOWN_LABEL);
+        assert_eq!(report.last_cycle_partial_source_code, 0);
         assert_eq!(report.last_cycle_duration_seconds, 2.0);
         assert_eq!(report.failed_cycles, 0);
         assert_eq!(report.partial_cycles, 1);
@@ -2098,7 +2188,11 @@ mod tests {
     #[tokio::test]
     async fn report_tracks_partial_scan_cycle_without_failed_increment() {
         let metrics = Metrics::new();
-        metrics.record_scan_cycle_partial(Duration::from_millis(2500), ScanCyclePartialReason::Directories);
+        metrics.record_scan_cycle_partial_with_source(
+            Duration::from_millis(2500),
+            ScanCyclePartialReason::Directories,
+            Some(ScannerWorkSource::Usage),
+        );
 
         let report = metrics.report().await;
 
@@ -2106,6 +2200,8 @@ mod tests {
         assert_eq!(report.last_cycle_result_code, SCAN_CYCLE_RESULT_PARTIAL as u64);
         assert_eq!(report.last_cycle_partial_reason, "directories");
         assert_eq!(report.last_cycle_partial_reason_code, ScanCyclePartialReason::Directories as u8 as u64);
+        assert_eq!(report.last_cycle_partial_source, ScannerWorkSource::Usage.as_str());
+        assert_eq!(report.last_cycle_partial_source_code, 1);
         assert_eq!(report.last_cycle_duration_seconds, 2.5);
         assert_eq!(report.failed_cycles, 0);
         assert_eq!(report.partial_cycles, 1);
@@ -2113,6 +2209,12 @@ mod tests {
         assert_eq!(report.partial_cycles_runtime, 0);
         assert_eq!(report.partial_cycles_objects, 0);
         assert_eq!(report.partial_cycles_unknown, 0);
+        let usage = report
+            .partial_cycles_by_source
+            .iter()
+            .find(|source| source.source == ScannerWorkSource::Usage.as_str())
+            .expect("usage partial source count should be visible");
+        assert_eq!(usage.cycles, 1);
     }
 
     #[tokio::test]

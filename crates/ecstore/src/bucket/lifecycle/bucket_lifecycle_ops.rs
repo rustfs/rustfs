@@ -1770,11 +1770,31 @@ pub async fn get_transitioned_object_reader(
         gopts.length = length;
     }
 
-    //return Ok(HttpFileReader::new(rs, &oi, opts, &h));
-    //timeTierAction := auditTierActions(oi.transitioned_object.Tier, length)
+    debug!(
+        bucket = %bucket,
+        object = %object,
+        tier = %oi.transitioned_object.tier,
+        tier_object = %oi.transitioned_object.name,
+        tier_version_id = %oi.transitioned_object.version_id,
+        start_offset = gopts.start_offset,
+        length = gopts.length,
+        "fetching transitioned object from tier"
+    );
     let reader = tgt_client
         .get(&oi.transitioned_object.name, &oi.transitioned_object.version_id, gopts)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                bucket = %bucket,
+                object = %object,
+                tier = %oi.transitioned_object.tier,
+                tier_object = %oi.transitioned_object.name,
+                tier_version_id = %oi.transitioned_object.version_id,
+                error = %e,
+                "tier GET failed"
+            );
+            e
+        })?;
     Ok(get_fn(reader, h.clone()))
 }
 
