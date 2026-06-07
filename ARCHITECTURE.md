@@ -6,6 +6,8 @@
 > If you want to familiarize yourself with the code base, you are in the right place!
 >
 > See also [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow.
+> See also [docs/architecture](docs/architecture/overview.md) for active
+> architecture migration guardrails.
 
 ## Bird's Eye View
 
