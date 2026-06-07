@@ -20,8 +20,9 @@ In scope:
 - Consumers that persist, clone, inspect, mutate, or pass these types across
   runtime boundaries.
 - Adjacent users of `rustfs_ecstore::config::com::{read_config, save_config,
-  delete_config}` are listed separately because moving `com.rs` would affect
-  them even when they do not consume `Config`, `KV`, or `KVS`.
+  delete_config}` and related helper variants are listed separately because
+  moving `com.rs` would affect them even when they do not consume `Config`,
+  `KV`, or `KVS`.
 
 Out of scope:
 
@@ -123,6 +124,8 @@ behind narrower contracts.
 | `rustfs/src/admin/handlers/kms_dynamic.rs` | Uses generic `read_config` and `save_config` for dynamic KMS config objects. |
 | `rustfs/src/admin/handlers/site_replication.rs` | Uses generic `read_config`, `save_config`, and `delete_config` for site-replication state objects. |
 | `rustfs/src/admin/service/site_replication.rs` | Uses generic `read_config` and `save_config` for site-replication state normalization. |
+| `rustfs/src/server/module_switch.rs` | Uses generic `read_config` and `save_config` for module-switch config objects. |
+| `crates/iam/src/store/object.rs` | Uses generic `read_config_no_lock`, `read_config_with_metadata`, `save_config`, `save_config_with_opts`, and `delete_config` helper variants for IAM object-store persistence paths. |
 | `crates/scanner/src/{scanner,data_usage_define}.rs` | Uses generic `read_config` and `save_config` for scanner metadata and cache persistence paths. |
 
 ### Runtime Target, Notify, And Audit Crates

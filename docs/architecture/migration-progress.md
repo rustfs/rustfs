@@ -67,7 +67,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Re-review confirmed dependency/call direction arrows, scanner global readers, adjacent scanner persistence helpers, notify config-manager persistence, narrowed test wording, and `Config model contract` wording are source-backed |
+| Quality/architecture | pass | Re-review confirmed dependency/call direction arrows, scanner global readers, adjacent scanner/module-switch/IAM persistence helpers, notify config-manager persistence, narrowed test wording, and `Config model contract` wording are source-backed |
 | Migration preservation | pass | Confirmed this branch is docs-only, aligned with `rustfs/backlog#660`, and does not touch runtime logic, storage hot paths, global state implementation, compatibility code, scripts, or crate boundaries |
 | Testing/verification | pass | Confirmed docs-only verification is sufficient after wording was narrowed and the final staged diff check covers all docs |
 
