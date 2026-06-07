@@ -154,6 +154,21 @@ fn record_scanner_ilm_action_if_queued(metrics: &Metrics, count: u64, queued: bo
     queued
 }
 
+#[derive(Clone, Copy)]
+struct PendingScannerAccounting<'a> {
+    object: &'a ObjectInfo,
+    retained_size: i64,
+    expired_size: i64,
+}
+
+impl PendingScannerAccounting<'_> {
+    fn apply(self, size_summary: &mut SizeSummary, cumulative_size: &mut i64, queued: bool) {
+        let size = if queued { self.expired_size } else { self.retained_size };
+        size_summary.actions_accounting(self.object, size, self.retained_size);
+        *cumulative_size += size;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FolderResumeMatch {
     Exact,
@@ -566,6 +581,7 @@ impl ScannerItem {
         };
         let mut to_delete_objs: Vec<ObjectToDelete> = Vec::new();
         let mut noncurrent_events: Vec<Event> = Vec::new();
+        let mut noncurrent_accounting: Vec<PendingScannerAccounting<'_>> = Vec::new();
         let mut cumulative_size = 0;
         let mut remaining_versions = object_infos.len();
         'eventLoop: {
@@ -580,41 +596,67 @@ impl ScannerItem {
                 };
 
                 let mut size = actual_size;
+                let mut account_now = true;
 
                 match event.action {
                     IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
-                        remaining_versions = 0;
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
                         if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
                             done_ilm(1)();
+                            remaining_versions = 0;
+                        } else {
+                            PendingScannerAccounting {
+                                object: oi,
+                                retained_size: actual_size,
+                                expired_size: 0,
+                            }
+                            .apply(size_summary, &mut cumulative_size, false);
+                            for retained in object_infos.iter().skip(i + 1) {
+                                let retained_size = match retained.get_actual_size() {
+                                    Ok(size) => size,
+                                    Err(_) => {
+                                        warn!("apply_actions: Failed to get actual size for object {}", retained.name);
+                                        0
+                                    }
+                                };
+                                PendingScannerAccounting {
+                                    object: retained,
+                                    retained_size,
+                                    expired_size: 0,
+                                }
+                                .apply(size_summary, &mut cumulative_size, false);
+                            }
                         }
                         break 'eventLoop;
                     }
 
                     IlmAction::DeleteAction | IlmAction::DeleteRestoredAction | IlmAction::DeleteRestoredVersionAction => {
-                        if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
-                            remaining_versions -= 1;
-                            size = 0;
-                        }
-
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
                         if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
                             done_ilm(1)();
+                            if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
+                                remaining_versions -= 1;
+                                size = 0;
+                            }
                         }
                     }
                     IlmAction::DeleteVersionAction => {
-                        remaining_versions -= 1;
-                        size = 0;
                         if let Some(opt) = object_opts.get(i) {
                             to_delete_objs.push(ObjectToDelete {
                                 object_name: opt.name.clone(),
                                 version_id: opt.version_id,
                                 ..Default::default()
                             });
+                            noncurrent_accounting.push(PendingScannerAccounting {
+                                object: oi,
+                                retained_size: actual_size,
+                                expired_size: 0,
+                            });
+                            account_now = false;
                         }
                         noncurrent_events.push(event.clone());
                     }
@@ -632,9 +674,10 @@ impl ScannerItem {
                     }
                 }
 
-                size_summary.actions_accounting(oi, size, actual_size);
-
-                cumulative_size += size;
+                if account_now {
+                    size_summary.actions_accounting(oi, size, actual_size);
+                    cumulative_size += size;
+                }
             }
         }
 
@@ -651,6 +694,10 @@ impl ScannerItem {
                 .await;
             if record_scanner_ilm_action_if_queued(global_metrics(), count, queued) {
                 done_ilm(count)();
+                remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
+            }
+            for pending in noncurrent_accounting {
+                pending.apply(size_summary, &mut cumulative_size, queued);
             }
         }
         self.alert_excessive_versions(remaining_versions, cumulative_size);
@@ -2024,6 +2071,34 @@ mod tests {
             .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
             .expect("lifecycle source work should be visible");
         assert_eq!(lifecycle.executed, 3);
+    }
+
+    #[test]
+    fn test_pending_scanner_accounting_requires_enqueue_success() {
+        let object = ObjectInfo {
+            size: 10,
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let pending = PendingScannerAccounting {
+            object: &object,
+            retained_size: 10,
+            expired_size: 0,
+        };
+
+        let mut failed_summary = SizeSummary::default();
+        let mut failed_cumulative_size = 0;
+        pending.apply(&mut failed_summary, &mut failed_cumulative_size, false);
+        assert_eq!(failed_summary.versions, 1);
+        assert_eq!(failed_summary.total_size, 10);
+        assert_eq!(failed_cumulative_size, 10);
+
+        let mut queued_summary = SizeSummary::default();
+        let mut queued_cumulative_size = 0;
+        pending.apply(&mut queued_summary, &mut queued_cumulative_size, true);
+        assert_eq!(queued_summary.versions, 0);
+        assert_eq!(queued_summary.total_size, 0);
+        assert_eq!(queued_cumulative_size, 0);
     }
 
     #[test]
