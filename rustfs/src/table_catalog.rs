@@ -38,6 +38,7 @@ use rustfs_ecstore::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
@@ -67,6 +68,7 @@ const TABLE_ENTRY_FILE: &str = "table-entry.json";
 const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
 const TABLE_CATALOG_LIST_MAX_KEYS: i32 = 1000;
+const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogIdentifierError {
@@ -314,6 +316,7 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 pub(crate) struct TableCatalogObject {
     pub data: Vec<u8>,
     pub etag: Option<String>,
+    pub mod_time: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,6 +650,7 @@ where
         protected.extend(report.retained_metadata_locations.iter().cloned());
 
         let mut cleanup_candidate_locations = BTreeSet::new();
+        let now = OffsetDateTime::now_utc();
         for metadata_location in report.cleanup_candidate_locations {
             if !is_valid_table_metadata_location(&namespace, &table, &metadata_location) {
                 return Err(TableCatalogStoreError::Invalid(format!(
@@ -657,6 +661,12 @@ where
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "cleanup candidate {metadata_location} is retained by current metadata"
                 )));
+            }
+            let Some(candidate_object) = self.backend.read_object(table_bucket, &metadata_location).await? else {
+                continue;
+            };
+            if !metadata_candidate_is_past_safety_window(candidate_object.mod_time, now) {
+                continue;
             }
             cleanup_candidate_locations.insert(metadata_location);
         }
@@ -1031,7 +1041,11 @@ where
             .read_to_end(&mut data)
             .await
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to read catalog object {bucket}/{object}: {err}")))?;
-        Ok(Some(TableCatalogObject { data, etag: info.etag }))
+        Ok(Some(TableCatalogObject {
+            data,
+            etag: info.etag,
+            mod_time: info.mod_time,
+        }))
     }
 
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
@@ -1140,6 +1154,13 @@ fn metadata_log_locations(
     }
 
     locations
+}
+
+fn metadata_candidate_is_past_safety_window(mod_time: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
+    let Some(mod_time) = mod_time else {
+        return false;
+    };
+    mod_time <= now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS)
 }
 
 fn catalog_path_hash(value: &str) -> String {
@@ -1933,15 +1954,21 @@ mod tests {
     struct TestCatalogObjectRecord {
         data: Vec<u8>,
         etag: String,
+        mod_time: Option<OffsetDateTime>,
     }
 
     impl TestCatalogObjectBackend {
         async fn seed_object(&self, bucket: &str, object: &str, data: Vec<u8>) {
+            self.seed_object_with_mod_time(bucket, object, data, Some(OffsetDateTime::UNIX_EPOCH))
+                .await;
+        }
+
+        async fn seed_object_with_mod_time(&self, bucket: &str, object: &str, data: Vec<u8>, mod_time: Option<OffsetDateTime>) {
             let mut state = self.state.lock().await;
             let etag = state.next_etag();
             state
                 .objects
-                .insert((bucket.to_string(), object.to_string()), TestCatalogObjectRecord { data, etag });
+                .insert((bucket.to_string(), object.to_string()), TestCatalogObjectRecord { data, etag, mod_time });
         }
 
         async fn fail_put_attempt(&self, bucket: &str, object: &str, attempt: usize) {
@@ -1971,6 +1998,7 @@ mod tests {
                 .map(|record| TableCatalogObject {
                     data: record.data.clone(),
                     etag: Some(record.etag.clone()),
+                    mod_time: record.mod_time,
                 }))
         }
 
@@ -2018,7 +2046,14 @@ mod tests {
             }
 
             let etag = state.next_etag();
-            state.objects.insert(key, TestCatalogObjectRecord { data, etag });
+            state.objects.insert(
+                key,
+                TestCatalogObjectRecord {
+                    data,
+                    etag,
+                    mod_time: Some(OffsetDateTime::now_utc()),
+                },
+            );
             Ok(())
         }
 
@@ -2251,6 +2286,36 @@ mod tests {
         assert!(backend.object_exists(bucket, &retained).await.unwrap());
         assert!(backend.object_exists(bucket, &current).await.unwrap());
         assert!(backend.object_exists(bucket, &manifest).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn maintenance_delete_skips_recent_uncommitted_metadata_candidates() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let fresh = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        backend
+            .seed_object_with_mod_time(bucket, &fresh, br#"{"metadata-log":[]}"#.to_vec(), Some(OffsetDateTime::now_utc()))
+            .await;
+
+        let report = store
+            .delete_table_metadata_maintenance_candidates(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+
+        assert_eq!(report.cleanup_candidate_locations, vec![old.clone()]);
+        assert!(!backend.object_exists(bucket, &old).await.unwrap());
+        assert!(backend.object_exists(bucket, &fresh).await.unwrap());
     }
 
     #[tokio::test]

@@ -1076,6 +1076,7 @@ mod tests {
                 crate::table_catalog::TableCatalogObject {
                     data,
                     etag: Some("etag".to_string()),
+                    mod_time: None,
                 },
             );
         }
@@ -1116,6 +1117,7 @@ mod tests {
                 crate::table_catalog::TableCatalogObject {
                     data,
                     etag: Some("etag".to_string()),
+                    mod_time: None,
                 },
             );
             Ok(())
