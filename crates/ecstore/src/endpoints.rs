@@ -733,8 +733,13 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
                     match crate::disk::endpoint::windows_fallback_local_path(path, &err, "disk independence validation") {
                         Ok(absolute) => {
                             let abs_path = absolute.to_string_lossy().into_owned();
+                            diagnostic.canonical_path = Some(abs_path.clone());
+                            if let Ok(serial) = rustfs_utils::os::get_volume_serial_number(&abs_path) {
+                                diagnostic.device_numbers = Some(format!("serial:{serial:#010x}"));
+                            }
                             match rustfs_utils::os::get_physical_device_ids(&abs_path) {
                                 Ok(ids) => {
+                                    diagnostic.device_ids = Some(ids.clone());
                                     for device_id in ids {
                                         device_paths.entry(device_id).or_default().insert(abs_path.clone());
                                     }
@@ -745,6 +750,7 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
                                     )));
                                 }
                             }
+                            diagnostics.push(diagnostic);
                             continue;
                         }
                         Err(fallback_err) => {
@@ -772,6 +778,10 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
         #[cfg(not(windows))]
         if let Ok(stat) = rustix::fs::stat(canonical.as_path()) {
             diagnostic.device_numbers = Some(format!("{}:{}", rustix::fs::major(stat.st_dev), rustix::fs::minor(stat.st_dev)));
+        }
+        #[cfg(windows)]
+        if let Ok(serial) = rustfs_utils::os::get_volume_serial_number(&canonical_path) {
+            diagnostic.device_numbers = Some(format!("serial:{serial:#010x}"));
         }
         let device_ids = rustfs_utils::os::get_physical_device_ids(&canonical_path).map_err(|err| {
             Error::other(format!("failed to inspect physical disk for local endpoint '{canonical_path}': {err}"))
