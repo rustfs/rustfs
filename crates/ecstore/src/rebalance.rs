@@ -29,6 +29,7 @@ use http::HeaderMap;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::io::Cursor;
@@ -1676,15 +1677,16 @@ fn is_rebalance_terminal_status(status: RebalStatus) -> bool {
 }
 
 fn merge_rebalance_bucket_lists(remote: &mut Vec<String>, local: &[String]) {
+    let mut existing: HashSet<String> = remote.iter().cloned().collect();
     for bucket in local {
-        if !remote.contains(bucket) {
+        if existing.insert(bucket.clone()) {
             remote.push(bucket.clone());
         }
     }
 }
 
 fn remove_rebalanced_buckets_from_queue(pool_stat: &mut RebalanceStats) {
-    let rebalanced_buckets = pool_stat.rebalanced_buckets.clone();
+    let rebalanced_buckets: HashSet<String> = pool_stat.rebalanced_buckets.iter().cloned().collect();
     pool_stat.buckets.retain(|bucket| !rebalanced_buckets.contains(bucket));
 }
 
@@ -4299,6 +4301,47 @@ mod rebalance_unit_tests {
 
         assert_eq!(decoded.total_uncompressed, 2_097_152);
         assert_eq!(decoded.total_compressed, 2_097_152);
+    }
+
+    #[test]
+    fn test_merge_rebalance_bucket_lists_keeps_existing_order_and_skips_duplicates() {
+        let mut remote = vec!["bucket-a".to_string(), "bucket-b".to_string()];
+        let local = vec![
+            "bucket-b".to_string(),
+            "bucket-c".to_string(),
+            "bucket-c".to_string(),
+            "bucket-d".to_string(),
+        ];
+
+        super::merge_rebalance_bucket_lists(&mut remote, &local);
+
+        assert_eq!(
+            remote,
+            vec![
+                "bucket-a".to_string(),
+                "bucket-b".to_string(),
+                "bucket-c".to_string(),
+                "bucket-d".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_remove_rebalanced_buckets_from_queue_filters_membership_linearly() {
+        let mut pool_stat = RebalanceStats {
+            buckets: vec![
+                "bucket-a".to_string(),
+                "bucket-b".to_string(),
+                "bucket-c".to_string(),
+                "bucket-b".to_string(),
+            ],
+            rebalanced_buckets: vec!["bucket-b".to_string(), "bucket-d".to_string()],
+            ..Default::default()
+        };
+
+        super::remove_rebalanced_buckets_from_queue(&mut pool_stat);
+
+        assert_eq!(pool_stat.buckets, vec!["bucket-a".to_string(), "bucket-c".to_string()]);
     }
 
     #[test]
