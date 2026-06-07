@@ -769,6 +769,7 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
         };
         let canonical_path = canonical.to_string_lossy().into_owned();
         diagnostic.canonical_path = Some(canonical_path.clone());
+        #[cfg(not(windows))]
         if let Ok(stat) = rustix::fs::stat(canonical.as_path()) {
             diagnostic.device_numbers = Some(format!("{}:{}", rustix::fs::major(stat.st_dev), rustix::fs::minor(stat.st_dev)));
         }
