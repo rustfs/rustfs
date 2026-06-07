@@ -42,6 +42,10 @@ artifacts/
 PR_DESCRIPTION.md
 scripts/s3-tests/selected_tests.txt
 docs
+!docs/
+docs/*
+!docs/architecture/
+!docs/architecture/**
 
 # nix stuff
 result*
