@@ -885,7 +885,13 @@ fn handle_peer_failure(
 ) -> Option<StorageInfo> {
     let cache = cache?;
 
-    let mut c = cache.lock().unwrap();
+    let mut c = match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            warn!("peer {host} storage_info cache mutex poisoned");
+            poisoned.into_inner()
+        }
+    };
     c.storage_failures += 1;
 
     if let Some(ref cached) = c.last_storage_info
@@ -915,7 +921,13 @@ fn handle_server_info_failure(
         return initializing_server_properties(host);
     };
 
-    let mut c = cache.lock().unwrap();
+    let mut c = match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            warn!("peer {host} server_info cache mutex poisoned");
+            poisoned.into_inner()
+        }
+    };
     c.server_failures += 1;
 
     if let Some(ref cached) = c.last_server_info
@@ -1250,5 +1262,28 @@ mod tests {
         let server_result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
         assert_eq!(server_result.state, "online");
         assert_eq!(cache.lock().unwrap().server_failures, 1);
+    }
+
+    #[test]
+    fn poisoned_admin_cache_mutex_still_returns_fallbacks() {
+        let storage_cache = Mutex::new(PeerAdminCache::new());
+        let server_cache = Mutex::new(PeerAdminCache::new());
+        let endpoints = EndpointServerPools::default();
+
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = storage_cache.lock().expect("test: poison storage cache mutex");
+            panic!("poison storage cache mutex");
+        });
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = server_cache.lock().expect("test: poison server cache mutex");
+            panic!("poison server cache mutex");
+        });
+
+        let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints);
+        assert!(storage_result.is_none());
+
+        let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints);
+        assert_eq!(server_result.endpoint, "peer-1");
+        assert_eq!(server_result.state, ItemState::Initializing.to_string());
     }
 }
