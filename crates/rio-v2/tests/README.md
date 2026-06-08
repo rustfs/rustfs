@@ -30,7 +30,7 @@ Or point the tests at another generated root:
 
 ```powershell
 $env:RUSTFS_MINIO_FIXTURE_ROOT = '.\rustfs\tmp\minio-fixture-lab-smoke'
-cargo +1.95.0 test -p rustfs-rio-v2 --test minio_generated_fixtures -- --ignored
+cargo +1.96.0 test -p rustfs-rio-v2 --test minio_generated_fixtures -- --ignored
 ```
 
 ## Scope

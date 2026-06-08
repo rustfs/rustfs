@@ -19,7 +19,7 @@ inputs:
   rust-version:
     description: "Rust version to install"
     required: false
-    default: "stable"
+    default: "1.96.0"
   cache-shared-key:
     description: "Shared cache key for Rust dependencies"
     required: false
@@ -70,7 +70,7 @@ runs:
         version: "25.12.19"
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.96.0
       with:
         toolchain: ${{ inputs.rust-version }}
         targets: ${{ inputs.target }}
