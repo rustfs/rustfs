@@ -773,6 +773,14 @@ fn delete_file_info_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
     }
 }
 
+fn should_use_inline_small_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
+    is_inline_buffer && object_size > 0 && object_size <= block_size as i64
+}
+
+fn should_use_single_block_non_inline_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
+    !is_inline_buffer && object_size > 0 && object_size <= block_size as i64
+}
+
 #[async_trait::async_trait]
 impl ObjectIO for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1065,9 +1073,11 @@ impl ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let use_fast_path = is_inline_buffer && data.size() <= fi.erasure.block_size as i64;
+            let use_inline_fast_path = should_use_inline_small_fast_path(is_inline_buffer, data.size(), fi.erasure.block_size);
+            let use_single_block_non_inline_fast_path =
+                should_use_single_block_non_inline_fast_path(is_inline_buffer, data.size(), fi.erasure.block_size);
 
-            let (reader, w_size) = if use_fast_path {
+            let (reader, w_size) = if use_inline_fast_path {
                 match Arc::new(erasure)
                     .encode_inline_small(stream, &mut writers, write_quorum)
                     .await
@@ -1075,6 +1085,17 @@ impl ObjectIO for SetDisks {
                     Ok((r, w)) => (r, w),
                     Err(e) => {
                         error!("encode_inline_small err {:?}", e);
+                        return Err(e.into());
+                    }
+                }
+            } else if use_single_block_non_inline_fast_path {
+                match Arc::new(erasure)
+                    .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                    .await
+                {
+                    Ok((r, w)) => (r, w),
+                    Err(e) => {
+                        error!("encode_single_block_non_inline err {:?}", e);
                         return Err(e.into());
                     }
                 }
@@ -2971,7 +2992,16 @@ impl MultipartOperations for SetDisks {
             HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
-        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
+        let use_single_block_non_inline_fast_path =
+            should_use_single_block_non_inline_fast_path(false, data.size(), fi.erasure.block_size);
+
+        let (reader, w_size) = if use_single_block_non_inline_fast_path {
+            Arc::new(erasure)
+                .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                .await?
+        } else {
+            Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
+        }; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
 
@@ -6714,6 +6744,32 @@ mod tests {
         let version_id = Uuid::new_v4();
         assert_eq!(delete_file_info_version_id(Some(version_id)), Some(version_id));
         assert_eq!(delete_file_info_version_id(None), None);
+    }
+
+    #[test]
+    fn put_object_fast_path_selection_prefers_inline_only_when_inline_buffer_and_single_block() {
+        assert!(should_use_inline_small_fast_path(true, 1024, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(true, 1024, 4096));
+
+        assert!(!should_use_inline_small_fast_path(false, 1024, 4096));
+        assert!(should_use_single_block_non_inline_fast_path(false, 1024, 4096));
+    }
+
+    #[test]
+    fn put_object_fast_path_selection_rejects_zero_and_multi_block_payloads() {
+        assert!(!should_use_inline_small_fast_path(true, 0, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 0, 4096));
+
+        assert!(!should_use_inline_small_fast_path(true, 8192, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 8192, 4096));
+    }
+
+    #[test]
+    fn put_object_part_fast_path_selection_matches_single_block_non_inline_rules() {
+        assert!(should_use_single_block_non_inline_fast_path(false, 4096, 4096));
+        assert!(should_use_single_block_non_inline_fast_path(false, 2048, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 4097, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 0, 4096));
     }
 
     #[test]
