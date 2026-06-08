@@ -149,4 +149,7 @@ mod snowball_auto_extract_test;
 #[cfg(test)]
 mod namespace_lock_quorum_test;
 
+#[cfg(test)]
+mod admin_timeout_regression_test;
+
 pub mod tls_gen;
