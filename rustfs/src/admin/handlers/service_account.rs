@@ -416,6 +416,14 @@ fn request_user_name(cred: &StoredCredentials) -> &str {
     }
 }
 
+fn can_fallback_view_access_key_info(requester: &StoredCredentials, target: &StoredCredentials) -> bool {
+    if target.is_temp() || target.is_service_account() {
+        return request_user_name(requester) == target.parent_user;
+    }
+
+    request_user_name(requester) == target.access_key
+}
+
 async fn build_info_service_account_resp<T: IamStore>(
     iam_store: &rustfs_iam::sys::IamSys<T>,
     account: &StoredCredentials,
@@ -457,6 +465,18 @@ async fn build_info_service_account_resp<T: IamStore>(
         expiration: account.expiration,
         policy,
     })
+}
+
+fn build_info_regular_user_resp(account: &StoredCredentials, user_info: &rustfs_madmin::UserInfo) -> InfoServiceAccountResp {
+    InfoServiceAccountResp {
+        parent_user: String::new(),
+        account_status: user_info.status.as_ref().to_string(),
+        implied_policy: false,
+        policy: user_info.policy_name.clone(),
+        name: account.name.clone(),
+        description: account.description.clone(),
+        expiration: None,
+    }
 }
 
 fn guess_user_provider(credentials: &StoredCredentials) -> &'static str {
@@ -848,7 +868,7 @@ impl Operation for InfoAccessKey {
                 return Err(s3_error!(AccessDenied, "access denied"));
             };
 
-            if request_user_name(&cred) != target_cred.parent_user {
+            if !can_fallback_view_access_key_info(&cred, target_cred) {
                 return Err(s3_error!(AccessDenied, "access denied"));
             }
         }
@@ -878,7 +898,37 @@ impl Operation for InfoAccessKey {
             })?;
             ("Service Account".to_string(), session_policy)
         } else {
-            return Err(s3_error!(InvalidRequest, "access key not exist"));
+            let user_info = iam_store.get_user_info(&access_key).await.map_err(|e| {
+                debug!("get user info failed, e: {:?}", e);
+                iam_error_to_s3_error(e)
+            })?;
+
+            let user_provider = guess_user_provider(&target_cred).to_string();
+            let resp = InfoAccessKeyResp {
+                access_key,
+                info: build_info_regular_user_resp(&target_cred, &user_info),
+                user_type: "User".to_string(),
+                user_provider: user_provider.clone(),
+                ldap_specific_info: if user_provider == "ldap" {
+                    ldap_specific_info(target_cred.claims.as_ref())
+                } else {
+                    LDAPSpecificAccessKeyInfo::default()
+                },
+                open_id_specific_info: if user_provider == "openid" {
+                    openid_specific_info(target_cred.claims.as_ref())
+                } else {
+                    OpenIDSpecificAccessKeyInfo::default()
+                },
+            };
+
+            let body =
+                serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
+            let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
+
+            let mut header = HeaderMap::new();
+            header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+
+            return Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header));
         };
 
         let user_provider = guess_user_provider(&target_cred).to_string();
@@ -1622,5 +1672,74 @@ mod tests {
         assert!(!merged.contains_key("exp"));
         assert_eq!(merged.get("parent"), Some(&json!("owner-user")));
         assert_eq!(merged.get("custom"), Some(&json!("value")));
+    }
+
+    #[test]
+    fn fallback_access_key_info_allows_same_regular_user() {
+        let requester = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            ..Default::default()
+        };
+        let target = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            ..Default::default()
+        };
+
+        assert!(can_fallback_view_access_key_info(&requester, &target));
+    }
+
+    #[test]
+    fn fallback_access_key_info_allows_parent_for_derived_credentials() {
+        let requester = StoredCredentials {
+            access_key: "sts-user".to_string(),
+            session_token: "session-token".to_string(),
+            parent_user: "owner-user".to_string(),
+            ..Default::default()
+        };
+        let target = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            ..Default::default()
+        };
+
+        assert!(can_fallback_view_access_key_info(&requester, &target));
+    }
+
+    #[test]
+    fn fallback_access_key_info_denies_other_regular_user() {
+        let requester = StoredCredentials {
+            access_key: "alice".to_string(),
+            ..Default::default()
+        };
+        let target = StoredCredentials {
+            access_key: "bob".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!can_fallback_view_access_key_info(&requester, &target));
+    }
+
+    #[test]
+    fn build_info_regular_user_resp_maps_user_metadata() {
+        let account = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            name: Some("Owner".to_string()),
+            description: Some("Primary user".to_string()),
+            ..Default::default()
+        };
+        let user_info = rustfs_madmin::UserInfo {
+            policy_name: Some("readwrite".to_string()),
+            status: rustfs_madmin::AccountStatus::Enabled,
+            ..Default::default()
+        };
+
+        let resp = build_info_regular_user_resp(&account, &user_info);
+
+        assert_eq!(resp.parent_user, "");
+        assert_eq!(resp.account_status, "enabled");
+        assert!(!resp.implied_policy);
+        assert_eq!(resp.policy.as_deref(), Some("readwrite"));
+        assert_eq!(resp.name.as_deref(), Some("Owner"));
+        assert_eq!(resp.description.as_deref(), Some("Primary user"));
+        assert_eq!(resp.expiration, None);
     }
 }
