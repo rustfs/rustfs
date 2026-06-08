@@ -13,8 +13,16 @@
 // limitations under the License.
 
 pub mod admin_matrix;
+pub mod redaction;
+pub mod serde_policy;
+pub mod supply_chain;
 
 pub use admin_matrix::{
     AdminActionRef, AdminRouteAccess, AdminRouteMatrixError, AdminRouteSpec, HttpMethod, PublicRouteKind, RouteRiskLevel,
     validate_admin_route_specs,
+};
+pub use redaction::{RedactionLevel, RedactionPolicyError, RedactionRule, validate_redaction_rules};
+pub use serde_policy::{SerdePolicy, SerdePolicyError, SerdePolicyKind, UnknownFieldPolicy, validate_serde_policies};
+pub use supply_chain::{
+    ArtifactIntegrityPolicy, ArtifactSourceKind, SupplyChainPolicyError, validate_artifact_integrity_policies,
 };
