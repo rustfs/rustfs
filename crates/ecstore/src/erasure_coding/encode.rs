@@ -70,6 +70,18 @@ fn format_write_quorum_failure(summary: &WriteQuorumFailureSummary) -> String {
     )
 }
 
+fn quorum_dominant_error_metric_label(summary: &WriteQuorumFailureSummary) -> &'static str {
+    match summary.dominant_error.as_ref() {
+        Some(Error::DiskNotFound) => "disk_not_found",
+        Some(Error::ShortWrite) => "short_write",
+        Some(err) => match err.internode_http_error_kind() {
+            Some(kind) => kind.metric_label(),
+            None => "other_error",
+        },
+        None => "nil_dominated",
+    }
+}
+
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
     write_quorum: usize,
@@ -131,6 +143,8 @@ impl<'a> MultiWriter<'a> {
         if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
             let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
             let summary_text = format_write_quorum_failure(&summary);
+            rustfs_io_metrics::internode_metrics::global_internode_metrics()
+                .record_erasure_write_quorum_failure("write", quorum_dominant_error_metric_label(&summary));
             error!("reduce_write_quorum_errs: {:?}, {}, errs={:?}", write_err, summary_text, self.errs);
             return Err(std::io::Error::other(format!("Failed to write data: {summary_text}")));
         }
@@ -184,6 +198,8 @@ impl<'a> MultiWriter<'a> {
         if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
             let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
             let summary_text = format_write_quorum_failure(&summary);
+            rustfs_io_metrics::internode_metrics::global_internode_metrics()
+                .record_erasure_write_quorum_failure("shutdown", quorum_dominant_error_metric_label(&summary));
             error!(
                 "reduce_write_quorum_errs during shutdown: {:?}, {}, errs={:?}",
                 write_err, summary_text, self.errs
@@ -225,10 +241,7 @@ impl Erasure {
         }
 
         if require_single_block {
-            debug_assert!(
-                total <= self.block_size,
-                "single-block non-inline fast path expects total <= block_size"
-            );
+            debug_assert!(total <= self.block_size, "single-block non-inline fast path expects total <= block_size");
         }
 
         let shards = self.encode_data(&buf)?;

@@ -6764,10 +6764,7 @@ mod tests {
     fn put_object_fast_path_selection_prefers_inline_only_when_inline_buffer_and_single_block() {
         assert!(should_use_inline_small_fast_path(true, 1024, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(true, 1024, 4096));
-        assert!(matches!(
-            classify_small_write_path(true, 1024, 4096),
-            SmallWritePath::Inline
-        ));
+        assert!(matches!(classify_small_write_path(true, 1024, 4096), SmallWritePath::Inline));
 
         assert!(!should_use_inline_small_fast_path(false, 1024, 4096));
         assert!(should_use_single_block_non_inline_fast_path(false, 1024, 4096));
@@ -6785,10 +6782,7 @@ mod tests {
 
         assert!(!should_use_inline_small_fast_path(true, 8192, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(false, 8192, 4096));
-        assert!(matches!(
-            classify_small_write_path(false, 8192, 4096),
-            SmallWritePath::Pipeline
-        ));
+        assert!(matches!(classify_small_write_path(false, 8192, 4096), SmallWritePath::Pipeline));
     }
 
     #[test]

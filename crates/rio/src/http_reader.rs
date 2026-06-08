@@ -83,6 +83,24 @@ impl InternodeHttpErrorKind {
             Self::HttpStatus(_) | Self::Unknown => io::ErrorKind::Other,
         }
     }
+
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            Self::ConnectTimeout => "connect_timeout",
+            Self::ConnectionRefused => "connection_refused",
+            Self::DnsResolutionFailed => "dns_resolution_failed",
+            Self::ConnectionReset => "connection_reset",
+            Self::BodyStreamAborted => "body_stream_aborted",
+            Self::HttpStatus(status) => match status.as_u16() {
+                429 => "http_429",
+                502 => "http_502",
+                503 => "http_503",
+                504 => "http_504",
+                _ => "http_status_other",
+            },
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 impl std::fmt::Display for InternodeHttpErrorKind {
@@ -445,11 +463,13 @@ impl HttpReader {
 
         let resp = request.send().await.map_err(|e| {
             record_internode_error(track_internode_metrics, internode_operation);
+            record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
             internode_reqwest_error(&method, &url, internode_operation, e)
         })?;
 
         if resp.status().is_success().not() {
             record_internode_error(track_internode_metrics, internode_operation);
+            record_internode_classified_error(track_internode_metrics, internode_operation, classify_http_status(resp.status()));
             return Err(internode_status_error(&method, &url, internode_operation, resp.status()));
         }
 
@@ -459,6 +479,7 @@ impl HttpReader {
         let stream_error_method = method.clone();
         let stream = resp.bytes_stream().map_err(move |e| {
             record_internode_error(track_internode_metrics, internode_operation);
+            record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
             internode_reqwest_error(&stream_error_method, &stream_error_url, internode_operation, e)
         });
 
@@ -632,6 +653,11 @@ impl HttpWriter {
                     // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
                         record_internode_error(track_internode_metrics, internode_operation);
+                        record_internode_classified_error(
+                            track_internode_metrics,
+                            internode_operation,
+                            classify_http_status(resp.status()),
+                        );
                         let io_err = internode_status_error(&method_clone, &url_clone, internode_operation, resp.status());
                         let _ = err_tx.send(Error::new(io_err.kind(), io_err.to_string()));
                         return Err(io_err);
@@ -639,6 +665,7 @@ impl HttpWriter {
                 }
                 Err(e) => {
                     record_internode_error(track_internode_metrics, internode_operation);
+                    record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
                     let io_err = internode_reqwest_error(&method_clone, &url_clone, internode_operation, e);
                     let _ = err_tx.send(Error::new(io_err.kind(), io_err.to_string()));
                     return Err(io_err);
@@ -742,6 +769,20 @@ fn record_internode_error(track: bool, operation: Option<&'static str>) {
             global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
         }
         None => global_internode_metrics().record_error(),
+    }
+}
+
+fn record_internode_classified_error(track: bool, operation: Option<&'static str>, classification: InternodeHttpErrorKind) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        global_internode_metrics().record_classified_error_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            classification.metric_label(),
+        );
     }
 }
 

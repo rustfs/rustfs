@@ -30,11 +30,18 @@ pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
+const CLASSIFICATION_LABEL: &str = "classification";
+const STAGE_LABEL: &str = "stage";
+const DOMINANT_ERROR_LABEL: &str = "dominant_error";
 const INTERNODE_OPERATION_SENT_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_sent_bytes_total";
 const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_recv_bytes_total";
 const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
 const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_incoming_total";
 const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
+const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
+const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
+const INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL: &str = "rustfs_system_network_internode_operation_retry_successes_total";
+const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InternodeOperationMetricDescriptor {
@@ -43,6 +50,8 @@ pub struct InternodeOperationMetricDescriptor {
 }
 
 const OPERATION_BACKEND_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL];
+const OPERATION_BACKEND_CLASSIFICATION_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL];
+const QUORUM_FAILURE_LABELS: &[&str] = &[STAGE_LABEL, DOMINANT_ERROR_LABEL];
 
 pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &[
     InternodeOperationMetricDescriptor {
@@ -64,6 +73,22 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_ERRORS_TOTAL,
         labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL,
+        labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_RETRIES_TOTAL,
+        labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL,
+        labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
+        labels: QUORUM_FAILURE_LABELS,
     },
 ];
 
@@ -181,6 +206,60 @@ impl InternodeMetrics {
     pub fn record_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_error();
         counter!(INTERNODE_OPERATION_ERRORS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
+    }
+
+    pub fn record_classified_error_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        classification: &'static str,
+    ) {
+        counter!(
+            INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL,
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            CLASSIFICATION_LABEL => classification
+        )
+        .increment(1);
+    }
+
+    pub fn record_retry_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        classification: &'static str,
+    ) {
+        counter!(
+            INTERNODE_OPERATION_RETRIES_TOTAL,
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            CLASSIFICATION_LABEL => classification
+        )
+        .increment(1);
+    }
+
+    pub fn record_retry_success_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        classification: &'static str,
+    ) {
+        counter!(
+            INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL,
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            CLASSIFICATION_LABEL => classification
+        )
+        .increment(1);
+    }
+
+    pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
+        counter!(
+            ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
+            STAGE_LABEL => stage,
+            DOMINANT_ERROR_LABEL => dominant_error
+        )
+        .increment(1);
     }
 
     pub fn record_dial_result(&self, duration: Duration, success: bool) {
@@ -303,10 +382,14 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 5);
-        for metric in INTERNODE_OPERATION_METRICS {
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 9);
+        for metric in &INTERNODE_OPERATION_METRICS[..5] {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
         }
+        for metric in &INTERNODE_OPERATION_METRICS[5..8] {
+            assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL]);
+        }
+        assert_eq!(INTERNODE_OPERATION_METRICS[8].labels, &[STAGE_LABEL, DOMINANT_ERROR_LABEL]);
     }
 
     #[test]
@@ -322,29 +405,48 @@ mod tests {
         assert_eq!(INTERNODE_TRANSPORT_BACKEND_UNKNOWN, "unknown");
 
         assert_eq!(
-            INTERNODE_OPERATION_METRICS,
-            &[
-                InternodeOperationMetricDescriptor {
-                    name: "rustfs_system_network_internode_operation_sent_bytes_total",
-                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
-                },
-                InternodeOperationMetricDescriptor {
-                    name: "rustfs_system_network_internode_operation_recv_bytes_total",
-                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
-                },
-                InternodeOperationMetricDescriptor {
-                    name: "rustfs_system_network_internode_operation_requests_outgoing_total",
-                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
-                },
-                InternodeOperationMetricDescriptor {
-                    name: "rustfs_system_network_internode_operation_requests_incoming_total",
-                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
-                },
-                InternodeOperationMetricDescriptor {
-                    name: "rustfs_system_network_internode_operation_errors_total",
-                    labels: &[OPERATION_LABEL, BACKEND_LABEL],
-                },
-            ]
+            INTERNODE_OPERATION_METRICS[5].name,
+            "rustfs_system_network_internode_operation_classified_errors_total"
         );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[6].name,
+            "rustfs_system_network_internode_operation_retries_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[7].name,
+            "rustfs_system_network_internode_operation_retry_successes_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[8].name,
+            "rustfs_system_storage_erasure_write_quorum_failures_total"
+        );
+    }
+
+    #[test]
+    fn classified_and_retry_metrics_update_counters() {
+        let metrics = InternodeMetrics::default();
+
+        metrics.record_classified_error_for_operation_and_backend(
+            INTERNODE_OPERATION_PUT_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            "connection_reset",
+        );
+        metrics.record_retry_for_operation_and_backend(
+            INTERNODE_OPERATION_PUT_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            "connection_reset",
+        );
+        metrics.record_retry_success_for_operation_and_backend(
+            INTERNODE_OPERATION_PUT_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            "connection_reset",
+        );
+        metrics.record_erasure_write_quorum_failure("write", "connection_reset");
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.sent_bytes_total, 0);
+        assert_eq!(snapshot.recv_bytes_total, 0);
+        assert_eq!(snapshot.outgoing_requests_total, 0);
+        assert_eq!(snapshot.incoming_requests_total, 0);
     }
 }

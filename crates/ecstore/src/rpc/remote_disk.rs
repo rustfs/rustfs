@@ -36,7 +36,7 @@ use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
-    global_internode_metrics,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
@@ -165,10 +165,31 @@ impl RemoteDisk {
 
     async fn open_write_with_retry(&self, request: WriteStreamRequest) -> Result<FileWriter> {
         let mut attempt = 1;
+        let mut last_retry_classification = None;
         loop {
             match self.data_transport.open_write(request.clone()).await {
-                Ok(writer) => return Ok(writer),
+                Ok(writer) => {
+                    if attempt > 1
+                        && let Some(classification) = last_retry_classification
+                    {
+                        global_internode_metrics().record_retry_success_for_operation_and_backend(
+                            rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM,
+                            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+                            classification,
+                        );
+                    }
+                    return Ok(writer);
+                }
                 Err(err) if attempt < REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS && Self::is_retryable_open_write_error(&err) => {
+                    if let Some(classification) = err.internode_http_error_kind() {
+                        let classification = classification.metric_label();
+                        global_internode_metrics().record_retry_for_operation_and_backend(
+                            rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM,
+                            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+                            classification,
+                        );
+                        last_retry_classification = Some(classification);
+                    }
                     debug!(
                         endpoint = %request.endpoint,
                         volume = %request.volume,
@@ -2377,6 +2398,7 @@ mod tests {
             OpenWriteTestStep::Success,
         ]);
         let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        rustfs_io_metrics::internode_metrics::global_internode_metrics().reset_for_test();
 
         let _created = remote_disk
             .create_file("orig-bucket", "bucket", "object/part.1", 4096)
@@ -2385,6 +2407,8 @@ mod tests {
 
         let calls = transport.calls();
         assert_eq!(calls.len(), 2, "create_file should retry exactly once");
+        let snapshot = rustfs_io_metrics::internode_metrics::global_internode_metrics().snapshot();
+        assert_eq!(snapshot.outgoing_requests_total, 0);
     }
 
     #[tokio::test]
