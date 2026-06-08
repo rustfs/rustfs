@@ -45,7 +45,7 @@ use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime};
@@ -267,6 +267,22 @@ fn cache_root_entry_info(cache: &DataUsageCache) -> DataUsageEntryInfo {
         parent: DATA_USAGE_ROOT.to_string(),
         entry,
     }
+}
+
+fn apply_bucket_result_to_cache(
+    cache: &mut DataUsageCache,
+    result: DataUsageEntryInfo,
+    update_time: SystemTime,
+    publish_immediately: bool,
+) -> bool {
+    cache.replace(&result.name, &result.parent, result.entry);
+    cache.info.last_update = Some(update_time);
+
+    publish_immediately
+}
+
+fn bucket_result_should_publish_immediately(published_buckets: &mut HashSet<String>, bucket_name: &str) -> bool {
+    published_buckets.insert(bucket_name.to_string())
 }
 
 async fn send_cache_root_entry_info(
@@ -620,6 +636,7 @@ impl ScannerIOCache for SetDisks {
 
         let mut permutes = buckets.clone();
         permutes.shuffle(&mut rand::rng());
+        let mut preloaded_published_buckets = HashSet::new();
 
         for bucket in permutes.iter() {
             if old_cache.find(&bucket.name).is_none()
@@ -632,6 +649,9 @@ impl ScannerIOCache for SetDisks {
         for bucket in permutes.iter() {
             if let Some(c) = old_cache.find(&bucket.name) {
                 cache.replace(&bucket.name, DATA_USAGE_ROOT, c.clone());
+                if old_cache.info.last_update.is_some() {
+                    preloaded_published_buckets.insert(bucket.name.clone());
+                }
 
                 if let Err(e) = bucket_tx.send(bucket.clone()).await {
                     error!("Failed to send bucket info: {}", e);
@@ -677,10 +697,21 @@ impl ScannerIOCache for SetDisks {
                     }
                     res =  bucket_result_rx.recv() => {
                         if let Some(result) = res {
-                            let mut cache = cache_mutex_clone.lock().await;
-                            cache.replace(&result.name, &result.parent, result.entry);
-                            cache.info.last_update = Some(SystemTime::now());
+                            let cache_snapshot = {
+                                let mut cache = cache_mutex_clone.lock().await;
+                                let publish_immediately =
+                                    bucket_result_should_publish_immediately(&mut preloaded_published_buckets, &result.name);
+                                if apply_bucket_result_to_cache(&mut cache, result, SystemTime::now(), publish_immediately) {
+                                    Some(cache.clone())
+                                } else {
+                                    None
+                                }
+                            };
 
+                            if let Some(cache_snapshot) = cache_snapshot {
+                                last_update =
+                                    persist_and_publish_cache_snapshot(store_clone.clone(), &updates, cache_snapshot).await;
+                            }
                         } else {
                             let cache_snapshot = {
                                 let mut cache = cache_mutex_clone.lock().await;
@@ -1257,5 +1288,127 @@ mod tests {
         assert_eq!(info.parent, DATA_USAGE_ROOT);
         assert_eq!(info.entry.size, 10);
         assert_eq!(info.entry.objects, 1);
+    }
+
+    #[test]
+    fn apply_bucket_result_requests_immediate_publish_for_missing_bucket() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let should_publish = apply_bucket_result_to_cache(
+            &mut cache,
+            DataUsageEntryInfo {
+                name: "bucket".to_string(),
+                parent: DATA_USAGE_ROOT.to_string(),
+                entry: DataUsageEntry {
+                    size: 10,
+                    objects: 1,
+                    ..Default::default()
+                },
+            },
+            SystemTime::now(),
+            true,
+        );
+
+        assert!(should_publish);
+        assert!(cache.info.last_update.is_some());
+        let entry = cache.find("bucket").expect("bucket entry should be inserted");
+        assert_eq!(entry.size, 10);
+        assert_eq!(entry.objects, 1);
+    }
+
+    #[test]
+    fn apply_bucket_result_defers_publish_for_existing_published_bucket() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                last_update: Some(SystemTime::now()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: 5,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let should_publish = apply_bucket_result_to_cache(
+            &mut cache,
+            DataUsageEntryInfo {
+                name: "bucket".to_string(),
+                parent: DATA_USAGE_ROOT.to_string(),
+                entry: DataUsageEntry {
+                    size: 10,
+                    objects: 2,
+                    ..Default::default()
+                },
+            },
+            SystemTime::now(),
+            false,
+        );
+
+        assert!(!should_publish);
+        let entry = cache.find("bucket").expect("bucket entry should remain present");
+        assert_eq!(entry.size, 10);
+        assert_eq!(entry.objects, 2);
+    }
+
+    #[test]
+    fn apply_bucket_result_defers_publish_for_preloaded_published_bucket() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: 5,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let should_publish = apply_bucket_result_to_cache(
+            &mut cache,
+            DataUsageEntryInfo {
+                name: "bucket".to_string(),
+                parent: DATA_USAGE_ROOT.to_string(),
+                entry: DataUsageEntry {
+                    size: 10,
+                    objects: 2,
+                    ..Default::default()
+                },
+            },
+            SystemTime::now(),
+            false,
+        );
+
+        assert!(!should_publish);
+        let entry = cache.find("bucket").expect("bucket entry should remain present");
+        assert_eq!(entry.size, 10);
+        assert_eq!(entry.objects, 2);
+    }
+
+    #[test]
+    fn bucket_result_immediate_publish_tracks_preloaded_and_current_results() {
+        let mut published_buckets = HashSet::from(["existing".to_string()]);
+
+        assert!(!bucket_result_should_publish_immediately(&mut published_buckets, "existing"));
+        assert!(bucket_result_should_publish_immediately(&mut published_buckets, "missing"));
+        assert!(!bucket_result_should_publish_immediately(&mut published_buckets, "missing"));
     }
 }
