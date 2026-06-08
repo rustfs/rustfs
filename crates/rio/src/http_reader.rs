@@ -47,6 +47,162 @@ const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InternodeHttpErrorKind {
+    ConnectTimeout,
+    ConnectionRefused,
+    DnsResolutionFailed,
+    ConnectionReset,
+    BodyStreamAborted,
+    HttpStatus(reqwest::StatusCode),
+    Unknown,
+}
+
+impl InternodeHttpErrorKind {
+    pub fn is_retryable(self) -> bool {
+        match self {
+            Self::ConnectTimeout | Self::ConnectionRefused | Self::ConnectionReset | Self::BodyStreamAborted => true,
+            Self::HttpStatus(status) => matches!(
+                status,
+                reqwest::StatusCode::TOO_MANY_REQUESTS
+                    | reqwest::StatusCode::BAD_GATEWAY
+                    | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    | reqwest::StatusCode::GATEWAY_TIMEOUT
+            ),
+            Self::DnsResolutionFailed | Self::Unknown => false,
+        }
+    }
+
+    fn io_error_kind(self) -> io::ErrorKind {
+        match self {
+            Self::ConnectTimeout => io::ErrorKind::TimedOut,
+            Self::ConnectionRefused => io::ErrorKind::ConnectionRefused,
+            Self::DnsResolutionFailed => io::ErrorKind::AddrNotAvailable,
+            Self::ConnectionReset => io::ErrorKind::ConnectionReset,
+            Self::BodyStreamAborted => io::ErrorKind::BrokenPipe,
+            Self::HttpStatus(_) | Self::Unknown => io::ErrorKind::Other,
+        }
+    }
+
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            Self::ConnectTimeout => "connect_timeout",
+            Self::ConnectionRefused => "connection_refused",
+            Self::DnsResolutionFailed => "dns_resolution_failed",
+            Self::ConnectionReset => "connection_reset",
+            Self::BodyStreamAborted => "body_stream_aborted",
+            Self::HttpStatus(status) => match status.as_u16() {
+                429 => "http_429",
+                502 => "http_502",
+                503 => "http_503",
+                504 => "http_504",
+                _ => "http_status_other",
+            },
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for InternodeHttpErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectTimeout => write!(f, "internode connect timeout"),
+            Self::ConnectionRefused => write!(f, "internode connection refused"),
+            Self::DnsResolutionFailed => write!(f, "internode dns resolution failed"),
+            Self::ConnectionReset => write!(f, "internode connection reset"),
+            Self::BodyStreamAborted => write!(f, "internode body stream aborted"),
+            Self::HttpStatus(status) => write!(f, "internode http status {status}"),
+            Self::Unknown => write!(f, "internode request failed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InternodeHttpRequestContext {
+    method: String,
+    target: String,
+    operation: Option<&'static str>,
+}
+
+impl InternodeHttpRequestContext {
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn operation(&self) -> Option<&'static str> {
+        self.operation
+    }
+}
+
+impl std::fmt::Display for InternodeHttpRequestContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.method, self.target)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{kind}: {context}")]
+pub struct InternodeHttpError {
+    kind: InternodeHttpErrorKind,
+    context: InternodeHttpRequestContext,
+    #[source]
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl InternodeHttpError {
+    pub fn kind(&self) -> InternodeHttpErrorKind {
+        self.kind
+    }
+
+    pub fn context(&self) -> &InternodeHttpRequestContext {
+        &self.context
+    }
+
+    fn new(kind: InternodeHttpErrorKind, context: InternodeHttpRequestContext) -> Self {
+        Self {
+            kind,
+            context,
+            source: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn new_for_test(kind: InternodeHttpErrorKind) -> Self {
+        Self::new(
+            kind,
+            InternodeHttpRequestContext {
+                method: "PUT".to_string(),
+                target: "/rustfs/rpc/put_file_stream".to_string(),
+                operation: Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+            },
+        )
+    }
+
+    fn with_source<E>(kind: InternodeHttpErrorKind, context: InternodeHttpRequestContext, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self {
+            kind,
+            context,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    fn into_io_error(self) -> io::Error {
+        io::Error::new(self.kind.io_error_kind(), self)
+    }
+}
+
+#[doc(hidden)]
+pub fn new_test_internode_http_io_error(kind: InternodeHttpErrorKind) -> io::Error {
+    InternodeHttpError::new_for_test(kind).into_io_error()
+}
+
 fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[Vec<u8>]) -> reqwest::ClientBuilder {
     let mut b = builder;
     for der in certs_der {
@@ -189,6 +345,75 @@ async fn get_http_client(url: &str) -> Client {
     return_client
 }
 
+fn internode_request_context(method: &Method, url: &str, operation: Option<&'static str>) -> InternodeHttpRequestContext {
+    let target = reqwest::Url::parse(url)
+        .ok()
+        .map(|parsed| match parsed.query() {
+            Some(query) => format!("{}?{query}", parsed.path()),
+            None => parsed.path().to_string(),
+        })
+        .unwrap_or_else(|| url.to_string());
+    InternodeHttpRequestContext {
+        method: method.to_string(),
+        target,
+        operation,
+    }
+}
+
+fn classify_reqwest_error(err: &reqwest::Error) -> InternodeHttpErrorKind {
+    if err.is_timeout() {
+        return InternodeHttpErrorKind::ConnectTimeout;
+    }
+
+    let message = err.to_string().to_ascii_lowercase();
+    if err.is_connect() {
+        if message.contains("dns")
+            || message.contains("name or service not known")
+            || message.contains("failed to lookup address")
+        {
+            return InternodeHttpErrorKind::DnsResolutionFailed;
+        }
+        if message.contains("refused") {
+            return InternodeHttpErrorKind::ConnectionRefused;
+        }
+    }
+
+    if message.contains("connection reset") || message.contains("broken pipe") || message.contains("connection aborted") {
+        return InternodeHttpErrorKind::ConnectionReset;
+    }
+    if message.contains("body") || message.contains("stream") {
+        return InternodeHttpErrorKind::BodyStreamAborted;
+    }
+
+    InternodeHttpErrorKind::Unknown
+}
+
+fn classify_http_status(status: reqwest::StatusCode) -> InternodeHttpErrorKind {
+    InternodeHttpErrorKind::HttpStatus(status)
+}
+
+fn internode_reqwest_error(method: &Method, url: &str, operation: Option<&'static str>, err: reqwest::Error) -> io::Error {
+    let context = internode_request_context(method, url, operation);
+    let classified = classify_reqwest_error(&err);
+    InternodeHttpError::with_source(classified, context, err).into_io_error()
+}
+
+fn internode_classified_error(
+    method: &Method,
+    url: &str,
+    operation: Option<&'static str>,
+    kind: InternodeHttpErrorKind,
+) -> io::Error {
+    let context = internode_request_context(method, url, operation);
+    InternodeHttpError::new(kind, context).into_io_error()
+}
+
+fn internode_status_error(method: &Method, url: &str, operation: Option<&'static str>, status: reqwest::StatusCode) -> io::Error {
+    let context = internode_request_context(method, url, operation);
+    let classified = classify_http_status(status);
+    InternodeHttpError::new(classified, context).into_io_error()
+}
+
 pin_project! {
     pub struct HttpReader {
         url:String,
@@ -248,15 +473,14 @@ impl HttpReader {
 
         let resp = request.send().await.map_err(|e| {
             record_internode_error(track_internode_metrics, internode_operation);
-            Error::other(format!("HttpReader HTTP request error for {method} {url}: {e}"))
+            record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
+            internode_reqwest_error(&method, &url, internode_operation, e)
         })?;
 
         if resp.status().is_success().not() {
             record_internode_error(track_internode_metrics, internode_operation);
-            return Err(Error::other(format!(
-                "HttpReader HTTP request failed for {method} {url} with non-200 status {}",
-                resp.status(),
-            )));
+            record_internode_classified_error(track_internode_metrics, internode_operation, classify_http_status(resp.status()));
+            return Err(internode_status_error(&method, &url, internode_operation, resp.status()));
         }
 
         record_internode_outgoing_request(track_internode_metrics, internode_operation);
@@ -265,7 +489,8 @@ impl HttpReader {
         let stream_error_method = method.clone();
         let stream = resp.bytes_stream().map_err(move |e| {
             record_internode_error(track_internode_metrics, internode_operation);
-            Error::other(format!("HttpReader stream error for {stream_error_method} {stream_error_url}: {e}"))
+            record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
+            internode_reqwest_error(&stream_error_method, &stream_error_url, internode_operation, e)
         });
 
         Ok(Self {
@@ -426,7 +651,7 @@ impl HttpWriter {
 
             let client = get_http_client(&url_clone).await;
             let request = client
-                .request(method_clone, url_clone.clone())
+                .request(method_clone.clone(), url_clone.clone())
                 .headers(headers_clone.clone())
                 .body(body);
 
@@ -438,18 +663,24 @@ impl HttpWriter {
                     // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
                         record_internode_error(track_internode_metrics, internode_operation);
-                        let _ = err_tx.send(Error::other(format!(
-                            "HttpWriter HTTP request failed with non-200 status {}",
-                            resp.status()
-                        )));
-                        return Err(Error::other(format!("HTTP request failed with non-200 status {}", resp.status())));
+                        record_internode_classified_error(
+                            track_internode_metrics,
+                            internode_operation,
+                            classify_http_status(resp.status()),
+                        );
+                        let status = resp.status();
+                        let io_err = internode_status_error(&method_clone, &url_clone, internode_operation, status);
+                        let _ = err_tx.send(internode_status_error(&method_clone, &url_clone, internode_operation, status));
+                        return Err(io_err);
                     }
                 }
                 Err(e) => {
                     record_internode_error(track_internode_metrics, internode_operation);
-                    // http_log!("[HttpWriter::spawn] HTTP request error: {e}");
-                    let _ = err_tx.send(Error::other(format!("HTTP request failed: {e}")));
-                    return Err(Error::other(format!("HTTP request failed: {e}")));
+                    let classified = classify_reqwest_error(&e);
+                    record_internode_classified_error(track_internode_metrics, internode_operation, classified);
+                    let _ = err_tx.send(internode_classified_error(&method_clone, &url_clone, internode_operation, classified));
+                    let io_err = internode_reqwest_error(&method_clone, &url_clone, internode_operation, e);
+                    return Err(io_err);
                 }
             }
 
@@ -550,6 +781,20 @@ fn record_internode_error(track: bool, operation: Option<&'static str>) {
             global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
         }
         None => global_internode_metrics().record_error(),
+    }
+}
+
+fn record_internode_classified_error(track: bool, operation: Option<&'static str>, classification: InternodeHttpErrorKind) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        global_internode_metrics().record_classified_error_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            classification.metric_label(),
+        );
     }
 }
 
@@ -915,9 +1160,72 @@ mod tests {
             Err(err) => err,
         };
 
-        let err_text = err.to_string();
-        assert!(err_text.contains("HttpReader HTTP request error for GET"));
-        assert!(err_text.contains(&url));
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("expected InternodeHttpError source");
+        assert_eq!(source.context().method(), "GET");
+        assert!(source.context().target().contains("/stream"));
+    }
+
+    #[test]
+    fn classify_http_status_marks_retryable_gateway_errors() {
+        let unavailable = classify_http_status(reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let bad_gateway = classify_http_status(reqwest::StatusCode::BAD_GATEWAY);
+        let bad_request = classify_http_status(reqwest::StatusCode::BAD_REQUEST);
+
+        assert!(unavailable.is_retryable());
+        assert!(bad_gateway.is_retryable());
+        assert!(!bad_request.is_retryable());
+    }
+
+    #[test]
+    fn dns_resolution_error_uses_network_io_kind() {
+        let err = internode_classified_error(
+            &Method::GET,
+            "http://missing.invalid/rustfs/rpc/read_file_stream",
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+            InternodeHttpErrorKind::DnsResolutionFailed,
+        );
+
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+        assert!(err.to_string().contains("internode dns resolution failed"));
+        assert!(err.to_string().contains("GET /rustfs/rpc/read_file_stream"));
+    }
+
+    #[test]
+    fn internode_status_error_preserves_classification_source_and_context() {
+        let err = internode_status_error(
+            &Method::PUT,
+            "http://node:9000/rustfs/rpc/put_file_stream?disk=disk-a",
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        );
+
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("expected status error to carry InternodeHttpError source");
+        assert_eq!(
+            source.kind(),
+            InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(source.context().method(), "PUT");
+        assert!(source.context().target().contains(PUT_FILE_STREAM_PATH));
+    }
+
+    #[test]
+    fn test_internode_http_error_test_helper_is_retryable() {
+        let err = new_test_internode_http_io_error(InternodeHttpErrorKind::ConnectionReset);
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("expected test helper to carry InternodeHttpError source");
+
+        assert_eq!(source.kind(), InternodeHttpErrorKind::ConnectionReset);
+        assert!(source.kind().is_retryable());
+        assert_eq!(source.context().method(), "PUT");
+        assert!(source.context().target().contains(PUT_FILE_STREAM_PATH));
     }
 
     #[test]
