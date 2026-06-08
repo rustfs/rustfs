@@ -205,6 +205,39 @@ impl<'a> MultiWriter<'a> {
 }
 
 impl Erasure {
+    async fn encode_small_direct<R>(
+        self: Arc<Self>,
+        mut reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+        require_single_block: bool,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::with_capacity(self.block_size);
+        let total = reader.read_to_end(&mut buf).await?;
+
+        if total == 0 {
+            return Ok((reader, 0));
+        }
+
+        if require_single_block {
+            debug_assert!(
+                total <= self.block_size,
+                "single-block non-inline fast path expects total <= block_size"
+            );
+        }
+
+        let shards = self.encode_data(&buf)?;
+        let mut mw = MultiWriter::new(writers, quorum);
+        mw.write(shards).await?;
+        mw.shutdown().await?;
+        Ok((reader, total))
+    }
+
     pub async fn encode<R>(
         self: Arc<Self>,
         mut reader: R,
@@ -312,56 +345,28 @@ impl Erasure {
     /// Reads all data, encodes directly, writes shards sequentially.
     pub async fn encode_inline_small<R>(
         self: Arc<Self>,
-        mut reader: R,
+        reader: R,
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        use tokio::io::AsyncReadExt;
-
-        let mut buf = Vec::with_capacity(self.block_size);
-        let total = reader.read_to_end(&mut buf).await?;
-
-        if total == 0 {
-            return Ok((reader, 0));
-        }
-
-        let shards = self.encode_data(&buf)?;
-        let mut mw = MultiWriter::new(writers, quorum);
-        mw.write(shards).await?;
-        mw.shutdown().await?;
-        Ok((reader, total))
+        self.encode_small_direct(reader, writers, quorum, false).await
     }
 
     /// Fast path for single-block non-inline objects: avoids the producer/consumer
     /// pipeline in `encode()` while keeping the same writer/quorum/shutdown semantics.
     pub async fn encode_single_block_non_inline<R>(
         self: Arc<Self>,
-        mut reader: R,
+        reader: R,
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        use tokio::io::AsyncReadExt;
-
-        let mut buf = Vec::with_capacity(self.block_size);
-        let total = reader.read_to_end(&mut buf).await?;
-
-        if total == 0 {
-            return Ok((reader, 0));
-        }
-
-        debug_assert!(total <= self.block_size, "single-block non-inline fast path expects total <= block_size");
-
-        let shards = self.encode_data(&buf)?;
-        let mut mw = MultiWriter::new(writers, quorum);
-        mw.write(shards).await?;
-        mw.shutdown().await?;
-        Ok((reader, total))
+        self.encode_small_direct(reader, writers, quorum, true).await
     }
 }
 

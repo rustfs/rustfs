@@ -781,6 +781,22 @@ fn should_use_single_block_non_inline_fast_path(is_inline_buffer: bool, object_s
     !is_inline_buffer && object_size > 0 && object_size <= block_size as i64
 }
 
+enum SmallWritePath {
+    Inline,
+    SingleBlockNonInline,
+    Pipeline,
+}
+
+fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
+    if should_use_inline_small_fast_path(is_inline_buffer, object_size, block_size) {
+        SmallWritePath::Inline
+    } else if should_use_single_block_non_inline_fast_path(is_inline_buffer, object_size, block_size) {
+        SmallWritePath::SingleBlockNonInline
+    } else {
+        SmallWritePath::Pipeline
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectIO for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1073,12 +1089,10 @@ impl ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let use_inline_fast_path = should_use_inline_small_fast_path(is_inline_buffer, data.size(), fi.erasure.block_size);
-            let use_single_block_non_inline_fast_path =
-                should_use_single_block_non_inline_fast_path(is_inline_buffer, data.size(), fi.erasure.block_size);
+            let write_path = classify_small_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
 
-            let (reader, w_size) = if use_inline_fast_path {
-                match Arc::new(erasure)
+            let (reader, w_size) = match write_path {
+                SmallWritePath::Inline => match Arc::new(erasure)
                     .encode_inline_small(stream, &mut writers, write_quorum)
                     .await
                 {
@@ -1087,9 +1101,8 @@ impl ObjectIO for SetDisks {
                         error!("encode_inline_small err {:?}", e);
                         return Err(e.into());
                     }
-                }
-            } else if use_single_block_non_inline_fast_path {
-                match Arc::new(erasure)
+                },
+                SmallWritePath::SingleBlockNonInline => match Arc::new(erasure)
                     .encode_single_block_non_inline(stream, &mut writers, write_quorum)
                     .await
                 {
@@ -1098,15 +1111,14 @@ impl ObjectIO for SetDisks {
                         error!("encode_single_block_non_inline err {:?}", e);
                         return Err(e.into());
                     }
-                }
-            } else {
-                match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
+                },
+                SmallWritePath::Pipeline => match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
                     Ok((r, w)) => (r, w),
                     Err(e) => {
                         error!("encode err {:?}", e);
                         return Err(e.into());
                     }
-                }
+                },
             };
 
             let _ = mem::replace(&mut data.stream, reader);
@@ -2992,15 +3004,17 @@ impl MultipartOperations for SetDisks {
             HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
-        let use_single_block_non_inline_fast_path =
-            should_use_single_block_non_inline_fast_path(false, data.size(), fi.erasure.block_size);
+        let write_path = classify_small_write_path(false, data.size(), fi.erasure.block_size);
 
-        let (reader, w_size) = if use_single_block_non_inline_fast_path {
-            Arc::new(erasure)
-                .encode_single_block_non_inline(stream, &mut writers, write_quorum)
-                .await?
-        } else {
-            Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
+        let (reader, w_size) = match write_path {
+            SmallWritePath::SingleBlockNonInline => {
+                Arc::new(erasure)
+                    .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                    .await?
+            }
+            SmallWritePath::Inline | SmallWritePath::Pipeline => {
+                Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
+            }
         }; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
@@ -6750,18 +6764,31 @@ mod tests {
     fn put_object_fast_path_selection_prefers_inline_only_when_inline_buffer_and_single_block() {
         assert!(should_use_inline_small_fast_path(true, 1024, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(true, 1024, 4096));
+        assert!(matches!(
+            classify_small_write_path(true, 1024, 4096),
+            SmallWritePath::Inline
+        ));
 
         assert!(!should_use_inline_small_fast_path(false, 1024, 4096));
         assert!(should_use_single_block_non_inline_fast_path(false, 1024, 4096));
+        assert!(matches!(
+            classify_small_write_path(false, 1024, 4096),
+            SmallWritePath::SingleBlockNonInline
+        ));
     }
 
     #[test]
     fn put_object_fast_path_selection_rejects_zero_and_multi_block_payloads() {
         assert!(!should_use_inline_small_fast_path(true, 0, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(false, 0, 4096));
+        assert!(matches!(classify_small_write_path(true, 0, 4096), SmallWritePath::Pipeline));
 
         assert!(!should_use_inline_small_fast_path(true, 8192, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(false, 8192, 4096));
+        assert!(matches!(
+            classify_small_write_path(false, 8192, 4096),
+            SmallWritePath::Pipeline
+        ));
     }
 
     #[test]
@@ -6770,6 +6797,10 @@ mod tests {
         assert!(should_use_single_block_non_inline_fast_path(false, 2048, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(false, 4097, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(false, 0, 4096));
+        assert!(matches!(
+            classify_small_write_path(false, 4096, 4096),
+            SmallWritePath::SingleBlockNonInline
+        ));
     }
 
     #[test]
