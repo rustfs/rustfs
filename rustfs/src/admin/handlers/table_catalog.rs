@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::{
-    auth::validate_admin_request,
+    auth::{validate_admin_request, validate_admin_request_with_bucket},
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
@@ -241,6 +241,26 @@ async fn authorize_table_catalog_request(req: &S3Request<Body>, action: AdminAct
         false,
         vec![Action::AdminAction(action)],
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+    )
+    .await
+}
+
+async fn authorize_table_catalog_warehouse_request(req: &S3Request<Body>, warehouse: &str, action: AdminAction) -> S3Result<()> {
+    let Some(input_cred) = &req.credentials else {
+        return Err(s3_error!(InvalidRequest, "authentication required"));
+    };
+
+    let (cred, owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+    validate_admin_request_with_bucket(
+        &req.headers,
+        &cred,
+        owner,
+        false,
+        vec![Action::AdminAction(action)],
+        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        warehouse,
     )
     .await
 }
@@ -683,8 +703,8 @@ pub struct RestListNamespacesHandler {}
 #[async_trait::async_trait]
 impl Operation for RestListNamespacesHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::GetTableNamespaceAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::GetTableNamespaceAction).await?;
         let store = table_catalog_store()?;
         let response = list_namespaces_response(&store, &warehouse).await?;
         build_json_response(StatusCode::OK, &response)
@@ -696,8 +716,8 @@ pub struct RestCreateNamespaceHandler {}
 #[async_trait::async_trait]
 impl Operation for RestCreateNamespaceHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::SetTableNamespaceAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::SetTableNamespaceAction).await?;
         let request = read_json_body::<CreateNamespaceRequest>(req.input).await?;
         let store = table_catalog_store()?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
@@ -711,8 +731,8 @@ pub struct RestGetNamespaceHandler {}
 #[async_trait::async_trait]
 impl Operation for RestGetNamespaceHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::GetTableNamespaceAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::GetTableNamespaceAction).await?;
         let namespace = namespace_from_params(&params)?;
         let store = table_catalog_store()?;
         let response = get_namespace_response(&store, &warehouse, &namespace).await?;
@@ -725,8 +745,8 @@ pub struct RestDropNamespaceHandler {}
 #[async_trait::async_trait]
 impl Operation for RestDropNamespaceHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::DeleteTableNamespaceAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::DeleteTableNamespaceAction).await?;
         let namespace = namespace_from_params(&params)?;
         let store = table_catalog_store()?;
         drop_namespace_in_store(&store, &warehouse, &namespace.public_name()).await?;
@@ -739,8 +759,8 @@ pub struct RestListTablesHandler {}
 #[async_trait::async_trait]
 impl Operation for RestListTablesHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::GetTableAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::GetTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let store = table_catalog_store()?;
         let response = list_tables_response(&store, &warehouse, &namespace).await?;
@@ -753,8 +773,8 @@ pub struct RestCreateTableHandler {}
 #[async_trait::async_trait]
 impl Operation for RestCreateTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::CreateTableAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::CreateTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let request = read_json_body::<CreateTableRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
@@ -771,8 +791,8 @@ pub struct RestRegisterTableHandler {}
 #[async_trait::async_trait]
 impl Operation for RestRegisterTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::RegisterTableAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::RegisterTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let request = read_json_body::<RegisterTableRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
@@ -789,8 +809,8 @@ pub struct RestLoadTableHandler {}
 #[async_trait::async_trait]
 impl Operation for RestLoadTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::GetTableAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::GetTableMetadataAction).await?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let metadata_backend = table_catalog_backend()?;
@@ -805,8 +825,8 @@ pub struct RestCommitTableHandler {}
 #[async_trait::async_trait]
 impl Operation for RestCommitTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::CommitTableAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::CommitTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let request = read_json_body::<RestCommitTableRequest>(req.input).await?;
@@ -821,8 +841,8 @@ pub struct RestDropTableHandler {}
 #[async_trait::async_trait]
 impl Operation for RestDropTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_table_catalog_request(&req, AdminAction::DeleteTableAction).await?;
         let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::DeleteTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let store = table_catalog_store()?;
@@ -871,14 +891,43 @@ mod tests {
     fn table_catalog_handlers_require_table_admin_actions() {
         let src = include_str!("table_catalog.rs");
 
-        assert!(src.contains("AdminAction::GetTableCatalogAction"));
-        assert!(src.contains("AdminAction::GetTableNamespaceAction"));
-        assert!(src.contains("AdminAction::SetTableNamespaceAction"));
-        assert!(src.contains("AdminAction::DeleteTableNamespaceAction"));
-        assert!(src.contains("AdminAction::CreateTableAction"));
-        assert!(src.contains("AdminAction::RegisterTableAction"));
-        assert!(src.contains("AdminAction::CommitTableAction"));
-        assert!(src.contains("AdminAction::DeleteTableAction"));
+        assert!(
+            operation_block(src, "GetCatalogConfigHandler")
+                .contains("authorize_table_catalog_request(&req, AdminAction::GetTableCatalogAction).await?;")
+        );
+
+        for (handler, action) in [
+            ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
+            ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
+            ("RestGetNamespaceHandler", "AdminAction::GetTableNamespaceAction"),
+            ("RestDropNamespaceHandler", "AdminAction::DeleteTableNamespaceAction"),
+            ("RestListTablesHandler", "AdminAction::GetTableAction"),
+            ("RestCreateTableHandler", "AdminAction::CreateTableAction"),
+            ("RestRegisterTableHandler", "AdminAction::RegisterTableAction"),
+            ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
+            ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
+        ] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains(&format!("authorize_table_catalog_warehouse_request(&req, &warehouse, {action}).await?;")),
+                "{handler} should require {action} with warehouse-scoped auth"
+            );
+            assert!(
+                !block.contains("authorize_table_catalog_request(&req,"),
+                "{handler} must not use unscoped table catalog authorization"
+            );
+        }
+    }
+
+    fn operation_block<'a>(src: &'a str, handler: &str) -> &'a str {
+        let marker = format!("impl Operation for {handler}");
+        let block = src.split_once(&marker).expect("handler impl should exist").1;
+        let end = block
+            .find("\npub struct ")
+            .or_else(|| block.find("\n#[cfg(test)]"))
+            .unwrap_or(block.len());
+        &block[..end]
     }
 
     #[test]
