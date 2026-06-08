@@ -81,7 +81,7 @@ impl ECStore {
                                 achieved,
                             }
                         }
-                        other => StorageError::other(format!("make_bucket: failed to acquire write lock on {bucket}: {other}")),
+                        other => StorageError::Lock(other),
                     })?,
             )
         } else {
@@ -185,7 +185,7 @@ impl ECStore {
                                 achieved,
                             }
                         }
-                        other => StorageError::other(format!("delete_bucket: failed to acquire write lock on {bucket}: {other}")),
+                        other => StorageError::Lock(other),
                     })?,
             )
         } else {
