@@ -16,6 +16,7 @@
 mod tests {
     use crate::storage::sse::SseDekProvider;
     use crate::storage::sse::TestSseDekProvider;
+    use rustfs_kms::types::ObjectEncryptionContext;
     use rustfs_rio::{DecryptReader, EncryptReader};
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
@@ -36,9 +37,10 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key";
         let kms_key_id = "default"; // Key ID is ignored in test provider
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
 
         let (data_key, _encrypted_dek) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK");
 
@@ -104,9 +106,10 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key-large";
         let kms_key_id = "default";
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
 
         let (data_key, _encrypted_dek) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK");
 
@@ -153,15 +156,16 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key";
         let kms_key_id = "default";
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
 
         // Generate two different keys (with different nonces)
         let (data_key1, _) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK 1");
 
         let (data_key2, _) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK 2");
 
@@ -201,10 +205,11 @@ mod tests {
         let bucket = "test-bucket";
         let key = "test-key";
         let kms_key_id = "default";
+        let context = ObjectEncryptionContext::new(bucket.to_string(), key.to_string());
 
         // Step 1: Generate DEK and get encrypted DEK
         let (data_key, encrypted_dek) = provider
-            .generate_sse_dek(bucket, key, kms_key_id)
+            .generate_sse_dek(&context, kms_key_id)
             .await
             .expect("Failed to generate DEK");
 
@@ -213,7 +218,7 @@ mod tests {
 
         // Step 2: Later, decrypt the DEK (simulating GET operation)
         let decrypted_plaintext_key = provider
-            .decrypt_sse_dek(&encrypted_dek, kms_key_id)
+            .decrypt_sse_dek(&encrypted_dek, kms_key_id, &context)
             .await
             .expect("Failed to decrypt DEK");
 

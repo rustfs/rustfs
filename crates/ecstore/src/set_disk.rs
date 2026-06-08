@@ -85,7 +85,6 @@ use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
 };
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
@@ -129,6 +128,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
@@ -1146,7 +1147,7 @@ impl ObjectIO for SetDisks {
                 insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
             }
 
-            let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+            let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
 
             //TODO: userDefined
 
@@ -3035,7 +3036,7 @@ impl MultipartOperations for SetDisks {
             )));
         }
 
-        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+        let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
 
         let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
 

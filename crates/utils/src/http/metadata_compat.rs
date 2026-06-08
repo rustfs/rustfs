@@ -112,18 +112,27 @@ pub fn insert_str(map: &mut HashMap<String, String>, suffix: &str, value: String
 
 pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
     let (k1, k2) = both_keys(suffix);
-    map.get(&k1).cloned().or_else(|| map.get(&k2).cloned())
+    map.get(&k1).cloned().or_else(|| map.get(&k2).cloned()).or_else(|| {
+        map.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
+            .map(|(_, value)| value.clone())
+    })
 }
 
 pub fn contains_key_str(map: &HashMap<String, String>, suffix: &str) -> bool {
     let (k1, k2) = both_keys(suffix);
-    map.contains_key(&k1) || map.contains_key(&k2)
+    map.contains_key(&k1)
+        || map.contains_key(&k2)
+        || map
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
 }
 
 pub fn remove_str(map: &mut HashMap<String, String>, suffix: &str) {
     let (k1, k2) = both_keys(suffix);
     map.remove(&k1);
     map.remove(&k2);
+    map.retain(|key, _| !key.eq_ignore_ascii_case(&k1) && !key.eq_ignore_ascii_case(&k2));
 }
 
 // === Vec<u8> type (meta_sys) ===
@@ -177,5 +186,22 @@ mod tests {
         assert!(has_internal_suffix("x-minio-internal-data-mov", SUFFIX_DATA_MOV));
         assert!(!has_internal_suffix("x-rustfs-internal-purgestatus", SUFFIX_HEALING));
         assert!(!has_internal_suffix("x-amz-meta-custom", SUFFIX_PURGESTATUS));
+    }
+
+    #[test]
+    fn test_str_lookup_accepts_minio_metadata_case() {
+        let mut metadata = HashMap::from([
+            ("X-Minio-Internal-compression".to_string(), "klauspost/compress/s2".to_string()),
+            ("X-Minio-Internal-actual-size".to_string(), "268435456".to_string()),
+        ]);
+
+        assert!(contains_key_str(&metadata, SUFFIX_COMPRESSION));
+        assert_eq!(get_str(&metadata, SUFFIX_COMPRESSION).as_deref(), Some("klauspost/compress/s2"));
+        assert_eq!(get_str(&metadata, SUFFIX_ACTUAL_SIZE).as_deref(), Some("268435456"));
+
+        remove_str(&mut metadata, SUFFIX_COMPRESSION);
+        assert!(!contains_key_str(&metadata, SUFFIX_COMPRESSION));
+        assert!(!metadata.contains_key("X-Minio-Internal-compression"));
+        assert!(contains_key_str(&metadata, SUFFIX_ACTUAL_SIZE));
     }
 }
