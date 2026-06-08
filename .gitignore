@@ -46,6 +46,7 @@ docs
 docs/*
 !docs/architecture/
 !docs/architecture/**
+docs/architecture/issue-662-erasure-write-diagnosis-and-safe-retry-plan.zh-CN.md
 
 # nix stuff
 result*
