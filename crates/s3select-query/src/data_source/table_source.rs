@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -78,10 +77,6 @@ impl TableSourceAdapter {
 
 #[async_trait]
 impl TableSource for TableSourceAdapter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.table_handle.schema()
     }

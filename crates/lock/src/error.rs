@@ -290,17 +290,18 @@ impl From<tonic::Status> for LockError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn test_error_creation() {
         let timeout_err = LockError::timeout("test-resource", Duration::from_secs(5));
-        assert!(matches!(timeout_err, LockError::Timeout { .. }));
+        assert_matches!(timeout_err, LockError::Timeout { .. });
 
         let not_found_err = LockError::resource_not_found("missing-resource");
-        assert!(matches!(not_found_err, LockError::ResourceNotFound { .. }));
+        assert_matches!(not_found_err, LockError::ResourceNotFound { .. });
 
         let permission_err = LockError::permission_denied("insufficient privileges");
-        assert!(matches!(permission_err, LockError::PermissionDenied { .. }));
+        assert_matches!(permission_err, LockError::PermissionDenied { .. });
     }
 
     #[test]
