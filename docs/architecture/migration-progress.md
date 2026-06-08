@@ -5,14 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-security-governance-types`
-- Baseline: `upstream/main` at `c03c0ebc363209a4820e6d6f2267e0342c6a7782`
+- Branch: `overtrue/arch-security-governance-policy-types`
+- Baseline: `upstream/main` at `7a9bf707ee66e779f85e6e00cedfaa10ec2af4c2`
 - PR type for this branch: `contract`
 - Runtime behavior changes: none
-- Rust code changes: add the pure `rustfs-security-governance` contract crate
-  with admin route matrix metadata types, typed validation errors, and unit tests.
+- Rust code changes: add redaction, serde policy, and artifact integrity
+  contract modules to the pure rustfs-security-governance crate, with typed
+  validation errors and unit tests.
 - CI/script changes: none
-- Docs changes: record the Phase 1 security-governance contract handoff.
+- Docs changes: record the Phase 1 policy contract handoff.
 
 ## Phase 0 Tasks
 
@@ -73,26 +74,37 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     `PublicRouteKind`, `RouteRiskLevel`, and validation errors model route
     governance metadata without registering routes or enforcing auth.
   - Verification: `cargo test -p rustfs-security-governance`.
-- [ ] `S-003` Add redaction contract types.
-- [ ] `S-004` Add serde policy marker types.
-- [ ] `S-005` Add supply-chain policy contract types.
+- [x] `S-003` Add redaction contract types.
+  - Acceptance: `RedactionRule`, `RedactionLevel`, and validation errors model
+    sensitive field handling without logging, masking, or runtime integration.
+  - Verification: `cargo test -p rustfs-security-governance`.
+- [x] `S-004` Add serde policy marker types.
+  - Acceptance: `SerdePolicy`, `SerdePolicyKind`, `UnknownFieldPolicy`, and
+    validation errors model strict ingress and compatibility serde contracts
+    without changing deserialization behavior.
+  - Verification: `cargo test -p rustfs-security-governance`.
+- [x] `S-005` Add supply-chain policy contract types.
+  - Acceptance: `ArtifactIntegrityPolicy`, `ArtifactSourceKind`, and validation
+    errors model digest, signature, and provenance requirements without changing
+    release or CI behavior.
+  - Verification: `cargo test -p rustfs-security-governance`.
 - [ ] `S-006` Add `rustfs/src/admin/route_policy.rs` backed by these contract
   types, without changing route registration or auth behavior.
 
 ## Next PRs
 
-1. `contract`: add redaction, serde policy, or supply-chain governance contract
-   modules inside rustfs-security-governance.
-2. `contract`: add an admin route policy table that consumes the new
-   admin_matrix types while preserving route registration and auth behavior.
+1. `contract`: add an admin route policy table that consumes the new admin
+   route matrix types while preserving route registration and auth behavior.
+2. `contract`: add initial policy inventory tables for redaction, serde, or
+   supply-chain governance only after the contract shape remains stable.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed this is a pure `contract` PR: the new crate has a narrow admin_matrix module, typed errors via thiserror, no dependency on implementation crates, and no route registration or auth integration |
-| Migration preservation | pass | Confirmed no runtime code paths changed: no admin handler/router edits, no startup/global-state/storage hot-path movement, no compatibility wrappers, and no behavior drift |
-| Testing/verification | pass | Confirmed focused unit tests cover valid admin/public specs, duplicate method/path rejection, empty path rejection, and empty action rejection; focused checks, migration guard scripts, dependency tree review, diff check, and full `make pre-commit` passed |
+| Quality/architecture | pass | Confirmed the staged diff includes the new modules, keeps a pure `contract` design, uses clear API names and typed errors, and does not introduce runtime/admin/router/auth/startup/storage/config/global-state integration |
+| Migration preservation | pass | Confirmed this PR only completes `S-003` through `S-005`, does not shift away from backlog #660, does not touch storage hot paths or global-state migration, and does not need compatibility markers |
+| Testing/verification | pass | Confirmed focused contract tests assert valid and invalid policy behavior, production logic was not changed to satisfy tests, focused checks passed, and full `make pre-commit` passed |
 
 ## Verification Notes
 
@@ -106,6 +118,11 @@ Passed:
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
 - `make pre-commit`
+
+Notes:
+- `cargo test -p rustfs-security-governance` passed 19 unit tests.
+- `make pre-commit` passed, including 5512 nextest tests, 105 skipped tests,
+  and workspace doctests.
 
 ## Handoff Notes
 
