@@ -1530,6 +1530,161 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn test_table_admin_action_with_resource_is_limited_to_bucket() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:GetTableMetadata"],
+      "Resource": ["arn:aws:s3:::warehouse-a"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+
+        let matching_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy.is_allowed(&matching_args).await,
+            "table admin action should allow the explicitly granted warehouse bucket"
+        );
+
+        let mismatched_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-b",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&mismatched_args).await,
+            "table admin action must not ignore Resource when the request targets a different warehouse bucket"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_table_admin_action_with_not_resource_excludes_bucket() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:GetTableMetadata"],
+      "NotResource": ["arn:aws:s3:::warehouse-b"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+
+        let allowed_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy.is_allowed(&allowed_args).await,
+            "table admin NotResource should allow a warehouse outside the excluded bucket"
+        );
+
+        let excluded_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-b",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&excluded_args).await,
+            "table admin NotResource should deny the excluded warehouse bucket"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_non_table_admin_action_keeps_unscoped_resource_behavior() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:ServerInfo"],
+      "Resource": ["arn:aws:s3:::warehouse-a"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+
+        let args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::ServerInfoAdminAction),
+            bucket: "warehouse-b",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy.is_allowed(&args).await,
+            "existing non-table admin actions should preserve resource-independent evaluation"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_sts_statement_without_resource_is_valid() {
         let data = r#"
