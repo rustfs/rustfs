@@ -91,6 +91,7 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
 /// Main CLI parser
 #[derive(Parser, Clone)]
 #[command(name = "rustfs", version = SHORT_VERSION, long_version = LONG_VERSION)]
+#[command(disable_help_subcommand = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
