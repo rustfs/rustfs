@@ -89,6 +89,18 @@ enum ActionFamily {
 }
 
 impl Statement {
+    fn skips_resource_match_for_args(&self, args: &Args<'_>) -> bool {
+        if self.is_sts() {
+            return true;
+        }
+
+        if !self.is_admin() {
+            return false;
+        }
+
+        !matches!(args.action, Action::AdminAction(action) if action.is_table_resource_scoped())
+    }
+
     fn is_kms(&self) -> bool {
         for act in self.actions.iter() {
             if matches!(act, Action::KmsAction(_)) {
@@ -188,8 +200,7 @@ impl Statement {
                 .resources
                 .is_match_with_resolver(&resource, args.conditions, Some(resolver))
                 .await
-            && !self.is_admin()
-            && !self.is_sts()
+            && !self.skips_resource_match_for_args(args)
         {
             return false;
         }
@@ -199,8 +210,7 @@ impl Statement {
                 .not_resources
                 .is_match_with_resolver(&resource, args.conditions, Some(resolver))
                 .await
-            && !self.is_admin()
-            && !self.is_sts()
+            && !self.skips_resource_match_for_args(args)
         {
             return false;
         }
