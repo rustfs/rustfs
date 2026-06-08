@@ -149,6 +149,7 @@ async fn test_concurrent_put_same_key_never_returns_500() -> TestResult {
 
     let err_500_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let err_503_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let unexpected_err_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ok_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let mut handles = Vec::with_capacity(writer_count);
@@ -158,6 +159,7 @@ async fn test_concurrent_put_same_key_never_returns_500() -> TestResult {
         let payload = format!("payload from writer {writer_id:02}").into_bytes();
         let err_500 = err_500_count.clone();
         let err_503 = err_503_count.clone();
+        let unexpected_err = unexpected_err_count.clone();
         let ok = ok_count.clone();
 
         handles.push(tokio::spawn(async move {
@@ -182,10 +184,12 @@ async fn test_concurrent_put_same_key_never_returns_500() -> TestResult {
                         } else if code == "503" || code == "ServiceUnavailable" {
                             err_503.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         } else {
+                            unexpected_err.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             warn!("writer {writer_id} returned unexpected error: {code}");
                         }
                     }
                     other => {
+                        unexpected_err.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!("writer {writer_id} returned SDK error: {other:?}");
                     }
                 },
@@ -194,15 +198,30 @@ async fn test_concurrent_put_same_key_never_returns_500() -> TestResult {
     }
 
     for handle in handles {
-        let _ = handle.await;
+        if let Err(err) = handle.await {
+            unexpected_err_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("writer task join failed: {err}");
+        }
     }
 
     let ok = ok_count.load(std::sync::atomic::Ordering::Relaxed);
     let err_503 = err_503_count.load(std::sync::atomic::Ordering::Relaxed);
     let err_500 = err_500_count.load(std::sync::atomic::Ordering::Relaxed);
-    let total = ok + err_503 + err_500;
+    let unexpected_err = unexpected_err_count.load(std::sync::atomic::Ordering::Relaxed);
+    let total = ok + err_503 + err_500 + unexpected_err;
 
-    info!("Concurrent PUT 500 regression: total={total}, ok={ok}, 503={err_503}, 500={err_500}");
+    info!("Concurrent PUT 500 regression: total={total}, ok={ok}, 503={err_503}, 500={err_500}, unexpected={unexpected_err}");
+
+    assert_eq!(
+        total, writer_count as u64,
+        "every concurrent PUT writer must be classified as success, 503, 500, or unexpected error"
+    );
+
+    assert_eq!(
+        unexpected_err, 0,
+        "Concurrent PUTs to the same key must only succeed or return 503. \
+         Got {unexpected_err} unexpected errors out of {total} requests. 503 count: {err_503}, ok: {ok}"
+    );
 
     assert_eq!(
         err_500, 0,
