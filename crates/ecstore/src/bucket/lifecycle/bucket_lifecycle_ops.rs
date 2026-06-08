@@ -45,7 +45,7 @@ use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use rustfs_common::heal_channel::rep_has_active_rules;
-use rustfs_common::metrics::{IlmAction, Metrics};
+use rustfs_common::metrics::{IlmAction, Metrics, global_metrics};
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
     DEFAULT_TRANSITION_WORKERS_CAP, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS,
@@ -143,6 +143,12 @@ fn is_immediate_transition_source(src: &LcEventSrc) -> bool {
         src,
         LcEventSrc::S3PutObject | LcEventSrc::S3CopyObject | LcEventSrc::S3CompleteMultipartUpload
     )
+}
+
+fn record_scanner_lifecycle_enqueue_result(src: &LcEventSrc, count: u64, queued: bool) {
+    if matches!(src, LcEventSrc::Scanner) {
+        global_metrics().record_scanner_ilm_enqueue_result(count, queued);
+    }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -357,7 +363,7 @@ impl ExpiryState {
         }
     }
 
-    pub async fn enqueue_by_days(&mut self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
+    pub async fn enqueue_by_days(&mut self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
         let task = ExpiryTask {
             obj_info: oi.clone(),
             event: event.clone(),
@@ -366,22 +372,29 @@ impl ExpiryState {
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
             *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
-            return;
+            record_scanner_lifecycle_enqueue_result(src, 1, false);
+            return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
-        select! {
-            //_ -> GlobalContext.Done() => {}
-            _ = wrkr.send(Some(Box::new(task))) => (),
-            else => {
-                *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
-            }
+        let queued = wrkr.send(Some(Box::new(task))).await.is_ok();
+        if !queued {
+            *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
         }
+        record_scanner_lifecycle_enqueue_result(src, 1, queued);
+        queued
     }
 
-    pub async fn enqueue_by_newer_noncurrent(&mut self, bucket: &str, versions: Vec<ObjectToDelete>, lc_event: lifecycle::Event) {
+    pub async fn enqueue_by_newer_noncurrent(
+        &mut self,
+        bucket: &str,
+        versions: Vec<ObjectToDelete>,
+        lc_event: lifecycle::Event,
+        src: &LcEventSrc,
+    ) -> bool {
         if versions.is_empty() {
-            return;
+            return true;
         }
+        let version_count = u64::try_from(versions.len()).unwrap_or(u64::MAX);
 
         let task = NewerNoncurrentTask {
             bucket: String::from(bucket),
@@ -391,16 +404,16 @@ impl ExpiryState {
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
             *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
-            return;
+            record_scanner_lifecycle_enqueue_result(src, version_count, false);
+            return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
-        select! {
-            //_ -> GlobalContext.Done() => {}
-            _ = wrkr.send(Some(Box::new(task))) => (),
-            else => {
-                *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
-            }
+        let queued = wrkr.send(Some(Box::new(task))).await.is_ok();
+        if !queued {
+            *self.stats.as_mut().expect("stats lock").missed_expiry_tasks.get_mut() += 1;
         }
+        record_scanner_lifecycle_enqueue_result(src, version_count, queued);
+        queued
     }
 
     pub fn get_worker_ch(&self, h: u64) -> Option<Sender<Option<ExpiryOpType>>> {
@@ -739,10 +752,11 @@ impl TransitionState {
         }
     }
 
-    pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) {
+    pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
         if is_immediate_transition_source(src) && should_force_immediate_transition_enqueue_timeout() {
             self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::ForcedTimeout);
-            return;
+            record_scanner_lifecycle_enqueue_result(src, 1, false);
+            return false;
         }
 
         let task = TransitionTask {
@@ -750,14 +764,15 @@ impl TransitionState {
             src: src.clone(),
             event: event.clone(),
         };
+        let mut queued = false;
         if is_immediate_transition_source(src) {
             match self.transition_tx.try_send(Some(task)) {
-                Ok(()) => {}
+                Ok(()) => queued = true,
                 Err(async_channel::TrySendError::Full(task)) => {
                     Self::inc_counter(&self.queue_full_tasks);
                     let send_timeout = self.transition_queue_send_timeout;
                     match tokio::time::timeout(send_timeout, self.transition_tx.send(task)).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => queued = true,
                         Ok(Err(_)) => {
                             self.handle_immediate_enqueue_failure(
                                 oi,
@@ -782,29 +797,31 @@ impl TransitionState {
                     self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::QueueClosed { timeout_ms: None });
                 }
             }
-            return;
+            record_scanner_lifecycle_enqueue_result(src, 1, queued);
+            return queued;
         }
 
-        if let Err(err) = self.transition_tx.try_send(Some(task)) {
-            match err {
-                async_channel::TrySendError::Full(_) => {
-                    debug!(
-                        bucket = %oi.bucket,
-                        object = %oi.name,
-                        source = ?src,
-                        "transition queue is full; deferring to scanner/backfill"
-                    );
-                }
-                async_channel::TrySendError::Closed(_) => {
-                    warn!(
-                        bucket = %oi.bucket,
-                        object = %oi.name,
-                        source = ?src,
-                        "transition enqueue failed because the queue is closed"
-                    );
-                }
+        match self.transition_tx.try_send(Some(task)) {
+            Ok(()) => queued = true,
+            Err(async_channel::TrySendError::Full(_)) => {
+                debug!(
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    source = ?src,
+                    "transition queue is full; deferring to scanner/backfill"
+                );
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                warn!(
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    source = ?src,
+                    "transition enqueue failed because the queue is closed"
+                );
             }
         }
+        record_scanner_lifecycle_enqueue_result(src, 1, queued);
+        queued
     }
 
     pub async fn init(api: Arc<ECStore>) {
@@ -1482,7 +1499,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         GLOBAL_ExpiryState
             .write()
             .await
-            .enqueue_by_newer_noncurrent(&oi.bucket, to_delete_objs, event)
+            .enqueue_by_newer_noncurrent(&oi.bucket, to_delete_objs, event, &src)
             .await;
     }
 }
@@ -2045,8 +2062,7 @@ pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, o
     if oi.delete_marker || oi.is_dir {
         return false;
     }
-    GLOBAL_TransitionState.queue_transition_task(oi, event, src).await;
-    true
+    GLOBAL_TransitionState.queue_transition_task(oi, event, src).await
 }
 
 pub async fn apply_expiry_on_transitioned_object(
@@ -2135,8 +2151,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
 
 pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut expiry_state = GLOBAL_ExpiryState.write().await;
-    expiry_state.enqueue_by_days(oi, event, src).await;
-    true
+    expiry_state.enqueue_by_days(oi, event, src).await
 }
 
 fn lifecycle_deleted_object(oi: &ObjectInfo, dobj: &ObjectInfo) -> crate::store_api::DeletedObject {
@@ -2297,7 +2312,7 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-        DEFAULT_TRANSITION_WORKERS_CAP, GLOBAL_TransitionState, StaleMultipartUploadCandidate, TransitionState,
+        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, GLOBAL_TransitionState, StaleMultipartUploadCandidate, TransitionState,
         cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at, lifecycle_deleted_object,
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
         mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
@@ -2305,6 +2320,7 @@ mod tests {
         resolve_transition_workers_absolute_max, should_defer_date_expiry_for_recent_config_update,
         should_reuse_lifecycle_delete_replication_state,
     };
+    use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
     use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
@@ -2317,6 +2333,7 @@ mod tests {
         BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader,
     };
     use futures::FutureExt;
+    use rustfs_common::metrics::IlmAction;
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
@@ -2332,6 +2349,48 @@ mod tests {
     use tokio::fs;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn expiry_enqueue_reports_missed_without_worker_channel() {
+        let state = ExpiryState::new();
+        let mut state = state.write().await;
+        let object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::DeleteAction,
+            ..Default::default()
+        };
+
+        let queued = state.enqueue_by_days(&object, &event, &LcEventSrc::Scanner).await;
+
+        assert!(!queued);
+        let stats = state.stats.as_ref().expect("expiry stats should exist");
+        assert_eq!(stats.missed_tasks(), 1);
+    }
+
+    #[tokio::test]
+    async fn scanner_transition_enqueue_reports_full_queue() {
+        let state = TransitionState::new_with_capacity(1);
+        let object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        let first = state.queue_transition_task(&object, &event, &LcEventSrc::Scanner).await;
+        let second = state.queue_transition_task(&object, &event, &LcEventSrc::Scanner).await;
+
+        assert!(first);
+        assert!(!second);
+        assert_eq!(state.transition_rx.len(), 1);
+    }
 
     #[test]
     fn mark_delete_opts_skip_decommissioned_on_remote_success_sets_flag_on_success() {

@@ -21,6 +21,11 @@ unsafe-code-check: ## Check unsafe_code allowances have SAFETY comments
 	@echo "🔒 Checking unsafe_code allowances..."
 	./scripts/check_unsafe_code_allowances.sh
 
+.PHONY: architecture-migration-check
+architecture-migration-check: ## Check architecture migration guardrails
+	@echo "🏗️ Checking architecture migration guardrails..."
+	./scripts/check_architecture_migration_rules.sh
+
 .PHONY: compilation-check
 compilation-check: core-deps ## Run compilation check
 	@echo "🔨 Running compilation check..."
