@@ -31,6 +31,10 @@ impl ArtifactSourceKind {
     pub const fn requires_provenance(self) -> bool {
         matches!(self, Self::GeneratedReleaseAsset)
     }
+
+    pub const fn requires_signature(self) -> bool {
+        matches!(self, Self::GeneratedReleaseAsset)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,6 +95,9 @@ pub enum SupplyChainPolicyError {
     #[error("artifact integrity policy for {artifact} must require provenance")]
     ProvenanceRequired { artifact: &'static str },
 
+    #[error("artifact integrity policy for {artifact} must require a signature")]
+    SignatureRequired { artifact: &'static str },
+
     #[error("duplicate artifact integrity policy for {artifact}")]
     DuplicateArtifact { artifact: &'static str },
 }
@@ -111,6 +118,12 @@ pub fn validate_artifact_integrity_policies(policies: &[ArtifactIntegrityPolicy]
 
         if policy.source.requires_provenance() && !policy.provenance_required {
             return Err(SupplyChainPolicyError::ProvenanceRequired {
+                artifact: policy.artifact,
+            });
+        }
+
+        if policy.source.requires_signature() && !policy.signature_required {
+            return Err(SupplyChainPolicyError::SignatureRequired {
                 artifact: policy.artifact,
             });
         }
@@ -220,6 +233,26 @@ mod tests {
         assert_eq!(
             err,
             SupplyChainPolicyError::ProvenanceRequired {
+                artifact: "rustfs-cli-windows-amd64.zip"
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_generated_artifacts_without_signature() {
+        let policies = [ArtifactIntegrityPolicy::new(
+            "rustfs-cli-windows-amd64.zip",
+            ArtifactSourceKind::GeneratedReleaseAsset,
+            true,
+            false,
+            true,
+        )];
+
+        let err = validate_artifact_integrity_policies(&policies).expect_err("generated artifact should require signature");
+
+        assert_eq!(
+            err,
+            SupplyChainPolicyError::SignatureRequired {
                 artifact: "rustfs-cli-windows-amd64.zip"
             }
         );
