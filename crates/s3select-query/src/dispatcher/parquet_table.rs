@@ -88,7 +88,7 @@ impl ParquetSelectTable {
     fn partitioned_file(&self) -> PartitionedFile {
         let file = PartitionedFile::new(self.object_path.clone(), self.object_size);
         if let Some(access_plan) = self.access_plan.as_ref() {
-            file.with_extension(Arc::clone(access_plan))
+            file.with_extension(access_plan.as_ref().clone())
         } else {
             file
         }

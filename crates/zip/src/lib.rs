@@ -972,18 +972,17 @@ mod tests {
 
     #[test]
     fn test_convert_level_rejects_overflow() {
-        let err = CompressionFormat::Gzip
-            .get_encoder(SharedBuffer::default(), CompressionLevel::Level(u32::MAX))
-            .err()
-            .expect("overflow level should return an error");
+        let err = match CompressionFormat::Gzip.get_encoder(SharedBuffer::default(), CompressionLevel::Level(u32::MAX)) {
+            Ok(_) => panic!("overflow level should return an error"),
+            Err(err) => err,
+        };
         assert!(matches!(err, ZipError::InvalidCompressionLevel(u32::MAX)));
     }
 
     #[test]
     fn test_validate_archive_entry_name_rejects_absolute_path() {
         let err = validate_archive_entry_name("/absolute.txt", ArchiveLimits::default())
-            .err()
-            .expect("absolute path should fail validation");
+            .expect_err("absolute path should fail validation");
         assert!(matches!(err, ZipError::UnsafeEntryPath(path) if path == "/absolute.txt"));
     }
 
@@ -1121,8 +1120,7 @@ mod tests {
     async fn test_read_archive_entries_rejects_zip_streams() {
         let err = read_archive_entries(std::io::Cursor::new(Vec::<u8>::new()), CompressionFormat::Zip, |_entry| async { Ok(()) })
             .await
-            .err()
-            .expect("zip stream should be rejected");
+            .expect_err("zip stream should be rejected");
 
         assert!(matches!(
             err,
@@ -1141,8 +1139,7 @@ mod tests {
             |_entry| async { Ok(()) },
         )
         .await
-        .err()
-        .expect("corrupt tar.gz stream should fail");
+        .expect_err("corrupt tar.gz stream should fail");
 
         assert!(matches!(err, ZipError::Io(_)));
     }
@@ -1156,8 +1153,7 @@ mod tests {
 
         let err = read_archive_entries(std::io::Cursor::new(truncated), CompressionFormat::Gzip, |_entry| async { Ok(()) })
             .await
-            .err()
-            .expect("truncated tar.gz stream should fail");
+            .expect_err("truncated tar.gz stream should fail");
 
         assert!(matches!(err, ZipError::Io(_)));
     }
@@ -1178,8 +1174,7 @@ mod tests {
             |_entry| async { Ok(()) },
         )
         .await
-        .err()
-        .expect("entry count limit should fail");
+        .expect_err("entry count limit should fail");
 
         assert!(matches!(err, ZipError::EntryCountLimitExceeded { count: 2, limit: 1 }));
     }
@@ -1200,8 +1195,7 @@ mod tests {
             |_entry| async { Ok(()) },
         )
         .await
-        .err()
-        .expect("entry size limit should fail");
+        .expect_err("entry size limit should fail");
 
         assert!(matches!(
             err,
@@ -1229,8 +1223,7 @@ mod tests {
             |_entry| async { Ok(()) },
         )
         .await
-        .err()
-        .expect("total unpacked size limit should fail");
+        .expect_err("total unpacked size limit should fail");
 
         assert!(matches!(err, ZipError::TotalUnpackedSizeLimitExceeded { size: 10, limit: 9 }));
     }
@@ -1251,8 +1244,7 @@ mod tests {
             |_entry| async { Ok(()) },
         )
         .await
-        .err()
-        .expect("path length limit should fail");
+        .expect_err("path length limit should fail");
 
         assert!(matches!(
             err,
@@ -1559,8 +1551,7 @@ mod tests {
             },
         )
         .await
-        .err()
-        .expect("zip entry count limit should fail");
+        .expect_err("zip entry count limit should fail");
 
         assert!(matches!(err, ZipError::EntryCountLimitExceeded { count: 2, limit: 1 }));
     }
@@ -1584,8 +1575,7 @@ mod tests {
             },
         )
         .await
-        .err()
-        .expect("zip entry size limit should fail");
+        .expect_err("zip entry size limit should fail");
 
         assert!(matches!(
             err,
@@ -1616,8 +1606,7 @@ mod tests {
             },
         )
         .await
-        .err()
-        .expect("zip total size limit should fail");
+        .expect_err("zip total size limit should fail");
 
         assert!(matches!(err, ZipError::TotalUnpackedSizeLimitExceeded { size: 10, limit: 9 }));
     }
@@ -1641,8 +1630,7 @@ mod tests {
             },
         )
         .await
-        .err()
-        .expect("zip path length limit should fail");
+        .expect_err("zip path length limit should fail");
 
         assert!(matches!(
             err,
