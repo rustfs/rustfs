@@ -37,3 +37,4 @@ Current `test-and-lint` gate includes:
 - `cargo test -p rustfs --doc --features rio-v2`
 - `cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings`
 - `./scripts/check_layer_dependencies.sh`
+- `./scripts/check_architecture_migration_rules.sh`

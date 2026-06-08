@@ -27,7 +27,8 @@ use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, emit_scan_cycle_complete, emit_scan_cycle_partial, global_metrics,
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerWorkSource, emit_scan_cycle_complete,
+    emit_scan_cycle_partial_with_source, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
 #[cfg(test)]
@@ -96,6 +97,13 @@ fn scan_cycle_partial_reason(reason: Option<ScannerCycleBudgetReason>) -> ScanCy
     }
 }
 
+fn scan_cycle_partial_source(reason: Option<ScannerCycleBudgetReason>) -> Option<ScannerWorkSource> {
+    match reason {
+        Some(ScannerCycleBudgetReason::Objects | ScannerCycleBudgetReason::Directories) => Some(ScannerWorkSource::Usage),
+        Some(ScannerCycleBudgetReason::Runtime) | None => None,
+    }
+}
+
 /// Compute a randomized inter-cycle sleep.
 // Delay is scan interval +- 10%, with a floor of 1 second.
 fn randomized_cycle_delay() -> Duration {
@@ -110,14 +118,88 @@ fn randomized_cycle_delay_for(interval: Duration) -> Duration {
     delay.max(Duration::from_secs(1))
 }
 
-fn initial_scanner_delay() -> Duration {
-    initial_scanner_delay_for(scanner_start_delay().map(|duration| duration.as_secs()))
-}
-
 fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
     start_delay_secs
         .map(|secs| randomized_cycle_delay_for(Duration::from_secs(secs)))
         .unwrap_or_else(randomized_cycle_delay)
+}
+
+fn initial_scanner_delay_for_startup(start_delay_secs: Option<u64>, usage_cache_is_cold: bool, has_buckets: bool) -> Duration {
+    if usage_cache_is_cold && has_buckets {
+        Duration::ZERO
+    } else {
+        initial_scanner_delay_for(start_delay_secs)
+    }
+}
+
+fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
+    info.last_update.is_none() || (info.buckets_usage.is_empty() && info.bucket_sizes.is_empty())
+}
+
+async fn read_data_usage_config_for_startup(storeapi: &Arc<ECStore>) -> Result<Option<Vec<u8>>, EcstoreError> {
+    match read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
+        Ok(data) => Ok(Some(data)),
+        Err(EcstoreError::ConfigNotFound) => {
+            let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+            match read_config(storeapi.clone(), backup_path.as_str()).await {
+                Ok(data) => Ok(Some(data)),
+                Err(EcstoreError::ConfigNotFound) => Ok(None),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn persisted_usage_cache_is_cold_for_startup(storeapi: &Arc<ECStore>) -> bool {
+    let Some(data) = (match read_data_usage_config_for_startup(storeapi).await {
+        Ok(data) => data,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to inspect persisted data usage cache; keeping configured scanner startup delay"
+            );
+            return false;
+        }
+    }) else {
+        return true;
+    };
+
+    match serde_json::from_slice::<DataUsageInfo>(&data) {
+        Ok(info) => data_usage_info_is_cold(&info),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to decode persisted data usage cache; running initial scanner cycle without startup delay"
+            );
+            true
+        }
+    }
+}
+
+async fn initial_scanner_startup_usage_state(storeapi: &Arc<ECStore>) -> (bool, bool) {
+    let has_buckets = match storeapi
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(buckets) => !buckets.is_empty(),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to inspect buckets for scanner startup delay; keeping configured scanner startup delay"
+            );
+            false
+        }
+    };
+
+    if !has_buckets {
+        return (false, false);
+    }
+
+    (persisted_usage_cache_is_cold_for_startup(storeapi).await, true)
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
@@ -131,8 +213,17 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     let ctx_clone = ctx;
     let storeapi_clone = storeapi;
     tokio::spawn(async move {
-        let sleep_time = initial_scanner_delay();
-        tokio::time::sleep(sleep_time).await;
+        let (usage_cache_is_cold, has_buckets) = initial_scanner_startup_usage_state(&storeapi_clone).await;
+        let sleep_time = initial_scanner_delay_for_startup(
+            scanner_start_delay().map(|duration| duration.as_secs()),
+            usage_cache_is_cold,
+            has_buckets,
+        );
+        if sleep_time.is_zero() {
+            info!("Skipping initial data scanner delay because persisted data usage cache is cold");
+        } else {
+            tokio::time::sleep(sleep_time).await;
+        }
 
         loop {
             if ctx_clone.is_cancelled() {
@@ -505,7 +596,12 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
                 max_directories = ?cycle_budget.max_directories(),
                 "Data scanner cycle stopped after reaching its cycle budget"
             );
-            emit_scan_cycle_partial(cycle_start.elapsed(), scan_cycle_partial_reason(cycle_budget.reason()));
+            let budget_reason = cycle_budget.reason();
+            emit_scan_cycle_partial_with_source(
+                cycle_start.elapsed(),
+                scan_cycle_partial_reason(budget_reason),
+                scan_cycle_partial_source(budget_reason),
+            );
             mark_scan_cycle_idle(cycle_info).await;
             return;
         }
@@ -526,7 +622,12 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             "Data scanner cycle stopped after reaching its cycle budget"
         );
         global_metrics().finish_scan_cycle_work(cycle_work_start);
-        emit_scan_cycle_partial(cycle_start.elapsed(), scan_cycle_partial_reason(cycle_budget.reason()));
+        let budget_reason = cycle_budget.reason();
+        emit_scan_cycle_partial_with_source(
+            cycle_start.elapsed(),
+            scan_cycle_partial_reason(budget_reason),
+            scan_cycle_partial_source(budget_reason),
+        );
         mark_scan_cycle_idle(cycle_info).await;
         return;
     }
@@ -764,6 +865,29 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
+        let delay = initial_scanner_delay_for_startup(Some(120), true, true);
+        assert_eq!(delay, Duration::ZERO);
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache() {
+        let delay = initial_scanner_delay_for_startup(Some(120), false, true);
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_keeps_configured_delay_without_buckets() {
+        let delay = initial_scanner_delay_for_startup(Some(120), true, false);
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
+    }
+
+    #[test]
+    #[serial]
     fn test_scanner_cycle_max_duration_uses_env() {
         with_var(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, Some("42"), || {
             assert_eq!(scanner_cycle_max_duration(), Some(Duration::from_secs(42)));
@@ -853,6 +977,20 @@ mod tests {
             ScanCyclePartialReason::Directories
         );
         assert_eq!(scan_cycle_partial_reason(None), ScanCyclePartialReason::Unknown);
+    }
+
+    #[test]
+    fn test_scan_cycle_partial_source_maps_budget_reason() {
+        assert_eq!(scan_cycle_partial_source(Some(ScannerCycleBudgetReason::Runtime)), None);
+        assert_eq!(
+            scan_cycle_partial_source(Some(ScannerCycleBudgetReason::Objects)),
+            Some(ScannerWorkSource::Usage)
+        );
+        assert_eq!(
+            scan_cycle_partial_source(Some(ScannerCycleBudgetReason::Directories)),
+            Some(ScannerWorkSource::Usage)
+        );
+        assert_eq!(scan_cycle_partial_source(None), None);
     }
 
     #[tokio::test]

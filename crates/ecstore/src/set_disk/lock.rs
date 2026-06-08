@@ -67,10 +67,7 @@ impl SetDisks {
                     achieved,
                 }
             }
-            other => StorageError::other(format!(
-                "Failed to acquire {mode} lock: {}",
-                self.format_lock_error_from_error(bucket, object, mode, &other)
-            )),
+            other => StorageError::Lock(other),
         }
     }
 

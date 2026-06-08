@@ -120,6 +120,14 @@ pub struct LastMinute {
     pub ilm: HashMap<String, TimedAction>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerSourceCycleSnapshot {
+    #[serde(rename = "source", default)]
+    pub source: String,
+    #[serde(rename = "cycles", default)]
+    pub cycles: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerMetrics {
     #[serde(rename = "collected")]
@@ -140,12 +148,21 @@ pub struct ScannerMetrics {
     pub last_minute: LastMinute,
     #[serde(rename = "active")]
     pub active_paths: Vec<String>,
+    #[serde(rename = "last_cycle_partial_source", default)]
+    pub last_cycle_partial_source: String,
+    #[serde(rename = "last_cycle_partial_source_code", default)]
+    pub last_cycle_partial_source_code: u64,
+    #[serde(rename = "partial_cycles_by_source", default)]
+    pub partial_cycles_by_source: Vec<ScannerSourceCycleSnapshot>,
 }
 
 impl ScannerMetrics {
     pub fn merge(&mut self, other: &Self) {
-        if self.collected_at < other.collected_at {
+        let other_is_newer = self.collected_at < other.collected_at;
+        if other_is_newer {
             self.collected_at = other.collected_at;
+            self.last_cycle_partial_source = other.last_cycle_partial_source.clone();
+            self.last_cycle_partial_source_code = other.last_cycle_partial_source_code;
         }
 
         if self.ongoing_buckets < other.ongoing_buckets {
@@ -181,6 +198,20 @@ impl ScannerMetrics {
         for (k, v) in other.last_minute.ilm.iter() {
             self.last_minute.ilm.entry(k.clone()).or_default().merge(v);
         }
+
+        for source in other.partial_cycles_by_source.iter() {
+            if let Some(existing) = self
+                .partial_cycles_by_source
+                .iter_mut()
+                .find(|existing| existing.source == source.source)
+            {
+                existing.cycles += source.cycles;
+            } else {
+                self.partial_cycles_by_source.push(source.clone());
+            }
+        }
+        self.partial_cycles_by_source
+            .sort_by(|left, right| left.source.cmp(&right.source));
 
         self.active_paths.extend(other.active_paths.clone());
 
@@ -667,4 +698,57 @@ impl OsMetrics {
 pub struct Operations {
     #[serde(rename = "operations")]
     pub operations: HashMap<String, TimedAction>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scanner_metrics_merge_aggregates_partial_cycles_by_source() {
+        let collected_at = Utc::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            last_cycle_partial_source: "usage".to_string(),
+            last_cycle_partial_source_code: 1,
+            partial_cycles_by_source: vec![ScannerSourceCycleSnapshot {
+                source: "usage".to_string(),
+                cycles: 1,
+            }],
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            last_cycle_partial_source: "lifecycle".to_string(),
+            last_cycle_partial_source_code: 2,
+            partial_cycles_by_source: vec![
+                ScannerSourceCycleSnapshot {
+                    source: "usage".to_string(),
+                    cycles: 2,
+                },
+                ScannerSourceCycleSnapshot {
+                    source: "lifecycle".to_string(),
+                    cycles: 1,
+                },
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.last_cycle_partial_source, "lifecycle");
+        assert_eq!(scanner.last_cycle_partial_source_code, 2);
+        assert_eq!(
+            scanner.partial_cycles_by_source,
+            vec![
+                ScannerSourceCycleSnapshot {
+                    source: "lifecycle".to_string(),
+                    cycles: 1,
+                },
+                ScannerSourceCycleSnapshot {
+                    source: "usage".to_string(),
+                    cycles: 3,
+                },
+            ]
+        );
+    }
 }

@@ -2212,6 +2212,8 @@ pub struct S3Router<T> {
     router: Router<T>,
     console_enabled: bool,
     console_router: Option<axum::routing::RouterIntoService<Body>>,
+    #[cfg(test)]
+    registered_routes: Vec<String>,
 }
 
 fn is_public_health_path(path: &str) -> bool {
@@ -2242,6 +2244,8 @@ impl<T: Operation> S3Router<T> {
             router,
             console_enabled,
             console_router,
+            #[cfg(test)]
+            registered_routes: Vec::new(),
         }
     }
 
@@ -2250,6 +2254,13 @@ impl<T: Operation> S3Router<T> {
 
         // warn!("set uri {}", &path);
 
+        #[cfg(test)]
+        {
+            self.router.insert(path.clone(), operation).map_err(std::io::Error::other)?;
+            self.registered_routes.push(path);
+        }
+
+        #[cfg(not(test))]
         self.router.insert(path, operation).map_err(std::io::Error::other)?;
 
         Ok(())
@@ -2271,6 +2282,11 @@ impl<T: Operation> S3Router<T> {
         let canonical_path = canonicalize_admin_path(path);
         let route = Self::make_route_str(method, canonical_path.as_ref());
         self.router.at(&route).is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registered_routes(&self) -> &[String] {
+        &self.registered_routes
     }
 }
 

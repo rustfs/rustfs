@@ -139,6 +139,9 @@ jobs:
       - name: Check layered dependencies
         run: ./scripts/check_layer_dependencies.sh
 
+      - name: Check architecture migration rules
+        run: ./scripts/check_architecture_migration_rules.sh
+
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
     needs: skip-check

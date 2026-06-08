@@ -43,6 +43,10 @@ PR_DESCRIPTION.md
 scripts/s3-tests/selected_tests.txt
 docs
 __pycache__/
+!docs/
+docs/*
+!docs/architecture/
+!docs/architecture/**
 
 # nix stuff
 result*

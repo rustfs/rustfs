@@ -243,7 +243,7 @@ impl ECStore {
                 required,
                 achieved,
             },
-            other => StorageError::other(format!("Failed to acquire {mode} lock on {bucket}/{object}: {other}")),
+            other => StorageError::Lock(other),
         }
     }
 
@@ -570,9 +570,32 @@ impl ECStore {
             }
 
             if !dst_opts.versioned && src_opts.version_id.is_none() {
-                return self.pools[pool_idx]
-                    .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, &dst_opts)
-                    .await;
+                if src_info.metadata_only {
+                    return self.pools[pool_idx]
+                        .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, &dst_opts)
+                        .await;
+                }
+                // Transitioned object self-copy: restore from tier into the same pool.
+                let put_opts = ObjectOptions {
+                    user_defined: (*src_info.user_defined).clone(),
+                    versioned: dst_opts.versioned,
+                    version_id: dst_opts.version_id.clone(),
+                    no_lock: dst_opts.no_lock,
+                    mod_time: dst_opts.mod_time,
+                    http_preconditions: dst_opts.http_preconditions.clone(),
+                    ..Default::default()
+                };
+                return if let Some(reader) = src_info.put_object_reader.as_mut() {
+                    self.pools[pool_idx]
+                        .put_object(dst_bucket, &dst_object, reader, &put_opts)
+                        .await
+                } else {
+                    Err(StorageError::InvalidArgument(
+                        src_bucket.to_owned(),
+                        src_object.to_owned(),
+                        "put_object_reader is none".to_owned(),
+                    ))
+                };
             }
 
             if dst_opts.versioned && src_opts.version_id != dst_opts.version_id {

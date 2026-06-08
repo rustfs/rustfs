@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
-    DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageScanCheckpoint, DataUsageScanCheckpointReason,
-    SizeSummary, hash_path,
+    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageScanCheckpoint,
+    DataUsageScanCheckpointReason, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
 use crate::runtime_config::{
@@ -35,7 +35,9 @@ use rustfs_common::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealScanMode,
     send_heal_request_with_admission,
 };
-use rustfs_common::metrics::{IlmAction, Metric, Metrics, UpdateCurrentPathFn, current_path_updater, global_metrics};
+use rustfs_common::metrics::{
+    IlmAction, Metric, Metrics, ScannerWorkSource, UpdateCurrentPathFn, current_path_updater, global_metrics,
+};
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_expiry_rule};
 use rustfs_ecstore::bucket::lifecycle::evaluator::Evaluator;
@@ -145,10 +147,39 @@ fn should_yield_after_object(object_count: u64, yield_every: u64) -> bool {
     yield_every > 0 && object_count.is_multiple_of(yield_every)
 }
 
+fn record_scanner_ilm_action_if_queued(metrics: &Metrics, count: u64, queued: bool) -> bool {
+    if queued {
+        metrics.record_scanner_ilm_action(count);
+    }
+    queued
+}
+
+#[derive(Clone, Copy)]
+struct PendingScannerAccounting<'a> {
+    object: &'a ObjectInfo,
+    retained_size: i64,
+    expired_size: i64,
+}
+
+impl PendingScannerAccounting<'_> {
+    fn apply(self, size_summary: &mut SizeSummary, cumulative_size: &mut i64, queued: bool) {
+        let size = if queued { self.expired_size } else { self.retained_size };
+        size_summary.actions_accounting(self.object, size, self.retained_size);
+        *cumulative_size += size;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FolderResumeMatch {
     Exact,
     Descendant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderResumeOrder {
+    NoHint,
+    Used,
+    Stale,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,14 +204,14 @@ fn folder_resume_match(folder_name: &str, resume_after: &str) -> Option<FolderRe
         .map(|_| FolderResumeMatch::Descendant)
 }
 
-fn order_items_for_resume<T, F>(items: &mut [T], resume_after: Option<&str>, name: F)
+fn order_items_for_resume<T, F>(items: &mut [T], resume_after: Option<&str>, name: F) -> FolderResumeOrder
 where
     F: Fn(&T) -> &str,
 {
     items.sort_by(|left, right| name(left).cmp(name(right)));
 
     let Some(resume_after) = resume_after.filter(|resume_after| !resume_after.is_empty()) else {
-        return;
+        return FolderResumeOrder::NoHint;
     };
 
     let Some((resume_index, resume_match)) = items
@@ -188,7 +219,7 @@ where
         .enumerate()
         .find_map(|(index, item)| folder_resume_match(name(item), resume_after).map(|resume_match| (index, resume_match)))
     else {
-        return;
+        return FolderResumeOrder::Stale;
     };
 
     let rotate_by = match resume_match {
@@ -198,15 +229,16 @@ where
     if rotate_by < items.len() {
         items.rotate_left(rotate_by);
     }
+    FolderResumeOrder::Used
 }
 
 #[cfg(test)]
-fn order_folders_for_resume(folders: &mut [CachedFolder], resume_after: Option<&str>) {
-    order_items_for_resume(folders, resume_after, |folder| folder.name.as_str());
+fn order_folders_for_resume(folders: &mut [CachedFolder], resume_after: Option<&str>) -> FolderResumeOrder {
+    order_items_for_resume(folders, resume_after, |folder| folder.name.as_str())
 }
 
-fn order_queued_folders_for_resume(folders: &mut [QueuedFolder], resume_after: Option<&str>) {
-    order_items_for_resume(folders, resume_after, |folder| folder.folder.name.as_str());
+fn order_queued_folders_for_resume(folders: &mut [QueuedFolder], resume_after: Option<&str>) -> FolderResumeOrder {
+    order_items_for_resume(folders, resume_after, |folder| folder.folder.name.as_str())
 }
 
 fn checkpoint_reason_from_budget(reason: Option<ScannerCycleBudgetReason>) -> DataUsageScanCheckpointReason {
@@ -228,7 +260,13 @@ fn set_scan_checkpoint(cache: &mut DataUsageCache, reason: DataUsageScanCheckpoi
     });
 
     if let Some(resume_after) = resume_after {
-        cache.info.scan_checkpoint = Some(DataUsageScanCheckpoint::new(resume_after, reason));
+        let checkpoint = DataUsageScanCheckpoint::new(resume_after, reason);
+        global_metrics().record_scanner_checkpoint_set(
+            checkpoint.version,
+            checkpoint.resume_after.clone(),
+            checkpoint.reason.as_str(),
+        );
+        cache.info.scan_checkpoint = Some(checkpoint);
     } else {
         cache.info.scan_checkpoint = None;
     }
@@ -543,6 +581,7 @@ impl ScannerItem {
         };
         let mut to_delete_objs: Vec<ObjectToDelete> = Vec::new();
         let mut noncurrent_events: Vec<Event> = Vec::new();
+        let mut noncurrent_accounting: Vec<PendingScannerAccounting<'_>> = Vec::new();
         let mut cumulative_size = 0;
         let mut remaining_versions = object_infos.len();
         'eventLoop: {
@@ -557,48 +596,77 @@ impl ScannerItem {
                 };
 
                 let mut size = actual_size;
+                let mut account_now = true;
 
-                let done_ilm = Metrics::time_ilm(event.action);
                 match event.action {
                     IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
-                        remaining_versions = 0;
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
-                        apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        done_ilm(1)();
-                        global_metrics().record_scanner_ilm_action(1);
+                        let done_ilm = Metrics::time_ilm(event.action);
+                        let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                            done_ilm(1)();
+                            remaining_versions = 0;
+                        } else {
+                            PendingScannerAccounting {
+                                object: oi,
+                                retained_size: actual_size,
+                                expired_size: 0,
+                            }
+                            .apply(size_summary, &mut cumulative_size, false);
+                            for retained in object_infos.iter().skip(i + 1) {
+                                let retained_size = match retained.get_actual_size() {
+                                    Ok(size) => size,
+                                    Err(_) => {
+                                        warn!("apply_actions: Failed to get actual size for object {}", retained.name);
+                                        0
+                                    }
+                                };
+                                PendingScannerAccounting {
+                                    object: retained,
+                                    retained_size,
+                                    expired_size: 0,
+                                }
+                                .apply(size_summary, &mut cumulative_size, false);
+                            }
+                        }
                         break 'eventLoop;
                     }
 
                     IlmAction::DeleteAction | IlmAction::DeleteRestoredAction | IlmAction::DeleteRestoredVersionAction => {
-                        if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
-                            remaining_versions -= 1;
-                            size = 0;
-                        }
-
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
-                        apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        done_ilm(1)();
-                        global_metrics().record_scanner_ilm_action(1);
+                        let done_ilm = Metrics::time_ilm(event.action);
+                        let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                            done_ilm(1)();
+                            if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
+                                remaining_versions -= 1;
+                                size = 0;
+                            }
+                        }
                     }
                     IlmAction::DeleteVersionAction => {
-                        remaining_versions -= 1;
-                        size = 0;
                         if let Some(opt) = object_opts.get(i) {
                             to_delete_objs.push(ObjectToDelete {
                                 object_name: opt.name.clone(),
                                 version_id: opt.version_id,
                                 ..Default::default()
                             });
+                            noncurrent_accounting.push(PendingScannerAccounting {
+                                object: oi,
+                                retained_size: actual_size,
+                                expired_size: 0,
+                            });
+                            account_now = false;
                         }
                         noncurrent_events.push(event.clone());
-                        done_ilm(1)();
-                        global_metrics().record_scanner_ilm_action(1);
                     }
                     IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                         debug!("apply_actions: applying transition rule for object: {} {}", oi.name, event.action);
-                        apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
-                        done_ilm(1)();
-                        global_metrics().record_scanner_ilm_action(1);
+                        let done_ilm = Metrics::time_ilm(event.action);
+                        let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
+                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                            done_ilm(1)();
+                        }
                     }
 
                     IlmAction::NoneAction | IlmAction::ActionCount => {
@@ -606,20 +674,31 @@ impl ScannerItem {
                     }
                 }
 
-                size_summary.actions_accounting(oi, size, actual_size);
-
-                cumulative_size += size;
+                if account_now {
+                    size_summary.actions_accounting(oi, size, actual_size);
+                    cumulative_size += size;
+                }
             }
         }
 
         if !to_delete_objs.is_empty()
             && let Some(event) = noncurrent_events.first().cloned()
         {
-            GLOBAL_ExpiryState
+            let action = event.action;
+            let count = u64::try_from(to_delete_objs.len()).unwrap_or(u64::MAX);
+            let done_ilm = Metrics::time_ilm(action);
+            let queued = GLOBAL_ExpiryState
                 .write()
                 .await
-                .enqueue_by_newer_noncurrent(&self.bucket, to_delete_objs, event)
+                .enqueue_by_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner)
                 .await;
+            if record_scanner_ilm_action_if_queued(global_metrics(), count, queued) {
+                done_ilm(count)();
+                remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
+            }
+            for pending in noncurrent_accounting {
+                pending.apply(size_summary, &mut cumulative_size, queued);
+            }
         }
         self.alert_excessive_versions(remaining_versions, cumulative_size);
     }
@@ -740,6 +819,7 @@ impl ScannerItem {
         ensure_scanner_alert_metrics_registered();
         let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
         if too_many_versions {
+            global_metrics().record_scanner_source_executed(ScannerWorkSource::Alerts, 1);
             counter!(
                 METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL,
                 "bucket" => self.bucket.clone()
@@ -754,6 +834,7 @@ impl ScannerItem {
             );
         }
         if too_large_versions {
+            global_metrics().record_scanner_source_executed(ScannerWorkSource::Alerts, 1);
             counter!(
                 METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL,
                 "bucket" => self.bucket.clone()
@@ -877,17 +958,23 @@ impl FolderScanner {
         self.new_cache.info.scan_resume_after = Some(folder.to_string());
         self.update_cache.info.scan_resume_after = Some(folder.to_string());
         let checkpoint = DataUsageScanCheckpoint::new(folder.to_string(), DataUsageScanCheckpointReason::Unknown);
+        global_metrics().record_scanner_checkpoint_set(
+            checkpoint.version,
+            checkpoint.resume_after.clone(),
+            checkpoint.reason.as_str(),
+        );
         self.new_cache.info.scan_checkpoint = Some(checkpoint.clone());
         self.update_cache.info.scan_checkpoint = Some(checkpoint);
     }
 
     fn alert_excessive_folders(&self, folder: &str, total_folders: usize) {
         let threshold = scanner_excess_folders_threshold();
-        if total_folders as u64 <= threshold {
+        if u64::try_from(total_folders).unwrap_or(u64::MAX) <= threshold {
             return;
         }
 
         ensure_scanner_alert_metrics_registered();
+        global_metrics().record_scanner_source_executed(ScannerWorkSource::Alerts, 1);
         counter!(
             METRIC_SCANNER_EXCESS_FOLDERS_TOTAL,
             "root" => self.root.clone()
@@ -937,14 +1024,18 @@ impl FolderScanner {
     /// Send update if enough time has passed
     /// Should be called on a regular basis when the new_cache contains more recent total than previously.
     /// May or may not send an update upstream.
-    pub async fn send_update(&mut self) {
-        // Send at most an update every minute.
+    fn should_send_update(&self) -> bool {
         if self.updates.is_none() {
-            return;
+            return false;
         }
 
         let elapsed = self.last_update.elapsed().unwrap_or(Duration::from_secs(0));
-        if elapsed < Duration::from_secs(60) {
+        elapsed >= Duration::from_secs(60)
+    }
+
+    pub async fn send_update(&mut self) {
+        // Send at most an update every minute.
+        if !self.should_send_update() {
             return;
         }
 
@@ -957,6 +1048,15 @@ impl FolderScanner {
             }
             self.last_update = SystemTime::now();
         }
+    }
+
+    async fn send_update_for_entry(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, entry: &DataUsageEntry) {
+        if !self.should_send_update() {
+            return;
+        }
+
+        self.update_cache.replace_hashed(hash, parent, entry);
+        self.send_update().await;
     }
 
     /// Scan a folder recursively
@@ -1213,6 +1313,7 @@ impl FolderScanner {
                 }
 
                 if should_yield_after_object(object_count, yield_every_objects) {
+                    self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                     let yield_start = Instant::now();
                     tokio::task::yield_now().await;
                     global_metrics().record_scanner_yield(yield_start.elapsed());
@@ -1255,13 +1356,29 @@ impl FolderScanner {
                 }
             }
 
-            let scan_resume_after = self
-                .old_cache
-                .info
-                .scan_checkpoint
-                .as_ref()
-                .map(|checkpoint| checkpoint.resume_after.as_str())
-                .or(self.old_cache.info.scan_resume_after.as_deref());
+            let is_scan_root = folder.name == self.old_cache.info.name;
+            let scan_checkpoint = self.old_cache.info.scan_checkpoint.as_ref();
+            let checkpoint_resume_after = scan_checkpoint.and_then(|checkpoint| {
+                if is_scan_root {
+                    global_metrics().record_scanner_checkpoint_set(
+                        checkpoint.version,
+                        checkpoint.resume_after.clone(),
+                        checkpoint.reason.as_str(),
+                    );
+                }
+                if checkpoint.version != DATA_USAGE_SCAN_CHECKPOINT_VERSION || checkpoint.resume_after.is_empty() {
+                    if is_scan_root {
+                        global_metrics().record_scanner_checkpoint_ignored();
+                    }
+                    None
+                } else {
+                    Some(checkpoint.resume_after.as_str())
+                }
+            });
+            let checkpoint_tracks_child_order = checkpoint_resume_after
+                .and_then(|resume_after| folder_resume_match(&folder.name, resume_after))
+                .is_some_and(|resume_match| matches!(resume_match, FolderResumeMatch::Descendant));
+            let scan_resume_after = checkpoint_resume_after.or(self.old_cache.info.scan_resume_after.as_deref());
             let mut queued_folders = Vec::with_capacity(new_folders.len() + existing_folders.len());
             queued_folders.extend(new_folders.into_iter().map(|folder| QueuedFolder {
                 folder,
@@ -1271,7 +1388,15 @@ impl FolderScanner {
                 folder,
                 source: FolderScanSource::Existing,
             }));
-            order_queued_folders_for_resume(&mut queued_folders, scan_resume_after);
+            let has_queued_folders = !queued_folders.is_empty();
+            let resume_order = order_queued_folders_for_resume(&mut queued_folders, scan_resume_after);
+            if checkpoint_tracks_child_order && has_queued_folders {
+                match resume_order {
+                    FolderResumeOrder::Used => global_metrics().record_scanner_checkpoint_used(),
+                    FolderResumeOrder::Stale => global_metrics().record_scanner_checkpoint_stale(),
+                    FolderResumeOrder::NoHint => {}
+                }
+            }
 
             // Scan child folders in the combined resume order.
             for queued_folder in queued_folders {
@@ -1334,6 +1459,7 @@ impl FolderScanner {
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
                     fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
                     self.record_scan_resume_hint(&folder_item.name);
+                    self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                     tokio::task::yield_now().await;
                 } else {
                     let mut dst = DataUsageEntry::default();
@@ -1583,6 +1709,7 @@ impl FolderScanner {
                         // In compacted mode child totals are accumulated directly into the parent entry.
                         let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
                         fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                        self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                         tokio::task::yield_now().await;
                     } else {
                         let mut dst = DataUsageEntry::default();
@@ -1767,8 +1894,12 @@ pub async fn scan_data_folder(
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
+            let had_scan_checkpoint = cache.info.scan_checkpoint.is_some() || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
             new_cache.info.scan_checkpoint = None;
+            if had_scan_checkpoint {
+                global_metrics().record_scanner_checkpoint_cleared();
+            }
 
             close_disk().await;
             Ok(new_cache.clone())
@@ -1935,6 +2066,57 @@ mod tests {
         assert!(!ScannerItem::should_account_replication_stats(&purge_version));
     }
 
+    #[tokio::test]
+    async fn test_scanner_ilm_action_accounting_requires_enqueue_success() {
+        let metrics = Metrics::new();
+
+        record_scanner_ilm_action_if_queued(&metrics, 2, false);
+        let report = metrics.report().await;
+        let lifecycle = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source work should be visible");
+        assert_eq!(lifecycle.executed, 0);
+
+        record_scanner_ilm_action_if_queued(&metrics, 3, true);
+        let report = metrics.report().await;
+        let lifecycle = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source work should be visible");
+        assert_eq!(lifecycle.executed, 3);
+    }
+
+    #[test]
+    fn test_pending_scanner_accounting_requires_enqueue_success() {
+        let object = ObjectInfo {
+            size: 10,
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let pending = PendingScannerAccounting {
+            object: &object,
+            retained_size: 10,
+            expired_size: 0,
+        };
+
+        let mut failed_summary = SizeSummary::default();
+        let mut failed_cumulative_size = 0;
+        pending.apply(&mut failed_summary, &mut failed_cumulative_size, false);
+        assert_eq!(failed_summary.versions, 1);
+        assert_eq!(failed_summary.total_size, 10);
+        assert_eq!(failed_cumulative_size, 10);
+
+        let mut queued_summary = SizeSummary::default();
+        let mut queued_cumulative_size = 0;
+        pending.apply(&mut queued_summary, &mut queued_cumulative_size, true);
+        assert_eq!(queued_summary.versions, 0);
+        assert_eq!(queued_summary.total_size, 0);
+        assert_eq!(queued_cumulative_size, 0);
+    }
+
     #[test]
     #[serial]
     fn test_excessive_version_alert_thresholds_use_env() {
@@ -2037,9 +2219,10 @@ mod tests {
             },
         ];
 
-        order_folders_for_resume(&mut folders, Some("bucket/child-b"));
+        let outcome = order_folders_for_resume(&mut folders, Some("bucket/child-b"));
 
         let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
+        assert_eq!(outcome, FolderResumeOrder::Used);
         assert_eq!(
             names,
             vec![
@@ -2070,9 +2253,10 @@ mod tests {
             },
         ];
 
-        order_folders_for_resume(&mut folders, Some("bucket/child-b/grandchild"));
+        let outcome = order_folders_for_resume(&mut folders, Some("bucket/child-b/grandchild"));
 
         let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
+        assert_eq!(outcome, FolderResumeOrder::Used);
         assert_eq!(
             names,
             vec![
@@ -2081,6 +2265,28 @@ mod tests {
                 "bucket/child-a".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_order_folders_for_resume_reports_stale_hint() {
+        let mut folders = vec![
+            CachedFolder {
+                name: "bucket/child-c".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            CachedFolder {
+                name: "bucket/child-a".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+        ];
+
+        let outcome = order_folders_for_resume(&mut folders, Some("bucket/child-b"));
+
+        let names = folders.into_iter().map(|folder| folder.name).collect::<Vec<_>>();
+        assert_eq!(outcome, FolderResumeOrder::Stale);
+        assert_eq!(names, vec!["bucket/child-a".to_string(), "bucket/child-c".to_string()]);
     }
 
     #[tokio::test]
@@ -2413,6 +2619,48 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_scan_folder_compacted_parent_sends_partial_update() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+
+        let bucket_dir = temp_dir.join("bucket");
+        tokio::fs::create_dir_all(bucket_dir.join("child"))
+            .await
+            .expect("failed to create child directory");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+        scanner.last_update = SystemTime::UNIX_EPOCH;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        scanner.updates = Some(tx);
+
+        let folder = CachedFolder {
+            name: "bucket".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+        let mut into = DataUsageEntry {
+            compacted: true,
+            ..Default::default()
+        };
+
+        scanner
+            .scan_folder(CancellationToken::new(), folder, &mut into)
+            .await
+            .expect("compacted scan should finish successfully");
+
+        let update = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("compacted scan should send a partial update")
+            .expect("partial update channel should remain open");
+
+        assert!(update.compacted, "partial update should preserve compacted state");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
         let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2464,6 +2712,51 @@ mod tests {
         assert!(partial_cache.root().is_some(), "partial cache should keep completed scan progress");
         assert!(budget.budget_elapsed());
         assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_data_folder_reports_invalid_checkpoint_ignored_once() {
+        let (scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir.clone()),
+        };
+
+        tokio::fs::create_dir_all(temp_dir.join("bucket").join("child-a").join("grandchild"))
+            .await
+            .expect("failed to create nested child directory");
+
+        let before = global_metrics().report().await.scan_checkpoint_ignored;
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&parent, Default::default());
+        let cache = DataUsageCache {
+            info: crate::data_usage_define::DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                scan_checkpoint: Some(crate::data_usage_define::DataUsageScanCheckpoint {
+                    version: crate::data_usage_define::DATA_USAGE_SCAN_CHECKPOINT_VERSION + 1,
+                    resume_after: "bucket/child-a".to_string(),
+                    reason: crate::data_usage_define::DataUsageScanCheckpointReason::Unknown,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = scan_data_folder(
+            budget.token(),
+            budget.clone(),
+            vec![scanner.local_disk.clone()],
+            scanner.local_disk.clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "scan should complete with an ignored checkpoint");
+        let after = global_metrics().report().await.scan_checkpoint_ignored;
+        assert_eq!(after.saturating_sub(before), 1);
     }
 
     #[tokio::test]
