@@ -147,21 +147,13 @@ async fn async_main() -> Result<()> {
         }
     };
 
-    // Handle info command
-    if let rustfs::config::CommandResult::Info(opts) = command_result {
-        rustfs::config::execute_info(&opts);
-        return Ok(());
-    }
-
-    if let rustfs::config::CommandResult::Tls(opts) = &command_result {
-        rustfs::tls::execute_tls(opts)?;
-        return Ok(());
-    }
-
-    // Get config for server command
+    // Execute subcommand, or prepare config for `server` subcommand
     let config = match command_result {
-        rustfs::config::CommandResult::Server(cfg) => cfg,
-        rustfs::config::CommandResult::Info(_) | rustfs::config::CommandResult::Tls(_) => unreachable!(),
+        rustfs::config::CommandResult::Info(opts) => {
+            return Ok(rustfs::config::execute_info(&opts));
+        }
+        rustfs::config::CommandResult::Tls(opts) => return rustfs::tls::execute_tls(&opts),
+        rustfs::config::CommandResult::Server(config) => config,
     };
 
     // Initialize the global config snapshot for info command
