@@ -723,7 +723,7 @@ fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err
             required,
             achieved,
         },
-        other => StorageError::other(format!("Failed to acquire {mode} lock on {bucket}/{object}: {other}")),
+        other => StorageError::Lock(other),
     }
 }
 
