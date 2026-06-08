@@ -14,21 +14,86 @@
 
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, XzDecoder, ZlibDecoder, ZstdDecoder};
 use async_compression::tokio::write::{BzEncoder, GzipEncoder, XzEncoder, ZlibEncoder, ZstdEncoder};
-use std::path::Path;
+use std::collections::HashSet;
+use std::future::Future;
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use thiserror::Error;
 use tokio::fs::File;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::task::spawn_blocking;
 use tokio_stream::StreamExt;
 use tokio_tar::Archive;
+use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+pub type Result<T> = std::result::Result<T, ZipError>;
+
+#[derive(Debug, Error)]
+pub enum ZipError {
+    #[error("unsupported {operation} for format {format:?}")]
+    UnsupportedFormat {
+        format: CompressionFormat,
+        operation: &'static str,
+    },
+    #[error("invalid compression level {0}: value exceeds i32::MAX")]
+    InvalidCompressionLevel(u32),
+    #[error("unsafe archive entry path: {0}")]
+    UnsafeEntryPath(String),
+    #[error("archive entry path length {length} exceeds limit {limit}: {path}")]
+    EntryPathTooLong { path: String, length: usize, limit: usize },
+    #[error("archive entry count {count} exceeds limit {limit}")]
+    EntryCountLimitExceeded { count: usize, limit: usize },
+    #[error("archive entry '{path}' size {size} exceeds limit {limit}")]
+    EntrySizeLimitExceeded { path: String, size: u64, limit: u64 },
+    #[error("archive total unpacked size {size} exceeds limit {limit}")]
+    TotalUnpackedSizeLimitExceeded { size: u64, limit: u64 },
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Zip(#[from] zip::result::ZipError),
+    #[error(transparent)]
+    Join(#[from] tokio::task::JoinError),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CompressionCodec {
+    Gzip,
+    Bzip2,
+    Xz,
+    Zlib,
+    Zstd,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ArchiveKind {
+    Tar,
+    Zip,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ArchiveFormat {
+    Tar,
+    TarGzip,
+    TarBzip2,
+    TarXz,
+    TarZlib,
+    TarZstd,
+    Zip,
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum CompressionFormat {
-    Gzip,  //.gz
-    Bzip2, //.bz2
-    Zip,   //.zip
-    Xz,    //.xz
-    Zlib,  //.z
-    Zstd,  //.zst
-    Tar,   //.tar (uncompressed)
+    Gzip,
+    Bzip2,
+    Zip,
+    Xz,
+    Zlib,
+    Zstd,
+    Tar,
     Unknown,
 }
 
@@ -41,32 +106,144 @@ pub enum CompressionLevel {
     Level(u32),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipEntry {
+    pub name: String,
+    pub size: u64,
+    pub compressed_size: u64,
+    pub is_dir: bool,
+    pub compression_method: String,
+    pub archive_kind: ArchiveKind,
+    pub format: ArchiveFormat,
+    pub unix_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ZipExtractSummary {
+    pub entry_count: usize,
+    pub directory_count: usize,
+    pub file_count: usize,
+    pub total_unpacked_size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveLimits {
+    pub max_entries: usize,
+    pub max_entry_size: u64,
+    pub max_total_unpacked_size: u64,
+    pub max_path_length: usize,
+    pub validate_entry_paths: bool,
+}
+
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 100_000,
+            max_entry_size: 1_073_741_824,
+            max_total_unpacked_size: 10_737_418_240,
+            max_path_length: 1024,
+            validate_entry_paths: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZipWriteOptions {
+    pub compression_level: CompressionLevel,
+    pub create_directory_entries: bool,
+}
+
+impl Default for ZipWriteOptions {
+    fn default() -> Self {
+        Self {
+            compression_level: CompressionLevel::Default,
+            create_directory_entries: false,
+        }
+    }
+}
+
+const SMALL_ZIP_EXTRACT_FAST_PATH_LIMIT: u64 = 8 * 1024;
+
+#[derive(Clone, Default)]
+struct SharedBuffer {
+    inner: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedBuffer {
+    fn into_vec(self) -> Vec<u8> {
+        self.inner.lock().expect("shared in-memory writer lock poisoned").clone()
+    }
+}
+
+impl AsyncWrite for SharedBuffer {
+    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("shared in-memory writer lock poisoned"))?;
+        inner.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl CompressionFormat {
-    /// Identify compression format from file extension
     pub fn from_extension(ext: &str) -> Self {
-        match ext.to_lowercase().as_str() {
-            "gz" | "gzip" | "tgz" => CompressionFormat::Gzip,
-            "bz2" | "bzip2" | "tbz" | "tbz2" => CompressionFormat::Bzip2,
-            "zip" => CompressionFormat::Zip,
-            "xz" | "txz" => CompressionFormat::Xz,
-            "zlib" => CompressionFormat::Zlib,
-            "zst" | "zstd" | "tzst" => CompressionFormat::Zstd,
-            "tar" => CompressionFormat::Tar,
-            _ => CompressionFormat::Unknown,
+        Self::from_archive_format(ArchiveFormat::from_extension(ext))
+    }
+
+    pub fn from_archive_format(format: ArchiveFormat) -> Self {
+        match format {
+            ArchiveFormat::TarGzip => CompressionFormat::Gzip,
+            ArchiveFormat::TarBzip2 => CompressionFormat::Bzip2,
+            ArchiveFormat::TarXz => CompressionFormat::Xz,
+            ArchiveFormat::TarZlib => CompressionFormat::Zlib,
+            ArchiveFormat::TarZstd => CompressionFormat::Zstd,
+            ArchiveFormat::Tar => CompressionFormat::Tar,
+            ArchiveFormat::Zip => CompressionFormat::Zip,
+            ArchiveFormat::Unknown => CompressionFormat::Unknown,
         }
     }
 
-    /// Identify compression format from file path
+    pub fn archive_format_from_path<P: AsRef<Path>>(path: P) -> ArchiveFormat {
+        ArchiveFormat::from_path(path)
+    }
+
+    pub fn archive_kind(&self) -> Option<ArchiveKind> {
+        match self {
+            CompressionFormat::Tar => Some(ArchiveKind::Tar),
+            CompressionFormat::Zip => Some(ArchiveKind::Zip),
+            CompressionFormat::Gzip
+            | CompressionFormat::Bzip2
+            | CompressionFormat::Xz
+            | CompressionFormat::Zlib
+            | CompressionFormat::Zstd
+            | CompressionFormat::Unknown => None,
+        }
+    }
+
+    pub fn compression_codec(&self) -> Option<CompressionCodec> {
+        match self {
+            CompressionFormat::Gzip => Some(CompressionCodec::Gzip),
+            CompressionFormat::Bzip2 => Some(CompressionCodec::Bzip2),
+            CompressionFormat::Xz => Some(CompressionCodec::Xz),
+            CompressionFormat::Zlib => Some(CompressionCodec::Zlib),
+            CompressionFormat::Zstd => Some(CompressionCodec::Zstd),
+            CompressionFormat::Tar | CompressionFormat::Zip | CompressionFormat::Unknown => None,
+        }
+    }
+
     pub fn from_path<P: AsRef<Path>>(path: P) -> Self {
-        let path = path.as_ref();
-        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            Self::from_extension(ext)
-        } else {
-            CompressionFormat::Unknown
-        }
+        Self::from_archive_format(ArchiveFormat::from_path(path))
     }
 
-    /// Get file extension corresponding to the format
     pub fn extension(&self) -> &'static str {
         match self {
             CompressionFormat::Gzip => "gz",
@@ -80,13 +257,11 @@ impl CompressionFormat {
         }
     }
 
-    /// Check if format is supported
     pub fn is_supported(&self) -> bool {
         !matches!(self, CompressionFormat::Unknown)
     }
 
-    /// Create decompressor
-    pub fn get_decoder<R>(&self, input: R) -> io::Result<Box<dyn AsyncRead + Send + Unpin>>
+    pub fn get_decoder<R>(&self, input: R) -> Result<Box<dyn AsyncRead + Send + Unpin>>
     where
         R: AsyncRead + Send + Unpin + 'static,
     {
@@ -100,65 +275,58 @@ impl CompressionFormat {
             CompressionFormat::Zstd => Box::new(ZstdDecoder::new(reader)),
             CompressionFormat::Tar => Box::new(reader),
             CompressionFormat::Zip => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Zip format requires special handling, use extract_zip function instead",
-                ));
+                return Err(ZipError::UnsupportedFormat {
+                    format: *self,
+                    operation: "stream decoding",
+                });
             }
             CompressionFormat::Unknown => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported file format"));
+                return Err(ZipError::UnsupportedFormat {
+                    format: *self,
+                    operation: "decoding",
+                });
             }
         };
 
         Ok(decoder)
     }
-    /// Convert CompressionLevel to async_compression::Level
-    fn convert_level(level: CompressionLevel) -> async_compression::Level {
+
+    fn convert_level(level: CompressionLevel) -> Result<async_compression::Level> {
         match level {
-            CompressionLevel::Fastest => async_compression::Level::Fastest,
-            CompressionLevel::Best => async_compression::Level::Best,
-            CompressionLevel::Default => async_compression::Level::Default,
-            CompressionLevel::Level(n) => async_compression::Level::Precise(n as i32),
+            CompressionLevel::Fastest => Ok(async_compression::Level::Fastest),
+            CompressionLevel::Best => Ok(async_compression::Level::Best),
+            CompressionLevel::Default => Ok(async_compression::Level::Default),
+            CompressionLevel::Level(n) => {
+                let level = i32::try_from(n).map_err(|_| ZipError::InvalidCompressionLevel(n))?;
+                Ok(async_compression::Level::Precise(level))
+            }
         }
     }
 
-    /// Create compressor
-    pub fn get_encoder<W>(&self, output: W, level: CompressionLevel) -> io::Result<Box<dyn AsyncWrite + Send + Unpin>>
+    pub fn get_encoder<W>(&self, output: W, level: CompressionLevel) -> Result<Box<dyn AsyncWrite + Send + Unpin>>
     where
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let writer = BufWriter::new(output);
 
         let encoder: Box<dyn AsyncWrite + Send + Unpin + 'static> = match self {
-            CompressionFormat::Gzip => {
-                let level = Self::convert_level(level);
-                Box::new(GzipEncoder::with_quality(writer, level))
-            }
-            CompressionFormat::Bzip2 => {
-                let level = Self::convert_level(level);
-                Box::new(BzEncoder::with_quality(writer, level))
-            }
-            CompressionFormat::Zlib => {
-                let level = Self::convert_level(level);
-                Box::new(ZlibEncoder::with_quality(writer, level))
-            }
-            CompressionFormat::Xz => {
-                let level = Self::convert_level(level);
-                Box::new(XzEncoder::with_quality(writer, level))
-            }
-            CompressionFormat::Zstd => {
-                let level = Self::convert_level(level);
-                Box::new(ZstdEncoder::with_quality(writer, level))
-            }
+            CompressionFormat::Gzip => Box::new(GzipEncoder::with_quality(writer, Self::convert_level(level)?)),
+            CompressionFormat::Bzip2 => Box::new(BzEncoder::with_quality(writer, Self::convert_level(level)?)),
+            CompressionFormat::Zlib => Box::new(ZlibEncoder::with_quality(writer, Self::convert_level(level)?)),
+            CompressionFormat::Xz => Box::new(XzEncoder::with_quality(writer, Self::convert_level(level)?)),
+            CompressionFormat::Zstd => Box::new(ZstdEncoder::with_quality(writer, Self::convert_level(level)?)),
             CompressionFormat::Tar => Box::new(writer),
             CompressionFormat::Zip => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Zip format requires special handling, use create_zip function instead",
-                ));
+                return Err(ZipError::UnsupportedFormat {
+                    format: *self,
+                    operation: "stream encoding",
+                });
             }
             CompressionFormat::Unknown => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported file format"));
+                return Err(ZipError::UnsupportedFormat {
+                    format: *self,
+                    operation: "encoding",
+                });
             }
         };
 
@@ -166,55 +334,432 @@ impl CompressionFormat {
     }
 }
 
-/// Decompress tar format compressed files
-pub async fn decompress<R, F>(input: R, format: CompressionFormat, mut callback: F) -> io::Result<()>
+impl ArchiveFormat {
+    pub fn from_extension(ext: &str) -> Self {
+        match ext.to_ascii_lowercase().as_str() {
+            "gz" | "gzip" | "tgz" => ArchiveFormat::TarGzip,
+            "bz2" | "bzip2" | "tbz" | "tbz2" => ArchiveFormat::TarBzip2,
+            "xz" | "txz" => ArchiveFormat::TarXz,
+            "zlib" | "zz" => ArchiveFormat::TarZlib,
+            "zst" | "zstd" | "tzst" => ArchiveFormat::TarZstd,
+            "tar" => ArchiveFormat::Tar,
+            "zip" => ArchiveFormat::Zip,
+            _ => ArchiveFormat::Unknown,
+        }
+    }
+
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Self {
+        let path = path.as_ref();
+        let lower_name = path.file_name().and_then(|name| name.to_str()).map(str::to_ascii_lowercase);
+
+        if let Some(name) = lower_name {
+            if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+                return ArchiveFormat::TarGzip;
+            }
+            if name.ends_with(".tar.bz2") || name.ends_with(".tbz") || name.ends_with(".tbz2") {
+                return ArchiveFormat::TarBzip2;
+            }
+            if name.ends_with(".tar.xz") || name.ends_with(".txz") {
+                return ArchiveFormat::TarXz;
+            }
+            if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
+                return ArchiveFormat::TarZstd;
+            }
+            if name.ends_with(".tar.zlib") {
+                return ArchiveFormat::TarZlib;
+            }
+        }
+
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(Self::from_extension)
+            .unwrap_or(ArchiveFormat::Unknown)
+    }
+
+    pub fn archive_kind(&self) -> Option<ArchiveKind> {
+        match self {
+            ArchiveFormat::Tar
+            | ArchiveFormat::TarGzip
+            | ArchiveFormat::TarBzip2
+            | ArchiveFormat::TarXz
+            | ArchiveFormat::TarZlib
+            | ArchiveFormat::TarZstd => Some(ArchiveKind::Tar),
+            ArchiveFormat::Zip => Some(ArchiveKind::Zip),
+            ArchiveFormat::Unknown => None,
+        }
+    }
+
+    pub fn compression_codec(&self) -> Option<CompressionCodec> {
+        match self {
+            ArchiveFormat::TarGzip => Some(CompressionCodec::Gzip),
+            ArchiveFormat::TarBzip2 => Some(CompressionCodec::Bzip2),
+            ArchiveFormat::TarXz => Some(CompressionCodec::Xz),
+            ArchiveFormat::TarZlib => Some(CompressionCodec::Zlib),
+            ArchiveFormat::TarZstd => Some(CompressionCodec::Zstd),
+            ArchiveFormat::Tar | ArchiveFormat::Zip | ArchiveFormat::Unknown => None,
+        }
+    }
+
+    pub fn extension(&self) -> &'static str {
+        match self {
+            ArchiveFormat::Tar => "tar",
+            ArchiveFormat::TarGzip => "tar.gz",
+            ArchiveFormat::TarBzip2 => "tar.bz2",
+            ArchiveFormat::TarXz => "tar.xz",
+            ArchiveFormat::TarZlib => "tar.zlib",
+            ArchiveFormat::TarZstd => "tar.zst",
+            ArchiveFormat::Zip => "zip",
+            ArchiveFormat::Unknown => "",
+        }
+    }
+}
+
+/// Read entries from a tar-family archive stream.
+///
+/// Supported formats are:
+/// - `CompressionFormat::Tar`
+/// - `CompressionFormat::Gzip`
+/// - `CompressionFormat::Bzip2`
+/// - `CompressionFormat::Xz`
+/// - `CompressionFormat::Zlib`
+/// - `CompressionFormat::Zstd`
+///
+/// `CompressionFormat::Zip` is intentionally not supported here because ZIP
+/// requires central-directory semantics and is handled through file-based
+/// helper APIs.
+pub async fn read_archive_entries<R, F, Fut>(input: R, format: CompressionFormat, callback: F) -> Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
-    F: AsyncFnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> io::Result<()> + Send + 'static,
+    F: FnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send,
+{
+    read_archive_entries_with_limits(input, format, ArchiveLimits::default(), callback).await
+}
+
+pub async fn read_archive_entries_with_limits<R, F, Fut>(
+    input: R,
+    format: CompressionFormat,
+    limits: ArchiveLimits,
+    mut callback: F,
+) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    F: FnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send,
 {
     let decoder = format.get_decoder(input)?;
     let mut ar = Archive::new(decoder);
     let mut entries = ar.entries()?;
+    let mut entry_count = 0_usize;
+    let mut total_unpacked_size = 0_u64;
 
     while let Some(entry) = entries.next().await {
         let entry = entry?;
+        entry_count += 1;
+        validate_archive_entry_count(entry_count, limits)?;
+
+        let entry_path = entry.path()?.to_string_lossy().into_owned();
+        validate_archive_entry_name(&entry_path, limits)?;
+
+        let entry_size = entry.header().size()?;
+        validate_archive_entry_size(&entry_path, entry_size, limits)?;
+        total_unpacked_size = total_unpacked_size.saturating_add(entry_size);
+        validate_archive_total_size(total_unpacked_size, limits)?;
+
         callback(entry).await?;
     }
 
     Ok(())
 }
 
-/// ZIP file entry information
-#[derive(Debug, Clone)]
-pub struct ZipEntry {
-    pub name: String,
-    pub size: u64,
-    pub compressed_size: u64,
-    pub is_dir: bool,
-    pub compression_method: String,
+/// Backward-compatible wrapper for archive entry iteration.
+pub async fn decompress<R, F, Fut>(input: R, format: CompressionFormat, callback: F) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    F: FnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send,
+{
+    read_archive_entries(input, format, callback).await
 }
 
-/// Simplified ZIP file processing (temporarily using standard library zip crate)
-pub async fn extract_zip_simple<P: AsRef<Path>>(zip_path: P, extract_to: P) -> io::Result<Vec<ZipEntry>> {
-    // Use standard library zip processing, return empty list as placeholder for now
-    // Actual implementation needs to be improved in future versions
-    let _zip_path = zip_path.as_ref();
-    let _extract_to = extract_to.as_ref();
-
-    Ok(Vec::new())
+/// Explicit tar-family alias for callers that want a clearer name than
+/// `decompress()`.
+pub async fn extract_tar_entries<R, F, Fut>(input: R, format: CompressionFormat, callback: F) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    F: FnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send,
+{
+    read_archive_entries(input, format, callback).await
 }
 
-/// Simplified ZIP file creation
+fn normalize_zip_entry_name(name: &str) -> Result<String> {
+    let path = Path::new(name);
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ZipError::UnsafeEntryPath(name.to_string()));
+            }
+        }
+    }
+
+    let normalized = normalized.to_string_lossy().replace('\\', "/");
+    if normalized.is_empty() {
+        return Err(ZipError::UnsafeEntryPath(name.to_string()));
+    }
+
+    Ok(normalized)
+}
+
+fn validate_archive_entry_name(name: &str, limits: ArchiveLimits) -> Result<()> {
+    if !limits.validate_entry_paths {
+        return Ok(());
+    }
+
+    let normalized = normalize_zip_entry_name(name)?;
+    let length = normalized.len();
+    if length > limits.max_path_length {
+        return Err(ZipError::EntryPathTooLong {
+            path: normalized,
+            length,
+            limit: limits.max_path_length,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_archive_entry_size(path: &str, size: u64, limits: ArchiveLimits) -> Result<()> {
+    if size > limits.max_entry_size {
+        return Err(ZipError::EntrySizeLimitExceeded {
+            path: path.to_string(),
+            size,
+            limit: limits.max_entry_size,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_archive_entry_count(count: usize, limits: ArchiveLimits) -> Result<()> {
+    if count > limits.max_entries {
+        return Err(ZipError::EntryCountLimitExceeded {
+            count,
+            limit: limits.max_entries,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_archive_total_size(total_size: u64, limits: ArchiveLimits) -> Result<()> {
+    if total_size > limits.max_total_unpacked_size {
+        return Err(ZipError::TotalUnpackedSizeLimitExceeded {
+            size: total_size,
+            limit: limits.max_total_unpacked_size,
+        });
+    }
+
+    Ok(())
+}
+
+fn zip_method_for_level(level: CompressionLevel) -> CompressionMethod {
+    match level {
+        CompressionLevel::Fastest => CompressionMethod::Stored,
+        CompressionLevel::Best | CompressionLevel::Default | CompressionLevel::Level(_) => CompressionMethod::Deflated,
+    }
+}
+
+fn parent_directories_for(path: &str) -> Vec<String> {
+    let path = Path::new(path);
+    let mut current = PathBuf::new();
+    let mut directories = Vec::new();
+
+    if let Some(parent) = path.parent() {
+        for component in parent.components() {
+            if let Component::Normal(part) = component {
+                current.push(part);
+                directories.push(format!("{}/", current.to_string_lossy().replace('\\', "/")));
+            }
+        }
+    }
+
+    directories
+}
+
+fn ensure_directory(path: &Path, created_directories: &mut HashSet<PathBuf>) -> Result<()> {
+    let path = path.to_path_buf();
+    if created_directories.insert(path.clone()) {
+        std::fs::create_dir_all(&path)?;
+    }
+
+    Ok(())
+}
+
+fn write_small_zip_entry<R: Read>(reader: &mut R, output_path: &Path, size: u64) -> Result<()> {
+    let size = usize::try_from(size).map_err(|_| io::Error::other("small zip entry size overflow"))?;
+    let mut buffer = [0_u8; SMALL_ZIP_EXTRACT_FAST_PATH_LIMIT as usize];
+    reader.read_exact(&mut buffer[..size])?;
+    std::fs::write(output_path, &buffer[..size])?;
+    Ok(())
+}
+
+pub async fn extract_zip_simple<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, extract_to: Q) -> Result<Vec<ZipEntry>> {
+    extract_zip_with_limits(zip_path, extract_to, ArchiveLimits::default()).await
+}
+
+pub async fn extract_zip_to_path_with_limits<P: AsRef<Path>, Q: AsRef<Path>>(
+    zip_path: P,
+    extract_to: Q,
+    limits: ArchiveLimits,
+) -> Result<ZipExtractSummary> {
+    let zip_path = zip_path.as_ref().to_path_buf();
+    let extract_to = extract_to.as_ref().to_path_buf();
+
+    spawn_blocking(move || extract_zip_impl(zip_path, extract_to, limits, false).map(|(_, summary)| summary)).await?
+}
+
+pub async fn extract_zip_with_limits<P: AsRef<Path>, Q: AsRef<Path>>(
+    zip_path: P,
+    extract_to: Q,
+    limits: ArchiveLimits,
+) -> Result<Vec<ZipEntry>> {
+    let zip_path = zip_path.as_ref().to_path_buf();
+    let extract_to = extract_to.as_ref().to_path_buf();
+
+    spawn_blocking(move || extract_zip_impl(zip_path, extract_to, limits, true).map(|(entries, _)| entries.unwrap_or_default()))
+        .await?
+}
+
+fn extract_zip_impl(
+    zip_path: PathBuf,
+    extract_to: PathBuf,
+    limits: ArchiveLimits,
+    collect_entries: bool,
+) -> Result<(Option<Vec<ZipEntry>>, ZipExtractSummary)> {
+    let file = std::fs::File::open(&zip_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    std::fs::create_dir_all(&extract_to)?;
+    let mut created_directories = HashSet::from([extract_to.clone()]);
+
+    let mut entries = collect_entries.then(|| Vec::with_capacity(archive.len()));
+    let mut summary = ZipExtractSummary::default();
+    for index in 0..archive.len() {
+        validate_archive_entry_count(index + 1, limits)?;
+        let mut zip_file = archive.by_index(index)?;
+        let enclosed_name = zip_file
+            .enclosed_name()
+            .ok_or_else(|| ZipError::UnsafeEntryPath(zip_file.name().to_string()))?;
+        let entry_name = enclosed_name.to_string_lossy().replace('\\', "/");
+        let is_dir = zip_file.is_dir();
+        let size = zip_file.size();
+        validate_archive_entry_name(&entry_name, limits)?;
+        validate_archive_entry_size(&entry_name, size, limits)?;
+        summary.total_unpacked_size = summary.total_unpacked_size.saturating_add(size);
+        validate_archive_total_size(summary.total_unpacked_size, limits)?;
+        let output_path = extract_to.join(&enclosed_name);
+
+        if is_dir {
+            ensure_directory(&output_path, &mut created_directories)?;
+            summary.directory_count += 1;
+        } else {
+            if let Some(parent) = output_path.parent() {
+                ensure_directory(parent, &mut created_directories)?;
+            }
+            if size <= SMALL_ZIP_EXTRACT_FAST_PATH_LIMIT {
+                write_small_zip_entry(&mut zip_file, &output_path, size)?;
+            } else {
+                let mut output = std::fs::File::create(&output_path)?;
+                std::io::copy(&mut zip_file, &mut output)?;
+            }
+            summary.file_count += 1;
+        }
+        summary.entry_count += 1;
+
+        if let Some(ref mut entries) = entries {
+            entries.push(ZipEntry {
+                name: entry_name,
+                size,
+                compressed_size: zip_file.compressed_size(),
+                is_dir,
+                compression_method: format!("{:?}", zip_file.compression()),
+                archive_kind: ArchiveKind::Zip,
+                format: ArchiveFormat::Zip,
+                unix_mode: zip_file.unix_mode(),
+            });
+        }
+    }
+
+    Ok((entries, summary))
+}
+
 pub async fn create_zip_simple<P: AsRef<Path>>(
-    _zip_path: P,
-    _files: Vec<(String, Vec<u8>)>, // (filename, file content)
-    _compression_level: CompressionLevel,
-) -> io::Result<()> {
-    // Return unimplemented error for now
-    Err(io::Error::new(io::ErrorKind::Unsupported, "ZIP creation not yet implemented"))
+    zip_path: P,
+    files: Vec<(String, Vec<u8>)>,
+    compression_level: CompressionLevel,
+) -> Result<()> {
+    create_zip_with_options(
+        zip_path,
+        files,
+        ZipWriteOptions {
+            compression_level,
+            ..ZipWriteOptions::default()
+        },
+    )
+    .await
 }
 
-/// Compression utility struct
+pub async fn create_zip_with_options<P: AsRef<Path>>(
+    zip_path: P,
+    files: Vec<(String, Vec<u8>)>,
+    options: ZipWriteOptions,
+) -> Result<()> {
+    let zip_path = zip_path.as_ref().to_path_buf();
+
+    spawn_blocking(move || -> Result<()> {
+        if let Some(parent) = zip_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let file = std::fs::File::create(&zip_path)?;
+        let mut writer = ZipWriter::new(file);
+        let file_options = SimpleFileOptions::default().compression_method(zip_method_for_level(options.compression_level));
+        let explicit_directories = files
+            .iter()
+            .filter(|(name, _)| name.ends_with('/'))
+            .map(|(name, _)| normalize_zip_entry_name(name))
+            .collect::<Result<HashSet<_>>>()?;
+        let mut written_directories = HashSet::new();
+
+        for (name, contents) in files {
+            let entry_name = normalize_zip_entry_name(&name)?;
+            if name.ends_with('/') {
+                if written_directories.insert(entry_name.clone()) {
+                    writer.add_directory(entry_name, file_options)?;
+                }
+            } else {
+                if options.create_directory_entries {
+                    for directory in parent_directories_for(&entry_name) {
+                        if !explicit_directories.contains(&directory) && written_directories.insert(directory.clone()) {
+                            writer.add_directory(directory, file_options)?;
+                        }
+                    }
+                }
+                writer.start_file(entry_name, file_options)?;
+                writer.write_all(&contents)?;
+            }
+        }
+
+        writer.finish()?;
+        Ok(())
+    })
+    .await?
+}
+
 pub struct Compressor {
     format: CompressionFormat,
     level: CompressionLevel,
@@ -233,34 +778,28 @@ impl Compressor {
         self
     }
 
-    /// Compress data
-    pub async fn compress(&self, input: &[u8]) -> io::Result<Vec<u8>> {
-        let output = Vec::new();
-        let cursor = std::io::Cursor::new(output);
-        let mut encoder = self.format.get_encoder(cursor, self.level)?;
+    pub async fn compress(&self, input: &[u8]) -> Result<Vec<u8>> {
+        let sink = SharedBuffer::default();
+        let mut encoder = self.format.get_encoder(sink.clone(), self.level)?;
+        let mut reader = input;
 
-        io::copy(&mut std::io::Cursor::new(input), &mut encoder).await?;
+        io::copy(&mut reader, &mut encoder).await?;
         encoder.shutdown().await?;
+        drop(encoder);
 
-        // Get compressed data
-        // Note: API needs to be redesigned here as we cannot retrieve data from encoder
-        // Return empty vector as placeholder for now
-        Ok(Vec::new())
+        Ok(sink.into_vec())
     }
 
-    /// Decompress data
-    pub async fn decompress(&self, input: Vec<u8>) -> io::Result<Vec<u8>> {
+    pub async fn decompress(&self, input: Vec<u8>) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         let cursor = std::io::Cursor::new(input);
         let mut decoder = self.format.get_decoder(cursor)?;
 
-        io::copy(&mut decoder, &mut output).await?;
-
+        decoder.read_to_end(&mut output).await?;
         Ok(output)
     }
 }
 
-/// Decompression utility struct
 pub struct Decompressor {
     format: CompressionFormat,
 }
@@ -271,12 +810,12 @@ impl Decompressor {
     }
 
     pub fn auto_detect<P: AsRef<Path>>(path: P) -> Self {
-        let format = CompressionFormat::from_path(path);
-        Self { format }
+        Self {
+            format: CompressionFormat::from_path(path),
+        }
     }
 
-    /// Decompress file
-    pub async fn decompress_file<P: AsRef<Path>>(&self, input_path: P, output_path: P) -> io::Result<()> {
+    pub async fn decompress_file<P: AsRef<Path>>(&self, input_path: P, output_path: P) -> Result<()> {
         let input_file = File::open(&input_path).await?;
         let output_file = File::create(&output_path).await?;
 
@@ -293,694 +832,847 @@ impl Decompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::mem::size_of;
+    use tempfile::tempdir;
+    use tokio::fs;
     use tokio::io::AsyncReadExt;
+    use tokio_tar::{Builder, Header};
+    use zip::write::FileOptions;
+
+    async fn build_tar_bytes(files: &[(&str, &[u8])]) -> io::Result<Vec<u8>> {
+        let sink = SharedBuffer::default();
+        let handle = sink.clone();
+        let mut builder = Builder::new(sink);
+
+        for (path, content) in files {
+            let mut header = Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, *path, &content[..]).await?;
+        }
+
+        builder.finish().await?;
+        Ok(handle.into_vec())
+    }
+
+    async fn build_compressed_tar_bytes(format: CompressionFormat, files: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+        let tar_bytes = build_tar_bytes(files).await?;
+        Compressor::new(format).compress(&tar_bytes).await
+    }
+
+    async fn build_zip_file_with_entries(path: &Path, files: &[(&str, &[u8])]) -> Result<()> {
+        let path = path.to_path_buf();
+        let files = files
+            .iter()
+            .map(|(name, content)| ((*name).to_string(), content.to_vec()))
+            .collect::<Vec<_>>();
+        spawn_blocking(move || -> Result<()> {
+            let file = std::fs::File::create(path)?;
+            let mut writer = ZipWriter::new(file);
+            let options: FileOptions<'_, ()> = FileOptions::default().compression_method(CompressionMethod::Stored);
+            for (name, content) in files {
+                writer.start_file(name, options)?;
+                writer.write_all(&content)?;
+            }
+            writer.finish()?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn collect_archive_entries(payload: Vec<u8>, format: CompressionFormat) -> Result<Vec<(String, Vec<u8>)>> {
+        let seen = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let seen_ref = Arc::clone(&seen);
+        let cursor = std::io::Cursor::new(payload);
+
+        read_archive_entries(cursor, format, move |mut entry| {
+            let seen_ref = Arc::clone(&seen_ref);
+            async move {
+                let path = entry.path()?.to_string_lossy().into_owned();
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content).await?;
+                seen_ref.lock().expect("seen collection lock poisoned").push((path, content));
+                Ok(())
+            }
+        })
+        .await?;
+
+        Ok(seen.lock().expect("seen collection lock poisoned").clone())
+    }
 
     #[test]
     fn test_compression_format_from_extension() {
-        // Test supported compression format recognition
         assert_eq!(CompressionFormat::from_extension("gz"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_extension("gzip"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_extension("tgz"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_extension("bz2"), CompressionFormat::Bzip2);
-        assert_eq!(CompressionFormat::from_extension("bzip2"), CompressionFormat::Bzip2);
-        assert_eq!(CompressionFormat::from_extension("tbz"), CompressionFormat::Bzip2);
-        assert_eq!(CompressionFormat::from_extension("tbz2"), CompressionFormat::Bzip2);
-        assert_eq!(CompressionFormat::from_extension("zip"), CompressionFormat::Zip);
-        assert_eq!(CompressionFormat::from_extension("xz"), CompressionFormat::Xz);
-        assert_eq!(CompressionFormat::from_extension("txz"), CompressionFormat::Xz);
-        assert_eq!(CompressionFormat::from_extension("zlib"), CompressionFormat::Zlib);
-        assert_eq!(CompressionFormat::from_extension("zst"), CompressionFormat::Zstd);
-        assert_eq!(CompressionFormat::from_extension("zstd"), CompressionFormat::Zstd);
+        assert_eq!(CompressionFormat::from_extension("ZIP"), CompressionFormat::Zip);
         assert_eq!(CompressionFormat::from_extension("tzst"), CompressionFormat::Zstd);
-        assert_eq!(CompressionFormat::from_extension("tar"), CompressionFormat::Tar);
-
-        // Test case insensitivity
-        assert_eq!(CompressionFormat::from_extension("GZ"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_extension("TGZ"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_extension("ZIP"), CompressionFormat::Zip);
-
-        // Test unknown formats
-        assert_eq!(CompressionFormat::from_extension("unknown"), CompressionFormat::Unknown);
         assert_eq!(CompressionFormat::from_extension("txt"), CompressionFormat::Unknown);
-        assert_eq!(CompressionFormat::from_extension(""), CompressionFormat::Unknown);
     }
 
     #[test]
-    fn test_compression_format_case_sensitivity() {
-        // Test case insensitivity (now supports case insensitivity)
-        assert_eq!(CompressionFormat::from_extension("GZ"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_extension("Gz"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_extension("BZ2"), CompressionFormat::Bzip2);
-        assert_eq!(CompressionFormat::from_extension("ZIP"), CompressionFormat::Zip);
+    fn test_archive_format_from_extension() {
+        assert_eq!(ArchiveFormat::from_extension("gz"), ArchiveFormat::TarGzip);
+        assert_eq!(ArchiveFormat::from_extension("tbz2"), ArchiveFormat::TarBzip2);
+        assert_eq!(ArchiveFormat::from_extension("txz"), ArchiveFormat::TarXz);
+        assert_eq!(ArchiveFormat::from_extension("zip"), ArchiveFormat::Zip);
+        assert_eq!(ArchiveFormat::from_extension("txt"), ArchiveFormat::Unknown);
     }
 
     #[test]
-    fn test_compression_format_edge_cases() {
-        // Test edge cases
-        assert_eq!(CompressionFormat::from_extension("gz "), CompressionFormat::Unknown);
-        assert_eq!(CompressionFormat::from_extension(" gz"), CompressionFormat::Unknown);
-        assert_eq!(CompressionFormat::from_extension("gz.bak"), CompressionFormat::Unknown);
-        assert_eq!(CompressionFormat::from_extension("tar.gz"), CompressionFormat::Unknown);
-    }
-
-    #[test]
-    fn test_compression_format_debug() {
-        // Test Debug trait implementation
-        let format = CompressionFormat::Gzip;
-        let debug_str = format!("{format:?}");
-        assert_eq!(debug_str, "Gzip");
-
-        let unknown_format = CompressionFormat::Unknown;
-        let unknown_debug_str = format!("{unknown_format:?}");
-        assert_eq!(unknown_debug_str, "Unknown");
-    }
-
-    #[test]
-    fn test_compression_format_equality() {
-        // Test PartialEq trait implementation
-        assert_eq!(CompressionFormat::Gzip, CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::Unknown, CompressionFormat::Unknown);
-        assert_ne!(CompressionFormat::Gzip, CompressionFormat::Bzip2);
-        assert_ne!(CompressionFormat::Zip, CompressionFormat::Unknown);
-    }
-
-    #[tokio::test]
-    async fn test_get_decoder_supported_formats() {
-        // Test that supported formats can create decoders
-        let test_data = b"test data";
-        let cursor = Cursor::new(test_data);
-
-        let gzip_format = CompressionFormat::Gzip;
-        let decoder_result = gzip_format.get_decoder(cursor);
-        assert!(decoder_result.is_ok(), "Gzip decoder should be created successfully");
-    }
-
-    #[tokio::test]
-    async fn test_get_decoder_unsupported_formats() {
-        // Test that unsupported formats return errors
-        let test_data = b"test data";
-        let cursor = Cursor::new(test_data);
-
-        let unknown_format = CompressionFormat::Unknown;
-        let decoder_result = unknown_format.get_decoder(cursor);
-        assert!(decoder_result.is_err(), "Unknown format should return error");
-
-        if let Err(e) = decoder_result {
-            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-            assert_eq!(e.to_string(), "Unsupported file format");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_decoder_zip_format() {
-        // Test Zip format (currently not supported)
-        let test_data = b"test data";
-        let cursor = Cursor::new(test_data);
-
-        let zip_format = CompressionFormat::Zip;
-        let decoder_result = zip_format.get_decoder(cursor);
-        assert!(decoder_result.is_err(), "Zip format should return error (not implemented)");
-    }
-
-    #[tokio::test]
-    async fn test_get_decoder_all_supported_formats() {
-        // Test that all supported formats can create decoders successfully
-        let sample_content = b"Hello, compression world!";
-
-        let supported_formats = vec![
-            CompressionFormat::Gzip,
-            CompressionFormat::Bzip2,
-            CompressionFormat::Zlib,
-            CompressionFormat::Xz,
-            CompressionFormat::Zstd,
-            CompressionFormat::Tar,
-        ];
-
-        for format in supported_formats {
-            let cursor = Cursor::new(sample_content);
-            let decoder_result = format.get_decoder(cursor);
-            assert!(decoder_result.is_ok(), "Format {format:?} should create decoder successfully");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_decoder_type_consistency() {
-        // Test decoder return type consistency
-        let sample_content = b"Hello, compression world!";
-        let cursor = Cursor::new(sample_content);
-
-        let gzip_format = CompressionFormat::Gzip;
-        let mut decoder = gzip_format.get_decoder(cursor).unwrap();
-
-        // Verify that the returned decoder implements the correct trait object
-        let mut output_buffer = Vec::new();
-        // This only verifies the type, we don't expect successful reading (since data is not actual gzip format)
-        let _read_result = decoder.read_to_end(&mut output_buffer).await;
-    }
-
-    #[test]
-    fn test_compression_format_exhaustive_matching() {
-        // Test that all enum variants have corresponding handling
-        let all_formats = vec![
-            CompressionFormat::Gzip,
-            CompressionFormat::Bzip2,
-            CompressionFormat::Zip,
-            CompressionFormat::Xz,
-            CompressionFormat::Zlib,
-            CompressionFormat::Zstd,
-            CompressionFormat::Unknown,
-        ];
-
-        for format in all_formats {
-            // Verify each format has corresponding Debug implementation
-            let _debug_str = format!("{format:?}");
-
-            // Verify each format has corresponding PartialEq implementation
-            assert_eq!(format, format);
-        }
-    }
-
-    #[test]
-    fn test_extension_mapping_completeness() {
-        // Test completeness of extension mapping
-        let extension_mappings = vec![
-            ("gz", CompressionFormat::Gzip),
-            ("gzip", CompressionFormat::Gzip),
-            ("bz2", CompressionFormat::Bzip2),
-            ("bzip2", CompressionFormat::Bzip2),
-            ("zip", CompressionFormat::Zip),
-            ("xz", CompressionFormat::Xz),
-            ("zlib", CompressionFormat::Zlib),
-            ("zst", CompressionFormat::Zstd),
-            ("zstd", CompressionFormat::Zstd),
-            ("tar", CompressionFormat::Tar),
-        ];
-
-        for (ext, expected_format) in extension_mappings {
-            assert_eq!(
-                CompressionFormat::from_extension(ext),
-                expected_format,
-                "Extension '{ext}' should map to {expected_format:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_format_string_representations() {
-        // Test string representation of formats
-        let format_strings = vec![
-            (CompressionFormat::Gzip, "Gzip"),
-            (CompressionFormat::Bzip2, "Bzip2"),
-            (CompressionFormat::Zip, "Zip"),
-            (CompressionFormat::Xz, "Xz"),
-            (CompressionFormat::Zlib, "Zlib"),
-            (CompressionFormat::Zstd, "Zstd"),
-            (CompressionFormat::Unknown, "Unknown"),
-        ];
-
-        for (format, expected_str) in format_strings {
-            assert_eq!(
-                format!("{format:?}"),
-                expected_str,
-                "Format {:?} should have string representation '{}'",
-                format,
-                expected_str
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_decoder_error_handling() {
-        // Test decoder error handling with edge cases
-        let empty_content = b"";
-        let cursor = Cursor::new(empty_content);
-
-        let gzip_format = CompressionFormat::Gzip;
-        let decoder_result = gzip_format.get_decoder(cursor);
-
-        // Decoder creation should succeed even with empty content
-        assert!(decoder_result.is_ok(), "Decoder creation should succeed even with empty content");
-    }
-
-    #[test]
-    fn test_compression_format_memory_efficiency() {
-        // Verify enum size is reasonable
-        let size = size_of::<CompressionFormat>();
-        assert!(size <= 8, "CompressionFormat should be memory efficient, got {size} bytes");
-
-        // Verify Option<CompressionFormat> size
-        let option_size = size_of::<Option<CompressionFormat>>();
-        assert!(
-            option_size <= 16,
-            "Option<CompressionFormat> should be efficient, got {option_size} bytes"
-        );
-    }
-
-    #[test]
-    fn test_extension_validation() {
-        // Test edge cases of extension validation
-        let test_cases = vec![
-            // Normal cases
-            ("gz", true),
-            ("bz2", true),
-            ("xz", true),
-            // Edge cases
-            ("", false),
-            ("g", false),
-            ("gzz", false),
-            ("gz2", false),
-            // Special characters
-            ("gz.", false),
-            (".gz", false),
-            ("gz-", false),
-            ("gz_", false),
-        ];
-
-        for (ext, should_be_known) in test_cases {
-            let format = CompressionFormat::from_extension(ext);
-            let is_known = format != CompressionFormat::Unknown;
-            assert_eq!(
-                is_known, should_be_known,
-                "Extension '{ext}' recognition mismatch: expected {should_be_known}, got {is_known}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_decoder_trait_bounds() {
-        // Test decoder trait bounds compliance
-        let sample_content = b"Hello, compression world!";
-        let cursor = Cursor::new(sample_content);
-
-        let gzip_format = CompressionFormat::Gzip;
-        let decoder = gzip_format.get_decoder(cursor).unwrap();
-
-        // Verify that the returned decoder satisfies required trait bounds
-        fn check_trait_bounds<T: AsyncRead + Send + Unpin + ?Sized>(_: &T) {}
-        check_trait_bounds(&*decoder);
-    }
-
-    #[test]
-    fn test_format_consistency_with_extensions() {
-        // Test format consistency with extensions
-        let consistency_tests = vec![
-            (CompressionFormat::Gzip, "gz"),
-            (CompressionFormat::Bzip2, "bz2"),
-            (CompressionFormat::Zip, "zip"),
-            (CompressionFormat::Xz, "xz"),
-            (CompressionFormat::Zlib, "zlib"),
-            (CompressionFormat::Zstd, "zst"),
-        ];
-
-        for (format, ext) in consistency_tests {
-            let parsed_format = CompressionFormat::from_extension(ext);
-            assert_eq!(parsed_format, format, "Extension '{ext}' should consistently map to {format:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_decompress_with_invalid_format() {
-        // Test decompression with invalid format
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let sample_content = b"Hello, compression world!";
-        let cursor = Cursor::new(sample_content);
-
-        let processed_entries_count = Arc::new(AtomicUsize::new(0));
-        let processed_entries_count_clone = processed_entries_count.clone();
-
-        let decompress_result = decompress(cursor, CompressionFormat::Unknown, move |_archive_entry| {
-            processed_entries_count_clone.fetch_add(1, Ordering::SeqCst);
-            async move { Ok(()) }
-        })
-        .await;
-
-        assert!(decompress_result.is_err(), "Decompress with Unknown format should fail");
-        assert_eq!(
-            processed_entries_count.load(Ordering::SeqCst),
-            0,
-            "No entries should be processed with invalid format"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_decompress_with_zip_format() {
-        // Test decompression with Zip format (currently not supported)
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let sample_content = b"Hello, compression world!";
-        let cursor = Cursor::new(sample_content);
-
-        let processed_entries_count = Arc::new(AtomicUsize::new(0));
-        let processed_entries_count_clone = processed_entries_count.clone();
-
-        let decompress_result = decompress(cursor, CompressionFormat::Zip, move |_archive_entry| {
-            processed_entries_count_clone.fetch_add(1, Ordering::SeqCst);
-            async move { Ok(()) }
-        })
-        .await;
-
-        assert!(decompress_result.is_err(), "Decompress with Zip format should fail (not implemented)");
-        assert_eq!(
-            processed_entries_count.load(Ordering::SeqCst),
-            0,
-            "No entries should be processed with unsupported format"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_decompress_error_propagation() {
-        // Test error propagation during decompression process
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let sample_content = b"Hello, compression world!";
-        let cursor = Cursor::new(sample_content);
-
-        let callback_invocation_count = Arc::new(AtomicUsize::new(0));
-        let callback_invocation_count_clone = callback_invocation_count.clone();
-
-        let decompress_result = decompress(cursor, CompressionFormat::Gzip, move |_archive_entry| {
-            let invocation_number = callback_invocation_count_clone.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if invocation_number == 0 {
-                    // First invocation returns an error
-                    Err(io::Error::other("Simulated callback error"))
-                } else {
-                    Ok(())
-                }
-            }
-        })
-        .await;
-
-        // Since input data is not valid gzip format, it may fail during parsing phase
-        // This mainly tests the error handling mechanism
-        assert!(decompress_result.is_err(), "Should propagate callback errors");
-    }
-
-    #[tokio::test]
-    async fn test_decompress_callback_execution() {
-        // Test callback function execution during decompression
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let sample_content = b"Hello, compression world!";
-        let cursor = Cursor::new(sample_content);
-
-        let callback_was_invoked = Arc::new(AtomicBool::new(false));
-        let callback_was_invoked_clone = callback_was_invoked.clone();
-
-        let _decompress_result = decompress(cursor, CompressionFormat::Gzip, move |_archive_entry| {
-            callback_was_invoked_clone.store(true, Ordering::SeqCst);
-            async move { Ok(()) }
-        })
-        .await;
-
-        // Note: Since test data is not valid gzip format, callback may not be invoked
-        // This test mainly verifies function signature and basic flow
-    }
-
-    #[test]
-    fn test_compression_format_clone_and_copy() {
-        // Test if CompressionFormat can be copied
-        let format = CompressionFormat::Gzip;
-        let format_copy = format;
-
-        // Verify copied values are equal
-        assert_eq!(format, format_copy);
-
-        // Verify original value is still usable
-        assert_eq!(format, CompressionFormat::Gzip);
-    }
-
-    #[test]
-    fn test_compression_format_match_exhaustiveness() {
-        // Test match statement completeness
-        fn handle_format(format: CompressionFormat) -> &'static str {
-            match format {
-                CompressionFormat::Gzip => "gzip",
-                CompressionFormat::Bzip2 => "bzip2",
-                CompressionFormat::Zip => "zip",
-                CompressionFormat::Xz => "xz",
-                CompressionFormat::Zlib => "zlib",
-                CompressionFormat::Zstd => "zstd",
-                CompressionFormat::Tar => "tar",
-                CompressionFormat::Unknown => "unknown",
-            }
-        }
-
-        // Test all variants have corresponding handlers
-        assert_eq!(handle_format(CompressionFormat::Gzip), "gzip");
-        assert_eq!(handle_format(CompressionFormat::Bzip2), "bzip2");
-        assert_eq!(handle_format(CompressionFormat::Zip), "zip");
-        assert_eq!(handle_format(CompressionFormat::Xz), "xz");
-        assert_eq!(handle_format(CompressionFormat::Zlib), "zlib");
-        assert_eq!(handle_format(CompressionFormat::Zstd), "zstd");
-        assert_eq!(handle_format(CompressionFormat::Unknown), "unknown");
-    }
-
-    #[test]
-    fn test_extension_parsing_performance() {
-        // Test extension parsing performance (simple performance test)
-        let extensions = vec!["gz", "bz2", "zip", "xz", "zlib", "zst", "unknown"];
-
-        // Multiple calls to test performance consistency
-        for _ in 0..1000 {
-            for ext in &extensions {
-                let _format = CompressionFormat::from_extension(ext);
-            }
-        }
-
-        // Extension parsing performance test completed
-    }
-
-    #[test]
-    fn test_format_default_behavior() {
-        // Test format default behavior
-        let unknown_extensions = vec!["", "txt", "doc", "pdf", "unknown_ext"];
-
-        for ext in unknown_extensions {
-            let format = CompressionFormat::from_extension(ext);
-            assert_eq!(format, CompressionFormat::Unknown, "Extension '{ext}' should default to Unknown");
-        }
-    }
-
-    #[test]
-    fn test_compression_level() {
-        // Test compression level
-        let default_level = CompressionLevel::default();
-        assert_eq!(default_level, CompressionLevel::Default);
-
-        let fastest = CompressionLevel::Fastest;
-        let best = CompressionLevel::Best;
-        let custom = CompressionLevel::Level(5);
-
-        assert_ne!(fastest, best);
-        assert_ne!(default_level, custom);
-    }
-
-    #[test]
-    fn test_format_extension() {
-        // Test format extension retrieval
-        assert_eq!(CompressionFormat::Gzip.extension(), "gz");
-        assert_eq!(CompressionFormat::Bzip2.extension(), "bz2");
-        assert_eq!(CompressionFormat::Zip.extension(), "zip");
-        assert_eq!(CompressionFormat::Xz.extension(), "xz");
-        assert_eq!(CompressionFormat::Zlib.extension(), "zlib");
-        assert_eq!(CompressionFormat::Zstd.extension(), "zst");
-        assert_eq!(CompressionFormat::Tar.extension(), "tar");
-        assert_eq!(CompressionFormat::Unknown.extension(), "");
-    }
-
-    #[test]
-    fn test_format_is_supported() {
-        // Test format support check
-        assert!(CompressionFormat::Gzip.is_supported());
-        assert!(CompressionFormat::Bzip2.is_supported());
-        assert!(CompressionFormat::Zip.is_supported());
-        assert!(CompressionFormat::Xz.is_supported());
-        assert!(CompressionFormat::Zlib.is_supported());
-        assert!(CompressionFormat::Zstd.is_supported());
-        assert!(CompressionFormat::Tar.is_supported());
-        assert!(!CompressionFormat::Unknown.is_supported());
-    }
-
-    #[test]
-    fn test_format_from_path() {
-        // Test format recognition from path
-        use std::path::Path;
-
-        assert_eq!(CompressionFormat::from_path("file.gz"), CompressionFormat::Gzip);
+    fn test_compression_format_from_path_handles_compound_suffixes() {
+        assert_eq!(CompressionFormat::from_path("archive.tar.gz"), CompressionFormat::Gzip);
+        assert_eq!(CompressionFormat::from_path("archive.tgz"), CompressionFormat::Gzip);
+        assert_eq!(CompressionFormat::from_path("archive.tar.bz2"), CompressionFormat::Bzip2);
         assert_eq!(CompressionFormat::from_path("archive.zip"), CompressionFormat::Zip);
-        assert_eq!(CompressionFormat::from_path("/path/to/file.tar.gz"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_path("no_extension"), CompressionFormat::Unknown);
+        assert_eq!(CompressionFormat::from_path("archive"), CompressionFormat::Unknown);
+    }
 
-        let path = Path::new("test.bz2");
-        assert_eq!(CompressionFormat::from_path(path), CompressionFormat::Bzip2);
+    #[test]
+    fn test_archive_format_from_path_handles_compound_suffixes() {
+        assert_eq!(ArchiveFormat::from_path("archive.tar.gz"), ArchiveFormat::TarGzip);
+        assert_eq!(ArchiveFormat::from_path("archive.tar.bz2"), ArchiveFormat::TarBzip2);
+        assert_eq!(ArchiveFormat::from_path("archive.tar.xz"), ArchiveFormat::TarXz);
+        assert_eq!(ArchiveFormat::from_path("archive.tar.zst"), ArchiveFormat::TarZstd);
+        assert_eq!(ArchiveFormat::from_path("archive.zip"), ArchiveFormat::Zip);
+        assert_eq!(ArchiveFormat::from_path("archive"), ArchiveFormat::Unknown);
+    }
+
+    #[test]
+    fn test_archive_format_and_legacy_compression_format_are_compatible() {
+        assert_eq!(CompressionFormat::from_archive_format(ArchiveFormat::TarGzip), CompressionFormat::Gzip);
+        assert_eq!(CompressionFormat::from_archive_format(ArchiveFormat::Tar), CompressionFormat::Tar);
+        assert_eq!(CompressionFormat::from_archive_format(ArchiveFormat::Zip), CompressionFormat::Zip);
+    }
+
+    #[test]
+    fn test_archive_format_exposes_archive_kind_and_codec() {
+        assert_eq!(ArchiveFormat::TarGzip.archive_kind(), Some(ArchiveKind::Tar));
+        assert_eq!(ArchiveFormat::TarGzip.compression_codec(), Some(CompressionCodec::Gzip));
+        assert_eq!(ArchiveFormat::Tar.archive_kind(), Some(ArchiveKind::Tar));
+        assert_eq!(ArchiveFormat::Tar.compression_codec(), None);
+        assert_eq!(ArchiveFormat::Zip.archive_kind(), Some(ArchiveKind::Zip));
+        assert_eq!(ArchiveFormat::Zip.compression_codec(), None);
+    }
+
+    #[test]
+    fn test_legacy_compression_format_exposes_kind_and_codec() {
+        assert_eq!(CompressionFormat::Gzip.archive_kind(), None);
+        assert_eq!(CompressionFormat::Gzip.compression_codec(), Some(CompressionCodec::Gzip));
+        assert_eq!(CompressionFormat::Tar.archive_kind(), Some(ArchiveKind::Tar));
+        assert_eq!(CompressionFormat::Tar.compression_codec(), None);
+        assert_eq!(CompressionFormat::Zip.archive_kind(), Some(ArchiveKind::Zip));
+    }
+
+    #[test]
+    fn test_compression_format_size_is_small() {
+        assert!(size_of::<CompressionFormat>() <= 8);
+        assert!(size_of::<Option<CompressionFormat>>() <= 16);
+    }
+
+    #[test]
+    fn test_convert_level_rejects_overflow() {
+        let err = CompressionFormat::Gzip
+            .get_encoder(SharedBuffer::default(), CompressionLevel::Level(u32::MAX))
+            .err()
+            .expect("overflow level should return an error");
+        assert!(matches!(err, ZipError::InvalidCompressionLevel(u32::MAX)));
+    }
+
+    #[test]
+    fn test_validate_archive_entry_name_rejects_absolute_path() {
+        let err = validate_archive_entry_name("/absolute.txt", ArchiveLimits::default())
+            .err()
+            .expect("absolute path should fail validation");
+        assert!(matches!(err, ZipError::UnsafeEntryPath(path) if path == "/absolute.txt"));
     }
 
     #[tokio::test]
-    async fn test_get_encoder_supported_formats() {
-        // Test supported formats can create encoders
-        use std::io::Cursor;
-
-        let output = Vec::new();
-        let cursor = Cursor::new(output);
-
-        let gzip_format = CompressionFormat::Gzip;
-        let encoder_result = gzip_format.get_encoder(cursor, CompressionLevel::Default);
-        assert!(encoder_result.is_ok(), "Gzip encoder should be created successfully");
-    }
-
-    #[tokio::test]
-    async fn test_get_encoder_unsupported_formats() {
-        // Test unsupported formats return errors
-        use std::io::Cursor;
-
-        let output1 = Vec::new();
-        let cursor1 = Cursor::new(output1);
-
-        let unknown_format = CompressionFormat::Unknown;
-        let encoder_result = unknown_format.get_encoder(cursor1, CompressionLevel::Default);
-        assert!(encoder_result.is_err(), "Unknown format should return error");
-
-        let output2 = Vec::new();
-        let cursor2 = Cursor::new(output2);
-        let zip_format = CompressionFormat::Zip;
-        let zip_encoder_result = zip_format.get_encoder(cursor2, CompressionLevel::Default);
-        assert!(zip_encoder_result.is_err(), "Zip format should return error (requires special handling)");
-    }
-
-    #[tokio::test]
-    async fn test_compressor_basic_functionality() {
-        // Test basic compressor functionality (Note: current implementation returns empty vector as placeholder)
+    async fn test_compressor_round_trip_gzip() {
+        let input = b"hello rustfs zip ".repeat(64);
         let compressor = Compressor::new(CompressionFormat::Gzip);
-        let sample_text = b"Hello, World! This is a sample string for compression testing.";
 
-        let compression_result = compressor.compress(sample_text).await;
-        assert!(compression_result.is_ok(), "Compression should succeed");
+        let compressed = compressor.compress(&input).await.expect("gzip compress should succeed");
+        assert!(!compressed.is_empty());
+        assert_ne!(compressed, input);
 
-        // Note: Current implementation returns empty vector as placeholder
-        let compressed_output = compression_result.unwrap();
-        // assert!(!compressed_output.is_empty(), "Compressed data should not be empty");
-        // assert_ne!(compressed_output.as_slice(), sample_text, "Compressed data should be different from original");
-
-        // Temporarily verify that function can be called normally
-        assert!(compressed_output.is_empty(), "Current implementation returns empty vector as placeholder");
+        let decompressed = compressor
+            .decompress(compressed)
+            .await
+            .expect("gzip decompress should succeed");
+        assert_eq!(decompressed, input);
     }
 
     #[tokio::test]
-    async fn test_compressor_with_level() {
-        // Test compressor with custom compression level
-        let compressor = Compressor::new(CompressionFormat::Gzip).with_level(CompressionLevel::Best);
+    async fn test_compressor_round_trip_zstd() {
+        let input = b"zstd payload ".repeat(128);
+        let compressor = Compressor::new(CompressionFormat::Zstd).with_level(CompressionLevel::Best);
 
-        let sample_text = b"Sample text for compression level testing";
-        let compression_result = compressor.compress(sample_text).await;
-        assert!(compression_result.is_ok(), "Compression with custom level should succeed");
+        let compressed = compressor.compress(&input).await.expect("zstd compress should succeed");
+        let decompressed = compressor
+            .decompress(compressed)
+            .await
+            .expect("zstd decompress should succeed");
+        assert_eq!(decompressed, input);
     }
 
-    #[test]
-    fn test_decompressor_creation() {
-        // Test decompressor creation
-        let decompressor = Decompressor::new(CompressionFormat::Gzip);
-        assert_eq!(decompressor.format, CompressionFormat::Gzip);
-
-        let auto_decompressor = Decompressor::auto_detect("test.gz");
-        assert_eq!(auto_decompressor.format, CompressionFormat::Gzip);
+    #[tokio::test]
+    async fn test_zip_stream_encoder_is_rejected() {
+        let err = CompressionFormat::Zip
+            .get_encoder(SharedBuffer::default(), CompressionLevel::Default)
+            .err()
+            .expect("zip stream encoder should be rejected");
+        assert!(matches!(
+            err,
+            ZipError::UnsupportedFormat {
+                format: CompressionFormat::Zip,
+                operation: "stream encoding",
+            }
+        ));
     }
 
-    #[test]
-    fn test_zip_entry_creation() {
-        // Test ZIP entry info creation
-        let entry = ZipEntry {
-            name: "test.txt".to_string(),
-            size: 1024,
-            compressed_size: 512,
-            is_dir: false,
-            compression_method: "Deflate".to_string(),
-        };
+    #[tokio::test]
+    async fn test_read_archive_entries_iterates_tar_gzip_entries() {
+        let gzip_bytes =
+            build_compressed_tar_bytes(CompressionFormat::Gzip, &[("nested/hello.txt", b"hello"), ("world.txt", b"world")])
+                .await
+                .expect("tar.gz build should succeed");
 
-        assert_eq!(entry.name, "test.txt");
-        assert_eq!(entry.size, 1024);
-        assert_eq!(entry.compressed_size, 512);
-        assert!(!entry.is_dir);
-        assert_eq!(entry.compression_method, "Deflate");
+        let seen = collect_archive_entries(gzip_bytes, CompressionFormat::Gzip)
+            .await
+            .expect("tar.gz archive iteration should succeed");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "nested/hello.txt");
+        assert_eq!(seen[0].1, b"hello");
+        assert_eq!(seen[1].0, "world.txt");
+        assert_eq!(seen[1].1, b"world");
     }
 
-    #[test]
-    fn test_compression_level_variants() {
-        // Test all compression level variants
-        let levels = vec![
-            CompressionLevel::Fastest,
-            CompressionLevel::Best,
-            CompressionLevel::Default,
-            CompressionLevel::Level(1),
-            CompressionLevel::Level(9),
-        ];
+    #[tokio::test]
+    async fn test_read_archive_entries_iterates_tar_bzip2_entries() {
+        let payload =
+            build_compressed_tar_bytes(CompressionFormat::Bzip2, &[("nested/hello.txt", b"hello"), ("world.txt", b"world")])
+                .await
+                .expect("tar.bz2 build should succeed");
 
-        for level in levels {
-            // Verify each level has corresponding Debug implementation
-            let _debug_str = format!("{level:?}");
-        }
+        let seen = collect_archive_entries(payload, CompressionFormat::Bzip2)
+            .await
+            .expect("tar.bz2 archive iteration should succeed");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "nested/hello.txt");
+        assert_eq!(seen[1].0, "world.txt");
     }
 
-    #[test]
-    fn test_format_comprehensive_coverage() {
-        // Test comprehensive format coverage
-        let all_formats = vec![
+    #[tokio::test]
+    async fn test_read_archive_entries_iterates_tar_xz_entries() {
+        let payload =
+            build_compressed_tar_bytes(CompressionFormat::Xz, &[("nested/hello.txt", b"hello"), ("world.txt", b"world")])
+                .await
+                .expect("tar.xz build should succeed");
+
+        let seen = collect_archive_entries(payload, CompressionFormat::Xz)
+            .await
+            .expect("tar.xz archive iteration should succeed");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "nested/hello.txt");
+        assert_eq!(seen[1].0, "world.txt");
+    }
+
+    #[tokio::test]
+    async fn test_read_archive_entries_iterates_tar_zstd_entries() {
+        let payload =
+            build_compressed_tar_bytes(CompressionFormat::Zstd, &[("nested/hello.txt", b"hello"), ("world.txt", b"world")])
+                .await
+                .expect("tar.zst build should succeed");
+
+        let seen = collect_archive_entries(payload, CompressionFormat::Zstd)
+            .await
+            .expect("tar.zst archive iteration should succeed");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "nested/hello.txt");
+        assert_eq!(seen[1].0, "world.txt");
+    }
+
+    #[tokio::test]
+    async fn test_extract_tar_entries_alias_matches_stream_behavior() {
+        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("hello.txt", b"hello")])
+            .await
+            .expect("tar.gz build should succeed");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_ref = Arc::clone(&seen);
+
+        extract_tar_entries(std::io::Cursor::new(payload), CompressionFormat::Gzip, move |entry| {
+            let seen_ref = Arc::clone(&seen_ref);
+            async move {
+                seen_ref
+                    .lock()
+                    .expect("seen collection lock poisoned")
+                    .push(entry.path()?.to_string_lossy().into_owned());
+                Ok(())
+            }
+        })
+        .await
+        .expect("extract_tar_entries alias should succeed");
+
+        assert_eq!(seen.lock().expect("seen collection lock poisoned").as_slice(), ["hello.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_read_archive_entries_rejects_zip_streams() {
+        let err = read_archive_entries(std::io::Cursor::new(Vec::<u8>::new()), CompressionFormat::Zip, |_entry| async { Ok(()) })
+            .await
+            .err()
+            .expect("zip stream should be rejected");
+
+        assert!(matches!(
+            err,
+            ZipError::UnsupportedFormat {
+                format: CompressionFormat::Zip,
+                operation: "stream decoding",
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_read_archive_entries_rejects_corrupt_tar_gzip_stream() {
+        let err = read_archive_entries(
+            std::io::Cursor::new(b"not-a-valid-gzip-stream".to_vec()),
             CompressionFormat::Gzip,
-            CompressionFormat::Bzip2,
-            CompressionFormat::Zip,
-            CompressionFormat::Xz,
-            CompressionFormat::Zlib,
-            CompressionFormat::Zstd,
-            CompressionFormat::Tar,
-            CompressionFormat::Unknown,
-        ];
+            |_entry| async { Ok(()) },
+        )
+        .await
+        .err()
+        .expect("corrupt tar.gz stream should fail");
 
-        for format in all_formats {
-            // Verify each format has an extension
-            let _ext = format.extension();
+        assert!(matches!(err, ZipError::Io(_)));
+    }
 
-            // Verify support status check
-            let _supported = format.is_supported();
+    #[tokio::test]
+    async fn test_read_archive_entries_rejects_truncated_tar_gzip_stream() {
+        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("hello.txt", b"hello world")])
+            .await
+            .expect("tar.gz build should succeed");
+        let truncated = payload[..payload.len() / 2].to_vec();
 
-            // Verify Debug implementation
-            let _debug = format!("{format:?}");
+        let err = read_archive_entries(std::io::Cursor::new(truncated), CompressionFormat::Gzip, |_entry| async { Ok(()) })
+            .await
+            .err()
+            .expect("truncated tar.gz stream should fail");
+
+        assert!(matches!(err, ZipError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn test_read_archive_entries_rejects_too_many_entries() {
+        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("one.txt", b"1"), ("two.txt", b"2")])
+            .await
+            .expect("tar.gz build should succeed");
+
+        let err = read_archive_entries_with_limits(
+            std::io::Cursor::new(payload),
+            CompressionFormat::Gzip,
+            ArchiveLimits {
+                max_entries: 1,
+                ..ArchiveLimits::default()
+            },
+            |_entry| async { Ok(()) },
+        )
+        .await
+        .err()
+        .expect("entry count limit should fail");
+
+        assert!(matches!(err, ZipError::EntryCountLimitExceeded { count: 2, limit: 1 }));
+    }
+
+    #[tokio::test]
+    async fn test_read_archive_entries_rejects_oversized_entry() {
+        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("big.txt", b"hello world")])
+            .await
+            .expect("tar.gz build should succeed");
+
+        let err = read_archive_entries_with_limits(
+            std::io::Cursor::new(payload),
+            CompressionFormat::Gzip,
+            ArchiveLimits {
+                max_entry_size: 4,
+                ..ArchiveLimits::default()
+            },
+            |_entry| async { Ok(()) },
+        )
+        .await
+        .err()
+        .expect("entry size limit should fail");
+
+        assert!(matches!(
+            err,
+            ZipError::EntrySizeLimitExceeded {
+                path,
+                size: 11,
+                limit: 4,
+            } if path == "big.txt"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_read_archive_entries_rejects_total_unpacked_size_limit() {
+        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("one.txt", b"12345"), ("two.txt", b"67890")])
+            .await
+            .expect("tar.gz build should succeed");
+
+        let err = read_archive_entries_with_limits(
+            std::io::Cursor::new(payload),
+            CompressionFormat::Gzip,
+            ArchiveLimits {
+                max_total_unpacked_size: 9,
+                ..ArchiveLimits::default()
+            },
+            |_entry| async { Ok(()) },
+        )
+        .await
+        .err()
+        .expect("total unpacked size limit should fail");
+
+        assert!(matches!(err, ZipError::TotalUnpackedSizeLimitExceeded { size: 10, limit: 9 }));
+    }
+
+    #[tokio::test]
+    async fn test_read_archive_entries_rejects_entry_path_length_limit() {
+        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("nested/hello.txt", b"hello")])
+            .await
+            .expect("tar.gz build should succeed");
+
+        let err = read_archive_entries_with_limits(
+            std::io::Cursor::new(payload),
+            CompressionFormat::Gzip,
+            ArchiveLimits {
+                max_path_length: 5,
+                ..ArchiveLimits::default()
+            },
+            |_entry| async { Ok(()) },
+        )
+        .await
+        .err()
+        .expect("path length limit should fail");
+
+        assert!(matches!(
+            err,
+            ZipError::EntryPathTooLong { path, limit: 5, .. } if path == "nested/hello.txt"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_and_extract_zip_round_trip() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("archive.zip");
+        let extract_path = temp.path().join("extract");
+
+        create_zip_simple(
+            &zip_path,
+            vec![
+                ("nested/hello.txt".to_string(), b"hello".to_vec()),
+                ("world.txt".to_string(), b"world".to_vec()),
+            ],
+            CompressionLevel::Default,
+        )
+        .await
+        .expect("zip creation should succeed");
+
+        let entries = extract_zip_simple(&zip_path, &extract_path)
+            .await
+            .expect("zip extraction should succeed");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            fs::read(extract_path.join("nested/hello.txt"))
+                .await
+                .expect("nested zip entry should be extracted"),
+            b"hello"
+        );
+        assert_eq!(
+            fs::read(extract_path.join("world.txt"))
+                .await
+                .expect("root zip entry should be extracted"),
+            b"world"
+        );
+        assert!(entries.iter().all(|entry| entry.archive_kind == ArchiveKind::Zip));
+        assert!(entries.iter().all(|entry| entry.format == ArchiveFormat::Zip));
+    }
+
+    #[tokio::test]
+    async fn test_create_zip_with_directory_entries_and_extract_directory_scenarios() {
+        let temp = tempdir().expect("tempdir should be created");
+        let explicit_zip_path = temp.path().join("explicit-directories.zip");
+        let explicit_extract_path = temp.path().join("explicit-extract");
+        let auto_zip_path = temp.path().join("auto-directories.zip");
+        let auto_extract_path = temp.path().join("auto-extract");
+
+        create_zip_with_options(
+            &explicit_zip_path,
+            vec![
+                ("nested/".to_string(), Vec::new()),
+                ("nested/deeper/".to_string(), Vec::new()),
+            ],
+            ZipWriteOptions {
+                compression_level: CompressionLevel::Default,
+                create_directory_entries: false,
+            },
+        )
+        .await
+        .expect("zip creation with explicit directory entries should succeed");
+
+        let explicit_entries = extract_zip_with_limits(&explicit_zip_path, &explicit_extract_path, ArchiveLimits::default())
+            .await
+            .expect("zip extraction with explicit directory entries should succeed");
+
+        assert!(
+            explicit_entries
+                .iter()
+                .any(|entry| entry.name.trim_end_matches('/') == "nested" && entry.is_dir)
+        );
+        assert!(
+            explicit_entries
+                .iter()
+                .any(|entry| entry.name.trim_end_matches('/') == "nested/deeper" && entry.is_dir)
+        );
+        assert!(
+            fs::metadata(explicit_extract_path.join("nested"))
+                .await
+                .expect("nested directory should exist")
+                .is_dir()
+        );
+        assert!(
+            fs::metadata(explicit_extract_path.join("nested/deeper"))
+                .await
+                .expect("nested deeper directory should exist")
+                .is_dir()
+        );
+
+        create_zip_with_options(
+            &auto_zip_path,
+            vec![("nested/deeper/file.txt".to_string(), b"hello".to_vec())],
+            ZipWriteOptions {
+                compression_level: CompressionLevel::Default,
+                create_directory_entries: true,
+            },
+        )
+        .await
+        .expect("zip creation with automatic directory entries should succeed");
+
+        let entries = extract_zip_with_limits(&auto_zip_path, &auto_extract_path, ArchiveLimits::default())
+            .await
+            .expect("zip extraction with automatic directory entries should succeed");
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name.trim_end_matches('/') == "nested" && entry.is_dir)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name.trim_end_matches('/') == "nested/deeper" && entry.is_dir)
+        );
+        assert!(
+            fs::metadata(auto_extract_path.join("nested"))
+                .await
+                .expect("nested directory should exist")
+                .is_dir()
+        );
+        assert!(
+            fs::metadata(auto_extract_path.join("nested/deeper"))
+                .await
+                .expect("nested deeper directory should exist")
+                .is_dir()
+        );
+        assert_eq!(
+            fs::read(auto_extract_path.join("nested/deeper/file.txt"))
+                .await
+                .expect("nested file should be extracted"),
+            b"hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_zip_with_lots_of_small_files_round_trip() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("many-small-files.zip");
+        let extract_path = temp.path().join("extract");
+        let files = (0..32)
+            .map(|index| (format!("batch/file-{index}.txt"), format!("payload-{index}").into_bytes()))
+            .collect::<Vec<_>>();
+
+        create_zip_with_options(
+            &zip_path,
+            files.clone(),
+            ZipWriteOptions {
+                compression_level: CompressionLevel::Default,
+                create_directory_entries: true,
+            },
+        )
+        .await
+        .expect("zip creation for many small files should succeed");
+
+        let entries = extract_zip_with_limits(&zip_path, &extract_path, ArchiveLimits::default())
+            .await
+            .expect("zip extraction for many small files should succeed");
+
+        assert!(entries.len() >= files.len());
+        for (path, expected) in files {
+            assert_eq!(
+                fs::read(extract_path.join(path))
+                    .await
+                    .expect("small file should be extracted"),
+                expected
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_to_path_with_limits_returns_summary() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("summary.zip");
+        let extract_path = temp.path().join("extract");
+
+        create_zip_with_options(
+            &zip_path,
+            vec![
+                ("nested/".to_string(), Vec::new()),
+                ("nested/hello.txt".to_string(), b"hello".to_vec()),
+                ("world.txt".to_string(), b"world".to_vec()),
+            ],
+            ZipWriteOptions {
+                compression_level: CompressionLevel::Default,
+                create_directory_entries: false,
+            },
+        )
+        .await
+        .expect("zip creation for summary should succeed");
+
+        let summary = extract_zip_to_path_with_limits(&zip_path, &extract_path, ArchiveLimits::default())
+            .await
+            .expect("zip extract summary should succeed");
+
+        assert_eq!(summary.entry_count, 3);
+        assert_eq!(summary.directory_count, 1);
+        assert_eq!(summary.file_count, 2);
+        assert_eq!(summary.total_unpacked_size, 10);
+        assert_eq!(
+            fs::read(extract_path.join("nested/hello.txt"))
+                .await
+                .expect("nested file should be extracted"),
+            b"hello"
+        );
+        assert_eq!(
+            fs::read(extract_path.join("world.txt"))
+                .await
+                .expect("world file should be extracted"),
+            b"world"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zip_helper_exposes_stored_vs_deflated_metadata() {
+        let temp = tempdir().expect("tempdir should be created");
+        let stored_zip_path = temp.path().join("stored.zip");
+        let deflated_zip_path = temp.path().join("deflated.zip");
+        let stored_extract_path = temp.path().join("stored-extract");
+        let deflated_extract_path = temp.path().join("deflated-extract");
+        let payload = b"compressible-content-".repeat(64);
+
+        create_zip_with_options(
+            &stored_zip_path,
+            vec![("payload.txt".to_string(), payload.clone())],
+            ZipWriteOptions {
+                compression_level: CompressionLevel::Fastest,
+                create_directory_entries: false,
+            },
+        )
+        .await
+        .expect("stored zip creation should succeed");
+
+        create_zip_with_options(
+            &deflated_zip_path,
+            vec![("payload.txt".to_string(), payload.clone())],
+            ZipWriteOptions {
+                compression_level: CompressionLevel::Best,
+                create_directory_entries: false,
+            },
+        )
+        .await
+        .expect("deflated zip creation should succeed");
+
+        let stored_entries = extract_zip_with_limits(&stored_zip_path, &stored_extract_path, ArchiveLimits::default())
+            .await
+            .expect("stored zip extraction should succeed");
+        let deflated_entries = extract_zip_with_limits(&deflated_zip_path, &deflated_extract_path, ArchiveLimits::default())
+            .await
+            .expect("deflated zip extraction should succeed");
+
+        assert_eq!(stored_entries[0].compression_method, "Stored");
+        assert_eq!(deflated_entries[0].compression_method, "Deflated");
+        assert_eq!(
+            fs::read(stored_extract_path.join("payload.txt"))
+                .await
+                .expect("stored payload should be extracted"),
+            payload
+        );
+        assert_eq!(
+            fs::read(deflated_extract_path.join("payload.txt"))
+                .await
+                .expect("deflated payload should be extracted"),
+            payload
+        );
+        assert!(deflated_entries[0].compressed_size <= stored_entries[0].compressed_size);
+    }
+
+    #[tokio::test]
+    async fn test_create_zip_rejects_unsafe_entry_name() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("archive.zip");
+
+        let err = create_zip_simple(
+            &zip_path,
+            vec![("../escape.txt".to_string(), b"escape".to_vec())],
+            CompressionLevel::Default,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ZipError::UnsafeEntryPath(path) if path == "../escape.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_rejects_too_many_entries() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("too-many.zip");
+        let extract_path = temp.path().join("extract");
+
+        build_zip_file_with_entries(&zip_path, &[("one.txt", b"1"), ("two.txt", b"2")])
+            .await
+            .expect("zip fixture should be created");
+
+        let err = extract_zip_with_limits(
+            &zip_path,
+            &extract_path,
+            ArchiveLimits {
+                max_entries: 1,
+                ..ArchiveLimits::default()
+            },
+        )
+        .await
+        .err()
+        .expect("zip entry count limit should fail");
+
+        assert!(matches!(err, ZipError::EntryCountLimitExceeded { count: 2, limit: 1 }));
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_rejects_oversized_entry() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("oversized.zip");
+        let extract_path = temp.path().join("extract");
+
+        build_zip_file_with_entries(&zip_path, &[("big.txt", b"hello world")])
+            .await
+            .expect("zip fixture should be created");
+
+        let err = extract_zip_with_limits(
+            &zip_path,
+            &extract_path,
+            ArchiveLimits {
+                max_entry_size: 4,
+                ..ArchiveLimits::default()
+            },
+        )
+        .await
+        .err()
+        .expect("zip entry size limit should fail");
+
+        assert!(matches!(
+            err,
+            ZipError::EntrySizeLimitExceeded {
+                path,
+                size: 11,
+                limit: 4,
+            } if path == "big.txt"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_rejects_total_unpacked_size_limit() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("too-large-total.zip");
+        let extract_path = temp.path().join("extract");
+
+        build_zip_file_with_entries(&zip_path, &[("one.txt", b"12345"), ("two.txt", b"67890")])
+            .await
+            .expect("zip fixture should be created");
+
+        let err = extract_zip_with_limits(
+            &zip_path,
+            &extract_path,
+            ArchiveLimits {
+                max_total_unpacked_size: 9,
+                ..ArchiveLimits::default()
+            },
+        )
+        .await
+        .err()
+        .expect("zip total size limit should fail");
+
+        assert!(matches!(err, ZipError::TotalUnpackedSizeLimitExceeded { size: 10, limit: 9 }));
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_rejects_entry_path_length_limit() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("long-path.zip");
+        let extract_path = temp.path().join("extract");
+
+        build_zip_file_with_entries(&zip_path, &[("nested/hello.txt", b"hello")])
+            .await
+            .expect("zip fixture should be created");
+
+        let err = extract_zip_with_limits(
+            &zip_path,
+            &extract_path,
+            ArchiveLimits {
+                max_path_length: 5,
+                ..ArchiveLimits::default()
+            },
+        )
+        .await
+        .err()
+        .expect("zip path length limit should fail");
+
+        assert!(matches!(
+            err,
+            ZipError::EntryPathTooLong { path, limit: 5, .. } if path == "nested/hello.txt"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_decompress_file_round_trip() {
+        let temp = tempdir().expect("tempdir should be created");
+        let input_path = temp.path().join("payload.txt.gz");
+        let output_path = temp.path().join("payload.txt");
+        let compressed = Compressor::new(CompressionFormat::Gzip)
+            .compress(b"payload")
+            .await
+            .expect("gzip compress should succeed");
+        fs::write(&input_path, compressed)
+            .await
+            .expect("compressed input file should be written");
+
+        Decompressor::auto_detect(&input_path)
+            .decompress_file(&input_path, &output_path)
+            .await
+            .expect("gzip file decompress should succeed");
+
+        assert_eq!(
+            fs::read(&output_path)
+                .await
+                .expect("decompressed output file should be readable"),
+            b"payload"
+        );
     }
 }
-
-// #[tokio::test]
-// async fn test_decompress() -> io::Result<()> {
-//     use std::path::Path;
-//     use tokio::fs::File;
-
-//     let input_path = "/Users/weisd/Downloads/wsd.tar.gz"; // Replace with your compressed file path
-
-//     let f = File::open(input_path).await?;
-
-//     let Some(ext) = Path::new(input_path).extension().and_then(|s| s.to_str()) else {
-//         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported file format"));
-//     };
-
-//     match decompress(
-//         f,
-//         CompressionFormat::from_extension(ext),
-//         |entry: tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin>>>| async move {
-//             let path = entry.path().unwrap();
-//             println!("Extracted: {}", path.display());
-//             Ok(())
-//         },
-//     )
-//     .await
-//     {
-//         Ok(_) => println!("Decompression successful!"),
-//         Err(e) => println!("Decompression failed: {}", e),
-//     }
-
-//     Ok(())
-// }
