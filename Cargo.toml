@@ -38,6 +38,7 @@ members = [
     "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
+    "crates/rio-v2", # Next-generation Rust I/O compatibility layer
     "crates/concurrency", # Concurrency management for RustFS - timeout, locking, backpressure, and I/O scheduling
     "crates/s3-types", # S3 event type definitions
     "crates/s3-ops", # S3 operation definitions and mapping
@@ -104,6 +105,7 @@ rustfs-policy = { path = "crates/policy", version = "1.0.0-beta.7" }
 rustfs-protos = { path = "crates/protos", version = "1.0.0-beta.7" }
 rustfs-protocols = { path = "crates/protocols", version = "1.0.0-beta.7" }
 rustfs-rio = { path = "crates/rio", version = "1.0.0-beta.7" }
+rustfs-rio-v2 = { path = "crates/rio-v2", version = "1.0.0-beta.7" }
 rustfs-s3-types = { path = "crates/s3-types", version = "1.0.0-beta.7" }
 rustfs-s3-ops = { path = "crates/s3-ops", version = "1.0.0-beta.7" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "1.0.0-beta.7" }

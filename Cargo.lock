@@ -6256,6 +6256,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "minlz"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20c19c645132db7e3664aabe291a16896f601053c6b5f567f4c5a196e6817827"
+dependencies = [
+ "crc",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9047,6 +9056,7 @@ dependencies = [
  "futures-util",
  "hashbrown 0.17.1",
  "hex-simd",
+ "hmac 0.13.0",
  "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
@@ -9328,6 +9338,7 @@ dependencies = [
  "rustfs-policy",
  "rustfs-protos",
  "rustfs-rio",
+ "rustfs-rio-v2",
  "rustfs-s3-types",
  "rustfs-signer",
  "rustfs-tls-runtime",
@@ -9844,6 +9855,27 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-rio-v2"
+version = "1.0.0-beta.7"
+dependencies = [
+ "aes-gcm",
+ "bytes",
+ "hex",
+ "hmac 0.13.0",
+ "minlz",
+ "pin-project-lite",
+ "rand 0.10.1",
+ "rustfs-filemeta",
+ "rustfs-rio",
+ "rustfs-utils",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "walkdir",
 ]
 
 [[package]]

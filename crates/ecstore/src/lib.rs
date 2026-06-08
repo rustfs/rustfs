@@ -34,6 +34,7 @@ pub mod metrics_realtime;
 pub mod notification_sys;
 pub mod pools;
 pub mod rebalance;
+pub mod rio;
 pub mod rpc;
 pub mod set_disk;
 mod sets;
@@ -60,3 +61,12 @@ pub use global::{get_global_lock_client, get_global_lock_clients, set_global_loc
 
 pub use global::GLOBAL_Endpoints;
 pub use store_api::StorageAPI;
+
+#[cfg(test)]
+mod rio_tests {
+    #[test]
+    fn uses_expected_rio_backend() {
+        let expected = if cfg!(feature = "rio-v2") { "rio-v2" } else { "legacy-rio" };
+        assert_eq!(crate::rio::backend_name(), expected);
+    }
+}

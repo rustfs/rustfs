@@ -48,6 +48,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      NIX_CURL_FLAGS: -A cargo/1.95.0
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -57,7 +59,8 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           extra-conf: |
-            experimental-features = nix-command flakes
+            experimental-features = nix-command flakes configurable-impure-env
+            impure-env = NIX_CURL_FLAGS
             max-jobs = 1
 
       - name: Cache Nix

@@ -31,7 +31,10 @@ use crate::storage::options::{
 };
 use crate::storage::request_context::spawn_traced;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
-use crate::storage::sse::{SSEType, build_ssec_read_headers, encryption_material_to_metadata, map_get_object_reader_error};
+use crate::storage::sse::{
+    SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers,
+    map_get_object_reader_error,
+};
 use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use crate::storage::*;
 use crate::table_catalog;
@@ -71,6 +74,7 @@ use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::{error::DiskError, error_reduce::is_all_buckets_not_found};
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::rio::{DynReader, HashReader, WritePlan, wrap_reader};
 use rustfs_ecstore::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use rustfs_ecstore::store_api::{
     HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader, StorageAPI,
@@ -84,7 +88,6 @@ use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_rio::{CompressReader, DynReader, EncryptReader, HashReader, wrap_reader};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::{
@@ -1193,10 +1196,28 @@ impl DefaultObjectUsecase {
     where
         R: AsyncRead + Send + Sync + 'static,
     {
-        Some(StreamingBlob::wrap(bytes_stream(
-            ReaderStream::with_capacity(reader, optimal_buffer_size),
-            response_content_length as usize,
-        )))
+        let expected = response_content_length.max(0) as usize;
+        #[cfg(feature = "tracing-chunk-debug")]
+        let stream = {
+            let mut emitted = 0usize;
+            ReaderStream::with_capacity(reader, optimal_buffer_size).inspect(move |item| match item {
+                Ok(bytes) => {
+                    emitted += bytes.len();
+                    tracing::debug!(emitted, expected, chunk_len = bytes.len(), "GetObject ReaderStream emitted bytes");
+                }
+                Err(err) => {
+                    tracing::error!(
+                        emitted,
+                        expected,
+                        error = %err,
+                        "GetObject ReaderStream returned error"
+                    );
+                }
+            })
+        };
+        #[cfg(not(feature = "tracing-chunk-debug"))]
+        let stream = ReaderStream::with_capacity(reader, optimal_buffer_size);
+        Some(StreamingBlob::wrap(bytes_stream(stream, expected)))
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
@@ -1839,6 +1860,7 @@ impl DefaultObjectUsecase {
         validate_sse_headers_for_write(
             effective_sse.as_ref(),
             effective_kms_key_id.as_ref(),
+            extract_ssekms_context_from_headers(&req.headers)?.as_ref(),
             sse_customer_algorithm.as_ref(),
             sse_customer_key.as_ref(),
             sse_customer_key_md5.as_ref(),
@@ -1906,9 +1928,15 @@ impl DefaultObjectUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        let mut reader = if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
+        let should_compress = is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64;
+        let mut write_plan = WritePlan::new();
+        let mut reader = if should_compress {
             let algorithm = CompressionAlgorithm::default();
-            insert_str(&mut metadata, SUFFIX_COMPRESSION, algorithm.to_string());
+            insert_str(
+                &mut metadata,
+                SUFFIX_COMPRESSION,
+                rustfs_ecstore::rio::compression_metadata_value(algorithm),
+            );
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let mut hrd =
@@ -1919,12 +1947,16 @@ impl DefaultObjectUsecase {
             }
 
             opts.want_checksum = hrd.checksum();
-            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, algorithm.to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_COMPRESSION,
+                rustfs_ecstore::rio::compression_metadata_value(algorithm),
+            );
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             size = HashReader::SIZE_PRESERVE_LAYER;
-            HashReader::from_reader(CompressReader::new(hrd, algorithm), size, actual_size, None, None, false)
-                .map_err(ApiError::from)?
+            write_plan = write_plan.with_compression(algorithm);
+            hrd
         } else {
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
         };
@@ -1938,6 +1970,7 @@ impl DefaultObjectUsecase {
         }
 
         let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
+        let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
 
         // Apply encryption using unified SSE API.
         let encryption_request = EncryptionRequest {
@@ -1945,6 +1978,7 @@ impl DefaultObjectUsecase {
             key: &key,
             server_side_encryption: effective_sse.clone(),
             ssekms_key_id: effective_kms_key_id.clone(),
+            ssekms_context,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -1964,14 +1998,14 @@ impl DefaultObjectUsecase {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
-            let encrypted_reader = EncryptReader::new(reader, material.key_bytes, material.base_nonce);
-            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
+            write_plan = write_plan.with_encryption(material.write_encryption(None));
 
             let encryption_metadata = encryption_material_to_metadata(&material);
             metadata.extend(encryption_metadata.clone());
             opts.user_defined.extend(encryption_metadata);
         }
+
+        reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         let mut reader = PutObjReader::new(reader);
 
@@ -2864,14 +2898,18 @@ impl DefaultObjectUsecase {
 
         let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
 
-        let mut length = actual_size;
+        let length = actual_size;
 
         let mut compress_metadata = HashMap::new();
 
         let should_compress = is_compressible(&req.headers, &key) && actual_size > MIN_COMPRESSIBLE_SIZE as i64;
 
         if should_compress {
-            insert_str(&mut compress_metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
+            insert_str(
+                &mut compress_metadata,
+                SUFFIX_COMPRESSION,
+                rustfs_ecstore::rio::compression_metadata_value(CompressionAlgorithm::default()),
+            );
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
             remove_str(&mut user_defined, SUFFIX_COMPRESSION);
@@ -2907,18 +2945,12 @@ impl DefaultObjectUsecase {
         }
         apply_bucket_default_lock_retention(&bucket, &mut user_defined, has_explicit_object_lock_retention).await?;
 
+        let mut write_plan = WritePlan::new();
         let mut reader = if should_compress {
+            let algorithm = CompressionAlgorithm::default();
             let hrd = HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
-            length = HashReader::SIZE_PRESERVE_LAYER;
-            HashReader::from_reader(
-                CompressReader::new(hrd, CompressionAlgorithm::default()),
-                length,
-                actual_size,
-                None,
-                None,
-                false,
-            )
-            .map_err(ApiError::from)?
+            write_plan = write_plan.with_compression(algorithm);
+            hrd
         } else {
             HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?
         };
@@ -2928,6 +2960,7 @@ impl DefaultObjectUsecase {
             key: &key,
             server_side_encryption: effective_sse.clone(),
             ssekms_key_id: effective_kms_key_id.clone(),
+            ssekms_context: extract_ssekms_context_from_headers(&req.headers)?,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -2938,12 +2971,12 @@ impl DefaultObjectUsecase {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.kms_key_id.clone();
 
-            let encrypted_reader = EncryptReader::new(reader, material.key_bytes, material.base_nonce);
-            reader = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                .map_err(ApiError::from)?;
+            write_plan = write_plan.with_encryption(material.write_encryption(None));
 
             user_defined.extend(encryption_material_to_metadata(&material));
         }
+
+        reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         src_info.put_object_reader = Some(PutObjReader::new(reader));
 
@@ -4182,6 +4215,7 @@ impl DefaultObjectUsecase {
         validate_sse_headers_for_write(
             effective_sse.as_ref(),
             effective_kms_key_id.as_ref(),
+            extract_ssekms_context_from_headers(&req.headers)?.as_ref(),
             sse_customer_algorithm.as_ref(),
             sse_customer_key.as_ref(),
             sse_customer_key_md5.as_ref(),
@@ -4379,24 +4413,22 @@ impl DefaultObjectUsecase {
 
             let should_compress = !is_dir && is_compressible(&HeaderMap::new(), &fpath) && size > MIN_COMPRESSIBLE_SIZE as i64;
 
+            let mut write_plan = WritePlan::new();
             let mut hrd = if is_dir {
                 HashReader::from_stream(std::io::Cursor::new(Vec::new()), size, actual_size, None, None, false)
                     .map_err(ApiError::from)?
             } else if should_compress {
-                insert_str(&mut metadata, SUFFIX_COMPRESSION, CompressionAlgorithm::default().to_string());
+                let algorithm = CompressionAlgorithm::default();
+                insert_str(
+                    &mut metadata,
+                    SUFFIX_COMPRESSION,
+                    rustfs_ecstore::rio::compression_metadata_value(algorithm),
+                );
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
                 let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;
-                size = HashReader::SIZE_PRESERVE_LAYER;
-                HashReader::from_reader(
-                    CompressReader::new(hrd, CompressionAlgorithm::default()),
-                    size,
-                    actual_size,
-                    None,
-                    None,
-                    false,
-                )
-                .map_err(ApiError::from)?
+                write_plan = write_plan.with_compression(algorithm);
+                hrd
             } else {
                 HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?
             };
@@ -4413,6 +4445,7 @@ impl DefaultObjectUsecase {
                 key: &fpath,
                 server_side_encryption: effective_sse.clone(),
                 ssekms_key_id: effective_kms_key_id.clone(),
+                ssekms_context: extract_ssekms_context_from_headers(&req.headers)?,
                 sse_customer_algorithm: sse_customer_algorithm.clone(),
                 sse_customer_key: sse_customer_key.clone(),
                 sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -4423,14 +4456,13 @@ impl DefaultObjectUsecase {
                 effective_sse = Some(material.server_side_encryption.clone());
                 effective_kms_key_id = material.kms_key_id.clone();
 
-                let encrypted_reader = EncryptReader::new(hrd, material.key_bytes, material.base_nonce);
-                hrd = HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
+                write_plan = write_plan.with_encryption(material.write_encryption(None));
 
                 let encryption_metadata = encryption_material_to_metadata(&material);
                 metadata.extend(encryption_metadata.clone());
                 opts.user_defined.extend(encryption_metadata);
             }
+            hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
             opts.user_defined.extend(metadata);
             let mut reader = PutObjReader::new(hrd);
 
