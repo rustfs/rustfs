@@ -24,6 +24,7 @@ pub struct WriteQuorumFailureSummary {
     pub ignored_failures: usize,
     pub retryable_failures: usize,
     pub dominant_error: Option<Error>,
+    pub dominant_error_label: &'static str,
 }
 
 pub static OBJECT_OP_IGNORED_ERRS: &[Error] = &[
@@ -105,6 +106,7 @@ pub fn build_write_quorum_failure_summary(
         .count();
     let retryable_failures = count_retryable_failures(errors);
     let (_, dominant_error) = reduce_errs(errors, ignored_errs);
+    let dominant_error_label = dominant_error_label(errors, ignored_errs, dominant_error.as_ref());
 
     WriteQuorumFailureSummary {
         required: quorum,
@@ -115,7 +117,29 @@ pub fn build_write_quorum_failure_summary(
         ignored_failures,
         retryable_failures,
         dominant_error,
+        dominant_error_label,
     }
+}
+
+fn dominant_error_label(errors: &[Option<Error>], ignored_errs: &[Error], dominant_error: Option<&Error>) -> &'static str {
+    let Some(dominant_error) = dominant_error else {
+        return "nil_dominated";
+    };
+
+    if dominant_error == &Error::DiskNotFound {
+        return "disk_not_found";
+    }
+    if dominant_error == &Error::ShortWrite {
+        return "short_write";
+    }
+
+    errors
+        .iter()
+        .filter_map(|err| err.as_ref())
+        .find(|err| !is_ignored_err(ignored_errs, err) && *err == dominant_error)
+        .and_then(Error::internode_http_error_kind)
+        .map(|kind| kind.metric_label())
+        .unwrap_or("other_error")
 }
 
 pub fn is_ignored_err(ignored_errs: &[Error], err: &Error) -> bool {
@@ -238,6 +262,23 @@ mod tests {
         assert_eq!(summary.ignored_failures, 1);
         assert_eq!(summary.retryable_failures, 1);
         assert_eq!(summary.dominant_error, None);
+        assert_eq!(summary.dominant_error_label, "nil_dominated");
+    }
+
+    #[test]
+    fn test_build_write_quorum_failure_summary_preserves_internode_label() {
+        let retryable_a = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::ConnectionReset,
+        ));
+        let retryable_b = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::ConnectionReset,
+        ));
+        let errors = vec![Some(retryable_a), Some(retryable_b)];
+
+        let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, 2);
+
+        assert_eq!(summary.retryable_failures, 2);
+        assert_eq!(summary.dominant_error_label, "connection_reset");
     }
 
     #[test]

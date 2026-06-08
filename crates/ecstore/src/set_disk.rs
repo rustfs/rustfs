@@ -773,12 +773,19 @@ fn delete_file_info_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
     }
 }
 
+fn object_fits_single_block(object_size: i64, block_size: usize) -> bool {
+    match usize::try_from(object_size) {
+        Ok(size) => size > 0 && size <= block_size,
+        Err(_) => false,
+    }
+}
+
 fn should_use_inline_small_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
-    is_inline_buffer && object_size > 0 && object_size <= block_size as i64
+    is_inline_buffer && object_fits_single_block(object_size, block_size)
 }
 
 fn should_use_single_block_non_inline_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
-    !is_inline_buffer && object_size > 0 && object_size <= block_size as i64
+    !is_inline_buffer && object_fits_single_block(object_size, block_size)
 }
 
 enum SmallWritePath {
@@ -6779,6 +6786,10 @@ mod tests {
         assert!(!should_use_inline_small_fast_path(true, 0, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(false, 0, 4096));
         assert!(matches!(classify_small_write_path(true, 0, 4096), SmallWritePath::Pipeline));
+
+        assert!(!should_use_inline_small_fast_path(true, -1, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, -1, 4096));
+        assert!(matches!(classify_small_write_path(false, -1, 4096), SmallWritePath::Pipeline));
 
         assert!(!should_use_inline_small_fast_path(true, 8192, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(false, 8192, 4096));

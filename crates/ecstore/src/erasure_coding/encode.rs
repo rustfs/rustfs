@@ -51,12 +51,11 @@ async fn drain_queued_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Bytes>>) {
     }
 }
 
+fn dominant_error_summary_label(summary: &WriteQuorumFailureSummary) -> &'static str {
+    summary.dominant_error_label
+}
+
 fn format_write_quorum_failure(summary: &WriteQuorumFailureSummary) -> String {
-    let dominant_error = summary
-        .dominant_error
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "successful writes dominated before quorum failed".to_string());
     format!(
         "erasure write quorum (required={}, achieved={}, failed={}, total={}, offline-disks={}/{}, retryable-failures={}, dominant-error={})",
         summary.required,
@@ -66,20 +65,12 @@ fn format_write_quorum_failure(summary: &WriteQuorumFailureSummary) -> String {
         summary.offline_disks,
         summary.total,
         summary.retryable_failures,
-        dominant_error
+        dominant_error_summary_label(summary)
     )
 }
 
 fn quorum_dominant_error_metric_label(summary: &WriteQuorumFailureSummary) -> &'static str {
-    match summary.dominant_error.as_ref() {
-        Some(Error::DiskNotFound) => "disk_not_found",
-        Some(Error::ShortWrite) => "short_write",
-        Some(err) => match err.internode_http_error_kind() {
-            Some(kind) => kind.metric_label(),
-            None => "other_error",
-        },
-        None => "nil_dominated",
-    }
+    dominant_error_summary_label(summary)
 }
 
 pub(crate) struct MultiWriter<'a> {
@@ -630,6 +621,29 @@ mod tests {
         assert_eq!(encode_channel_capacity(0, 1024), 1);
         assert_eq!(encode_channel_capacity(4096, 0), 1);
         assert_eq!(encode_channel_capacity(4096, 1024), 1);
+    }
+
+    #[test]
+    fn write_quorum_failure_summary_uses_stable_dominant_error_label() {
+        let err = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::ConnectionReset,
+        ));
+        let summary = WriteQuorumFailureSummary {
+            required: 2,
+            achieved: 0,
+            failed: 2,
+            total: 2,
+            offline_disks: 0,
+            ignored_failures: 0,
+            retryable_failures: 2,
+            dominant_error: Some(err),
+            dominant_error_label: "connection_reset",
+        };
+        let text = format_write_quorum_failure(&summary);
+
+        assert!(text.contains("dominant-error=connection_reset"));
+        assert!(!text.contains("/rustfs/rpc/put_file_stream"));
+        assert!(!text.contains("PUT "));
     }
 
     #[test]
