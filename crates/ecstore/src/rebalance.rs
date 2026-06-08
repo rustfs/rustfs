@@ -19,18 +19,18 @@ use crate::data_movement;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
 use crate::error::{Error, Result};
-use crate::error::{
-    is_err_data_movement_overwrite, is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found,
-};
+use crate::error::{is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found, is_network_or_host_down};
 use crate::global::get_global_endpoints;
 use crate::pools::ListCallback;
-use crate::set_disk::SetDisks;
+use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::store::ECStore;
 use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions};
 use http::HeaderMap;
+use rand::RngExt as _;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::io::Cursor;
@@ -38,12 +38,17 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const REBAL_META_FMT: u16 = 1; // Replace with actual format value
 const REBAL_META_VER: u16 = 1; // Replace with actual version value
 const REBAL_META_NAME: &str = "rebalance.bin";
+const REBALANCE_LISTING_MAX_ATTEMPTS: usize = 3;
+const REBALANCE_LISTING_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const REBALANCE_MIGRATION_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const REBALANCE_MIGRATION_LOCK_RETRY_CAP: Duration = Duration::from_secs(10);
+const REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX: &str = "deferred transient rebalance entry failure:";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RebalanceStats {
@@ -93,6 +98,12 @@ impl RebalanceStats {
         self.bucket = bucket;
         self.object = fi.name.clone();
     }
+
+    pub fn update_batch(&mut self, bucket: String, versions: &[&FileInfo]) {
+        for version in versions {
+            self.update(bucket.clone(), version);
+        }
+    }
 }
 
 pub type RStats = Vec<Arc<RebalanceStats>>;
@@ -110,7 +121,20 @@ pub(crate) struct MigrationVersionResult {
     pub ignored: bool,
     pub cleanup_ignored: bool,
     pub failed: bool,
+    pub stage: Option<&'static str>,
     pub error: Option<Error>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RebalanceBucketOutcome {
+    Completed,
+    Deferred { last_error: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RebalanceEntryOutcome {
+    Completed,
+    Deferred { last_error: String },
 }
 
 fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Option<String>, src_pool_idx: usize) -> ObjectOptions {
@@ -198,12 +222,45 @@ pub(crate) async fn migrate_entry_version<Backend, F, Fut>(
     version_id: Option<String>,
     max_attempts: usize,
     ignore_data_usage_cache: bool,
-    mut transfer: F,
+    transfer: F,
 ) -> MigrationVersionResult
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
     Fut: Future<Output = Result<()>> + Send,
+{
+    migrate_entry_version_with_retry_wait(
+        set,
+        bucket,
+        pool_index,
+        version,
+        version_id,
+        max_attempts,
+        ignore_data_usage_cache,
+        transfer,
+        sleep_rebalance_migration_retry,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, W, WFut>(
+    set: &Backend,
+    bucket: String,
+    pool_index: usize,
+    version: &FileInfo,
+    version_id: Option<String>,
+    max_attempts: usize,
+    ignore_data_usage_cache: bool,
+    mut transfer: F,
+    mut wait_retry: W,
+) -> MigrationVersionResult
+where
+    Backend: MigrationBackend + ?Sized,
+    F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
+    Fut: Future<Output = Result<()>> + Send,
+    W: FnMut(Duration) -> WFut + Send,
+    WFut: Future<Output = ()> + Send,
 {
     let max_attempts = max_attempts.max(1);
 
@@ -213,6 +270,7 @@ where
             ignored: true,
             cleanup_ignored: false,
             failed: false,
+            stage: None,
             error: None,
         };
     }
@@ -227,12 +285,13 @@ where
             )
             .await
         {
-            if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
+            if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                 return MigrationVersionResult {
                     moved: false,
                     ignored: true,
                     cleanup_ignored: true,
                     failed: false,
+                    stage: Some("move_remote_version"),
                     error: None,
                 };
             }
@@ -242,6 +301,7 @@ where
                 ignored: false,
                 cleanup_ignored: false,
                 failed: true,
+                stage: Some("move_remote_version"),
                 error: Some(err),
             };
         }
@@ -251,6 +311,7 @@ where
             ignored: false,
             cleanup_ignored: false,
             failed: false,
+            stage: None,
             error: None,
         };
     }
@@ -260,12 +321,13 @@ where
             .delete_object_for_migration(&bucket, &version.name, rebalance_delete_marker_opts(version, version_id, pool_index))
             .await
         {
-            if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
+            if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                 return MigrationVersionResult {
                     moved: false,
                     ignored: true,
                     cleanup_ignored: true,
                     failed: false,
+                    stage: Some("delete_marker"),
                     error: None,
                 };
             }
@@ -275,6 +337,7 @@ where
                 ignored: false,
                 cleanup_ignored: false,
                 failed: true,
+                stage: Some("delete_marker"),
                 error: Some(err),
             };
         }
@@ -284,6 +347,7 @@ where
             ignored: false,
             cleanup_ignored: false,
             failed: false,
+            stage: None,
             error: None,
         };
     }
@@ -312,47 +376,59 @@ where
                         ignored: true,
                         cleanup_ignored: true,
                         failed: false,
+                        stage: Some("read_source"),
                         error: None,
                     };
                 }
 
                 last_error = Some(err);
-                if attempt + 1 >= max_attempts {
+                let Some(err) = last_error.as_ref() else {
+                    continue;
+                };
+                if attempt + 1 >= max_attempts || !is_transient_rebalance_error(err) {
                     return MigrationVersionResult {
                         moved: false,
                         ignored: false,
                         cleanup_ignored: false,
                         failed: true,
+                        stage: Some("read_source"),
                         error: last_error,
                     };
                 }
 
+                wait_retry(rebalance_migration_retry_delay(attempt, err)).await;
                 continue;
             }
         };
 
         if let Err(err) = transfer(pool_index, bucket.clone(), rd).await {
-            if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
+            if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                 return MigrationVersionResult {
                     moved: false,
                     ignored: true,
                     cleanup_ignored: true,
                     failed: false,
+                    stage: Some("write_target"),
                     error: None,
                 };
             }
 
             last_error = Some(err);
-            if attempt + 1 >= max_attempts {
+            let Some(err) = last_error.as_ref() else {
+                continue;
+            };
+            if attempt + 1 >= max_attempts || !is_transient_rebalance_error(err) {
                 return MigrationVersionResult {
                     moved: false,
                     ignored: false,
                     cleanup_ignored: false,
                     failed: true,
+                    stage: Some("write_target"),
                     error: last_error,
                 };
             }
 
+            wait_retry(rebalance_migration_retry_delay(attempt, err)).await;
             continue;
         }
 
@@ -361,6 +437,7 @@ where
             ignored: false,
             cleanup_ignored: false,
             failed: false,
+            stage: None,
             error: None,
         };
     }
@@ -370,6 +447,7 @@ where
         ignored: false,
         cleanup_ignored: false,
         failed: true,
+        stage: Some("migrate"),
         error: last_error,
     }
 }
@@ -546,6 +624,36 @@ impl RebalanceMeta {
 }
 
 impl ECStore {
+    async fn save_rebalance_meta_with_merge<S: StorageAPI>(
+        &self,
+        pool: Arc<S>,
+        local_snapshot: &RebalanceMeta,
+        stage: &str,
+    ) -> Result<()> {
+        let ns_lock = pool.new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+        let _guard = ns_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(rebalance_meta_lock_error)?;
+
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let mut merged = RebalanceMeta::new();
+        match merged.load_with_opts(pool.clone(), opts.clone()).await {
+            Ok(()) => {
+                merge_rebalance_meta(&mut merged, local_snapshot);
+            }
+            Err(Error::ConfigNotFound) => {
+                merged = local_snapshot.clone();
+            }
+            Err(err) => return Err(Error::other(format!("rebalance meta load before save failed during {stage}: {err}"))),
+        }
+
+        merged.save_with_opts(pool, opts).await
+    }
+
     #[tracing::instrument(skip_all)]
     pub async fn load_rebalance_meta(&self) -> Result<()> {
         let mut meta = RebalanceMeta::new();
@@ -602,7 +710,11 @@ impl ECStore {
             let rebalance_meta = self.rebalance_meta.read().await;
             if let Some(meta) = rebalance_meta.as_ref() {
                 let pool = clone_first_arc(&self.pools, "update_rebalance_stats: no pools available")?;
-                resolve_rebalance_meta_save_result(meta.save(pool).await, "update_rebalance_stats")?;
+                resolve_rebalance_meta_save_result(
+                    self.save_rebalance_meta_with_merge(pool, meta, "update_rebalance_stats")
+                        .await,
+                    "update_rebalance_stats",
+                )?;
             }
         }
 
@@ -673,7 +785,10 @@ impl ECStore {
         };
 
         let pool = clone_first_arc(&self.pools, "init_rebalance_meta: no pools available")?;
-        resolve_rebalance_meta_save_result(meta.save(pool).await, "init_rebalance_meta")?;
+        resolve_rebalance_meta_save_result(
+            self.save_rebalance_meta_with_merge(pool, &meta, "init_rebalance_meta").await,
+            "init_rebalance_meta",
+        )?;
 
         info!("init_rebalance_meta: rebalance meta saved");
 
@@ -690,11 +805,24 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, fi))]
     pub async fn update_pool_stats(&self, pool_index: usize, bucket: String, fi: &FileInfo) -> Result<()> {
+        self.update_pool_stats_batch(pool_index, bucket, &[fi]).await
+    }
+
+    #[tracing::instrument(skip(self, versions))]
+    pub async fn update_pool_stats_batch(&self, pool_index: usize, bucket: String, versions: &[&FileInfo]) -> Result<()> {
+        if versions.is_empty() {
+            return Ok(());
+        }
+
         let mut rebalance_meta = self.rebalance_meta.write().await;
-        if let Some(meta) = rebalance_meta.as_mut()
-            && let Some(pool_stat) = meta.pool_stats.get_mut(pool_index)
-        {
-            pool_stat.update(bucket, fi);
+        if let Some(meta) = rebalance_meta.as_mut() {
+            if !should_accept_rebalance_stats_update(meta, pool_index) {
+                return Ok(());
+            }
+
+            if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
+                pool_stat.update_batch(bucket, versions);
+            }
         }
 
         Ok(())
@@ -712,6 +840,23 @@ impl ECStore {
     pub async fn bucket_rebalance_done(&self, pool_index: usize, bucket: String) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
         mark_rebalance_bucket_done(rebalance_meta.as_mut(), pool_index, &bucket)
+    }
+
+    async fn defer_rebalance_bucket(&self, pool_index: usize, bucket: String, last_error: String) -> Result<()> {
+        let mut rebalance_meta = self.rebalance_meta.write().await;
+        let Some(meta) = rebalance_meta.as_mut() else {
+            return Err(rebalance_metadata_not_initialized_error("defer rebalance bucket"));
+        };
+        let pool_count = meta.pool_stats.len();
+        ensure_valid_rebalance_pool_index(pool_count, pool_index)?;
+        let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) else {
+            return Err(invalid_rebalance_pool_index_error(pool_index, pool_count));
+        };
+
+        defer_bucket_in_rebalance_queue(pool_stat, &bucket)?;
+        pool_stat.info.last_error = Some(last_error);
+        meta.last_refreshed_at = Some(OffsetDateTime::now_utc());
+        Ok(())
     }
 
     pub async fn is_rebalance_started(&self) -> bool {
@@ -766,7 +911,11 @@ impl ECStore {
 
         if let Some(meta_to_save) = meta_to_save {
             let pool = clone_first_arc(self.pools.as_slice(), "stop_rebalance: no pools available")?;
-            resolve_rebalance_meta_save_result(meta_to_save.save(pool).await, "stop_rebalance")?;
+            resolve_rebalance_meta_save_result(
+                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "stop_rebalance")
+                    .await,
+                "stop_rebalance",
+            )?;
         }
 
         Ok(())
@@ -803,7 +952,11 @@ impl ECStore {
 
         if let Some(meta) = meta_to_save {
             let pool = clone_first_arc(self.pools.as_slice(), "start_rebalance: no pools available")?;
-            resolve_rebalance_meta_save_result(meta.save(pool).await, "start_rebalance complete pools at goal")?;
+            resolve_rebalance_meta_save_result(
+                self.save_rebalance_meta_with_merge(pool, &meta, "start_rebalance complete pools at goal")
+                    .await,
+                "start_rebalance complete pools at goal",
+            )?;
         }
 
         let participants = if let Some(ref meta) = *self.rebalance_meta.read().await {
@@ -918,6 +1071,7 @@ impl ECStore {
 
         info!("Pool {} rebalancing is started", pool_index);
         let mut final_result: Result<()> = Ok(());
+        let mut deferred_buckets = HashSet::new();
 
         loop {
             if rx.is_cancelled() {
@@ -945,17 +1099,45 @@ impl ECStore {
             if let Some(bucket) = next_bucket {
                 info!("Rebalancing bucket: start {}", bucket);
 
-                if let Err(err) = resolve_rebalance_bucket_result(
+                let outcome = match resolve_rebalance_bucket_result(
                     self.rebalance_bucket(rx.clone(), bucket.clone(), pool_index).await,
                     pool_index,
                     &bucket,
                 ) {
-                    error!("Error rebalancing bucket {}: {:?}", bucket, err);
-                    final_result = Err(resolve_rebalance_terminal_error(
-                        err.clone(),
-                        send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
-                    ));
-                    break;
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        error!("Error rebalancing bucket {}: {:?}", bucket, err);
+                        final_result = Err(resolve_rebalance_terminal_error(
+                            err.clone(),
+                            send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
+                        ));
+                        break;
+                    }
+                };
+
+                if let RebalanceBucketOutcome::Deferred { last_error } = outcome {
+                    if !deferred_buckets.insert(bucket.clone()) {
+                        let err = Error::other(format!(
+                            "rebalance bucket {bucket} deferred repeatedly due to transient object failures: {last_error}"
+                        ));
+                        error!("Error rebalancing bucket {}: {:?}", bucket, err);
+                        final_result = Err(resolve_rebalance_terminal_error(
+                            err.clone(),
+                            send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
+                        ));
+                        break;
+                    }
+
+                    warn!("Rebalance bucket deferred due to transient object failures: {bucket}: {last_error}");
+                    if let Err(err) = self.defer_rebalance_bucket(pool_index, bucket.clone(), last_error).await {
+                        error!("defer_rebalance_bucket failed for pool {}: {:?}", pool_index, err);
+                        final_result = Err(resolve_rebalance_terminal_error(
+                            err.clone(),
+                            send_rebalance_done_signal(&done_tx, Err(err.clone()), pool_index).await,
+                        ));
+                        break;
+                    }
+                    continue;
                 }
 
                 info!("Rebalance bucket: done {} ", bucket);
@@ -1009,12 +1191,14 @@ impl ECStore {
                 (pool_stat.init_free_space + pool_stat.bytes) as f64 / pool_stat.init_capacity as f64
             };
 
-            if rebalance_goal_reached(
-                pool_stat.init_free_space,
-                pool_stat.init_capacity,
-                pool_stat.bytes,
-                meta.percent_free_goal,
-            ) {
+            if !has_deferred_rebalance_error(pool_stat)
+                && rebalance_goal_reached(
+                    pool_stat.init_free_space,
+                    pool_stat.init_capacity,
+                    pool_stat.bytes,
+                    meta.percent_free_goal,
+                )
+            {
                 pool_stat.info.status = RebalStatus::Completed;
                 pool_stat.info.end_time = Some(OffsetDateTime::now_utc());
                 info!("check_if_rebalance_done: pool {} is completed, pfi: {}", pool_index, pfi);
@@ -1065,6 +1249,16 @@ fn clone_rebalance_pool_stats(meta: Option<&RebalanceMeta>) -> Result<Vec<Rebala
     Ok(meta.pool_stats.clone())
 }
 
+fn should_accept_rebalance_stats_update(meta: &RebalanceMeta, pool_index: usize) -> bool {
+    if meta.stopped_at.is_some() {
+        return false;
+    }
+
+    meta.pool_stats
+        .get(pool_index)
+        .is_some_and(|pool_stat| pool_stat.info.status == RebalStatus::Started)
+}
+
 fn resolve_next_rebalance_bucket(meta: Option<&RebalanceMeta>, pool_index: usize) -> Result<Option<String>> {
     let Some(meta) = meta else {
         return Err(rebalance_metadata_not_initialized_error("resolve next rebalance bucket"));
@@ -1108,6 +1302,9 @@ fn mark_rebalance_bucket_done(meta: Option<&mut RebalanceMeta>, pool_index: usiz
 
     if take_bucket_from_rebalance_queue(pool_stat, bucket) {
         info!("bucket_rebalance_done: bucket {} rebalanced", bucket);
+        if has_deferred_rebalance_error(pool_stat) {
+            pool_stat.info.last_error = None;
+        }
         Ok(())
     } else {
         Err(Error::other(format!(
@@ -1131,6 +1328,16 @@ fn take_bucket_from_rebalance_queue(pool_stat: &mut RebalanceStats, bucket: &str
     found
 }
 
+fn defer_bucket_in_rebalance_queue(pool_stat: &mut RebalanceStats, bucket: &str) -> Result<()> {
+    let Some(pos) = pool_stat.buckets.iter().position(|name| name == bucket) else {
+        return Err(Error::other(format!("failed to defer rebalance bucket {bucket}: bucket was not queued")));
+    };
+
+    let bucket = pool_stat.buckets.remove(pos);
+    pool_stat.buckets.push(bucket);
+    Ok(())
+}
+
 fn should_pool_participate(init_free_space: u64, init_capacity: u64, percent_free_goal: f64) -> bool {
     init_capacity > 0 && percent_free_ratio(init_free_space, init_capacity) < percent_free_goal
 }
@@ -1139,7 +1346,7 @@ fn complete_rebalance_pools_at_goal(meta: &mut RebalanceMeta, now: OffsetDateTim
     let mut changed = false;
 
     for pool_stat in meta.pool_stats.iter_mut() {
-        if !is_rebalance_pool_started(pool_stat) {
+        if !is_rebalance_pool_started(pool_stat) || has_deferred_rebalance_error(pool_stat) {
             continue;
         }
 
@@ -1159,28 +1366,45 @@ fn complete_rebalance_pools_at_goal(meta: &mut RebalanceMeta, now: OffsetDateTim
     changed
 }
 
-fn resolve_rebalance_worker_result(
+fn has_deferred_rebalance_error(pool_stat: &RebalanceStats) -> bool {
+    pool_stat
+        .info
+        .last_error
+        .as_deref()
+        .is_some_and(|last_error| last_error.starts_with(REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX))
+}
+
+fn resolve_rebalance_worker_result<T>(
     set_idx: usize,
-    worker_result: std::result::Result<Result<()>, tokio::task::JoinError>,
-) -> Result<()> {
+    worker_result: std::result::Result<Result<T>, tokio::task::JoinError>,
+) -> Result<T> {
     match worker_result {
         Ok(result) => result,
         Err(err) => Err(Error::other(format!("rebalance worker {set_idx} task join error: {err}"))),
     }
 }
 
-type RebalanceEntryTask = tokio::task::JoinHandle<Result<()>>;
+type RebalanceEntryTask = tokio::task::JoinHandle<Result<RebalanceEntryOutcome>>;
 
-async fn wait_rebalance_entry_tasks(set_idx: usize, tasks: Arc<tokio::sync::Mutex<Vec<RebalanceEntryTask>>>) -> Result<()> {
+async fn wait_rebalance_entry_tasks(
+    set_idx: usize,
+    tasks: Arc<tokio::sync::Mutex<Vec<RebalanceEntryTask>>>,
+) -> Result<Option<String>> {
     let tasks = {
         let mut tasks = tasks.lock().await;
         std::mem::take(&mut *tasks)
     };
 
     let mut first_error = None;
+    let mut first_deferred = None;
     for task in tasks {
         match task.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(RebalanceEntryOutcome::Completed)) => {}
+            Ok(Ok(RebalanceEntryOutcome::Deferred { last_error })) => {
+                if first_deferred.is_none() {
+                    first_deferred = Some(last_error);
+                }
+            }
             Ok(Err(err)) => {
                 error!("rebalance entry task failed for set {}: {}", set_idx, err);
                 if first_error.is_none() {
@@ -1197,7 +1421,11 @@ async fn wait_rebalance_entry_tasks(set_idx: usize, tasks: Arc<tokio::sync::Mute
         }
     }
 
-    if let Some(err) = first_error { Err(err) } else { Ok(()) }
+    if let Some(err) = first_error {
+        Err(err)
+    } else {
+        Ok(first_deferred)
+    }
 }
 
 fn resolve_rebalance_save_task_result(
@@ -1212,6 +1440,23 @@ fn resolve_rebalance_save_task_result(
 
 fn resolve_rebalance_meta_save_result(result: Result<()>, stage: &str) -> Result<()> {
     result.map_err(|err| Error::other(format!("rebalance meta save failed during {stage}: {err}")))
+}
+
+fn rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error {
+    match err {
+        rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: crate::disk::RUSTFS_META_BUCKET.to_string(),
+            object: REBAL_META_NAME.to_string(),
+            required,
+            achieved,
+        },
+        other => Error::other(format!(
+            "failed to acquire rebalance metadata write lock on {}/{}: {other}",
+            crate::disk::RUSTFS_META_BUCKET,
+            REBAL_META_NAME
+        )),
+    }
 }
 
 fn resolve_rebalance_meta_load_result(result: Result<()>) -> Result<bool> {
@@ -1267,6 +1512,10 @@ fn resolve_rebalance_migrate_result_error(
     })
 }
 
+fn should_defer_rebalance_entry_failure(err: &Error) -> bool {
+    is_transient_rebalance_error(err)
+}
+
 fn resolve_load_rebalance_stats_update_result(result: Result<()>) -> Result<()> {
     result.map_err(|err| Error::other(format!("rebalance metadata stats refresh failed after load: {err}")))
 }
@@ -1301,11 +1550,117 @@ fn resolve_rebalance_bucket_error(entry_error: Option<Error>, worker_error: Opti
     Ok(())
 }
 
-fn resolve_rebalance_bucket_result(result: Result<()>, pool_idx: usize, bucket: &str) -> Result<()> {
+fn resolve_rebalance_bucket_result(
+    result: Result<RebalanceBucketOutcome>,
+    pool_idx: usize,
+    bucket: &str,
+) -> Result<RebalanceBucketOutcome> {
     match result {
-        Ok(()) => Ok(()),
+        Ok(outcome) => Ok(outcome),
         Err(err) if is_err_operation_canceled(&err) => Err(err),
         Err(err) => Err(Error::other(format!("rebalance bucket {bucket} failed for pool {pool_idx}: {err}"))),
+    }
+}
+
+fn is_transient_rebalance_error(err: &Error) -> bool {
+    match err {
+        Error::SlowDown
+        | Error::ErasureReadQuorum
+        | Error::ErasureWriteQuorum
+        | Error::InsufficientReadQuorum(_, _)
+        | Error::InsufficientWriteQuorum(_, _) => true,
+        Error::Lock(lock_err) => is_rebalance_transient_lock_error(lock_err),
+        Error::Io(io_err) => is_rebalance_transient_io_error(io_err) || is_rebalance_transient_message(&io_err.to_string()),
+        _ => is_rebalance_transient_message(&err.to_string()) || is_network_or_host_down(&err.to_string(), true),
+    }
+}
+
+fn is_rebalance_transient_lock_error(err: &rustfs_lock::LockError) -> bool {
+    match err {
+        rustfs_lock::LockError::Timeout { .. } | rustfs_lock::LockError::Network { .. } => true,
+        rustfs_lock::LockError::Internal { message } => is_rebalance_transient_message(message),
+        _ => false,
+    }
+}
+
+fn is_rebalance_transient_io_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::TimedOut {
+        return true;
+    }
+
+    if let Some(disk_err) = err.get_ref().and_then(|err| err.downcast_ref::<DiskError>())
+        && *disk_err == DiskError::Timeout
+    {
+        return true;
+    }
+
+    let message = err.to_string();
+    message.eq_ignore_ascii_case("timeout") || is_rebalance_transient_message(&message)
+}
+
+fn is_rebalance_transient_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("lock acquisition timed out")
+        || message.contains("remote lock rpc timed out")
+        || message.contains("keepalivetimedout")
+        || message.contains("i/o timeout")
+        || message.contains("operation timed out")
+}
+
+fn should_retry_rebalance_listing(err: &Error, attempt: usize, max_attempts: usize) -> bool {
+    attempt + 1 < max_attempts && is_transient_rebalance_error(err)
+}
+
+fn rebalance_listing_retry_delay(attempt: usize) -> Duration {
+    let multiplier = u32::try_from(attempt.saturating_add(1)).unwrap_or(u32::MAX);
+    REBALANCE_LISTING_RETRY_BASE_DELAY.saturating_mul(multiplier)
+}
+
+fn is_rebalance_lock_or_rpc_timeout(err: &Error) -> bool {
+    match err {
+        Error::Lock(rustfs_lock::LockError::Timeout { .. }) | Error::Lock(rustfs_lock::LockError::Network { .. }) => true,
+        Error::Io(io_err) => is_rebalance_lock_or_rpc_timeout_message(&io_err.to_string()),
+        _ => is_rebalance_lock_or_rpc_timeout_message(&err.to_string()),
+    }
+}
+
+fn is_rebalance_lock_or_rpc_timeout_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("lock acquisition timed out")
+        || message.contains("remote lock rpc timed out")
+        || message.contains("keepalivetimedout")
+}
+
+fn rebalance_migration_retry_delay(attempt: usize, err: &Error) -> Duration {
+    if is_rebalance_lock_or_rpc_timeout(err) {
+        return rebalance_lock_retry_delay(attempt);
+    }
+
+    let multiplier = u32::try_from(attempt.saturating_add(1)).unwrap_or(u32::MAX);
+    REBALANCE_MIGRATION_RETRY_BASE_DELAY.saturating_mul(multiplier)
+}
+
+fn rebalance_lock_retry_delay(attempt: usize) -> Duration {
+    let lock_timeout = get_lock_acquire_timeout();
+    let attempt_shift = u32::try_from(attempt.min(4)).unwrap_or(4);
+    let multiplier = 1_u32.checked_shl(attempt_shift).unwrap_or(u32::MAX);
+    let cap = lock_timeout
+        .saturating_mul(multiplier)
+        .min(REBALANCE_MIGRATION_LOCK_RETRY_CAP)
+        .max(REBALANCE_MIGRATION_RETRY_BASE_DELAY);
+    let max_millis = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX).max(1);
+    let jitter_millis = rand::rng().random_range(1..=max_millis);
+    Duration::from_millis(jitter_millis)
+}
+
+async fn sleep_rebalance_migration_retry(delay: Duration) {
+    tokio::time::sleep(delay).await;
+}
+
+async fn wait_rebalance_listing_retry(rx: &CancellationToken, delay: Duration) -> Result<()> {
+    tokio::select! {
+        _ = rx.cancelled() => Err(Error::OperationCanceled),
+        _ = tokio::time::sleep(delay) => Ok(()),
     }
 }
 
@@ -1523,6 +1878,113 @@ fn apply_rebalance_save_option(meta: &mut RebalanceMeta, pool_idx: usize, opt: R
     meta.last_refreshed_at = Some(now);
 }
 
+fn is_rebalance_terminal_status(status: RebalStatus) -> bool {
+    matches!(status, RebalStatus::Completed | RebalStatus::Stopped | RebalStatus::Failed)
+}
+
+fn merge_rebalance_bucket_lists(remote: &mut Vec<String>, local: &[String]) {
+    let mut existing: HashSet<String> = remote.iter().cloned().collect();
+    for bucket in local {
+        if existing.insert(bucket.clone()) {
+            remote.push(bucket.clone());
+        }
+    }
+}
+
+fn remove_rebalanced_buckets_from_queue(pool_stat: &mut RebalanceStats) {
+    let rebalanced_buckets: HashSet<String> = pool_stat.rebalanced_buckets.iter().cloned().collect();
+    pool_stat.buckets.retain(|bucket| !rebalanced_buckets.contains(bucket));
+}
+
+fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &RebalanceStats) {
+    remote.init_free_space = remote.init_free_space.max(local.init_free_space);
+    remote.init_capacity = remote.init_capacity.max(local.init_capacity);
+    remote.participating |= local.participating;
+
+    merge_rebalance_bucket_lists(&mut remote.buckets, &local.buckets);
+    merge_rebalance_bucket_lists(&mut remote.rebalanced_buckets, &local.rebalanced_buckets);
+    remove_rebalanced_buckets_from_queue(remote);
+
+    let local_is_newer = local.num_versions >= remote.num_versions;
+    remote.num_objects = remote.num_objects.max(local.num_objects);
+    remote.num_versions = remote.num_versions.max(local.num_versions);
+    remote.bytes = remote.bytes.max(local.bytes);
+
+    if local_is_newer {
+        remote.bucket = local.bucket.clone();
+        remote.object = local.object.clone();
+    }
+
+    if remote.info.start_time.is_none() {
+        remote.info.start_time = local.info.start_time;
+    }
+
+    if is_rebalance_terminal_status(remote.info.status) && local.info.status == RebalStatus::Started {
+        return;
+    }
+
+    if remote.info.status == RebalStatus::Stopped && matches!(local.info.status, RebalStatus::Started | RebalStatus::Completed) {
+        return;
+    }
+
+    match local.info.status {
+        RebalStatus::Failed => {
+            remote.info.status = RebalStatus::Failed;
+            remote.info.end_time = local.info.end_time.or(remote.info.end_time);
+            remote.info.last_error = local.info.last_error.clone().or_else(|| remote.info.last_error.clone());
+        }
+        RebalStatus::Stopped => {
+            if remote.info.status != RebalStatus::Failed {
+                remote.info.status = RebalStatus::Stopped;
+                remote.info.end_time = local.info.end_time.or(remote.info.end_time);
+                remote.info.last_error = None;
+            }
+        }
+        RebalStatus::Completed => {
+            if !matches!(remote.info.status, RebalStatus::Failed | RebalStatus::Stopped) {
+                remote.info.status = RebalStatus::Completed;
+                remote.info.end_time = local.info.end_time.or(remote.info.end_time);
+                remote.info.last_error = None;
+            }
+        }
+        RebalStatus::Started => {
+            if !is_rebalance_terminal_status(remote.info.status) {
+                remote.info.status = RebalStatus::Started;
+                remote.info.last_error = local.info.last_error.clone();
+            }
+        }
+        RebalStatus::None => {}
+    }
+}
+
+fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &RebalanceMeta) {
+    if remote.id.is_empty() {
+        *remote = local.clone();
+        return;
+    }
+
+    if !local.id.is_empty() && remote.id != local.id {
+        *remote = local.clone();
+        return;
+    }
+
+    remote.percent_free_goal = local.percent_free_goal;
+    remote.last_refreshed_at = Some(OffsetDateTime::now_utc());
+    if remote.stopped_at.is_none() {
+        remote.stopped_at = local.stopped_at;
+    }
+
+    if remote.pool_stats.len() < local.pool_stats.len() {
+        remote.pool_stats.resize_with(local.pool_stats.len(), RebalanceStats::default);
+    }
+
+    for (idx, local_pool_stat) in local.pool_stats.iter().enumerate() {
+        if let Some(remote_pool_stat) = remote.pool_stats.get_mut(idx) {
+            merge_rebalance_pool_stats(remote_pool_stat, local_pool_stat);
+        }
+    }
+}
+
 fn mark_started_rebalance_pools_stopped(meta: &mut RebalanceMeta, stop_time: OffsetDateTime) {
     for pool_stat in meta.pool_stats.iter_mut() {
         if pool_stat.info.status == RebalStatus::Started {
@@ -1572,7 +2034,7 @@ impl ECStore {
         set: Arc<SetDisks>,
         bucket_configs: Arc<RebalanceBucketConfigs>,
         // wk: Arc<Workers>,
-    ) -> Result<()> {
+    ) -> Result<RebalanceEntryOutcome> {
         info!("rebalance_entry: start rebalance_entry");
 
         // defer!(|| async {
@@ -1583,12 +2045,12 @@ impl ECStore {
 
         if entry.is_dir() {
             info!("rebalance_entry: entry is dir, skipping");
-            return Ok(());
+            return Ok(RebalanceEntryOutcome::Completed);
         }
 
         if self.check_if_rebalance_done(pool_index).await {
             info!("rebalance_entry: rebalance done, skipping pool {}", pool_index);
-            return Ok(());
+            return Ok(RebalanceEntryOutcome::Completed);
         }
 
         let mut fivs =
@@ -1599,6 +2061,7 @@ impl ECStore {
 
         let mut rebalanced: usize = 0;
         let mut expired: usize = 0;
+        let mut stats_updates = Vec::with_capacity(fivs.versions.len());
         for version in fivs.versions.iter() {
             if crate::pools::should_skip_lifecycle_for_data_movement(
                 self.clone(),
@@ -1664,19 +2127,52 @@ impl ECStore {
                     "rebalance_entry {} Error rebalancing entry {}/{:?}: {:?}",
                     &bucket, &version.name, &version.version_id, err
                 );
-                return Err(with_rebalance_entry_context("migrate", bucket.as_str(), version.name.as_str(), err));
+                if should_defer_rebalance_entry_failure(&err) {
+                    let deferred_error = format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} {err}");
+                    warn!(
+                        "rebalance_entry {} deferring transient migration failure for {}/{:?}: {}",
+                        &bucket, &version.name, &version.version_id, err
+                    );
+                    if let Err(stats_err) = self.update_rebalance_last_error(pool_index, deferred_error.clone()).await {
+                        error!(
+                            "rebalance_entry {} failed to record deferred transient failure for {}: {}",
+                            &bucket, &entry.name, stats_err
+                        );
+                    }
+                    return Ok(RebalanceEntryOutcome::Deferred {
+                        last_error: deferred_error,
+                    });
+                }
+                let entry_err =
+                    with_rebalance_entry_context(result.stage.unwrap_or("migrate"), bucket.as_str(), version.name.as_str(), err);
+
+                if !stats_updates.is_empty()
+                    && let Err(stats_err) = self
+                        .update_pool_stats_batch(pool_index, bucket.clone(), stats_updates.as_slice())
+                        .await
+                {
+                    error!(
+                        "rebalance_entry {} failed to update stats before returning migration error for {}: {}",
+                        &bucket, &entry.name, stats_err
+                    );
+                }
+
+                return Err(entry_err);
             }
 
-            resolve_rebalance_stats_update_result(
-                self.update_pool_stats(pool_index, bucket.clone(), version).await,
-                pool_index,
-                bucket.as_str(),
-                version.name.as_str(),
-            )?;
+            stats_updates.push(version);
             if should_count_rebalance_version_complete(&result) {
                 rebalanced += 1;
             }
         }
+
+        resolve_rebalance_stats_update_result(
+            self.update_pool_stats_batch(pool_index, bucket.clone(), stats_updates.as_slice())
+                .await,
+            pool_index,
+            bucket.as_str(),
+            entry.name.as_str(),
+        )?;
 
         if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len()) {
             resolve_rebalance_entry_cleanup_delete_result(
@@ -1693,11 +2189,12 @@ impl ECStore {
                 .await,
                 bucket.as_str(),
                 entry.name.as_str(),
-            )?;
+            )
+            .map_err(|err| with_rebalance_entry_context("cleanup_source", bucket.as_str(), entry.name.as_str(), err))?;
             info!("rebalance_entry {} Entry {} deleted successfully", &bucket, &entry.name);
         }
 
-        Ok(())
+        Ok(RebalanceEntryOutcome::Completed)
     }
 
     #[tracing::instrument(skip(self, rd))]
@@ -1705,8 +2202,29 @@ impl ECStore {
         data_movement::migrate_object(self, pool_idx, bucket, rd, "rebalance_object").await
     }
 
+    async fn update_rebalance_last_error(&self, pool_idx: usize, message: String) -> Result<()> {
+        let mut rebalance_meta = self.rebalance_meta.write().await;
+        let Some(meta) = rebalance_meta.as_mut() else {
+            return Err(rebalance_metadata_not_initialized_error("record rebalance last error"));
+        };
+        let pool_count = meta.pool_stats.len();
+        ensure_valid_rebalance_pool_index(pool_count, pool_idx)?;
+        let Some(pool_stat) = meta.pool_stats.get_mut(pool_idx) else {
+            return Err(invalid_rebalance_pool_index_error(pool_idx, pool_count));
+        };
+
+        pool_stat.info.last_error = Some(message);
+        meta.last_refreshed_at = Some(OffsetDateTime::now_utc());
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self, rx))]
-    async fn rebalance_bucket(self: &Arc<Self>, rx: CancellationToken, bucket: String, pool_index: usize) -> Result<()> {
+    async fn rebalance_bucket(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        bucket: String,
+        pool_index: usize,
+    ) -> Result<RebalanceBucketOutcome> {
         ensure_valid_rebalance_pool_index(self.pools.len(), pool_index)?;
 
         // Placeholder for actual bucket rebalance logic
@@ -1794,7 +2312,15 @@ impl ECStore {
             let entry_tasks = entry_tasks.clone();
 
             let job = tokio::spawn(async move {
-                let list_result = set.list_objects_to_rebalance(rx, bucket, rebalance_entry).await;
+                let list_result = run_rebalance_listing_with_retry(
+                    set,
+                    rx,
+                    bucket.clone(),
+                    rebalance_entry,
+                    set_idx,
+                    REBALANCE_LISTING_MAX_ATTEMPTS,
+                )
+                .await;
                 let entry_result = wait_rebalance_entry_tasks(set_idx, entry_tasks).await;
                 let result = list_result.and(entry_result);
                 if let Err(err) = &result {
@@ -1809,18 +2335,27 @@ impl ECStore {
         }
 
         let mut worker_error: Option<Error> = None;
+        let mut deferred_error: Option<String> = None;
         for (set_idx, job) in jobs {
-            if let Err(err) = resolve_rebalance_worker_result(set_idx, job.await)
-                && worker_error.is_none()
-            {
-                worker_error = Some(err);
+            match resolve_rebalance_worker_result(set_idx, job.await) {
+                Ok(Some(last_error)) if deferred_error.is_none() => {
+                    deferred_error = Some(last_error);
+                }
+                Ok(_) => {}
+                Err(err) if worker_error.is_none() => {
+                    worker_error = Some(err);
+                }
+                Err(_) => {}
             }
         }
         let entry_error = entry_error.lock().await.clone();
         resolve_rebalance_bucket_error(entry_error, worker_error)?;
+        if let Some(last_error) = deferred_error {
+            return Ok(RebalanceBucketOutcome::Deferred { last_error });
+        }
 
         info!("rebalance_bucket: rebalance_bucket done");
-        Ok(())
+        Ok(RebalanceBucketOutcome::Completed)
     }
 
     #[tracing::instrument(skip(self))]
@@ -1843,10 +2378,64 @@ impl ECStore {
             pool_idx, opt, meta_to_save
         );
         let stage = format!("save_rebalance_stats for pool {pool_idx} opt {opt:?}");
-        resolve_rebalance_meta_save_result(meta_to_save.save(pool).await, stage.as_str())?;
+        resolve_rebalance_meta_save_result(
+            self.save_rebalance_meta_with_merge(pool, &meta_to_save, stage.as_str()).await,
+            stage.as_str(),
+        )?;
 
         Ok(())
     }
+}
+
+async fn run_rebalance_listing_with_retry(
+    set: Arc<SetDisks>,
+    rx: CancellationToken,
+    bucket: String,
+    cb: ListCallback,
+    set_idx: usize,
+    max_attempts: usize,
+) -> Result<()> {
+    let max_attempts = max_attempts.max(1);
+    let mut last_error = None;
+
+    for attempt in 0..max_attempts {
+        match set.list_objects_to_rebalance(rx.clone(), bucket.clone(), cb.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(err) if should_retry_rebalance_listing(&err, attempt, max_attempts) => {
+                let next_attempt = attempt + 2;
+                let delay = rebalance_listing_retry_delay(attempt);
+                error!(
+                    "rebalance listing failed for bucket {} set {} attempt {}/{}: {}; retrying in {:?}",
+                    bucket,
+                    set_idx,
+                    attempt + 1,
+                    max_attempts,
+                    err,
+                    delay
+                );
+                last_error = Some(err);
+                wait_rebalance_listing_retry(&rx, delay).await?;
+                info!(
+                    "rebalance listing retrying bucket {} set {} attempt {}/{}",
+                    bucket, set_idx, next_attempt, max_attempts
+                );
+            }
+            Err(err) => {
+                return Err(Error::other(format!(
+                    "rebalance listing failed for bucket {bucket} set {set_idx} attempt {}/{}: {err}",
+                    attempt + 1,
+                    max_attempts
+                )));
+            }
+        }
+    }
+
+    Err(Error::other(format!(
+        "rebalance listing failed for bucket {bucket} set {set_idx} after {max_attempts} attempts: {}",
+        last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "unknown listing failure".to_string())
+    )))
 }
 
 impl SetDisks {
@@ -1880,6 +2469,7 @@ impl SetDisks {
                 bucket: bucket.clone(),
                 recursive: true,
                 min_disks: listing_quorum,
+                skip_walkdir_total_timeout: true,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                     info!("list_objects_to_rebalance: agreed: {:?}", &entry.name);
                     Box::pin(cb1(entry))
@@ -1912,6 +2502,7 @@ impl SetDisks {
 
 #[cfg(test)]
 mod rebalance_unit_tests {
+    use super::REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX;
     use super::first_rebalance_bucket;
     use super::is_rebalance_actively_running;
     use super::is_rebalance_conflicting_with_decommission;
@@ -1919,23 +2510,27 @@ mod rebalance_unit_tests {
     use super::percent_free_ratio;
     use super::rebalance_goal_reached;
     use super::{
-        GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions, RebalSaveOpt,
-        RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceTerminalEvent, apply_rebalance_save_option,
-        apply_rebalance_terminal_event, apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc,
-        clone_rebalance_pool_stats, complete_rebalance_pools_at_goal, ensure_rebalance_listing_disks_available,
-        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, is_rebalance_stopped_terminal_event,
-        load_rebalance_bucket_configs, mark_rebalance_bucket_done, migrate_entry_version, next_rebal_bucket_from_stat,
-        rebalance_delete_marker_opts, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
-        rebalance_meta_load_unknown_version_error, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
+        DiskError, GetObjectReader, HTTPRangeSpec, MigrationBackend, MigrationVersionResult, ObjectInfo, ObjectOptions,
+        RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
+        RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event, apply_stopped_at,
+        classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
+        complete_rebalance_pools_at_goal, defer_bucket_in_rebalance_queue, ensure_rebalance_listing_disks_available,
+        ensure_rebalance_not_decommissioning, ensure_valid_rebalance_pool_index, has_deferred_rebalance_error,
+        is_rebalance_stopped_terminal_event, is_transient_rebalance_error, load_rebalance_bucket_configs,
+        mark_rebalance_bucket_done, merge_rebalance_meta, migrate_entry_version, migrate_entry_version_with_retry_wait,
+        next_rebal_bucket_from_stat, rebalance_delete_marker_opts, rebalance_listing_retry_delay,
+        rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error, rebalance_meta_load_unknown_version_error,
+        rebalance_migration_retry_delay, resolve_load_rebalance_stats_update_result, resolve_next_rebalance_bucket,
         resolve_rebalance_bucket_error, resolve_rebalance_bucket_result, resolve_rebalance_entry_cleanup_delete_result,
         resolve_rebalance_file_info_versions_result, resolve_rebalance_meta_load_result, resolve_rebalance_meta_save_result,
         resolve_rebalance_migrate_result_error, resolve_rebalance_optional_bucket_config_result, resolve_rebalance_participants,
         resolve_rebalance_save_task_result, resolve_rebalance_stats_update_result, resolve_rebalance_terminal_error,
-        resolve_rebalance_worker_result, send_rebalance_done_signal, should_cleanup_rebalance_source_entry,
-        should_count_rebalance_version_complete, should_ignore_rebalance_data_usage_cache, should_pool_participate,
-        should_preserve_rebalance_stopped_state, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
+        resolve_rebalance_worker_result, send_rebalance_done_signal, should_accept_rebalance_stats_update,
+        should_cleanup_rebalance_source_entry, should_count_rebalance_version_complete, should_defer_rebalance_entry_failure,
+        should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
+        should_retry_rebalance_listing, should_skip_rebalance_delete_marker, should_skip_start_rebalance,
         stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue, validate_start_rebalance_state,
-        with_rebalance_entry_context,
+        wait_rebalance_listing_retry, with_rebalance_entry_context,
     };
     use crate::data_movement;
     use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -1951,6 +2546,7 @@ mod rebalance_unit_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use time::OffsetDateTime;
     use tokio::sync::mpsc;
+    use tokio::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     struct MigrationBackendSpy {
@@ -2174,6 +2770,41 @@ mod rebalance_unit_tests {
     }
 
     #[tokio::test]
+    async fn test_migrate_entry_version_remote_overwrite_is_not_ignored() {
+        let backend = MigrationBackendSpy::new(
+            None,
+            None,
+            Some(Err(Error::DataMovementOverwriteErr(
+                "bucket".to_string(),
+                "object.bin".to_string(),
+                "vid-1".to_string(),
+            ))),
+        );
+        let version = version_remote();
+        let mut transfer = |_, _, _| async move { Ok(()) };
+
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            0,
+            &version,
+            Some("vid-1".to_string()),
+            3,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(result.failed);
+        assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
+        assert!(!result.moved);
+        assert_eq!(result.stage, Some("move_remote_version"));
+        assert!(matches!(result.error, Some(Error::DataMovementOverwriteErr(_, _, _))));
+        assert_eq!(backend.move_remote_calls(), 1);
+    }
+
+    #[tokio::test]
     async fn test_migrate_entry_version_remote_failure_is_reported() {
         let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), Some(Err(Error::SlowDown)));
         let version = version_remote();
@@ -2270,6 +2901,41 @@ mod rebalance_unit_tests {
     }
 
     #[tokio::test]
+    async fn test_migrate_entry_version_deleted_version_overwrite_is_not_ignored() {
+        let backend = MigrationBackendSpy::new(
+            None,
+            Some(Err(Error::DataMovementOverwriteErr(
+                "bucket".to_string(),
+                "object.bin".to_string(),
+                "vid-1".to_string(),
+            ))),
+            None,
+        );
+        let version = version_deleted();
+        let mut transfer = |_, _, _| async move { Ok(()) };
+
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            Some("vid-1".to_string()),
+            3,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(result.failed);
+        assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
+        assert!(!result.moved);
+        assert_eq!(result.stage, Some("delete_marker"));
+        assert!(matches!(result.error, Some(Error::DataMovementOverwriteErr(_, _, _))));
+        assert_eq!(backend.delete_calls(), 1);
+    }
+
+    #[tokio::test]
     async fn test_migrate_entry_version_reader_not_found_is_ignored() {
         let backend = MigrationBackendSpy::new(
             Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))),
@@ -2304,6 +2970,7 @@ mod rebalance_unit_tests {
     async fn test_migrate_entry_version_reader_retries_before_success() {
         let backend = MigrationBackendSpy::new(Some(Err(Error::SlowDown)), None, None);
         let transfer_count = Arc::new(AtomicUsize::new(0));
+        let wait_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
             let transfer_count = transfer_count.clone();
             move |_, _, _| {
@@ -2316,7 +2983,7 @@ mod rebalance_unit_tests {
         };
 
         let version = version_normal();
-        let result = migrate_entry_version(
+        let result = migrate_entry_version_with_retry_wait(
             &backend,
             "bucket".to_string(),
             1,
@@ -2325,6 +2992,15 @@ mod rebalance_unit_tests {
             3,
             false,
             &mut transfer,
+            {
+                let wait_count = wait_count.clone();
+                move |_| {
+                    let wait_count = wait_count.clone();
+                    async move {
+                        wait_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            },
         )
         .await;
 
@@ -2336,6 +3012,7 @@ mod rebalance_unit_tests {
         assert_eq!(backend.get_calls(), 2);
         assert_eq!(backend.delete_calls(), 0);
         assert_eq!(transfer_count.load(Ordering::SeqCst), 1);
+        assert_eq!(wait_count.load(Ordering::SeqCst), 1);
     }
 
     struct AlwaysFailGetBackend {
@@ -2461,6 +3138,7 @@ mod rebalance_unit_tests {
     async fn test_migrate_entry_version_transfer_retries_before_success() {
         let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
         let transfer_count = Arc::new(AtomicUsize::new(0));
+        let wait_count = Arc::new(AtomicUsize::new(0));
         let mut transfer = {
             let transfer_count = transfer_count.clone();
             move |_, _, _| {
@@ -2476,7 +3154,7 @@ mod rebalance_unit_tests {
         };
 
         let version = version_normal();
-        let result = migrate_entry_version(
+        let result = migrate_entry_version_with_retry_wait(
             &backend,
             "bucket".to_string(),
             1,
@@ -2485,6 +3163,15 @@ mod rebalance_unit_tests {
             3,
             false,
             &mut transfer,
+            {
+                let wait_count = wait_count.clone();
+                move |_| {
+                    let wait_count = wait_count.clone();
+                    async move {
+                        wait_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            },
         )
         .await;
 
@@ -2494,6 +3181,54 @@ mod rebalance_unit_tests {
         assert!(!result.failed);
         assert_eq!(backend.get_calls(), 2);
         assert_eq!(transfer_count.load(Ordering::SeqCst), 2);
+        assert_eq!(wait_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_transfer_non_transient_fails_without_retry() {
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+        let transfer_count = Arc::new(AtomicUsize::new(0));
+        let wait_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = {
+            let transfer_count = transfer_count.clone();
+            move |_, _, _| {
+                let transfer_count = transfer_count.clone();
+                async move {
+                    transfer_count.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::FileAccessDenied)
+                }
+            }
+        };
+
+        let version = version_normal();
+        let result = migrate_entry_version_with_retry_wait(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            3,
+            false,
+            &mut transfer,
+            {
+                let wait_count = wait_count.clone();
+                move |_| {
+                    let wait_count = wait_count.clone();
+                    async move {
+                        wait_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(result.failed);
+        assert!(!result.ignored);
+        assert_eq!(result.stage, Some("write_target"));
+        assert!(matches!(result.error, Some(Error::FileAccessDenied)));
+        assert_eq!(backend.get_calls(), 1);
+        assert_eq!(transfer_count.load(Ordering::SeqCst), 1);
+        assert_eq!(wait_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2506,7 +3241,7 @@ mod rebalance_unit_tests {
                 let transfer_count = transfer_count.clone();
                 async move {
                     transfer_count.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::NotModified)
+                    Err(Error::SlowDown)
                 }
             }
         };
@@ -2566,6 +3301,47 @@ mod rebalance_unit_tests {
         assert!(!result.moved);
         assert!(!result.failed);
         assert!(result.error.is_none());
+        assert_eq!(transfer_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_transfer_overwrite_is_not_ignored() {
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+        let transfer_count = Arc::new(AtomicUsize::new(0));
+        let mut transfer = {
+            let transfer_count = transfer_count.clone();
+            move |_, _, _| {
+                let transfer_count = transfer_count.clone();
+                async move {
+                    transfer_count.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::DataMovementOverwriteErr(
+                        "bucket".to_string(),
+                        "object.bin".to_string(),
+                        "vid-1".to_string(),
+                    ))
+                }
+            }
+        };
+
+        let version = version_normal();
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            Some("vid-1".to_string()),
+            3,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(result.failed);
+        assert!(!result.ignored);
+        assert!(!result.cleanup_ignored);
+        assert!(!result.moved);
+        assert_eq!(result.stage, Some("write_target"));
+        assert!(matches!(result.error, Some(Error::DataMovementOverwriteErr(_, _, _))));
         assert_eq!(transfer_count.load(Ordering::SeqCst), 1);
     }
 
@@ -2712,7 +3488,7 @@ mod rebalance_unit_tests {
     fn test_resolve_rebalance_worker_result_passthrough() {
         assert!(resolve_rebalance_worker_result(0, Ok(Ok(()))).is_ok());
 
-        let err = resolve_rebalance_worker_result(0, Ok(Err(Error::OperationCanceled))).unwrap_err();
+        let err = resolve_rebalance_worker_result::<()>(0, Ok(Err(Error::OperationCanceled))).unwrap_err();
         assert!(matches!(err, Error::OperationCanceled));
     }
 
@@ -2724,23 +3500,27 @@ mod rebalance_unit_tests {
         .await
         .expect_err("panic task should return JoinError");
 
-        let err = resolve_rebalance_worker_result(7, Err(join_error)).unwrap_err();
+        let err = resolve_rebalance_worker_result::<()>(7, Err(join_error)).unwrap_err();
         assert!(err.to_string().contains("rebalance worker 7 task join error"));
     }
 
     #[tokio::test]
     async fn test_wait_rebalance_entry_tasks_returns_ok_for_successful_tasks() {
-        let tasks = Arc::new(tokio::sync::Mutex::new(vec![tokio::spawn(async { Ok(()) })]));
+        let tasks = Arc::new(tokio::sync::Mutex::new(vec![tokio::spawn(async {
+            Ok(RebalanceEntryOutcome::Completed)
+        })]));
 
-        super::wait_rebalance_entry_tasks(1, tasks)
+        let result = super::wait_rebalance_entry_tasks(1, tasks)
             .await
             .expect("successful entry tasks should pass");
+
+        assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_wait_rebalance_entry_tasks_returns_first_task_error() {
         let tasks = Arc::new(tokio::sync::Mutex::new(vec![
-            tokio::spawn(async { Ok(()) }),
+            tokio::spawn(async { Ok(RebalanceEntryOutcome::Completed) }),
             tokio::spawn(async { Err(Error::other("entry failed")) }),
         ]));
 
@@ -2749,6 +3529,24 @@ mod rebalance_unit_tests {
             .expect_err("entry task failure should be returned");
 
         assert!(err.to_string().contains("entry failed"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_rebalance_entry_tasks_returns_deferred_error_without_failing() {
+        let tasks = Arc::new(tokio::sync::Mutex::new(vec![
+            tokio::spawn(async { Ok(RebalanceEntryOutcome::Completed) }),
+            tokio::spawn(async {
+                Ok(RebalanceEntryOutcome::Deferred {
+                    last_error: "deferred transient rebalance entry failure: timeout".to_string(),
+                })
+            }),
+        ]));
+
+        let result = super::wait_rebalance_entry_tasks(1, tasks)
+            .await
+            .expect("deferred transient entry should not fail worker");
+
+        assert_eq!(result.as_deref(), Some("deferred transient rebalance entry failure: timeout"));
     }
 
     #[test]
@@ -2775,6 +3573,239 @@ mod rebalance_unit_tests {
         let message = err.to_string();
         assert!(message.contains("rebalance meta save failed during init_rebalance_meta"));
         assert!(message.contains(Error::SlowDown.to_string().as_str()));
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_preserves_updates_from_multiple_pools() {
+        let start_time = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let mut remote = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![
+                RebalanceStats {
+                    buckets: vec!["bucket-a".to_string()],
+                    participating: true,
+                    info: RebalanceInfo {
+                        start_time: Some(start_time),
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    num_versions: 4,
+                    bytes: 400,
+                    bucket: "bucket-a".to_string(),
+                    object: "remote-object".to_string(),
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    buckets: vec!["bucket-a".to_string()],
+                    participating: true,
+                    info: RebalanceInfo {
+                        start_time: Some(start_time),
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let local = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![
+                RebalanceStats {
+                    buckets: vec!["bucket-a".to_string()],
+                    participating: true,
+                    info: RebalanceInfo {
+                        start_time: Some(start_time),
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    buckets: Vec::new(),
+                    rebalanced_buckets: vec!["bucket-a".to_string()],
+                    participating: true,
+                    info: RebalanceInfo {
+                        start_time: Some(start_time),
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    num_versions: 7,
+                    bytes: 700,
+                    bucket: "bucket-a".to_string(),
+                    object: "local-object".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        assert_eq!(remote.pool_stats[0].num_versions, 4);
+        assert_eq!(remote.pool_stats[0].object, "remote-object");
+        assert_eq!(remote.pool_stats[1].num_versions, 7);
+        assert_eq!(remote.pool_stats[1].object, "local-object");
+        assert!(remote.pool_stats[1].buckets.is_empty());
+        assert_eq!(remote.pool_stats[1].rebalanced_buckets, vec!["bucket-a"]);
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_does_not_overwrite_failed_with_started_stats() {
+        let now = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        let mut remote = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Failed,
+                    end_time: Some(now),
+                    last_error: Some("timeout".to_string()),
+                    ..Default::default()
+                },
+                num_versions: 10,
+                bytes: 1_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let local = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                num_versions: 8,
+                bytes: 800,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        assert_eq!(remote.pool_stats[0].info.status, RebalStatus::Failed);
+        assert_eq!(remote.pool_stats[0].info.last_error.as_deref(), Some("timeout"));
+        assert_eq!(remote.pool_stats[0].num_versions, 10);
+        assert_eq!(remote.pool_stats[0].bytes, 1_000);
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_does_not_overwrite_stopped_with_started_stats() {
+        let stopped_at = OffsetDateTime::from_unix_timestamp(3_000).unwrap();
+        let mut remote = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            stopped_at: Some(stopped_at),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Stopped,
+                    end_time: Some(stopped_at),
+                    ..Default::default()
+                },
+                num_versions: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let local = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                num_versions: 9,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        assert_eq!(remote.stopped_at, Some(stopped_at));
+        assert_eq!(remote.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert_eq!(remote.pool_stats[0].info.end_time, Some(stopped_at));
+        assert_eq!(remote.pool_stats[0].num_versions, 9);
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_preserves_failed_status_over_stopped() {
+        let stopped_at = OffsetDateTime::from_unix_timestamp(3_000).unwrap();
+        let failed_at = OffsetDateTime::from_unix_timestamp(4_000).unwrap();
+        let mut remote = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            stopped_at: Some(stopped_at),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Stopped,
+                    end_time: Some(stopped_at),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let local = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Failed,
+                    end_time: Some(failed_at),
+                    last_error: Some("late failure".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        assert_eq!(remote.pool_stats[0].info.status, RebalStatus::Failed);
+        assert_eq!(remote.pool_stats[0].info.end_time, Some(failed_at));
+        assert_eq!(remote.pool_stats[0].info.last_error.as_deref(), Some("late failure"));
+    }
+
+    #[test]
+    fn test_merge_rebalance_meta_does_not_overwrite_stopped_with_completed_status() {
+        let stopped_at = OffsetDateTime::from_unix_timestamp(3_000).unwrap();
+        let completed_at = OffsetDateTime::from_unix_timestamp(5_000).unwrap();
+        let mut remote = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            stopped_at: Some(stopped_at),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Stopped,
+                    end_time: Some(stopped_at),
+                    ..Default::default()
+                },
+                num_versions: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let local = RebalanceMeta {
+            id: "rebal-1".to_string(),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    end_time: Some(completed_at),
+                    ..Default::default()
+                },
+                num_versions: 12,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_meta(&mut remote, &local);
+
+        assert_eq!(remote.stopped_at, Some(stopped_at));
+        assert_eq!(remote.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert_eq!(remote.pool_stats[0].info.end_time, Some(stopped_at));
+        assert_eq!(remote.pool_stats[0].num_versions, 12);
     }
 
     #[test]
@@ -2910,7 +3941,9 @@ mod rebalance_unit_tests {
 
     #[test]
     fn test_resolve_rebalance_bucket_result_passthrough() {
-        assert!(resolve_rebalance_bucket_result(Ok(()), 2, "bucket-a").is_ok());
+        let outcome = resolve_rebalance_bucket_result(Ok(RebalanceBucketOutcome::Completed), 2, "bucket-a")
+            .expect("completed bucket should pass through");
+        assert_eq!(outcome, RebalanceBucketOutcome::Completed);
     }
 
     #[test]
@@ -2945,11 +3978,170 @@ mod rebalance_unit_tests {
     }
 
     #[test]
+    fn test_is_transient_rebalance_error_classifies_retryable_errors() {
+        assert!(is_transient_rebalance_error(&Error::SlowDown));
+        assert!(is_transient_rebalance_error(&Error::ErasureReadQuorum));
+        assert!(is_transient_rebalance_error(&Error::ErasureWriteQuorum));
+        assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ))));
+        assert!(is_transient_rebalance_error(&Error::other("i/o timeout")));
+    }
+
+    #[test]
+    fn test_is_transient_rebalance_error_accepts_lock_and_rpc_timeouts() {
+        assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::other(
+            "Failed to acquire read lock: ns_loc: read lock acquisition timed out on bucket/object"
+        ))));
+        assert!(is_transient_rebalance_error(&Error::other(
+            "Remote lock RPC timed out: RPC timed out after 50ms"
+        )));
+        assert!(is_transient_rebalance_error(&Error::other(
+            "Unknown hyper error: hyper::Error(Http2, KeepAliveTimedOut)"
+        )));
+        assert!(is_transient_rebalance_error(&Error::Lock(rustfs_lock::LockError::timeout(
+            "bucket/object",
+            Duration::from_secs(5),
+        ))));
+    }
+
+    #[test]
+    fn test_is_transient_rebalance_error_accepts_wrapped_disk_timeout() {
+        assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::other(DiskError::Timeout))));
+    }
+
+    #[test]
+    fn test_is_transient_rebalance_error_accepts_io_timeout_message() {
+        assert!(is_transient_rebalance_error(&Error::Io(std::io::Error::other("timeout"))));
+    }
+
+    #[test]
+    fn test_is_transient_rebalance_error_rejects_terminal_errors() {
+        assert!(!is_transient_rebalance_error(&Error::DataMovementOverwriteErr(
+            "bucket".to_string(),
+            "object".to_string(),
+            "version".to_string(),
+        )));
+        assert!(!is_transient_rebalance_error(&Error::ObjectNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+        )));
+        assert!(!is_transient_rebalance_error(&Error::FileAccessDenied));
+        assert!(!is_transient_rebalance_error(&Error::Lock(rustfs_lock::LockError::already_locked(
+            "bucket/object",
+            "owner-a",
+        ))));
+        assert!(!is_transient_rebalance_error(&Error::other(
+            "Failed to acquire read lock: ns_loc: read lock acquisition failed on bucket/object: permission denied"
+        )));
+    }
+
+    #[test]
+    fn test_should_retry_rebalance_listing_respects_attempt_limit_and_error_type() {
+        assert!(should_retry_rebalance_listing(&Error::SlowDown, 0, 3));
+        assert!(should_retry_rebalance_listing(&Error::SlowDown, 1, 3));
+        assert!(!should_retry_rebalance_listing(&Error::SlowDown, 2, 3));
+        assert!(!should_retry_rebalance_listing(&Error::FileAccessDenied, 0, 3));
+    }
+
+    #[test]
+    fn test_rebalance_listing_retry_delay_scales_by_attempt() {
+        assert_eq!(rebalance_listing_retry_delay(0), Duration::from_millis(250));
+        assert_eq!(rebalance_listing_retry_delay(1), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_rebalance_migration_retry_delay_scales_for_non_lock_timeout() {
+        assert_eq!(rebalance_migration_retry_delay(0, &Error::SlowDown), Duration::from_millis(250));
+        assert_eq!(rebalance_migration_retry_delay(1, &Error::SlowDown), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_should_defer_rebalance_entry_failure_only_for_transient_errors() {
+        assert!(should_defer_rebalance_entry_failure(&Error::Io(std::io::Error::other(
+            "Failed to acquire write lock: ns_loc: write lock acquisition timed out on bucket/object"
+        ))));
+        assert!(!should_defer_rebalance_entry_failure(&Error::DataMovementOverwriteErr(
+            "bucket".to_string(),
+            "object".to_string(),
+            "version".to_string(),
+        )));
+        assert!(!should_defer_rebalance_entry_failure(&Error::FileAccessDenied));
+    }
+
+    #[tokio::test]
+    async fn test_wait_rebalance_listing_retry_returns_canceled_without_sleeping() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = wait_rebalance_listing_retry(&token, Duration::from_secs(30))
+            .await
+            .expect_err("canceled rebalance should not wait before retrying");
+
+        assert!(matches!(err, Error::OperationCanceled));
+    }
+
+    #[test]
     fn test_with_rebalance_entry_context_formats_stage_bucket_and_object() {
         let err = with_rebalance_entry_context("migrate", "bucket-a", "obj.txt", Error::SlowDown);
         let message = err.to_string();
         assert!(message.contains("rebalance entry migrate failed for bucket-a/obj.txt"));
         assert!(message.contains("Please reduce your request rate"));
+    }
+
+    #[test]
+    fn test_with_rebalance_entry_context_formats_precise_stage() {
+        let err = with_rebalance_entry_context("write_target", "bucket-a", "obj.txt", Error::SlowDown);
+        let message = err.to_string();
+        assert!(message.contains("rebalance entry write_target failed for bucket-a/obj.txt"));
+        assert!(message.contains("Please reduce your request rate"));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_transfer_failure_reports_write_target_stage() {
+        let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+        let mut transfer = |_, _, _| async { Err(Error::SlowDown) };
+        let version = version_normal();
+
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            1,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(result.failed);
+        assert_eq!(result.stage, Some("write_target"));
+        assert!(matches!(result.error, Some(Error::SlowDown)));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_entry_version_reader_failure_reports_read_source_stage() {
+        let backend = AlwaysFailGetBackend::new();
+        let mut transfer = |_, _, _| async { Ok(()) };
+        let version = version_normal();
+
+        let result = migrate_entry_version(
+            &backend,
+            "bucket".to_string(),
+            1,
+            &version,
+            version.version_id.map(|v| v.to_string()),
+            1,
+            false,
+            &mut transfer,
+        )
+        .await;
+
+        assert!(result.failed);
+        assert_eq!(result.stage, Some("read_source"));
+        assert!(matches!(result.error, Some(Error::SlowDown)));
     }
 
     #[test]
@@ -2994,6 +4186,58 @@ mod rebalance_unit_tests {
     #[test]
     fn test_should_count_rebalance_version_complete_rejects_incomplete_result() {
         assert!(!should_count_rebalance_version_complete(&MigrationVersionResult::default()));
+    }
+
+    #[test]
+    fn test_should_accept_rebalance_stats_update_only_for_started_pool() {
+        let meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(should_accept_rebalance_stats_update(&meta, 0));
+    }
+
+    #[test]
+    fn test_should_accept_rebalance_stats_update_rejects_stopped_meta() {
+        let meta = RebalanceMeta {
+            stopped_at: Some(OffsetDateTime::UNIX_EPOCH),
+            pool_stats: vec![RebalanceStats {
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(!should_accept_rebalance_stats_update(&meta, 0));
+    }
+
+    #[test]
+    fn test_should_accept_rebalance_stats_update_rejects_terminal_or_invalid_pool() {
+        for status in [RebalStatus::Completed, RebalStatus::Stopped, RebalStatus::Failed] {
+            let meta = RebalanceMeta {
+                pool_stats: vec![RebalanceStats {
+                    info: RebalanceInfo {
+                        status,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            assert!(!should_accept_rebalance_stats_update(&meta, 0));
+            assert!(!should_accept_rebalance_stats_update(&meta, 1));
+        }
     }
 
     #[test]
@@ -3403,6 +4647,31 @@ mod rebalance_unit_tests {
     }
 
     #[test]
+    fn test_complete_rebalance_pools_at_goal_skips_deferred_transient_error() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let mut meta = RebalanceMeta {
+            percent_free_goal: 0.5,
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                init_free_space: 400,
+                init_capacity: 1_000,
+                bytes: 100,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    last_error: Some(format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} timeout")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(!complete_rebalance_pools_at_goal(&mut meta, now));
+        assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(has_deferred_rebalance_error(&meta.pool_stats[0]));
+    }
+
+    #[test]
     fn test_should_skip_start_rebalance_only_when_running_and_cancel_attached() {
         assert!(should_skip_start_rebalance(true, true));
         assert!(!should_skip_start_rebalance(true, false));
@@ -3447,6 +4716,47 @@ mod rebalance_unit_tests {
 
         assert_eq!(decoded.total_uncompressed, 2_097_152);
         assert_eq!(decoded.total_compressed, 2_097_152);
+    }
+
+    #[test]
+    fn test_merge_rebalance_bucket_lists_keeps_existing_order_and_skips_duplicates() {
+        let mut remote = vec!["bucket-a".to_string(), "bucket-b".to_string()];
+        let local = vec![
+            "bucket-b".to_string(),
+            "bucket-c".to_string(),
+            "bucket-c".to_string(),
+            "bucket-d".to_string(),
+        ];
+
+        super::merge_rebalance_bucket_lists(&mut remote, &local);
+
+        assert_eq!(
+            remote,
+            vec![
+                "bucket-a".to_string(),
+                "bucket-b".to_string(),
+                "bucket-c".to_string(),
+                "bucket-d".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_remove_rebalanced_buckets_from_queue_filters_membership_linearly() {
+        let mut pool_stat = RebalanceStats {
+            buckets: vec![
+                "bucket-a".to_string(),
+                "bucket-b".to_string(),
+                "bucket-c".to_string(),
+                "bucket-b".to_string(),
+            ],
+            rebalanced_buckets: vec!["bucket-b".to_string(), "bucket-d".to_string()],
+            ..Default::default()
+        };
+
+        super::remove_rebalanced_buckets_from_queue(&mut pool_stat);
+
+        assert_eq!(pool_stat.buckets, vec!["bucket-a".to_string(), "bucket-c".to_string()]);
     }
 
     #[test]
@@ -3777,6 +5087,38 @@ mod rebalance_unit_tests {
     }
 
     #[test]
+    fn test_defer_bucket_in_rebalance_queue_moves_bucket_to_back() {
+        let mut pool_stat = RebalanceStats {
+            buckets: vec!["bucket-a".to_string(), "bucket-b".to_string(), "bucket-c".to_string()],
+            rebalanced_buckets: Vec::new(),
+            ..Default::default()
+        };
+
+        defer_bucket_in_rebalance_queue(&mut pool_stat, "bucket-a").expect("queued bucket should be deferred");
+
+        assert_eq!(
+            pool_stat.buckets,
+            vec!["bucket-b".to_string(), "bucket-c".to_string(), "bucket-a".to_string()]
+        );
+        assert!(pool_stat.rebalanced_buckets.is_empty());
+    }
+
+    #[test]
+    fn test_defer_bucket_in_rebalance_queue_rejects_missing_bucket() {
+        let mut pool_stat = RebalanceStats {
+            buckets: vec!["bucket-a".to_string(), "bucket-b".to_string()],
+            rebalanced_buckets: Vec::new(),
+            ..Default::default()
+        };
+
+        let err = defer_bucket_in_rebalance_queue(&mut pool_stat, "bucket-c").expect_err("missing bucket should not be deferred");
+
+        assert!(err.to_string().contains("failed to defer rebalance bucket bucket-c"));
+        assert_eq!(pool_stat.buckets, vec!["bucket-a".to_string(), "bucket-b".to_string()]);
+        assert!(pool_stat.rebalanced_buckets.is_empty());
+    }
+
+    #[test]
     fn test_mark_rebalance_bucket_done_rejects_missing_meta() {
         let err = mark_rebalance_bucket_done(None, 0, "bucket-a").expect_err("missing meta should fail");
         assert!(
@@ -3827,6 +5169,26 @@ mod rebalance_unit_tests {
         mark_rebalance_bucket_done(Some(&mut meta), 0, "bucket-a").expect("bucket in queue should be marked done");
         assert_eq!(meta.pool_stats[0].buckets, vec!["bucket-b".to_string()]);
         assert_eq!(meta.pool_stats[0].rebalanced_buckets, vec!["bucket-a".to_string()]);
+    }
+
+    #[test]
+    fn test_mark_rebalance_bucket_done_clears_deferred_transient_error() {
+        let mut meta = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                buckets: vec!["bucket-a".to_string()],
+                info: RebalanceInfo {
+                    last_error: Some(format!("{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX} timeout")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        mark_rebalance_bucket_done(Some(&mut meta), 0, "bucket-a")
+            .expect("bucket in queue should be marked done after deferred retry succeeds");
+
+        assert!(meta.pool_stats[0].info.last_error.is_none());
     }
 
     #[test]
@@ -4107,6 +5469,30 @@ mod rebalance_unit_tests {
             + (historical.size * (historical.erasure.data_blocks + historical.erasure.parity_blocks) as i64
                 / historical.erasure.data_blocks as i64) as u64;
         assert_eq!(stat.bytes, expected_bytes);
+    }
+
+    #[test]
+    fn test_rebalance_stats_update_batch_matches_repeated_updates() {
+        let mut latest = version_normal();
+        latest.is_latest = true;
+        latest.size = 128;
+
+        let mut historical = version_normal();
+        historical.is_latest = false;
+        historical.size = 64;
+
+        let mut repeated = RebalanceStats::default();
+        repeated.update("bucket-a".to_string(), &latest);
+        repeated.update("bucket-a".to_string(), &historical);
+
+        let mut batched = RebalanceStats::default();
+        batched.update_batch("bucket-a".to_string(), &[&latest, &historical]);
+
+        assert_eq!(batched.bucket, repeated.bucket);
+        assert_eq!(batched.object, repeated.object);
+        assert_eq!(batched.num_objects, repeated.num_objects);
+        assert_eq!(batched.num_versions, repeated.num_versions);
+        assert_eq!(batched.bytes, repeated.bytes);
     }
 
     #[test]
