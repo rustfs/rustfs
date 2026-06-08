@@ -118,14 +118,88 @@ fn randomized_cycle_delay_for(interval: Duration) -> Duration {
     delay.max(Duration::from_secs(1))
 }
 
-fn initial_scanner_delay() -> Duration {
-    initial_scanner_delay_for(scanner_start_delay().map(|duration| duration.as_secs()))
-}
-
 fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
     start_delay_secs
         .map(|secs| randomized_cycle_delay_for(Duration::from_secs(secs)))
         .unwrap_or_else(randomized_cycle_delay)
+}
+
+fn initial_scanner_delay_for_startup(start_delay_secs: Option<u64>, usage_cache_is_cold: bool, has_buckets: bool) -> Duration {
+    if usage_cache_is_cold && has_buckets {
+        Duration::ZERO
+    } else {
+        initial_scanner_delay_for(start_delay_secs)
+    }
+}
+
+fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
+    info.last_update.is_none() || (info.buckets_usage.is_empty() && info.bucket_sizes.is_empty())
+}
+
+async fn read_data_usage_config_for_startup(storeapi: &Arc<ECStore>) -> Result<Option<Vec<u8>>, EcstoreError> {
+    match read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
+        Ok(data) => Ok(Some(data)),
+        Err(err) if err == EcstoreError::ConfigNotFound => {
+            let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+            match read_config(storeapi.clone(), backup_path.as_str()).await {
+                Ok(data) => Ok(Some(data)),
+                Err(err) if err == EcstoreError::ConfigNotFound => Ok(None),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn persisted_usage_cache_is_cold_for_startup(storeapi: &Arc<ECStore>) -> bool {
+    let Some(data) = (match read_data_usage_config_for_startup(storeapi).await {
+        Ok(data) => data,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to inspect persisted data usage cache; keeping configured scanner startup delay"
+            );
+            return false;
+        }
+    }) else {
+        return true;
+    };
+
+    match serde_json::from_slice::<DataUsageInfo>(&data) {
+        Ok(info) => data_usage_info_is_cold(&info),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to decode persisted data usage cache; running initial scanner cycle without startup delay"
+            );
+            true
+        }
+    }
+}
+
+async fn initial_scanner_startup_usage_state(storeapi: &Arc<ECStore>) -> (bool, bool) {
+    let has_buckets = match storeapi
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(buckets) => !buckets.is_empty(),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to inspect buckets for scanner startup delay; keeping configured scanner startup delay"
+            );
+            false
+        }
+    };
+
+    if !has_buckets {
+        return (false, false);
+    }
+
+    (persisted_usage_cache_is_cold_for_startup(storeapi).await, true)
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
@@ -139,8 +213,17 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     let ctx_clone = ctx;
     let storeapi_clone = storeapi;
     tokio::spawn(async move {
-        let sleep_time = initial_scanner_delay();
-        tokio::time::sleep(sleep_time).await;
+        let (usage_cache_is_cold, has_buckets) = initial_scanner_startup_usage_state(&storeapi_clone).await;
+        let sleep_time = initial_scanner_delay_for_startup(
+            scanner_start_delay().map(|duration| duration.as_secs()),
+            usage_cache_is_cold,
+            has_buckets,
+        );
+        if sleep_time.is_zero() {
+            info!("Skipping initial data scanner delay because persisted data usage cache is cold");
+        } else {
+            tokio::time::sleep(sleep_time).await;
+        }
 
         loop {
             if ctx_clone.is_cancelled() {
@@ -778,6 +861,29 @@ mod tests {
             assert!(delay <= Duration::from_secs(132));
         });
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
+        let delay = initial_scanner_delay_for_startup(Some(120), true, true);
+        assert_eq!(delay, Duration::ZERO);
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache() {
+        let delay = initial_scanner_delay_for_startup(Some(120), false, true);
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
+    }
+
+    #[test]
+    #[serial]
+    fn test_initial_scanner_delay_keeps_configured_delay_without_buckets() {
+        let delay = initial_scanner_delay_for_startup(Some(120), true, false);
+        assert!(delay >= Duration::from_secs(108));
+        assert!(delay <= Duration::from_secs(132));
     }
 
     #[test]
