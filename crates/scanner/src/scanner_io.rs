@@ -269,6 +269,15 @@ fn cache_root_entry_info(cache: &DataUsageCache) -> DataUsageEntryInfo {
     }
 }
 
+fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEntryInfo, update_time: SystemTime) -> bool {
+    let should_publish = cache.info.last_update.is_none() || cache.find(&result.name).is_none();
+
+    cache.replace(&result.name, &result.parent, result.entry);
+    cache.info.last_update = Some(update_time);
+
+    should_publish
+}
+
 async fn send_cache_root_entry_info(
     bucket_result_tx: &Arc<Mutex<mpsc::Sender<DataUsageEntryInfo>>>,
     cache: &DataUsageCache,
@@ -677,10 +686,19 @@ impl ScannerIOCache for SetDisks {
                     }
                     res =  bucket_result_rx.recv() => {
                         if let Some(result) = res {
-                            let mut cache = cache_mutex_clone.lock().await;
-                            cache.replace(&result.name, &result.parent, result.entry);
-                            cache.info.last_update = Some(SystemTime::now());
+                            let cache_snapshot = {
+                                let mut cache = cache_mutex_clone.lock().await;
+                                if apply_bucket_result_to_cache(&mut cache, result, SystemTime::now()) {
+                                    Some(cache.clone())
+                                } else {
+                                    None
+                                }
+                            };
 
+                            if let Some(cache_snapshot) = cache_snapshot {
+                                last_update =
+                                    persist_and_publish_cache_snapshot(store_clone.clone(), &updates, cache_snapshot).await;
+                            }
                         } else {
                             let cache_snapshot = {
                                 let mut cache = cache_mutex_clone.lock().await;
@@ -1259,5 +1277,76 @@ mod tests {
         assert_eq!(info.parent, DATA_USAGE_ROOT);
         assert_eq!(info.entry.size, 10);
         assert_eq!(info.entry.objects, 1);
+    }
+
+    #[test]
+    fn apply_bucket_result_requests_immediate_publish_for_missing_bucket() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let should_publish = apply_bucket_result_to_cache(
+            &mut cache,
+            DataUsageEntryInfo {
+                name: "bucket".to_string(),
+                parent: DATA_USAGE_ROOT.to_string(),
+                entry: DataUsageEntry {
+                    size: 10,
+                    objects: 1,
+                    ..Default::default()
+                },
+            },
+            SystemTime::now(),
+        );
+
+        assert!(should_publish);
+        assert!(cache.info.last_update.is_some());
+        let entry = cache.find("bucket").expect("bucket entry should be inserted");
+        assert_eq!(entry.size, 10);
+        assert_eq!(entry.objects, 1);
+    }
+
+    #[test]
+    fn apply_bucket_result_defers_publish_for_existing_published_bucket() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                last_update: Some(SystemTime::now()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: 5,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let should_publish = apply_bucket_result_to_cache(
+            &mut cache,
+            DataUsageEntryInfo {
+                name: "bucket".to_string(),
+                parent: DATA_USAGE_ROOT.to_string(),
+                entry: DataUsageEntry {
+                    size: 10,
+                    objects: 2,
+                    ..Default::default()
+                },
+            },
+            SystemTime::now(),
+        );
+
+        assert!(!should_publish);
+        let entry = cache.find("bucket").expect("bucket entry should remain present");
+        assert_eq!(entry.size, 10);
+        assert_eq!(entry.objects, 2);
     }
 }
