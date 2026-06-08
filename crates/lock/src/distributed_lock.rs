@@ -800,6 +800,7 @@ mod tests {
         should_warn_lock_failure,
     };
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
+    use std::assert_matches;
     use std::{
         collections::{HashMap, VecDeque},
         sync::{Arc, Mutex},
@@ -1105,7 +1106,7 @@ mod tests {
         let result = lock.acquire_guard(&request).await;
         let elapsed = started.elapsed();
 
-        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        assert_matches!(result, Ok(None));
         assert!(
             elapsed >= Duration::from_millis(250),
             "remote RPC timeouts should be retried within the caller timeout, got {elapsed:?}"
@@ -1131,7 +1132,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let result = lock.acquire_guard(&request).await;
 
-        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        assert_matches!(result, Ok(None));
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "acquire should fail this attempt before waiting for delayed impossible-quorum tasks"
@@ -1210,7 +1211,7 @@ mod tests {
 
         let result = lock.acquire_lock_quorum_with_retry(&request).await.unwrap();
 
-        assert!(matches!(result.failure_kind, Some(LockAcquireFailureKind::NonRetryable)));
+        assert_matches!(result.failure_kind, Some(LockAcquireFailureKind::NonRetryable));
         assert!(
             result
                 .response
@@ -1254,7 +1255,7 @@ mod tests {
         let result = lock.acquire_guard(&request).await;
         let elapsed = started.elapsed();
 
-        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        assert_matches!(result, Ok(None));
         assert!(
             elapsed >= Duration::from_millis(250),
             "expected at least one retry attempt for transient timeout, got {elapsed:?}"
@@ -1273,7 +1274,7 @@ mod tests {
 
         let result = lock.acquire_guard(&request).await;
 
-        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        assert_matches!(result, Ok(None));
         let seen_timeouts = seen_timeouts.lock().unwrap();
         assert!(!seen_timeouts.is_empty(), "expected lock clients to observe acquire timeouts");
         assert!(
@@ -1297,7 +1298,7 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_millis(800), lock.acquire_guard(&request)).await;
 
-        assert!(matches!(result, Ok(Ok(None))), "unexpected result: {result:?}");
+        assert_matches!(result, Ok(Ok(None)));
     }
 
     #[tokio::test]
