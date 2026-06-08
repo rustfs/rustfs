@@ -36,7 +36,7 @@ use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
-    global_internode_metrics,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
@@ -73,6 +73,9 @@ enum FailureHealthAction {
     MarkFailure,
     IgnoreFailure,
 }
+
+const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
+const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 
 async fn copy_stream_with_buffer<R, W>(reader: &mut R, writer: &mut W, buffer_size: usize) -> io::Result<u64>
 where
@@ -119,6 +122,10 @@ impl RemoteDisk {
         err_text.contains("httpreader stream error") || err_text.contains("error decoding response body")
     }
 
+    fn is_retryable_open_write_error(err: &DiskError) -> bool {
+        err.is_retryable_internode_write_failure()
+    }
+
     pub(crate) async fn new(ep: &Endpoint, opt: &DiskOption, data_transport: Arc<dyn InternodeDataTransport>) -> Result<Self> {
         let addr = if let Some(port) = ep.url.port() {
             format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), port)
@@ -154,6 +161,50 @@ impl RemoteDisk {
 
     pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
         self.health.last_capacity_snapshot()
+    }
+
+    async fn open_write_with_retry(&self, request: WriteStreamRequest) -> Result<FileWriter> {
+        let mut attempt = 1;
+        let mut last_retry_classification = None;
+        loop {
+            match self.data_transport.open_write(request.clone()).await {
+                Ok(writer) => {
+                    if attempt > 1
+                        && let Some(classification) = last_retry_classification
+                    {
+                        global_internode_metrics().record_retry_success_for_operation_and_backend(
+                            rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM,
+                            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+                            classification,
+                        );
+                    }
+                    return Ok(writer);
+                }
+                Err(err) if attempt < REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS && Self::is_retryable_open_write_error(&err) => {
+                    if let Some(classification) = err.internode_http_error_kind() {
+                        let classification = classification.metric_label();
+                        global_internode_metrics().record_retry_for_operation_and_backend(
+                            rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM,
+                            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+                            classification,
+                        );
+                        last_retry_classification = Some(classification);
+                    }
+                    debug!(
+                        endpoint = %request.endpoint,
+                        volume = %request.volume,
+                        path = %request.path,
+                        append = request.append,
+                        size = request.size,
+                        attempt,
+                        "retrying remote open_write after retryable transport error"
+                    );
+                    tokio::time::sleep(REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
@@ -1347,16 +1398,15 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
-        self.data_transport
-            .open_write(WriteStreamRequest {
-                endpoint: self.endpoint.grid_host(),
-                disk,
-                volume: volume.to_string(),
-                path: path.to_string(),
-                append: true,
-                size: 0,
-            })
-            .await
+        self.open_write_with_retry(WriteStreamRequest {
+            endpoint: self.endpoint.grid_host(),
+            disk,
+            volume: volume.to_string(),
+            path: path.to_string(),
+            append: true,
+            size: 0,
+        })
+        .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1373,16 +1423,15 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
-        self.data_transport
-            .open_write(WriteStreamRequest {
-                endpoint: self.endpoint.grid_host(),
-                disk,
-                volume: volume.to_string(),
-                path: path.to_string(),
-                append: false,
-                size: file_size,
-            })
-            .await
+        self.open_write_with_retry(WriteStreamRequest {
+            endpoint: self.endpoint.grid_host(),
+            disk,
+            volume: volume.to_string(),
+            path: path.to_string(),
+            append: false,
+            size: file_size,
+        })
+        .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1837,6 +1886,35 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    enum OpenWriteTestStep {
+        Error(DiskError),
+        Success,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RetryingOpenWriteInternodeDataTransport {
+        calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
+        steps: Arc<StdMutex<Vec<OpenWriteTestStep>>>,
+    }
+
+    impl RetryingOpenWriteInternodeDataTransport {
+        fn with_steps(steps: Vec<OpenWriteTestStep>) -> Self {
+            Self {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                steps: Arc::new(StdMutex::new(steps)),
+            }
+        }
+
+        fn calls(&self) -> Vec<RecordedTransportCall> {
+            self.calls.lock().expect("recorded transport calls lock poisoned").clone()
+        }
+
+        fn record(&self, call: RecordedTransportCall) {
+            self.calls.lock().expect("recorded transport calls lock poisoned").push(call);
+        }
+    }
+
     #[derive(Debug, Default)]
     struct EmptyTestReader;
 
@@ -1914,6 +1992,34 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "retrying-walk-dir"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for RetryingOpenWriteInternodeDataTransport {
+        async fn open_read(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            panic!("open_read should not be used in open_write retry test");
+        }
+
+        async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
+            self.record(RecordedTransportCall::Write(request));
+            let step = self.steps.lock().expect("open_write retry steps lock poisoned").remove(0);
+            match step {
+                OpenWriteTestStep::Error(err) => Err(err),
+                OpenWriteTestStep::Success => Ok(Box::new(SinkTestWriter)),
+            }
+        }
+
+        async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+            panic!("open_walk_dir should not be used in open_write retry test");
+        }
+
+        fn name(&self) -> &'static str {
+            "retrying-open-write"
         }
 
         fn capabilities(&self) -> InternodeDataTransportCapabilities {
@@ -2286,6 +2392,47 @@ mod tests {
             }
             other => panic!("expected append write transport call, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_create_file_retries_once_on_retryable_open_write_error() {
+        let transport = RetryingOpenWriteInternodeDataTransport::with_steps(vec![
+            OpenWriteTestStep::Error(DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+                rustfs_rio::InternodeHttpErrorKind::ConnectionReset,
+            ))),
+            OpenWriteTestStep::Success,
+        ]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        rustfs_io_metrics::internode_metrics::global_internode_metrics().reset_for_test();
+
+        let _created = remote_disk
+            .create_file("orig-bucket", "bucket", "object/part.1", 4096)
+            .await
+            .expect("retryable open_write error should recover");
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2, "create_file should retry exactly once");
+        let snapshot = rustfs_io_metrics::internode_metrics::global_internode_metrics().snapshot();
+        assert_eq!(snapshot.outgoing_requests_total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_append_file_does_not_retry_non_retryable_open_write_error() {
+        let transport = RetryingOpenWriteInternodeDataTransport::with_steps(vec![OpenWriteTestStep::Error(DiskError::from(
+            rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::DnsResolutionFailed),
+        ))]);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+
+        let err = match remote_disk.append_file("bucket", "object/part.2").await {
+            Ok(_) => panic!("non-retryable open_write error should be returned directly"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.internode_http_error_kind(),
+            Some(rustfs_rio::InternodeHttpErrorKind::DnsResolutionFailed)
+        );
+        assert_eq!(transport.calls().len(), 1, "append_file should not retry non-retryable errors");
     }
 
     #[tokio::test]

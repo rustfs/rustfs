@@ -57,3 +57,4 @@ rustfs-webdav.code-workspace
 # Local test/benchmark artifacts
 benchmarks.logs
 tmp/
+crates/*/docs

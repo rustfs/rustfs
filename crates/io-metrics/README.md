@@ -167,6 +167,10 @@ Operation-level metrics use the same low-cardinality label set:
 | `rustfs_system_network_internode_operation_requests_outgoing_total` | `operation`, `backend` | Outgoing request attempts for an internode operation. |
 | `rustfs_system_network_internode_operation_requests_incoming_total` | `operation`, `backend` | Incoming request attempts for an internode operation. |
 | `rustfs_system_network_internode_operation_errors_total` | `operation`, `backend` | Failed internode operation attempts. |
+| `rustfs_system_network_internode_operation_classified_errors_total` | `operation`, `backend`, `classification` | Classified internode transport failures. |
+| `rustfs_system_network_internode_operation_retries_total` | `operation`, `backend`, `classification` | Retry attempts for retryable internode transport failures. |
+| `rustfs_system_network_internode_operation_retry_successes_total` | `operation`, `backend`, `classification` | Successful recoveries after retryable internode transport failures. |
+| `rustfs_system_storage_erasure_write_quorum_failures_total` | `stage`, `dominant_error` | Erasure write quorum failures grouped by failure stage and dominant error class. |
 
 Current `operation` values are `read_file_stream`, `put_file_stream`,
 `walk_dir`, `grpc_read_all`, and `grpc_write_all`. Current `backend` values are
@@ -179,6 +183,21 @@ are represented by `rustfs_system_network_internode_operation_errors_total`;
 successful completions are not emitted as a dedicated result-labeled metric.
 Adding completion/result labels is a follow-up once stream completion semantics
 are defined consistently for request setup, body transfer, and shutdown.
+
+Current low-cardinality `classification` values come from the TCP/HTTP internode
+path and include:
+
+- `connect_timeout`
+- `connection_refused`
+- `dns_resolution_failed`
+- `connection_reset`
+- `body_stream_aborted`
+- `http_429`
+- `http_502`
+- `http_503`
+- `http_504`
+- `http_status_other`
+- `unknown`
 
 `scripts/run_internode_transport_baseline.sh --metrics-url ...` records metric
 deltas with `operation` and `backend` columns, so the TCP baseline can attribute
