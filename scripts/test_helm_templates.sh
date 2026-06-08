@@ -281,3 +281,14 @@ if [[ $low_replica_status -eq 0 ]]; then
   echo "Distributed mode with replicaCount=1 must fail rendering" >&2
   exit 1
 fi
+
+# service.externalIPs must render correctly when supplied.
+external_ips_output=$(helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key \
+  --set 'service.externalIPs[0]=203.0.113.1')
+if ! grep -A2 'externalIPs:' <<<"$external_ips_output" | grep -q '203.0.113.1'; then
+  echo "service.externalIPs must contain 203.0.113.1" >&2
+  exit 1
+fi
