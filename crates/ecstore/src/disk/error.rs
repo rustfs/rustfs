@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_rio::{InternodeHttpError, InternodeHttpErrorKind};
 use std::hash::{Hash, Hasher};
 use std::io::{self};
 use std::path::PathBuf;
@@ -181,6 +182,26 @@ impl DiskError {
         matches!(err, &DiskError::FileVersionNotFound)
     }
 
+    pub fn is_retryable_internode_write_failure(&self) -> bool {
+        match self {
+            DiskError::Io(io_error) => io_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .is_some_and(|err| err.kind().is_retryable()),
+            _ => false,
+        }
+    }
+
+    pub fn internode_http_error_kind(&self) -> Option<InternodeHttpErrorKind> {
+        match self {
+            DiskError::Io(io_error) => io_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .map(InternodeHttpError::kind),
+            _ => None,
+        }
+    }
+
     // /// If all errors are of the same fatal disk error type, returns the corresponding error.
     // /// Otherwise, returns Ok.
     // pub fn check_disk_fatal_errs(errs: &[Option<Error>]) -> Result<()> {
@@ -241,7 +262,10 @@ impl From<rustfs_filemeta::Error> for DiskError {
 
 impl From<std::io::Error> for DiskError {
     fn from(e: std::io::Error) -> Self {
-        e.downcast::<DiskError>().unwrap_or_else(DiskError::Io)
+        match e.downcast::<DiskError>() {
+            Ok(disk_error) => disk_error,
+            Err(io_error) => DiskError::Io(io_error),
+        }
     }
 }
 

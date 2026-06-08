@@ -14,6 +14,18 @@
 
 use crate::disk::error::Error;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteQuorumFailureSummary {
+    pub required: usize,
+    pub achieved: usize,
+    pub failed: usize,
+    pub total: usize,
+    pub offline_disks: usize,
+    pub ignored_failures: usize,
+    pub retryable_failures: usize,
+    pub dominant_error: Option<Error>,
+}
+
 pub static OBJECT_OP_IGNORED_ERRS: &[Error] = &[
     Error::DiskNotFound,
     Error::FaultyDisk,
@@ -77,12 +89,49 @@ pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, 
     }
 }
 
+pub fn build_write_quorum_failure_summary(
+    errors: &[Option<Error>],
+    ignored_errs: &[Error],
+    quorum: usize,
+) -> WriteQuorumFailureSummary {
+    let total = errors.len();
+    let achieved = errors.iter().filter(|err| err.is_none()).count();
+    let failed = total.saturating_sub(achieved);
+    let offline_disks = count_errs(errors, &Error::DiskNotFound);
+    let ignored_failures = errors
+        .iter()
+        .filter_map(|err| err.as_ref())
+        .filter(|err| is_ignored_err(ignored_errs, err))
+        .count();
+    let retryable_failures = count_retryable_failures(errors);
+    let (_, dominant_error) = reduce_errs(errors, ignored_errs);
+
+    WriteQuorumFailureSummary {
+        required: quorum,
+        achieved,
+        failed,
+        total,
+        offline_disks,
+        ignored_failures,
+        retryable_failures,
+        dominant_error,
+    }
+}
+
 pub fn is_ignored_err(ignored_errs: &[Error], err: &Error) -> bool {
     ignored_errs.iter().any(|e| e == err)
 }
 
 pub fn count_errs(errors: &[Option<Error>], err: &Error) -> usize {
     errors.iter().filter(|&e| e.as_ref() == Some(err)).count()
+}
+
+pub fn count_retryable_failures(errors: &[Option<Error>]) -> usize {
+    errors
+        .iter()
+        .filter_map(|err| err.as_ref())
+        .filter(|err| err.is_retryable_internode_write_failure())
+        .count()
 }
 
 pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
@@ -161,6 +210,34 @@ mod tests {
         let ignored = vec![e1.clone()];
         assert!(is_ignored_err(&ignored, &e1));
         assert!(!is_ignored_err(&ignored, &e2));
+    }
+
+    #[test]
+    fn test_build_write_quorum_failure_summary() {
+        let retryable = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::ConnectionReset,
+        ));
+        let non_retryable = err_io("other");
+        let errors = vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(retryable),
+            Some(non_retryable),
+            Some(Error::DiskNotFound),
+        ];
+
+        let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, 6);
+        assert_eq!(summary.required, 6);
+        assert_eq!(summary.achieved, 5);
+        assert_eq!(summary.failed, 3);
+        assert_eq!(summary.total, 8);
+        assert_eq!(summary.offline_disks, 1);
+        assert_eq!(summary.ignored_failures, 1);
+        assert_eq!(summary.retryable_failures, 1);
+        assert_eq!(summary.dominant_error, None);
     }
 
     #[test]
