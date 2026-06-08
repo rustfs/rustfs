@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -88,8 +88,7 @@ impl ParquetSelectTable {
     fn partitioned_file(&self) -> PartitionedFile {
         let file = PartitionedFile::new(self.object_path.clone(), self.object_size);
         if let Some(access_plan) = self.access_plan.as_ref() {
-            let extensions: Arc<dyn Any + Send + Sync> = access_plan.clone();
-            file.with_extensions(extensions)
+            file.with_extension(Arc::clone(access_plan))
         } else {
             file
         }
@@ -98,10 +97,6 @@ impl ParquetSelectTable {
 
 #[async_trait]
 impl TableProvider for ParquetSelectTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
