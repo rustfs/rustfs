@@ -3943,10 +3943,7 @@ impl HealOperations for SetDisks {
         let disks = disks.clone();
         let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
         if DiskError::is_all_not_found(&errs) {
-            warn!(
-                "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
-                bucket, object, version_id
-            );
+            debug!(bucket, object, version_id, "heal_object skipped missing object");
             let err = if !version_id.is_empty() {
                 Error::FileVersionNotFound
             } else {
