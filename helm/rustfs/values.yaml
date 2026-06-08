@@ -81,8 +81,6 @@ config:
     console_enable: "true"
     console_address: ":9001"
     region: "us-east-1"
-    obs_log_directory: "/logs" # Set to "" to disable log PVCs and mounts.
-    obs_environment: "development"
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"
