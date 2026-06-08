@@ -155,5 +155,9 @@ harness = false
 name = "rename_data_meta_benchmark"
 harness = false
 
+[[bench]]
+name = "single_block_non_inline_benchmark"
+harness = false
+
 [lib]
 doctest = false
