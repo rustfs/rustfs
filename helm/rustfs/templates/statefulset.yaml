@@ -1,5 +1,9 @@
 {{- $logDir := .Values.config.rustfs.obs_log_directory }}
 {{- $logDirEnabled := ne $logDir "" }}
+{{- $drivesPerNode := int (include "rustfs.drivesPerNode" .) -}}
+{{- if and .Values.mode.distributed.enabled (le (int .Values.replicaCount) 1) -}}
+{{- fail "Distributed mode requires replicaCount >= 2" -}}
+{{- end -}}
 
 {{- if .Values.mode.distributed.enabled }}
 ---
@@ -81,11 +85,11 @@ spec:
             - sh
             - -c
             - |
-              if [ "$REPLICA_COUNT" -eq 4 ]; then
-                for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
+              if [ "$DRIVES_PER_NODE" -gt 1 ]; then
+                for i in $(seq 0 $(($DRIVES_PER_NODE - 1))); do
                   mkdir -p /data/rustfs$i
-                done;
-              elif [ "$REPLICA_COUNT" -eq 16 ]; then
+                done
+              else
                 mkdir -p /data
               fi
               {{- if $logDirEnabled }}
@@ -204,8 +208,11 @@ spec:
         name: logs
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}
+        {{- $logAnn := .Values.storageclass.pvcAnnotations.logs | default (dict) -}}
+        {{- if gt (len $logAnn) 0 }}
         annotations:
-          {{- toYaml (.Values.storageclass.pvcAnnotations.logs | default (dict)) | nindent 10 }}
+          {{- toYaml $logAnn | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ .Values.storageclass.name }}
@@ -221,8 +228,11 @@ spec:
         name: data-rustfs-{{ $i }}
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
+        {{- $dataAnn := $.Values.storageclass.pvcAnnotations.data | default (dict) -}}
+        {{- if gt (len $dataAnn) 0 }}
         annotations:
-          {{- toYaml ($.Values.storageclass.pvcAnnotations.data | default (dict)) | nindent 10 }}
+          {{- toYaml $dataAnn | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $.Values.storageclass.name }}
@@ -237,8 +247,11 @@ spec:
         name: data
         labels:
           {{- toYaml .Values.commonLabels | nindent 10 }}
+        {{- $dataAnn := .Values.storageclass.pvcAnnotations.data | default (dict) -}}
+        {{- if gt (len $dataAnn) 0 }}
         annotations:
-          {{- toYaml (.Values.storageclass.pvcAnnotations.data | default (dict)) | nindent 10 }}
+          {{- toYaml $dataAnn | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ .Values.storageclass.name }}

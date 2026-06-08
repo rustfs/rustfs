@@ -225,3 +225,59 @@ assert_extra_volumes_wired "$distributed_extra_output" "distributed StatefulSet"
 # Empty extraVolumes must not inject ca-bundle into distributed StatefulSet volumes.
 distributed_default_output=$(render_distributed_statefulset)
 assert_extra_volumes_absent "$distributed_default_output" "distributed StatefulSet"
+
+# Legacy topology compatibility: default replicaCount=4 (no drivesPerNode set)
+# must render the old 4x4 PVC names (data-rustfs-0 .. data-rustfs-3).
+legacy_four_by_four=$(render_distributed_statefulset)
+for i in 0 1 2 3; do
+  if ! grep -q "name: data-rustfs-${i}" <<<"$legacy_four_by_four"; then
+    echo "Legacy 4x4 topology must contain PVC data-rustfs-${i}" >&2
+    exit 1
+  fi
+done
+if grep -q "name: data$" <<<"$legacy_four_by_four"; then
+  echo "Legacy 4x4 topology must NOT contain a single 'data' PVC" >&2
+  exit 1
+fi
+
+# Legacy topology compatibility: replicaCount=16 (no drivesPerNode set)
+# must render a single 'data' PVC (old 16x1 behaviour).
+legacy_sixteen_by_one=$(render_distributed_statefulset --set replicaCount=16)
+if ! grep -q "name: data$" <<<"$legacy_sixteen_by_one"; then
+  echo "Legacy 16x1 topology must contain a single 'data' PVC" >&2
+  exit 1
+fi
+if grep -q "name: data-rustfs-" <<<"$legacy_sixteen_by_one"; then
+  echo "Legacy 16x1 topology must NOT contain data-rustfs-* PVCs" >&2
+  exit 1
+fi
+
+# Generic topology: explicit replicaCount=8 drivesPerNode=2 must render
+# exactly two PVCs per pod.
+generic_eight_by_two=$(render_distributed_statefulset --set replicaCount=8 --set drivesPerNode=2)
+for i in 0 1; do
+  if ! grep -q "name: data-rustfs-${i}" <<<"$generic_eight_by_two"; then
+    echo "Generic 8x2 topology must contain PVC data-rustfs-${i}" >&2
+    exit 1
+  fi
+done
+if grep -q "name: data$" <<<"$generic_eight_by_two"; then
+  echo "Generic 8x2 topology must NOT contain a single 'data' PVC" >&2
+  exit 1
+fi
+
+# volumeClaimTemplates must not contain empty annotations when pvcAnnotations are unset,
+# because Kubernetes treats annotations: {} as a mutation of the immutable field.
+no_ann_output=$(render_distributed_statefulset)
+if grep -A1 'kind: PersistentVolumeClaim' <<<"$no_ann_output" | grep -q 'annotations:'; then
+  echo "Empty pvcAnnotations must not render an annotations key in volumeClaimTemplates" >&2
+  exit 1
+fi
+
+# Distributed mode with replicaCount < 2 must fail rendering.
+low_replica_status=0
+render_distributed_statefulset --set replicaCount=1 >/dev/null 2>&1 || low_replica_status=$?
+if [[ $low_replica_status -eq 0 ]]; then
+  echo "Distributed mode with replicaCount=1 must fail rendering" >&2
+  exit 1
+fi

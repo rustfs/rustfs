@@ -173,16 +173,35 @@ Merges (in order of increasing precedence):
 {{- end }}
 
 {{/*
+Resolve drivesPerNode with backward-compatible inference.
+Returns an integer.
+*/}}
+{{- define "rustfs.drivesPerNode" -}}
+{{- $drives := .Values.drivesPerNode -}}
+{{- if or (kindIs "string" $drives) (kindIs "float64" $drives) (kindIs "int64" $drives) -}}
+  {{- $drives = int $drives -}}
+{{- end -}}
+{{- if not (kindIs "int" $drives) -}}
+  {{- if eq (int .Values.replicaCount) 4 -}}
+    {{- $drives = 4 -}}
+  {{- else -}}
+    {{- $drives = 1 -}}
+  {{- end -}}
+{{- end -}}
+{{- if lt $drives 1 -}}
+{{- fail "drivesPerNode must be an integer >= 1" -}}
+{{- end -}}
+{{- $drives -}}
+{{- end -}}
+
+{{/*
 Render RUSTFS_VOLUMES
 */}}
 {{- define "rustfs.volumes" -}}
 {{- $replicas := int .Values.replicaCount -}}
-{{- $drives := int .Values.drivesPerNode -}}
+{{- $drives := int (include "rustfs.drivesPerNode" .) -}}
 {{- if lt $replicas 1 -}}
 {{- fail "rustfs.volumes requires .Values.replicaCount to be >= 1" -}}
-{{- end -}}
-{{- if lt $drives 1 -}}
-{{- fail "rustfs.volumes requires .Values.drivesPerNode to be >= 1" -}}
 {{- end -}}
 
 {{- $protocol := "http" -}}
