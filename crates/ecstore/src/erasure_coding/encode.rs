@@ -234,14 +234,27 @@ impl Erasure {
         use tokio::io::AsyncReadExt;
 
         let mut buf = Vec::with_capacity(self.block_size);
-        let total = reader.read_to_end(&mut buf).await?;
+        let total = if require_single_block {
+            let read_limit = self
+                .block_size
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "erasure block_size is too large"))?;
+            let read_limit = u64::try_from(read_limit)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "erasure block_size exceeds u64"))?;
+            (&mut reader).take(read_limit).read_to_end(&mut buf).await?
+        } else {
+            reader.read_to_end(&mut buf).await?
+        };
 
         if total == 0 {
             return Ok((reader, 0));
         }
 
-        if require_single_block {
-            debug_assert!(total <= self.block_size, "single-block non-inline fast path expects total <= block_size");
+        if require_single_block && total > self.block_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "single-block non-inline fast path expects total <= block_size",
+            ));
         }
 
         let shards = self.encode_data(&buf)?;
@@ -574,6 +587,41 @@ mod tests {
         assert_eq!(total, payload.len());
         for (i, c) in committed.iter().enumerate() {
             assert!(!c.lock().unwrap().is_empty(), "shard {i} should have received data");
+        }
+    }
+
+    #[tokio::test]
+    async fn encode_single_block_non_inline_rejects_multi_block_payload() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
+            .iter()
+            .map(|c| {
+                Some(BitrotWriterWrapper::new(
+                    CustomWriter::new_tokio_writer(DeferredCommitWriter::new(c.clone())),
+                    BLOCK_SIZE / DATA_SHARDS,
+                    HashAlgorithm::HighwayHash256S,
+                ))
+            })
+            .collect();
+
+        let payload = vec![1u8; BLOCK_SIZE + 1];
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(payload));
+        let err = erasure
+            .encode_single_block_non_inline(reader, &mut writers, DATA_SHARDS)
+            .await
+            .expect_err("single-block fast path must reject oversized readers");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("single-block non-inline fast path"));
+        for c in committed {
+            assert!(c.lock().unwrap().is_empty());
         }
     }
 

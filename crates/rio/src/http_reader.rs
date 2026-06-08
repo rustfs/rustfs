@@ -77,7 +77,7 @@ impl InternodeHttpErrorKind {
         match self {
             Self::ConnectTimeout => io::ErrorKind::TimedOut,
             Self::ConnectionRefused => io::ErrorKind::ConnectionRefused,
-            Self::DnsResolutionFailed => io::ErrorKind::NotFound,
+            Self::DnsResolutionFailed => io::ErrorKind::AddrNotAvailable,
             Self::ConnectionReset => io::ErrorKind::ConnectionReset,
             Self::BodyStreamAborted => io::ErrorKind::BrokenPipe,
             Self::HttpStatus(_) | Self::Unknown => io::ErrorKind::Other,
@@ -145,7 +145,7 @@ impl std::fmt::Display for InternodeHttpRequestContext {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("{kind}")]
+#[error("{kind}: {context}")]
 pub struct InternodeHttpError {
     kind: InternodeHttpErrorKind,
     context: InternodeHttpRequestContext,
@@ -396,6 +396,16 @@ fn internode_reqwest_error(method: &Method, url: &str, operation: Option<&'stati
     let context = internode_request_context(method, url, operation);
     let classified = classify_reqwest_error(&err);
     InternodeHttpError::with_source(classified, context, err).into_io_error()
+}
+
+fn internode_classified_error(
+    method: &Method,
+    url: &str,
+    operation: Option<&'static str>,
+    kind: InternodeHttpErrorKind,
+) -> io::Error {
+    let context = internode_request_context(method, url, operation);
+    InternodeHttpError::new(kind, context).into_io_error()
 }
 
 fn internode_status_error(method: &Method, url: &str, operation: Option<&'static str>, status: reqwest::StatusCode) -> io::Error {
@@ -658,16 +668,18 @@ impl HttpWriter {
                             internode_operation,
                             classify_http_status(resp.status()),
                         );
-                        let io_err = internode_status_error(&method_clone, &url_clone, internode_operation, resp.status());
-                        let _ = err_tx.send(Error::new(io_err.kind(), io_err.to_string()));
+                        let status = resp.status();
+                        let io_err = internode_status_error(&method_clone, &url_clone, internode_operation, status);
+                        let _ = err_tx.send(internode_status_error(&method_clone, &url_clone, internode_operation, status));
                         return Err(io_err);
                     }
                 }
                 Err(e) => {
                     record_internode_error(track_internode_metrics, internode_operation);
-                    record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
+                    let classified = classify_reqwest_error(&e);
+                    record_internode_classified_error(track_internode_metrics, internode_operation, classified);
+                    let _ = err_tx.send(internode_classified_error(&method_clone, &url_clone, internode_operation, classified));
                     let io_err = internode_reqwest_error(&method_clone, &url_clone, internode_operation, e);
-                    let _ = err_tx.send(Error::new(io_err.kind(), io_err.to_string()));
                     return Err(io_err);
                 }
             }
@@ -1165,6 +1177,41 @@ mod tests {
         assert!(unavailable.is_retryable());
         assert!(bad_gateway.is_retryable());
         assert!(!bad_request.is_retryable());
+    }
+
+    #[test]
+    fn dns_resolution_error_uses_network_io_kind() {
+        let err = internode_classified_error(
+            &Method::GET,
+            "http://missing.invalid/rustfs/rpc/read_file_stream",
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+            InternodeHttpErrorKind::DnsResolutionFailed,
+        );
+
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+        assert!(err.to_string().contains("internode dns resolution failed"));
+        assert!(err.to_string().contains("GET /rustfs/rpc/read_file_stream"));
+    }
+
+    #[test]
+    fn internode_status_error_preserves_classification_source_and_context() {
+        let err = internode_status_error(
+            &Method::PUT,
+            "http://node:9000/rustfs/rpc/put_file_stream?disk=disk-a",
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        );
+
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("expected status error to carry InternodeHttpError source");
+        assert_eq!(
+            source.kind(),
+            InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(source.context().method(), "PUT");
+        assert!(source.context().target().contains(PUT_FILE_STREAM_PATH));
     }
 
     #[test]

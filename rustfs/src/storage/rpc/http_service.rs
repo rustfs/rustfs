@@ -280,18 +280,30 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
     let mut file = if query.append {
         match disk.append_file(&query.volume, &query.path).await {
             Ok(file) => file,
-            Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("append file err {e}")),
+            Err(e) => {
+                let message = put_file_stage_error_message("append", &query, &e);
+                warn!("{message}");
+                return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+            }
         }
     } else {
         match disk.create_file("", &query.volume, &query.path, query.size).await {
             Ok(file) => file,
-            Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("create file err {e}")),
+            Err(e) => {
+                let message = put_file_stage_error_message("create", &query, &e);
+                warn!("{message}");
+                return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+            }
         }
     };
 
     let copied = match write_body_chunks_to_writer(req.into_body().into_data_stream(), &mut file).await {
         Ok(copied) => copied,
-        Err(e) => return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}")),
+        Err(e) => {
+            let message = put_file_stage_error_message("write_body", &query, &e);
+            warn!("{message}");
+            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+        }
     };
 
     global_internode_metrics().record_incoming_request_for_operation_and_backend(
@@ -305,7 +317,9 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
     );
 
     if let Err(e) = file.flush().await {
-        return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, format!("write file err {e}"));
+        let message = put_file_stage_error_message("flush", &query, &e);
+        warn!("{message}");
+        return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
 
     empty_ok()
@@ -364,6 +378,13 @@ fn response_with_status(status: StatusCode, message: impl Into<String>) -> Respo
         .expect("failed to build rpc error response")
 }
 
+fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std::fmt::Display) -> String {
+    format!(
+        "{stage} file err {err} [disk={}, volume={}, path={}, append={}, size={}]",
+        query.disk, query.volume, query.path, query.append, query.size
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +423,25 @@ mod tests {
         let headers = HeaderMap::new();
         let response = verify_internode_rpc_signature(&uri, &Method::GET, &headers).expect_err("response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn put_file_stage_error_message_includes_stage_and_request_context() {
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: ".rustfs.sys/tmp".to_string(),
+            path: "tmp/object/part.1".to_string(),
+            append: false,
+            size: 1024,
+        };
+
+        let msg = put_file_stage_error_message("write_body", &query, &"connection reset");
+        assert!(msg.contains("write_body"));
+        assert!(msg.contains("disk=disk-a"));
+        assert!(msg.contains("volume=.rustfs.sys/tmp"));
+        assert!(msg.contains("path=tmp/object/part.1"));
+        assert!(msg.contains("append=false"));
+        assert!(msg.contains("size=1024"));
     }
 
     #[tokio::test]

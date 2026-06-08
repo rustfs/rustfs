@@ -111,7 +111,7 @@ fn bench_single_block_non_inline_fast_path(c: &mut Criterion) {
                 rt.block_on(async {
                     erasure
                         .clone()
-                        .encode_inline_small(reader, &mut writers, config.data_shards)
+                        .encode_single_block_non_inline(reader, &mut writers, config.data_shards)
                         .await
                         .expect("single block candidate benchmark");
                 });
