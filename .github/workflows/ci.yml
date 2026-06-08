@@ -54,7 +54,7 @@ on:
       - ".github/workflows/audit.yml"
       - ".github/workflows/performance.yml"
   merge_group:
-    types: [checks_requested]
+    types: [ checks_requested ]
   schedule:
     - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
   workflow_dispatch:
@@ -98,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@stable
       - name: Typos check with custom config file
         uses: crate-ci/typos@master
 
@@ -117,7 +117,7 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          rust-version: 1.96.0
+          rust-version: stable
           cache-shared-key: ci-test-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -157,7 +157,7 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          rust-version: 1.96.0
+          rust-version: stable
           cache-shared-key: ci-test-rio-v2-${{ hashFiles('**/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -185,7 +185,7 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          rust-version: 1.96.0
+          rust-version: stable
           cache-shared-key: ci-rustfs-debug-binary-${{ hashFiles('**/Cargo.lock') }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -218,7 +218,7 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          rust-version: 1.96.0
+          rust-version: stable
           cache-shared-key: ci-rustfs-debug-binary-rio-v2-${{ hashFiles('**/Cargo.lock') }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -256,7 +256,7 @@ jobs:
         run: chmod +x ./target/debug/rustfs
 
       - name: Setup Rust toolchain for s3s-e2e installation
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@v2
@@ -308,7 +308,7 @@ jobs:
         run: chmod +x ./target/debug/rustfs
 
       - name: Setup Rust toolchain for s3s-e2e installation
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@v2
