@@ -243,7 +243,7 @@ impl ECStore {
                 required,
                 achieved,
             },
-            other => StorageError::other(format!("Failed to acquire {mode} lock on {bucket}/{object}: {other}")),
+            other => StorageError::Lock(other),
         }
     }
 
