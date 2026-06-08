@@ -21,8 +21,10 @@ const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
 const ADD_USER_TO_GROUP: AdminActionRef = AdminActionRef::new("AddUserToGroupAdminAction");
 const ATTACH_POLICY: AdminActionRef = AdminActionRef::new("AttachPolicyAdminAction");
 const CONFIG_UPDATE: AdminActionRef = AdminActionRef::new("ConfigUpdateAdminAction");
+const COMMIT_TABLE: AdminActionRef = AdminActionRef::new("CommitTableAction");
 const CREATE_POLICY: AdminActionRef = AdminActionRef::new("CreatePolicyAdminAction");
 const CREATE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("CreateServiceAccountAdminAction");
+const CREATE_TABLE: AdminActionRef = AdminActionRef::new("CreateTableAction");
 const DECOMMISSION: AdminActionRef = AdminActionRef::new("DecommissionAdminAction");
 const DELETE_POLICY: AdminActionRef = AdminActionRef::new("DeletePolicyAdminAction");
 const DELETE_TABLE: AdminActionRef = AdminActionRef::new("DeleteTableAction");
@@ -599,7 +601,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Post,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables",
-        SET_TABLE,
+        CREATE_TABLE,
         RouteRiskLevel::High,
     ),
     admin(
@@ -617,7 +619,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Post,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
-        SET_TABLE,
+        COMMIT_TABLE,
         RouteRiskLevel::High,
     ),
     admin(
@@ -801,6 +803,12 @@ mod tests {
             .filter(|spec| spec.path().starts_with("/iceberg/v1"));
         assert_eq!(table_specs.count(), 11);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+            COMMIT_TABLE,
+        );
     }
 
     #[test]
