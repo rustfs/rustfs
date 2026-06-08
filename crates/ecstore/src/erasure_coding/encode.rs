@@ -257,7 +257,7 @@ impl Erasure {
             ));
         }
 
-        let shards = self.encode_data(&buf)?;
+        let shards = self.encode_data_owned(buf)?;
         let mut mw = MultiWriter::new(writers, quorum);
         mw.write(shards).await?;
         mw.shutdown().await?;
