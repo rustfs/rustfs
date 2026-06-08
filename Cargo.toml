@@ -123,7 +123,7 @@ mysql_async = { version = "0.37", default-features = false, features = ["default
 async-compression = { version = "0.4.42" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
-async-nats = "0.49.0"
+async-nats = "0.49.1"
 axum = "0.8.9"
 futures = "0.3.32"
 futures-core = "0.3.32"
@@ -157,7 +157,7 @@ bytesize = "2.3.1"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
-prost = "0.14.3"
+prost = "0.14.4"
 quick-xml = "0.40.1"
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
@@ -185,7 +185,7 @@ subtle = "2.6"
 zeroize = { version = "1.8.2", features = ["derive"] }
 
 # Time and Date
-chrono = { version = "0.4.44", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 humantime = "2.3.0"
 jiff = { version = "0.2.28", features = ["serde"] }
 time = { version = "0.3.47", features = ["std", "parsing", "formatting", "macros", "serde"] }
@@ -199,7 +199,7 @@ tokio-postgres-rustls = "0.14.0"
 anyhow = "1.0.102"
 arc-swap = "1.9.1"
 astral-tokio-tar = "0.6.2"
-atoi = "2.0.0"
+atoi = "3.0.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.8.18" }
 aws-credential-types = { version = "1.2.14" }
@@ -223,8 +223,8 @@ enumset = "1.1.13"
 faster-hex = "0.10.0"
 flate2 = "1.1.9"
 glob = "0.3.3"
-google-cloud-storage = "1.12.0"
-google-cloud-auth = "1.10.0"
+google-cloud-storage = "1.14.0"
+google-cloud-auth = "1.12.0"
 hashbrown = { version = "0.17.1", features = ["serde", "rayon"] }
 hex = "0.4.3"
 hex-simd = "0.8.0"
@@ -310,7 +310,7 @@ libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
 suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
-russh = { version = "0.61.1",features = ["serde"] }
+russh = { version = "0.61.2",features = ["serde"] }
 russh-sftp = "2.3.0"
 
 # WebDAV
