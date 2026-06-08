@@ -3,15 +3,24 @@
 # Declare variables to be passed into your templates.
 
 # Number of StatefulSet pods (nodes in the distributed cluster).
+# In distributed mode this must be >= 2 (RustFS requires at least two nodes
+# for an erasure-coded cluster).
 replicaCount: 4
 
 # Number of data drives (PVCs) per pod. Combined with replicaCount this
 # determines the total drive count seen by rustfs.
 # - drivesPerNode > 1: each pod gets N volumes mounted at /data/rustfs0.../data/rustfsN-1
 # - drivesPerNode = 1: each pod gets a single volume mounted at /data
-# Upgrade note: deployments that previously used replicaCount=16 for one drive
-# per pod should now set replicaCount=16 and drivesPerNode=1 explicitly.
-drivesPerNode: 4
+#
+# When left unset (null) the chart infers a backward-compatible value:
+#   replicaCount = 4  -> drivesPerNode = 4  (legacy default)
+#   replicaCount != 4 -> drivesPerNode = 1  (legacy 16x1 and any other topology)
+#
+# WARNING: changing drivesPerNode on an existing StatefulSet is not allowed
+# because Kubernetes forbids updates to volumeClaimTemplates. To change the
+# drive count you must delete the StatefulSet (with --cascade=orphan to keep
+# pods/PVCs) and recreate it, or perform a full reinstall.
+drivesPerNode: null
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:

@@ -238,12 +238,9 @@ RUSTFS_VOLUMES on spaces, one pool per expression).
 */}}
 {{- define "rustfs.volumes" -}}
 {{- $replicas := int .Values.replicaCount -}}
-{{- $drives := int .Values.drivesPerNode -}}
+{{- $drives := int (include "rustfs.drivesPerNode" .) -}}
 {{- if lt $replicas 1 -}}
 {{- fail "rustfs.volumes requires .Values.replicaCount to be >= 1" -}}
-{{- end -}}
-{{- if lt $drives 1 -}}
-{{- fail "rustfs.volumes requires .Values.drivesPerNode to be >= 1" -}}
 {{- end -}}
 
 {{- $protocol := "http" -}}
