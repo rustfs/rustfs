@@ -139,11 +139,11 @@ fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
 async fn read_data_usage_config_for_startup(storeapi: &Arc<ECStore>) -> Result<Option<Vec<u8>>, EcstoreError> {
     match read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
         Ok(data) => Ok(Some(data)),
-        Err(err) if err == EcstoreError::ConfigNotFound => {
+        Err(EcstoreError::ConfigNotFound) => {
             let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
             match read_config(storeapi.clone(), backup_path.as_str()).await {
                 Ok(data) => Ok(Some(data)),
-                Err(err) if err == EcstoreError::ConfigNotFound => Ok(None),
+                Err(EcstoreError::ConfigNotFound) => Ok(None),
                 Err(err) => Err(err),
             }
         }
