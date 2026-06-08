@@ -20,6 +20,10 @@ use rustfs_config::{ENV_TEST_IAM_FAIL_INIT_ATTEMPTS, ENV_TEST_IAM_RETRY_INTERVAL
 use std::time::Duration;
 use temp_env::async_with_vars;
 
+fn response_preview(body: &str) -> String {
+    body.chars().take(512).collect()
+}
+
 fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
     let creds = Credentials::new(access_key, secret_key, None, None, "test");
     let config = Config::builder()
@@ -51,7 +55,10 @@ async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
                 .expect("start embedded server with deferred IAM bootstrap");
 
             let endpoint = server.endpoint();
-            let http = reqwest::Client::new();
+            let http = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build local readiness client without proxy");
             let ready_url = format!("{endpoint}/health/ready");
 
             let initial_ready = http
@@ -59,8 +66,19 @@ async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
                 .send()
                 .await
                 .expect("readiness probe should respond during deferred bootstrap");
-            assert_eq!(initial_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let initial_status = initial_ready.status();
+            let initial_body = initial_ready
+                .text()
+                .await
+                .expect("readiness response body should be readable");
+            assert_eq!(
+                initial_status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "initial readiness response body: {}",
+                response_preview(&initial_body)
+            );
 
+            let mut last_ready_response = None;
             let recovered = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -69,14 +87,24 @@ async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
                         .send()
                         .await
                         .expect("readiness probe should keep responding");
-                    if response.status() == StatusCode::OK {
+                    let status = response.status();
+                    if status == StatusCode::OK {
                         return true;
                     }
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|err| format!("failed to read body: {err}"));
+                    last_ready_response = Some((status, response_preview(&body)));
                 }
             })
             .await
             .unwrap_or(false);
-            assert!(recovered, "readiness should recover after deferred IAM bootstrap succeeds");
+            assert!(
+                recovered,
+                "readiness should recover after deferred IAM bootstrap succeeds; last response: {:?}",
+                last_ready_response
+            );
 
             let client = s3_client(&endpoint, server.access_key(), server.secret_key());
             client

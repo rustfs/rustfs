@@ -1171,7 +1171,7 @@ impl ObjectIO for SetDisks {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
 
-            let (online_disks, _, op_old_dir) = Self::rename_data(
+            let (online_disks, _, op_old_dir, cleanup_disks) = Self::rename_data(
                 &shuffle_disks,
                 RUSTFS_META_TMP_BUCKET,
                 tmp_dir.as_str(),
@@ -1183,7 +1183,7 @@ impl ObjectIO for SetDisks {
             .await?;
 
             if let Some(old_dir) = op_old_dir {
-                self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
+                self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                     .await?;
             }
 
@@ -1635,10 +1635,17 @@ impl ObjectOperations for SetDisks {
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        // FIXME: TODO:
-
         if !src_info.metadata_only {
-            return Err(StorageError::NotImplemented);
+            if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object]) {
+                return Err(StorageError::NotImplemented);
+            }
+            // Self-copy with a data reader: write tier data back locally (de-tiering).
+            // Handles `mc cp --storage-class STANDARD obj obj` on a transitioned object.
+            if let Some(mut put_reader) = src_info.put_object_reader.take() {
+                return self.put_object(dst_bucket, dst_object, &mut put_reader, dst_opts).await;
+            }
+            // Same-key tiered copy without a pre-fetched reader: fall through to the metadata
+            // path so the caller gets a disk/quorum error rather than NotImplemented.
         }
 
         if path_join_buf(&[src_bucket, src_object]) != path_join_buf(&[dst_bucket, dst_object]) {
@@ -3840,7 +3847,7 @@ impl MultipartOperations for SetDisks {
 
         self.cleanup_multipart_path(&parts).await;
 
-        let (online_disks, versions, op_old_dir) = Self::rename_data(
+        let (online_disks, versions, op_old_dir, cleanup_disks) = Self::rename_data(
             &shuffle_disks,
             RUSTFS_META_MULTIPART_BUCKET,
             &upload_id_path,
@@ -3852,7 +3859,7 @@ impl MultipartOperations for SetDisks {
         .await?;
 
         if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&online_disks, bucket, object, &old_dir.to_string(), write_quorum)
+            self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
         }
 
@@ -4727,6 +4734,7 @@ pub fn is_infrequent_access_class(storage_class: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -6267,6 +6275,10 @@ mod tests {
         let data_dirs = vec![Some(uuid1), Some(uuid2), None];
         let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
         assert_eq!(result, None); // No UUID meets quorum of 2
+
+        let data_dirs = vec![Some(uuid1), Some(uuid1), None, None];
+        let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
+        assert_eq!(result, Some(uuid1)); // Ignore None votes; uuid1 should still meet quorum
     }
 
     #[test]
@@ -6730,5 +6742,60 @@ mod tests {
         assert!(!is_infrequent_access_class(storageclass::RRS));
         assert!(!is_infrequent_access_class(storageclass::DEEP_ARCHIVE));
         assert!(!is_infrequent_access_class(storageclass::EXPRESS_ONEZONE));
+    }
+
+    // Regression test: `mc cp --storage-class STANDARD` on a tiered object (self-copy) must not
+    // return NotImplemented.  When the source object is tiered (transitioned_object.tier is
+    // non-empty) the usecase layer in object_usecase.rs intentionally leaves metadata_only=false
+    // so that the full copy path is taken.  SetDisks::copy_object must therefore accept a
+    // same-bucket/same-key call even when metadata_only=false.
+    //
+    // Currently this test FAILS because the guard at set_disk.rs:1579 unconditionally rejects
+    // !metadata_only with StorageError::NotImplemented.  Once the fix is applied the test will
+    // pass (or progress further through the copy path before failing on missing disk data).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn copy_object_tiered_self_copy_does_not_return_not_implemented() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let set_disks = make_test_set_disks(vec![Arc::new(LocalClient::with_manager(Arc::new(
+            rustfs_lock::GlobalLockManager::new(),
+        )))])
+        .await;
+
+        // Simulate a tiered object: metadata_only is false (set_disk must handle the full copy),
+        // and transitioned_object.tier is non-empty (the object lives on a remote tier).
+        let mut src_info = ObjectInfo {
+            metadata_only: false,
+            transitioned_object: TransitionedObject {
+                tier: "NEXTCLOUD".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = set_disks
+            .copy_object(
+                "bucket",
+                "object",
+                "bucket",
+                "object",
+                &mut src_info,
+                &ObjectOptions::default(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // The copy must not be rejected with NotImplemented.  Any other outcome (Ok or a
+        // different error such as missing-disk / quorum) is acceptable here.
+        if let Err(ref err) = result {
+            assert!(
+                !matches!(err, StorageError::NotImplemented),
+                "tiered self-copy returned NotImplemented — copy_object must handle \
+                 metadata_only=false for same-key copies of tiered objects, got: {err}"
+            );
+        }
     }
 }

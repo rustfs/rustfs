@@ -19,6 +19,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
 };
+use crate::bucket::metadata_sys::get_global_bucket_metadata_sys;
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::check_abort_multipart_args;
 use crate::bucket::utils::check_complete_multipart_args;
@@ -33,6 +34,7 @@ use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::config::storageclass;
+use crate::config::{get_global_server_config, get_global_storage_class};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -44,7 +46,8 @@ use crate::event_notification::EventNotifier;
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
     GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives, get_global_deployment_id, get_global_endpoints,
-    init_global_bucket_monitor, is_erasure_sd, set_global_deployment_id, set_object_layer,
+    get_global_region, get_global_tier_config_mgr, init_global_bucket_monitor, is_erasure_sd, set_global_deployment_id,
+    set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -73,7 +76,7 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
-use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -228,6 +231,66 @@ impl ECStore {
     /// Set storage class configuration (delegates to global)
     pub fn set_storage_class(&self, cfg: crate::config::storageclass::Config) {
         crate::config::set_global_storage_class(cfg);
+    }
+}
+
+/// Phase 3: Accessor methods for service globals
+/// These provide a unified API through ECStore for accessing cross-cutting
+/// service singletons. The globals remain the source of truth.
+impl ECStore {
+    /// Get the notification system
+    pub fn notification_system(&self) -> Option<&'static crate::notification_sys::NotificationSys> {
+        get_global_notification_sys()
+    }
+
+    /// Get the bucket metadata system
+    pub fn bucket_metadata_sys(&self) -> Option<Arc<tokio::sync::RwLock<crate::bucket::metadata_sys::BucketMetadataSys>>> {
+        get_global_bucket_metadata_sys()
+    }
+
+    /// Get the global endpoints
+    pub fn endpoints(&self) -> EndpointServerPools {
+        get_global_endpoints()
+    }
+
+    /// Get the global region
+    pub fn region(&self) -> Option<s3s::region::Region> {
+        get_global_region()
+    }
+
+    /// Get the tier config manager
+    pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::tier::tier::TierConfigMgr>> {
+        get_global_tier_config_mgr()
+    }
+
+    /// Get the server configuration
+    pub fn server_config(&self) -> Option<crate::config::Config> {
+        get_global_server_config()
+    }
+
+    /// Get the storage class configuration
+    pub fn storage_class(&self) -> Option<crate::config::storageclass::Config> {
+        get_global_storage_class()
+    }
+}
+
+/// Phase 4: Server address accessors
+/// These provide a unified API through ECStore for accessing server-level
+/// configuration globals. The globals remain the source of truth.
+impl ECStore {
+    /// Get the server port
+    pub fn port(&self) -> u16 {
+        crate::global::global_rustfs_port()
+    }
+
+    /// Get the server host
+    pub async fn host(&self) -> String {
+        GLOBAL_RUSTFS_HOST.read().await.clone()
+    }
+
+    /// Get the server address (host:port)
+    pub async fn addr(&self) -> String {
+        GLOBAL_RUSTFS_ADDR.read().await.clone()
     }
 }
 

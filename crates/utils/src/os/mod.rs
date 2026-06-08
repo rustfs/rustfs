@@ -30,7 +30,9 @@ pub use linux::{check_cross_device_mounts, get_drive_stats, get_info, get_physic
 pub use unix::{check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, same_disk};
 
 #[cfg(target_os = "windows")]
-pub use windows::{check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, same_disk};
+pub use windows::{
+    check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, get_volume_serial_number, same_disk,
+};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct IOStats {
