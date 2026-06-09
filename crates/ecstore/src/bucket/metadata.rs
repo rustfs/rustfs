@@ -30,6 +30,7 @@ use s3s::dto::{
     ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use serde::Serializer;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -246,6 +247,28 @@ pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
 pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
+pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
+pub const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str = "table-buckets";
+
+pub fn table_catalog_path_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+pub fn table_bucket_catalog_metadata_prefix(bucket: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        BUCKET_TABLE_CATALOG_META_PREFIX,
+        BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX,
+        table_catalog_path_hash(bucket)
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct BucketMetadata {

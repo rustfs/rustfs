@@ -28,16 +28,19 @@ use std::{
 
 use http::HeaderMap;
 use rustfs_ecstore::bucket::{
-    metadata::{BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX},
+    metadata::{
+        BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
+        BUCKET_TABLE_RESERVED_PREFIX, table_catalog_path_hash,
+    },
     metadata_sys,
 };
+use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::{
     set_disk::get_lock_acquire_timeout,
     store_api::{HTTPPreconditions, ObjectOptions, PutObjReader, StorageAPI},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
@@ -61,10 +64,11 @@ const TABLE_MARKER_FILE: &str = "table.json";
 const CURRENT_POINTER_FILE: &str = "current.json";
 const LIFECYCLE_FILE: &str = "lifecycle.json";
 const METADATA_DIR: &str = "metadata";
-const CATALOG_ROOT: &str = "catalog";
 const TABLE_BUCKET_ENTRY_FILE: &str = "table-bucket.json";
 const NAMESPACE_ENTRY_FILE: &str = "namespace-entry.json";
 const TABLE_ENTRY_FILE: &str = "table-entry.json";
+const INTERNAL_CATALOG_ROOT: &str = BUCKET_TABLE_CATALOG_META_PREFIX;
+const TABLE_BUCKET_ROOT: &str = BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
 const TABLE_CATALOG_LIST_MAX_KEYS: i32 = 1000;
@@ -372,60 +376,75 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableCatalogObjectPaths {
-    reserved_prefix: &'static str,
+    catalog_root: &'static str,
 }
 
 impl Default for TableCatalogObjectPaths {
     fn default() -> Self {
         Self {
-            reserved_prefix: TABLE_RESERVED_PREFIX,
+            catalog_root: INTERNAL_CATALOG_ROOT,
         }
     }
 }
 
 impl TableCatalogObjectPaths {
-    pub fn table_bucket_entry_path(&self) -> String {
-        format!("{}{}", self.catalog_root_prefix(), TABLE_BUCKET_ENTRY_FILE)
+    pub fn table_bucket_entry_path(&self, table_bucket: &str) -> String {
+        format!("{}{}", self.table_bucket_root_prefix(table_bucket), TABLE_BUCKET_ENTRY_FILE)
     }
 
-    pub fn namespace_entries_prefix(&self) -> String {
-        format!("{}{}/", self.catalog_root_prefix(), NAMESPACE_ROOT)
+    pub fn namespace_entries_prefix(&self, table_bucket: &str) -> String {
+        format!("{}{}/", self.table_bucket_root_prefix(table_bucket), NAMESPACE_ROOT)
     }
 
-    pub fn namespace_entry_path(&self, namespace: &Namespace) -> String {
-        format!("{}{}/{}", self.namespace_entries_prefix(), namespace.storage_id(), NAMESPACE_ENTRY_FILE)
+    pub fn namespace_entry_path(&self, table_bucket: &str, namespace: &Namespace) -> String {
+        format!(
+            "{}{}/{}",
+            self.namespace_entries_prefix(table_bucket),
+            namespace.storage_id(),
+            NAMESPACE_ENTRY_FILE
+        )
     }
 
-    pub fn table_entries_prefix(&self, namespace: &Namespace) -> String {
-        format!("{}{}/{}/", self.namespace_entries_prefix(), namespace.storage_id(), TABLE_ROOT)
+    pub fn table_entries_prefix(&self, table_bucket: &str, namespace: &Namespace) -> String {
+        format!(
+            "{}{}/{}/",
+            self.namespace_entries_prefix(table_bucket),
+            namespace.storage_id(),
+            TABLE_ROOT
+        )
     }
 
-    pub fn table_entry_path(&self, namespace: &Namespace, table: &IdentifierSegment) -> String {
-        format!("{}{}/{}", self.table_entries_prefix(namespace), table.as_str(), TABLE_ENTRY_FILE)
+    pub fn table_entry_path(&self, table_bucket: &str, namespace: &Namespace, table: &IdentifierSegment) -> String {
+        format!(
+            "{}{}/{}",
+            self.table_entries_prefix(table_bucket, namespace),
+            table.as_str(),
+            TABLE_ENTRY_FILE
+        )
     }
 
-    pub fn commit_log_entry_path(&self, table_id: &str, commit_id: &str) -> String {
+    pub fn commit_log_entry_path(&self, table_bucket: &str, table_id: &str, commit_id: &str) -> String {
         format!(
             "{}{}/{}/{}.json",
-            self.catalog_root_prefix(),
+            self.table_bucket_root_prefix(table_bucket),
             COMMIT_LOG_ROOT,
-            catalog_path_hash(table_id),
-            catalog_path_hash(commit_id)
+            table_catalog_path_hash(table_id),
+            table_catalog_path_hash(commit_id)
         )
     }
 
-    pub fn commit_idempotency_entry_path(&self, table_id: &str, idempotency_key: &str) -> String {
+    pub fn commit_idempotency_entry_path(&self, table_bucket: &str, table_id: &str, idempotency_key: &str) -> String {
         format!(
             "{}{}/{}/{}.json",
-            self.catalog_root_prefix(),
+            self.table_bucket_root_prefix(table_bucket),
             COMMIT_IDEMPOTENCY_ROOT,
-            catalog_path_hash(table_id),
-            catalog_path_hash(idempotency_key)
+            table_catalog_path_hash(table_id),
+            table_catalog_path_hash(idempotency_key)
         )
     }
 
-    fn catalog_root_prefix(&self) -> String {
-        format!("{}/{}/{}/{}/", self.reserved_prefix, WAREHOUSE_ROOT, DEFAULT_WAREHOUSE_ID, CATALOG_ROOT)
+    fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
+        format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, table_catalog_path_hash(table_bucket))
     }
 }
 
@@ -444,6 +463,10 @@ where
             backend,
             paths: TableCatalogObjectPaths::default(),
         }
+    }
+
+    fn catalog_bucket(&self) -> &'static str {
+        RUSTFS_META_BUCKET
     }
 
     async fn read_entry<T>(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<(T, Option<String>)>>
@@ -487,8 +510,8 @@ where
         namespace: &Namespace,
         table: &IdentifierSegment,
     ) -> TableCatalogStoreResult<Option<(TableEntry, String)>> {
-        let table_path = self.paths.table_entry_path(namespace, table);
-        let Some((entry, etag)) = self.read_entry::<TableEntry>(table_bucket, &table_path).await? else {
+        let table_path = self.paths.table_entry_path(table_bucket, namespace, table);
+        let Some((entry, etag)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
             return Ok(None);
         };
         let Some(etag) = etag else {
@@ -512,27 +535,27 @@ where
                 entry.table_bucket, entry.namespace
             )));
         }
-        let table_path = self.paths.table_entry_path(&namespace, &table);
-        self.write_entry(&entry.table_bucket, &table_path, &entry, precondition).await
+        let table_path = self.paths.table_entry_path(&entry.table_bucket, &namespace, &table);
+        self.write_entry(self.catalog_bucket(), &table_path, &entry, precondition)
+            .await
     }
 
-    async fn read_commit_by_path(&self, table_bucket: &str, object: &str) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
-        self.read_entry::<CommitLogEntry>(table_bucket, object)
+    async fn read_commit_by_path(&self, object: &str) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
+        self.read_entry::<CommitLogEntry>(self.catalog_bucket(), object)
             .await
             .map(|entry| entry.map(|(commit, _)| commit))
     }
 
     async fn finalize_commit_log(
         &self,
-        table_bucket: &str,
         commit_path: &str,
         idempotency_path: Option<&str>,
         commit_log: &CommitLogEntry,
     ) -> TableCatalogStoreResult<()> {
-        self.write_entry(table_bucket, commit_path, commit_log, TableCatalogPutPrecondition::Any)
+        self.write_entry(self.catalog_bucket(), commit_path, commit_log, TableCatalogPutPrecondition::Any)
             .await?;
         if let Some(idempotency_path) = idempotency_path {
-            self.write_entry(table_bucket, idempotency_path, commit_log, TableCatalogPutPrecondition::Any)
+            self.write_entry(self.catalog_bucket(), idempotency_path, commit_log, TableCatalogPutPrecondition::Any)
                 .await?;
         }
         Ok(())
@@ -548,13 +571,13 @@ where
         let table = parse_table_for_store(table)?;
 
         let Some((table_bucket_entry, _)) = self
-            .read_entry::<TableBucketEntry>(table_bucket, &self.paths.table_bucket_entry_path())
+            .read_entry::<TableBucketEntry>(self.catalog_bucket(), &self.paths.table_bucket_entry_path(table_bucket))
             .await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
         };
         let Some((namespace_entry, _)) = self
-            .read_entry::<NamespaceEntry>(table_bucket, &self.paths.namespace_entry_path(&namespace))
+            .read_entry::<NamespaceEntry>(self.catalog_bucket(), &self.paths.namespace_entry_path(table_bucket, &namespace))
             .await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
@@ -564,7 +587,7 @@ where
             )));
         };
         let Some((table_entry, _)) = self
-            .read_entry::<TableEntry>(table_bucket, &self.paths.table_entry_path(&namespace, &table))
+            .read_entry::<TableEntry>(self.catalog_bucket(), &self.paths.table_entry_path(table_bucket, &namespace, &table))
             .await?
         else {
             return Err(TableCatalogStoreError::NotFound(format!(
@@ -650,8 +673,8 @@ where
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
-        let table_path = self.paths.table_entry_path(&namespace, &table);
-        let Some((entry, _)) = self.read_entry::<TableEntry>(table_bucket, &table_path).await? else {
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "table {}/{}/{}",
                 table_bucket,
@@ -739,8 +762,8 @@ where
             ));
         }
 
-        let table_path = self.paths.table_entry_path(&namespace, &table);
-        let _guard = self.backend.acquire_write_lock(table_bucket, &table_path).await?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
         let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "table {}/{}/{}",
@@ -816,7 +839,7 @@ where
     B: TableCatalogObjectBackend,
 {
     async fn get_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>> {
-        self.read_entry::<TableBucketEntry>(table_bucket, &self.paths.table_bucket_entry_path())
+        self.read_entry::<TableBucketEntry>(self.catalog_bucket(), &self.paths.table_bucket_entry_path(table_bucket))
             .await
             .map(|entry| entry.map(|(bucket, _)| bucket))
     }
@@ -831,8 +854,8 @@ where
         }
 
         self.write_entry(
-            &entry.table_bucket,
-            &self.paths.table_bucket_entry_path(),
+            self.catalog_bucket(),
+            &self.paths.table_bucket_entry_path(&entry.table_bucket),
             &entry,
             TableCatalogPutPrecondition::Any,
         )
@@ -843,8 +866,8 @@ where
         validate_catalog_entry_version("namespace", entry.version)?;
         self.require_table_bucket(&entry.table_bucket).await?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
-        let object = self.paths.namespace_entry_path(&namespace);
-        self.write_entry(&entry.table_bucket, &object, &entry, TableCatalogPutPrecondition::IfAbsent)
+        let object = self.paths.namespace_entry_path(&entry.table_bucket, &namespace);
+        self.write_entry(self.catalog_bucket(), &object, &entry, TableCatalogPutPrecondition::IfAbsent)
             .await
     }
 
@@ -852,13 +875,13 @@ where
         let mut entries = Vec::new();
         for object in self
             .backend
-            .list_objects(table_bucket, &self.paths.namespace_entries_prefix())
+            .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
             .await?
         {
             if !object.ends_with(NAMESPACE_ENTRY_FILE) {
                 continue;
             }
-            if let Some((entry, _)) = self.read_entry::<NamespaceEntry>(table_bucket, &object).await? {
+            if let Some((entry, _)) = self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &object).await? {
                 entries.push(entry);
             }
         }
@@ -868,7 +891,7 @@ where
 
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
         let namespace = parse_namespace_for_store(namespace)?;
-        self.read_entry::<NamespaceEntry>(table_bucket, &self.paths.namespace_entry_path(&namespace))
+        self.read_entry::<NamespaceEntry>(self.catalog_bucket(), &self.paths.namespace_entry_path(table_bucket, &namespace))
             .await
             .map(|entry| entry.map(|(namespace, _)| namespace))
     }
@@ -890,7 +913,7 @@ where
             )));
         }
         self.backend
-            .delete_object(table_bucket, &self.paths.namespace_entry_path(&namespace))
+            .delete_object(self.catalog_bucket(), &self.paths.namespace_entry_path(table_bucket, &namespace))
             .await
     }
 
@@ -907,13 +930,13 @@ where
         let mut entries = Vec::new();
         for object in self
             .backend
-            .list_objects(table_bucket, &self.paths.table_entries_prefix(&namespace))
+            .list_objects(self.catalog_bucket(), &self.paths.table_entries_prefix(table_bucket, &namespace))
             .await?
         {
             if !object.ends_with(TABLE_ENTRY_FILE) {
                 continue;
             }
-            if let Some((entry, _)) = self.read_entry::<TableEntry>(table_bucket, &object).await? {
+            if let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? {
                 entries.push(entry);
             }
         }
@@ -924,7 +947,7 @@ where
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
-        self.read_entry::<TableEntry>(table_bucket, &self.paths.table_entry_path(&namespace, &table))
+        self.read_entry::<TableEntry>(self.catalog_bucket(), &self.paths.table_entry_path(table_bucket, &namespace, &table))
             .await
             .map(|entry| entry.map(|(table, _)| table))
     }
@@ -932,8 +955,8 @@ where
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
         let namespace = parse_namespace_for_store(&request.namespace)?;
         let table = parse_table_for_store(&request.table)?;
-        let table_path = self.paths.table_entry_path(&namespace, &table);
-        let _guard = self.backend.acquire_write_lock(&request.table_bucket, &table_path).await?;
+        let table_path = self.paths.table_entry_path(&request.table_bucket, &namespace, &table);
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
 
         let Some((current, current_etag)) = self.read_table_with_etag(&request.table_bucket, &namespace, &table).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
@@ -942,14 +965,16 @@ where
             )));
         };
 
-        let commit_path = self.paths.commit_log_entry_path(&current.table_id, &request.commit_id);
-        let existing_commit = self.read_commit_by_path(&request.table_bucket, &commit_path).await?;
-        let idempotency_path = request
-            .idempotency_key
-            .as_deref()
-            .map(|idempotency_key| self.paths.commit_idempotency_entry_path(&current.table_id, idempotency_key));
+        let commit_path = self
+            .paths
+            .commit_log_entry_path(&request.table_bucket, &current.table_id, &request.commit_id);
+        let existing_commit = self.read_commit_by_path(&commit_path).await?;
+        let idempotency_path = request.idempotency_key.as_deref().map(|idempotency_key| {
+            self.paths
+                .commit_idempotency_entry_path(&request.table_bucket, &current.table_id, idempotency_key)
+        });
         let existing_idempotency_commit = match idempotency_path.as_deref() {
-            Some(idempotency_path) => self.read_commit_by_path(&request.table_bucket, idempotency_path).await?,
+            Some(idempotency_path) => self.read_commit_by_path(idempotency_path).await?,
             None => None,
         };
 
@@ -964,7 +989,7 @@ where
                 let mut committed = existing.clone();
                 committed.status = CommitLogStatus::Committed;
                 let _ = self
-                    .finalize_commit_log(&request.table_bucket, &commit_path, idempotency_path.as_deref(), &committed)
+                    .finalize_commit_log(&commit_path, idempotency_path.as_deref(), &committed)
                     .await;
                 return Ok(TableCommitResult {
                     table: current,
@@ -1040,7 +1065,7 @@ where
 
         if !has_existing_commit {
             self.write_entry(
-                &request.table_bucket,
+                self.catalog_bucket(),
                 &commit_path,
                 &staged_commit_log,
                 TableCatalogPutPrecondition::IfAbsent,
@@ -1051,7 +1076,7 @@ where
             && existing_idempotency_commit.is_none()
         {
             self.write_entry(
-                &request.table_bucket,
+                self.catalog_bucket(),
                 idempotency_path,
                 &staged_commit_log,
                 TableCatalogPutPrecondition::IfAbsent,
@@ -1060,7 +1085,7 @@ where
         }
 
         self.write_entry(
-            &request.table_bucket,
+            self.catalog_bucket(),
             &table_path,
             &next,
             TableCatalogPutPrecondition::IfMatch(current_etag),
@@ -1072,7 +1097,7 @@ where
         // After the table CAS succeeds, the staged record is the durable recovery source.
         // A finalization failure must not turn an externally committed pointer into a failed commit response.
         let _ = self
-            .finalize_commit_log(&request.table_bucket, &commit_path, idempotency_path.as_deref(), &commit_log)
+            .finalize_commit_log(&commit_path, idempotency_path.as_deref(), &commit_log)
             .await;
 
         Ok(TableCommitResult { table: next, commit_log })
@@ -1081,7 +1106,7 @@ where
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
-        let object = self.paths.table_entry_path(&namespace, &table);
+        let object = self.paths.table_entry_path(table_bucket, &namespace, &table);
         if self
             .load_table(table_bucket, &namespace.public_name(), table.as_str())
             .await?
@@ -1094,7 +1119,7 @@ where
                 table.as_str()
             )));
         }
-        self.backend.delete_object(table_bucket, &object).await
+        self.backend.delete_object(self.catalog_bucket(), &object).await
     }
 
     async fn get_commit_by_id(
@@ -1103,8 +1128,8 @@ where
         table_id: &str,
         commit_id: &str,
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
-        let object = self.paths.commit_log_entry_path(table_id, commit_id);
-        self.read_commit_by_path(table_bucket, &object).await
+        let object = self.paths.commit_log_entry_path(table_bucket, table_id, commit_id);
+        self.read_commit_by_path(&object).await
     }
 
     async fn get_commit_by_idempotency_key(
@@ -1113,8 +1138,10 @@ where
         table_id: &str,
         idempotency_key: &str,
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
-        let object = self.paths.commit_idempotency_entry_path(table_id, idempotency_key);
-        self.read_commit_by_path(table_bucket, &object).await
+        let object = self
+            .paths
+            .commit_idempotency_entry_path(table_bucket, table_id, idempotency_key);
+        self.read_commit_by_path(&object).await
     }
 }
 
@@ -1287,17 +1314,6 @@ fn metadata_candidate_is_past_safety_window(mod_time: Option<OffsetDateTime>, no
         return false;
     };
     mod_time <= now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS)
-}
-
-fn catalog_path_hash(value: &str) -> String {
-    let digest = Sha256::digest(value.as_bytes());
-    let mut output = String::with_capacity(digest.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in digest {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn validate_catalog_entry_version(kind: &str, version: u16) -> TableCatalogStoreResult<()> {
@@ -2031,33 +2047,33 @@ mod tests {
     }
 
     #[test]
-    fn catalog_object_entry_paths_use_reserved_prefix_and_hashed_untrusted_ids() {
+    fn catalog_object_entry_paths_use_internal_root_and_hashed_untrusted_ids() {
         let paths = TableCatalogObjectPaths::default();
+        let bucket = "analytics";
         let namespace = Namespace::parse("analytics.daily_events").unwrap();
         let table = IdentifierSegment::parse("events").unwrap();
+        let bucket_root = format!("s3tables/catalog/table-buckets/{}/", table_catalog_path_hash(bucket));
 
+        assert_eq!(paths.table_bucket_entry_path(bucket), format!("{bucket_root}table-bucket.json"));
         assert_eq!(
-            paths.table_bucket_entry_path(),
-            ".rustfs-table/warehouses/default/catalog/table-bucket.json"
+            paths.namespace_entry_path(bucket, &namespace),
+            format!("{bucket_root}namespaces/analytics/daily_events/namespace-entry.json")
         );
         assert_eq!(
-            paths.namespace_entry_path(&namespace),
-            ".rustfs-table/warehouses/default/catalog/namespaces/analytics/daily_events/namespace-entry.json"
-        );
-        assert_eq!(
-            paths.table_entry_path(&namespace, &table),
-            ".rustfs-table/warehouses/default/catalog/namespaces/analytics/daily_events/tables/events/table-entry.json"
+            paths.table_entry_path(bucket, &namespace, &table),
+            format!("{bucket_root}namespaces/analytics/daily_events/tables/events/table-entry.json")
         );
 
-        let commit_path = paths.commit_log_entry_path("table/../id", "commit/%2f\nid");
-        let idempotency_path = paths.commit_idempotency_entry_path("table/../id", "client/%2f\nrequest");
+        let commit_path = paths.commit_log_entry_path("table/../bucket", "table/../id", "commit/%2f\nid");
+        let idempotency_path = paths.commit_idempotency_entry_path("table/../bucket", "table/../id", "client/%2f\nrequest");
 
         for path in [commit_path, idempotency_path] {
-            assert!(path.starts_with(".rustfs-table/warehouses/default/catalog/"));
+            assert!(path.starts_with("s3tables/catalog/table-buckets/"));
             assert!(path.ends_with(".json"));
             assert!(!path.contains(".."));
             assert!(!path.contains('%'));
             assert!(!path.contains('\n'));
+            assert!(!path.contains("table/../bucket"));
             assert!(!path.contains("table/../id"));
             assert!(!path.contains("client/%2f"));
         }
@@ -2265,6 +2281,24 @@ mod tests {
             .create_table(test_table_entry(bucket, namespace, table, current_metadata))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_writes_catalog_entries_to_internal_meta_bucket() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+
+        let state = backend.state.lock().await;
+        let object_buckets = state
+            .objects
+            .keys()
+            .map(|(bucket, _)| bucket.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(object_buckets, BTreeSet::from([rustfs_ecstore::disk::RUSTFS_META_BUCKET]));
     }
 
     #[tokio::test]
@@ -2660,7 +2694,8 @@ mod tests {
         let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
         let idempotency_key = "client-request";
-        let idempotency_path = TableCatalogObjectPaths::default().commit_idempotency_entry_path("table-id", idempotency_key);
+        let idempotency_path =
+            TableCatalogObjectPaths::default().commit_idempotency_entry_path(bucket, "table-id", idempotency_key);
 
         store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
         store
@@ -2672,7 +2707,9 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend.fail_put_attempt(bucket, &idempotency_path, 1).await;
+        backend
+            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &idempotency_path, 1)
+            .await;
 
         let err = store
             .commit_table(TableCommitRequest {
@@ -2708,7 +2745,7 @@ mod tests {
         let table = IdentifierSegment::parse("orders").unwrap();
         let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let new_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
-        let commit_path = TableCatalogObjectPaths::default().commit_log_entry_path("table-id", "commit-1");
+        let commit_path = TableCatalogObjectPaths::default().commit_log_entry_path(bucket, "table-id", "commit-1");
 
         store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
         store
@@ -2720,7 +2757,9 @@ mod tests {
             .await
             .unwrap();
         backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
-        backend.fail_put_attempt(bucket, &commit_path, 2).await;
+        backend
+            .fail_put_attempt(rustfs_ecstore::disk::RUSTFS_META_BUCKET, &commit_path, 2)
+            .await;
 
         let request = TableCommitRequest {
             table_bucket: bucket.to_string(),

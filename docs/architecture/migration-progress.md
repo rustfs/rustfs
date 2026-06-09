@@ -5,14 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-kms-action-taxonomy`
-- Baseline: `upstream/main` at `51c26278a4907449c565c7f1f52c1d9ae0616486`
-- PR type for this branch: `contract`
-- Runtime behavior changes: none
-- Rust code changes: extend `KmsAction` with the dedicated policy action
-  taxonomy required before handler-level KMS authorization migration.
+- Branch: `overtrue/arch-kms-handler-actions`
+- Baseline: `upstream/main` at `4fec606dc4f92b19e085f1609a188e82a72720ff`
+- PR type for this branch: `security-change`
+- Runtime behavior changes: high-risk KMS admin handlers now authorize through
+  dedicated `kms:*` actions instead of broad `ServerInfoAdminAction`.
+- Rust code changes: migrate KMS handler action lists and route policy inventory
+  to dedicated KMS actions, while keeping temporary legacy create/status admin
+  action compatibility with `RUSTFS_COMPAT_TODO(S-012)`.
 - CI/script changes: none
-- Docs changes: record the S-011 KMS action taxonomy handoff.
+- Docs changes: record S-012 action migration status and temporary compatibility cleanup.
 
 ## Phase 0 Tasks
 
@@ -98,51 +100,58 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     service-control, clear-cache, generate-data-key, delete, rotate, list, and
     describe actions; wildcard matching still works.
   - Verification: `cargo test -p rustfs-policy action --no-fail-fast`.
+- [x] `S-012` Migrate KMS handlers to dedicated actions.
+  - Acceptance: KMS data-key, delete/cancel-delete, cache, configure,
+    service-control, list, and describe handlers use dedicated `kms:*` actions.
+  - Compatibility: legacy KMS create/status admin actions are retained only as
+    temporary compatibility paths and registered in
+    [`compat-cleanup-register.md`](compat-cleanup-register.md).
+  - Verification: focused handler and route policy tests, migration rules,
+    formatting, and `make pre-commit`.
 
 ## Next PRs
 
-1. `security-change`: migrate KMS handlers to dedicated actions with explicit
-   legacy compatibility where required.
-2. `contract`: add initial policy inventory tables for redaction, serde, or
+1. `contract`: add initial policy inventory tables for redaction, serde, or
    supply-chain governance only after the contract shape remains stable.
+2. `security-change`: apply KMS response/config redaction after action
+   migration settles.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Pure policy taxonomy extension; names follow existing `KmsAction` variant style and the branch stays a single `contract` PR. |
-| Migration preservation | pass | No handler authorization, route policy inventory, startup, global state, crate split, or storage hot-path behavior changes. |
-| Testing/verification | pass | Baseline action tests, focused policy tests, full `rustfs-policy`, migration guard scripts, `make pre-commit`, nextest, and doctests pass. |
+| Quality/architecture | pass | Single `security-change` PR; KMS auth action lists are local helper functions, names match `KmsAction`, and no storage/startup/global-state logic is touched. |
+| Migration preservation | pass | Legacy create/status admin actions are retained only behind `RUSTFS_COMPAT_TODO(S-012)` and registered for cleanup; broad `ServerInfoAdminAction` is intentionally not retained for high-risk KMS operations. |
+| Testing/verification | pass | Focused handler/route-policy tests cover dedicated actions and broad-action negative cases; migration rules, formatting, full `make pre-commit`, nextest, and doctests pass. |
 
 ## Verification Notes
 
 Passed:
-- Baseline `cargo test -p rustfs-policy action --no-fail-fast`
+- Baseline `cargo test -p rustfs admin::handlers::kms --no-fail-fast`
+- Baseline `cargo test -p rustfs admin::route_policy --no-fail-fast`
 - `cargo fmt --all --check`
-- `cargo test -p rustfs-policy action --no-fail-fast`
-- `cargo test -p rustfs-policy`
+- `cargo test -p rustfs admin::handlers::kms --no-fail-fast`
+- `cargo test -p rustfs admin::route_policy --no-fail-fast`
 - `./scripts/check_architecture_migration_rules.sh`
-- `./scripts/check_layer_dependencies.sh`
-- `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
 - `make pre-commit`
 
 Notes:
-- This branch only extends KMS policy taxonomy. It does not change KMS handler
-  authorization, route policy inventory, runtime state, startup order, storage
-  paths, or compatibility mappings.
-- `make pre-commit` passed all checks, including 5672 nextest tests and
+- This branch changes only KMS admin authorization action selection and route
+  policy inventory. It does not change KMS runtime defaults, redaction, startup
+  order, global state, storage paths, or crate boundaries.
+- `make pre-commit` passed all checks, including 5682 nextest tests and
   workspace doctests.
 
 ## Handoff Notes
 
-- Keep this S-011 branch as a pure `contract` PR. Do not change KMS handler
-  authorization, admin route registration, route policy inventory, Config moves,
-  Storage API moves, Runtime moves, or ECStore moves.
+- Keep this S-012 branch as a focused `security-change` PR. Do not change KMS
+  defaults, redaction, admin route registration shape, Config moves, Storage API
+  moves, Runtime moves, or ECStore moves.
 - `rustfs` may depend on `rustfs-security-governance` for contract metadata;
   the security-governance crate must stay independent from implementation
   crates and runtime state.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
-- S-012 must decide any legacy compatibility mapping explicitly instead of
-  silently replacing existing admin actions in this taxonomy PR.
+- The next KMS security PR should handle redaction or production default
+  hardening separately; do not bundle those with this action migration.

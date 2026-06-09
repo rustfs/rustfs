@@ -24,7 +24,7 @@ use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{KmsError, init_global_kms_service_manager, types::*};
-use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
@@ -118,6 +118,38 @@ async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_k
     manager.get_encryption_service().await
 }
 
+fn kms_create_key_actions() -> Vec<Action> {
+    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS create-key grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:Configure.
+    vec![
+        Action::KmsAction(KmsAction::ConfigureAction),
+        Action::AdminAction(AdminAction::KMSCreateKeyAdminAction),
+    ]
+}
+
+fn kms_describe_key_actions() -> Vec<Action> {
+    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS key-status grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:DescribeKey.
+    vec![
+        Action::KmsAction(KmsAction::DescribeKeyAction),
+        Action::AdminAction(AdminAction::KMSKeyStatusAdminAction),
+    ]
+}
+
+fn kms_list_keys_actions() -> Vec<Action> {
+    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS key-status grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:ListKeys.
+    vec![
+        Action::KmsAction(KmsAction::ListKeysAction),
+        Action::AdminAction(AdminAction::KMSKeyStatusAdminAction),
+    ]
+}
+
+fn kms_generate_data_key_actions() -> Vec<Action> {
+    vec![Action::KmsAction(KmsAction::GenerateDataKeyAction)]
+}
+
+fn kms_delete_key_actions() -> Vec<Action> {
+    vec![Action::KmsAction(KmsAction::DeleteKeyAction)]
+}
+
 pub fn register_kms_key_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::POST,
@@ -170,7 +202,7 @@ impl Operation for CreateKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSCreateKeyAdminAction)],
+            kms_create_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -249,7 +281,7 @@ impl Operation for DescribeKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
+            kms_describe_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -288,8 +320,20 @@ impl Operation for DescribeKeyHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_key_id;
+    use super::{
+        extract_key_id, kms_create_key_actions, kms_delete_key_actions, kms_describe_key_actions, kms_generate_data_key_actions,
+        kms_list_keys_actions,
+    };
     use http::Uri;
+    use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+
+    fn assert_has_action(actions: &[Action], action: Action) {
+        assert!(actions.contains(&action), "expected action list to contain {action:?}");
+    }
+
+    fn assert_lacks_action(actions: &[Action], action: Action) {
+        assert!(!actions.contains(&action), "expected action list not to contain {action:?}");
+    }
 
     #[test]
     fn test_extract_key_id_supports_minio_aliases() {
@@ -331,6 +375,31 @@ mod tests {
             assert_eq!(extract_key_id(&uri).as_deref(), expected);
         }
     }
+
+    #[test]
+    fn kms_key_auth_actions_use_dedicated_kms_actions() {
+        let create_actions = kms_create_key_actions();
+        assert_has_action(&create_actions, Action::KmsAction(KmsAction::ConfigureAction));
+        assert_has_action(&create_actions, Action::AdminAction(AdminAction::KMSCreateKeyAdminAction));
+
+        let describe_actions = kms_describe_key_actions();
+        assert_has_action(&describe_actions, Action::KmsAction(KmsAction::DescribeKeyAction));
+        assert_has_action(&describe_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
+
+        let list_actions = kms_list_keys_actions();
+        assert_has_action(&list_actions, Action::KmsAction(KmsAction::ListKeysAction));
+        assert_has_action(&list_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
+    }
+
+    #[test]
+    fn kms_sensitive_key_actions_reject_server_info_fallback() {
+        for actions in [kms_generate_data_key_actions(), kms_delete_key_actions()] {
+            assert_lacks_action(&actions, Action::AdminAction(AdminAction::ServerInfoAdminAction));
+        }
+
+        assert_has_action(&kms_generate_data_key_actions(), Action::KmsAction(KmsAction::GenerateDataKeyAction));
+        assert_has_action(&kms_delete_key_actions(), Action::KmsAction(KmsAction::DeleteKeyAction));
+    }
 }
 
 /// List KMS keys (legacy endpoint)
@@ -351,7 +420,7 @@ impl Operation for ListKeysHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
+            kms_list_keys_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -413,7 +482,7 @@ impl Operation for GenerateDataKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_generate_data_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -479,7 +548,7 @@ impl Operation for CreateKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSCreateKeyAdminAction)],
+            kms_create_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -613,7 +682,7 @@ impl Operation for DeleteKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_delete_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -762,7 +831,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_delete_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -891,7 +960,7 @@ impl Operation for ListKmsKeysHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
+            kms_list_keys_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -1003,7 +1072,7 @@ impl Operation for DescribeKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
+            kms_describe_key_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
