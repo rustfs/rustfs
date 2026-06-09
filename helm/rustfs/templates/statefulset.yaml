@@ -65,6 +65,7 @@ spec:
       topologySpreadConstraints:
         {{- toYaml .Values.topologySpreadConstraints.constraints | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
