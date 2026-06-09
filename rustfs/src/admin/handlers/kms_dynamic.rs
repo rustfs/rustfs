@@ -28,7 +28,7 @@ use rustfs_kms::{
     ConfigureKmsRequest, ConfigureKmsResponse, KmsConfig, KmsConfigSummary, KmsServiceStatus, KmsStatusResponse, StartKmsRequest,
     StartKmsResponse, StopKmsResponse,
 };
-use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use tracing::{error, info, instrument, warn};
 
@@ -55,6 +55,14 @@ fn existing_vault_auth(config: &KmsConfig) -> Option<rustfs_kms::config::VaultAu
         rustfs_kms::config::BackendConfig::VaultTransit(vault) => Some(vault.auth_method.clone()),
         rustfs_kms::config::BackendConfig::Local(_) => None,
     }
+}
+
+fn kms_configure_actions() -> Vec<Action> {
+    vec![Action::KmsAction(KmsAction::ConfigureAction)]
+}
+
+fn kms_service_control_actions() -> Vec<Action> {
+    vec![Action::KmsAction(KmsAction::ServiceControlAction)]
 }
 
 fn normalize_configure_request_auth(
@@ -184,7 +192,7 @@ impl Operation for ConfigureKmsHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_configure_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -284,7 +292,7 @@ impl Operation for StartKmsHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_service_control_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -414,7 +422,7 @@ impl Operation for StopKmsHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_service_control_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -476,7 +484,7 @@ impl Operation for GetKmsStatusHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_service_control_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -544,7 +552,7 @@ impl Operation for ReconfigureKmsHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            kms_configure_actions(),
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -623,5 +631,31 @@ impl Operation for ReconfigureKmsHandler {
         };
 
         Ok(S3Response::new((StatusCode::OK, Body::from(json_response))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kms_configure_actions, kms_service_control_actions};
+    use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+
+    fn assert_has_action(actions: &[Action], action: Action) {
+        assert!(actions.contains(&action), "expected action list to contain {action:?}");
+    }
+
+    fn assert_lacks_action(actions: &[Action], action: Action) {
+        assert!(!actions.contains(&action), "expected action list not to contain {action:?}");
+    }
+
+    #[test]
+    fn kms_dynamic_auth_actions_use_dedicated_kms_actions() {
+        assert_has_action(&kms_configure_actions(), Action::KmsAction(KmsAction::ConfigureAction));
+        assert_has_action(&kms_service_control_actions(), Action::KmsAction(KmsAction::ServiceControlAction));
+    }
+
+    #[test]
+    fn kms_dynamic_actions_reject_server_info_fallback() {
+        assert_lacks_action(&kms_configure_actions(), Action::AdminAction(AdminAction::ServerInfoAdminAction));
+        assert_lacks_action(&kms_service_control_actions(), Action::AdminAction(AdminAction::ServerInfoAdminAction));
     }
 }

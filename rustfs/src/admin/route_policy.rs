@@ -45,8 +45,13 @@ const GET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("GetTableNamespa
 const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
 const IMPORT_IAM: AdminActionRef = AdminActionRef::new("ImportIAMAction");
-const KMS_CREATE_KEY: AdminActionRef = AdminActionRef::new("KMSCreateKeyAdminAction");
-const KMS_KEY_STATUS: AdminActionRef = AdminActionRef::new("KMSKeyStatusAdminAction");
+const KMS_CLEAR_CACHE: AdminActionRef = AdminActionRef::new("kms:ClearCache");
+const KMS_CONFIGURE: AdminActionRef = AdminActionRef::new("kms:Configure");
+const KMS_DELETE_KEY: AdminActionRef = AdminActionRef::new("kms:DeleteKey");
+const KMS_DESCRIBE_KEY: AdminActionRef = AdminActionRef::new("kms:DescribeKey");
+const KMS_GENERATE_DATA_KEY: AdminActionRef = AdminActionRef::new("kms:GenerateDataKey");
+const KMS_LIST_KEYS: AdminActionRef = AdminActionRef::new("kms:ListKeys");
+const KMS_SERVICE_CONTROL: AdminActionRef = AdminActionRef::new("kms:ServiceControl");
 const LIST_GROUPS: AdminActionRef = AdminActionRef::new("ListGroupsAdminAction");
 const LIST_TEMPORARY_ACCOUNTS: AdminActionRef = AdminActionRef::new("ListTemporaryAccountsAdminAction");
 const LIST_TIER: AdminActionRef = AdminActionRef::new("ListTierAction");
@@ -475,59 +480,74 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/profile", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/status", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/tls/status", PROFILING, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/create-key", KMS_CREATE_KEY, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/key/create", KMS_CREATE_KEY, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/create-key", KMS_CONFIGURE, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/key/create", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/describe-key",
-        KMS_KEY_STATUS,
+        KMS_DESCRIBE_KEY,
         RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/key/status",
-        KMS_KEY_STATUS,
+        KMS_DESCRIBE_KEY,
         RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/list-keys",
-        KMS_KEY_STATUS,
+        KMS_LIST_KEYS,
         RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/kms/generate-data-key",
-        SERVER_INFO,
+        KMS_GENERATE_DATA_KEY,
         RouteRiskLevel::High,
     ),
-    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/status", SERVER_INFO, RouteRiskLevel::Sensitive),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/status", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/config", SERVER_INFO, RouteRiskLevel::Sensitive),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/clear-cache", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/start", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/stop", SERVER_INFO, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/kms/status",
+        KMS_SERVICE_CONTROL,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/status", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/config", KMS_CONFIGURE, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/clear-cache",
+        KMS_CLEAR_CACHE,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", KMS_CONFIGURE, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/start", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/stop", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/service-status",
-        SERVER_INFO,
+        KMS_SERVICE_CONTROL,
         RouteRiskLevel::Sensitive,
     ),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/reconfigure", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys", KMS_CREATE_KEY, RouteRiskLevel::High),
-    admin(HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete", SERVER_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/reconfigure", KMS_CONFIGURE, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys", KMS_CONFIGURE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/kms/keys/delete",
+        KMS_DELETE_KEY,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/kms/keys/cancel-deletion",
-        SERVER_INFO,
+        KMS_DELETE_KEY,
         RouteRiskLevel::High,
     ),
-    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/keys", KMS_KEY_STATUS, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/keys", KMS_LIST_KEYS, RouteRiskLevel::Sensitive),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/keys/{key_id}",
-        KMS_KEY_STATUS,
+        KMS_DESCRIBE_KEY,
         RouteRiskLevel::Sensitive,
     ),
     public(
@@ -818,6 +838,33 @@ mod tests {
     }
 
     #[test]
+    fn route_policy_records_dedicated_kms_actions() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/create-key", KMS_CONFIGURE);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/describe-key", KMS_DESCRIBE_KEY);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/list-keys", KMS_LIST_KEYS);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/generate-data-key", KMS_GENERATE_DATA_KEY);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/clear-cache", KMS_CLEAR_CACHE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", KMS_CONFIGURE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/start", KMS_SERVICE_CONTROL);
+        assert_action(HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete", KMS_DELETE_KEY);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion", KMS_DELETE_KEY);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/keys/{key_id}", KMS_DESCRIBE_KEY);
+    }
+
+    #[test]
+    fn route_policy_rejects_server_info_for_sensitive_kms_actions() {
+        for (method, path) in [
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/generate-data-key"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/clear-cache"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/configure"),
+            (HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion"),
+        ] {
+            assert_not_action(method, path, SERVER_INFO);
+        }
+    }
+
+    #[test]
     fn route_policy_keeps_contextual_auth_deferred() {
         assert_deferred(
             HttpMethod::Get,
@@ -854,6 +901,14 @@ mod tests {
             .find(|spec| spec.method() == method && spec.path() == path)
             .expect("expected direct route policy");
         assert_eq!(spec.access().admin_action(), Some(action));
+    }
+
+    fn assert_not_action(method: HttpMethod, path: &str, action: AdminActionRef) {
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == method && spec.path() == path)
+            .expect("expected direct route policy");
+        assert_ne!(spec.access().admin_action(), Some(action));
     }
 
     fn assert_public(method: HttpMethod, path: &str, kind: PublicRouteKind) {
