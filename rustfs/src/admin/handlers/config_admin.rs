@@ -1812,14 +1812,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_config_directives_accepts_heal_bitrot_cycle() {
-        let input = format!("{HEAL_SUB_SYS} {HEAL_BITROT_CYCLE}=\"off\"");
-        let directives = parse_config_directives(&input, false).expect("parse heal directive");
-
-        validate_config_directives(&directives).expect("heal bitrot_cycle should be a supported config key");
-    }
-
-    #[test]
     fn set_get_and_delete_config_kv_round_trip() {
         let mut config = ServerConfig::new();
         let directives = parse_config_directives(
@@ -1974,6 +1966,14 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.keys_help.len(), 1);
         assert_eq!(response.keys_help[0].key, "start_delay");
         assert!(response.keys_help[0].description.contains("cycle"));
+    }
+
+    #[test]
+    fn validate_config_directives_accepts_heal_bitrot_cycle() {
+        let input = format!("{HEAL_SUB_SYS} {HEAL_BITROT_CYCLE}=\"off\"");
+        let directives = parse_config_directives(&input, false).expect("parse heal directive");
+
+        validate_config_directives(&directives).expect("heal bitrot_cycle should be a supported config key");
     }
 
     #[test]
