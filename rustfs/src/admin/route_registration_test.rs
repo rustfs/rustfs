@@ -303,6 +303,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/{warehouse}/namespaces/{namespace}/tables/{table}",
             "/analytics/namespaces/sales/tables/orders",
         ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+            "/analytics/namespaces/sales/tables/orders/maintenance/metadata",
+        ),
     ]
 }
 
@@ -420,6 +425,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
     assert_route(&router, Method::DELETE, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/metadata"),
+    );
 
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));

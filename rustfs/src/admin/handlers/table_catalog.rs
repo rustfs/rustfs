@@ -57,6 +57,7 @@ static REGISTER_TABLE_HANDLER: RestRegisterTableHandler = RestRegisterTableHandl
 static LOAD_TABLE_HANDLER: RestLoadTableHandler = RestLoadTableHandler {};
 static COMMIT_TABLE_HANDLER: RestCommitTableHandler = RestCommitTableHandler {};
 static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
+static TABLE_METADATA_MAINTENANCE_HANDLER: RestTableMetadataMaintenanceHandler = RestTableMetadataMaintenanceHandler {};
 
 #[derive(Debug, Serialize)]
 struct CatalogConfigResponse {
@@ -121,6 +122,15 @@ struct RestCommitTableRequest {
     updates: Vec<serde_json::Value>,
     #[serde(default)]
     writer: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableMetadataMaintenanceRequest {
+    #[serde(default, rename = "retain-recent-metadata-files")]
+    retain_recent_metadata_files: usize,
+    #[serde(default)]
+    delete: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +230,11 @@ pub fn register_table_catalog_route(r: &mut S3Router<AdminOperation>) -> std::io
         Method::DELETE,
         format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&DROP_TABLE_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/metadata").as_str(),
+        AdminOperation(&TABLE_METADATA_MAINTENANCE_HANDLER),
     )?;
 
     Ok(())
@@ -1454,6 +1469,34 @@ where
         .map_err(catalog_store_error)
 }
 
+async fn table_metadata_maintenance_response<B>(
+    store: &crate::table_catalog::ObjectTableCatalogStore<B>,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: TableMetadataMaintenanceRequest,
+) -> S3Result<crate::table_catalog::TableMetadataMaintenanceReport>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend,
+{
+    if request.delete {
+        store
+            .delete_table_metadata_maintenance_candidates(
+                bucket,
+                &namespace.public_name(),
+                table,
+                request.retain_recent_metadata_files,
+            )
+            .await
+            .map_err(catalog_store_error)
+    } else {
+        store
+            .plan_table_metadata_maintenance(bucket, &namespace.public_name(), table, request.retain_recent_metadata_files)
+            .await
+            .map_err(catalog_store_error)
+    }
+}
+
 pub struct GetCatalogConfigHandler {}
 
 #[async_trait::async_trait]
@@ -1618,6 +1661,23 @@ impl Operation for RestDropTableHandler {
     }
 }
 
+pub struct RestTableMetadataMaintenanceHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestTableMetadataMaintenanceHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::RunTableMaintenanceAction).await?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let request = read_json_body::<TableMetadataMaintenanceRequest>(req.input).await?;
+        let metadata_backend = table_catalog_backend()?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend);
+        let response = table_metadata_maintenance_response(&store, &warehouse, &namespace, &table, request).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1674,6 +1734,7 @@ mod tests {
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
+            ("RestTableMetadataMaintenanceHandler", "AdminAction::RunTableMaintenanceAction"),
         ] {
             let block = operation_block(src, handler);
             assert!(
@@ -1711,6 +1772,7 @@ mod tests {
         let _: &RestLoadTableHandler = &LOAD_TABLE_HANDLER;
         let _: &RestCommitTableHandler = &COMMIT_TABLE_HANDLER;
         let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
+        let _: &RestTableMetadataMaintenanceHandler = &TABLE_METADATA_MAINTENANCE_HANDLER;
 
         assert_operation::<RestListNamespacesHandler>();
         assert_operation::<RestCreateNamespaceHandler>();
@@ -1722,6 +1784,28 @@ mod tests {
         assert_operation::<RestLoadTableHandler>();
         assert_operation::<RestCommitTableHandler>();
         assert_operation::<RestDropTableHandler>();
+        assert_operation::<RestTableMetadataMaintenanceHandler>();
+    }
+
+    #[test]
+    fn table_metadata_maintenance_request_uses_conservative_defaults() {
+        let request: TableMetadataMaintenanceRequest =
+            serde_json::from_value(serde_json::json!({})).expect("default maintenance request should parse");
+
+        assert_eq!(request.retain_recent_metadata_files, 0);
+        assert!(!request.delete);
+    }
+
+    #[test]
+    fn table_metadata_maintenance_request_accepts_delete_mode() {
+        let request: TableMetadataMaintenanceRequest = serde_json::from_value(serde_json::json!({
+            "retain-recent-metadata-files": 2,
+            "delete": true
+        }))
+        .expect("metadata maintenance request should parse");
+
+        assert_eq!(request.retain_recent_metadata_files, 2);
+        assert!(request.delete);
     }
 
     #[test]
@@ -2046,6 +2130,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn table_metadata_maintenance_helper_runs_dry_run_and_delete() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        let old = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_object_table_for_metadata_maintenance(&store, &backend, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .put_json_with_mod_time(bucket, &old, serde_json::json!({}), Some(OffsetDateTime::UNIX_EPOCH))
+            .await;
+        backend
+            .put_json_with_mod_time(
+                bucket,
+                &current,
+                serde_json::json!({
+                    "metadata-log": []
+                }),
+                Some(OffsetDateTime::UNIX_EPOCH),
+            )
+            .await;
+
+        let dry_run = table_metadata_maintenance_response(
+            &store,
+            bucket,
+            &namespace,
+            "events",
+            TableMetadataMaintenanceRequest {
+                retain_recent_metadata_files: 0,
+                delete: false,
+            },
+        )
+        .await
+        .expect("metadata maintenance dry-run should succeed");
+        assert_eq!(dry_run.cleanup_candidate_locations, vec![old.clone()]);
+        assert_eq!(dry_run.deletable_metadata_locations, vec![old.clone()]);
+        assert!(
+            backend
+                .object_exists(bucket, &old)
+                .await
+                .expect("old metadata lookup should succeed")
+        );
+
+        let deleted = table_metadata_maintenance_response(
+            &store,
+            bucket,
+            &namespace,
+            "events",
+            TableMetadataMaintenanceRequest {
+                retain_recent_metadata_files: 0,
+                delete: true,
+            },
+        )
+        .await
+        .expect("metadata maintenance delete should succeed");
+        assert_eq!(deleted.cleanup_candidate_locations, vec![old.clone()]);
+        assert_eq!(deleted.deletable_metadata_locations, vec![old.clone()]);
+        assert!(
+            !backend
+                .object_exists(bucket, &old)
+                .await
+                .expect("old metadata lookup should succeed after delete")
+        );
+    }
+
     #[test]
     fn commit_requirements_reject_mismatched_table_uuid() {
         let metadata = serde_json::json!({
@@ -2167,16 +2319,86 @@ mod tests {
 
     impl TestTableCatalogObjectBackend {
         async fn put_json(&self, bucket: &str, object: &str, value: serde_json::Value) {
+            self.put_json_with_mod_time(bucket, object, value, None).await;
+        }
+
+        async fn put_json_with_mod_time(
+            &self,
+            bucket: &str,
+            object: &str,
+            value: serde_json::Value,
+            mod_time: Option<OffsetDateTime>,
+        ) {
             let data = serde_json::to_vec(&value).expect("metadata JSON should serialize");
             self.objects.lock().await.insert(
                 (bucket.to_string(), object.to_string()),
                 crate::table_catalog::TableCatalogObject {
                     data,
                     etag: Some("etag".to_string()),
-                    mod_time: None,
+                    mod_time,
                 },
             );
         }
+    }
+
+    async fn seed_object_table_for_metadata_maintenance(
+        store: &crate::table_catalog::ObjectTableCatalogStore<TestTableCatalogObjectBackend>,
+        backend: &TestTableCatalogObjectBackend,
+        bucket: &str,
+        namespace: &crate::table_catalog::Namespace,
+        table: &crate::table_catalog::IdentifierSegment,
+        current_metadata_location: String,
+    ) {
+        store
+            .put_table_bucket(crate::table_catalog::TableBucketEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: bucket.to_string(),
+                catalog_type: crate::table_catalog::TABLE_BUCKET_CATALOG_TYPE.to_string(),
+                warehouse_root: format!("s3://{bucket}/"),
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            })
+            .await
+            .expect("table bucket entry should seed");
+        store
+            .create_namespace(crate::table_catalog::NamespaceEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                namespace_id: namespace.storage_id(),
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            })
+            .await
+            .expect("namespace entry should seed");
+        store
+            .create_table(crate::table_catalog::TableEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                table_id: "table-id".to_string(),
+                table_uuid: "table-uuid".to_string(),
+                format: "ICEBERG".to_string(),
+                format_version: 2,
+                warehouse_location: format!("s3://{bucket}/tables/table-id"),
+                metadata_location: current_metadata_location,
+                version_token: "token-v1".to_string(),
+                generation: 1,
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            })
+            .await
+            .expect("table entry should seed");
+        backend
+            .put_json(bucket, "unrelated/ignored.json", serde_json::json!({}))
+            .await;
     }
 
     #[async_trait::async_trait]
