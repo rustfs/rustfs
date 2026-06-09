@@ -5,14 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-background-services-inventory`
-- Baseline: `upstream/main` at `03eb10b07f5f968c531151ae667dfe218050493d`
+- Branch: `overtrue/arch-background-controller-contract`
+- Baseline: `upstream/main` at `f9a5e6d7e67322ac6f626b6f437a5e722fbe22e2`
 - PR type for this branch: `docs-only`
 - Runtime behavior changes: none.
 - Rust code changes: none.
 - CI/script changes: none
-- Docs changes: add BGC-001 background service inventory and index it from the
-  architecture overview.
+- Docs changes: add BGC-002 background controller contract vocabulary and index
+  it from the background service inventory and architecture overview.
 
 ## Phase 0 Tasks
 
@@ -124,20 +124,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Must preserve: no code behavior change and no new controller contract in
     this PR.
   - Verification: docs-only architecture checks and diff hygiene.
+- [x] `BGC-002` Define minimal controller contract.
+  - Acceptance:
+    [`background-controller-contract.md`](background-controller-contract.md)
+    defines desired/current/status/reconcile vocabulary, status state
+    semantics, service boundaries, and side-effect rules without starting
+    workers or changing scheduling.
+  - Must preserve: no Rust trait, scheduler, service registry, worker
+    start/stop path, storage write, readiness change, peer signal, or runtime
+    behavior change.
+  - Verification: docs-only architecture checks and diff hygiene.
 
 ## Next PRs
 
-1. `contract`: define the minimal BackgroundController status vocabulary after
-   this inventory is reviewed.
-2. `test-only`: add focused preservation tests before moving scanner, heal,
+1. `test-only`: add focused preservation tests before moving scanner, heal,
    replication, lifecycle, or disk health workers.
+2. `contract`: add a side-effect-free BGC-003 status snapshot for a low-risk
+   service such as memory observability.
+3. `behavior-change`: migrate one low-risk controller behind idempotence and
+   shutdown preservation tests.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `docs-only` BGC-001 inventory; it records current owners, cancellation, side effects, and follow-up inputs without adding a controller abstraction. |
-| Migration preservation | pass | No Rust source, Cargo manifest, workflow, script, or runtime config diff; storage hot path and shutdown behavior are untouched. |
+| Quality/architecture | pass | Single `docs-only` BGC-002 contract; it defines vocabulary and boundaries without adding a Rust trait, scheduler, or service registry. |
+| Migration preservation | pass | No Rust source, Cargo manifest, workflow, script, runtime config, worker start/stop path, readiness path, or storage hot path diff. |
 | Testing/verification | pass | Architecture migration rules, layer dependency guard, metrics reference guard, docs diff hygiene, and no-code-diff check passed. |
 
 ## Verification Notes
@@ -157,10 +169,11 @@ Notes:
 
 ## Handoff Notes
 
-- Keep this BGC-001 branch as a focused `docs-only` PR.
-- Do not add controller traits, status structs, service registry code, shutdown
-  wiring, worker tests, or runtime behavior changes in this PR.
-- Follow-up BGC-002 may define a minimal read-only controller status vocabulary
-  after this inventory is reviewed.
+- Keep this BGC-002 branch as a focused `docs-only` PR.
+- Do not add controller traits, status structs, service registry code,
+  scheduling, shutdown wiring, worker tests, or runtime behavior changes in this
+  PR.
+- Follow-up BGC-003 should add a side-effect-free status snapshot for one
+  low-risk service first, preferably memory observability.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
