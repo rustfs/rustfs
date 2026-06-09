@@ -9564,6 +9564,7 @@ dependencies = [
  "moka",
  "rand 0.10.1",
  "reqwest",
+ "rustfs-security-governance",
  "rustfs-utils",
  "serde",
  "serde_json",

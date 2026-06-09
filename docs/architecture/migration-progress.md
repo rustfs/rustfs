@@ -5,16 +5,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-kms-handler-actions`
-- Baseline: `upstream/main` at `4fec606dc4f92b19e085f1609a188e82a72720ff`
+- Branch: `overtrue/arch-kms-redaction`
+- Baseline: `upstream/main` at `0cdcd1eb7bfd5fc229eb45f851c624084b072365`
 - PR type for this branch: `security-change`
-- Runtime behavior changes: high-risk KMS admin handlers now authorize through
-  dedicated `kms:*` actions instead of broad `ServerInfoAdminAction`.
-- Rust code changes: migrate KMS handler action lists and route policy inventory
-  to dedicated KMS actions, while keeping temporary legacy create/status admin
-  action compatibility with `RUSTFS_COMPAT_TODO(S-012)`.
+- Runtime behavior changes: KMS secret-bearing `Debug` output and admin status
+  summary views no longer expose local master keys, Vault tokens, or AppRole
+  secret IDs. KMS backend behavior, authorization, production defaults, and
+  config persistence are unchanged.
+- Rust code changes: add KMS redaction rules, safe `Debug` implementations for
+  secret-bearing KMS config and configure request types, and focused tests that
+  prove secrets are absent from debug/admin views while serde persistence keeps
+  the original values.
 - CI/script changes: none
-- Docs changes: record S-012 action migration status and temporary compatibility cleanup.
+- Docs changes: record S-013 redaction status and the no-behavior-drift
+  migration boundary.
 
 ## Phase 0 Tasks
 
@@ -108,50 +112,63 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     [`compat-cleanup-register.md`](compat-cleanup-register.md).
   - Verification: focused handler and route policy tests, migration rules,
     formatting, and `make pre-commit`.
+- [x] `S-013` Apply KMS redaction.
+  - Acceptance: KMS Debug output and admin status response summaries contain no
+    Vault token, AppRole secret ID, or local master key values.
+  - Must preserve: internal KMS config values remain available to runtime code
+    and persisted config serialization still writes the original secret values.
+  - Verification: focused KMS redaction/status tests, full KMS tests, migration
+    guards, Rust quality scan, clippy, and `make pre-commit` passed.
 
 ## Next PRs
 
-1. `contract`: add initial policy inventory tables for redaction, serde, or
-   supply-chain governance only after the contract shape remains stable.
-2. `security-change`: apply KMS response/config redaction after action
-   migration settles.
+1. `security-change`: inventory KMS development defaults before any production
+   default hardening.
+2. `security-change`: apply IAM and plugin redaction in a separate S-014 PR.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `security-change` PR; KMS auth action lists are local helper functions, names match `KmsAction`, and no storage/startup/global-state logic is touched. |
-| Migration preservation | pass | Legacy create/status admin actions are retained only behind `RUSTFS_COMPAT_TODO(S-012)` and registered for cleanup; broad `ServerInfoAdminAction` is intentionally not retained for high-risk KMS operations. |
-| Testing/verification | pass | Focused handler/route-policy tests cover dedicated actions and broad-action negative cases; migration rules, formatting, full `make pre-commit`, nextest, and doctests pass. |
+| Quality/architecture | pass | Single `security-change` PR; redaction rules use the security-governance crate, custom `Debug` stays local to secret-bearing KMS types, and no startup/storage/global-state path is touched. |
+| Migration preservation | pass | Runtime secret access and persisted config serialization are explicitly preserved by tests; no temporary compatibility path is introduced. |
+| Testing/verification | pass | Focused redaction/status tests, full KMS tests, admin KMS handler tests, governance tests, clippy, migration guards, Rust quality scan, nextest, doctests, and `make pre-commit` passed. |
 
 ## Verification Notes
 
 Passed:
-- Baseline `cargo test -p rustfs admin::handlers::kms --no-fail-fast`
-- Baseline `cargo test -p rustfs admin::route_policy --no-fail-fast`
-- `cargo fmt --all --check`
+- `cargo test -p rustfs-kms redaction -- --nocapture`
+- `cargo test -p rustfs-kms status_response -- --nocapture`
+- `cargo test -p rustfs-kms --no-fail-fast`
 - `cargo test -p rustfs admin::handlers::kms --no-fail-fast`
-- `cargo test -p rustfs admin::route_policy --no-fail-fast`
+- `cargo test -p rustfs-security-governance --no-fail-fast`
+- `cargo clippy -p rustfs-kms --all-targets --all-features -- -D warnings`
+- Rust code quality scan on changed KMS source files
+- `cargo fmt --all --check`
+- `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_architecture_migration_rules.sh`
+- `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
 - `make pre-commit`
 
 Notes:
-- This branch changes only KMS admin authorization action selection and route
-  policy inventory. It does not change KMS runtime defaults, redaction, startup
-  order, global state, storage paths, or crate boundaries.
-- `make pre-commit` passed all checks, including 5682 nextest tests and
-  workspace doctests.
+- This branch changes only KMS redaction for debug/admin view surfaces. It does
+  not change KMS authorization, production defaults, startup order, global
+  state, storage paths, route registration, or crate boundaries.
+- Config serialization still preserves secret values for persisted cluster
+  config; this is tested explicitly to avoid runtime data loss.
+- `make pre-commit` passed all checks, including 5691 nextest tests, 111
+  skipped tests, and workspace doctests.
 
 ## Handoff Notes
 
-- Keep this S-012 branch as a focused `security-change` PR. Do not change KMS
-  defaults, redaction, admin route registration shape, Config moves, Storage API
-  moves, Runtime moves, or ECStore moves.
+- Keep this S-013 branch as a focused `security-change` PR. Do not change KMS
+  defaults, admin authorization, admin route registration shape, Config moves,
+  Storage API moves, Runtime moves, or ECStore moves.
 - `rustfs` may depend on `rustfs-security-governance` for contract metadata;
   the security-governance crate must stay independent from implementation
   crates and runtime state.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
-- The next KMS security PR should handle redaction or production default
-  hardening separately; do not bundle those with this action migration.
+- KMS production default hardening remains a separate task group; do not bundle
+  it with this redaction PR.
