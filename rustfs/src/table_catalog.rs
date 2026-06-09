@@ -28,7 +28,10 @@ use std::{
 
 use http::HeaderMap;
 use rustfs_ecstore::bucket::{
-    metadata::{BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX},
+    metadata::{
+        BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
+        BUCKET_TABLE_RESERVED_PREFIX, table_catalog_path_hash,
+    },
     metadata_sys,
 };
 use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
@@ -38,7 +41,6 @@ use rustfs_ecstore::{
     store_api::{HTTPPreconditions, ObjectOptions, PutObjReader, StorageAPI},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
@@ -65,8 +67,8 @@ const METADATA_DIR: &str = "metadata";
 const TABLE_BUCKET_ENTRY_FILE: &str = "table-bucket.json";
 const NAMESPACE_ENTRY_FILE: &str = "namespace-entry.json";
 const TABLE_ENTRY_FILE: &str = "table-entry.json";
-const INTERNAL_CATALOG_ROOT: &str = "s3tables/catalog";
-const TABLE_BUCKET_ROOT: &str = "table-buckets";
+const INTERNAL_CATALOG_ROOT: &str = BUCKET_TABLE_CATALOG_META_PREFIX;
+const TABLE_BUCKET_ROOT: &str = BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
 const TABLE_CATALOG_LIST_MAX_KEYS: i32 = 1000;
@@ -426,8 +428,8 @@ impl TableCatalogObjectPaths {
             "{}{}/{}/{}.json",
             self.table_bucket_root_prefix(table_bucket),
             COMMIT_LOG_ROOT,
-            catalog_path_hash(table_id),
-            catalog_path_hash(commit_id)
+            table_catalog_path_hash(table_id),
+            table_catalog_path_hash(commit_id)
         )
     }
 
@@ -436,13 +438,13 @@ impl TableCatalogObjectPaths {
             "{}{}/{}/{}.json",
             self.table_bucket_root_prefix(table_bucket),
             COMMIT_IDEMPOTENCY_ROOT,
-            catalog_path_hash(table_id),
-            catalog_path_hash(idempotency_key)
+            table_catalog_path_hash(table_id),
+            table_catalog_path_hash(idempotency_key)
         )
     }
 
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
-        format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, catalog_path_hash(table_bucket))
+        format!("{}/{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT, table_catalog_path_hash(table_bucket))
     }
 }
 
@@ -1314,17 +1316,6 @@ fn metadata_candidate_is_past_safety_window(mod_time: Option<OffsetDateTime>, no
     mod_time <= now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS)
 }
 
-fn catalog_path_hash(value: &str) -> String {
-    let digest = Sha256::digest(value.as_bytes());
-    let mut output = String::with_capacity(digest.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in digest {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
 fn validate_catalog_entry_version(kind: &str, version: u16) -> TableCatalogStoreResult<()> {
     if version != TABLE_CATALOG_ENTRY_VERSION {
         return Err(TableCatalogStoreError::Invalid(format!("unsupported {kind} entry version")));
@@ -2061,7 +2052,7 @@ mod tests {
         let bucket = "analytics";
         let namespace = Namespace::parse("analytics.daily_events").unwrap();
         let table = IdentifierSegment::parse("events").unwrap();
-        let bucket_root = format!("s3tables/catalog/table-buckets/{}/", catalog_path_hash(bucket));
+        let bucket_root = format!("s3tables/catalog/table-buckets/{}/", table_catalog_path_hash(bucket));
 
         assert_eq!(paths.table_bucket_entry_path(bucket), format!("{bucket_root}table-bucket.json"));
         assert_eq!(
