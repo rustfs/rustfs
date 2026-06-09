@@ -1730,6 +1730,28 @@ mod test {
     }
 
     #[test]
+    fn test_dedicated_kms_statement_without_resource_is_valid() {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(
+            result.is_ok(),
+            "KMS-only dedicated Action statement without Resource should be valid, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
     fn test_mixed_action_families_are_invalid_even_with_resource() {
         let data = r#"
 {
