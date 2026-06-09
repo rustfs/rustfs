@@ -25,6 +25,9 @@ hot-path behavior must not drift during this migration.
 - [`background-services-inventory.md`](background-services-inventory.md): current
   scanner, heal, lifecycle, replication, config reload, metrics, and shutdown
   surface before BackgroundController work.
+- [`background-controller-contract.md`](background-controller-contract.md):
+  desired/current/status/reconcile vocabulary and lifecycle boundaries for
+  future read-only BackgroundController work.
 - [`crate-boundaries.md`](crate-boundaries.md): PR types, crate direction,
   compatibility rules, and migration guardrails.
 - [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md):
