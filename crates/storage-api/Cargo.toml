@@ -27,5 +27,12 @@ categories = ["web-programming", "development-tools", "filesystem"]
 [lib]
 doctest = false
 
+[dependencies]
+serde.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

@@ -5,14 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-background-controller-contract`
-- Baseline: `upstream/main` at `f9a5e6d7e67322ac6f626b6f437a5e722fbe22e2`
-- PR type for this branch: `docs-only`
+- Branch: `overtrue/arch-storage-api-bucket-dtos`
+- Baseline: `upstream/main` at `5fef10548477d9d25b0d391874f8280bf259d10e`
+- PR type for this branch: `api-extraction`
 - Runtime behavior changes: none.
-- Rust code changes: none.
+- Rust code changes: move the pure bucket/options DTO subset from
+  `rustfs-ecstore` into `rustfs-storage-api`, while preserving old
+  `ecstore::store_api` import paths through a temporary compatibility
+  re-export.
 - CI/script changes: none
-- Docs changes: add BGC-002 background controller contract vocabulary and index
-  it from the background service inventory and architecture overview.
+- Docs changes: record API-003 bucket DTO compatibility cleanup.
 
 ## Phase 0 Tasks
 
@@ -114,6 +116,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused KMS redaction/status tests, full KMS tests, migration
     guards, Rust quality scan, clippy, and `make pre-commit` passed.
 
+## Phase 2 Storage API Tasks
+
+- [x] `API-001` Add `crates/storage-api`.
+  - Acceptance: the crate is a workspace member and starts as a contract crate
+    with no ECStore implementation dependency.
+  - Verification: `cargo check -p rustfs-storage-api`.
+- [~] `API-002` Move public storage error/result contracts.
+  - Current PR: `rustfs/rustfs#3313`.
+  - Acceptance: storage error code mapping is shared by the contract crate while
+    ECStore-specific error variants and conversions stay in ECStore.
+- [~] `API-003` Move DTOs.
+  - Current branch: move the pure bucket/options DTO subset:
+    `MakeBucketOptions`, `SRBucketDeleteOp`, `DeleteBucketOptions`,
+    `BucketOptions`, and `BucketInfo`.
+  - Acceptance: `rustfs-storage-api` exports these DTOs, ECStore re-exports
+    them from the old `ecstore::store_api` path, and compatibility cleanup is
+    registered with `RUSTFS_COMPAT_TODO(API-003)`.
+  - Must preserve: no `ObjectOptions`, `ObjectInfo`, reader, compression,
+    encryption, filemeta conversion, multipart conversion, route, storage, or
+    runtime behavior changes in this PR.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -137,43 +160,55 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `test-only`: add focused preservation tests before moving scanner, heal,
+1. `api-extraction`: continue API-003 with the next pure DTO subset only after
+   the bucket/options compatibility re-export is reviewed.
+2. `contract`: wait for API-002/#3313 before adding error-aware storage API
+   traits.
+3. `test-only`: add focused preservation tests before moving scanner, heal,
    replication, lifecycle, or disk health workers.
-2. `contract`: add a side-effect-free BGC-003 status snapshot for a low-risk
-   service such as memory observability.
-3. `behavior-change`: migrate one low-risk controller behind idempotence and
-   shutdown preservation tests.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `docs-only` BGC-002 contract; it defines vocabulary and boundaries without adding a Rust trait, scheduler, or service registry. |
-| Migration preservation | pass | No Rust source, Cargo manifest, workflow, script, runtime config, worker start/stop path, readiness path, or storage hot path diff. |
-| Testing/verification | pass | Architecture migration rules, layer dependency guard, metrics reference guard, docs diff hygiene, and no-code-diff check passed. |
+| Quality/architecture | pass | Only pure bucket/options DTOs moved into `rustfs-storage-api`; object, reader, compression, encryption, filemeta, multipart, storage, and runtime logic stayed in ECStore. |
+| Migration preservation | pass | Old `ecstore::store_api` import paths remain through `RUSTFS_COMPAT_TODO(API-003)` compatibility re-export, with cleanup registered. |
+| Testing/verification | pass | Focused DTO tests, ECStore compatibility test, migration guards, formatting, rio-v2 clippy, dependency review, diff checks, and pre-commit passed. |
 
 ## Verification Notes
 
 Passed:
+
+- `cargo test -p rustfs-storage-api`
+- `cargo test -p rustfs-ecstore --test storage_api_compat_test`
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore`
+- `cargo check -p rustfs-ecstore --features rio-v2`
+- `cargo clippy -p rustfs-ecstore --features rio-v2 --all-targets -- -D warnings`
+- `cargo fmt --all`
+- `cargo fmt --all --check`
 - `./scripts/check_architecture_migration_rules.sh`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
+- `./scripts/check_unsafe_code_allowances.sh`
 - `git diff --check`
-- `git diff --name-only -- '*.rs' 'Cargo.toml' 'Cargo.lock' '.github/**' 'Makefile' 'Justfile'`
+- `cargo tree -p rustfs-storage-api --edges normal`
+- `make NUM_CORES=1 pre-commit`
 
 Notes:
-- This branch changes architecture documentation only.
-- No Rust source, Cargo manifest, workflow, script, or runtime configuration is
-  changed.
-- `make pre-commit` is intentionally not required for this docs-only PR.
+- Plain `make pre-commit` runs `fmt` and `unsafe-code-check` concurrently via
+  global Makefile parallelism; `unsafe-code-check` passes standalone, and the
+  full pre-commit target passed when run serially with `NUM_CORES=1`.
+- Full nextest in pre-commit: 5704 passed, 111 skipped.
+- Workspace doctests passed.
 
 ## Handoff Notes
 
-- Keep this BGC-002 branch as a focused `docs-only` PR.
-- Do not add controller traits, status structs, service registry code,
-  scheduling, shutdown wiring, worker tests, or runtime behavior changes in this
-  PR.
-- Follow-up BGC-003 should add a side-effect-free status snapshot for one
-  low-risk service first, preferably memory observability.
+- Keep this API-003 branch as a focused `api-extraction` PR for bucket/options
+  DTOs only.
+- Do not move `ObjectOptions`, `ObjectInfo`, `CompletePart`, reader types,
+  compression/encryption helpers, filemeta conversions, S3 DTO conversions, or
+  storage traits in this PR.
+- Keep the old `ecstore::store_api` compatibility re-export until all consumers
+  import bucket DTOs from `rustfs_storage_api`.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.

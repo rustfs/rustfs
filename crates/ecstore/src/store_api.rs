@@ -39,7 +39,6 @@ use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_RESTORE, AMZ_STORAGE_CLASS};
 use rustfs_utils::path::decode_dir_object;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;

@@ -13,3 +13,7 @@
 // limitations under the License.
 
 //! Storage API contracts for RustFS.
+
+pub mod bucket;
+
+pub use bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};

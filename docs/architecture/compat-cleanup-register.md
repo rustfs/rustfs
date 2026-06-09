@@ -18,6 +18,12 @@ for later deletion.
   - Why: legacy KMS create-key and key-status admin grants must keep working during the dedicated KMS policy migration.
   - Removal condition: remove after KMS admin clients and built-in policies use `kms:Configure`, `kms:DescribeKey`, and `kms:ListKeys`.
   - Status: planned cleanup.
+- `RUSTFS_COMPAT_TODO(API-003)`
+  - Task: `API-003`
+  - File: `crates/ecstore/src/store_api/types.rs`
+  - Why: old `ecstore::store_api` bucket DTO import paths must keep compiling while storage API consumers migrate.
+  - Removal condition: remove after all consumers import bucket DTOs from the storage API crate.
+  - Status: planned cleanup.
 
 ## Review Checklist
 

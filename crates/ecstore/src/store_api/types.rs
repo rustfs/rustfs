@@ -1,29 +1,7 @@
 use super::*;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct MakeBucketOptions {
-    pub lock_enabled: bool,
-    pub versioning_enabled: bool,
-    pub force_create: bool,                 // Create buckets even if they are already created.
-    pub created_at: Option<OffsetDateTime>, // only for site replication
-    pub no_lock: bool,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub enum SRBucketDeleteOp {
-    #[default]
-    NoOp,
-    MarkDelete,
-    Purge,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct DeleteBucketOptions {
-    pub no_lock: bool,
-    pub no_recreate: bool,
-    pub force: bool, // Force deletion
-    pub srdelete_op: SRBucketDeleteOp,
-}
+// RUSTFS_COMPAT_TODO(API-003): keep old ecstore::store_api bucket DTO import paths while storage API consumers migrate. Remove after all consumers import these DTOs from rustfs_storage_api.
+pub use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 
 #[derive(Debug, Default, Clone)]
 pub struct HTTPPreconditions {
@@ -223,22 +201,6 @@ fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> 
     let mod_secs = mod_time.unix_timestamp();
     let given_secs = given_time.unix_timestamp();
     mod_secs > given_secs
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct BucketOptions {
-    pub deleted: bool, // true only when site replication is enabled
-    pub cached: bool, // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
-    pub no_metadata: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BucketInfo {
-    pub name: String,
-    pub created: Option<OffsetDateTime>,
-    pub deleted: Option<OffsetDateTime>,
-    pub versioning: bool,
-    pub object_locking: bool,
 }
 
 #[derive(Debug, Default, Clone)]
