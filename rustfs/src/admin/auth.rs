@@ -109,6 +109,19 @@ pub async fn validate_admin_request_with_bucket(
     remote_addr: Option<std::net::SocketAddr>,
     bucket: &str,
 ) -> S3Result<()> {
+    validate_admin_request_with_bucket_object(headers, cred, is_owner, deny_only, actions, remote_addr, bucket, "").await
+}
+
+pub async fn validate_admin_request_with_bucket_object(
+    headers: &HeaderMap,
+    cred: &Credentials,
+    is_owner: bool,
+    deny_only: bool,
+    actions: Vec<Action>,
+    remote_addr: Option<std::net::SocketAddr>,
+    bucket: &str,
+    object: &str,
+) -> S3Result<()> {
     let Ok(iam_store) = rustfs_iam::get() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
@@ -121,7 +134,7 @@ pub async fn validate_admin_request_with_bucket(
     };
 
     for action in &actions {
-        if check_admin_request_auth(iam_store.clone(), &ctx, *action, bucket, "")
+        if check_admin_request_auth(iam_store.clone(), &ctx, *action, bucket, object)
             .await
             .is_ok()
         {
