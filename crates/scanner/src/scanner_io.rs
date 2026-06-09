@@ -35,6 +35,7 @@ use rustfs_ecstore::bucket::versioning::VersioningApi as _;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::STORAGE_FORMAT_FILE;
+use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::disk::{Disk, DiskAPI};
 use rustfs_ecstore::error::{Error, StorageError};
 use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
@@ -55,6 +56,8 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+
+pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
 
 const METRIC_SCANNER_SET_SCAN_CONCURRENCY_LIMIT: &str = "rustfs_scanner_set_scan_concurrency_limit";
 const METRIC_SCANNER_DISK_SCAN_CONCURRENCY_LIMIT: &str = "rustfs_scanner_disk_scan_concurrency_limit";
@@ -939,11 +942,14 @@ impl ScannerIODisk for Disk {
         let done_object = Metrics::time(Metric::ScanObject);
 
         if !is_xl_meta_path(&item.path) {
-            return Err(StorageError::other("skip file".to_string()));
+            return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
         }
 
         let data = match self.read_metadata(&item.bucket, &item.object_path()).await {
             Ok(data) => data,
+            Err(e) if DiskError::is_err_object_not_found(&e) || DiskError::is_err_version_not_found(&e) => {
+                return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
+            }
             Err(e) => {
                 return Err(StorageError::other(format!(
                     "failed to read metadata: {e}, bucket={}, object_path={}",
@@ -960,7 +966,7 @@ impl ScannerIODisk for Disk {
             Ok(versions) => versions,
             Err(e) => {
                 error!("Failed to get file info versions: {}/{}, err: {e}", item.bucket, item.object_path());
-                return Err(StorageError::other("skip file".to_string()));
+                return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
             }
         };
 
@@ -1127,8 +1133,12 @@ impl ScannerIODisk for Disk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner_folder::ScannerItem;
+    use rustfs_ecstore::disk::{DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
+    use rustfs_ecstore::pools::path2_bucket_object_with_base_path;
     use serial_test::serial;
     use temp_env::with_var;
+    use uuid::Uuid;
 
     #[test]
     fn record_set_scan_failure_preserves_first_error() {
@@ -1214,6 +1224,65 @@ mod tests {
     #[test]
     fn is_xl_meta_path_accepts_forward_separator() {
         assert!(is_xl_meta_path("/data/bucket/object/xl.meta"));
+    }
+
+    #[tokio::test]
+    async fn get_size_treats_missing_metadata_as_skip_file() {
+        let temp_dir = std::env::temp_dir().join(format!("rustfs-scanner-missing-meta-{}", Uuid::new_v4()));
+        let bucket = "bucket";
+        let object = "object";
+        let object_dir = temp_dir.join(bucket).join(object);
+        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+        tokio::fs::create_dir_all(&object_dir)
+            .await
+            .expect("failed to create object directory");
+        tokio::fs::write(&metadata_path, [])
+            .await
+            .expect("failed to create metadata placeholder");
+
+        let endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("failed to open local disk");
+
+        let relative_path = metadata_path.to_string_lossy().to_string();
+        let (_, scanner_path) = path2_bucket_object_with_base_path(temp_dir.to_string_lossy().as_ref(), relative_path.as_str());
+        let file_type = tokio::fs::metadata(&metadata_path)
+            .await
+            .expect("failed to stat metadata placeholder")
+            .file_type();
+
+        tokio::fs::remove_dir_all(&object_dir)
+            .await
+            .expect("failed to remove object directory");
+
+        let item = ScannerItem {
+            path: scanner_path,
+            bucket: bucket.to_string(),
+            prefix: object.to_string(),
+            object_name: STORAGE_FORMAT_FILE.to_string(),
+            file_type,
+            lifecycle: None,
+            replication: None,
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        };
+
+        let err = disk
+            .get_size(item)
+            .await
+            .expect_err("missing metadata should be skipped instead of reported as a scanner failure");
+        assert!(matches!(err, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[test]

@@ -49,7 +49,7 @@ jobs:
       contents: read
       id-token: write
     env:
-      NIX_CURL_FLAGS: -A cargo/1.95.0
+      NIX_CURL_FLAGS: -A cargo/stable
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6

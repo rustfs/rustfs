@@ -1725,6 +1725,7 @@ fn is_lower_ascii_alnum(value: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn reserved_table_object_key_matches_exact_prefix_and_children_only() {
@@ -2490,7 +2491,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, TableCatalogStoreError::Conflict(_)));
+        assert_matches!(err, TableCatalogStoreError::Conflict(_));
         assert!(backend.object_exists(bucket, &old).await.unwrap());
     }
 
@@ -2690,7 +2691,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, TableCatalogStoreError::Internal(_)));
+        assert_matches!(err, TableCatalogStoreError::Internal(_));
         let loaded = store.load_table(bucket, "sales", "orders").await.unwrap().unwrap();
         assert_eq!(loaded.metadata_location, current_metadata);
         assert_eq!(loaded.version_token, "token-v1");
@@ -2789,7 +2790,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, TableCatalogStoreError::Conflict(_)));
+        assert_matches!(err, TableCatalogStoreError::Conflict(_));
         let loaded = store.load_table(bucket, "sales", "orders").await.unwrap().unwrap();
         assert_eq!(loaded.metadata_location, current_metadata);
         assert_eq!(loaded.version_token, "token-v1");

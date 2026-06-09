@@ -28,7 +28,7 @@ use crate::runtime_config::{
     scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
 };
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetReason};
-use crate::scanner_io::ScannerIODisk as _;
+use crate::scanner_io::{SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _};
 use crate::sleeper::DynamicSleeper;
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
@@ -36,7 +36,8 @@ use rustfs_common::heal_channel::{
     send_heal_request_with_admission,
 };
 use rustfs_common::metrics::{
-    IlmAction, Metric, Metrics, ScannerWorkSource, UpdateCurrentPathFn, current_path_updater, global_metrics,
+    IlmAction, Metric, Metrics, ScannerSourceWorkUpdate, ScannerWorkSource, UpdateCurrentPathFn, current_path_updater,
+    global_metrics,
 };
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_expiry_rule};
@@ -45,7 +46,9 @@ use rustfs_ecstore::bucket::lifecycle::{
     bucket_lifecycle_ops::apply_transition_rule,
     lifecycle::{Event, Lifecycle, ObjectOpts},
 };
-use rustfs_ecstore::bucket::replication::{ReplicationConfig, ReplicationConfigurationExt as _, queue_replication_heal_internal};
+use rustfs_ecstore::bucket::replication::{
+    ReplicationConfig, ReplicationConfigurationExt as _, ReplicationQueueAdmission, queue_replication_heal_internal,
+};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
@@ -159,6 +162,18 @@ fn record_scanner_ilm_action_if_queued(metrics: &Metrics, count: u64, queued: bo
         metrics.record_scanner_ilm_action(count);
     }
     queued
+}
+
+fn record_scanner_replication_admission(metrics: &Metrics, admission: ReplicationQueueAdmission) {
+    let work = match admission {
+        ReplicationQueueAdmission::Queued => ScannerSourceWorkUpdate::queued(1),
+        ReplicationQueueAdmission::Missed => ScannerSourceWorkUpdate::missed(1),
+        ReplicationQueueAdmission::Skipped => ScannerSourceWorkUpdate {
+            skipped: 1,
+            ..Default::default()
+        },
+    };
+    metrics.record_scanner_source_work(ScannerWorkSource::BucketReplication, work);
 }
 
 #[derive(Clone, Copy)]
@@ -731,8 +746,10 @@ impl ScannerItem {
         };
 
         let done_replication = Metrics::time(Metric::CheckReplication);
-        let roi = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
+        let replication_result = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
         done_replication();
+        record_scanner_replication_admission(global_metrics(), replication_result.admission);
+        let roi = replication_result.object_info;
         if !Self::should_account_replication_stats(oi) {
             return;
         }
@@ -1286,7 +1303,7 @@ impl FolderScanner {
                 let sz = match self.local_disk.get_size(item.clone()).await {
                     Ok(sz) => sz,
                     Err(e) => {
-                        let is_skip_file = matches!(e, StorageError::Io(ref io) if io.to_string() == "skip file");
+                        let is_skip_file = matches!(e, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR);
 
                         if !is_skip_file {
                             // Track failed objects to prevent infinite retry loops
@@ -2126,6 +2143,26 @@ mod tests {
         assert_eq!(queued_summary.versions, 0);
         assert_eq!(queued_summary.total_size, 0);
         assert_eq!(queued_cumulative_size, 0);
+    }
+
+    #[tokio::test]
+    async fn test_scanner_replication_admission_accounting_maps_source_work() {
+        let metrics = Metrics::new();
+
+        record_scanner_replication_admission(&metrics, ReplicationQueueAdmission::Skipped);
+        record_scanner_replication_admission(&metrics, ReplicationQueueAdmission::Queued);
+        record_scanner_replication_admission(&metrics, ReplicationQueueAdmission::Missed);
+
+        let report = metrics.report().await;
+        let replication = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::BucketReplication.as_str())
+            .expect("bucket replication source work should be visible");
+
+        assert_eq!(replication.skipped, 1);
+        assert_eq!(replication.queued, 1);
+        assert_eq!(replication.missed, 1);
     }
 
     #[test]
