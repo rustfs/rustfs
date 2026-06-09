@@ -16,6 +16,9 @@ mod auth;
 pub mod console;
 pub mod handlers;
 mod plugin_contract;
+// Contract inventory is validated by tests before later runtime integration.
+#[allow(dead_code)]
+pub(crate) mod route_policy;
 pub mod router;
 pub mod service;
 pub mod site_replication_identity;

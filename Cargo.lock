@@ -9105,6 +9105,7 @@ dependencies = [
  "rustfs-s3select-api",
  "rustfs-s3select-query",
  "rustfs-scanner",
+ "rustfs-security-governance",
  "rustfs-signer",
  "rustfs-targets",
  "rustfs-tls-runtime",
