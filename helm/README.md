@@ -61,6 +61,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
+| priorityClassName | string | `""` |  |
 | enableServiceLinks | bool | `false` |  |
 | extraManifests | list | `[]` | List of additional k8s manifests. |
 | fullnameOverride | string | `""` |  |
