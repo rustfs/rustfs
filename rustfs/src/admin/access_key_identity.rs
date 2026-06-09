@@ -25,11 +25,139 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::debug;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccessKeyUserType {
+    User,
+    ServiceAccount,
+    Sts,
+}
+
+impl AccessKeyUserType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::ServiceAccount => "Service Account",
+            Self::Sts => "STS",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccessKeyProvider {
+    Builtin,
+    Ldap,
+    OpenId,
+}
+
+impl AccessKeyProvider {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Ldap => "ldap",
+            Self::OpenId => "openid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StableSubjectHint {
+    BuiltinAccessKey(String),
+    LdapUser(String),
+    OpenId { issuer: String, subject: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccessKeyIdentity {
+    user_type: AccessKeyUserType,
+    provider: AccessKeyProvider,
+    stable_subject_hint: Option<StableSubjectHint>,
+}
+
+impl AccessKeyIdentity {
+    fn from_credentials(credentials: &StoredCredentials) -> Self {
+        let user_type = if credentials.is_temp() {
+            AccessKeyUserType::Sts
+        } else if credentials.is_service_account() {
+            AccessKeyUserType::ServiceAccount
+        } else {
+            AccessKeyUserType::User
+        };
+
+        let provider = match user_type {
+            AccessKeyUserType::User => AccessKeyProvider::Builtin,
+            AccessKeyUserType::ServiceAccount | AccessKeyUserType::Sts => {
+                classify_provider_from_claims(credentials.claims.as_ref())
+            }
+        };
+
+        let stable_subject_hint = match provider {
+            AccessKeyProvider::Builtin => match user_type {
+                AccessKeyUserType::User => Some(StableSubjectHint::BuiltinAccessKey(credentials.access_key.clone())),
+                AccessKeyUserType::ServiceAccount | AccessKeyUserType::Sts => None,
+            },
+            AccessKeyProvider::Ldap => {
+                claim_string(credentials.claims.as_ref(), &["ldap:user", "ldap:username"]).map(StableSubjectHint::LdapUser)
+            }
+            AccessKeyProvider::OpenId => stable_openid_subject_hint(credentials.claims.as_ref()),
+        };
+
+        Self {
+            user_type,
+            provider,
+            stable_subject_hint,
+        }
+    }
+
+    fn ldap_specific_info(&self, claims: Option<&HashMap<String, serde_json::Value>>) -> LDAPSpecificAccessKeyInfo {
+        let username = match &self.stable_subject_hint {
+            Some(StableSubjectHint::LdapUser(username)) => Some(username.clone()),
+            _ => claim_string(claims, &["ldap:user", "ldap:username"]),
+        };
+
+        LDAPSpecificAccessKeyInfo { username }
+    }
+
+    fn openid_specific_info(&self, claims: Option<&HashMap<String, serde_json::Value>>) -> OpenIDSpecificAccessKeyInfo {
+        let user_id = match &self.stable_subject_hint {
+            Some(StableSubjectHint::OpenId { subject, .. }) => Some(subject.clone()),
+            _ => claim_string(claims, &["sub"]),
+        };
+        let display_name = claim_string(claims, &["name"]);
+
+        OpenIDSpecificAccessKeyInfo {
+            config_name: None,
+            user_id: user_id.clone(),
+            user_id_claim: user_id.as_ref().map(|_| "sub".to_string()),
+            display_name: display_name.clone(),
+            display_name_claim: display_name.as_ref().map(|_| "name".to_string()),
+        }
+    }
+}
+
+fn identity_from_provider(
+    user_type: AccessKeyUserType,
+    provider: AccessKeyProvider,
+    claims: Option<&HashMap<String, serde_json::Value>>,
+) -> AccessKeyIdentity {
+    let stable_subject_hint = match provider {
+        AccessKeyProvider::Builtin => None,
+        AccessKeyProvider::Ldap => claim_string(claims, &["ldap:user", "ldap:username"]).map(StableSubjectHint::LdapUser),
+        AccessKeyProvider::OpenId => stable_openid_subject_hint(claims),
+    };
+
+    AccessKeyIdentity {
+        user_type,
+        provider,
+        stable_subject_hint,
+    }
+}
+
 pub(crate) async fn resolve_info_access_key_resp<T: IamStore>(
     iam_store: &rustfs_iam::sys::IamSys<T>,
     access_key: String,
     target_cred: StoredCredentials,
 ) -> S3Result<InfoAccessKeyResp> {
+    let identity = AccessKeyIdentity::from_credentials(&target_cred);
     let (user_type, info) = if target_cred.is_temp() {
         let (_, session_policy) = iam_store.get_temporary_account(&access_key).await.map_err(|e| {
             debug!("get temporary account failed, e: {:?}", e);
@@ -40,7 +168,7 @@ pub(crate) async fn resolve_info_access_key_resp<T: IamStore>(
             }
         })?;
         (
-            "STS".to_string(),
+            identity.user_type.as_str().to_string(),
             build_info_service_account_resp(iam_store, &target_cred, session_policy).await?,
         )
     } else if target_cred.is_service_account() {
@@ -53,7 +181,7 @@ pub(crate) async fn resolve_info_access_key_resp<T: IamStore>(
             }
         })?;
         (
-            "Service Account".to_string(),
+            identity.user_type.as_str().to_string(),
             build_info_service_account_resp(iam_store, &target_cred, session_policy).await?,
         )
     } else {
@@ -61,22 +189,25 @@ pub(crate) async fn resolve_info_access_key_resp<T: IamStore>(
             debug!("get user info failed, e: {:?}", e);
             iam_error_to_s3_error(e)
         })?;
-        ("User".to_string(), build_info_regular_user_resp(&target_cred, &user_info))
+        (
+            identity.user_type.as_str().to_string(),
+            build_info_regular_user_resp(&target_cred, &user_info),
+        )
     };
 
-    let user_provider = guess_user_provider(&target_cred).to_string();
+    let user_provider = identity.provider.as_str().to_string();
     Ok(InfoAccessKeyResp {
         access_key,
         info,
         user_type,
         user_provider: user_provider.clone(),
         ldap_specific_info: if user_provider == "ldap" {
-            ldap_specific_info(target_cred.claims.as_ref())
+            identity.ldap_specific_info(target_cred.claims.as_ref())
         } else {
             LDAPSpecificAccessKeyInfo::default()
         },
         open_id_specific_info: if user_provider == "openid" {
-            openid_specific_info(target_cred.claims.as_ref())
+            identity.openid_specific_info(target_cred.claims.as_ref())
         } else {
             OpenIDSpecificAccessKeyInfo::default()
         },
@@ -141,56 +272,19 @@ pub(crate) fn build_info_regular_user_resp(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn guess_user_provider(credentials: &StoredCredentials) -> &'static str {
-    if !credentials.is_service_account() && !credentials.is_temp() {
-        return "builtin";
-    }
-
-    let Some(claims) = credentials.claims.as_ref() else {
-        return "builtin";
-    };
-
-    if claims.contains_key("ldap:user") || claims.contains_key("ldap:username") {
-        return "ldap";
-    }
-
-    if claims.contains_key("sub") {
-        return "openid";
-    }
-
-    "builtin"
+    AccessKeyIdentity::from_credentials(credentials).provider.as_str()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ldap_specific_info(claims: Option<&HashMap<String, serde_json::Value>>) -> LDAPSpecificAccessKeyInfo {
-    let username = claims
-        .and_then(|claims| {
-            claims
-                .get("ldap:user")
-                .or_else(|| claims.get("ldap:username"))
-                .and_then(|value| value.as_str())
-        })
-        .map(ToOwned::to_owned);
-
-    LDAPSpecificAccessKeyInfo { username }
+    identity_from_provider(AccessKeyUserType::ServiceAccount, AccessKeyProvider::Ldap, claims).ldap_specific_info(claims)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn openid_specific_info(claims: Option<&HashMap<String, serde_json::Value>>) -> OpenIDSpecificAccessKeyInfo {
-    let user_id = claims
-        .and_then(|claims| claims.get("sub"))
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned);
-    let display_name = claims
-        .and_then(|claims| claims.get("name"))
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned);
-
-    OpenIDSpecificAccessKeyInfo {
-        config_name: None,
-        user_id: user_id.clone(),
-        user_id_claim: user_id.as_ref().map(|_| "sub".to_string()),
-        display_name: display_name.clone(),
-        display_name_claim: display_name.as_ref().map(|_| "name".to_string()),
-    }
+    identity_from_provider(AccessKeyUserType::ServiceAccount, AccessKeyProvider::OpenId, claims).openid_specific_info(claims)
 }
 
 pub(crate) fn list_entry_from_credentials(account: &StoredCredentials, expiration: Option<OffsetDateTime>) -> ServiceAccountInfo {
@@ -205,10 +299,37 @@ pub(crate) fn list_entry_from_credentials(account: &StoredCredentials, expiratio
     }
 }
 
+fn classify_provider_from_claims(claims: Option<&HashMap<String, serde_json::Value>>) -> AccessKeyProvider {
+    if claim_string(claims, &["ldap:user", "ldap:username"]).is_some() {
+        return AccessKeyProvider::Ldap;
+    }
+
+    if claim_string(claims, &["sub"]).is_some() {
+        return AccessKeyProvider::OpenId;
+    }
+
+    AccessKeyProvider::Builtin
+}
+
+fn stable_openid_subject_hint(claims: Option<&HashMap<String, serde_json::Value>>) -> Option<StableSubjectHint> {
+    let issuer = claim_string(claims, &["iss"])?;
+    let subject = claim_string(claims, &["sub"])?;
+
+    Some(StableSubjectHint::OpenId { issuer, subject })
+}
+
+fn claim_string(claims: Option<&HashMap<String, serde_json::Value>>, keys: &[&str]) -> Option<String> {
+    claims.and_then(|claims| {
+        keys.iter()
+            .find_map(|key| claims.get(*key).and_then(|value| value.as_str()).map(ToOwned::to_owned))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustfs_iam::error::Error as IamError;
+    use serde_json::json;
 
     #[test]
     fn regular_user_lookup_errors_match_shared_iam_mapper() {
@@ -222,5 +343,105 @@ mod tests {
         assert_eq!(mapped.code(), expected.code());
         assert_eq!(mapped.message(), expected.message());
         assert_eq!(mapped.source().is_some(), expected.source().is_some());
+    }
+
+    #[test]
+    fn builtin_regular_user_identity_uses_access_key_as_stable_hint() {
+        let credentials = StoredCredentials {
+            access_key: "builtin-user".to_string(),
+            ..Default::default()
+        };
+
+        let identity = AccessKeyIdentity::from_credentials(&credentials);
+
+        assert_eq!(identity.user_type, AccessKeyUserType::User);
+        assert_eq!(identity.provider, AccessKeyProvider::Builtin);
+        assert_eq!(
+            identity.stable_subject_hint,
+            Some(StableSubjectHint::BuiltinAccessKey("builtin-user".to_string()))
+        );
+    }
+
+    #[test]
+    fn builtin_regular_user_takes_precedence_over_ldap_like_claims() {
+        let credentials = StoredCredentials {
+            access_key: "svc".to_string(),
+            parent_user: "parent".to_string(),
+            claims: Some(HashMap::from([("ldap:username".to_string(), json!("alice"))])),
+            ..Default::default()
+        };
+
+        let identity = AccessKeyIdentity::from_credentials(&credentials);
+
+        assert_eq!(identity.user_type, AccessKeyUserType::User);
+        assert_eq!(identity.provider, AccessKeyProvider::Builtin);
+        assert_eq!(identity.stable_subject_hint, Some(StableSubjectHint::BuiltinAccessKey("svc".to_string())));
+    }
+
+    #[test]
+    fn ldap_service_account_identity_uses_known_ldap_claim_as_stable_hint() {
+        let credentials = StoredCredentials {
+            access_key: "svc".to_string(),
+            parent_user: "parent".to_string(),
+            claims: Some(HashMap::from([
+                ("ldap:username".to_string(), json!("alice")),
+                (rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(), json!("embedded")),
+            ])),
+            ..Default::default()
+        };
+
+        let identity = AccessKeyIdentity::from_credentials(&credentials);
+
+        assert_eq!(identity.user_type, AccessKeyUserType::ServiceAccount);
+        assert_eq!(identity.provider, AccessKeyProvider::Ldap);
+        assert_eq!(identity.stable_subject_hint, Some(StableSubjectHint::LdapUser("alice".to_string())));
+    }
+
+    #[test]
+    fn openid_identity_requires_issuer_for_stable_hint_but_keeps_legacy_user_id_projection() {
+        let claims = HashMap::from([
+            ("sub".to_string(), json!("subject-123")),
+            ("name".to_string(), json!("RustFS User")),
+        ]);
+        let credentials = StoredCredentials {
+            access_key: "sts".to_string(),
+            session_token: "session-token".to_string(),
+            parent_user: "parent".to_string(),
+            claims: Some(claims.clone()),
+            ..Default::default()
+        };
+
+        let identity = AccessKeyIdentity::from_credentials(&credentials);
+        let openid_info = identity.openid_specific_info(Some(&claims));
+
+        assert_eq!(identity.user_type, AccessKeyUserType::Sts);
+        assert_eq!(identity.provider, AccessKeyProvider::OpenId);
+        assert_eq!(identity.stable_subject_hint, None);
+        assert_eq!(openid_info.user_id.as_deref(), Some("subject-123"));
+        assert_eq!(openid_info.display_name.as_deref(), Some("RustFS User"));
+    }
+
+    #[test]
+    fn openid_identity_uses_issuer_and_subject_as_stable_hint() {
+        let credentials = StoredCredentials {
+            access_key: "sts".to_string(),
+            session_token: "session-token".to_string(),
+            parent_user: "parent".to_string(),
+            claims: Some(HashMap::from([
+                ("iss".to_string(), json!("https://issuer.example/realms/rustfs")),
+                ("sub".to_string(), json!("subject-123")),
+            ])),
+            ..Default::default()
+        };
+
+        let identity = AccessKeyIdentity::from_credentials(&credentials);
+
+        assert_eq!(
+            identity.stable_subject_hint,
+            Some(StableSubjectHint::OpenId {
+                issuer: "https://issuer.example/realms/rustfs".to_string(),
+                subject: "subject-123".to_string(),
+            })
+        );
     }
 }
