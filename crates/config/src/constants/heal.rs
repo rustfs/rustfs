@@ -12,6 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Heal admin config subsystem name.
+pub const HEAL_SUB_SYS: &str = "heal";
+
+/// Heal config key setting the scanner-driven periodic deep bitrot scan cycle in seconds.
+pub const HEAL_BITROT_CYCLE: &str = "bitrot_cycle";
+
+/// Heal config keys supported by the admin config subsystem.
+pub const HEAL_KEYS: &[&str] = &[HEAL_BITROT_CYCLE];
+
+/// Default scanner-driven bitrot scan cycle used by heal/scanner runtime config.
+pub const DEFAULT_HEAL_BITROT_CYCLE_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Environment variable name that enables or disables auto-heal functionality.
 /// - Purpose: Control whether the system automatically performs heal operations.
 /// - Valid values: "true" or "false" (case insensitive).

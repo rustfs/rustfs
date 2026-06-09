@@ -15,8 +15,8 @@
 use crate::scanner_budget::ScannerCycleBudgetConfig;
 use crate::sleeper::{SCANNER_SLEEPER, scanner_default_speed};
 use rustfs_config::{
-    DEFAULT_DELIMITER, DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS, DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE,
-    DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS, DEFAULT_SCANNER_BITROT_CYCLE_SECS, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
+    DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS,
+    DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE, DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
     DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS,
     DEFAULT_SCANNER_IDLE_MODE, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS,
     DEFAULT_SCANNER_SPEED, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
@@ -24,9 +24,9 @@ use rustfs_config::{
     ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
     ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_IDLE_MODE,
     ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
-    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, SCANNER_ALERT_EXCESS_FOLDERS, SCANNER_ALERT_EXCESS_VERSION_SIZE,
-    SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE,
-    SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_IDLE_MODE,
+    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, SCANNER_ALERT_EXCESS_FOLDERS,
+    SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT,
+    SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_IDLE_MODE,
     SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS,
     SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
 };
@@ -51,6 +51,7 @@ static SCANNER_RUNTIME_CONFIG: LazyLock<RwLock<ScannerRuntimeConfig>> =
 pub enum ScannerRuntimeConfigSource {
     Env,
     Config,
+    ScannerCompatConfig,
     Default,
 }
 
@@ -99,7 +100,7 @@ impl Default for ScannerRuntimeConfig {
                 .map(Duration::from_secs)
                 .unwrap_or_else(|| scanner_default_speed().cycle_interval()),
             cycle_interval_source: ScannerRuntimeConfigSource::Default,
-            bitrot_cycle: Some(Duration::from_secs(DEFAULT_SCANNER_BITROT_CYCLE_SECS)),
+            bitrot_cycle: Some(Duration::from_secs(DEFAULT_HEAL_BITROT_CYCLE_SECS)),
             bitrot_cycle_source: ScannerRuntimeConfigSource::Default,
             cycle_budget: ScannerCycleBudgetConfig::default(),
             cycle_max_duration_source: ScannerRuntimeConfigSource::Default,
@@ -183,6 +184,10 @@ fn scanner_kvs(config: Option<&ServerConfig>) -> Option<KVS> {
     config.and_then(|config| config.get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER))
 }
 
+fn heal_kvs(config: Option<&ServerConfig>) -> Option<KVS> {
+    config.and_then(|config| config.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER))
+}
+
 fn validate_default_scanner_target(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
     let Some(targets) = config.0.get(SCANNER_SUB_SYS) else {
         return Ok(());
@@ -191,6 +196,19 @@ fn validate_default_scanner_target(config: &ServerConfig) -> Result<(), ScannerR
     for target in targets.keys() {
         if target != DEFAULT_DELIMITER {
             return Err(invalid_value("target", target.clone(), "scanner config only supports the default target"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_default_heal_target(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
+    let Some(targets) = config.0.get(HEAL_SUB_SYS) else {
+        return Ok(());
+    };
+
+    for target in targets.keys() {
+        if target != DEFAULT_DELIMITER {
+            return Err(invalid_value("target", target.clone(), "heal config only supports the default target"));
         }
     }
     Ok(())
@@ -228,11 +246,11 @@ fn parse_config_speed(value: String) -> Result<ScannerSpeed, ScannerRuntimeConfi
     ScannerSpeed::parse_str(&value).ok_or_else(|| invalid_value(SCANNER_SPEED, value, "expected scanner speed preset"))
 }
 
-fn parse_config_bitrot_cycle(value: String) -> Result<Option<Duration>, ScannerRuntimeConfigError> {
+fn parse_config_bitrot_cycle(key: &'static str, value: String) -> Result<Option<Duration>, ScannerRuntimeConfigError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "0" | "true" | "on" | "yes" => Ok(Some(Duration::ZERO)),
         "false" | "off" | "no" | "disabled" => Ok(None),
-        _ => parse_config_u64(SCANNER_BITROT_CYCLE, value).map(|secs| Some(Duration::from_secs(secs))),
+        _ => parse_config_u64(key, value).map(|secs| Some(Duration::from_secs(secs))),
     }
 }
 
@@ -244,10 +262,10 @@ fn parse_env_bitrot_cycle(value: String) -> Option<Duration> {
             warn!(
                 env = ENV_SCANNER_BITROT_CYCLE_SECS,
                 value,
-                default_secs = DEFAULT_SCANNER_BITROT_CYCLE_SECS,
+                default_secs = DEFAULT_HEAL_BITROT_CYCLE_SECS,
                 "Invalid scanner bitrot cycle, using default"
             );
-            Some(Duration::from_secs(DEFAULT_SCANNER_BITROT_CYCLE_SECS))
+            Some(Duration::from_secs(DEFAULT_HEAL_BITROT_CYCLE_SECS))
         }),
     }
 }
@@ -276,31 +294,37 @@ fn validate_optional_config_usize(
 
 fn validate_persisted_scanner_runtime_config(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
     validate_default_scanner_target(config)?;
+    validate_default_heal_target(config)?;
 
-    let kvs = scanner_kvs(Some(config));
-    let kvs = kvs.as_ref();
+    let scanner_kvs = scanner_kvs(Some(config));
+    let scanner_kvs = scanner_kvs.as_ref();
+    let heal_kvs = heal_kvs(Some(config));
+    let heal_kvs = heal_kvs.as_ref();
 
-    if let Some(value) = config_value(kvs, SCANNER_SPEED, DEFAULT_SCANNER_SPEED) {
+    if let Some(value) = config_value(scanner_kvs, SCANNER_SPEED, DEFAULT_SCANNER_SPEED) {
         parse_config_speed(value)?;
     }
-    if let Some(value) = config_value(kvs, SCANNER_IDLE_MODE, DEFAULT_SCANNER_IDLE_MODE) {
+    if let Some(value) = config_value(scanner_kvs, SCANNER_IDLE_MODE, DEFAULT_SCANNER_IDLE_MODE) {
         parse_config_bool(SCANNER_IDLE_MODE, value)?;
     }
-    validate_optional_config_u64(kvs, SCANNER_START_DELAY, "")?;
-    validate_optional_config_u64(kvs, SCANNER_CYCLE, "")?;
-    validate_optional_config_u64(kvs, SCANNER_CYCLE_MAX_DURATION, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS)?;
-    validate_optional_config_u64(kvs, SCANNER_CYCLE_MAX_OBJECTS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS)?;
-    validate_optional_config_u64(kvs, SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES)?;
-    if let Some(value) = config_value(kvs, SCANNER_BITROT_CYCLE, DEFAULT_SCANNER_BITROT_CYCLE_SECS) {
-        parse_config_bitrot_cycle(value)?;
+    validate_optional_config_u64(scanner_kvs, SCANNER_START_DELAY, "")?;
+    validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE, "")?;
+    validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_DURATION, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS)?;
+    validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_OBJECTS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS)?;
+    validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES)?;
+    if let Some(value) = config_value(heal_kvs, HEAL_BITROT_CYCLE, DEFAULT_HEAL_BITROT_CYCLE_SECS) {
+        parse_config_bitrot_cycle(HEAL_BITROT_CYCLE, value)?;
     }
-    validate_optional_config_u64(kvs, SCANNER_CACHE_SAVE_TIMEOUT, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)?;
-    validate_optional_config_usize(kvs, SCANNER_MAX_CONCURRENT_SET_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS)?;
-    validate_optional_config_usize(kvs, SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS)?;
-    validate_optional_config_u64(kvs, SCANNER_YIELD_EVERY_N_OBJECTS, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS)?;
-    validate_optional_config_u64(kvs, SCANNER_ALERT_EXCESS_VERSIONS, DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS)?;
-    validate_optional_config_u64(kvs, SCANNER_ALERT_EXCESS_VERSION_SIZE, DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE)?;
-    validate_optional_config_u64(kvs, SCANNER_ALERT_EXCESS_FOLDERS, DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS)?;
+    if let Some(value) = config_value(scanner_kvs, SCANNER_BITROT_CYCLE, DEFAULT_HEAL_BITROT_CYCLE_SECS) {
+        parse_config_bitrot_cycle(SCANNER_BITROT_CYCLE, value)?;
+    }
+    validate_optional_config_u64(scanner_kvs, SCANNER_CACHE_SAVE_TIMEOUT, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)?;
+    validate_optional_config_usize(scanner_kvs, SCANNER_MAX_CONCURRENT_SET_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS)?;
+    validate_optional_config_usize(scanner_kvs, SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS)?;
+    validate_optional_config_u64(scanner_kvs, SCANNER_YIELD_EVERY_N_OBJECTS, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS)?;
+    validate_optional_config_u64(scanner_kvs, SCANNER_ALERT_EXCESS_VERSIONS, DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS)?;
+    validate_optional_config_u64(scanner_kvs, SCANNER_ALERT_EXCESS_VERSION_SIZE, DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE)?;
+    validate_optional_config_u64(scanner_kvs, SCANNER_ALERT_EXCESS_FOLDERS, DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS)?;
 
     Ok(())
 }
@@ -408,15 +432,18 @@ fn lookup_bool(
 pub(crate) fn lookup_scanner_runtime_config(
     config: Option<&ServerConfig>,
 ) -> Result<ScannerRuntimeConfig, ScannerRuntimeConfigError> {
-    let kvs = scanner_kvs(config);
-    let kvs = kvs.as_ref();
-    let (speed, speed_source) = lookup_speed(kvs)?;
-    let (idle_mode, idle_mode_source) = lookup_bool(kvs, SCANNER_IDLE_MODE, ENV_SCANNER_IDLE_MODE, DEFAULT_SCANNER_IDLE_MODE)?;
-    let (start_delay, start_delay_source) = lookup_start_delay(kvs)?;
+    let scanner_kvs = scanner_kvs(config);
+    let scanner_kvs = scanner_kvs.as_ref();
+    let heal_kvs = heal_kvs(config);
+    let heal_kvs = heal_kvs.as_ref();
+    let (speed, speed_source) = lookup_speed(scanner_kvs)?;
+    let (idle_mode, idle_mode_source) =
+        lookup_bool(scanner_kvs, SCANNER_IDLE_MODE, ENV_SCANNER_IDLE_MODE, DEFAULT_SCANNER_IDLE_MODE)?;
+    let (start_delay, start_delay_source) = lookup_start_delay(scanner_kvs)?;
 
     let (cycle_interval, cycle_interval_source) = if let Some(secs) = rustfs_utils::get_env_opt_u64(ENV_SCANNER_CYCLE) {
         (Duration::from_secs(secs), ScannerRuntimeConfigSource::Env)
-    } else if let Some(value) = config_value(kvs, SCANNER_CYCLE, "") {
+    } else if let Some(value) = config_value(scanner_kvs, SCANNER_CYCLE, "") {
         (
             Duration::from_secs(parse_config_u64(SCANNER_CYCLE, value)?),
             ScannerRuntimeConfigSource::Config,
@@ -430,19 +457,19 @@ pub(crate) fn lookup_scanner_runtime_config(
     };
 
     let (cycle_max_duration, cycle_max_duration_source) = lookup_optional_seconds(
-        kvs,
+        scanner_kvs,
         SCANNER_CYCLE_MAX_DURATION,
         ENV_SCANNER_CYCLE_MAX_DURATION_SECS,
         DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS,
     )?;
     let (cycle_max_objects, cycle_max_objects_source) = lookup_count_budget(
-        kvs,
+        scanner_kvs,
         SCANNER_CYCLE_MAX_OBJECTS,
         ENV_SCANNER_CYCLE_MAX_OBJECTS,
         DEFAULT_SCANNER_CYCLE_MAX_OBJECTS,
     )?;
     let (cycle_max_directories, cycle_max_directories_source) = lookup_count_budget(
-        kvs,
+        scanner_kvs,
         SCANNER_CYCLE_MAX_DIRECTORIES,
         ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
         DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES,
@@ -455,53 +482,58 @@ pub(crate) fn lookup_scanner_runtime_config(
 
     let (bitrot_cycle, bitrot_cycle_source) = if let Some(value) = rustfs_utils::get_env_opt_str(ENV_SCANNER_BITROT_CYCLE_SECS) {
         (parse_env_bitrot_cycle(value), ScannerRuntimeConfigSource::Env)
-    } else if let Some(value) = config_value(kvs, SCANNER_BITROT_CYCLE, DEFAULT_SCANNER_BITROT_CYCLE_SECS) {
-        (parse_config_bitrot_cycle(value)?, ScannerRuntimeConfigSource::Config)
+    } else if let Some(value) = config_value(heal_kvs, HEAL_BITROT_CYCLE, DEFAULT_HEAL_BITROT_CYCLE_SECS) {
+        (parse_config_bitrot_cycle(HEAL_BITROT_CYCLE, value)?, ScannerRuntimeConfigSource::Config)
+    } else if let Some(value) = config_value(scanner_kvs, SCANNER_BITROT_CYCLE, DEFAULT_HEAL_BITROT_CYCLE_SECS) {
+        (
+            parse_config_bitrot_cycle(SCANNER_BITROT_CYCLE, value)?,
+            ScannerRuntimeConfigSource::ScannerCompatConfig,
+        )
     } else {
         (
-            Some(Duration::from_secs(DEFAULT_SCANNER_BITROT_CYCLE_SECS)),
+            Some(Duration::from_secs(DEFAULT_HEAL_BITROT_CYCLE_SECS)),
             ScannerRuntimeConfigSource::Default,
         )
     };
 
     let (cache_save_timeout, cache_save_timeout_source) = lookup_u64(
-        kvs,
+        scanner_kvs,
         SCANNER_CACHE_SAVE_TIMEOUT,
         ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
         DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
     )?;
     let (max_concurrent_set_scans, max_concurrent_set_scans_source) = lookup_usize(
-        kvs,
+        scanner_kvs,
         SCANNER_MAX_CONCURRENT_SET_SCANS,
         ENV_SCANNER_MAX_CONCURRENT_SET_SCANS,
         DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS,
     )?;
     let (max_concurrent_disk_scans, max_concurrent_disk_scans_source) = lookup_usize(
-        kvs,
+        scanner_kvs,
         SCANNER_MAX_CONCURRENT_DISK_SCANS,
         ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS,
         DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS,
     )?;
     let (yield_every_n_objects, yield_every_n_objects_source) = lookup_u64(
-        kvs,
+        scanner_kvs,
         SCANNER_YIELD_EVERY_N_OBJECTS,
         ENV_SCANNER_YIELD_EVERY_N_OBJECTS,
         DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS,
     )?;
     let (alert_excess_versions, alert_excess_versions_source) = lookup_u64(
-        kvs,
+        scanner_kvs,
         SCANNER_ALERT_EXCESS_VERSIONS,
         ENV_SCANNER_ALERT_EXCESS_VERSIONS,
         DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS,
     )?;
     let (alert_excess_version_size, alert_excess_version_size_source) = lookup_u64(
-        kvs,
+        scanner_kvs,
         SCANNER_ALERT_EXCESS_VERSION_SIZE,
         ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE,
         DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE,
     )?;
     let (alert_excess_folders, alert_excess_folders_source) = lookup_u64(
-        kvs,
+        scanner_kvs,
         SCANNER_ALERT_EXCESS_FOLDERS,
         ENV_SCANNER_ALERT_EXCESS_FOLDERS,
         DEFAULT_SCANNER_ALERT_EXCESS_FOLDERS,
@@ -685,8 +717,9 @@ pub(crate) fn scanner_alert_excess_folders() -> u64 {
 mod tests {
     use super::{ScannerRuntimeConfigSource, lookup_scanner_runtime_config, validate_scanner_runtime_config};
     use rustfs_config::{
-        DEFAULT_DELIMITER, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_OBJECTS,
-        ENV_SCANNER_SPEED, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
+        DEFAULT_DELIMITER, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE,
+        ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_SPEED, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, SCANNER_BITROT_CYCLE,
+        SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
         SCANNER_CYCLE_MAX_OBJECTS, SCANNER_IDLE_MODE, SCANNER_SPEED, SCANNER_SUB_SYS, ScannerSpeed,
     };
     use rustfs_ecstore::config::{Config as ServerConfig, KVS};
@@ -705,6 +738,19 @@ mod tests {
         config
             .0
             .insert(SCANNER_SUB_SYS.to_string(), HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]));
+        config.set_defaults();
+        config
+    }
+
+    fn server_config_with_scanner_and_heal(scanner_entries: &[(&str, &str)], heal_entries: &[(&str, &str)]) -> ServerConfig {
+        let mut config = server_config_with_scanner(scanner_entries);
+        let mut kvs = KVS::new();
+        for (key, value) in heal_entries {
+            kvs.insert((*key).to_string(), (*value).to_string());
+        }
+        config
+            .0
+            .insert(HEAL_SUB_SYS.to_string(), HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]));
         config.set_defaults();
         config
     }
@@ -767,6 +813,36 @@ mod tests {
                 assert_eq!(resolved.cycle_interval_source, ScannerRuntimeConfigSource::Env);
             });
         });
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_config_prefers_heal_bitrot_cycle_over_scanner_compat_config() {
+        let config = server_config_with_scanner_and_heal(&[(SCANNER_BITROT_CYCLE, "3600")], &[(HEAL_BITROT_CYCLE, "off")]);
+
+        with_var_unset(ENV_SCANNER_BITROT_CYCLE_SECS, || {
+            let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+
+            assert_eq!(resolved.bitrot_cycle, None);
+            assert_eq!(resolved.bitrot_cycle_source, ScannerRuntimeConfigSource::Config);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_config_marks_scanner_bitrot_cycle_as_compat_source() {
+        let config = server_config_with_scanner(&[(SCANNER_BITROT_CYCLE, "3600")]);
+
+        with_var_unset(ENV_SCANNER_BITROT_CYCLE_SECS, || {
+            let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+            super::apply_resolved_runtime_config(resolved);
+
+            let encoded = serde_json::to_value(super::scanner_runtime_config_status()).expect("scanner status should serialize");
+
+            assert_eq!(encoded["bitrot_cycle_seconds"]["value"], 3600);
+            assert_eq!(encoded["bitrot_cycle_seconds"]["source"], "scanner_compat_config");
+        });
+        super::refresh_scanner_runtime_config_for_tests();
     }
 
     #[test]
