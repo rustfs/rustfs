@@ -328,8 +328,213 @@ fn claim_string(claims: Option<&HashMap<String, serde_json::Value>>, keys: &[&st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_iam::cache::Cache;
     use rustfs_iam::error::Error as IamError;
+    use rustfs_iam::manager::IamCache;
+    use rustfs_iam::store::{MappedPolicy, Store, UserType};
+    use rustfs_iam::sys::IamSys;
+    use rustfs_policy::auth::UserIdentity;
     use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64};
+    use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    struct InfoAccessKeyTestStore;
+
+    #[async_trait::async_trait]
+    impl Store for InfoAccessKeyTestStore {
+        fn has_watcher(&self) -> bool {
+            false
+        }
+
+        async fn save_iam_config<Item: serde::Serialize + Send>(
+            &self,
+            _item: Item,
+            _path: impl AsRef<str> + Send,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn load_iam_config<Item: serde::de::DeserializeOwned>(
+            &self,
+            _path: impl AsRef<str> + Send,
+        ) -> rustfs_iam::error::Result<Item> {
+            Err(IamError::ConfigNotFound)
+        }
+
+        async fn delete_iam_config(&self, _path: impl AsRef<str> + Send) -> rustfs_iam::error::Result<()> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn save_user_identity(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _item: UserIdentity,
+            _ttl: Option<usize>,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> rustfs_iam::error::Result<()> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn load_user_identity(&self, _name: &str, _user_type: UserType) -> rustfs_iam::error::Result<UserIdentity> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn load_user(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _m: &mut HashMap<String, UserIdentity>,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn load_users(
+            &self,
+            _user_type: UserType,
+            _m: &mut HashMap<String, UserIdentity>,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn load_secret_key(&self, _name: &str, _user_type: UserType) -> rustfs_iam::error::Result<String> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn save_group_info(&self, _name: &str, _item: rustfs_iam::store::GroupInfo) -> rustfs_iam::error::Result<()> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn delete_group_info(&self, _name: &str) -> rustfs_iam::error::Result<()> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn load_group(
+            &self,
+            _name: &str,
+            _m: &mut HashMap<String, rustfs_iam::store::GroupInfo>,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn load_groups(&self, _m: &mut HashMap<String, rustfs_iam::store::GroupInfo>) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn save_policy_doc(&self, _name: &str, _item: rustfs_policy::policy::PolicyDoc) -> rustfs_iam::error::Result<()> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn delete_policy_doc(&self, _name: &str) -> rustfs_iam::error::Result<()> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn load_policy(&self, _name: &str) -> rustfs_iam::error::Result<rustfs_policy::policy::PolicyDoc> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn load_policy_doc(
+            &self,
+            _name: &str,
+            _m: &mut HashMap<String, rustfs_policy::policy::PolicyDoc>,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn load_policy_docs(
+            &self,
+            _m: &mut HashMap<String, rustfs_policy::policy::PolicyDoc>,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn save_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _item: MappedPolicy,
+            _ttl: Option<usize>,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+        ) -> rustfs_iam::error::Result<()> {
+            Err(IamError::InvalidArgument)
+        }
+
+        async fn load_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn load_mapped_policies(
+            &self,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+
+        async fn load_all(&self, _cache: &Cache) -> rustfs_iam::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_iam_sys_with_user(
+        access_key: &str,
+        status: rustfs_madmin::AccountStatus,
+        policy_name: Option<&str>,
+    ) -> IamSys<InfoAccessKeyTestStore> {
+        let (sender, _receiver) = mpsc::channel::<i64>(1);
+        let cache = Cache::default();
+        let now = OffsetDateTime::now_utc();
+        cache.add_or_update_user(
+            access_key,
+            &UserIdentity::from(StoredCredentials {
+                access_key: access_key.to_string(),
+                secret_key: "secret-key".to_string(),
+                status: match status {
+                    rustfs_madmin::AccountStatus::Enabled => "on".to_string(),
+                    rustfs_madmin::AccountStatus::Disabled => "off".to_string(),
+                },
+                ..Default::default()
+            }),
+            now,
+        );
+        if let Some(policy_name) = policy_name {
+            cache.add_or_update_user_policy(access_key, &MappedPolicy::new(policy_name), now);
+        }
+
+        IamSys::new(Arc::new(IamCache {
+            api: InfoAccessKeyTestStore,
+            cache,
+            state: Arc::new(AtomicU8::new(2)),
+            loading: Arc::new(AtomicBool::new(false)),
+            roles: HashMap::new(),
+            send_chan: sender,
+            last_timestamp: AtomicI64::new(now.unix_timestamp()),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
+        }))
+    }
 
     #[test]
     fn regular_user_lookup_errors_match_shared_iam_mapper() {
@@ -443,5 +648,29 @@ mod tests {
                 subject: "subject-123".to_string(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_info_access_key_resp_preserves_regular_user_contract() {
+        let iam_sys = test_iam_sys_with_user("builtin-user", rustfs_madmin::AccountStatus::Enabled, Some("consoleAdmin"));
+        let credentials = StoredCredentials {
+            access_key: "builtin-user".to_string(),
+            name: Some("Builtin User".to_string()),
+            description: Some("regular user".to_string()),
+            ..Default::default()
+        };
+
+        let resp = resolve_info_access_key_resp(&iam_sys, "builtin-user".to_string(), credentials)
+            .await
+            .expect("resolve info access key");
+
+        assert_eq!(resp.user_type, "User");
+        assert_eq!(resp.user_provider, "builtin");
+        assert_eq!(resp.info.account_status, "enabled");
+        assert_eq!(resp.info.policy.as_deref(), Some("consoleAdmin"));
+        assert_eq!(resp.info.name.as_deref(), Some("Builtin User"));
+        assert_eq!(resp.info.description.as_deref(), Some("regular user"));
+        assert_eq!(resp.ldap_specific_info.username, None);
+        assert_eq!(resp.open_id_specific_info.user_id, None);
     }
 }
