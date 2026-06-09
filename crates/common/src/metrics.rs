@@ -1334,9 +1334,6 @@ impl Metrics {
             Metric::HealCheck => {
                 self.record_scanner_source_checked(ScannerWorkSource::Heal, count);
             }
-            Metric::HealAbandonedObject => {
-                self.record_scanner_source_executed(ScannerWorkSource::Heal, count);
-            }
             _ => {}
         }
     }
@@ -2167,7 +2164,7 @@ mod tests {
             .find(|work| work.source == ScannerWorkSource::Heal.as_str())
             .expect("heal source work should be visible");
         assert_eq!(heal.checked, 5);
-        assert_eq!(heal.executed, 6);
+        assert_eq!(heal.executed, 0);
     }
 
     #[tokio::test]
