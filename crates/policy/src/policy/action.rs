@@ -698,6 +698,22 @@ pub enum StsAction {
 pub enum KmsAction {
     #[strum(serialize = "kms:*")]
     AllActions,
+    #[strum(serialize = "kms:Configure")]
+    ConfigureAction,
+    #[strum(serialize = "kms:ServiceControl")]
+    ServiceControlAction,
+    #[strum(serialize = "kms:ClearCache")]
+    ClearCacheAction,
+    #[strum(serialize = "kms:GenerateDataKey")]
+    GenerateDataKeyAction,
+    #[strum(serialize = "kms:DeleteKey")]
+    DeleteKeyAction,
+    #[strum(serialize = "kms:RotateKey")]
+    RotateKeyAction,
+    #[strum(serialize = "kms:ListKeys")]
+    ListKeysAction,
+    #[strum(serialize = "kms:DescribeKey")]
+    DescribeKeyAction,
 }
 
 #[cfg(test)]
@@ -719,6 +735,33 @@ mod tests {
 
         let wildcard = Action::try_from("sts:*").expect("Should parse STS wildcard action");
         assert!(matches!(wildcard, Action::StsAction(StsAction::AllActions)));
+        assert!(wildcard.is_match(&action));
+    }
+
+    #[test]
+    fn test_kms_action_taxonomy_parses_and_serializes() {
+        for (raw, expected) in [
+            ("kms:Configure", KmsAction::ConfigureAction),
+            ("kms:ServiceControl", KmsAction::ServiceControlAction),
+            ("kms:ClearCache", KmsAction::ClearCacheAction),
+            ("kms:GenerateDataKey", KmsAction::GenerateDataKeyAction),
+            ("kms:DeleteKey", KmsAction::DeleteKeyAction),
+            ("kms:RotateKey", KmsAction::RotateKeyAction),
+            ("kms:ListKeys", KmsAction::ListKeysAction),
+            ("kms:DescribeKey", KmsAction::DescribeKeyAction),
+        ] {
+            let action = Action::try_from(raw).expect("Should parse KMS action");
+            assert_eq!(action, Action::KmsAction(expected));
+            assert_eq!(<&str>::from(&action), raw);
+        }
+    }
+
+    #[test]
+    fn test_kms_wildcard_matches_dedicated_actions() {
+        let wildcard = Action::try_from("kms:*").expect("Should parse KMS wildcard action");
+        let action = Action::try_from("kms:GenerateDataKey").expect("Should parse GenerateDataKey action");
+
+        assert!(matches!(wildcard, Action::KmsAction(KmsAction::AllActions)));
         assert!(wildcard.is_match(&action));
     }
 

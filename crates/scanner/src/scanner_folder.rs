@@ -176,6 +176,29 @@ fn record_scanner_replication_admission(metrics: &Metrics, admission: Replicatio
     metrics.record_scanner_source_work(ScannerWorkSource::BucketReplication, work);
 }
 
+fn scanner_heal_source(scan_mode: HealScanMode) -> ScannerWorkSource {
+    match scan_mode {
+        HealScanMode::Deep => ScannerWorkSource::Bitrot,
+        HealScanMode::Unknown | HealScanMode::Normal => ScannerWorkSource::Heal,
+    }
+}
+
+fn record_scanner_heal_admission(metrics: &Metrics, scan_mode: HealScanMode, admission: Result<HealAdmissionResult, ()>) -> bool {
+    let (work, admitted) = match admission {
+        Ok(HealAdmissionResult::Accepted) => (ScannerSourceWorkUpdate::queued(1), true),
+        Ok(HealAdmissionResult::Merged) => (
+            ScannerSourceWorkUpdate {
+                skipped: 1,
+                ..Default::default()
+            },
+            true,
+        ),
+        Ok(HealAdmissionResult::Full | HealAdmissionResult::Dropped(_)) | Err(_) => (ScannerSourceWorkUpdate::missed(1), false),
+    };
+    metrics.record_scanner_source_work(scanner_heal_source(scan_mode), work);
+    admitted
+}
+
 #[derive(Clone, Copy)]
 struct PendingScannerAccounting<'a> {
     object: &'a ObjectInfo,
@@ -824,6 +847,8 @@ impl ScannerItem {
         )
         .await;
 
+        let admission = result.as_ref().copied().map_err(|_| ());
+        let admitted = record_scanner_heal_admission(global_metrics(), scan_mode, admission);
         match result {
             Ok(HealAdmissionResult::Accepted | HealAdmissionResult::Merged) => {}
             Ok(result @ (HealAdmissionResult::Full | HealAdmissionResult::Dropped(_))) => {
@@ -836,7 +861,9 @@ impl ScannerItem {
             }
             Err(e) => warn!("enqueue_heal: failed to submit heal request: {}", e),
         }
-        done_heal();
+        if admitted {
+            done_heal();
+        }
     }
 
     fn alert_excessive_versions(&self, remaining_versions: usize, cumulative_size: i64) {
@@ -2163,6 +2190,68 @@ mod tests {
         assert_eq!(replication.skipped, 1);
         assert_eq!(replication.queued, 1);
         assert_eq!(replication.missed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scanner_heal_admission_accounting_maps_normal_scan_to_heal() {
+        let metrics = Metrics::new();
+
+        record_scanner_heal_admission(&metrics, HealScanMode::Normal, Ok(HealAdmissionResult::Accepted));
+        record_scanner_heal_admission(&metrics, HealScanMode::Normal, Ok(HealAdmissionResult::Merged));
+        record_scanner_heal_admission(&metrics, HealScanMode::Normal, Ok(HealAdmissionResult::Full));
+        record_scanner_heal_admission(
+            &metrics,
+            HealScanMode::Normal,
+            Ok(HealAdmissionResult::Dropped(
+                rustfs_common::heal_channel::HealAdmissionDropReason::QueueFull,
+            )),
+        );
+        record_scanner_heal_admission(&metrics, HealScanMode::Normal, Err(()));
+
+        let report = metrics.report().await;
+        let heal = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Heal.as_str())
+            .expect("heal source work should be visible");
+        let bitrot = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Bitrot.as_str())
+            .expect("bitrot source work should be visible");
+
+        assert_eq!(heal.queued, 1);
+        assert_eq!(heal.skipped, 1);
+        assert_eq!(heal.missed, 3);
+        assert_eq!(heal.executed, 0);
+        assert_eq!(bitrot.queued + bitrot.skipped + bitrot.missed + bitrot.executed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_scanner_heal_admission_accounting_maps_deep_scan_to_bitrot() {
+        let metrics = Metrics::new();
+
+        record_scanner_heal_admission(&metrics, HealScanMode::Deep, Ok(HealAdmissionResult::Accepted));
+        record_scanner_heal_admission(&metrics, HealScanMode::Deep, Ok(HealAdmissionResult::Merged));
+        record_scanner_heal_admission(&metrics, HealScanMode::Deep, Ok(HealAdmissionResult::Full));
+
+        let report = metrics.report().await;
+        let heal = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Heal.as_str())
+            .expect("heal source work should be visible");
+        let bitrot = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Bitrot.as_str())
+            .expect("bitrot source work should be visible");
+
+        assert_eq!(bitrot.queued, 1);
+        assert_eq!(bitrot.skipped, 1);
+        assert_eq!(bitrot.missed, 1);
+        assert_eq!(bitrot.executed, 0);
+        assert_eq!(heal.queued + heal.skipped + heal.missed + heal.executed, 0);
     }
 
     #[test]
