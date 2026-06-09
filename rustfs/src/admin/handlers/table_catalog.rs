@@ -33,6 +33,8 @@ use uuid::Uuid;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const WAREHOUSE_PROPERTY: &str = "warehouse";
+const CREDENTIAL_VENDING_CONFIG_KEY: &str = "rustfs.credential-vending";
+const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces",
     "POST /{warehouse}/namespaces",
@@ -156,11 +158,19 @@ struct RestListTablesResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct RestStorageCredential {
+    prefix: String,
+    config: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
 struct RestLoadTableResponse {
     #[serde(rename = "metadata-location")]
     metadata_location: String,
     metadata: serde_json::Value,
     config: BTreeMap<String, String>,
+    #[serde(rename = "storage-credentials")]
+    storage_credentials: Vec<RestStorageCredential>,
 }
 
 #[derive(Debug, Serialize)]
@@ -292,6 +302,52 @@ async fn authorize_table_catalog_warehouse_request(req: &S3Request<Body>, wareho
         warehouse,
     )
     .await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TableCatalogResource<'a> {
+    warehouse: &'a str,
+    namespace: Option<&'a str>,
+    table: Option<&'a str>,
+}
+
+impl<'a> TableCatalogResource<'a> {
+    fn warehouse(warehouse: &'a str) -> Self {
+        Self {
+            warehouse,
+            namespace: None,
+            table: None,
+        }
+    }
+
+    fn namespace(warehouse: &'a str, namespace: &'a str) -> Self {
+        Self {
+            warehouse,
+            namespace: Some(namespace),
+            table: None,
+        }
+    }
+
+    fn table(warehouse: &'a str, namespace: &'a str, table: &'a str) -> Self {
+        Self {
+            warehouse,
+            namespace: Some(namespace),
+            table: Some(table),
+        }
+    }
+
+    fn parts(&self) -> (&'a str, Option<&'a str>, Option<&'a str>) {
+        (self.warehouse, self.namespace, self.table)
+    }
+}
+
+async fn authorize_table_catalog_resource_request(
+    req: &S3Request<Body>,
+    resource: &TableCatalogResource<'_>,
+    action: AdminAction,
+) -> S3Result<()> {
+    let (warehouse, _namespace, _table) = resource.parts();
+    authorize_table_catalog_warehouse_request(req, warehouse, action).await
 }
 
 async fn read_json_body<T: DeserializeOwned>(mut input: Body) -> S3Result<T> {
@@ -427,10 +483,15 @@ fn list_tables_response_from_entries(entries: Vec<crate::table_catalog::TableEnt
 }
 
 fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metadata: serde_json::Value) -> RestLoadTableResponse {
+    let mut config = BTreeMap::new();
+    config.insert("warehouse-location".to_string(), entry.warehouse_location);
+    config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_UNSUPPORTED.to_string());
+
     RestLoadTableResponse {
         metadata_location: entry.metadata_location,
         metadata,
-        config: BTreeMap::from([("warehouse-location".to_string(), entry.warehouse_location)]),
+        config,
+        storage_credentials: Vec::new(),
     }
 }
 
@@ -1513,7 +1574,8 @@ pub struct RestListNamespacesHandler {}
 impl Operation for RestListNamespacesHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::GetTableNamespaceAction).await?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
         let store = table_catalog_store()?;
         let response = list_namespaces_response(&store, &warehouse).await?;
         build_json_response(StatusCode::OK, &response)
@@ -1526,7 +1588,8 @@ pub struct RestCreateNamespaceHandler {}
 impl Operation for RestCreateNamespaceHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::SetTableNamespaceAction).await?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableNamespaceAction).await?;
         let request = read_json_body::<CreateNamespaceRequest>(req.input).await?;
         let store = table_catalog_store()?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
@@ -1541,7 +1604,9 @@ pub struct RestGetNamespaceHandler {}
 impl Operation for RestGetNamespaceHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::GetTableNamespaceAction).await?;
+        let namespace_raw = params.get("namespace").unwrap_or("");
+        let resource = TableCatalogResource::namespace(&warehouse, namespace_raw);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
         let namespace = namespace_from_params(&params)?;
         let store = table_catalog_store()?;
         let response = get_namespace_response(&store, &warehouse, &namespace).await?;
@@ -1555,7 +1620,9 @@ pub struct RestDropNamespaceHandler {}
 impl Operation for RestDropNamespaceHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::DeleteTableNamespaceAction).await?;
+        let namespace_raw = params.get("namespace").unwrap_or("");
+        let resource = TableCatalogResource::namespace(&warehouse, namespace_raw);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableNamespaceAction).await?;
         let namespace = namespace_from_params(&params)?;
         let store = table_catalog_store()?;
         drop_namespace_in_store(&store, &warehouse, &namespace.public_name()).await?;
@@ -1569,7 +1636,9 @@ pub struct RestListTablesHandler {}
 impl Operation for RestListTablesHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::GetTableAction).await?;
+        let namespace_raw = params.get("namespace").unwrap_or("");
+        let resource = TableCatalogResource::namespace(&warehouse, namespace_raw);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let store = table_catalog_store()?;
         let response = list_tables_response(&store, &warehouse, &namespace).await?;
@@ -1583,7 +1652,9 @@ pub struct RestCreateTableHandler {}
 impl Operation for RestCreateTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::CreateTableAction).await?;
+        let namespace_raw = params.get("namespace").unwrap_or("");
+        let resource = TableCatalogResource::namespace(&warehouse, namespace_raw);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CreateTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let request = read_json_body::<CreateTableRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
@@ -1601,7 +1672,9 @@ pub struct RestRegisterTableHandler {}
 impl Operation for RestRegisterTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::RegisterTableAction).await?;
+        let namespace_raw = params.get("namespace").unwrap_or("");
+        let resource = TableCatalogResource::namespace(&warehouse, namespace_raw);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let request = read_json_body::<RegisterTableRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
@@ -1619,7 +1692,10 @@ pub struct RestLoadTableHandler {}
 impl Operation for RestLoadTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::GetTableMetadataAction).await?;
+        let namespace_raw = params.get("namespace").unwrap_or("");
+        let table_raw = params.get("table").unwrap_or("");
+        let resource = TableCatalogResource::table(&warehouse, namespace_raw, table_raw);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let metadata_backend = table_catalog_backend()?;
@@ -1635,7 +1711,10 @@ pub struct RestCommitTableHandler {}
 impl Operation for RestCommitTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::CommitTableAction).await?;
+        let namespace_raw = params.get("namespace").unwrap_or("");
+        let table_raw = params.get("table").unwrap_or("");
+        let resource = TableCatalogResource::table(&warehouse, namespace_raw, table_raw);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let request = read_json_body::<RestCommitTableRequest>(req.input).await?;
@@ -1652,7 +1731,10 @@ pub struct RestDropTableHandler {}
 impl Operation for RestDropTableHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::DeleteTableAction).await?;
+        let namespace_raw = params.get("namespace").unwrap_or("");
+        let table_raw = params.get("table").unwrap_or("");
+        let resource = TableCatalogResource::table(&warehouse, namespace_raw, table_raw);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let store = table_catalog_store()?;
@@ -1667,7 +1749,10 @@ pub struct RestTableMetadataMaintenanceHandler {}
 impl Operation for RestTableMetadataMaintenanceHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_warehouse_request(&req, &warehouse, AdminAction::RunTableMaintenanceAction).await?;
+        let namespace_raw = params.get("namespace").unwrap_or("");
+        let table_raw = params.get("table").unwrap_or("");
+        let resource = TableCatalogResource::table(&warehouse, namespace_raw, table_raw);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let request = read_json_body::<TableMetadataMaintenanceRequest>(req.input).await?;
@@ -1738,12 +1823,33 @@ mod tests {
         ] {
             let block = operation_block(src, handler);
             assert!(
-                block.contains(&format!("authorize_table_catalog_warehouse_request(&req, &warehouse, {action}).await?;")),
-                "{handler} should require {action} with warehouse-scoped auth"
+                block.contains(&format!("authorize_table_catalog_resource_request(&req, &resource, {action}).await?;")),
+                "{handler} should require {action} with catalog resource auth"
             );
             assert!(
                 !block.contains("authorize_table_catalog_request(&req,"),
                 "{handler} must not use unscoped table catalog authorization"
+            );
+            assert!(
+                !block.contains("authorize_table_catalog_warehouse_request(&req, &warehouse,"),
+                "{handler} should not bypass catalog resource auth"
+            );
+        }
+
+        for (handler, action) in [
+            ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
+            ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
+            ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
+            ("RestTableMetadataMaintenanceHandler", "AdminAction::RunTableMaintenanceAction"),
+        ] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains("TableCatalogResource::table(&warehouse, namespace_raw, table_raw)"),
+                "{handler} should build a table-aware catalog resource"
+            );
+            assert!(
+                block.contains(&format!("authorize_table_catalog_resource_request(&req, &resource, {action}).await?;")),
+                "{handler} should authorize against the table-aware catalog resource"
             );
         }
     }
@@ -2271,6 +2377,11 @@ mod tests {
         );
 
         assert_eq!(response.metadata, metadata);
+        assert!(response.storage_credentials.is_empty());
+        assert_eq!(response.config.get("rustfs.credential-vending"), Some(&"unsupported".to_string()));
+        assert!(!response.config.contains_key("s3.access-key-id"));
+        assert!(!response.config.contains_key("s3.secret-access-key"));
+        assert!(!response.config.contains_key("s3.session-token"));
     }
 
     #[test]
