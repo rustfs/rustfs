@@ -5,14 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-background-services-inventory`
-- Baseline: `upstream/main` at `03eb10b07f5f968c531151ae667dfe218050493d`
+- Branch: `overtrue/arch-kms-defaults-inventory`
+- Baseline: `upstream/main` at `f9a5e6d7e67322ac6f626b6f437a5e722fbe22e2`
 - PR type for this branch: `docs-only`
-- Runtime behavior changes: none.
-- Rust code changes: none.
+- Runtime behavior changes: none
+- Rust code changes: none
 - CI/script changes: none
-- Docs changes: add BGC-001 background service inventory and index it from the
-  architecture overview.
+- Docs changes: add KMSD-001 inventory for current KMS development defaults,
+  classify each default as production-safe, dev-only, or invalid for
+  production, and record follow-up hardening boundaries.
 
 ## Phase 0 Tasks
 
@@ -113,6 +114,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     and persisted config serialization still writes the original secret values.
   - Verification: focused KMS redaction/status tests, full KMS tests, migration
     guards, Rust quality scan, clippy, and `make pre-commit` passed.
+- [x] `KMSD-001` Inventory KMS development defaults.
+  - Acceptance:
+    [`kms-development-defaults-inventory.md`](kms-development-defaults-inventory.md)
+    records Local and Vault defaults for missing master keys, temp key dirs,
+    HTTP Vault addresses, default dev-token credentials, and skip-TLS behavior.
+  - Must preserve: no KMS runtime behavior, config serialization,
+    authorization, startup order, storage path, or crate boundary changes.
+  - Verification: docs diff review, migration guards, metrics reference guard,
+    and `git diff --check`.
 
 ## Phase 8 Background Controller Tasks
 
@@ -128,17 +138,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `contract`: define the minimal BackgroundController status vocabulary after
-   this inventory is reviewed.
+   the BGC-001 inventory is reviewed.
 2. `test-only`: add focused preservation tests before moving scanner, heal,
    replication, lifecycle, or disk health workers.
+3. `security-change`: make Local KMS unsafe defaults explicit development
+   opt-ins or production failures in KMSD-002.
+4. `security-change`: make Vault unsafe defaults explicit development opt-ins
+   or production failures in KMSD-003.
+5. `security-change`: apply IAM and plugin redaction in a separate S-014 PR.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `docs-only` BGC-001 inventory; it records current owners, cancellation, side effects, and follow-up inputs without adding a controller abstraction. |
-| Migration preservation | pass | No Rust source, Cargo manifest, workflow, script, or runtime config diff; storage hot path and shutdown behavior are untouched. |
-| Testing/verification | pass | Architecture migration rules, layer dependency guard, metrics reference guard, docs diff hygiene, and no-code-diff check passed. |
+| Quality/architecture | pass | Single `docs-only` PR; the inventory is isolated under `docs/architecture`, uses existing KMS source files as evidence, and introduces no new abstraction or dependency edge. |
+| Migration preservation | pass | No runtime code, config persistence, admin authorization, startup order, storage path, global state, or crate boundary changes are made. |
+| Testing/verification | pass | Docs-only verification is bounded to diff review, architecture migration rules, metrics reference guard, layer dependency guard, and whitespace checks. |
 
 ## Verification Notes
 
@@ -157,10 +172,13 @@ Notes:
 
 ## Handoff Notes
 
-- Keep this BGC-001 branch as a focused `docs-only` PR.
-- Do not add controller traits, status structs, service registry code, shutdown
-  wiring, worker tests, or runtime behavior changes in this PR.
-- Follow-up BGC-002 may define a minimal read-only controller status vocabulary
-  after this inventory is reviewed.
+- Keep this KMSD-001 branch as a focused `docs-only` PR. Do not change KMS
+  defaults, admin authorization, admin route registration shape, config moves,
+  Storage API moves, runtime moves, or ECStore moves.
+- `rustfs` may depend on `rustfs-security-governance` for contract metadata;
+  the security-governance crate must stay independent from implementation
+  crates and runtime state.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
+- KMS production default hardening remains a separate task group; do not bundle
+  it with this inventory PR.
