@@ -75,3 +75,10 @@ Rules:
 `ecstore::config::{Config, KV, KVS}` should move before extension config adapters
 or config-schema work. First inventory consumers, then decide whether existing
 `crates/config` is enough or whether a smaller model crate is required.
+
+The current decision is recorded in
+[`config-model-boundary-adr.md`](config-model-boundary-adr.md): use the existing
+`rustfs-config` package for the pure server-config model, keep persistence and
+global server-config state in `ecstore`, and preserve the old
+`rustfs_ecstore::config::*` path with a temporary compatibility marker during
+the first extraction.

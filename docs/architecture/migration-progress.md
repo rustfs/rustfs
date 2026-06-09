@@ -5,14 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-background-services-inventory`
-- Baseline: `upstream/main` at `03eb10b07f5f968c531151ae667dfe218050493d`
+- Branch: `overtrue/arch-config-consumer-inventory`
+- Baseline: `upstream/main` at `f9a5e6d7e67322ac6f626b6f437a5e722fbe22e2`
 - PR type for this branch: `docs-only`
 - Runtime behavior changes: none.
 - Rust code changes: none.
 - CI/script changes: none
-- Docs changes: add BGC-001 background service inventory and index it from the
-  architecture overview.
+- Docs changes: add the CFG-002 config model boundary ADR and link it from the
+  architecture overview, crate-boundary guardrails, and this progress handoff.
 
 ## Phase 0 Tasks
 
@@ -61,6 +61,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     source `RUSTFS_COMPAT_TODO(<task-id>)` marker lacks a cleanup-register entry,
     when a register entry lacks a source marker, or when a source marker omits a
     removal condition.
+
+## Phase 1a Config Model Tasks
+
+- [x] `CFG-001` Inventory `ecstore::config::{Config, KV, KVS}` consumers.
+  - Acceptance:
+    [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md)
+    records the current definitions, persistence helpers, global accessors,
+    consumer groups, migration risks, and do-not-change contract.
+- [x] `CFG-002` Decide model boundary.
+  - Acceptance:
+    [`config-model-boundary-adr.md`](config-model-boundary-adr.md) records
+    `rustfs-config` as the target package, `server_config` as the future model
+    module, allowed dependencies, forbidden dependencies, preserved shape, and
+    extraction verification gates.
+- [ ] `CFG-003` Move pure model definitions.
+  - Next boundary: move only `Config`, `KV`, `KVS`, and default-registration
+    surface into `rustfs-config`; keep persistence helpers and global
+    server-config state in `ecstore`.
+- [ ] `CFG-004` Keep old `ecstore::config::*` compatibility path.
+  - Required compatibility: source must contain `RUSTFS_COMPAT_TODO(CFG-004)`
+    and a matching cleanup-register entry.
 
 ## Phase 1 Security Governance Tasks
 
@@ -128,17 +149,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Next PRs
 
 1. `contract`: define the minimal BackgroundController status vocabulary after
-   this inventory is reviewed.
+   the BGC-001 inventory is reviewed.
 2. `test-only`: add focused preservation tests before moving scanner, heal,
    replication, lifecycle, or disk health workers.
+3. `api-extraction`: move only the pure server-config model into
+   rustfs-config as CFG-003.
+4. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+   RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
+5. `consumer-migration`: migrate external consumers one group at a time only
+   after the model path and compatibility shim are stable.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `docs-only` BGC-001 inventory; it records current owners, cancellation, side effects, and follow-up inputs without adding a controller abstraction. |
-| Migration preservation | pass | No Rust source, Cargo manifest, workflow, script, or runtime config diff; storage hot path and shutdown behavior are untouched. |
-| Testing/verification | pass | Architecture migration rules, layer dependency guard, metrics reference guard, docs diff hygiene, and no-code-diff check passed. |
+| Quality/architecture | pass | Single `docs-only` PR; ADR chooses existing rustfs-config, records module path and dependency boundaries, and avoids a speculative new crate. |
+| Migration preservation | pass | No code movement; ADR explicitly keeps persistence helpers, global server-config state, startup order, and old-path compatibility requirements out of CFG-002. |
+| Testing/verification | pass | Docs-only verification uses migration guard scripts, metrics reference guard, layer dependency guard, and whitespace checks. |
 
 ## Verification Notes
 
@@ -157,10 +184,14 @@ Notes:
 
 ## Handoff Notes
 
-- Keep this BGC-001 branch as a focused `docs-only` PR.
-- Do not add controller traits, status structs, service registry code, shutdown
-  wiring, worker tests, or runtime behavior changes in this PR.
-- Follow-up BGC-002 may define a minimal read-only controller status vocabulary
-  after this inventory is reviewed.
+- Keep this CFG-002 branch as a focused `docs-only` PR. Do not move
+  `Config`, `KV`, `KVS`, persistence helpers, global server-config state,
+  Storage API code, startup code, or target/notify/audit/IAM consumers in this
+  branch.
+- The next extraction PR must preserve the tuple-struct shape, serde fields,
+  `hiddenIfEmpty` alias, `Config::new` default behavior, marshal/unmarshal
+  behavior, and old `rustfs_ecstore::config::*` path.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
+- Do not create a new config-model crate unless a later implementation attempt
+  proves `rustfs-config` cannot hold the pure model boundary.
