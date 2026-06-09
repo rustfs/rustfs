@@ -40,6 +40,7 @@ const GET_POLICY: AdminActionRef = AdminActionRef::new("GetPolicyAdminAction");
 const GET_REPLICATION_METRICS: AdminActionRef = AdminActionRef::new("GetReplicationMetricsAction");
 const GET_TABLE: AdminActionRef = AdminActionRef::new("GetTableAction");
 const GET_TABLE_CATALOG: AdminActionRef = AdminActionRef::new("GetTableCatalogAction");
+const GET_TABLE_METADATA: AdminActionRef = AdminActionRef::new("GetTableMetadataAction");
 const GET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("GetTableNamespaceAction");
 const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
@@ -613,7 +614,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
-        GET_TABLE,
+        GET_TABLE_METADATA,
         RouteRiskLevel::Sensitive,
     ),
     admin(
@@ -804,6 +805,11 @@ mod tests {
         assert_eq!(table_specs.count(), 11);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
+        assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+            GET_TABLE_METADATA,
+        );
         assert_action(
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
