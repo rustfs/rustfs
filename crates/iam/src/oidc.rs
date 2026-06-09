@@ -32,6 +32,7 @@ use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -275,8 +276,14 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 
 // ---- Public types (unchanged API) ----
 
+const REDACTED_SECRET: &str = "***redacted***";
+
+fn redacted_optional_secret(value: Option<&str>) -> &'static str {
+    value.filter(|secret| !secret.is_empty()).map_or("", |_| REDACTED_SECRET)
+}
+
 /// Parsed configuration for a single OIDC provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OidcProviderConfig {
     pub id: String,
     pub enabled: bool,
@@ -296,6 +303,31 @@ pub struct OidcProviderConfig {
     pub email_claim: String,
     pub username_claim: String,
     pub hide_from_ui: bool,
+}
+
+impl fmt::Debug for OidcProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OidcProviderConfig")
+            .field("id", &self.id)
+            .field("enabled", &self.enabled)
+            .field("config_url", &self.config_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &redacted_optional_secret(self.client_secret.as_deref()))
+            .field("scopes", &self.scopes)
+            .field("other_audiences", &self.other_audiences)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("redirect_uri_dynamic", &self.redirect_uri_dynamic)
+            .field("claim_name", &self.claim_name)
+            .field("claim_prefix", &self.claim_prefix)
+            .field("role_policy", &self.role_policy)
+            .field("display_name", &self.display_name)
+            .field("groups_claim", &self.groups_claim)
+            .field("roles_claim", &self.roles_claim)
+            .field("email_claim", &self.email_claim)
+            .field("username_claim", &self.username_claim)
+            .field("hide_from_ui", &self.hide_from_ui)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1976,6 +2008,24 @@ mod tests {
             username_claim: "preferred_username".to_string(),
             hide_from_ui: false,
         }
+    }
+
+    #[test]
+    fn test_oidc_provider_config_debug_redacts_client_secret() {
+        let config = OidcProviderConfig {
+            client_secret: Some("oidc-client-secret".to_string()),
+            ..test_config("default")
+        };
+        let sourced = SourcedOidcProviderConfig {
+            config,
+            source: OidcProviderConfigSource::Persisted,
+        };
+
+        let rendered = format!("{sourced:?}");
+
+        assert!(!rendered.contains("oidc-client-secret"));
+        assert!(rendered.contains(REDACTED_SECRET));
+        assert!(rendered.contains("client-id"));
     }
 
     #[test]
