@@ -61,6 +61,7 @@ const PROFILING: AdminActionRef = AdminActionRef::new("ProfilingAdminAction");
 const REBALANCE: AdminActionRef = AdminActionRef::new("RebalanceAdminAction");
 const REGISTER_TABLE: AdminActionRef = AdminActionRef::new("RegisterTableAction");
 const REMOVE_USER_FROM_GROUP: AdminActionRef = AdminActionRef::new("RemoveUserFromGroupAdminAction");
+const RUN_TABLE_MAINTENANCE: AdminActionRef = AdminActionRef::new("RunTableMaintenanceAction");
 const SERVER_INFO: AdminActionRef = AdminActionRef::new("ServerInfoAdminAction");
 const SET_BUCKET_QUOTA: AdminActionRef = AdminActionRef::new("SetBucketQuotaAdminAction");
 const SET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("SetBucketTargetAction");
@@ -649,6 +650,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         DELETE_TABLE,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
 ];
 
 pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
@@ -822,7 +829,7 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1"));
-        assert_eq!(table_specs.count(), 11);
+        assert_eq!(table_specs.count(), 12);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(
@@ -834,6 +841,11 @@ mod tests {
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
             COMMIT_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+            RUN_TABLE_MAINTENANCE,
         );
     }
 

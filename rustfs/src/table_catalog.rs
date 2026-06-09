@@ -246,10 +246,25 @@ pub(crate) struct TableCommitResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableMetadataMaintenanceJob {
+    pub job_id: String,
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub current_metadata_location: String,
+    pub current_generation: u64,
+    pub retain_recent_metadata_files: usize,
+    pub safety_window_seconds: i64,
+    pub cleanup_watermark_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TableMetadataMaintenanceReport {
+    pub job: TableMetadataMaintenanceJob,
     pub current_metadata_location: String,
     pub retained_metadata_locations: Vec<String>,
     pub cleanup_candidate_locations: Vec<String>,
+    pub deletable_metadata_locations: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -724,12 +739,37 @@ where
         let cleanup_candidate_locations = metadata_locations
             .into_iter()
             .filter(|metadata_location| !retained.contains(metadata_location))
-            .collect();
+            .collect::<Vec<_>>();
+
+        let now = OffsetDateTime::now_utc();
+        let mut deletable_metadata_locations = Vec::new();
+        for metadata_location in &cleanup_candidate_locations {
+            let Some(candidate_object) = self.backend.read_object(table_bucket, metadata_location).await? else {
+                continue;
+            };
+            if metadata_candidate_is_past_safety_window(candidate_object.mod_time, now) {
+                deletable_metadata_locations.push(metadata_location.clone());
+            }
+        }
+        let current_metadata_location = entry.metadata_location;
 
         Ok(TableMetadataMaintenanceReport {
-            current_metadata_location: entry.metadata_location,
+            job: TableMetadataMaintenanceJob {
+                job_id: Uuid::new_v4().to_string(),
+                table_bucket: table_bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                current_metadata_location: current_metadata_location.clone(),
+                current_generation: entry.generation,
+                retain_recent_metadata_files,
+                safety_window_seconds: TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS,
+                cleanup_watermark_unix_seconds: (now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS))
+                    .unix_timestamp(),
+            },
+            current_metadata_location,
             retained_metadata_locations: retained.into_iter().collect(),
             cleanup_candidate_locations,
+            deletable_metadata_locations,
         })
     }
 
@@ -826,9 +866,11 @@ where
         }
 
         Ok(TableMetadataMaintenanceReport {
+            job: report.job,
             current_metadata_location: entry.metadata_location,
             retained_metadata_locations: protected.into_iter().collect(),
-            cleanup_candidate_locations,
+            cleanup_candidate_locations: cleanup_candidate_locations.clone(),
+            deletable_metadata_locations: cleanup_candidate_locations,
         })
     }
 }
@@ -2328,6 +2370,42 @@ mod tests {
         assert!(report.retained_metadata_locations.contains(&report.current_metadata_location));
         assert!(!report.cleanup_candidate_locations.contains(&report.current_metadata_location));
         assert_eq!(report.cleanup_candidate_locations, vec![v1, v2]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_dry_run_reports_job_context_and_deletable_candidates() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let old = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let fresh = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend.seed_object(bucket, &old, b"{}".to_vec()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        backend
+            .seed_object_with_mod_time(bucket, &fresh, b"{}".to_vec(), Some(OffsetDateTime::now_utc()))
+            .await;
+
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+
+        assert_eq!(report.job.table_bucket, bucket);
+        assert_eq!(report.job.namespace, "sales");
+        assert_eq!(report.job.table, "orders");
+        assert_eq!(report.job.current_generation, 1);
+        assert_eq!(report.job.safety_window_seconds, TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS);
+        assert!(!report.job.job_id.is_empty());
+        assert!(report.job.cleanup_watermark_unix_seconds <= OffsetDateTime::now_utc().unix_timestamp());
+        assert_eq!(report.cleanup_candidate_locations, vec![old.clone(), fresh]);
+        assert_eq!(report.deletable_metadata_locations, vec![old]);
     }
 
     #[tokio::test]
