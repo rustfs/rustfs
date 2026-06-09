@@ -1812,6 +1812,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_config_directives_accepts_notify_kafka_sasl_keys() {
+        let directives = parse_config_directives(
+            r#"notify_kafka sasl_enable="on" sasl_mechanism="SCRAM-SHA-512" sasl_username="user" sasl_password="secret""#,
+            false,
+        )
+        .expect("parse notify kafka sasl directives");
+
+        validate_config_directives(&directives).expect("notify kafka SASL keys should be accepted");
+    }
+
+    #[test]
+    fn validate_config_directives_accepts_audit_kafka_sasl_keys() {
+        let directives = parse_config_directives(
+            r#"audit_kafka sasl_enable="on" sasl_mechanism="SCRAM-SHA-512" sasl_username="user" sasl_password="secret""#,
+            false,
+        )
+        .expect("parse audit kafka sasl directives");
+
+        validate_config_directives(&directives).expect("audit kafka SASL keys should be accepted");
+    }
+
+    #[test]
     fn set_get_and_delete_config_kv_round_trip() {
         let mut config = ServerConfig::new();
         let directives = parse_config_directives(
