@@ -5,17 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-route-policy`
-- Baseline: `origin/main` at `3d0e6ce0da93de0f4618beb194ae2241df71f344`
+- Branch: `overtrue/arch-kms-action-taxonomy`
+- Baseline: `upstream/main` at `51c26278a4907449c565c7f1f52c1d9ae0616486`
 - PR type for this branch: `contract`
 - Runtime behavior changes: none
-- Rust code changes: add `rustfs/src/admin/route_policy.rs` as a pure
-  admin-route policy inventory backed by `rustfs-security-governance` route
-  contract types, with explicit deferred entries for routes that need
-  contextual, S3-action, multi-action, credential-only, or not-implemented
-  contract support.
+- Rust code changes: extend `KmsAction` with the dedicated policy action
+  taxonomy required before handler-level KMS authorization migration.
 - CI/script changes: none
-- Docs changes: record the S-006 route policy handoff.
+- Docs changes: record the S-011 KMS action taxonomy handoff.
 
 ## Phase 0 Tasks
 
@@ -96,51 +93,56 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     stable admin policy action, deferred inventory records routes that need
     richer contract support, and tests prove the combined inventory covers every
     registered admin route.
+- [x] `S-011` Add KMS action taxonomy.
+  - Acceptance: `KmsAction` can parse and serialize dedicated configure,
+    service-control, clear-cache, generate-data-key, delete, rotate, list, and
+    describe actions; wildcard matching still works.
+  - Verification: `cargo test -p rustfs-policy action --no-fail-fast`.
 
 ## Next PRs
 
-1. `contract`: add initial policy inventory tables for redaction, serde, or
+1. `security-change`: migrate KMS handlers to dedicated actions with explicit
+   legacy compatibility where required.
+2. `contract`: add initial policy inventory tables for redaction, serde, or
    supply-chain governance only after the contract shape remains stable.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Pure contract inventory module; no runtime route registration, alias canonicalization, or handler auth mutation. Names and deferred reasons are explicit and avoid false policy precision. |
-| Migration preservation | pass | Aligns with backlog #660: directory and contract boundary first, no global-state migration, no crate split, and no storage hot-path behavior drift. |
-| Testing/verification | pass | Route-policy tests cover validation, public exceptions, table-catalog scope, deferred contextual routes, and every registered admin route. Focused checks, guard scripts, and full pre-commit pass. |
+| Quality/architecture | pass | Pure policy taxonomy extension; names follow existing `KmsAction` variant style and the branch stays a single `contract` PR. |
+| Migration preservation | pass | No handler authorization, route policy inventory, startup, global state, crate split, or storage hot-path behavior changes. |
+| Testing/verification | pass | Baseline action tests, focused policy tests, full `rustfs-policy`, migration guard scripts, `make pre-commit`, nextest, and doctests pass. |
 
 ## Verification Notes
 
 Passed:
-- `cargo test -p rustfs admin::route_policy`
-- `cargo fmt --all`
+- Baseline `cargo test -p rustfs-policy action --no-fail-fast`
 - `cargo fmt --all --check`
-- `cargo check -p rustfs`
+- `cargo test -p rustfs-policy action --no-fail-fast`
+- `cargo test -p rustfs-policy`
 - `./scripts/check_architecture_migration_rules.sh`
-- `./scripts/check_metrics_migration_refs.sh`
 - `./scripts/check_layer_dependencies.sh`
+- `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
-- Rust quality scans for production `unwrap`/`expect`, narrowing casts,
-  string errors, boxed dynamic errors, debug printing, and relaxed atomics in
-  `rustfs/src/admin/route_policy.rs`
 - `make pre-commit`
 
 Notes:
-- `cargo test -p rustfs admin::route_policy` passed 7 route-policy tests.
-- `make pre-commit` passed all checks, including 5526 nextest tests and
+- This branch only extends KMS policy taxonomy. It does not change KMS handler
+  authorization, route policy inventory, runtime state, startup order, storage
+  paths, or compatibility mappings.
+- `make pre-commit` passed all checks, including 5672 nextest tests and
   workspace doctests.
 
 ## Handoff Notes
 
-- Keep this S-006 branch as a pure `contract` PR. Do not change
-  admin route registration, `/minio/admin` alias canonicalization, handler auth
-  enforcement, Config moves, Storage API moves, Runtime moves, or ECStore moves.
+- Keep this S-011 branch as a pure `contract` PR. Do not change KMS handler
+  authorization, admin route registration, route policy inventory, Config moves,
+  Storage API moves, Runtime moves, or ECStore moves.
 - `rustfs` may depend on `rustfs-security-governance` for contract metadata;
   the security-governance crate must stay independent from implementation
   crates and runtime state.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
-- Deferred route policy entries must remain explicit until the contract crate
-  gains richer support for contextual owner checks, S3 actions, multiple
-  accepted actions, credential-only gates, and not-implemented routes.
+- S-012 must decide any legacy compatibility mapping explicitly instead of
+  silently replacing existing admin actions in this taxonomy PR.
