@@ -85,7 +85,6 @@ use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
 };
-use rustfs_rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
@@ -129,6 +128,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
@@ -773,6 +774,37 @@ fn delete_file_info_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
     }
 }
 
+fn object_fits_single_block(object_size: i64, block_size: usize) -> bool {
+    match usize::try_from(object_size) {
+        Ok(size) => size > 0 && size <= block_size,
+        Err(_) => false,
+    }
+}
+
+fn should_use_inline_small_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
+    is_inline_buffer && object_fits_single_block(object_size, block_size)
+}
+
+fn should_use_single_block_non_inline_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
+    !is_inline_buffer && object_fits_single_block(object_size, block_size)
+}
+
+enum SmallWritePath {
+    Inline,
+    SingleBlockNonInline,
+    Pipeline,
+}
+
+fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
+    if should_use_inline_small_fast_path(is_inline_buffer, object_size, block_size) {
+        SmallWritePath::Inline
+    } else if should_use_single_block_non_inline_fast_path(is_inline_buffer, object_size, block_size) {
+        SmallWritePath::SingleBlockNonInline
+    } else {
+        SmallWritePath::Pipeline
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectIO for SetDisks {
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1065,10 +1097,10 @@ impl ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let use_fast_path = is_inline_buffer && data.size() <= fi.erasure.block_size as i64;
+            let write_path = classify_small_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
 
-            let (reader, w_size) = if use_fast_path {
-                match Arc::new(erasure)
+            let (reader, w_size) = match write_path {
+                SmallWritePath::Inline => match Arc::new(erasure)
                     .encode_inline_small(stream, &mut writers, write_quorum)
                     .await
                 {
@@ -1077,15 +1109,24 @@ impl ObjectIO for SetDisks {
                         error!("encode_inline_small err {:?}", e);
                         return Err(e.into());
                     }
-                }
-            } else {
-                match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
+                },
+                SmallWritePath::SingleBlockNonInline => match Arc::new(erasure)
+                    .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                    .await
+                {
+                    Ok((r, w)) => (r, w),
+                    Err(e) => {
+                        error!("encode_single_block_non_inline err {:?}", e);
+                        return Err(e.into());
+                    }
+                },
+                SmallWritePath::Pipeline => match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
                     Ok((r, w)) => (r, w),
                     Err(e) => {
                         error!("encode err {:?}", e);
                         return Err(e.into());
                     }
-                }
+                },
             };
 
             let _ = mem::replace(&mut data.stream, reader);
@@ -1106,7 +1147,7 @@ impl ObjectIO for SetDisks {
                 insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
             }
 
-            let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+            let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
 
             //TODO: userDefined
 
@@ -2971,7 +3012,18 @@ impl MultipartOperations for SetDisks {
             HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
-        let (reader, w_size) = Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?; // TODO: delete temporary directory on error
+        let write_path = classify_small_write_path(false, data.size(), fi.erasure.block_size);
+
+        let (reader, w_size) = match write_path {
+            SmallWritePath::SingleBlockNonInline => {
+                Arc::new(erasure)
+                    .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                    .await?
+            }
+            SmallWritePath::Inline | SmallWritePath::Pipeline => {
+                Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
+            }
+        }; // TODO: delete temporary directory on error
 
         let _ = mem::replace(&mut data.stream, reader);
 
@@ -2984,7 +3036,7 @@ impl MultipartOperations for SetDisks {
             )));
         }
 
-        let index_op = data.stream.try_get_index().map(|v| v.clone().into_vec());
+        let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
 
         let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
 
@@ -3943,10 +3995,7 @@ impl HealOperations for SetDisks {
         let disks = disks.clone();
         let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
         if DiskError::is_all_not_found(&errs) {
-            warn!(
-                "heal_object failed, all obj part not found, bucket: {}, obj: {}, version_id: {}",
-                bucket, object, version_id
-            );
+            debug!(bucket, object, version_id, "heal_object skipped missing object");
             let err = if !version_id.is_empty() {
                 Error::FileVersionNotFound
             } else {
@@ -6714,6 +6763,47 @@ mod tests {
         let version_id = Uuid::new_v4();
         assert_eq!(delete_file_info_version_id(Some(version_id)), Some(version_id));
         assert_eq!(delete_file_info_version_id(None), None);
+    }
+
+    #[test]
+    fn put_object_fast_path_selection_prefers_inline_only_when_inline_buffer_and_single_block() {
+        assert!(should_use_inline_small_fast_path(true, 1024, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(true, 1024, 4096));
+        assert!(matches!(classify_small_write_path(true, 1024, 4096), SmallWritePath::Inline));
+
+        assert!(!should_use_inline_small_fast_path(false, 1024, 4096));
+        assert!(should_use_single_block_non_inline_fast_path(false, 1024, 4096));
+        assert!(matches!(
+            classify_small_write_path(false, 1024, 4096),
+            SmallWritePath::SingleBlockNonInline
+        ));
+    }
+
+    #[test]
+    fn put_object_fast_path_selection_rejects_zero_and_multi_block_payloads() {
+        assert!(!should_use_inline_small_fast_path(true, 0, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 0, 4096));
+        assert!(matches!(classify_small_write_path(true, 0, 4096), SmallWritePath::Pipeline));
+
+        assert!(!should_use_inline_small_fast_path(true, -1, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, -1, 4096));
+        assert!(matches!(classify_small_write_path(false, -1, 4096), SmallWritePath::Pipeline));
+
+        assert!(!should_use_inline_small_fast_path(true, 8192, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 8192, 4096));
+        assert!(matches!(classify_small_write_path(false, 8192, 4096), SmallWritePath::Pipeline));
+    }
+
+    #[test]
+    fn put_object_part_fast_path_selection_matches_single_block_non_inline_rules() {
+        assert!(should_use_single_block_non_inline_fast_path(false, 4096, 4096));
+        assert!(should_use_single_block_non_inline_fast_path(false, 2048, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 4097, 4096));
+        assert!(!should_use_single_block_non_inline_fast_path(false, 0, 4096));
+        assert!(matches!(
+            classify_small_write_path(false, 4096, 4096),
+            SmallWritePath::SingleBlockNonInline
+        ));
     }
 
     #[test]

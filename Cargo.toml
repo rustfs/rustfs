@@ -38,6 +38,7 @@ members = [
     "crates/protocols", # Protocol implementations (FTPS, SFTP, etc.)
     "crates/protos", # Protocol buffer definitions
     "crates/rio", # Rust I/O utilities and abstractions
+    "crates/rio-v2", # Next-generation Rust I/O compatibility layer
     "crates/concurrency", # Concurrency management for RustFS - timeout, locking, backpressure, and I/O scheduling
     "crates/s3-types", # S3 event type definitions
     "crates/s3-ops", # S3 operation definitions and mapping
@@ -60,7 +61,7 @@ resolver = "3"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
-rust-version = "1.95.0"
+rust-version = "1.96.0"
 version = "1.0.0-beta.7"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
@@ -104,6 +105,7 @@ rustfs-policy = { path = "crates/policy", version = "1.0.0-beta.7" }
 rustfs-protos = { path = "crates/protos", version = "1.0.0-beta.7" }
 rustfs-protocols = { path = "crates/protocols", version = "1.0.0-beta.7" }
 rustfs-rio = { path = "crates/rio", version = "1.0.0-beta.7" }
+rustfs-rio-v2 = { path = "crates/rio-v2", version = "1.0.0-beta.7" }
 rustfs-s3-types = { path = "crates/s3-types", version = "1.0.0-beta.7" }
 rustfs-s3-ops = { path = "crates/s3-ops", version = "1.0.0-beta.7" }
 rustfs-s3select-api = { path = "crates/s3select-api", version = "1.0.0-beta.7" }
@@ -134,7 +136,7 @@ lapin = { version = "4.10.0", default-features = false, features = ["tokio", "ru
 hyper = { version = "1.10.1", features = ["http2", "http1", "server"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "server-graceful", "tracing"] }
-http = "1.4.1"
+http = "1.4.2"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
@@ -217,7 +219,7 @@ crossbeam-queue = "0.3.12"
 crossbeam-channel = "0.5.15"
 crossbeam-deque = "0.8.6"
 crossbeam-utils = "0.8.21"
-datafusion = "53.1.0"
+datafusion = "54.0.0"
 derive_builder = "0.20.2"
 enumset = "1.1.13"
 faster-hex = "0.10.0"
@@ -308,9 +310,9 @@ pyroscope = { version = "=2.0.5", features = ["backend-pprof-rs", "backend-jemal
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
-suppaftp = { version = "8.0.3", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
+suppaftp = { version = "8.0.4", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
-russh = { version = "0.61.2",features = ["serde"] }
+russh = { version = "0.61.2", features = ["serde"] }
 russh-sftp = "2.3.0"
 
 # WebDAV

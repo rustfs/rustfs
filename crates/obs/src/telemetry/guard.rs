@@ -28,6 +28,21 @@
 
 use opentelemetry_sdk::{logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider};
 
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+pub(crate) type ProfilingAgent = pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>;
+#[cfg(not(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+)))]
+pub(crate) type ProfilingAgent = ();
+#[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+pub(crate) type MemoryProfilingAgent = pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>;
+#[cfg(not(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+pub(crate) type MemoryProfilingAgent = ();
+
 /// RAII guard that owns all active OpenTelemetry providers and the
 /// `tracing_appender` worker guard.
 ///
@@ -41,10 +56,8 @@ pub struct OtelGuard {
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
-    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-    pub(crate) profiling_agent: Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-    pub(crate) memory_profiling_agent: Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>>,
+    pub(crate) profiling_agent: Option<ProfilingAgent>,
+    pub(crate) memory_profiling_agent: Option<MemoryProfilingAgent>,
     /// Handle to the background log-cleanup task; aborted on drop.
     pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
     /// Worker guard that keeps the non-blocking `tracing_appender` thread
@@ -59,12 +72,10 @@ impl std::fmt::Debug for OtelGuard {
         let mut s = f.debug_struct("OtelGuard");
         s.field("tracer_provider", &self.tracer_provider.is_some())
             .field("meter_provider", &self.meter_provider.is_some())
-            .field("logger_provider", &self.logger_provider.is_some());
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        s.field("profiling_agent", &self.profiling_agent.is_some());
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-        s.field("memory_profiling_agent", &self.memory_profiling_agent.is_some());
-        s.field("cleanup_handle", &self.cleanup_handle.is_some())
+            .field("logger_provider", &self.logger_provider.is_some())
+            .field("profiling_agent", &self.profiling_agent.is_some())
+            .field("memory_profiling_agent", &self.memory_profiling_agent.is_some())
+            .field("cleanup_handle", &self.cleanup_handle.is_some())
             .field("tracing_guard", &self.tracing_guard.is_some())
             .field("stdout_guard", &self.stdout_guard.is_some())
             .finish()
@@ -95,7 +106,10 @@ impl Drop for OtelGuard {
             eprintln!("Logger shutdown error: {err:?}");
         }
 
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+        #[cfg(all(
+            feature = "pyroscope",
+            any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+        ))]
         if let Some(agent) = self.profiling_agent.take() {
             match agent.stop() {
                 Err(err) => eprintln!("Profiling agent stop error: {err:?}"),
@@ -105,7 +119,7 @@ impl Drop for OtelGuard {
             }
         }
 
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+        #[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         if let Some(agent) = self.memory_profiling_agent.take() {
             match agent.stop() {
                 Err(err) => eprintln!("Memory profiling agent stop error: {err:?}"),

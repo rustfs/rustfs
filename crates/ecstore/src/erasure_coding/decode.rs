@@ -433,6 +433,63 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn test_erasure_decode_preserves_compressed_stream_near_block_boundary() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 1024 * 1024;
+
+        use crate::rio::CompressReader;
+        use rustfs_utils::CompressionAlgorithm;
+        use tokio::io::AsyncReadExt;
+
+        let plaintext_size = 8 * BLOCK_SIZE + 123;
+        let plaintext = (0..plaintext_size)
+            .scan(0x9e37_79b9_7f4a_7c15u64, |state, _| {
+                *state ^= *state << 7;
+                *state ^= *state >> 9;
+                *state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                Some((*state >> 32) as u8)
+            })
+            .collect::<Vec<_>>();
+
+        let mut compressor = CompressReader::new(Cursor::new(plaintext), CompressionAlgorithm::default());
+        let mut compressed = Vec::new();
+        compressor.read_to_end(&mut compressed).await.unwrap();
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let total_shards = DATA_SHARDS + PARITY_SHARDS;
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+
+        let mut shard_writers: Vec<BitrotWriter<Cursor<Vec<u8>>>> = (0..total_shards)
+            .map(|_| BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone()))
+            .collect();
+
+        for block in compressed.chunks(BLOCK_SIZE) {
+            let shards = erasure.encode_data(block).unwrap();
+            for (i, shard) in shards.iter().enumerate() {
+                shard_writers[i].write(shard).await.unwrap();
+            }
+        }
+
+        let shard_bufs: Vec<Vec<u8>> = shard_writers.into_iter().map(|w| w.into_inner().into_inner()).collect();
+        let readers = shard_bufs
+            .iter()
+            .map(|buf| Some(BitrotReader::new(Cursor::new(buf.clone()), shard_size, hash_algo.clone(), false)))
+            .collect();
+
+        let mut decoded = Vec::new();
+        let (written, err) = erasure
+            .decode(&mut decoded, readers, 0, compressed.len(), compressed.len())
+            .await;
+
+        assert!(err.is_none(), "unexpected decode error: {err:?}");
+        assert_eq!(written, compressed.len());
+        assert_eq!(decoded, compressed);
+    }
+
     #[tokio::test]
     async fn test_parallel_reader_normal() {
         const BLOCK_SIZE: usize = 64;

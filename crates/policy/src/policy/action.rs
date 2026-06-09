@@ -563,6 +563,31 @@ pub enum AdminAction {
 }
 
 impl AdminAction {
+    pub(crate) fn is_table_resource_scoped(&self) -> bool {
+        matches!(
+            self,
+            AdminAction::GetTableBucketAction
+                | AdminAction::SetTableBucketAction
+                | AdminAction::GetTableNamespaceAction
+                | AdminAction::SetTableNamespaceAction
+                | AdminAction::UpdateTableNamespacePropertiesAction
+                | AdminAction::DeleteTableNamespaceAction
+                | AdminAction::GetTableAction
+                | AdminAction::SetTableAction
+                | AdminAction::CreateTableAction
+                | AdminAction::RegisterTableAction
+                | AdminAction::CommitTableAction
+                | AdminAction::DeleteTableAction
+                | AdminAction::GetTableLifecycleAction
+                | AdminAction::SetTableLifecycleAction
+                | AdminAction::RunTableMaintenanceAction
+                | AdminAction::GetTableMetadataLocationAction
+                | AdminAction::SetTableMetadataLocationAction
+                | AdminAction::GetTableMetadataAction
+                | AdminAction::SetTableMetadataAction
+        )
+    }
+
     // IsValid - checks if action is valid or not.
     pub fn is_valid(&self) -> bool {
         matches!(

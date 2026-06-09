@@ -135,7 +135,7 @@ pub struct HealingDisk {
     pub finished: bool,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub enum BackendByte {
     #[default]
     Unknown,
@@ -143,13 +143,13 @@ pub enum BackendByte {
     Erasure,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StorageInfo {
     pub disks: Vec<Disk>,
     pub backend: BackendInfo,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BackendDisks(pub HashMap<String, usize>);
 
 impl BackendDisks {
@@ -161,7 +161,7 @@ impl BackendDisks {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct BackendInfo {
     pub backend_type: BackendByte,
@@ -187,7 +187,7 @@ pub const ITEM_OFFLINE: &str = "offline";
 pub const ITEM_INITIALIZING: &str = "initializing";
 pub const ITEM_ONLINE: &str = "online";
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MemStats {
     pub alloc: u64,
     pub total_alloc: u64,
@@ -196,7 +196,7 @@ pub struct MemStats {
     pub heap_alloc: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ServerProperties {
     pub state: String,
     pub endpoint: String,

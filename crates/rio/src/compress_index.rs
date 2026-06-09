@@ -394,12 +394,13 @@ impl Index {
             b = &b[n..];
 
             if idx > 0 {
-                c_predict += c_off / 2;
+                let next_c_predict = c_predict + c_off / 2;
                 let prev = self.info[idx - 1].compressed_offset;
                 c_off += prev + c_predict;
                 if c_off <= prev {
                     return Err(io::Error::other("invalid offset"));
                 }
+                c_predict = next_c_predict;
             }
             if c_off < 0 {
                 return Err(io::Error::other("negative offset"));
@@ -701,6 +702,7 @@ mod tests {
         let mut source = Index::new();
         source.add(100, 1_000)?;
         source.add(300, 1_000 + MIN_INDEX_DIST)?;
+        source.add(650, 1_000 + MIN_INDEX_DIST * 2)?;
 
         let encoded = source.clone().into_vec();
 
@@ -713,8 +715,10 @@ mod tests {
         assert_eq!(decoded.info.len(), source.info.len());
         assert_eq!(decoded.info[0].compressed_offset, source.info[0].compressed_offset);
         assert_eq!(decoded.info[0].uncompressed_offset, source.info[0].uncompressed_offset);
+        assert_eq!(decoded.info[1].compressed_offset, source.info[1].compressed_offset);
         assert_eq!(decoded.info[1].uncompressed_offset, source.info[1].uncompressed_offset);
-        assert!(decoded.info[1].compressed_offset > decoded.info[0].compressed_offset);
+        assert_eq!(decoded.info[2].compressed_offset, source.info[2].compressed_offset);
+        assert_eq!(decoded.info[2].uncompressed_offset, source.info[2].uncompressed_offset);
 
         Ok(())
     }

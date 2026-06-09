@@ -33,6 +33,14 @@
 //! - **Data Encryption Keys (DEK)**: Generated per object, encrypted by master keys
 //! - **Object Data**: Encrypted using DEKs with AES-256-GCM or ChaCha20-Poly1305
 //!
+//! ## Caching Discipline
+//!
+//! KMS may cache stable master-key metadata, but it must not cache or reuse generated
+//! data encryption keys by master key id alone. A generated DEK and its encrypted
+//! ciphertext can be bound to the object encryption context, such as the bucket and
+//! object path. Reusing it for another object can break context validation and would
+//! also violate the expected per-object DEK model for SSE-S3 and SSE-KMS.
+//!
 //! ## Example
 //!
 //! ```rust,no_run

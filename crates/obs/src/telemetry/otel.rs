@@ -40,7 +40,7 @@ use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::build_env_filter;
-use crate::telemetry::guard::OtelGuard;
+use crate::telemetry::guard::{MemoryProfilingAgent, OtelGuard, ProfilingAgent};
 use crate::telemetry::local::spawn_cleanup_task;
 use crate::telemetry::recorder::Recorder;
 use crate::telemetry::resource::build_resource;
@@ -164,10 +164,7 @@ pub(super) fn init_observability_http(
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
 
-    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
     let profiling_agent = init_profiler(config);
-
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     let memory_profiling_agent = init_memory_profiler(config);
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
@@ -317,9 +314,7 @@ pub(super) fn init_observability_http(
         tracer_provider,
         meter_provider,
         logger_provider,
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         profiling_agent,
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         memory_profiling_agent,
         tracing_guard,
         stdout_guard,
@@ -496,8 +491,11 @@ fn build_logger_provider(
 /// Returns `None` when profiling export is disabled, when no usable
 /// profiling endpoint is configured, or when building or starting the agent
 /// fails.
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
@@ -534,6 +532,14 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
     }
 }
 
+#[cfg(not(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+)))]
+fn init_profiler(_config: &OtelConfig) -> Option<ProfilingAgent> {
+    None
+}
+
 /// Initialise a Pyroscope agent for continuous **memory** profiling via jemalloc.
 ///
 /// This is only available on `linux + gnu + x86_64` where tikv-jemallocator
@@ -541,8 +547,8 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
 ///
 /// Returns `None` when profiling export is disabled, the endpoint is missing,
 /// jemalloc profiling is not activated, or the agent fails to build/start.
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-fn init_memory_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
+#[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+fn init_memory_profiler(config: &OtelConfig) -> Option<MemoryProfilingAgent> {
     use pyroscope::backend::jemalloc_backend;
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
@@ -586,6 +592,11 @@ fn init_memory_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent
             None
         }
     }
+}
+
+#[cfg(not(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+fn init_memory_profiler(_config: &OtelConfig) -> Option<MemoryProfilingAgent> {
+    None
 }
 
 /// Create a stdout periodic metrics reader for the given interval.

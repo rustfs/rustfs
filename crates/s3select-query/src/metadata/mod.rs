@@ -19,7 +19,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::var_provider::is_system_variables;
-use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
+use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF};
 use datafusion::variable::VarType;
 use datafusion::{
     config::ConfigOptions,
@@ -95,6 +95,10 @@ impl ContextProvider for MetadataProvider {
         self.func_manager.udaf(name).ok()
     }
 
+    fn get_higher_order_meta(&self, _name: &str) -> Option<Arc<HigherOrderUDF>> {
+        None
+    }
+
     fn get_variable_type(&self, variable_names: &[String]) -> Option<DataType> {
         if variable_names.is_empty() {
             return None;
@@ -128,6 +132,10 @@ impl ContextProvider for MetadataProvider {
 
     fn udf_names(&self) -> Vec<String> {
         self.func_manager.udfs()
+    }
+
+    fn higher_order_function_names(&self) -> Vec<String> {
+        Vec::new()
     }
 
     fn udaf_names(&self) -> Vec<String> {

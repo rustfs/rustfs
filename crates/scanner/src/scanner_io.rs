@@ -35,6 +35,7 @@ use rustfs_ecstore::bucket::versioning::VersioningApi as _;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::disk::STORAGE_FORMAT_FILE;
+use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::disk::{Disk, DiskAPI};
 use rustfs_ecstore::error::{Error, StorageError};
 use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
@@ -45,7 +46,7 @@ use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime};
@@ -55,6 +56,8 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
+
+pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
 
 const METRIC_SCANNER_SET_SCAN_CONCURRENCY_LIMIT: &str = "rustfs_scanner_set_scan_concurrency_limit";
 const METRIC_SCANNER_DISK_SCAN_CONCURRENCY_LIMIT: &str = "rustfs_scanner_disk_scan_concurrency_limit";
@@ -267,6 +270,22 @@ fn cache_root_entry_info(cache: &DataUsageCache) -> DataUsageEntryInfo {
         parent: DATA_USAGE_ROOT.to_string(),
         entry,
     }
+}
+
+fn apply_bucket_result_to_cache(
+    cache: &mut DataUsageCache,
+    result: DataUsageEntryInfo,
+    update_time: SystemTime,
+    publish_immediately: bool,
+) -> bool {
+    cache.replace(&result.name, &result.parent, result.entry);
+    cache.info.last_update = Some(update_time);
+
+    publish_immediately
+}
+
+fn bucket_result_should_publish_immediately(published_buckets: &mut HashSet<String>, bucket_name: &str) -> bool {
+    published_buckets.insert(bucket_name.to_string())
 }
 
 async fn send_cache_root_entry_info(
@@ -620,6 +639,7 @@ impl ScannerIOCache for SetDisks {
 
         let mut permutes = buckets.clone();
         permutes.shuffle(&mut rand::rng());
+        let mut preloaded_published_buckets = HashSet::new();
 
         for bucket in permutes.iter() {
             if old_cache.find(&bucket.name).is_none()
@@ -632,6 +652,9 @@ impl ScannerIOCache for SetDisks {
         for bucket in permutes.iter() {
             if let Some(c) = old_cache.find(&bucket.name) {
                 cache.replace(&bucket.name, DATA_USAGE_ROOT, c.clone());
+                if old_cache.info.last_update.is_some() {
+                    preloaded_published_buckets.insert(bucket.name.clone());
+                }
 
                 if let Err(e) = bucket_tx.send(bucket.clone()).await {
                     error!("Failed to send bucket info: {}", e);
@@ -677,10 +700,21 @@ impl ScannerIOCache for SetDisks {
                     }
                     res =  bucket_result_rx.recv() => {
                         if let Some(result) = res {
-                            let mut cache = cache_mutex_clone.lock().await;
-                            cache.replace(&result.name, &result.parent, result.entry);
-                            cache.info.last_update = Some(SystemTime::now());
+                            let cache_snapshot = {
+                                let mut cache = cache_mutex_clone.lock().await;
+                                let publish_immediately =
+                                    bucket_result_should_publish_immediately(&mut preloaded_published_buckets, &result.name);
+                                if apply_bucket_result_to_cache(&mut cache, result, SystemTime::now(), publish_immediately) {
+                                    Some(cache.clone())
+                                } else {
+                                    None
+                                }
+                            };
 
+                            if let Some(cache_snapshot) = cache_snapshot {
+                                last_update =
+                                    persist_and_publish_cache_snapshot(store_clone.clone(), &updates, cache_snapshot).await;
+                            }
                         } else {
                             let cache_snapshot = {
                                 let mut cache = cache_mutex_clone.lock().await;
@@ -908,19 +942,20 @@ impl ScannerIODisk for Disk {
         let done_object = Metrics::time(Metric::ScanObject);
 
         if !is_xl_meta_path(&item.path) {
-            return Err(StorageError::other("skip file".to_string()));
+            return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
         }
 
         let data = match self.read_metadata(&item.bucket, &item.object_path()).await {
             Ok(data) => data,
+            Err(e) if DiskError::is_err_object_not_found(&e) || DiskError::is_err_version_not_found(&e) => {
+                return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
+            }
             Err(e) => {
-                warn!(
-                    "Failed to read metadata: {e}, bucket={}, object_path={}",
+                return Err(StorageError::other(format!(
+                    "failed to read metadata: {e}, bucket={}, object_path={}",
                     &item.bucket,
                     &item.object_path()
-                );
-
-                return Err(StorageError::other("failed to read metadata".to_string()));
+                )));
             }
         };
 
@@ -931,7 +966,7 @@ impl ScannerIODisk for Disk {
             Ok(versions) => versions,
             Err(e) => {
                 error!("Failed to get file info versions: {}/{}, err: {e}", item.bucket, item.object_path());
-                return Err(StorageError::other("skip file".to_string()));
+                return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
             }
         };
 
@@ -1098,8 +1133,12 @@ impl ScannerIODisk for Disk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner_folder::ScannerItem;
+    use rustfs_ecstore::disk::{DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
+    use rustfs_ecstore::pools::path2_bucket_object_with_base_path;
     use serial_test::serial;
     use temp_env::with_var;
+    use uuid::Uuid;
 
     #[test]
     fn record_set_scan_failure_preserves_first_error() {
@@ -1187,6 +1226,65 @@ mod tests {
         assert!(is_xl_meta_path("/data/bucket/object/xl.meta"));
     }
 
+    #[tokio::test]
+    async fn get_size_treats_missing_metadata_as_skip_file() {
+        let temp_dir = std::env::temp_dir().join(format!("rustfs-scanner-missing-meta-{}", Uuid::new_v4()));
+        let bucket = "bucket";
+        let object = "object";
+        let object_dir = temp_dir.join(bucket).join(object);
+        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+        tokio::fs::create_dir_all(&object_dir)
+            .await
+            .expect("failed to create object directory");
+        tokio::fs::write(&metadata_path, [])
+            .await
+            .expect("failed to create metadata placeholder");
+
+        let endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("failed to open local disk");
+
+        let relative_path = metadata_path.to_string_lossy().to_string();
+        let (_, scanner_path) = path2_bucket_object_with_base_path(temp_dir.to_string_lossy().as_ref(), relative_path.as_str());
+        let file_type = tokio::fs::metadata(&metadata_path)
+            .await
+            .expect("failed to stat metadata placeholder")
+            .file_type();
+
+        tokio::fs::remove_dir_all(&object_dir)
+            .await
+            .expect("failed to remove object directory");
+
+        let item = ScannerItem {
+            path: scanner_path,
+            bucket: bucket.to_string(),
+            prefix: object.to_string(),
+            object_name: STORAGE_FORMAT_FILE.to_string(),
+            file_type,
+            lifecycle: None,
+            replication: None,
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        };
+
+        let err = disk
+            .get_size(item)
+            .await
+            .expect_err("missing metadata should be skipped instead of reported as a scanner failure");
+        assert!(matches!(err, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     #[test]
     fn cache_root_entry_info_flattens_bucket_children() {
         let mut cache = DataUsageCache {
@@ -1259,5 +1357,127 @@ mod tests {
         assert_eq!(info.parent, DATA_USAGE_ROOT);
         assert_eq!(info.entry.size, 10);
         assert_eq!(info.entry.objects, 1);
+    }
+
+    #[test]
+    fn apply_bucket_result_requests_immediate_publish_for_missing_bucket() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let should_publish = apply_bucket_result_to_cache(
+            &mut cache,
+            DataUsageEntryInfo {
+                name: "bucket".to_string(),
+                parent: DATA_USAGE_ROOT.to_string(),
+                entry: DataUsageEntry {
+                    size: 10,
+                    objects: 1,
+                    ..Default::default()
+                },
+            },
+            SystemTime::now(),
+            true,
+        );
+
+        assert!(should_publish);
+        assert!(cache.info.last_update.is_some());
+        let entry = cache.find("bucket").expect("bucket entry should be inserted");
+        assert_eq!(entry.size, 10);
+        assert_eq!(entry.objects, 1);
+    }
+
+    #[test]
+    fn apply_bucket_result_defers_publish_for_existing_published_bucket() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                last_update: Some(SystemTime::now()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: 5,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let should_publish = apply_bucket_result_to_cache(
+            &mut cache,
+            DataUsageEntryInfo {
+                name: "bucket".to_string(),
+                parent: DATA_USAGE_ROOT.to_string(),
+                entry: DataUsageEntry {
+                    size: 10,
+                    objects: 2,
+                    ..Default::default()
+                },
+            },
+            SystemTime::now(),
+            false,
+        );
+
+        assert!(!should_publish);
+        let entry = cache.find("bucket").expect("bucket entry should remain present");
+        assert_eq!(entry.size, 10);
+        assert_eq!(entry.objects, 2);
+    }
+
+    #[test]
+    fn apply_bucket_result_defers_publish_for_preloaded_published_bucket() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "bucket",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: 5,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let should_publish = apply_bucket_result_to_cache(
+            &mut cache,
+            DataUsageEntryInfo {
+                name: "bucket".to_string(),
+                parent: DATA_USAGE_ROOT.to_string(),
+                entry: DataUsageEntry {
+                    size: 10,
+                    objects: 2,
+                    ..Default::default()
+                },
+            },
+            SystemTime::now(),
+            false,
+        );
+
+        assert!(!should_publish);
+        let entry = cache.find("bucket").expect("bucket entry should remain present");
+        assert_eq!(entry.size, 10);
+        assert_eq!(entry.objects, 2);
+    }
+
+    #[test]
+    fn bucket_result_immediate_publish_tracks_preloaded_and_current_results() {
+        let mut published_buckets = HashSet::from(["existing".to_string()]);
+
+        assert!(!bucket_result_should_publish_immediately(&mut published_buckets, "existing"));
+        assert!(bucket_result_should_publish_immediately(&mut published_buckets, "missing"));
+        assert!(!bucket_result_should_publish_immediately(&mut published_buckets, "missing"));
     }
 }

@@ -1136,10 +1136,16 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        let timeout_duration = if opts.skip_total_timeout {
+            Duration::ZERO
+        } else {
+            get_drive_walkdir_timeout()
+        };
+
         self.track_disk_health_with_op_and_timeout_action(
             "walk_dir",
             || async { self.disk.walk_dir(opts, wr).await },
-            get_drive_walkdir_timeout(),
+            timeout_duration,
             // Listing/scanner backpressure should fail only the current walk, not poison drive health.
             TimeoutHealthAction::IgnoreFailure,
         )
@@ -1641,6 +1647,52 @@ mod tests {
                 .await;
 
             assert_eq!(result.expect_err("walk_dir should time out"), DiskError::Timeout);
+            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!wrapper.health.is_faulty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn walk_dir_skip_total_timeout_keeps_stream_pending() {
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+            let wrapper = LocalDiskWrapper::new(disk, false);
+            let bucket = "test-bucket";
+            let object = "test-object";
+
+            wrapper.make_volume(bucket).await.expect("bucket should be created");
+
+            let mut file_info = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+            file_info.volume = bucket.to_string();
+            file_info.name = object.to_string();
+            file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+            file_info.erasure.index = 1;
+
+            wrapper
+                .write_metadata("", bucket, object, file_info)
+                .await
+                .expect("object metadata should be written");
+
+            let mut writer = PendingWriter;
+            let result = tokio::time::timeout(
+                Duration::from_millis(20),
+                wrapper.walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        skip_total_timeout: true,
+                        ..Default::default()
+                    },
+                    &mut writer,
+                ),
+            )
+            .await;
+
+            assert!(result.is_err(), "skip_total_timeout should leave backpressured walk pending");
             assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
             assert!(!wrapper.health.is_faulty());
         })

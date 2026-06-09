@@ -698,6 +698,10 @@ pub struct WalkDirOptions {
     // DiskID contains the disk ID of the disk.
     // Leave empty to not check disk ID.
     pub disk_id: String,
+
+    // Skip the wrapper-level total timeout for long streaming walks.
+    #[serde(default)]
+    pub skip_total_timeout: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -894,6 +898,7 @@ mod tests {
             forward_to: Some("object/path".to_string()),
             limit: 100,
             disk_id: "disk-123".to_string(),
+            skip_total_timeout: false,
         };
 
         assert_eq!(opts.bucket, "test-bucket");
@@ -904,6 +909,7 @@ mod tests {
         assert_eq!(opts.forward_to, Some("object/path".to_string()));
         assert_eq!(opts.limit, 100);
         assert_eq!(opts.disk_id, "disk-123");
+        assert!(!opts.skip_total_timeout);
     }
 
     /// Test DeleteOptions structure

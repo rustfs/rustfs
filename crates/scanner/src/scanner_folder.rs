@@ -28,7 +28,7 @@ use crate::runtime_config::{
     scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
 };
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetReason};
-use crate::scanner_io::ScannerIODisk as _;
+use crate::scanner_io::{SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _};
 use crate::sleeper::DynamicSleeper;
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
@@ -36,7 +36,8 @@ use rustfs_common::heal_channel::{
     send_heal_request_with_admission,
 };
 use rustfs_common::metrics::{
-    IlmAction, Metric, Metrics, ScannerWorkSource, UpdateCurrentPathFn, current_path_updater, global_metrics,
+    IlmAction, Metric, Metrics, ScannerSourceWorkUpdate, ScannerWorkSource, UpdateCurrentPathFn, current_path_updater,
+    global_metrics,
 };
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::{GLOBAL_ExpiryState, apply_expiry_rule};
@@ -45,7 +46,9 @@ use rustfs_ecstore::bucket::lifecycle::{
     bucket_lifecycle_ops::apply_transition_rule,
     lifecycle::{Event, Lifecycle, ObjectOpts},
 };
-use rustfs_ecstore::bucket::replication::{ReplicationConfig, ReplicationConfigurationExt as _, queue_replication_heal_internal};
+use rustfs_ecstore::bucket::replication::{
+    ReplicationConfig, ReplicationConfigurationExt as _, ReplicationQueueAdmission, queue_replication_heal_internal,
+};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
@@ -147,11 +150,30 @@ fn should_yield_after_object(object_count: u64, yield_every: u64) -> bool {
     yield_every > 0 && object_count.is_multiple_of(yield_every)
 }
 
+const SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT: usize = 16;
+const SCANNER_FAILED_OBJECT_LOG_EVERY: usize = 1024;
+
+fn should_log_failed_object(failed_objects: usize) -> bool {
+    failed_objects <= SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT || failed_objects.is_multiple_of(SCANNER_FAILED_OBJECT_LOG_EVERY)
+}
+
 fn record_scanner_ilm_action_if_queued(metrics: &Metrics, count: u64, queued: bool) -> bool {
     if queued {
         metrics.record_scanner_ilm_action(count);
     }
     queued
+}
+
+fn record_scanner_replication_admission(metrics: &Metrics, admission: ReplicationQueueAdmission) {
+    let work = match admission {
+        ReplicationQueueAdmission::Queued => ScannerSourceWorkUpdate::queued(1),
+        ReplicationQueueAdmission::Missed => ScannerSourceWorkUpdate::missed(1),
+        ReplicationQueueAdmission::Skipped => ScannerSourceWorkUpdate {
+            skipped: 1,
+            ..Default::default()
+        },
+    };
+    metrics.record_scanner_source_work(ScannerWorkSource::BucketReplication, work);
 }
 
 #[derive(Clone, Copy)]
@@ -724,8 +746,10 @@ impl ScannerItem {
         };
 
         let done_replication = Metrics::time(Metric::CheckReplication);
-        let roi = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
+        let replication_result = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
         done_replication();
+        record_scanner_replication_admission(global_metrics(), replication_result.admission);
+        let roi = replication_result.object_info;
         if !Self::should_account_replication_stats(oi) {
             return;
         }
@@ -1024,14 +1048,18 @@ impl FolderScanner {
     /// Send update if enough time has passed
     /// Should be called on a regular basis when the new_cache contains more recent total than previously.
     /// May or may not send an update upstream.
-    pub async fn send_update(&mut self) {
-        // Send at most an update every minute.
+    fn should_send_update(&self) -> bool {
         if self.updates.is_none() {
-            return;
+            return false;
         }
 
         let elapsed = self.last_update.elapsed().unwrap_or(Duration::from_secs(0));
-        if elapsed < Duration::from_secs(60) {
+        elapsed >= Duration::from_secs(60)
+    }
+
+    pub async fn send_update(&mut self) {
+        // Send at most an update every minute.
+        if !self.should_send_update() {
             return;
         }
 
@@ -1044,6 +1072,15 @@ impl FolderScanner {
             }
             self.last_update = SystemTime::now();
         }
+    }
+
+    async fn send_update_for_entry(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, entry: &DataUsageEntry) {
+        if !self.should_send_update() {
+            return;
+        }
+
+        self.update_cache.replace_hashed(hash, parent, entry);
+        self.send_update().await;
     }
 
     /// Scan a folder recursively
@@ -1266,15 +1303,19 @@ impl FolderScanner {
                 let sz = match self.local_disk.get_size(item.clone()).await {
                     Ok(sz) => sz,
                     Err(e) => {
-                        let is_skip_file = matches!(e, StorageError::Io(ref io) if io.to_string() == "skip file");
+                        let is_skip_file = matches!(e, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR);
 
                         if !is_skip_file {
                             // Track failed objects to prevent infinite retry loops
                             into.failed_objects += 1;
                             self.record_failed(&item.path);
 
-                            // Only log non-skip errors to avoid noise
-                            warn!("scan_folder: failed to get size for item {}: {}", item.path, e);
+                            if should_log_failed_object(into.failed_objects) {
+                                warn!(
+                                    failed_objects = into.failed_objects,
+                                    "scan_folder: failed to get size for item {}: {}", item.path, e
+                                );
+                            }
                         }
 
                         timer.sleep().await;
@@ -1300,6 +1341,7 @@ impl FolderScanner {
                 }
 
                 if should_yield_after_object(object_count, yield_every_objects) {
+                    self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                     let yield_start = Instant::now();
                     tokio::task::yield_now().await;
                     global_metrics().record_scanner_yield(yield_start.elapsed());
@@ -1445,6 +1487,7 @@ impl FolderScanner {
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
                     fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
                     self.record_scan_resume_hint(&folder_item.name);
+                    self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                     tokio::task::yield_now().await;
                 } else {
                     let mut dst = DataUsageEntry::default();
@@ -1694,6 +1737,7 @@ impl FolderScanner {
                         // In compacted mode child totals are accumulated directly into the parent entry.
                         let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
                         fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                        self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                         tokio::task::yield_now().await;
                     } else {
                         let mut dst = DataUsageEntry::default();
@@ -2099,6 +2143,26 @@ mod tests {
         assert_eq!(queued_summary.versions, 0);
         assert_eq!(queued_summary.total_size, 0);
         assert_eq!(queued_cumulative_size, 0);
+    }
+
+    #[tokio::test]
+    async fn test_scanner_replication_admission_accounting_maps_source_work() {
+        let metrics = Metrics::new();
+
+        record_scanner_replication_admission(&metrics, ReplicationQueueAdmission::Skipped);
+        record_scanner_replication_admission(&metrics, ReplicationQueueAdmission::Queued);
+        record_scanner_replication_admission(&metrics, ReplicationQueueAdmission::Missed);
+
+        let report = metrics.report().await;
+        let replication = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::BucketReplication.as_str())
+            .expect("bucket replication source work should be visible");
+
+        assert_eq!(replication.skipped, 1);
+        assert_eq!(replication.queued, 1);
+        assert_eq!(replication.missed, 1);
     }
 
     #[test]
@@ -2603,6 +2667,48 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_scan_folder_compacted_parent_sends_partial_update() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+
+        let bucket_dir = temp_dir.join("bucket");
+        tokio::fs::create_dir_all(bucket_dir.join("child"))
+            .await
+            .expect("failed to create child directory");
+
+        scanner.old_cache.info.name = "bucket".to_string();
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+        scanner.last_update = SystemTime::UNIX_EPOCH;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        scanner.updates = Some(tx);
+
+        let folder = CachedFolder {
+            name: "bucket".to_string(),
+            parent: None,
+            object_heal_prob_div: 1,
+        };
+        let mut into = DataUsageEntry {
+            compacted: true,
+            ..Default::default()
+        };
+
+        scanner
+            .scan_folder(CancellationToken::new(), folder, &mut into)
+            .await
+            .expect("compacted scan should finish successfully");
+
+        let update = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("compacted scan should send a partial update")
+            .expect("partial update channel should remain open");
+
+        assert!(update.compacted, "partial update should preserve compacted state");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
         let (mut scanner, temp_dir) = build_test_scanner().await;
         let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2916,5 +3022,15 @@ mod tests {
 
         assert!(result.is_ok(), "expected symlinked child directory to be ignored");
         assert_eq!(into.failed_objects, 0, "expected ignored symlink not to count as a failed object");
+    }
+
+    #[test]
+    fn test_should_log_failed_object_samples_after_initial_limit() {
+        assert!(should_log_failed_object(1));
+        assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT));
+        assert!(!should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT + 1));
+        assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY));
+        assert!(!should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY + 1));
+        assert!(should_log_failed_object(SCANNER_FAILED_OBJECT_LOG_EVERY * 2));
     }
 }
