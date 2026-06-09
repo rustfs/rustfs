@@ -150,7 +150,8 @@ async fn async_main() -> Result<()> {
     // Execute subcommand, or prepare config for `server` subcommand
     let config = match command_result {
         rustfs::config::CommandResult::Info(opts) => {
-            return Ok(rustfs::config::execute_info(&opts));
+            rustfs::config::execute_info(&opts);
+            return Ok(());
         }
         rustfs::config::CommandResult::Tls(opts) => return rustfs::tls::execute_tls(&opts),
         rustfs::config::CommandResult::Server(config) => config,
