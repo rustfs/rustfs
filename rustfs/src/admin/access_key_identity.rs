@@ -645,7 +645,7 @@ mod tests {
         policy: &Policy,
     ) -> HashMap<String, serde_json::Value> {
         let encoded_policy =
-            base64_simd::URL_SAFE_NO_PAD.encode_to_string(&serde_json::to_vec(policy).expect("marshal embedded session policy"));
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(serde_json::to_vec(policy).expect("marshal embedded session policy"));
         claims.insert(IAM_POLICY_CLAIM_NAME_SA.to_string(), json!(EMBEDDED_POLICY_TYPE));
         claims.insert(SESSION_POLICY_NAME.to_string(), json!(encoded_policy));
         claims
