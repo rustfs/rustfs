@@ -1809,6 +1809,60 @@ mod tests {
     }
 
     #[test]
+    fn table_catalog_ingress_requests_reject_unknown_fields() {
+        assert_rejects_unknown_field::<CreateNamespaceRequest>(
+            "CreateNamespaceRequest",
+            serde_json::json!({
+                "namespace": ["analytics"],
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<RegisterTableRequest>(
+            "RegisterTableRequest",
+            serde_json::json!({
+                "name": "events",
+                "metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<CreateTableRequest>(
+            "CreateTableRequest",
+            serde_json::json!({
+                "name": "events",
+                "schema": {},
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<RestCommitTableRequest>(
+            "RestCommitTableRequest",
+            serde_json::json!({
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<TableMetadataMaintenanceRequest>(
+            "TableMetadataMaintenanceRequest",
+            serde_json::json!({
+                "delete": true,
+                "unexpected": true
+            }),
+        );
+    }
+
+    fn assert_rejects_unknown_field<T>(target: &str, value: serde_json::Value)
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let err = match serde_json::from_value::<T>(value) {
+            Ok(_) => panic!("{target} should reject unknown fields"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unknown field"),
+            "{target} should reject unknown fields, got: {err}"
+        );
+    }
+
+    #[test]
     fn create_namespace_request_uses_rest_namespace_segments_and_properties() {
         let request: CreateNamespaceRequest = serde_json::from_value(serde_json::json!({
             "namespace": ["analytics", "daily_events"],
