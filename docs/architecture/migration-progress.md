@@ -5,20 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-kms-redaction`
-- Baseline: `upstream/main` at `0cdcd1eb7bfd5fc229eb45f851c624084b072365`
-- PR type for this branch: `security-change`
-- Runtime behavior changes: KMS secret-bearing `Debug` output and admin status
-  summary views no longer expose local master keys, Vault tokens, or AppRole
-  secret IDs. KMS backend behavior, authorization, production defaults, and
-  config persistence are unchanged.
-- Rust code changes: add KMS redaction rules, safe `Debug` implementations for
-  secret-bearing KMS config and configure request types, and focused tests that
-  prove secrets are absent from debug/admin views while serde persistence keeps
-  the original values.
+- Branch: `overtrue/arch-background-services-inventory`
+- Baseline: `upstream/main` at `03eb10b07f5f968c531151ae667dfe218050493d`
+- PR type for this branch: `docs-only`
+- Runtime behavior changes: none.
+- Rust code changes: none.
 - CI/script changes: none
-- Docs changes: record S-013 redaction status and the no-behavior-drift
-  migration boundary.
+- Docs changes: add BGC-001 background service inventory and index it from the
+  architecture overview.
 
 ## Phase 0 Tasks
 
@@ -120,55 +114,53 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused KMS redaction/status tests, full KMS tests, migration
     guards, Rust quality scan, clippy, and `make pre-commit` passed.
 
+## Phase 8 Background Controller Tasks
+
+- [x] `BGC-001` Inventory background services.
+  - Acceptance:
+    [`background-services-inventory.md`](background-services-inventory.md)
+    records scanner, heal, lifecycle, replication, config reload, metrics,
+    shutdown, cancellation, and side-effect surfaces before controller work.
+  - Must preserve: no code behavior change and no new controller contract in
+    this PR.
+  - Verification: docs-only architecture checks and diff hygiene.
+
 ## Next PRs
 
-1. `security-change`: inventory KMS development defaults before any production
-   default hardening.
-2. `security-change`: apply IAM and plugin redaction in a separate S-014 PR.
+1. `contract`: define the minimal BackgroundController status vocabulary after
+   this inventory is reviewed.
+2. `test-only`: add focused preservation tests before moving scanner, heal,
+   replication, lifecycle, or disk health workers.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `security-change` PR; redaction rules use the security-governance crate, custom `Debug` stays local to secret-bearing KMS types, and no startup/storage/global-state path is touched. |
-| Migration preservation | pass | Runtime secret access and persisted config serialization are explicitly preserved by tests; no temporary compatibility path is introduced. |
-| Testing/verification | pass | Focused redaction/status tests, full KMS tests, admin KMS handler tests, governance tests, clippy, migration guards, Rust quality scan, nextest, doctests, and `make pre-commit` passed. |
+| Quality/architecture | pass | Single `docs-only` BGC-001 inventory; it records current owners, cancellation, side effects, and follow-up inputs without adding a controller abstraction. |
+| Migration preservation | pass | No Rust source, Cargo manifest, workflow, script, or runtime config diff; storage hot path and shutdown behavior are untouched. |
+| Testing/verification | pass | Architecture migration rules, layer dependency guard, metrics reference guard, docs diff hygiene, and no-code-diff check passed. |
 
 ## Verification Notes
 
 Passed:
-- `cargo test -p rustfs-kms redaction -- --nocapture`
-- `cargo test -p rustfs-kms status_response -- --nocapture`
-- `cargo test -p rustfs-kms --no-fail-fast`
-- `cargo test -p rustfs admin::handlers::kms --no-fail-fast`
-- `cargo test -p rustfs-security-governance --no-fail-fast`
-- `cargo clippy -p rustfs-kms --all-targets --all-features -- -D warnings`
-- Rust code quality scan on changed KMS source files
-- `cargo fmt --all --check`
-- `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_architecture_migration_rules.sh`
+- `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
-- `make pre-commit`
+- `git diff --name-only -- '*.rs' 'Cargo.toml' 'Cargo.lock' '.github/**' 'Makefile' 'Justfile'`
 
 Notes:
-- This branch changes only KMS redaction for debug/admin view surfaces. It does
-  not change KMS authorization, production defaults, startup order, global
-  state, storage paths, route registration, or crate boundaries.
-- Config serialization still preserves secret values for persisted cluster
-  config; this is tested explicitly to avoid runtime data loss.
-- `make pre-commit` passed all checks, including 5691 nextest tests, 111
-  skipped tests, and workspace doctests.
+- This branch changes architecture documentation only.
+- No Rust source, Cargo manifest, workflow, script, or runtime configuration is
+  changed.
+- `make pre-commit` is intentionally not required for this docs-only PR.
 
 ## Handoff Notes
 
-- Keep this S-013 branch as a focused `security-change` PR. Do not change KMS
-  defaults, admin authorization, admin route registration shape, Config moves,
-  Storage API moves, Runtime moves, or ECStore moves.
-- `rustfs` may depend on `rustfs-security-governance` for contract metadata;
-  the security-governance crate must stay independent from implementation
-  crates and runtime state.
+- Keep this BGC-001 branch as a focused `docs-only` PR.
+- Do not add controller traits, status structs, service registry code, shutdown
+  wiring, worker tests, or runtime behavior changes in this PR.
+- Follow-up BGC-002 may define a minimal read-only controller status vocabulary
+  after this inventory is reviewed.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
-- KMS production default hardening remains a separate task group; do not bundle
-  it with this redaction PR.

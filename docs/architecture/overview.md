@@ -22,6 +22,9 @@ hot-path behavior must not drift during this migration.
   startup/readiness, and shutdown contracts.
 - [`storage-control-data-plane.md`](storage-control-data-plane.md): boundaries
   between StorageCore, ECStore, ClusterControlPlane, and BackgroundControllers.
+- [`background-services-inventory.md`](background-services-inventory.md): current
+  scanner, heal, lifecycle, replication, config reload, metrics, and shutdown
+  surface before BackgroundController work.
 - [`crate-boundaries.md`](crate-boundaries.md): PR types, crate direction,
   compatibility rules, and migration guardrails.
 - [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md):
