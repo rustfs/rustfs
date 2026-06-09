@@ -328,12 +328,15 @@ fn claim_string(claims: Option<&HashMap<String, serde_json::Value>>, keys: &[&st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_credentials::{EMBEDDED_POLICY_TYPE, IAM_POLICY_CLAIM_NAME_SA};
+    use rustfs_credentials::{get_global_action_cred, init_global_action_credentials};
     use rustfs_iam::cache::Cache;
     use rustfs_iam::error::Error as IamError;
     use rustfs_iam::manager::IamCache;
     use rustfs_iam::store::{MappedPolicy, Store, UserType};
-    use rustfs_iam::sys::IamSys;
-    use rustfs_policy::auth::UserIdentity;
+    use rustfs_iam::sys::{IamSys, SESSION_POLICY_NAME};
+    use rustfs_policy::auth::{UserIdentity, jwt_sign};
+    use rustfs_policy::policy::Policy;
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64};
@@ -502,6 +505,7 @@ mod tests {
         status: rustfs_madmin::AccountStatus,
         policy_name: Option<&str>,
     ) -> IamSys<InfoAccessKeyTestStore> {
+        ensure_test_global_credentials();
         let (sender, _receiver) = mpsc::channel::<i64>(1);
         let cache = Cache::default();
         let now = OffsetDateTime::now_utc();
@@ -534,6 +538,125 @@ mod tests {
             sync_successes: AtomicU64::new(0),
             last_sync_duration_millis: AtomicU64::new(0),
         }))
+    }
+
+    fn ensure_test_global_credentials() {
+        if get_global_action_cred().is_none() {
+            let _ = init_global_action_credentials(Some("TESTROOTACCESSKEY".to_string()), Some("TESTROOTSECRET123".to_string()));
+        }
+    }
+
+    fn test_identity_with_signed_claims(mut identity: UserIdentity) -> UserIdentity {
+        if let Some(mut claims) = identity.credentials.claims.clone() {
+            if identity.credentials.is_temp() && !claims.contains_key("exp") {
+                claims.insert(
+                    "exp".to_string(),
+                    json!((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
+                );
+            }
+
+            identity.credentials.session_token =
+                jwt_sign(&claims, &identity.credentials.secret_key).expect("sign derived account claims");
+            identity.credentials.claims = Some(claims);
+        }
+
+        identity
+    }
+
+    fn test_temp_identity_with_signed_claims(mut identity: UserIdentity) -> UserIdentity {
+        let mut claims = identity.credentials.claims.clone().unwrap_or_default();
+        if !claims.contains_key("exp") {
+            claims.insert(
+                "exp".to_string(),
+                json!((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
+            );
+        }
+
+        identity.credentials.session_token =
+            jwt_sign(&claims, &identity.credentials.secret_key).expect("sign temp account claims");
+        identity.credentials.claims = Some(claims);
+        identity
+    }
+
+    fn test_iam_sys_with_identity(identity: UserIdentity) -> IamSys<InfoAccessKeyTestStore> {
+        ensure_test_global_credentials();
+        let (sender, _receiver) = mpsc::channel::<i64>(1);
+        let cache = Cache::default();
+        let now = OffsetDateTime::now_utc();
+        let identity = test_identity_with_signed_claims(identity);
+        if identity.credentials.is_temp() {
+            cache.add_or_update_sts_account(&identity.credentials.access_key, &identity, now);
+        } else {
+            cache.add_or_update_user(&identity.credentials.access_key, &identity, now);
+        }
+
+        IamSys::new(Arc::new(IamCache {
+            api: InfoAccessKeyTestStore,
+            cache,
+            state: Arc::new(AtomicU8::new(2)),
+            loading: Arc::new(AtomicBool::new(false)),
+            roles: HashMap::new(),
+            send_chan: sender,
+            last_timestamp: AtomicI64::new(now.unix_timestamp()),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
+        }))
+    }
+
+    fn test_iam_sys_with_temp_identity(identity: UserIdentity) -> IamSys<InfoAccessKeyTestStore> {
+        ensure_test_global_credentials();
+        let (sender, _receiver) = mpsc::channel::<i64>(1);
+        let cache = Cache::default();
+        let now = OffsetDateTime::now_utc();
+        let identity = test_temp_identity_with_signed_claims(identity);
+        cache.add_or_update_sts_account(&identity.credentials.access_key, &identity, now);
+
+        IamSys::new(Arc::new(IamCache {
+            api: InfoAccessKeyTestStore,
+            cache,
+            state: Arc::new(AtomicU8::new(2)),
+            loading: Arc::new(AtomicBool::new(false)),
+            roles: HashMap::new(),
+            send_chan: sender,
+            last_timestamp: AtomicI64::new(now.unix_timestamp()),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
+        }))
+    }
+
+    fn test_embedded_session_policy() -> Policy {
+        serde_json::from_value(json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": ["arn:aws:s3:::bucket/*"]
+                }
+            ]
+        }))
+        .expect("embedded session policy")
+    }
+
+    fn embedded_session_policy_claims(
+        mut claims: HashMap<String, serde_json::Value>,
+        policy: &Policy,
+    ) -> HashMap<String, serde_json::Value> {
+        let encoded_policy =
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(&serde_json::to_vec(policy).expect("marshal embedded session policy"));
+        claims.insert(IAM_POLICY_CLAIM_NAME_SA.to_string(), json!(EMBEDDED_POLICY_TYPE));
+        claims.insert(SESSION_POLICY_NAME.to_string(), json!(encoded_policy));
+        claims
+    }
+
+    fn temp_account_claims(mut claims: HashMap<String, serde_json::Value>) -> HashMap<String, serde_json::Value> {
+        claims.insert(
+            "exp".to_string(),
+            json!((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
+        );
+        claims
     }
 
     #[test]
@@ -672,5 +795,142 @@ mod tests {
         assert_eq!(resp.info.description.as_deref(), Some("regular user"));
         assert_eq!(resp.ldap_specific_info.username, None);
         assert_eq!(resp.open_id_specific_info.user_id, None);
+
+        let body = serde_json::to_value(&resp).expect("serialize regular user response");
+        assert_eq!(body.get("userType").and_then(|v| v.as_str()), Some("User"));
+        assert_eq!(body.get("userProvider").and_then(|v| v.as_str()), Some("builtin"));
+        assert!(body.get("accessKey").is_some());
+        assert!(body.get("accountStatus").is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_info_access_key_resp_preserves_ldap_service_account_contract() {
+        let policy = test_embedded_session_policy();
+        let credentials = StoredCredentials {
+            access_key: "svc-ldap".to_string(),
+            secret_key: "secret-key".to_string(),
+            parent_user: "ldap-parent".to_string(),
+            status: "on".to_string(),
+            name: Some("LDAP Service".to_string()),
+            description: Some("ldap derived service account".to_string()),
+            claims: Some(embedded_session_policy_claims(
+                HashMap::from([("ldap:username".to_string(), json!("alice"))]),
+                &policy,
+            )),
+            ..Default::default()
+        };
+        let iam_sys = test_iam_sys_with_identity(UserIdentity::from(credentials.clone()));
+
+        let resp = resolve_info_access_key_resp(&iam_sys, "svc-ldap".to_string(), credentials)
+            .await
+            .expect("resolve ldap service account info");
+
+        assert_eq!(resp.user_type, "Service Account");
+        assert_eq!(resp.user_provider, "ldap");
+        assert_eq!(resp.info.parent_user, "ldap-parent");
+        assert_eq!(resp.info.account_status, "on");
+        assert!(!resp.info.implied_policy);
+        assert_eq!(resp.info.name.as_deref(), Some("LDAP Service"));
+        assert_eq!(resp.info.description.as_deref(), Some("ldap derived service account"));
+        assert_eq!(resp.ldap_specific_info.username.as_deref(), Some("alice"));
+        assert_eq!(resp.open_id_specific_info.user_id, None);
+        assert!(resp.info.policy.is_some());
+
+        let body = serde_json::to_value(&resp).expect("serialize ldap service account response");
+        assert_eq!(body.get("userType").and_then(|v| v.as_str()), Some("Service Account"));
+        assert_eq!(body.get("userProvider").and_then(|v| v.as_str()), Some("ldap"));
+        assert_eq!(
+            body.get("ldapSpecificInfo")
+                .and_then(|v| v.get("username"))
+                .and_then(|v| v.as_str()),
+            Some("alice")
+        );
+        assert!(body.get("openIDSpecificInfo").is_none());
+        assert_eq!(body.get("parentUser").and_then(|v| v.as_str()), Some("ldap-parent"));
+        assert_eq!(body.get("accountStatus").and_then(|v| v.as_str()), Some("on"));
+        assert_eq!(body.get("name").and_then(|v| v.as_str()), Some("LDAP Service"));
+        assert_eq!(body.get("description").and_then(|v| v.as_str()), Some("ldap derived service account"));
+        assert!(body.get("policy").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_info_access_key_resp_preserves_openid_sts_contract() {
+        let credentials = StoredCredentials {
+            access_key: "sts-openid".to_string(),
+            secret_key: "secret-key".to_string(),
+            session_token: "session-token".to_string(),
+            parent_user: "oidc-parent".to_string(),
+            status: "on".to_string(),
+            name: Some("OIDC STS".to_string()),
+            description: Some("openid derived temporary account".to_string()),
+            claims: Some(temp_account_claims(HashMap::from([
+                ("iss".to_string(), json!("https://issuer.example/realms/rustfs")),
+                ("sub".to_string(), json!("subject-123")),
+                ("name".to_string(), json!("RustFS User")),
+            ]))),
+            ..Default::default()
+        };
+        let iam_sys = test_iam_sys_with_temp_identity(UserIdentity::from(credentials.clone()));
+
+        let resp = resolve_info_access_key_resp(&iam_sys, "sts-openid".to_string(), credentials)
+            .await
+            .expect("resolve openid sts info");
+
+        assert_eq!(resp.user_type, "STS");
+        assert_eq!(resp.user_provider, "openid");
+        assert_eq!(resp.info.parent_user, "oidc-parent");
+        assert_eq!(resp.info.account_status, "on");
+        assert!(resp.info.implied_policy);
+        assert_eq!(resp.info.name.as_deref(), Some("OIDC STS"));
+        assert_eq!(resp.info.description.as_deref(), Some("openid derived temporary account"));
+        assert_eq!(resp.ldap_specific_info.username, None);
+        assert_eq!(resp.open_id_specific_info.user_id.as_deref(), Some("subject-123"));
+        assert_eq!(resp.open_id_specific_info.user_id_claim.as_deref(), Some("sub"));
+        assert_eq!(resp.open_id_specific_info.display_name.as_deref(), Some("RustFS User"));
+        assert_eq!(resp.open_id_specific_info.display_name_claim.as_deref(), Some("name"));
+        assert_eq!(resp.open_id_specific_info.config_name, None);
+        assert_eq!(
+            resp.info.policy,
+            Some("{\n  \"ID\": \"\",\n  \"Version\": \"\",\n  \"Statement\": []\n}".to_string())
+        );
+
+        let body = serde_json::to_value(&resp).expect("serialize openid sts response");
+        assert_eq!(body.get("userType").and_then(|v| v.as_str()), Some("STS"));
+        assert_eq!(body.get("userProvider").and_then(|v| v.as_str()), Some("openid"));
+        assert!(body.get("ldapSpecificInfo").is_none());
+        assert_eq!(body.get("impliedPolicy").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            body.get("openIDSpecificInfo")
+                .and_then(|v| v.get("userID"))
+                .and_then(|v| v.as_str()),
+            Some("subject-123")
+        );
+        assert_eq!(
+            body.get("openIDSpecificInfo")
+                .and_then(|v| v.get("userIDClaim"))
+                .and_then(|v| v.as_str()),
+            Some("sub")
+        );
+        assert_eq!(
+            body.get("openIDSpecificInfo")
+                .and_then(|v| v.get("displayName"))
+                .and_then(|v| v.as_str()),
+            Some("RustFS User")
+        );
+        assert_eq!(
+            body.get("openIDSpecificInfo")
+                .and_then(|v| v.get("displayNameClaim"))
+                .and_then(|v| v.as_str()),
+            Some("name")
+        );
+        assert!(body.get("openIDSpecificInfo").is_some_and(|v| v.get("configName").is_none()));
+        assert_eq!(body.get("parentUser").and_then(|v| v.as_str()), Some("oidc-parent"));
+        assert_eq!(body.get("accountStatus").and_then(|v| v.as_str()), Some("on"));
+        assert_eq!(body.get("name").and_then(|v| v.as_str()), Some("OIDC STS"));
+        assert_eq!(body.get("description").and_then(|v| v.as_str()), Some("openid derived temporary account"));
+        assert_eq!(
+            body.get("policy").and_then(|v| v.as_str()),
+            Some("{\n  \"ID\": \"\",\n  \"Version\": \"\",\n  \"Statement\": []\n}")
+        );
     }
 }
