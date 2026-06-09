@@ -5,14 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-background-controller-contract`
-- Baseline: `upstream/main` at `f9a5e6d7e67322ac6f626b6f437a5e722fbe22e2`
-- PR type for this branch: `docs-only`
+- Branch: `overtrue/arch-storage-api-error-contracts`
+- Baseline: `upstream/main` at `5fef10548477d9d25b0d391874f8280bf259d10e`
+- PR type for this branch: `contract`
 - Runtime behavior changes: none.
-- Rust code changes: none.
+- Rust code changes: add the `rustfs-storage-api` error-code/result contract
+  and route ECStore storage error numeric conversion through that contract.
 - CI/script changes: none
-- Docs changes: add BGC-002 background controller contract vocabulary and index
-  it from the background service inventory and architecture overview.
+- Docs changes: record the API-002 first-slice contract boundary.
 
 ## Phase 0 Tasks
 
@@ -114,6 +114,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused KMS redaction/status tests, full KMS tests, migration
     guards, Rust quality scan, clippy, and `make pre-commit` passed.
 
+## Phase 2 Storage API Tasks
+
+- [x] `API-001` Add `crates/storage-api`.
+  - Acceptance: `rustfs-storage-api` is a workspace member and remains a
+    dependency-free contract crate.
+  - Verification: `cargo check -p rustfs-storage-api`.
+- [~] `API-002` Move public storage error/result contracts.
+  - Current slice: add public `StorageErrorCode` and `StorageResult` contracts
+    in `rustfs-storage-api`, then make ECStore `StorageError::to_u32/from_u32`
+    consume the shared code table.
+  - Deferred: keep the full ECStore `StorageError` enum and ECStore-specific
+    conversions in `rustfs-ecstore` until the `DiskError`, filemeta, lock, and
+    `std::io::Error` downcast boundary is proven safe.
+  - Acceptance: storage-api contract tests pass, ECStore compatibility tests
+    prove numeric codes match the new contract, and
+    `cargo check -p rustfs-storage-api -p rustfs-ecstore` passes.
+  - Must preserve: storage error display, conversions, object error mapping,
+    quorum classification, and reserved code gaps `0x2B/0x2C`.
+  - Risk defense: no storage hot-path enum move in this PR; only numeric code
+    mapping uses the new contract.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -137,43 +158,53 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `test-only`: add focused preservation tests before moving scanner, heal,
-   replication, lifecycle, or disk health workers.
-2. `contract`: add a side-effect-free BGC-003 status snapshot for a low-risk
-   service such as memory observability.
-3. `behavior-change`: migrate one low-risk controller behind idempotence and
-   shutdown preservation tests.
+1. Continue `API-002` only after reviewing whether `DiskError` and
+   `std::io::Error` conversion ownership can move without orphan-rule or
+   downcast behavior loss.
+2. `contract`: move DTOs that are contract-only in `API-003`; keep ECStore
+   implementation, KMS/SSE readers, erasure logic, and remote disk internals out
+   of rustfs-storage-api.
+3. `test-only`: add focused compatibility checks before moving store traits or
+   consumer imports.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `docs-only` BGC-002 contract; it defines vocabulary and boundaries without adding a Rust trait, scheduler, or service registry. |
-| Migration preservation | pass | No Rust source, Cargo manifest, workflow, script, runtime config, worker start/stop path, readiness path, or storage hot path diff. |
-| Testing/verification | pass | Architecture migration rules, layer dependency guard, metrics reference guard, docs diff hygiene, and no-code-diff check passed. |
+| Quality/architecture | pass | rustfs-storage-api only adds `StorageErrorCode` and `StorageResult`; ECStore keeps `StorageError`, `DiskError`, filemeta, lock, and `std::io::Error` conversion ownership. |
+| Migration preservation | pass | ECStore numeric conversion now consumes the shared code table while preserving old variant defaults, reserved gaps `0x2B/0x2C`, and existing display/conversion logic. |
+| Testing/verification | pass | Focused storage-api and ECStore tests, cargo check, dependency guard, migration guards, Rust quality scan, `make pre-commit`, nextest, and doctests passed. |
 
 ## Verification Notes
 
 Passed:
+- `cargo fmt --all`
+- `cargo fmt --all --check`
+- `cargo test -p rustfs-storage-api`
+- `cargo test -p rustfs-ecstore error -- --nocapture`
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore`
+- `cargo tree -p rustfs-storage-api --edges normal`
 - `./scripts/check_architecture_migration_rules.sh`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
-- `git diff --name-only -- '*.rs' 'Cargo.toml' 'Cargo.lock' '.github/**' 'Makefile' 'Justfile'`
+- Rust quality scan on changed Rust files.
+- `make pre-commit`
+  - Full nextest: 5704 passed, 111 skipped.
+  - Workspace doctests passed.
 
 Notes:
-- This branch changes architecture documentation only.
-- No Rust source, Cargo manifest, workflow, script, or runtime configuration is
-  changed.
-- `make pre-commit` is intentionally not required for this docs-only PR.
+- This branch changes Rust storage contract code and ECStore contract mapping.
+- Rust quality scan reported only existing patterns in `crates/ecstore/src/error.rs`:
+  a test-only `unwrap()` and the pre-existing `StorageError::other` boxed error
+  boundary. This PR does not add either pattern.
 
 ## Handoff Notes
 
-- Keep this BGC-002 branch as a focused `docs-only` PR.
-- Do not add controller traits, status structs, service registry code,
-  scheduling, shutdown wiring, worker tests, or runtime behavior changes in this
-  PR.
-- Follow-up BGC-003 should add a side-effect-free status snapshot for one
-  low-risk service first, preferably memory observability.
+- Keep this branch as the API-002 first slice, not the full error enum move.
+- Do not move `StorageError`, `DiskError`, filemeta conversion, lock conversion,
+  or `std::io::Error` downcast behavior out of ECStore in this PR.
+- Do not add ECStore implementation, KMS/SSE reader logic, erasure logic, or
+  remote disk internals to `rustfs-storage-api`.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
