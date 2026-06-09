@@ -28,6 +28,7 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -38,8 +39,10 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}",
     "DELETE /{warehouse}/namespaces/{namespace}",
     "GET /{warehouse}/namespaces/{namespace}/tables",
+    "POST /{warehouse}/namespaces/{namespace}/tables",
     "POST /{warehouse}/namespaces/{namespace}/register",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}",
     "DELETE /{warehouse}/namespaces/{namespace}/tables/{table}",
 ];
 
@@ -84,8 +87,15 @@ struct RegisterTableRequest {
 #[serde(deny_unknown_fields)]
 struct CreateTableRequest {
     name: String,
-    #[serde(rename = "metadata-location")]
-    metadata_location: String,
+    #[serde(default)]
+    location: Option<String>,
+    schema: serde_json::Value,
+    #[serde(default, rename = "partition-spec")]
+    partition_spec: Option<serde_json::Value>,
+    #[serde(default, rename = "write-order")]
+    write_order: Option<serde_json::Value>,
+    #[serde(default, rename = "stage-create")]
+    stage_create: bool,
     #[serde(default)]
     properties: BTreeMap<String, String>,
 }
@@ -93,19 +103,22 @@ struct CreateTableRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestCommitTableRequest {
-    #[serde(rename = "commit-id")]
-    commit_id: String,
+    #[serde(default, rename = "commit-id")]
+    commit_id: Option<String>,
     #[serde(default, rename = "idempotency-key")]
     idempotency_key: Option<String>,
-    operation: String,
-    #[serde(rename = "expected-version-token")]
-    expected_version_token: String,
-    #[serde(rename = "expected-metadata-location")]
-    expected_metadata_location: String,
-    #[serde(rename = "new-metadata-location")]
-    new_metadata_location: String,
+    #[serde(default)]
+    operation: Option<String>,
+    #[serde(default, rename = "expected-version-token")]
+    expected_version_token: Option<String>,
+    #[serde(default, rename = "expected-metadata-location")]
+    expected_metadata_location: Option<String>,
+    #[serde(default, rename = "new-metadata-location")]
+    new_metadata_location: Option<String>,
     #[serde(default)]
     requirements: Vec<serde_json::Value>,
+    #[serde(default)]
+    updates: Vec<serde_json::Value>,
     #[serde(default)]
     writer: Option<String>,
 }
@@ -144,6 +157,7 @@ struct RestLoadTableResponse {
 struct RestCommitTableResponse {
     #[serde(rename = "metadata-location")]
     metadata_location: String,
+    metadata: serde_json::Value,
     #[serde(rename = "version-token")]
     version_token: String,
     generation: u64,
@@ -405,9 +419,13 @@ fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metad
     }
 }
 
-fn commit_table_response_from_result(result: crate::table_catalog::TableCommitResult) -> RestCommitTableResponse {
+fn commit_table_response_from_result(
+    result: crate::table_catalog::TableCommitResult,
+    metadata: serde_json::Value,
+) -> RestCommitTableResponse {
     RestCommitTableResponse {
         metadata_location: result.table.metadata_location,
+        metadata,
         version_token: result.table.version_token,
         generation: result.table.generation,
         commit_id: result.commit_log.commit_id,
@@ -419,20 +437,41 @@ fn table_commit_request_from_rest_request(
     namespace: &crate::table_catalog::Namespace,
     table: &str,
     request: RestCommitTableRequest,
-) -> crate::table_catalog::TableCommitRequest {
-    crate::table_catalog::TableCommitRequest {
+) -> S3Result<crate::table_catalog::TableCommitRequest> {
+    Ok(crate::table_catalog::TableCommitRequest {
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
         table: table.to_string(),
-        commit_id: request.commit_id,
+        commit_id: request.commit_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         idempotency_key: request.idempotency_key,
-        operation: request.operation,
-        expected_version_token: request.expected_version_token,
-        expected_metadata_location: request.expected_metadata_location,
-        new_metadata_location: request.new_metadata_location,
+        operation: request.operation.unwrap_or_else(|| "commit".to_string()),
+        expected_version_token: request
+            .expected_version_token
+            .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires expected-version-token"))?,
+        expected_metadata_location: request
+            .expected_metadata_location
+            .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires expected-metadata-location"))?,
+        new_metadata_location: request
+            .new_metadata_location
+            .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires new-metadata-location"))?,
         requirements: request.requirements,
         writer: request.writer,
+    })
+}
+
+fn validate_table_location_in_bucket(bucket: &str, location: &str) -> S3Result<()> {
+    if !location.starts_with(&format!("s3://{bucket}/")) {
+        return Err(s3_error!(InvalidRequest, "table location must be inside the table bucket"));
     }
+    Ok(())
+}
+
+fn validate_metadata_table_location_in_bucket(bucket: &str, metadata: &serde_json::Value) -> S3Result<()> {
+    let location = metadata
+        .get("location")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "table metadata is missing location"))?;
+    validate_table_location_in_bucket(bucket, location)
 }
 
 fn table_entry_from_register_request(
@@ -474,19 +513,674 @@ fn table_entry_from_create_table_request(
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     request: CreateTableRequest,
-) -> S3Result<crate::table_catalog::TableEntry> {
-    let properties = request.properties;
-    let mut entry = table_entry_from_register_request(
-        bucket,
-        namespace,
-        RegisterTableRequest {
-            name: request.name,
-            metadata_location: request.metadata_location,
-            overwrite: false,
-        },
+) -> S3Result<(crate::table_catalog::TableEntry, serde_json::Value)> {
+    if request.stage_create {
+        return Err(s3_error!(NotImplemented, "stage-create is not supported"));
+    }
+
+    let table = crate::table_catalog::IdentifierSegment::parse(request.name)
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    let table_id = Uuid::new_v4().to_string();
+    let table_uuid = Uuid::new_v4().to_string();
+    let warehouse_location = request.location.unwrap_or_else(|| format!("s3://{bucket}/tables/{table_id}"));
+    validate_table_location_in_bucket(bucket, &warehouse_location)?;
+    let metadata_location = crate::table_catalog::default_table_metadata_file_path(namespace, &table, "00001.metadata.json");
+
+    let mut entry = crate::table_catalog::TableEntry {
+        version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        table_id,
+        table_uuid,
+        format: "ICEBERG".to_string(),
+        format_version: 2,
+        warehouse_location,
+        metadata_location,
+        version_token: format!("token-{}", Uuid::new_v4()),
+        generation: 1,
+        state: crate::table_catalog::TableCatalogEntryState::Active,
+        properties: request.properties,
+        created_at: None,
+        updated_at: None,
+    };
+    let metadata = initial_table_metadata_json(
+        &entry,
+        request.schema,
+        request.partition_spec,
+        request.write_order,
+        entry.properties.clone(),
     )?;
-    entry.properties = properties;
-    Ok(entry)
+    entry.format_version = metadata
+        .get("format-version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .unwrap_or(2);
+    Ok((entry, metadata))
+}
+
+fn initial_table_metadata_json(
+    entry: &crate::table_catalog::TableEntry,
+    mut schema: serde_json::Value,
+    partition_spec: Option<serde_json::Value>,
+    write_order: Option<serde_json::Value>,
+    properties: BTreeMap<String, String>,
+) -> S3Result<serde_json::Value> {
+    let schema_object = schema
+        .as_object_mut()
+        .ok_or_else(|| s3_error!(InvalidRequest, "schema must be a JSON object"))?;
+    schema_object
+        .entry("schema-id".to_string())
+        .or_insert_with(|| serde_json::Value::from(0));
+    let schema_id = schema_object
+        .get("schema-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "schema-id must be an integer"))?;
+    let last_column_id = max_field_id(&schema);
+
+    let mut spec = partition_spec.unwrap_or_else(|| {
+        serde_json::json!({
+            "spec-id": 0,
+            "fields": []
+        })
+    });
+    let spec_object = spec
+        .as_object_mut()
+        .ok_or_else(|| s3_error!(InvalidRequest, "partition-spec must be a JSON object"))?;
+    spec_object
+        .entry("spec-id".to_string())
+        .or_insert_with(|| serde_json::Value::from(0));
+    spec_object
+        .entry("fields".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let spec_id = spec_object
+        .get("spec-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "partition spec-id must be an integer"))?;
+    let last_partition_id = max_partition_field_id(&spec);
+
+    let mut sort_order = write_order.unwrap_or_else(|| {
+        serde_json::json!({
+            "order-id": 0,
+            "fields": []
+        })
+    });
+    let sort_order_object = sort_order
+        .as_object_mut()
+        .ok_or_else(|| s3_error!(InvalidRequest, "write-order must be a JSON object"))?;
+    sort_order_object
+        .entry("order-id".to_string())
+        .or_insert_with(|| serde_json::Value::from(0));
+    sort_order_object
+        .entry("fields".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let sort_order_id = sort_order_object
+        .get("order-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "sort order-id must be an integer"))?;
+
+    Ok(serde_json::json!({
+        "format-version": entry.format_version,
+        "table-uuid": entry.table_uuid,
+        "location": entry.warehouse_location,
+        "last-sequence-number": 0,
+        "last-updated-ms": current_time_millis(),
+        "last-column-id": last_column_id,
+        "schemas": [schema],
+        "current-schema-id": schema_id,
+        "partition-specs": [spec],
+        "default-spec-id": spec_id,
+        "last-partition-id": last_partition_id,
+        "sort-orders": [sort_order],
+        "default-sort-order-id": sort_order_id,
+        "properties": properties,
+        "snapshots": [],
+        "snapshot-log": [],
+        "metadata-log": [],
+        "refs": {}
+    }))
+}
+
+fn current_time_millis() -> i64 {
+    let now = OffsetDateTime::now_utc();
+    now.unix_timestamp()
+        .saturating_mul(1000)
+        .saturating_add(i64::from(now.millisecond()))
+}
+
+fn max_field_id(value: &serde_json::Value) -> i64 {
+    let mut max_id = 0;
+    collect_max_field_id(value, &mut max_id);
+    max_id
+}
+
+fn collect_max_field_id(value: &serde_json::Value, max_id: &mut i64) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(id) = object.get("id").and_then(serde_json::Value::as_i64) {
+                *max_id = (*max_id).max(id);
+            }
+            for child in object.values() {
+                collect_max_field_id(child, max_id);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_max_field_id(child, max_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn max_partition_field_id(value: &serde_json::Value) -> i64 {
+    let mut max_id = 999;
+    let Some(fields) = value.get("fields").and_then(serde_json::Value::as_array) else {
+        return max_id;
+    };
+    for field in fields {
+        if let Some(field_id) = field.get("field-id").and_then(serde_json::Value::as_i64) {
+            max_id = max_id.max(field_id);
+        }
+    }
+    max_id
+}
+
+fn next_metadata_file_name(generation: u64) -> String {
+    format!("{generation:05}.metadata.json")
+}
+
+fn validate_table_commit_requirements(metadata: &serde_json::Value, requirements: &[serde_json::Value]) -> S3Result<()> {
+    for requirement in requirements {
+        let requirement_type = requirement
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| s3_error!(InvalidRequest, "commit requirement type is required"))?;
+        match requirement_type {
+            "assert-create" => {
+                return Err(s3_error!(PreconditionFailed, "commit requirement failed: table already exists"));
+            }
+            "assert-table-uuid" => {
+                let expected = requirement
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| s3_error!(InvalidRequest, "assert-table-uuid requires uuid"))?;
+                let actual = metadata
+                    .get("table-uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| s3_error!(InvalidRequest, "current table metadata is missing table-uuid"))?;
+                if actual != expected {
+                    return Err(s3_error!(PreconditionFailed, "commit requirement failed: table uuid changed"));
+                }
+            }
+            "assert-current-schema-id" => {
+                validate_i64_requirement(metadata, requirement, "current-schema-id", "current schema id")?;
+            }
+            "assert-default-spec-id" => {
+                validate_i64_requirement(metadata, requirement, "default-spec-id", "default spec id")?;
+            }
+            "assert-default-sort-order-id" => {
+                validate_i64_requirement(metadata, requirement, "default-sort-order-id", "default sort order id")?;
+            }
+            "assert-last-assigned-field-id" => {
+                validate_i64_requirement_with_metadata_key(
+                    metadata,
+                    requirement,
+                    "last-assigned-field-id",
+                    "last-column-id",
+                    "last assigned field id",
+                )?;
+            }
+            "assert-last-assigned-partition-id" => {
+                validate_i64_requirement_with_metadata_key(
+                    metadata,
+                    requirement,
+                    "last-assigned-partition-id",
+                    "last-partition-id",
+                    "last assigned partition id",
+                )?;
+            }
+            "assert-ref-snapshot-id" => validate_ref_snapshot_requirement(metadata, requirement)?,
+            _ => return Err(s3_error!(NotImplemented, "unsupported commit requirement: {requirement_type}")),
+        }
+    }
+    Ok(())
+}
+
+fn validate_i64_requirement(
+    metadata: &serde_json::Value,
+    requirement: &serde_json::Value,
+    key: &str,
+    label: &str,
+) -> S3Result<()> {
+    validate_i64_requirement_with_metadata_key(metadata, requirement, key, key, label)
+}
+
+fn validate_i64_requirement_with_metadata_key(
+    metadata: &serde_json::Value,
+    requirement: &serde_json::Value,
+    requirement_key: &str,
+    metadata_key: &str,
+    label: &str,
+) -> S3Result<()> {
+    let expected = requirement
+        .get(requirement_key)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "{requirement_key} must be an integer"))?;
+    let actual = metadata
+        .get(metadata_key)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "current table metadata is missing {metadata_key}"))?;
+    if actual != expected {
+        return Err(s3_error!(PreconditionFailed, "commit requirement failed: {label} changed"));
+    }
+    Ok(())
+}
+
+fn validate_ref_snapshot_requirement(metadata: &serde_json::Value, requirement: &serde_json::Value) -> S3Result<()> {
+    let ref_name = requirement
+        .get("ref")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "assert-ref-snapshot-id requires ref"))?;
+    let refs = metadata.get("refs").and_then(serde_json::Value::as_object);
+    let actual = refs
+        .and_then(|refs| refs.get(ref_name))
+        .and_then(|reference| reference.get("snapshot-id"))
+        .and_then(serde_json::Value::as_i64);
+    if requirement.get("snapshot-id").is_some_and(serde_json::Value::is_null) {
+        if actual.is_some() {
+            return Err(s3_error!(PreconditionFailed, "commit requirement failed: snapshot ref exists"));
+        }
+        return Ok(());
+    }
+    let expected = requirement
+        .get("snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "assert-ref-snapshot-id requires snapshot-id"))?;
+    if actual != Some(expected) {
+        return Err(s3_error!(PreconditionFailed, "commit requirement failed: snapshot ref changed"));
+    }
+    Ok(())
+}
+
+fn apply_table_commit_updates(
+    mut metadata: serde_json::Value,
+    updates: &[serde_json::Value],
+    previous_metadata_location: &str,
+) -> S3Result<serde_json::Value> {
+    if !metadata.is_object() {
+        return Err(s3_error!(InvalidRequest, "current table metadata must be a JSON object"));
+    }
+
+    for update in updates {
+        let action = update
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| s3_error!(InvalidRequest, "table update action is required"))?;
+        match action {
+            "assign-uuid" => apply_assign_uuid_update(&mut metadata, update)?,
+            "upgrade-format-version" => apply_upgrade_format_version_update(&mut metadata, update)?,
+            "add-schema" => apply_add_schema_update(&mut metadata, update)?,
+            "set-current-schema" => apply_set_current_schema_update(&mut metadata, update)?,
+            "add-spec" => apply_add_spec_update(&mut metadata, update)?,
+            "set-default-spec" => apply_set_default_spec_update(&mut metadata, update)?,
+            "add-sort-order" => apply_add_sort_order_update(&mut metadata, update)?,
+            "set-default-sort-order" => apply_set_default_sort_order_update(&mut metadata, update)?,
+            "add-snapshot" => apply_add_snapshot_update(&mut metadata, update)?,
+            "set-snapshot-ref" => apply_set_snapshot_ref_update(&mut metadata, update)?,
+            "remove-snapshots" => apply_remove_snapshots_update(&mut metadata, update)?,
+            "remove-snapshot-ref" => apply_remove_snapshot_ref_update(&mut metadata, update)?,
+            "set-location" => apply_set_location_update(&mut metadata, update)?,
+            "set-properties" => apply_set_properties_update(&mut metadata, update)?,
+            "remove-properties" => apply_remove_properties_update(&mut metadata, update)?,
+            _ => return Err(s3_error!(NotImplemented, "unsupported table update: {action}")),
+        }
+    }
+
+    append_previous_metadata_log(&mut metadata, previous_metadata_location)?;
+    metadata_object_mut(&mut metadata)?.insert("last-updated-ms".to_string(), serde_json::Value::from(current_time_millis()));
+    Ok(metadata)
+}
+
+fn apply_assign_uuid_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let uuid = update
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "assign-uuid requires uuid"))?;
+    let object = metadata_object_mut(metadata)?;
+    if let Some(existing) = object.get("table-uuid").and_then(serde_json::Value::as_str)
+        && existing != uuid
+    {
+        return Err(s3_error!(PreconditionFailed, "cannot reassign table uuid"));
+    }
+    object.insert("table-uuid".to_string(), serde_json::Value::String(uuid.to_string()));
+    Ok(())
+}
+
+fn apply_upgrade_format_version_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let version = update
+        .get("format-version")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "upgrade-format-version requires format-version"))?;
+    let current = metadata
+        .get("format-version")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    if version < current {
+        return Err(s3_error!(InvalidRequest, "format-version cannot be downgraded"));
+    }
+    metadata_object_mut(metadata)?.insert("format-version".to_string(), serde_json::Value::from(version));
+    Ok(())
+}
+
+fn apply_add_schema_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let mut schema = update
+        .get("schema")
+        .cloned()
+        .ok_or_else(|| s3_error!(InvalidRequest, "add-schema requires schema"))?;
+    if !schema.is_object() {
+        return Err(s3_error!(InvalidRequest, "add-schema schema must be a JSON object"));
+    }
+    if schema.get("schema-id").is_none() {
+        let next_id = next_array_object_i64(metadata, "schemas", "schema-id")?;
+        schema
+            .as_object_mut()
+            .ok_or_else(|| s3_error!(InvalidRequest, "add-schema schema must be a JSON object"))?
+            .insert("schema-id".to_string(), serde_json::Value::from(next_id));
+    }
+    let last_column_id = max_field_id(&schema);
+    ensure_array_field(metadata, "schemas")?.push(schema);
+    let object = metadata_object_mut(metadata)?;
+    let current_last = object
+        .get("last-column-id")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    object.insert("last-column-id".to_string(), serde_json::Value::from(current_last.max(last_column_id)));
+    Ok(())
+}
+
+fn apply_set_current_schema_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let requested_id = update
+        .get("schema-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "set-current-schema requires schema-id"))?;
+    let schema_id = if requested_id == -1 {
+        last_array_object_i64(metadata, "schemas", "schema-id")?
+    } else {
+        requested_id
+    };
+    metadata_object_mut(metadata)?.insert("current-schema-id".to_string(), serde_json::Value::from(schema_id));
+    Ok(())
+}
+
+fn apply_add_spec_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let mut spec = update
+        .get("spec")
+        .cloned()
+        .ok_or_else(|| s3_error!(InvalidRequest, "add-spec requires spec"))?;
+    if !spec.is_object() {
+        return Err(s3_error!(InvalidRequest, "add-spec spec must be a JSON object"));
+    }
+    if spec.get("spec-id").is_none() {
+        let next_id = next_array_object_i64(metadata, "partition-specs", "spec-id")?;
+        spec.as_object_mut()
+            .ok_or_else(|| s3_error!(InvalidRequest, "add-spec spec must be a JSON object"))?
+            .insert("spec-id".to_string(), serde_json::Value::from(next_id));
+    }
+    let last_partition_id = max_partition_field_id(&spec);
+    ensure_array_field(metadata, "partition-specs")?.push(spec);
+    let object = metadata_object_mut(metadata)?;
+    let current_last = object
+        .get("last-partition-id")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(999);
+    object.insert(
+        "last-partition-id".to_string(),
+        serde_json::Value::from(current_last.max(last_partition_id)),
+    );
+    Ok(())
+}
+
+fn apply_set_default_spec_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let requested_id = update
+        .get("spec-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "set-default-spec requires spec-id"))?;
+    let spec_id = if requested_id == -1 {
+        last_array_object_i64(metadata, "partition-specs", "spec-id")?
+    } else {
+        requested_id
+    };
+    metadata_object_mut(metadata)?.insert("default-spec-id".to_string(), serde_json::Value::from(spec_id));
+    Ok(())
+}
+
+fn apply_add_sort_order_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let mut sort_order = update
+        .get("sort-order")
+        .cloned()
+        .ok_or_else(|| s3_error!(InvalidRequest, "add-sort-order requires sort-order"))?;
+    if !sort_order.is_object() {
+        return Err(s3_error!(InvalidRequest, "add-sort-order sort-order must be a JSON object"));
+    }
+    if sort_order.get("order-id").is_none() {
+        let next_id = next_array_object_i64(metadata, "sort-orders", "order-id")?;
+        sort_order
+            .as_object_mut()
+            .ok_or_else(|| s3_error!(InvalidRequest, "add-sort-order sort-order must be a JSON object"))?
+            .insert("order-id".to_string(), serde_json::Value::from(next_id));
+    }
+    ensure_array_field(metadata, "sort-orders")?.push(sort_order);
+    Ok(())
+}
+
+fn apply_set_default_sort_order_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let requested_id = update
+        .get("sort-order-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "set-default-sort-order requires sort-order-id"))?;
+    let sort_order_id = if requested_id == -1 {
+        last_array_object_i64(metadata, "sort-orders", "order-id")?
+    } else {
+        requested_id
+    };
+    metadata_object_mut(metadata)?.insert("default-sort-order-id".to_string(), serde_json::Value::from(sort_order_id));
+    Ok(())
+}
+
+fn apply_add_snapshot_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let snapshot = update
+        .get("snapshot")
+        .cloned()
+        .ok_or_else(|| s3_error!(InvalidRequest, "add-snapshot requires snapshot"))?;
+    let snapshot_id = snapshot
+        .get("snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "snapshot-id must be an integer"))?;
+    let sequence_number = snapshot
+        .get("sequence-number")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "snapshot sequence-number must be an integer"))?;
+    let timestamp_ms = snapshot
+        .get("timestamp-ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(current_time_millis);
+    ensure_array_field(metadata, "snapshots")?.push(snapshot);
+    let object = metadata_object_mut(metadata)?;
+    let current_sequence_number = object
+        .get("last-sequence-number")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    object.insert(
+        "last-sequence-number".to_string(),
+        serde_json::Value::from(current_sequence_number.max(sequence_number)),
+    );
+    object.insert("current-snapshot-id".to_string(), serde_json::Value::from(snapshot_id));
+    ensure_array_field(metadata, "snapshot-log")?.push(serde_json::json!({
+        "timestamp-ms": timestamp_ms,
+        "snapshot-id": snapshot_id
+    }));
+    Ok(())
+}
+
+fn apply_set_snapshot_ref_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let ref_name = update
+        .get("ref-name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "set-snapshot-ref requires ref-name"))?;
+    let snapshot_id = update
+        .get("snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| s3_error!(InvalidRequest, "set-snapshot-ref requires snapshot-id"))?;
+    let reference = update
+        .as_object()
+        .ok_or_else(|| s3_error!(InvalidRequest, "set-snapshot-ref must be a JSON object"))?
+        .iter()
+        .filter(|(key, _)| key.as_str() != "action" && key.as_str() != "ref-name")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    ensure_object_field(metadata, "refs")?.insert(ref_name.to_string(), serde_json::Value::Object(reference));
+    if ref_name == "main" {
+        metadata_object_mut(metadata)?.insert("current-snapshot-id".to_string(), serde_json::Value::from(snapshot_id));
+    }
+    Ok(())
+}
+
+fn apply_remove_snapshots_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let ids = update
+        .get("snapshot-ids")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| s3_error!(InvalidRequest, "remove-snapshots requires snapshot-ids"))?
+        .iter()
+        .filter_map(serde_json::Value::as_i64)
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure_array_field(metadata, "snapshots")?.retain(|snapshot| {
+        snapshot
+            .get("snapshot-id")
+            .and_then(serde_json::Value::as_i64)
+            .is_none_or(|snapshot_id| !ids.contains(&snapshot_id))
+    });
+    ensure_array_field(metadata, "snapshot-log")?.retain(|log| {
+        log.get("snapshot-id")
+            .and_then(serde_json::Value::as_i64)
+            .is_none_or(|snapshot_id| !ids.contains(&snapshot_id))
+    });
+    Ok(())
+}
+
+fn apply_remove_snapshot_ref_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let ref_name = update
+        .get("ref-name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "remove-snapshot-ref requires ref-name"))?;
+    ensure_object_field(metadata, "refs")?.remove(ref_name);
+    Ok(())
+}
+
+fn apply_set_location_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let location = update
+        .get("location")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| s3_error!(InvalidRequest, "set-location requires location"))?;
+    metadata_object_mut(metadata)?.insert("location".to_string(), serde_json::Value::String(location.to_string()));
+    Ok(())
+}
+
+fn apply_set_properties_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let updates = update
+        .get("updates")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| s3_error!(InvalidRequest, "set-properties requires updates"))?;
+    let properties = ensure_object_field(metadata, "properties")?;
+    for (key, value) in updates {
+        let value = value
+            .as_str()
+            .ok_or_else(|| s3_error!(InvalidRequest, "table property values must be strings"))?;
+        properties.insert(key.clone(), serde_json::Value::String(value.to_string()));
+    }
+    Ok(())
+}
+
+fn apply_remove_properties_update(metadata: &mut serde_json::Value, update: &serde_json::Value) -> S3Result<()> {
+    let removals = update
+        .get("removals")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| s3_error!(InvalidRequest, "remove-properties requires removals"))?;
+    let properties = ensure_object_field(metadata, "properties")?;
+    for removal in removals {
+        let key = removal
+            .as_str()
+            .ok_or_else(|| s3_error!(InvalidRequest, "property removals must be strings"))?;
+        properties.remove(key);
+    }
+    Ok(())
+}
+
+fn append_previous_metadata_log(metadata: &mut serde_json::Value, previous_metadata_location: &str) -> S3Result<()> {
+    ensure_array_field(metadata, "metadata-log")?.push(serde_json::json!({
+        "timestamp-ms": current_time_millis(),
+        "metadata-file": previous_metadata_location
+    }));
+    Ok(())
+}
+
+fn metadata_object_mut(metadata: &mut serde_json::Value) -> S3Result<&mut serde_json::Map<String, serde_json::Value>> {
+    metadata
+        .as_object_mut()
+        .ok_or_else(|| s3_error!(InvalidRequest, "table metadata must be a JSON object"))
+}
+
+fn ensure_array_field<'a>(metadata: &'a mut serde_json::Value, key: &str) -> S3Result<&'a mut Vec<serde_json::Value>> {
+    let object = metadata_object_mut(metadata)?;
+    object
+        .entry(key.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    object
+        .get_mut(key)
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| s3_error!(InvalidRequest, "metadata field {key} must be an array"))
+}
+
+fn ensure_object_field<'a>(
+    metadata: &'a mut serde_json::Value,
+    key: &str,
+) -> S3Result<&'a mut serde_json::Map<String, serde_json::Value>> {
+    let object = metadata_object_mut(metadata)?;
+    object
+        .entry(key.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    object
+        .get_mut(key)
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| s3_error!(InvalidRequest, "metadata field {key} must be an object"))
+}
+
+fn next_array_object_i64(metadata: &serde_json::Value, array_key: &str, id_key: &str) -> S3Result<i64> {
+    Ok(last_array_object_i64(metadata, array_key, id_key)?.saturating_add(1))
+}
+
+fn last_array_object_i64(metadata: &serde_json::Value, array_key: &str, id_key: &str) -> S3Result<i64> {
+    let values = metadata
+        .get(array_key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| s3_error!(InvalidRequest, "metadata field {array_key} must be an array"))?;
+    values
+        .iter()
+        .filter_map(|value| value.get(id_key).and_then(serde_json::Value::as_i64))
+        .max()
+        .ok_or_else(|| s3_error!(InvalidRequest, "metadata field {array_key} has no {id_key}"))
+}
+
+fn table_commit_operation(metadata: &serde_json::Value) -> String {
+    metadata
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|snapshots| snapshots.last())
+        .and_then(|snapshot| snapshot.get("summary"))
+        .and_then(|summary| summary.get("operation"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("commit")
+        .to_string()
 }
 
 fn namespace_entry_from_create_request(
@@ -600,9 +1294,19 @@ async fn create_table_response<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let entry = table_entry_from_create_table_request(bucket, namespace, request)?;
+    let (entry, metadata) = table_entry_from_create_table_request(bucket, namespace, request)?;
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
-    let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
+    let metadata_data = serde_json::to_vec(&metadata)
+        .map_err(|err| s3_error!(InternalError, "failed to serialize initial table metadata: {}", err))?;
+    metadata_backend
+        .put_object(
+            bucket,
+            &entry.metadata_location,
+            metadata_data,
+            crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
+        )
+        .await
+        .map_err(catalog_store_error)?;
     store.create_table(entry.clone()).await.map_err(catalog_store_error)?;
     Ok(load_table_response_from_entry(entry, metadata))
 }
@@ -665,6 +1369,7 @@ where
 
 async fn commit_table_response<S>(
     store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
@@ -673,9 +1378,70 @@ async fn commit_table_response<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    let request = table_commit_request_from_rest_request(bucket, namespace, table, request);
+    if request.new_metadata_location.is_none() {
+        return standard_commit_table_response(store, metadata_backend, bucket, namespace, table, request).await;
+    }
+
+    let request = table_commit_request_from_rest_request(bucket, namespace, table, request)?;
     let result = store.commit_table(request).await.map_err(catalog_store_error)?;
-    Ok(commit_table_response_from_result(result))
+    let metadata = read_table_metadata_json(metadata_backend, bucket, &result.table.metadata_location).await?;
+    Ok(commit_table_response_from_result(result, metadata))
+}
+
+async fn standard_commit_table_response<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: RestCommitTableRequest,
+) -> S3Result<RestCommitTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(current) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
+    validate_table_commit_requirements(&current_metadata, &request.requirements)?;
+    let next_metadata = apply_table_commit_updates(current_metadata, &request.updates, &current.metadata_location)?;
+    validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
+    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    let next_generation = current.generation.saturating_add(1);
+    let next_metadata_location =
+        crate::table_catalog::default_table_metadata_file_path(namespace, &table_name, &next_metadata_file_name(next_generation));
+    let next_metadata_data = serde_json::to_vec(&next_metadata)
+        .map_err(|err| s3_error!(InternalError, "failed to serialize table metadata update: {}", err))?;
+    metadata_backend
+        .put_object(
+            bucket,
+            &next_metadata_location,
+            next_metadata_data,
+            crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
+        )
+        .await
+        .map_err(catalog_store_error)?;
+
+    let commit_request = crate::table_catalog::TableCommitRequest {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        commit_id: request.commit_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        idempotency_key: request.idempotency_key,
+        operation: request.operation.unwrap_or_else(|| table_commit_operation(&next_metadata)),
+        expected_version_token: current.version_token,
+        expected_metadata_location: current.metadata_location,
+        new_metadata_location: next_metadata_location,
+        requirements: request.requirements,
+        writer: request.writer,
+    };
+    let result = store.commit_table(commit_request).await.map_err(catalog_store_error)?;
+    Ok(commit_table_response_from_result(result, next_metadata))
 }
 
 async fn drop_table_in_store<S>(store: &S, bucket: &str, namespace: &crate::table_catalog::Namespace, table: &str) -> S3Result<()>
@@ -830,8 +1596,9 @@ impl Operation for RestCommitTableHandler {
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let request = read_json_body::<RestCommitTableRequest>(req.input).await?;
-        let store = table_catalog_store()?;
-        let response = commit_table_response(&store, &warehouse, &namespace, &table, request).await?;
+        let metadata_backend = table_catalog_backend()?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let response = commit_table_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -854,11 +1621,11 @@ impl Operation for RestDropTableHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table_catalog::TableCatalogStore;
+    use crate::table_catalog::{TableCatalogObjectBackend, TableCatalogStore};
     use std::sync::Arc;
 
     #[test]
-    fn catalog_config_response_lists_mvp_rest_endpoints() {
+    fn catalog_config_response_lists_standard_rest_endpoints() {
         let response = catalog_config_response();
 
         assert_eq!(response.defaults.get(WAREHOUSE_PROPERTY), Some(&DEFAULT_WAREHOUSE_ID));
@@ -871,7 +1638,7 @@ mod tests {
                 .contains(&"POST /{warehouse}/namespaces/{namespace}/register")
         );
         assert!(
-            !response
+            response
                 .endpoints
                 .contains(&"POST /{warehouse}/namespaces/{namespace}/tables")
         );
@@ -881,7 +1648,7 @@ mod tests {
                 .contains(&"GET /{warehouse}/namespaces/{namespace}/tables/{table}")
         );
         assert!(
-            !response
+            response
                 .endpoints
                 .contains(&"POST /{warehouse}/namespaces/{namespace}/tables/{table}")
         );
@@ -1041,6 +1808,287 @@ mod tests {
     }
 
     #[test]
+    fn create_table_request_accepts_standard_iceberg_rest_shape() {
+        let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "id",
+                        "required": true,
+                        "type": "long"
+                    }
+                ]
+            },
+            "partition-spec": {
+                "spec-id": 0,
+                "fields": []
+            },
+            "write-order": {
+                "order-id": 0,
+                "fields": []
+            },
+            "properties": {
+                "write.format.default": "parquet"
+            }
+        }))
+        .expect("standard create table request should parse");
+
+        assert_eq!(request.name, "events");
+    }
+
+    #[test]
+    fn commit_table_request_accepts_standard_iceberg_rest_shape() {
+        let request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-table-uuid",
+                    "uuid": "table-uuid"
+                }
+            ],
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "lakehouse"
+                    }
+                }
+            ]
+        }))
+        .expect("standard commit table request should parse");
+
+        assert_eq!(request.requirements.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_table_response_writes_initial_metadata_for_standard_request() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+
+        let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "id",
+                        "required": true,
+                        "type": "long"
+                    }
+                ]
+            },
+            "properties": {
+                "write.format.default": "parquet"
+            }
+        }))
+        .expect("standard create table request should parse");
+
+        let response = create_table_response(&store, &metadata_backend, "warehouse", &namespace, request, true)
+            .await
+            .expect("table should be created");
+
+        assert_eq!(
+            response.metadata_location,
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+        );
+        assert_eq!(response.metadata["format-version"], 2);
+        assert_eq!(response.metadata["current-schema-id"], 0);
+        assert_eq!(response.metadata["default-spec-id"], 0);
+        assert_eq!(response.metadata["default-sort-order-id"], 0);
+        assert_eq!(
+            response.metadata["properties"]["write.format.default"],
+            serde_json::Value::String("parquet".to_string())
+        );
+        let entry = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(response.metadata["table-uuid"], entry.table_uuid);
+        assert!(
+            metadata_backend
+                .object_exists("warehouse", &response.metadata_location)
+                .await
+                .expect("metadata object lookup should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_commit_applies_updates_and_writes_next_metadata() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let create_request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "id",
+                        "required": true,
+                        "type": "long"
+                    }
+                ]
+            }
+        }))
+        .expect("standard create table request should parse");
+        let created = create_table_response(&store, &metadata_backend, "warehouse", &namespace, create_request, true)
+            .await
+            .expect("table should be created");
+        let table_uuid = created.metadata["table-uuid"]
+            .as_str()
+            .expect("created metadata should have table uuid")
+            .to_string();
+
+        let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-table-uuid",
+                    "uuid": table_uuid
+                },
+                {
+                    "type": "assert-current-schema-id",
+                    "current-schema-id": 0
+                }
+            ],
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "lakehouse"
+                    }
+                },
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": "s3://warehouse/tables/table-id/metadata/snap-10.avro",
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("standard commit table request should parse");
+
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
+            .await
+            .expect("standard commit should succeed");
+
+        assert_eq!(
+            commit.metadata_location,
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json"
+        );
+        assert_eq!(commit.metadata["properties"]["owner"], serde_json::Value::String("lakehouse".to_string()));
+        assert_eq!(commit.metadata["current-snapshot-id"], 10);
+        assert_eq!(commit.metadata["last-sequence-number"], 1);
+        assert_eq!(commit.metadata["refs"]["main"]["snapshot-id"], 10);
+        assert_eq!(
+            commit.metadata["metadata-log"][0]["metadata-file"],
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+        );
+        let committed = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("committed table lookup should succeed")
+            .expect("committed table should exist");
+        assert_eq!(committed.metadata_location, commit.metadata_location);
+        assert!(
+            metadata_backend
+                .object_exists("warehouse", &commit.metadata_location)
+                .await
+                .expect("committed metadata lookup should succeed")
+        );
+    }
+
+    #[test]
+    fn commit_requirements_reject_mismatched_table_uuid() {
+        let metadata = serde_json::json!({
+            "table-uuid": "actual-table-uuid"
+        });
+        let requirements = vec![serde_json::json!({
+            "type": "assert-table-uuid",
+            "uuid": "stale-table-uuid"
+        })];
+
+        assert!(validate_table_commit_requirements(&metadata, &requirements).is_err());
+    }
+
+    #[test]
+    fn table_updates_reject_unknown_actions() {
+        let metadata = serde_json::json!({
+            "metadata-log": []
+        });
+        let updates = vec![serde_json::json!({
+            "action": "rewrite-everything"
+        })];
+
+        assert!(apply_table_commit_updates(metadata, &updates, "metadata/00001.metadata.json").is_err());
+    }
+
+    #[test]
+    fn table_location_updates_must_stay_inside_bucket() {
+        let metadata = serde_json::json!({
+            "location": "s3://warehouse/tables/table-id",
+            "metadata-log": []
+        });
+        let updates = vec![serde_json::json!({
+            "action": "set-location",
+            "location": "s3://other-warehouse/tables/table-id"
+        })];
+
+        let updated = apply_table_commit_updates(metadata, &updates, "metadata/00001.metadata.json")
+            .expect("set-location should update metadata before boundary validation");
+
+        assert!(validate_metadata_table_location_in_bucket("warehouse", &updated).is_err());
+    }
+
+    #[test]
     fn load_table_response_includes_rest_metadata_payload() {
         let metadata = serde_json::json!({
             "format-version": 2,
@@ -1092,13 +2140,13 @@ mod tests {
         }))
         .expect("commit request should parse");
 
-        assert_eq!(request.commit_id, "commit-1");
+        assert_eq!(request.commit_id.as_deref(), Some("commit-1"));
         assert_eq!(request.idempotency_key.as_deref(), Some("retry-1"));
-        assert_eq!(request.operation, "append");
-        assert_eq!(request.expected_version_token, "token-v1");
+        assert_eq!(request.operation.as_deref(), Some("append"));
+        assert_eq!(request.expected_version_token.as_deref(), Some("token-v1"));
         assert_eq!(
-            request.new_metadata_location,
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json"
+            request.new_metadata_location.as_deref(),
+            Some(".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json")
         );
         assert_eq!(request.requirements.len(), 1);
         assert_eq!(request.writer.as_deref(), Some("pyiceberg"));
@@ -1578,17 +2626,19 @@ mod tests {
             .await;
         let commit = commit_table_response(
             &store,
+            &metadata_backend,
             "warehouse",
             &namespace,
             "events",
             RestCommitTableRequest {
-                commit_id: "commit-1".to_string(),
+                commit_id: Some("commit-1".to_string()),
                 idempotency_key: Some("retry-1".to_string()),
-                operation: "append".to_string(),
-                expected_version_token: current.version_token.clone(),
-                expected_metadata_location: current.metadata_location.clone(),
-                new_metadata_location: next_metadata_location.to_string(),
+                operation: Some("append".to_string()),
+                expected_version_token: Some(current.version_token.clone()),
+                expected_metadata_location: Some(current.metadata_location.clone()),
+                new_metadata_location: Some(next_metadata_location.to_string()),
                 requirements: Vec::new(),
+                updates: Vec::new(),
                 writer: Some("pyiceberg".to_string()),
             },
         )
