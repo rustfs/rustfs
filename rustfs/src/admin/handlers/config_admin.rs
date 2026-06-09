@@ -54,13 +54,14 @@ use rustfs_config::{
     ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
     ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_IDLE_MODE,
     ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
-    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD,
-    MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, SCANNER_ALERT_EXCESS_FOLDERS,
-    SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT,
-    SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_IDLE_MODE,
-    SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS,
-    SCANNER_YIELD_EVERY_N_OBJECTS, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY,
-    WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
+    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER,
+    MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC,
+    MQTT_USERNAME, SCANNER_ALERT_EXCESS_FOLDERS, SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS,
+    SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
+    SCANNER_CYCLE_MAX_OBJECTS, SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS,
+    SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS, SCANNER_YIELD_EVERY_N_OBJECTS, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
+    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR,
+    WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
 };
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS;
@@ -276,6 +277,13 @@ const SCANNER_HELP_KEYS: &[HelpKeyMetadata] = &[
         optional: true,
     },
 ];
+
+const HEAL_HELP_KEYS: &[HelpKeyMetadata] = &[HelpKeyMetadata {
+    key: HEAL_BITROT_CYCLE,
+    type_name: "seconds|off",
+    description: "set scanner-driven periodic deep bitrot scan cycle, 0 scans deeply every cycle, off disables periodic deep scans",
+    optional: true,
+}];
 
 const OIDC_HELP_KEYS: &[HelpKeyMetadata] = &[
     HelpKeyMetadata {
@@ -529,6 +537,12 @@ const HELP_SUBSYSTEMS: &[HelpSubSystemMetadata] = &[
         description: "configure background data scanner scheduling, throttling, bitrot, and observability thresholds",
         multiple_targets: false,
         keys: SCANNER_HELP_KEYS,
+    },
+    HelpSubSystemMetadata {
+        key: HEAL_SUB_SYS,
+        description: "configure heal and scanner-driven bitrot behavior",
+        multiple_targets: false,
+        keys: HEAL_HELP_KEYS,
     },
     HelpSubSystemMetadata {
         key: IDENTITY_OPENID_SUB_SYS,
@@ -1322,6 +1336,7 @@ fn env_help_key(sub_system: &str, key: &str) -> String {
         (SCANNER_SUB_SYS, SCANNER_ALERT_EXCESS_VERSIONS) => ENV_SCANNER_ALERT_EXCESS_VERSIONS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_ALERT_EXCESS_VERSION_SIZE) => ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE.to_string(),
         (SCANNER_SUB_SYS, SCANNER_ALERT_EXCESS_FOLDERS) => ENV_SCANNER_ALERT_EXCESS_FOLDERS.to_string(),
+        (HEAL_SUB_SYS, HEAL_BITROT_CYCLE) => ENV_SCANNER_BITROT_CYCLE_SECS.to_string(),
         (IDENTITY_OPENID_SUB_SYS, ENABLE_KEY) => ENV_IDENTITY_OPENID_ENABLE.to_string(),
         (IDENTITY_OPENID_SUB_SYS, OIDC_CONFIG_URL) => ENV_IDENTITY_OPENID_CONFIG_URL.to_string(),
         (IDENTITY_OPENID_SUB_SYS, OIDC_CLIENT_ID) => ENV_IDENTITY_OPENID_CLIENT_ID.to_string(),
@@ -1515,6 +1530,7 @@ async fn apply_and_signal_dynamic_subsystems(config: &ServerConfig) {
         AUDIT_WEBHOOK_SUB_SYS,
         AUDIT_MQTT_SUB_SYS,
         SCANNER_SUB_SYS,
+        HEAL_SUB_SYS,
     ] {
         if apply_dynamic_config_for_subsystem(config, sub_system).await.unwrap_or(false) {
             signal_dynamic_config_reload(sub_system).await;
@@ -1972,6 +1988,25 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.keys_help.len(), 1);
         assert_eq!(response.keys_help[0].key, "start_delay");
         assert!(response.keys_help[0].description.contains("cycle"));
+    }
+
+    #[test]
+    fn validate_config_directives_accepts_heal_bitrot_cycle() {
+        let input = format!("{HEAL_SUB_SYS} {HEAL_BITROT_CYCLE}=\"off\"");
+        let directives = parse_config_directives(&input, false).expect("parse heal directive");
+
+        validate_config_directives(&directives).expect("heal bitrot_cycle should be a supported config key");
+    }
+
+    #[test]
+    fn build_help_response_reports_heal_bitrot_cycle() {
+        let response = build_help_response(Some(HEAL_SUB_SYS), Some(HEAL_BITROT_CYCLE), false).expect("heal help response");
+
+        assert_eq!(response.sub_sys, HEAL_SUB_SYS);
+        assert!(!response.multiple_targets);
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].key, HEAL_BITROT_CYCLE);
+        assert!(response.keys_help[0].description.contains("scanner"));
     }
 
     #[test]

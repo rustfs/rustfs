@@ -26,6 +26,7 @@ use crate::store::ECStore;
 use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
 use rustfs_config::COMMENT_KEY;
 use rustfs_config::DEFAULT_DELIMITER;
+use rustfs_config::HEAL_SUB_SYS;
 use rustfs_config::audit::{
     AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_SUB_SYS,
     AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS,
@@ -256,6 +257,7 @@ pub fn init() {
     // Load storageclass default configuration
     kvs.insert(STORAGE_CLASS_SUB_SYS.to_owned(), storageclass::DEFAULT_KVS.clone());
     kvs.insert(rustfs_config::SCANNER_SUB_SYS.to_owned(), scanner::DEFAULT_KVS.clone());
+    kvs.insert(HEAL_SUB_SYS.to_owned(), heal::DEFAULT_KVS.clone());
     // New: Loading default configurations for notify_webhook and notify_mqtt
     // Referring subsystem names through constants to improve the readability and maintainability of the code
     kvs.insert(NOTIFY_WEBHOOK_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_WEBHOOK_KVS.clone());
@@ -285,7 +287,10 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_config::{DEFAULT_DELIMITER, DEFAULT_SCANNER_SPEED, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_SPEED, SCANNER_SUB_SYS};
+    use rustfs_config::{
+        DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, DEFAULT_SCANNER_SPEED, HEAL_BITROT_CYCLE, SCANNER_CYCLE_MAX_OBJECTS,
+        SCANNER_SPEED, SCANNER_SUB_SYS,
+    };
 
     #[test]
     fn global_server_config_set_and_get_roundtrip() {
@@ -314,5 +319,11 @@ mod tests {
 
         assert_eq!(scanner_kvs.get(SCANNER_SPEED), DEFAULT_SCANNER_SPEED);
         assert_eq!(scanner_kvs.get(SCANNER_CYCLE_MAX_OBJECTS), "0");
+
+        let heal_kvs = cfg
+            .get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("heal defaults should exist");
+
+        assert_eq!(heal_kvs.get(HEAL_BITROT_CYCLE), DEFAULT_HEAL_BITROT_CYCLE_SECS.to_string());
     }
 }
