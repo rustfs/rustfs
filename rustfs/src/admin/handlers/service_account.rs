@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::iam_error::iam_error_to_s3_error;
+use crate::admin::access_key_identity;
 use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
@@ -31,9 +32,9 @@ use rustfs_iam::store::Store as IamStore;
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
 use rustfs_madmin::{
     ACCESS_KEY_LIST_ALL, ACCESS_KEY_LIST_STS_ONLY, ACCESS_KEY_LIST_SVCACC_ONLY, ACCESS_KEY_LIST_USERS_ONLY, AddServiceAccountReq,
-    AddServiceAccountResp, Credentials, InfoAccessKeyResp, InfoServiceAccountResp, LDAPSpecificAccessKeyInfo, ListAccessKeysResp,
-    ListServiceAccountsResp, OpenIDSpecificAccessKeyInfo, SITE_REPL_API_VERSION, SRIAMItem, SRSessionPolicy, SRSvcAccChange,
-    SRSvcAccCreate, SRSvcAccDelete, SRSvcAccUpdate, ServiceAccountInfo, TemporaryAccountInfoResp, UpdateServiceAccountReq,
+    AddServiceAccountResp, Credentials, InfoServiceAccountResp, ListAccessKeysResp, ListServiceAccountsResp,
+    SITE_REPL_API_VERSION, SRIAMItem, SRSessionPolicy, SRSvcAccChange, SRSvcAccCreate, SRSvcAccDelete, SRSvcAccUpdate,
+    ServiceAccountInfo, TemporaryAccountInfoResp, UpdateServiceAccountReq,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_policy::policy::{Args, Policy};
@@ -429,106 +430,7 @@ async fn build_info_service_account_resp<T: IamStore>(
     account: &StoredCredentials,
     session_policy: Option<rustfs_policy::policy::Policy>,
 ) -> S3Result<InfoServiceAccountResp> {
-    let implied_policy = session_policy
-        .as_ref()
-        .is_none_or(|policy| policy.version.is_empty() && policy.statements.is_empty());
-
-    let effective_policy = if implied_policy {
-        let policies = iam_store
-            .policy_db_get(&account.parent_user, &account.groups)
-            .await
-            .map_err(|e| {
-                debug!("get service account policy failed, e: {:?}", e);
-                s3_error!(InternalError, "get service account policy failed")
-            })?;
-
-        Some(iam_store.get_combined_policy(&policies).await)
-    } else {
-        session_policy
-    };
-
-    let policy = effective_policy
-        .map(|policy| {
-            serde_json::to_string_pretty(&policy).map_err(|e| {
-                debug!("marshal policy failed, e: {:?}", e);
-                s3_error!(InternalError, "marshal policy failed")
-            })
-        })
-        .transpose()?;
-
-    Ok(InfoServiceAccountResp {
-        parent_user: account.parent_user.clone(),
-        account_status: account.status.clone(),
-        implied_policy,
-        name: account.name.clone(),
-        description: account.description.clone(),
-        expiration: account.expiration,
-        policy,
-    })
-}
-
-fn build_info_regular_user_resp(account: &StoredCredentials, user_info: &rustfs_madmin::UserInfo) -> InfoServiceAccountResp {
-    InfoServiceAccountResp {
-        parent_user: String::new(),
-        account_status: user_info.status.as_ref().to_string(),
-        implied_policy: false,
-        policy: user_info.policy_name.clone(),
-        name: account.name.clone(),
-        description: account.description.clone(),
-        expiration: None,
-    }
-}
-
-fn guess_user_provider(credentials: &StoredCredentials) -> &'static str {
-    if !credentials.is_service_account() && !credentials.is_temp() {
-        return "builtin";
-    }
-
-    let Some(claims) = credentials.claims.as_ref() else {
-        return "builtin";
-    };
-
-    if claims.contains_key("ldap:user") || claims.contains_key("ldap:username") {
-        return "ldap";
-    }
-
-    if claims.contains_key("sub") {
-        return "openid";
-    }
-
-    "builtin"
-}
-
-fn ldap_specific_info(claims: Option<&HashMap<String, serde_json::Value>>) -> LDAPSpecificAccessKeyInfo {
-    let username = claims
-        .and_then(|claims| {
-            claims
-                .get("ldap:user")
-                .or_else(|| claims.get("ldap:username"))
-                .and_then(|value| value.as_str())
-        })
-        .map(ToOwned::to_owned);
-
-    LDAPSpecificAccessKeyInfo { username }
-}
-
-fn openid_specific_info(claims: Option<&HashMap<String, serde_json::Value>>) -> OpenIDSpecificAccessKeyInfo {
-    let user_id = claims
-        .and_then(|claims| claims.get("sub"))
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned);
-    let display_name = claims
-        .and_then(|claims| claims.get("name"))
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned);
-
-    OpenIDSpecificAccessKeyInfo {
-        config_name: None,
-        user_id: user_id.clone(),
-        user_id_claim: user_id.as_ref().map(|_| "sub".to_string()),
-        display_name: display_name.clone(),
-        display_name_claim: display_name.as_ref().map(|_| "name".to_string()),
-    }
+    access_key_identity::build_info_service_account_resp(iam_store, account, session_policy).await
 }
 
 pub struct UpdateServiceAccount {}
@@ -877,77 +779,7 @@ impl Operation for InfoAccessKey {
             return Err(s3_error!(InvalidRequest, "access key not exist"));
         };
 
-        let (user_type, session_policy) = if target_cred.is_temp() {
-            let (_, session_policy) = iam_store.get_temporary_account(&access_key).await.map_err(|e| {
-                debug!("get temporary account failed, e: {:?}", e);
-                if is_err_no_such_temp_account(&e) {
-                    s3_error!(InvalidRequest, "access key not exist")
-                } else {
-                    s3_error!(InternalError, "get temporary account failed")
-                }
-            })?;
-            ("STS".to_string(), session_policy)
-        } else if target_cred.is_service_account() {
-            let (_, session_policy) = iam_store.get_service_account(&access_key).await.map_err(|e| {
-                debug!("get service account failed, e: {:?}", e);
-                if is_err_no_such_service_account(&e) {
-                    s3_error!(InvalidRequest, "access key not exist")
-                } else {
-                    s3_error!(InternalError, "get service account failed")
-                }
-            })?;
-            ("Service Account".to_string(), session_policy)
-        } else {
-            let user_info = iam_store.get_user_info(&access_key).await.map_err(|e| {
-                debug!("get user info failed, e: {:?}", e);
-                iam_error_to_s3_error(e)
-            })?;
-
-            let user_provider = guess_user_provider(&target_cred).to_string();
-            let resp = InfoAccessKeyResp {
-                access_key,
-                info: build_info_regular_user_resp(&target_cred, &user_info),
-                user_type: "User".to_string(),
-                user_provider: user_provider.clone(),
-                ldap_specific_info: if user_provider == "ldap" {
-                    ldap_specific_info(target_cred.claims.as_ref())
-                } else {
-                    LDAPSpecificAccessKeyInfo::default()
-                },
-                open_id_specific_info: if user_provider == "openid" {
-                    openid_specific_info(target_cred.claims.as_ref())
-                } else {
-                    OpenIDSpecificAccessKeyInfo::default()
-                },
-            };
-
-            let body =
-                serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-            let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
-
-            let mut header = HeaderMap::new();
-            header.insert(CONTENT_TYPE, content_type.parse().unwrap());
-
-            return Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header));
-        };
-
-        let user_provider = guess_user_provider(&target_cred).to_string();
-        let resp = InfoAccessKeyResp {
-            access_key,
-            info: build_info_service_account_resp(&iam_store, &target_cred, session_policy).await?,
-            user_type,
-            user_provider: user_provider.clone(),
-            ldap_specific_info: if user_provider == "ldap" {
-                ldap_specific_info(target_cred.claims.as_ref())
-            } else {
-                LDAPSpecificAccessKeyInfo::default()
-            },
-            open_id_specific_info: if user_provider == "openid" {
-                openid_specific_info(target_cred.claims.as_ref())
-            } else {
-                OpenIDSpecificAccessKeyInfo::default()
-            },
-        };
+        let resp = access_key_identity::resolve_info_access_key_resp(&iam_store, access_key, target_cred).await?;
 
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
         let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
@@ -1239,14 +1071,11 @@ impl Operation for ListAccessKeysBulk {
 
                 access_keys.sts_keys = sts_keys
                     .into_iter()
-                    .map(|sts| ServiceAccountInfo {
-                        parent_user: String::new(),
-                        account_status: String::new(),
-                        implied_policy: false,
-                        access_key: sts.access_key,
-                        name: sts.name,
-                        description: sts.description,
-                        expiration: expiration_for_admin_path(req.uri.path(), sts.expiration),
+                    .map(|sts| {
+                        access_key_identity::list_entry_from_credentials(
+                            &sts,
+                            expiration_for_admin_path(req.uri.path(), sts.expiration),
+                        )
                     })
                     .collect();
 
@@ -1263,14 +1092,11 @@ impl Operation for ListAccessKeysBulk {
 
                 access_keys.service_accounts = service_accounts
                     .into_iter()
-                    .map(|svc| ServiceAccountInfo {
-                        parent_user: String::new(),
-                        account_status: String::new(),
-                        implied_policy: false,
-                        access_key: svc.access_key,
-                        name: svc.name,
-                        description: svc.description,
-                        expiration: expiration_for_admin_path(req.uri.path(), svc.expiration),
+                    .map(|svc| {
+                        access_key_identity::list_entry_from_credentials(
+                            &svc,
+                            expiration_for_admin_path(req.uri.path(), svc.expiration),
+                        )
                     })
                     .collect();
 
@@ -1425,7 +1251,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(guess_user_provider(&credentials), "builtin");
+        assert_eq!(access_key_identity::guess_user_provider(&credentials), "builtin");
     }
 
     #[test]
@@ -1441,7 +1267,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(guess_user_provider(&credentials), "ldap");
+        assert_eq!(access_key_identity::guess_user_provider(&credentials), "ldap");
     }
 
     #[test]
@@ -1455,7 +1281,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(guess_user_provider(&credentials), "openid");
+        assert_eq!(access_key_identity::guess_user_provider(&credentials), "openid");
     }
 
     #[test]
@@ -1466,8 +1292,8 @@ mod tests {
             ("name".to_string(), json!("RustFS User")),
         ]);
 
-        let ldap_info = ldap_specific_info(Some(&claims));
-        let openid_info = openid_specific_info(Some(&claims));
+        let ldap_info = access_key_identity::ldap_specific_info(Some(&claims));
+        let openid_info = access_key_identity::openid_specific_info(Some(&claims));
 
         assert_eq!(ldap_info.username.as_deref(), Some("uid=rustfs,ou=people,dc=example,dc=com"));
         assert_eq!(openid_info.user_id.as_deref(), Some("subject-123"));
@@ -1732,7 +1558,7 @@ mod tests {
             ..Default::default()
         };
 
-        let resp = build_info_regular_user_resp(&account, &user_info);
+        let resp = access_key_identity::build_info_regular_user_resp(&account, &user_info);
 
         assert_eq!(resp.parent_user, "");
         assert_eq!(resp.account_status, "enabled");
