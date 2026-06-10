@@ -119,6 +119,8 @@ uer. `ClusterIssuer` or `Issuer`. |
 | pdb.maxUnavailable | string | `1` |  |
 | pdb.minAvailable | string | `""` |  |
 | podAnnotations | object | `{}` |  |
+| pools.enabled | bool | `false` | Enable multiple server pools (capacity expansion, distributed mode only). |
+| pools.list | list | `[]` | One entry per pool; entries may set `replicaCount` (4 or 16) and `storageclass`, omitted fields inherit top-level values. Append-only. |
 | podLabels | object | `{}` |  |
 | podSecurityContext.fsGroup | int | `10001` |  |
 | podSecurityContext.runAsGroup | int | `10001` |  |
@@ -195,6 +197,48 @@ Both approaches support pulling from private registries seamlessly and you can a
 - The default storageclass is [`local-path`](https://github.com/rancher/local-path-provisioner),if you want to specify your own storageclass, try to set parameter `storageclass.name`.
 
 - The default size for data and logs dir is **256Mi** which must satisfy the production usage,you should specify `storageclass.dataStorageSize` and `storageclass.logStorageSize` to change the size, for example, 1Ti for data and  1Gi for logs.
+
+# Server pools (capacity expansion)
+
+In distributed mode the chart can run multiple **server pools** — independent
+StatefulSets whose drives together form one cluster, the same expansion model
+the RustFS server already supports via space-separated `RUSTFS_VOLUMES`
+expressions (`rc admin pool ls` / `expand` / `rebalance` / `decommission`).
+
+With `pools.enabled=false` (default) the chart behaves exactly as before:
+one StatefulSet driven by the top-level `replicaCount`/`storageclass`.
+
+To expand an existing deployment, enable pools and describe the current
+layout as pool 0 plus your new capacity:
+
+```yaml
+pools:
+  enabled: true
+  list:
+    - {}                  # pool 0: inherits top-level values and keeps the
+                          # existing StatefulSet/pod/PVC names and data
+    - replicaCount: 4     # pool 1: new capacity (4 or 16)
+      storageclass:
+        dataStorageSize: 10Gi
+```
+
+Each entry may set `replicaCount` (4 or 16) and/or a `storageclass` block;
+omitted fields inherit the top-level values. Additional pools render as
+`<fullname>-pool<N>` StatefulSets; all pools share the headless service,
+the main service, the configuration and the credentials.
+
+Notes:
+
+* **Pools are append-only.** The list index determines the StatefulSet name —
+  never remove or reorder entries. Retire a pool with
+  `rc admin decommission` before removing it from the list.
+* During the expansion rollout, pods restart until every pod of every pool is
+  resolvable — the server refuses to start with unresolvable peers, so expect
+  a few crash/restart cycles before the cluster converges. This is harmless.
+* After the cluster converges, run `rc admin rebalance start <alias>` to
+  spread existing objects across the new pool.
+* Pod anti-affinity is scoped per pool, so two pools can share the same
+  nodes while each pool's own pods still spread across distinct nodes.
 
 # Installation
 
