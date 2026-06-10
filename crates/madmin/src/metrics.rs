@@ -138,6 +138,8 @@ pub struct ScannerPacingPressureSnapshot {
     pub current_active_scans: u64,
     #[serde(rename = "last_cycle_budget_limited", default)]
     pub last_cycle_budget_limited: bool,
+    #[serde(rename = "last_cycle_pause_observed", default)]
+    pub last_cycle_pause_observed: bool,
     #[serde(rename = "last_cycle_throttle_sleep_ratio", default)]
     pub last_cycle_throttle_sleep_ratio: f64,
     #[serde(rename = "last_cycle_yield_ratio", default)]
@@ -153,6 +155,7 @@ impl Default for ScannerPacingPressureSnapshot {
             current_queued_scans: 0,
             current_active_scans: 0,
             last_cycle_budget_limited: false,
+            last_cycle_pause_observed: false,
             last_cycle_throttle_sleep_ratio: 0.0,
             last_cycle_yield_ratio: 0.0,
             last_cycle_total_pause_ratio: 0.0,
@@ -166,7 +169,7 @@ impl ScannerPacingPressureSnapshot {
             "queued_scans"
         } else if self.last_cycle_budget_limited {
             "cycle_budget"
-        } else if self.last_cycle_total_pause_ratio > 0.0 {
+        } else if self.last_cycle_pause_observed {
             "throttle_pause"
         } else if self.current_active_scans > 0 {
             "active_scans"
@@ -177,9 +180,14 @@ impl ScannerPacingPressureSnapshot {
     }
 
     fn merge(&mut self, other: &Self) {
+        let pause_observed = self.last_cycle_pause_observed
+            || self.primary_pressure == "throttle_pause"
+            || other.last_cycle_pause_observed
+            || other.primary_pressure == "throttle_pause";
         self.current_queued_scans = self.current_queued_scans.saturating_add(other.current_queued_scans);
         self.current_active_scans = self.current_active_scans.saturating_add(other.current_active_scans);
         self.last_cycle_budget_limited |= other.last_cycle_budget_limited;
+        self.last_cycle_pause_observed = pause_observed;
         self.last_cycle_throttle_sleep_ratio = self
             .last_cycle_throttle_sleep_ratio
             .max(other.last_cycle_throttle_sleep_ratio);
@@ -780,6 +788,7 @@ mod tests {
                 primary_pressure: "cycle_budget".to_string(),
                 current_active_scans: 1,
                 last_cycle_budget_limited: true,
+                last_cycle_pause_observed: true,
                 last_cycle_throttle_sleep_ratio: 0.1,
                 last_cycle_yield_ratio: 0.2,
                 last_cycle_total_pause_ratio: 0.3,
@@ -824,6 +833,7 @@ mod tests {
         assert_eq!(scanner.pacing_pressure.current_queued_scans, 4);
         assert_eq!(scanner.pacing_pressure.current_active_scans, 3);
         assert!(scanner.pacing_pressure.last_cycle_budget_limited);
+        assert!(scanner.pacing_pressure.last_cycle_pause_observed);
         assert_eq!(scanner.pacing_pressure.last_cycle_throttle_sleep_ratio, 0.4);
         assert_eq!(scanner.pacing_pressure.last_cycle_yield_ratio, 0.2);
         assert_eq!(scanner.pacing_pressure.last_cycle_total_pause_ratio, 0.5);
@@ -840,5 +850,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn scanner_metrics_merge_preserves_pause_pressure_without_duration() {
+        let collected_at = Utc::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            pacing_pressure: ScannerPacingPressureSnapshot {
+                primary_pressure: "throttle_pause".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            pacing_pressure: ScannerPacingPressureSnapshot::default(),
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.pacing_pressure.primary_pressure, "throttle_pause");
+        assert!(scanner.pacing_pressure.last_cycle_pause_observed);
+        assert_eq!(scanner.pacing_pressure.last_cycle_total_pause_ratio, 0.0);
     }
 }

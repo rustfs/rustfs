@@ -107,6 +107,7 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             current_queued_scans: metrics.pacing_pressure.current_queued_scans,
             current_active_scans: metrics.pacing_pressure.current_active_scans,
             last_cycle_budget_limited: metrics.pacing_pressure.last_cycle_budget_limited,
+            last_cycle_pause_observed: metrics.pacing_pressure.last_cycle_pause_observed,
             last_cycle_throttle_sleep_ratio: metrics.pacing_pressure.last_cycle_throttle_sleep_ratio,
             last_cycle_yield_ratio: metrics.pacing_pressure.last_cycle_yield_ratio,
             last_cycle_total_pause_ratio: metrics.pacing_pressure.last_cycle_total_pause_ratio,
@@ -394,6 +395,7 @@ mod test {
                 current_queued_scans: 4,
                 current_active_scans: 2,
                 last_cycle_budget_limited: true,
+                last_cycle_pause_observed: true,
                 last_cycle_throttle_sleep_ratio: 0.25,
                 last_cycle_yield_ratio: 0.05,
                 last_cycle_total_pause_ratio: 0.3,
@@ -405,6 +407,7 @@ mod test {
         assert_eq!(scanner.pacing_pressure.current_queued_scans, 4);
         assert_eq!(scanner.pacing_pressure.current_active_scans, 2);
         assert!(scanner.pacing_pressure.last_cycle_budget_limited);
+        assert!(scanner.pacing_pressure.last_cycle_pause_observed);
         assert_eq!(scanner.pacing_pressure.last_cycle_throttle_sleep_ratio, 0.25);
         assert_eq!(scanner.pacing_pressure.last_cycle_yield_ratio, 0.05);
         assert_eq!(scanner.pacing_pressure.last_cycle_total_pause_ratio, 0.3);

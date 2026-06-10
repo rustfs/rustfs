@@ -754,6 +754,7 @@ pub struct ScannerPacingPressureSnapshot {
     pub current_queued_scans: u64,
     pub current_active_scans: u64,
     pub last_cycle_budget_limited: bool,
+    pub last_cycle_pause_observed: bool,
     pub last_cycle_throttle_sleep_ratio: f64,
     pub last_cycle_yield_ratio: f64,
     pub last_cycle_total_pause_ratio: f64,
@@ -766,6 +767,7 @@ impl Default for ScannerPacingPressureSnapshot {
             current_queued_scans: 0,
             current_active_scans: 0,
             last_cycle_budget_limited: false,
+            last_cycle_pause_observed: false,
             last_cycle_throttle_sleep_ratio: 0.0,
             last_cycle_yield_ratio: 0.0,
             last_cycle_total_pause_ratio: 0.0,
@@ -1002,6 +1004,7 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
         .max(usize_to_u64_saturated(metrics.active_scan_paths));
     let last_cycle_budget_limited =
         scanner_last_cycle_budget_limited(metrics.last_cycle_result_code, metrics.last_cycle_partial_reason.as_str());
+    let last_cycle_pause_observed = metrics.last_cycle_throttle_sleep_events > 0 || metrics.last_cycle_yield_events > 0;
     let last_cycle_throttle_sleep_ratio =
         scanner_ratio(metrics.last_cycle_throttle_sleep_duration_seconds, metrics.last_cycle_duration_seconds);
     let last_cycle_yield_ratio = scanner_ratio(metrics.last_cycle_yield_duration_seconds, metrics.last_cycle_duration_seconds);
@@ -1022,6 +1025,7 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
         current_queued_scans,
         current_active_scans,
         last_cycle_budget_limited,
+        last_cycle_pause_observed,
         last_cycle_throttle_sleep_ratio,
         last_cycle_yield_ratio,
         last_cycle_total_pause_ratio,
@@ -2181,6 +2185,7 @@ mod tests {
         assert_eq!(report.pacing_pressure.current_queued_scans, 7);
         assert_eq!(report.pacing_pressure.current_active_scans, 2);
         assert!(report.pacing_pressure.last_cycle_budget_limited);
+        assert!(report.pacing_pressure.last_cycle_pause_observed);
         assert_eq!(report.pacing_pressure.last_cycle_throttle_sleep_ratio, 0.25);
         assert_eq!(report.pacing_pressure.last_cycle_yield_ratio, 0.05);
         assert_eq!(report.pacing_pressure.last_cycle_total_pause_ratio, 0.3);
