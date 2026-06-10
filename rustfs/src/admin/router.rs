@@ -2475,6 +2475,7 @@ mod tests {
         assert!(is_admin_path("/rustfs/admin/v3/info"));
         assert!(is_admin_path("/minio/admin/v3/info"));
         assert!(is_admin_path(&format!("{}/config", crate::server::TABLE_CATALOG_PREFIX)));
+        assert!(is_admin_path("/_iceberg/v1/config"));
         assert!(!is_admin_path("/bucket/object"));
         assert!(!is_admin_path("/rustfs/administrator/object"));
         assert!(!is_admin_path("/minio/administrator/object"));

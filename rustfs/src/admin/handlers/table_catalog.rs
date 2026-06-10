@@ -17,7 +17,7 @@ use crate::admin::{
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{RemoteAddr, TABLE_CATALOG_PREFIX};
+use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::DEFAULT_WAREHOUSE_ID;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
@@ -33,6 +33,8 @@ use uuid::Uuid;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const WAREHOUSE_PROPERTY: &str = "warehouse";
+const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
+const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
 const CREDENTIAL_VENDING_CONFIG_KEY: &str = "rustfs.credential-vending";
 const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
 const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
@@ -188,64 +190,68 @@ struct RestCommitTableResponse {
 }
 
 pub fn register_table_catalog_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        register_table_catalog_prefix_routes(r, prefix)?;
+    }
+
+    Ok(())
+}
+
+fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix: &str) -> std::io::Result<()> {
+    r.insert(Method::GET, format!("{prefix}/config").as_str(), AdminOperation(&GET_CONFIG_HANDLER))?;
     r.insert(
         Method::GET,
-        format!("{TABLE_CATALOG_PREFIX}/config").as_str(),
-        AdminOperation(&GET_CONFIG_HANDLER),
-    )?;
-    r.insert(
-        Method::GET,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces").as_str(),
         AdminOperation(&LIST_NAMESPACES_HANDLER),
     )?;
     r.insert(
         Method::POST,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces").as_str(),
         AdminOperation(&CREATE_NAMESPACE_HANDLER),
     )?;
     r.insert(
         Method::GET,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}").as_str(),
         AdminOperation(&GET_NAMESPACE_HANDLER),
     )?;
     r.insert(
         Method::DELETE,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}").as_str(),
         AdminOperation(&DROP_NAMESPACE_HANDLER),
     )?;
     r.insert(
         Method::GET,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}/tables").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables").as_str(),
         AdminOperation(&LIST_TABLES_HANDLER),
     )?;
     r.insert(
         Method::POST,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}/tables").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables").as_str(),
         AdminOperation(&CREATE_TABLE_HANDLER),
     )?;
     r.insert(
         Method::POST,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}/register").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/register").as_str(),
         AdminOperation(&REGISTER_TABLE_HANDLER),
     )?;
     r.insert(
         Method::GET,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&LOAD_TABLE_HANDLER),
     )?;
     r.insert(
         Method::POST,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&COMMIT_TABLE_HANDLER),
     )?;
     r.insert(
         Method::DELETE,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}").as_str(),
         AdminOperation(&DROP_TABLE_HANDLER),
     )?;
     r.insert(
         Method::POST,
-        format!("{TABLE_CATALOG_PREFIX}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/metadata").as_str(),
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/metadata").as_str(),
         AdminOperation(&TABLE_METADATA_MAINTENANCE_HANDLER),
     )?;
 
@@ -254,7 +260,11 @@ pub fn register_table_catalog_route(r: &mut S3Router<AdminOperation>) -> std::io
 
 fn catalog_config_response() -> CatalogConfigResponse {
     CatalogConfigResponse {
-        defaults: BTreeMap::from([(WAREHOUSE_PROPERTY, DEFAULT_WAREHOUSE_ID)]),
+        defaults: BTreeMap::from([
+            (WAREHOUSE_PROPERTY, DEFAULT_WAREHOUSE_ID),
+            (CATALOG_ENDPOINT_PREFIX_CONFIG_KEY, TABLE_CATALOG_PREFIX),
+            (CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY, TABLE_CATALOG_COMPAT_PREFIX),
+        ]),
         overrides: BTreeMap::new(),
         endpoints: TABLE_CATALOG_ENDPOINTS.to_vec(),
     }
@@ -1765,6 +1775,11 @@ mod tests {
         let response = catalog_config_response();
 
         assert_eq!(response.defaults.get(WAREHOUSE_PROPERTY), Some(&DEFAULT_WAREHOUSE_ID));
+        assert_eq!(response.defaults.get(CATALOG_ENDPOINT_PREFIX_CONFIG_KEY), Some(&TABLE_CATALOG_PREFIX));
+        assert_eq!(
+            response.defaults.get(CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY),
+            Some(&TABLE_CATALOG_COMPAT_PREFIX)
+        );
         assert!(response.overrides.is_empty());
         assert!(response.endpoints.contains(&"GET /{warehouse}/namespaces"));
         assert!(response.endpoints.contains(&"POST /{warehouse}/namespaces"));
