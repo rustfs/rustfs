@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-usecase-storage-info`
-- Baseline: `origin/main` at `8a90bda16ab233504ee2c4f9e15942c340d54631`
+- Branch: `overtrue/arch-admin-readiness-storage-admin`
+- Baseline: `origin/main` at `b48d7b1fa514e5da274d652a0cb7f282521f46c0`
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: migrate the admin use-case storage-info consumer from the
-  old `StorageAPI::storage_info` trait import to the inventory-facing
-  `StorageAdminApi::storage_info` contract.
-- CI/script changes: none
-- Docs changes: record API-007 admin use-case consumer-migration context,
+- Rust code changes: migrate grouped admin/readiness read-side consumers from
+  old `StorageAPI::{backend_info, storage_info}` trait imports to the
+  inventory-facing `StorageAdminApi` contract.
+- CI/script changes: none.
+- Docs changes: record API-007 grouped consumer-migration context,
   verification evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
@@ -198,17 +198,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed second slice: `rustfs/rustfs#3332` migrated the admin
     storage-class config drive-count consumer to
     `StorageAdminApi::set_drive_counts`.
-  - Current branch slice: migrate the admin use-case storage-info consumer to
+  - Completed third slice: `rustfs/rustfs#3333` migrated
+    `DefaultAdminUsecase` storage-info reads to
     `StorageAdminApi::storage_info`.
-  - Acceptance: `rustfs/src/app/admin_usecase.rs` no longer imports old
-    `StorageAPI` only to read admin storage information.
+  - Current branch slice: migrate grouped read-side admin/readiness consumers:
+    account-info `backend_info`, rebalance status `storage_info`, and runtime
+    readiness `storage_info`.
+  - Acceptance: account-info, rebalance status, and readiness no longer import
+    old `StorageAPI` only to read admin storage information.
   - Must preserve: old `StorageAPI` trait shape, `StorageAPI::get_disks`
-    behavior, admin storage-info response shape, data-usage capacity
-    correction semantics, readiness/heal/scanner/RPC consumers, and storage hot
-    paths.
-  - Risk defense: keep this slice to `DefaultAdminUsecase` storage-info reads;
-    do not migrate account-info `backend_info`, RPC `local_storage_info`,
-    readiness, heal, scanner, or storage hot-path consumers in the same PR.
+    behavior, account-info response shape, rebalance used-space aggregation,
+    readiness degraded-state semantics, RPC `local_storage_info`, heal/scanner
+    consumers, and storage hot paths.
+  - Risk defense: group only read-side callers that delegate to the existing
+    ECStore admin info implementation; do not migrate RPC `local_storage_info`,
+    heal, scanner, observability, or storage hot-path consumers in this PR.
 
 ## Phase 8 Background Controller Tasks
 
@@ -252,39 +256,40 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed this remains a narrow admin use-case storage-info consumer-migration slice, with no ECStore, `StorageAPI`, storage-api, manifest, or lockfile boundary reshaping. |
-| Migration preservation | pass | Confirmed admin storage-info response shape, capacity correction semantics, old `StorageAPI`, `StorageAPI::get_disks`, ECStore handlers, and storage hot paths remain unchanged. |
-| Testing/verification | pass | Confirmed focused admin use-case tests, migration guards, formatting, diff hygiene, and full pre-commit evidence passed before push. |
+| Quality/architecture | pass | Confirmed the diff stays limited to three read-side consumers and migration notes, with no manifest, ECStore, storage-api, RPC, heal, scanner, observability, or hot-path scope creep. |
+| Migration preservation | pass | Confirmed the new and old ECStore trait paths still delegate to the same backend/storage-info handlers, while account-info response construction, rebalance aggregation, and readiness cache/degraded-state logic remain unchanged. |
+| Testing/verification | pass | Confirmed touched-consumer focused tests, compile checks, migration guards, diff hygiene, and full pre-commit evidence are sufficient; no missing success-path integration test is a blocker for this call-path migration. |
 
 ## Verification Notes
 
 Passed:
-- `cargo fmt --all --check`
-- `cargo check -p rustfs --lib`
-- `cargo test -p rustfs app::admin_usecase --lib`
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`
-- `./scripts/check_architecture_migration_rules.sh`
-- `./scripts/check_layer_dependencies.sh`
-- `./scripts/check_metrics_migration_refs.sh`
-- `./scripts/check_unsafe_code_allowances.sh`
-- `git diff --check`
-- `make NUM_CORES=1 pre-commit`
+- `cargo fmt --all --check`.
+- `cargo check -p rustfs --lib`.
+- `cargo test -p rustfs admin::handlers::account_info --lib`; 3 passed.
+- `cargo test -p rustfs admin::handlers::rebalance --lib`; 19 passed.
+- `cargo test -p rustfs server::readiness --lib`; 13 passed.
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`.
+- `./scripts/check_architecture_migration_rules.sh`.
+- `./scripts/check_layer_dependencies.sh`.
+- `./scripts/check_metrics_migration_refs.sh`.
+- `./scripts/check_unsafe_code_allowances.sh`.
+- `git diff --check`.
+- `make NUM_CORES=1 pre-commit`.
 
 Notes:
 - This branch relies on the existing direct `rustfs` dependency on
-  `rustfs-storage-api` from the previous API-007 slice.
-- Only `DefaultAdminUsecase` storage-info read calls changed.
-- No existing ECStore handler, admin route, readiness path, heal/scanner
-  consumer, RPC consumer, or storage hot path is changed.
+  `rustfs-storage-api` from earlier API-007 slices.
+- No ECStore handler, old `StorageAPI` trait, RPC consumer, heal/scanner
+  consumer, observability consumer, or storage hot path is changed.
 - Full pre-commit passed with nextest `5757 passed, 111 skipped`; workspace
   doctests passed.
 - No temporary compatibility shim was added.
 
 ## Handoff Notes
 
-- Keep this API-007 slice as a focused `consumer-migration` PR.
-- Do not migrate account-info `backend_info`, RPC `local_storage_info`,
-  readiness, heal, scanner, or storage hot-path consumers in this PR.
+- Keep this API-007 slice as a grouped read-side `consumer-migration` PR.
+- Do not migrate RPC `local_storage_info`, heal, scanner, observability, or
+  storage hot-path consumers in this PR.
 - Do not remove or route around `StorageAPI::get_disks` in this PR.
 - Do not make the old `StorageAPI` trait inherit `StorageAdminApi` in this PR.
 - Do not add temporary compatibility code unless a matching
