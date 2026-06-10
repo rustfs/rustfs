@@ -71,6 +71,9 @@ not define a new scheduler, controller framework, or shutdown contract.
 
 ## BGC-002 Contract Inputs
 
+These inputs are formalized in
+[`background-controller-contract.md`](background-controller-contract.md).
+
 Future controller contract work should start with a read-only shape:
 
 - `desired`: enabled/disabled plus static config source.

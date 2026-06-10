@@ -6,7 +6,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
 - Branch: `overtrue/arch-config-consumer-inventory`
-- Baseline: `upstream/main` at `f9a5e6d7e67322ac6f626b6f437a5e722fbe22e2`
+- Baseline: `upstream/main` at `a73c90c813bba16e668be090c5c4ca22c765b81b`
 - PR type for this branch: `docs-only`
 - Runtime behavior changes: none.
 - Rust code changes: none.
@@ -135,6 +135,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused KMS redaction/status tests, full KMS tests, migration
     guards, Rust quality scan, clippy, and `make pre-commit` passed.
 
+## Phase 2 Storage API Tasks
+
+- [x] `API-001` Add `crates/storage-api`.
+  - Acceptance: `rustfs-storage-api` is a workspace member and remains a
+    dependency-free contract crate.
+  - Verification: `cargo check -p rustfs-storage-api`.
+- [~] `API-002` Move public storage error/result contracts.
+  - Current slice: add public `StorageErrorCode` and `StorageResult` contracts
+    in `rustfs-storage-api`, then make ECStore `StorageError::to_u32/from_u32`
+    consume the shared code table.
+  - Deferred: keep the full ECStore `StorageError` enum and ECStore-specific
+    conversions in `rustfs-ecstore` until the `DiskError`, filemeta, lock, and
+    `std::io::Error` downcast boundary is proven safe.
+  - Acceptance: storage-api contract tests pass, ECStore compatibility tests
+    prove numeric codes match the new contract, and
+    `cargo check -p rustfs-storage-api -p rustfs-ecstore` passes.
+  - Must preserve: storage error display, conversions, object error mapping,
+    quorum classification, and reserved code gaps `0x2B/0x2C`.
+  - Risk defense: no storage hot-path enum move in this PR; only numeric code
+    mapping uses the new contract.
+
 ## Phase 8 Background Controller Tasks
 
 - [x] `BGC-001` Inventory background services.
@@ -145,18 +166,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Must preserve: no code behavior change and no new controller contract in
     this PR.
   - Verification: docs-only architecture checks and diff hygiene.
+- [x] `BGC-002` Define minimal controller contract.
+  - Acceptance:
+    [`background-controller-contract.md`](background-controller-contract.md)
+    defines desired/current/status/reconcile vocabulary, status state
+    semantics, service boundaries, and side-effect rules without starting
+    workers or changing scheduling.
+  - Must preserve: no Rust trait, scheduler, service registry, worker
+    start/stop path, storage write, readiness change, peer signal, or runtime
+    behavior change.
+  - Verification: docs-only architecture checks and diff hygiene.
 
 ## Next PRs
 
-1. `contract`: define the minimal BackgroundController status vocabulary after
-   the BGC-001 inventory is reviewed.
-2. `test-only`: add focused preservation tests before moving scanner, heal,
-   replication, lifecycle, or disk health workers.
-3. `api-extraction`: move only the pure server-config model into
+1. Continue `API-002` only after reviewing whether `DiskError` and
+   `std::io::Error` conversion ownership can move without orphan-rule or
+   downcast behavior loss.
+2. `contract`: move DTOs that are contract-only in `API-003`; keep ECStore
+   implementation, KMS/SSE readers, erasure logic, and remote disk internals out
+   of rustfs-storage-api.
+3. `test-only`: add focused compatibility checks before moving store traits or
+   consumer imports.
+4. `api-extraction`: move only the pure server-config model into
    rustfs-config as CFG-003.
-4. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+5. `api-extraction`: keep the old rustfs_ecstore::config::* path with
    RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
-5. `consumer-migration`: migrate external consumers one group at a time only
+6. `consumer-migration`: migrate external consumers one group at a time only
    after the model path and compatibility shim are stable.
 
 ## Pre-Push Review Log

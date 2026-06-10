@@ -13,3 +13,7 @@
 // limitations under the License.
 
 //! Storage API contracts for RustFS.
+
+pub mod error;
+
+pub use error::{StorageErrorCode, StorageResult};
