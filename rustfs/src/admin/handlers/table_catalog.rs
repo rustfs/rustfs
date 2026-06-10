@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::{
-    auth::{validate_admin_request, validate_admin_request_with_bucket_object},
+    auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::auth::{check_key_valid, get_session_token};
@@ -349,8 +349,7 @@ async fn authorize_table_catalog_resource_request(
         false,
         vec![Action::AdminAction(action)],
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        resource.warehouse,
-        object_path.as_deref().unwrap_or(""),
+        AdminResourceScope::bucket_object(resource.warehouse, object_path.as_deref().unwrap_or("")),
     )
     .await
 }
