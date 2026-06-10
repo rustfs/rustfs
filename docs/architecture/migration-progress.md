@@ -5,14 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-config-consumer-inventory`
-- Baseline: `upstream/main` at `a73c90c813bba16e668be090c5c4ca22c765b81b`
+- Branch: `overtrue/arch-kms-defaults-inventory`
+- Baseline: `upstream/main` at `f80162b5c99d6825b489ad94b81dfaeca6bfa874` (after CFG-002)
 - PR type for this branch: `docs-only`
-- Runtime behavior changes: none.
-- Rust code changes: none.
+- Runtime behavior changes: none
+- Rust code changes: none
 - CI/script changes: none
-- Docs changes: add the CFG-002 config model boundary ADR and link it from the
-  architecture overview, crate-boundary guardrails, and this progress handoff.
+- Docs changes: add KMSD-001 inventory for current KMS development defaults,
+  classify each default as production-safe, dev-only, or invalid for
+  production, and record follow-up hardening boundaries.
 
 ## Phase 0 Tasks
 
@@ -134,6 +135,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     and persisted config serialization still writes the original secret values.
   - Verification: focused KMS redaction/status tests, full KMS tests, migration
     guards, Rust quality scan, clippy, and `make pre-commit` passed.
+- [x] `KMSD-001` Inventory KMS development defaults.
+  - Acceptance:
+    [`kms-development-defaults-inventory.md`](kms-development-defaults-inventory.md)
+    records Local and Vault defaults for missing master keys, temp key dirs,
+    HTTP Vault addresses, default dev-token credentials, and skip-TLS behavior.
+  - Must preserve: no KMS runtime behavior, config serialization,
+    authorization, startup order, storage path, or crate boundary changes.
+  - Verification: docs diff review, migration guards, metrics reference guard,
+    and `git diff --check`.
 
 ## Phase 2 Storage API Tasks
 
@@ -193,14 +203,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
    RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
 6. `consumer-migration`: migrate external consumers one group at a time only
    after the model path and compatibility shim are stable.
+7. `security-change`: make Local KMS unsafe defaults explicit development
+   opt-ins or production failures in KMSD-002.
+8. `security-change`: make Vault unsafe defaults explicit development opt-ins
+   or production failures in KMSD-003.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `docs-only` PR; ADR chooses existing rustfs-config, records module path and dependency boundaries, and avoids a speculative new crate. |
-| Migration preservation | pass | No code movement; ADR explicitly keeps persistence helpers, global server-config state, startup order, and old-path compatibility requirements out of CFG-002. |
-| Testing/verification | pass | Docs-only verification uses migration guard scripts, metrics reference guard, layer dependency guard, and whitespace checks. |
+| Quality/architecture | pass | Single `docs-only` PR; the inventory is isolated under `docs/architecture`, uses existing KMS source files as evidence, and introduces no new abstraction or dependency edge. |
+| Migration preservation | pass | No runtime code, config persistence, admin authorization, startup order, storage path, global state, or crate boundary changes are made. |
+| Testing/verification | pass | Docs-only verification is bounded to diff review, architecture migration rules, metrics reference guard, layer dependency guard, and whitespace checks. |
 
 ## Verification Notes
 
@@ -219,14 +233,18 @@ Notes:
 
 ## Handoff Notes
 
-- Keep this CFG-002 branch as a focused `docs-only` PR. Do not move
-  `Config`, `KV`, `KVS`, persistence helpers, global server-config state,
-  Storage API code, startup code, or target/notify/audit/IAM consumers in this
-  branch.
-- The next extraction PR must preserve the tuple-struct shape, serde fields,
-  `hiddenIfEmpty` alias, `Config::new` default behavior, marshal/unmarshal
-  behavior, and old `rustfs_ecstore::config::*` path.
+- Keep this KMSD-001 branch as a focused `docs-only` PR. Do not change KMS
+  defaults, admin authorization, admin route registration shape, config moves,
+  Storage API moves, runtime moves, or ECStore moves.
+- `rustfs` may depend on `rustfs-security-governance` for contract metadata;
+  the security-governance crate must stay independent from implementation
+  crates and runtime state.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
+- KMS production default hardening remains a separate task group; do not bundle
+  it with this inventory PR.
+- The CFG-003 extraction PR must preserve the tuple-struct shape, serde fields,
+  `hiddenIfEmpty` alias, `Config::new` default behavior, marshal/unmarshal
+  behavior, and old `rustfs_ecstore::config::*` path.
 - Do not create a new config-model crate unless a later implementation attempt
   proves `rustfs-config` cannot hold the pure model boundary.
