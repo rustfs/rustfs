@@ -5,14 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-api-error-contracts`
-- Baseline: `upstream/main` at `5fef10548477d9d25b0d391874f8280bf259d10e`
-- PR type for this branch: `contract`
+- Branch: `overtrue/arch-config-consumer-inventory`
+- Baseline: `upstream/main` at `a73c90c813bba16e668be090c5c4ca22c765b81b`
+- PR type for this branch: `docs-only`
 - Runtime behavior changes: none.
-- Rust code changes: add the `rustfs-storage-api` error-code/result contract
-  and route ECStore storage error numeric conversion through that contract.
+- Rust code changes: none.
 - CI/script changes: none
-- Docs changes: record the API-002 first-slice contract boundary.
+- Docs changes: add the CFG-002 config model boundary ADR and link it from the
+  architecture overview, crate-boundary guardrails, and this progress handoff.
 
 ## Phase 0 Tasks
 
@@ -61,6 +61,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     source `RUSTFS_COMPAT_TODO(<task-id>)` marker lacks a cleanup-register entry,
     when a register entry lacks a source marker, or when a source marker omits a
     removal condition.
+
+## Phase 1a Config Model Tasks
+
+- [x] `CFG-001` Inventory `ecstore::config::{Config, KV, KVS}` consumers.
+  - Acceptance:
+    [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md)
+    records the current definitions, persistence helpers, global accessors,
+    consumer groups, migration risks, and do-not-change contract.
+- [x] `CFG-002` Decide model boundary.
+  - Acceptance:
+    [`config-model-boundary-adr.md`](config-model-boundary-adr.md) records
+    `rustfs-config` as the target package, `server_config` as the future model
+    module, allowed dependencies, forbidden dependencies, preserved shape, and
+    extraction verification gates.
+- [ ] `CFG-003` Move pure model definitions.
+  - Next boundary: move only `Config`, `KV`, `KVS`, and default-registration
+    surface into `rustfs-config`; keep persistence helpers and global
+    server-config state in `ecstore`.
+- [ ] `CFG-004` Keep old `ecstore::config::*` compatibility path.
+  - Required compatibility: source must contain `RUSTFS_COMPAT_TODO(CFG-004)`
+    and a matching cleanup-register entry.
 
 ## Phase 1 Security Governance Tasks
 
@@ -166,45 +187,46 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
    of rustfs-storage-api.
 3. `test-only`: add focused compatibility checks before moving store traits or
    consumer imports.
+4. `api-extraction`: move only the pure server-config model into
+   rustfs-config as CFG-003.
+5. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+   RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
+6. `consumer-migration`: migrate external consumers one group at a time only
+   after the model path and compatibility shim are stable.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | rustfs-storage-api only adds `StorageErrorCode` and `StorageResult`; ECStore keeps `StorageError`, `DiskError`, filemeta, lock, and `std::io::Error` conversion ownership. |
-| Migration preservation | pass | ECStore numeric conversion now consumes the shared code table while preserving old variant defaults, reserved gaps `0x2B/0x2C`, and existing display/conversion logic. |
-| Testing/verification | pass | Focused storage-api and ECStore tests, cargo check, dependency guard, migration guards, Rust quality scan, `make pre-commit`, nextest, and doctests passed. |
+| Quality/architecture | pass | Single `docs-only` PR; ADR chooses existing rustfs-config, records module path and dependency boundaries, and avoids a speculative new crate. |
+| Migration preservation | pass | No code movement; ADR explicitly keeps persistence helpers, global server-config state, startup order, and old-path compatibility requirements out of CFG-002. |
+| Testing/verification | pass | Docs-only verification uses migration guard scripts, metrics reference guard, layer dependency guard, and whitespace checks. |
 
 ## Verification Notes
 
 Passed:
-- `cargo fmt --all`
-- `cargo fmt --all --check`
-- `cargo test -p rustfs-storage-api`
-- `cargo test -p rustfs-ecstore error -- --nocapture`
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore`
-- `cargo tree -p rustfs-storage-api --edges normal`
 - `./scripts/check_architecture_migration_rules.sh`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
-- Rust quality scan on changed Rust files.
-- `make pre-commit`
-  - Full nextest: 5704 passed, 111 skipped.
-  - Workspace doctests passed.
+- `git diff --name-only -- '*.rs' 'Cargo.toml' 'Cargo.lock' '.github/**' 'Makefile' 'Justfile'`
 
 Notes:
-- This branch changes Rust storage contract code and ECStore contract mapping.
-- Rust quality scan reported only existing patterns in `crates/ecstore/src/error.rs`:
-  a test-only `unwrap()` and the pre-existing `StorageError::other` boxed error
-  boundary. This PR does not add either pattern.
+- This branch changes architecture documentation only.
+- No Rust source, Cargo manifest, workflow, script, or runtime configuration is
+  changed.
+- `make pre-commit` is intentionally not required for this docs-only PR.
 
 ## Handoff Notes
 
-- Keep this branch as the API-002 first slice, not the full error enum move.
-- Do not move `StorageError`, `DiskError`, filemeta conversion, lock conversion,
-  or `std::io::Error` downcast behavior out of ECStore in this PR.
-- Do not add ECStore implementation, KMS/SSE reader logic, erasure logic, or
-  remote disk internals to `rustfs-storage-api`.
+- Keep this CFG-002 branch as a focused `docs-only` PR. Do not move
+  `Config`, `KV`, `KVS`, persistence helpers, global server-config state,
+  Storage API code, startup code, or target/notify/audit/IAM consumers in this
+  branch.
+- The next extraction PR must preserve the tuple-struct shape, serde fields,
+  `hiddenIfEmpty` alias, `Config::new` default behavior, marshal/unmarshal
+  behavior, and old `rustfs_ecstore::config::*` path.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
+- Do not create a new config-model crate unless a later implementation attempt
+  proves `rustfs-config` cannot hold the pure model boundary.
