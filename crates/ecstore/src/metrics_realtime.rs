@@ -18,8 +18,8 @@ use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::Dr
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{
     DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
-    ScannerMetrics as MadminScannerMetrics, ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot,
-    TimedAction as MadminTimedAction,
+    ScannerMetrics as MadminScannerMetrics, ScannerPacingPressureSnapshot as MadminScannerPacingPressureSnapshot,
+    ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot, TimedAction as MadminTimedAction,
 };
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,16 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
         active_paths: metrics.active_paths,
         last_cycle_partial_source: metrics.last_cycle_partial_source,
         last_cycle_partial_source_code: metrics.last_cycle_partial_source_code,
+        pacing_pressure: MadminScannerPacingPressureSnapshot {
+            primary_pressure: metrics.pacing_pressure.primary_pressure,
+            current_queued_scans: metrics.pacing_pressure.current_queued_scans,
+            current_active_scans: metrics.pacing_pressure.current_active_scans,
+            last_cycle_budget_limited: metrics.pacing_pressure.last_cycle_budget_limited,
+            last_cycle_pause_observed: metrics.pacing_pressure.last_cycle_pause_observed,
+            last_cycle_throttle_sleep_ratio: metrics.pacing_pressure.last_cycle_throttle_sleep_ratio,
+            last_cycle_yield_ratio: metrics.pacing_pressure.last_cycle_yield_ratio,
+            last_cycle_total_pause_ratio: metrics.pacing_pressure.last_cycle_total_pause_ratio,
+        },
         partial_cycles_by_source: metrics
             .partial_cycles_by_source
             .into_iter()
@@ -375,5 +385,31 @@ mod test {
             .find(|source| source.source == "usage")
             .expect("usage partial source should be mapped");
         assert_eq!(usage.cycles, 2);
+    }
+
+    #[test]
+    fn scanner_metrics_mapping_preserves_pacing_pressure() {
+        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
+            pacing_pressure: rustfs_common::metrics::ScannerPacingPressureSnapshot {
+                primary_pressure: "cycle_budget".to_string(),
+                current_queued_scans: 4,
+                current_active_scans: 2,
+                last_cycle_budget_limited: true,
+                last_cycle_pause_observed: true,
+                last_cycle_throttle_sleep_ratio: 0.25,
+                last_cycle_yield_ratio: 0.05,
+                last_cycle_total_pause_ratio: 0.3,
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.pacing_pressure.primary_pressure, "cycle_budget");
+        assert_eq!(scanner.pacing_pressure.current_queued_scans, 4);
+        assert_eq!(scanner.pacing_pressure.current_active_scans, 2);
+        assert!(scanner.pacing_pressure.last_cycle_budget_limited);
+        assert!(scanner.pacing_pressure.last_cycle_pause_observed);
+        assert_eq!(scanner.pacing_pressure.last_cycle_throttle_sleep_ratio, 0.25);
+        assert_eq!(scanner.pacing_pressure.last_cycle_yield_ratio, 0.05);
+        assert_eq!(scanner.pacing_pressure.last_cycle_total_pause_ratio, 0.3);
     }
 }
