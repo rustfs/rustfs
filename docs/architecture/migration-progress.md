@@ -6,7 +6,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
 - Branch: `overtrue/arch-kms-defaults-inventory`
-- Baseline: `upstream/main` at `a73c90c8111e070740923431db0487ad3deb9334`
+- Baseline: `upstream/main` at `f80162b5c99d6825b489ad94b81dfaeca6bfa874` (after CFG-002)
 - PR type for this branch: `docs-only`
 - Runtime behavior changes: none
 - Rust code changes: none
@@ -62,6 +62,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     source `RUSTFS_COMPAT_TODO(<task-id>)` marker lacks a cleanup-register entry,
     when a register entry lacks a source marker, or when a source marker omits a
     removal condition.
+
+## Phase 1a Config Model Tasks
+
+- [x] `CFG-001` Inventory `ecstore::config::{Config, KV, KVS}` consumers.
+  - Acceptance:
+    [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md)
+    records the current definitions, persistence helpers, global accessors,
+    consumer groups, migration risks, and do-not-change contract.
+- [x] `CFG-002` Decide model boundary.
+  - Acceptance:
+    [`config-model-boundary-adr.md`](config-model-boundary-adr.md) records
+    `rustfs-config` as the target package, `server_config` as the future model
+    module, allowed dependencies, forbidden dependencies, preserved shape, and
+    extraction verification gates.
+- [ ] `CFG-003` Move pure model definitions.
+  - Next boundary: move only `Config`, `KV`, `KVS`, and default-registration
+    surface into `rustfs-config`; keep persistence helpers and global
+    server-config state in `ecstore`.
+- [ ] `CFG-004` Keep old `ecstore::config::*` compatibility path.
+  - Required compatibility: source must contain `RUSTFS_COMPAT_TODO(CFG-004)`
+    and a matching cleanup-register entry.
 
 ## Phase 1 Security Governance Tasks
 
@@ -176,9 +197,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
    of rustfs-storage-api.
 3. `test-only`: add focused compatibility checks before moving store traits or
    consumer imports.
-4. `security-change`: make Local KMS unsafe defaults explicit development
+4. `api-extraction`: move only the pure server-config model into
+   rustfs-config as CFG-003.
+5. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+   RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
+6. `consumer-migration`: migrate external consumers one group at a time only
+   after the model path and compatibility shim are stable.
+7. `security-change`: make Local KMS unsafe defaults explicit development
    opt-ins or production failures in KMSD-002.
-5. `security-change`: make Vault unsafe defaults explicit development opt-ins
+8. `security-change`: make Vault unsafe defaults explicit development opt-ins
    or production failures in KMSD-003.
 
 ## Pre-Push Review Log
@@ -216,3 +243,8 @@ Notes:
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
 - KMS production default hardening remains a separate task group; do not bundle
   it with this inventory PR.
+- The CFG-003 extraction PR must preserve the tuple-struct shape, serde fields,
+  `hiddenIfEmpty` alias, `Config::new` default behavior, marshal/unmarshal
+  behavior, and old `rustfs_ecstore::config::*` path.
+- Do not create a new config-model crate unless a later implementation attempt
+  proves `rustfs-config` cannot hold the pure model boundary.
