@@ -24,7 +24,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetType, build_queued_payload, delete_stored_payload, is_connectivity_error, open_target_queue_store,
-        persist_queued_payload_to_store,
+        persist_queued_payload_to_store, redacted_secret,
     },
 };
 use async_trait::async_trait;
@@ -33,6 +33,7 @@ use rustfs_config::{MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY};
 use rustfs_tls_runtime::{load_certs, load_private_key};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::fmt;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,7 +44,7 @@ use tracing::{debug, error, info, warn};
 ///
 /// Contains all configuration values needed to connect to a MySQL/TiDB
 /// database and write event notification records.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MySqlArgs {
     /// Whether the target is enabled
     pub enable: bool,
@@ -67,6 +68,24 @@ pub struct MySqlArgs {
     pub max_open_connections: usize,
     /// The target type (notify or audit)
     pub target_type: TargetType,
+}
+
+impl fmt::Debug for MySqlArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MySqlArgs")
+            .field("enable", &self.enable)
+            .field("dsn_string", &redact_mysql_dsn(&self.dsn_string))
+            .field("table", &self.table)
+            .field("format", &self.format)
+            .field("tls_ca", &self.tls_ca)
+            .field("tls_client_cert", &self.tls_client_cert)
+            .field("tls_client_key", &redacted_secret(&self.tls_client_key))
+            .field("queue_dir", &self.queue_dir)
+            .field("queue_limit", &self.queue_limit)
+            .field("max_open_connections", &self.max_open_connections)
+            .field("target_type", &self.target_type)
+            .finish()
+    }
 }
 
 impl MySqlArgs {
@@ -122,7 +141,7 @@ impl MySqlArgs {
 ///
 /// Produced by [`MySqlDsn::parse`] and consumed by the MySQL
 /// target runtime to build connection options.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MySqlDsn {
     /// MySQL user name
     pub user: String,
@@ -136,6 +155,19 @@ pub struct MySqlDsn {
     pub database: String,
     /// Whether TLS is enabled
     pub tls: bool,
+}
+
+impl fmt::Debug for MySqlDsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MySqlDsn")
+            .field("user", &self.user)
+            .field("password", &redacted_secret(&self.password))
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 impl MySqlDsn {
@@ -931,6 +963,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::REDACTED_SECRET;
 
     fn absolute_test_path(path: &str) -> String {
         std::env::temp_dir().join(path).to_string_lossy().into_owned()
@@ -1034,6 +1067,33 @@ mod tests {
     fn redact_dsn_empty_password() {
         let redacted = redact_mysql_dsn("root:@tcp(127.0.0.1:4000)/testdb");
         assert_eq!(redacted, "root:***@tcp(127.0.0.1:4000)/testdb");
+    }
+
+    #[test]
+    fn debug_redacts_mysql_secret_fields() {
+        let args = MySqlArgs {
+            enable: true,
+            dsn_string: "rustfs:mysql-password@tcp(127.0.0.1:3306)/db".to_string(),
+            table: "events".to_string(),
+            format: "access".to_string(),
+            tls_ca: String::new(),
+            tls_client_cert: String::new(),
+            tls_client_key: "/etc/rustfs/mysql.key".to_string(),
+            queue_dir: String::new(),
+            queue_limit: 0,
+            max_open_connections: 0,
+            target_type: TargetType::NotifyEvent,
+        };
+        let dsn = MySqlDsn::parse(&args.dsn_string).expect("valid DSN");
+
+        let rendered_args = format!("{args:?}");
+        let rendered_dsn = format!("{dsn:?}");
+
+        assert!(!rendered_args.contains("mysql-password"));
+        assert!(!rendered_args.contains("/etc/rustfs/mysql.key"));
+        assert!(!rendered_dsn.contains("mysql-password"));
+        assert!(rendered_args.contains("rustfs:***@"));
+        assert!(rendered_dsn.contains(REDACTED_SECRET));
     }
 
     #[test]
