@@ -289,7 +289,7 @@ mod tests {
     use super::*;
     use rustfs_config::{
         DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, DEFAULT_SCANNER_SPEED, HEAL_BITROT_CYCLE, SCANNER_CYCLE_MAX_OBJECTS,
-        SCANNER_SPEED, SCANNER_SUB_SYS,
+        SCANNER_DELAY, SCANNER_MAX_WAIT, SCANNER_SPEED, SCANNER_SUB_SYS,
     };
 
     #[test]
@@ -318,6 +318,8 @@ mod tests {
             .expect("scanner defaults should exist");
 
         assert_eq!(scanner_kvs.get(SCANNER_SPEED), DEFAULT_SCANNER_SPEED);
+        assert_eq!(scanner_kvs.get(SCANNER_DELAY), "");
+        assert_eq!(scanner_kvs.get(SCANNER_MAX_WAIT), "");
         assert_eq!(scanner_kvs.get(SCANNER_CYCLE_MAX_OBJECTS), "0");
 
         let heal_kvs = cfg
