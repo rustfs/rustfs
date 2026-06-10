@@ -1720,6 +1720,7 @@ where
 
 async fn update_table_metadata_location_response<S>(
     store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
     table: &str,
@@ -1735,6 +1736,13 @@ where
     else {
         return Err(s3_error!(InvalidRequest, "table not found"));
     };
+    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
+        return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
+    }
+    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+    validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
     let commit_request = crate::table_catalog::TableCommitRequest {
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -2158,8 +2166,10 @@ impl Operation for UpdateTableMetadataLocationHandler {
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
         let request = read_json_body::<UpdateTableMetadataLocationRequest>(req.input).await?;
-        let store = table_catalog_store()?;
-        let response = update_table_metadata_location_response(&store, &warehouse, &namespace, &table, request).await?;
+        let metadata_backend = table_catalog_backend()?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let response =
+            update_table_metadata_location_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -3784,6 +3794,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_location_api_loads_and_updates_current_pointer() {
         let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
         ensure_table_bucket_entry(&store, "warehouse", true)
             .await
@@ -3819,9 +3830,21 @@ mod tests {
             .await
             .expect("metadata location should load");
         let next_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json";
+        metadata_backend
+            .put_json(
+                "warehouse",
+                next_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
 
         let updated = update_table_metadata_location_response(
             &store,
+            &metadata_backend,
             "warehouse",
             &namespace,
             "events",
@@ -3838,6 +3861,81 @@ mod tests {
         assert_eq!(updated.metadata_location, next_location);
         assert_eq!(updated.generation, current.generation + 1);
         assert_ne!(updated.version_token, current.version_token);
+    }
+
+    #[tokio::test]
+    async fn metadata_location_api_rejects_invalid_target_metadata_before_commit() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let current_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json";
+        store
+            .register_table(
+                table_entry_from_register_request(
+                    "warehouse",
+                    &namespace,
+                    RegisterTableRequest {
+                        name: "events".to_string(),
+                        metadata_location: current_location.to_string(),
+                        overwrite: false,
+                    },
+                )
+                .expect("table entry should build"),
+            )
+            .await
+            .expect("table should register");
+        let current = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
+            .await
+            .expect("metadata location should load");
+        let invalid_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json";
+        metadata_backend
+            .put_json(
+                "warehouse",
+                invalid_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://other-warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        assert!(
+            update_table_metadata_location_response(
+                &store,
+                &metadata_backend,
+                "warehouse",
+                &namespace,
+                "events",
+                UpdateTableMetadataLocationRequest {
+                    metadata_location: invalid_location.to_string(),
+                    version_token: current.version_token,
+                    commit_id: Some("commit-1".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .is_err()
+        );
+        let unchanged = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
+            .await
+            .expect("metadata location should still load");
+        assert_eq!(unchanged.metadata_location, current_location);
+        assert_eq!(unchanged.generation, current.generation);
     }
 
     #[tokio::test]
