@@ -46,7 +46,7 @@ use rustfs_utils::path::{
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::io::SeekFrom;
+use std::io::{Error as IoError, SeekFrom};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -66,6 +66,31 @@ const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
+    warn!(
+        stage,
+        path = %path.display(),
+        error_kind = ?err.kind(),
+        raw_os_error = ?err.raw_os_error(),
+        error = ?err,
+        "local disk startup filesystem operation failed"
+    );
+}
+
+fn log_startup_disk_error(stage: &str, path: &Path, err: &DiskError) {
+    if let DiskError::Io(io_err) = err {
+        log_startup_disk_io_error(stage, path, io_err);
+        return;
+    }
+
+    warn!(
+        stage,
+        path = %path.display(),
+        error = ?err,
+        "local disk startup operation failed"
+    );
+}
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -409,9 +434,17 @@ fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         debug!("Creating local disk");
-        let root = resolve_local_disk_root(&ep.get_file_path())?;
+        let endpoint_path = ep.get_file_path();
+        let root = resolve_local_disk_root(&endpoint_path).inspect_err(|err| {
+            log_startup_disk_error("resolve_local_disk_root", Path::new(&endpoint_path), err);
+        })?;
 
-        ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
+        ensure_data_usage_layout(&root)
+            .await
+            .map_err(DiskError::from)
+            .inspect_err(|err| {
+                log_startup_disk_error("ensure_data_usage_layout", &root, err);
+            })?;
 
         let startup_cleanup_ready = Arc::new(AtomicU32::new(u32::from(!cleanup)));
         let startup_cleanup_notify = Arc::new(Notify::new());
@@ -428,7 +461,9 @@ impl LocalDisk {
         // Use optimized path resolution instead of absolutize_virtually
         let format_path = root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
         debug!("format_path: {:?}", format_path);
-        let (format_data, format_meta) = read_file_exists(&format_path).await?;
+        let (format_data, format_meta) = read_file_exists(&format_path).await.inspect_err(|err| {
+            log_startup_disk_error("read_format_json", &format_path, err);
+        })?;
 
         let mut id = None;
         // let mut format_legacy = false;
@@ -521,7 +556,9 @@ impl LocalDisk {
             startup_cleanup_notify,
             exit_signal: None,
         };
-        let (info, _root) = get_disk_info(root).await?;
+        let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
+            log_startup_disk_error("get_disk_info", &root, err);
+        })?;
         disk.major = info.major;
         disk.minor = info.minor;
         disk.fstype = info.fstype;
@@ -538,7 +575,9 @@ impl LocalDisk {
             disk.rotational = true;
         }
 
-        disk.make_meta_volumes().await?;
+        disk.make_meta_volumes().await.inspect_err(|err| {
+            log_startup_disk_error("make_meta_volumes", &disk.root, err);
+        })?;
 
         let (exit_tx, exit_rx) = tokio::sync::broadcast::channel(1);
         disk.exit_signal = Some(exit_tx);
@@ -587,16 +626,21 @@ impl LocalDisk {
         let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
         let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
 
-        rename_all(&tmp_path, &tmp_old_path, root).await?;
+        rename_all(&tmp_path, &tmp_old_path, root).await.inspect_err(|err| {
+            log_startup_disk_error("cleanup_tmp_rename_all", &tmp_path, err);
+        })?;
 
-        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
+        let tmp_deleted_path = Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET);
+        tokio::fs::create_dir_all(&tmp_deleted_path).await.inspect_err(|err| {
+            log_startup_disk_io_error("cleanup_tmp_create_deleted_dir", &tmp_deleted_path, err);
+        })?;
 
         let tmp_old_root = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET);
         tokio::spawn(async move {
             if let Err(err) = tokio::fs::remove_dir_all(&tmp_old_root).await
                 && err.kind() != ErrorKind::NotFound
             {
-                warn!(path = ?tmp_old_root, error = ?err, "failed to remove old temporary data");
+                log_startup_disk_io_error("cleanup_tmp_remove_old_dir", &tmp_old_root, &err);
             }
             startup_cleanup_ready.store(1, Ordering::Release);
             startup_cleanup_notify.notify_waiters();
@@ -1672,13 +1716,26 @@ async fn read_file_all(path: impl AsRef<Path>) -> Result<(Bytes, Metadata)> {
     let p = path.as_ref();
     let meta = read_file_metadata(&path).await?;
 
-    let data = fs::read(&p).await.map_err(to_file_error)?;
+    let data = fs::read(&p)
+        .await
+        .inspect_err(|err| {
+            log_startup_disk_io_error("read_file_all", p, err);
+        })
+        .map_err(to_file_error)?;
 
     Ok((data.into(), meta))
 }
 
 async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
-    let meta = fs::metadata(&p).await.map_err(to_file_error)?;
+    let path = p.as_ref();
+    let meta = fs::metadata(path)
+        .await
+        .inspect_err(|err| {
+            if err.kind() != ErrorKind::NotFound {
+                log_startup_disk_io_error("read_file_metadata", path, err);
+            }
+        })
+        .map_err(to_file_error)?;
 
     Ok(meta)
 }
@@ -3299,7 +3356,9 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
 
-    let disk_info = get_info(&drive_path)?;
+    let disk_info = get_info(&drive_path).inspect_err(|err| {
+        log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
+    })?;
     let root_drive = if !*GLOBAL_IsErasureSD.read().await {
         let root_disk_threshold = *GLOBAL_RootDiskThreshold.read().await;
         if root_disk_threshold > 0 {

@@ -293,8 +293,22 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     set_global_addr(&config.address).await;
 
     // For RPC
+    info!(
+        target: "rustfs::main::run",
+        server_address = %server_address,
+        volumes = ?config.volumes,
+        "starting endpoint parsing"
+    );
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), config.volumes.clone())
         .await
+        .inspect_err(|err| {
+            error!(
+                target: "rustfs::main::run",
+                stage = "endpoint_parsing",
+                error = ?err,
+                "startup storage stage failed"
+            );
+        })
         .map_err(Error::other)?;
     enforce_unsupported_fs_policy(&endpoint_pools)?;
 
@@ -302,7 +316,21 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     update_erasure_type(setup_type).await;
 
     // Initialize the local disk
-    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
+    info!(
+        target: "rustfs::main::run",
+        "starting local disk initialization"
+    );
+    init_local_disks(endpoint_pools.clone())
+        .await
+        .inspect_err(|err| {
+            error!(
+                target: "rustfs::main::run",
+                stage = "local_disk_initialization",
+                error = ?err,
+                "startup storage stage failed"
+            );
+        })
+        .map_err(Error::other)?;
     prewarm_local_disk_id_map().await;
     // Initialize the lock clients
 
@@ -366,10 +394,19 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // init store
     // 2. Start Storage Engine (ECStore)
+    info!(
+        target: "rustfs::main::run",
+        "starting ECStore initialization"
+    );
     let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
         .await
         .inspect_err(|err| {
-            error!("ECStore::new {:?}", err);
+            error!(
+                target: "rustfs::main::run",
+                stage = "ecstore_initialization",
+                error = ?err,
+                "startup storage stage failed"
+            );
         })?;
 
     ecconfig::init();
