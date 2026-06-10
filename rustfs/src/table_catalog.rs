@@ -54,6 +54,7 @@ pub(crate) const TABLE_NAMESPACE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
+pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
@@ -71,6 +72,9 @@ const INTERNAL_CATALOG_ROOT: &str = BUCKET_TABLE_CATALOG_META_PREFIX;
 const TABLE_BUCKET_ROOT: &str = BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
+const MAINTENANCE_ROOT: &str = "maintenance";
+const MAINTENANCE_CONFIG_FILE: &str = "config.json";
+const MAINTENANCE_JOB_ROOT: &str = "jobs";
 const TABLE_CATALOG_LIST_MAX_KEYS: i32 = 1000;
 const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
 
@@ -245,12 +249,36 @@ pub(crate) struct TableCommitResult {
     pub commit_log: CommitLogEntry,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableMaintenanceConfig {
+    pub version: u16,
+    #[serde(rename = "retain-recent-metadata-files")]
+    pub retain_recent_metadata_files: usize,
+    #[serde(rename = "delete-enabled")]
+    pub delete_enabled: bool,
+    #[serde(rename = "background-enabled")]
+    pub background_enabled: bool,
+}
+
+impl Default for TableMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            version: TABLE_MAINTENANCE_CONFIG_VERSION,
+            retain_recent_metadata_files: 0,
+            delete_enabled: false,
+            background_enabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableMetadataMaintenanceJob {
     pub job_id: String,
     pub table_bucket: String,
     pub namespace: String,
     pub table: String,
+    pub table_id: String,
     pub current_metadata_location: String,
     pub current_generation: u64,
     pub retain_recent_metadata_files: usize,
@@ -258,7 +286,7 @@ pub(crate) struct TableMetadataMaintenanceJob {
     pub cleanup_watermark_unix_seconds: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableMetadataMaintenanceReport {
     pub job: TableMetadataMaintenanceJob,
     pub current_metadata_location: String,
@@ -438,6 +466,38 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn table_maintenance_config_path(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+    ) -> String {
+        format!(
+            "{}{}/{MAINTENANCE_ROOT}/{}/{MAINTENANCE_CONFIG_FILE}",
+            self.table_entries_prefix(table_bucket, namespace),
+            table.as_str(),
+            table_catalog_path_hash(table_id)
+        )
+    }
+
+    pub fn table_maintenance_job_path(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+        job_id: &str,
+    ) -> String {
+        format!(
+            "{}{}/{MAINTENANCE_ROOT}/{}/{MAINTENANCE_JOB_ROOT}/{}.json",
+            self.table_entries_prefix(table_bucket, namespace),
+            table.as_str(),
+            table_catalog_path_hash(table_id),
+            table_catalog_path_hash(job_id)
+        )
+    }
+
     pub fn commit_log_entry_path(&self, table_bucket: &str, table_id: &str, commit_id: &str) -> String {
         format!(
             "{}{}/{}/{}.json",
@@ -574,6 +634,108 @@ where
                 .await?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn get_table_maintenance_config(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+
+        let config_path = self
+            .paths
+            .table_maintenance_config_path(table_bucket, &namespace, &table, &entry.table_id);
+        self.read_entry::<TableMaintenanceConfig>(self.catalog_bucket(), &config_path)
+            .await
+            .map(|entry| entry.map(|(config, _)| config).unwrap_or_default())
+    }
+
+    pub(crate) async fn put_table_maintenance_config(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableMaintenanceConfig,
+    ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
+        validate_table_maintenance_config_version(config.version)?;
+        if config.background_enabled {
+            return Err(TableCatalogStoreError::Invalid(
+                "background table maintenance is not supported".to_string(),
+            ));
+        }
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+
+        let config_path = self
+            .paths
+            .table_maintenance_config_path(table_bucket, &namespace, &table, &entry.table_id);
+        self.write_entry(self.catalog_bucket(), &config_path, &config, TableCatalogPutPrecondition::Any)
+            .await?;
+        Ok(config)
+    }
+
+    pub(crate) async fn put_table_metadata_maintenance_report(
+        &self,
+        report: &TableMetadataMaintenanceReport,
+    ) -> TableCatalogStoreResult<()> {
+        let namespace = parse_namespace_for_store(&report.job.namespace)?;
+        let table = parse_table_for_store(&report.job.table)?;
+        let job_path = self.paths.table_maintenance_job_path(
+            &report.job.table_bucket,
+            &namespace,
+            &table,
+            &report.job.table_id,
+            &report.job.job_id,
+        );
+        self.write_entry(self.catalog_bucket(), &job_path, report, TableCatalogPutPrecondition::Any)
+            .await
+    }
+
+    pub(crate) async fn get_table_metadata_maintenance_report(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        job_id: &str,
+    ) -> TableCatalogStoreResult<Option<TableMetadataMaintenanceReport>> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        let job_path = self
+            .paths
+            .table_maintenance_job_path(table_bucket, &namespace, &table, &entry.table_id, job_id);
+        self.read_entry::<TableMetadataMaintenanceReport>(self.catalog_bucket(), &job_path)
+            .await
+            .map(|entry| entry.map(|(report, _)| report))
     }
 
     pub(crate) async fn export_table_catalog_entry(
@@ -759,6 +921,7 @@ where
                 table_bucket: table_bucket.to_string(),
                 namespace: namespace.public_name(),
                 table: table.as_str().to_string(),
+                table_id: entry.table_id,
                 current_metadata_location: current_metadata_location.clone(),
                 current_generation: entry.generation,
                 retain_recent_metadata_files,
@@ -1361,6 +1524,15 @@ fn metadata_candidate_is_past_safety_window(mod_time: Option<OffsetDateTime>, no
 fn validate_catalog_entry_version(kind: &str, version: u16) -> TableCatalogStoreResult<()> {
     if version != TABLE_CATALOG_ENTRY_VERSION {
         return Err(TableCatalogStoreError::Invalid(format!("unsupported {kind} entry version")));
+    }
+    Ok(())
+}
+
+fn validate_table_maintenance_config_version(version: u16) -> TableCatalogStoreResult<()> {
+    if version != TABLE_MAINTENANCE_CONFIG_VERSION {
+        return Err(TableCatalogStoreError::Invalid(
+            "unsupported table maintenance config entry version".to_string(),
+        ));
     }
     Ok(())
 }
@@ -2108,8 +2280,11 @@ mod tests {
 
         let commit_path = paths.commit_log_entry_path("table/../bucket", "table/../id", "commit/%2f\nid");
         let idempotency_path = paths.commit_idempotency_entry_path("table/../bucket", "table/../id", "client/%2f\nrequest");
+        let maintenance_config_path = paths.table_maintenance_config_path("table/../bucket", &namespace, &table, "table/../id");
+        let maintenance_job_path =
+            paths.table_maintenance_job_path("table/../bucket", &namespace, &table, "table/../id", "job/%2f\nid");
 
-        for path in [commit_path, idempotency_path] {
+        for path in [commit_path, idempotency_path, maintenance_config_path, maintenance_job_path] {
             assert!(path.starts_with("s3tables/catalog/table-buckets/"));
             assert!(path.ends_with(".json"));
             assert!(!path.contains(".."));
@@ -2400,12 +2575,109 @@ mod tests {
         assert_eq!(report.job.table_bucket, bucket);
         assert_eq!(report.job.namespace, "sales");
         assert_eq!(report.job.table, "orders");
+        assert_eq!(report.job.table_id, "table-id");
         assert_eq!(report.job.current_generation, 1);
         assert_eq!(report.job.safety_window_seconds, TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS);
         assert!(!report.job.job_id.is_empty());
         assert!(report.job.cleanup_watermark_unix_seconds <= OffsetDateTime::now_utc().unix_timestamp());
         assert_eq!(report.cleanup_candidate_locations, vec![old.clone(), fresh]);
         assert_eq!(report.deletable_metadata_locations, vec![old]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_state_is_scoped_to_current_table_identity() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+
+        let mut first_table = test_table_entry(bucket, &namespace, &table, current.clone());
+        first_table.table_id = "table-id-1".to_string();
+        store.create_table(first_table).await.unwrap();
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 7,
+                    delete_enabled: true,
+                    background_enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        let report = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .unwrap();
+        store.put_table_metadata_maintenance_report(&report).await.unwrap();
+        assert!(
+            store
+                .get_table_metadata_maintenance_report(bucket, "sales", "orders", &report.job.job_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        store.drop_table(bucket, "sales", "orders").await.unwrap();
+
+        let mut second_table = test_table_entry(bucket, &namespace, &table, current);
+        second_table.table_id = "table-id-2".to_string();
+        store.create_table(second_table).await.unwrap();
+
+        assert_eq!(
+            store.get_table_maintenance_config(bucket, "sales", "orders").await.unwrap(),
+            TableMaintenanceConfig::default()
+        );
+        assert!(
+            store
+                .get_table_metadata_maintenance_report(bucket, "sales", "orders", &report.job.job_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_config_rejects_unsupported_config_version() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let err = store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION.saturating_add(1),
+                    retain_recent_metadata_files: 1,
+                    delete_enabled: false,
+                    background_enabled: false,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, TableCatalogStoreError::Invalid(_));
     }
 
     #[tokio::test]

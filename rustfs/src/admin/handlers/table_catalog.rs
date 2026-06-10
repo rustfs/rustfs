@@ -18,7 +18,7 @@ use crate::admin::{
 };
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
-use crate::table_catalog::DEFAULT_WAREHOUSE_ID;
+use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
@@ -40,6 +40,8 @@ const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
 const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
+    "PUT /buckets/{warehouse}",
+    "GET /buckets/{warehouse}",
     "GET /{warehouse}/namespaces",
     "POST /{warehouse}/namespaces",
     "GET /{warehouse}/namespaces/{namespace}",
@@ -50,9 +52,21 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}",
     "DELETE /{warehouse}/namespaces/{namespace}/tables/{table}",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+    "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+    "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
 ];
 
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
+static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
+static GET_TABLE_BUCKET_HANDLER: GetTableBucketHandler = GetTableBucketHandler {};
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
 static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
 static GET_NAMESPACE_HANDLER: RestGetNamespaceHandler = RestGetNamespaceHandler {};
@@ -63,7 +77,16 @@ static REGISTER_TABLE_HANDLER: RestRegisterTableHandler = RestRegisterTableHandl
 static LOAD_TABLE_HANDLER: RestLoadTableHandler = RestLoadTableHandler {};
 static COMMIT_TABLE_HANDLER: RestCommitTableHandler = RestCommitTableHandler {};
 static DROP_TABLE_HANDLER: RestDropTableHandler = RestDropTableHandler {};
+static GET_TABLE_METADATA_LOCATION_HANDLER: GetTableMetadataLocationHandler = GetTableMetadataLocationHandler {};
+static UPDATE_TABLE_METADATA_LOCATION_HANDLER: UpdateTableMetadataLocationHandler = UpdateTableMetadataLocationHandler {};
 static TABLE_METADATA_MAINTENANCE_HANDLER: RestTableMetadataMaintenanceHandler = RestTableMetadataMaintenanceHandler {};
+static GET_TABLE_MAINTENANCE_CONFIG_HANDLER: GetTableMaintenanceConfigHandler = GetTableMaintenanceConfigHandler {};
+static PUT_TABLE_MAINTENANCE_CONFIG_HANDLER: PutTableMaintenanceConfigHandler = PutTableMaintenanceConfigHandler {};
+static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTableMaintenanceJobHandler {};
+static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
+static IMPORT_TABLE_CATALOG_HANDLER: ImportTableCatalogHandler = ImportTableCatalogHandler {};
+static GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER: GetTableCatalogDiagnosticsHandler = GetTableCatalogDiagnosticsHandler {};
+static ROLLBACK_TABLE_CATALOG_HANDLER: RollbackTableCatalogHandler = RollbackTableCatalogHandler {};
 
 #[derive(Debug, Serialize)]
 struct CatalogConfigResponse {
@@ -139,6 +162,62 @@ struct TableMetadataMaintenanceRequest {
     delete: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateTableMetadataLocationRequest {
+    #[serde(rename = "metadata-location", alias = "metadataLocation")]
+    metadata_location: String,
+    #[serde(rename = "version-token", alias = "versionToken")]
+    version_token: String,
+    #[serde(default, rename = "commit-id", alias = "commitId")]
+    commit_id: Option<String>,
+    #[serde(default, rename = "idempotency-key", alias = "idempotencyKey")]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogImportRequest {
+    #[serde(rename = "metadata-location", alias = "metadataLocation")]
+    metadata_location: String,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollbackTableRequest {
+    #[serde(rename = "metadata-location", alias = "metadataLocation")]
+    metadata_location: String,
+    #[serde(rename = "version-token", alias = "versionToken")]
+    version_token: String,
+    #[serde(default, rename = "commit-id", alias = "commitId")]
+    commit_id: Option<String>,
+    #[serde(default, rename = "idempotency-key", alias = "idempotencyKey")]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TableBucketResponse {
+    #[serde(rename = "table-bucket")]
+    table_bucket: String,
+    enabled: bool,
+    #[serde(rename = "catalog-type")]
+    catalog_type: String,
+    warehouse: String,
+    #[serde(rename = "warehouse-location")]
+    warehouse_location: String,
+    #[serde(rename = "catalog-uri")]
+    catalog_uri: String,
+    #[serde(rename = "compat-catalog-uri")]
+    compat_catalog_uri: String,
+    #[serde(rename = "credential-vending")]
+    credential_vending: &'static str,
+    #[serde(rename = "catalog-entry-present")]
+    catalog_entry_present: bool,
+    properties: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Serialize)]
 struct RestNamespaceResponse {
     namespace: Vec<String>,
@@ -189,6 +268,17 @@ struct RestCommitTableResponse {
     commit_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct TableMetadataLocationResponse {
+    #[serde(rename = "metadata-location")]
+    metadata_location: String,
+    #[serde(rename = "version-token")]
+    version_token: String,
+    generation: u64,
+    #[serde(rename = "warehouse-location")]
+    warehouse_location: String,
+}
+
 pub fn register_table_catalog_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
         register_table_catalog_prefix_routes(r, prefix)?;
@@ -199,6 +289,16 @@ pub fn register_table_catalog_route(r: &mut S3Router<AdminOperation>) -> std::io
 
 fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix: &str) -> std::io::Result<()> {
     r.insert(Method::GET, format!("{prefix}/config").as_str(), AdminOperation(&GET_CONFIG_HANDLER))?;
+    r.insert(
+        Method::PUT,
+        format!("{prefix}/buckets/{{warehouse}}").as_str(),
+        AdminOperation(&ENABLE_TABLE_BUCKET_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/buckets/{{warehouse}}").as_str(),
+        AdminOperation(&GET_TABLE_BUCKET_HANDLER),
+    )?;
     r.insert(
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces").as_str(),
@@ -250,9 +350,54 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         AdminOperation(&DROP_TABLE_HANDLER),
     )?;
     r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/metadata-location").as_str(),
+        AdminOperation(&GET_TABLE_METADATA_LOCATION_HANDLER),
+    )?;
+    r.insert(
+        Method::PUT,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/metadata-location").as_str(),
+        AdminOperation(&UPDATE_TABLE_METADATA_LOCATION_HANDLER),
+    )?;
+    r.insert(
         Method::POST,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/metadata").as_str(),
         AdminOperation(&TABLE_METADATA_MAINTENANCE_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/config").as_str(),
+        AdminOperation(&GET_TABLE_MAINTENANCE_CONFIG_HANDLER),
+    )?;
+    r.insert(
+        Method::PUT,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/config").as_str(),
+        AdminOperation(&PUT_TABLE_MAINTENANCE_CONFIG_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/jobs/{{job}}").as_str(),
+        AdminOperation(&GET_TABLE_MAINTENANCE_JOB_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/export").as_str(),
+        AdminOperation(&EXPORT_TABLE_CATALOG_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/import").as_str(),
+        AdminOperation(&IMPORT_TABLE_CATALOG_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/diagnostics").as_str(),
+        AdminOperation(&GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/catalog/rollback").as_str(),
+        AdminOperation(&ROLLBACK_TABLE_CATALOG_HANDLER),
     )?;
 
     Ok(())
@@ -395,6 +540,14 @@ fn table_name_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     Ok(table.to_string())
 }
 
+fn job_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
+    let job = params.get("job").unwrap_or("");
+    if job.is_empty() {
+        return Err(s3_error!(InvalidRequest, "maintenance job id is required"));
+    }
+    Ok(job.to_string())
+}
+
 fn table_catalog_backend() -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
     let store = new_object_layer_fn().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store))
@@ -425,6 +578,15 @@ fn table_bucket_entry_from_metadata_marker(bucket: &str) -> crate::table_catalog
     }
 }
 
+async fn enable_table_bucket_marker(bucket: &str) -> S3Result<()> {
+    let marker = crate::table_catalog::table_bucket_marker_json()
+        .map_err(|err| s3_error!(InternalError, "failed to serialize table bucket marker: {}", err))?;
+    metadata_sys::update(bucket, crate::table_catalog::TABLE_BUCKET_MARKER_CONFIG, marker)
+        .await
+        .map(|_| ())
+        .map_err(|err| s3_error!(InvalidRequest, "failed to enable table bucket {bucket}: {}", err))
+}
+
 async fn ensure_table_bucket_entry<S>(store: &S, bucket: &str, table_bucket_enabled: bool) -> S3Result<()>
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
@@ -439,6 +601,44 @@ where
         .put_table_bucket(table_bucket_entry_from_metadata_marker(bucket))
         .await
         .map_err(catalog_store_error)
+}
+
+async fn table_bucket_response<S>(store: &S, bucket: &str, enabled: bool) -> S3Result<TableBucketResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let entry = store.get_table_bucket(bucket).await.map_err(catalog_store_error)?;
+    let (catalog_type, warehouse_location, properties, catalog_entry_present) = match entry {
+        Some(entry) => (entry.catalog_type, entry.warehouse_root, entry.properties, true),
+        None => (
+            crate::table_catalog::TABLE_BUCKET_CATALOG_TYPE.to_string(),
+            format!("s3://{bucket}/"),
+            BTreeMap::new(),
+            false,
+        ),
+    };
+
+    Ok(TableBucketResponse {
+        table_bucket: bucket.to_string(),
+        enabled,
+        catalog_type,
+        warehouse: bucket.to_string(),
+        warehouse_location,
+        catalog_uri: format!("{TABLE_CATALOG_PREFIX}/{bucket}"),
+        compat_catalog_uri: format!("{TABLE_CATALOG_COMPAT_PREFIX}/{bucket}"),
+        credential_vending: CREDENTIAL_VENDING_UNSUPPORTED,
+        catalog_entry_present,
+        properties,
+    })
+}
+
+async fn enable_table_bucket_response<S>(store: &S, bucket: &str) -> S3Result<TableBucketResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    ensure_table_bucket_entry(store, bucket, true).await?;
+    enable_table_bucket_marker(bucket).await?;
+    table_bucket_response(store, bucket, true).await
 }
 
 fn namespace_segments(namespace: &crate::table_catalog::Namespace) -> Vec<String> {
@@ -522,6 +722,15 @@ fn commit_table_response_from_result(
     }
 }
 
+fn table_metadata_location_response_from_entry(entry: crate::table_catalog::TableEntry) -> TableMetadataLocationResponse {
+    TableMetadataLocationResponse {
+        metadata_location: entry.metadata_location,
+        version_token: entry.version_token,
+        generation: entry.generation,
+        warehouse_location: entry.warehouse_location,
+    }
+}
+
 fn table_commit_request_from_rest_request(
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
@@ -594,6 +803,39 @@ fn table_entry_from_register_request(
         generation: 1,
         state: crate::table_catalog::TableCatalogEntryState::Active,
         properties: BTreeMap::new(),
+        created_at: None,
+        updated_at: None,
+    })
+}
+
+fn table_entry_from_import_request(
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: CatalogImportRequest,
+) -> S3Result<crate::table_catalog::TableEntry> {
+    let table = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &request.metadata_location) {
+        return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
+    }
+
+    let table_id = Uuid::new_v4().to_string();
+    Ok(crate::table_catalog::TableEntry {
+        version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.as_str().to_string(),
+        table_id: table_id.clone(),
+        table_uuid: Uuid::new_v4().to_string(),
+        format: "ICEBERG".to_string(),
+        format_version: 2,
+        warehouse_location: format!("s3://{bucket}/tables/{table_id}"),
+        metadata_location: request.metadata_location,
+        version_token: format!("token-{}", Uuid::new_v4()),
+        generation: 1,
+        state: crate::table_catalog::TableCatalogEntryState::Active,
+        properties: request.properties,
         created_at: None,
         updated_at: None,
     })
@@ -1457,6 +1699,67 @@ where
     Ok(load_table_response_from_entry(entry, metadata))
 }
 
+async fn get_table_metadata_location_response<S>(
+    store: &S,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> S3Result<TableMetadataLocationResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(entry) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    Ok(table_metadata_location_response_from_entry(entry))
+}
+
+async fn update_table_metadata_location_response<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: UpdateTableMetadataLocationRequest,
+) -> S3Result<TableMetadataLocationResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(current) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
+        return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
+    }
+    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+    validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
+    let commit_request = crate::table_catalog::TableCommitRequest {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        commit_id: request.commit_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        idempotency_key: request.idempotency_key,
+        operation: "update-metadata-location".to_string(),
+        expected_version_token: request.version_token,
+        expected_metadata_location: current.metadata_location,
+        new_metadata_location: request.metadata_location,
+        requirements: Vec::new(),
+        writer: Some("rustfs-metadata-location-api".to_string()),
+    };
+    let result = store.commit_table(commit_request).await.map_err(catalog_store_error)?;
+    Ok(table_metadata_location_response_from_entry(result.table))
+}
+
 async fn commit_table_response<S>(
     store: &S,
     metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
@@ -1554,7 +1857,7 @@ async fn table_metadata_maintenance_response<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    if request.delete {
+    let report = if request.delete {
         store
             .delete_table_metadata_maintenance_candidates(
                 bucket,
@@ -1569,7 +1872,74 @@ where
             .plan_table_metadata_maintenance(bucket, &namespace.public_name(), table, request.retain_recent_metadata_files)
             .await
             .map_err(catalog_store_error)
+    }?;
+    store
+        .put_table_metadata_maintenance_report(&report)
+        .await
+        .map_err(catalog_store_error)?;
+    Ok(report)
+}
+
+async fn catalog_import_response<B>(
+    store: &crate::table_catalog::ObjectTableCatalogStore<B>,
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: CatalogImportRequest,
+    table_bucket_enabled: bool,
+) -> S3Result<RestLoadTableResponse>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend,
+{
+    ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
+    let entry = table_entry_from_import_request(bucket, namespace, table, request)?;
+    let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
+    validate_metadata_table_location_in_bucket(bucket, &metadata)?;
+    store.register_table(entry.clone()).await.map_err(catalog_store_error)?;
+    Ok(load_table_response_from_entry(entry, metadata))
+}
+
+async fn rollback_table_response<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: RollbackTableRequest,
+) -> S3Result<RestCommitTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let Some(current) = store
+        .load_table(bucket, &namespace.public_name(), table)
+        .await
+        .map_err(catalog_store_error)?
+    else {
+        return Err(s3_error!(InvalidRequest, "table not found"));
+    };
+    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
+        return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
     }
+    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+    validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
+    let commit_request = crate::table_catalog::TableCommitRequest {
+        table_bucket: bucket.to_string(),
+        namespace: namespace.public_name(),
+        table: table.to_string(),
+        commit_id: request.commit_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        idempotency_key: request.idempotency_key,
+        operation: "rollback".to_string(),
+        expected_version_token: request.version_token,
+        expected_metadata_location: current.metadata_location,
+        new_metadata_location: request.metadata_location,
+        requirements: Vec::new(),
+        writer: Some("rustfs-catalog-rollback-api".to_string()),
+    };
+    let result = store.commit_table(commit_request).await.map_err(catalog_store_error)?;
+    Ok(commit_table_response_from_result(result, target_metadata))
 }
 
 pub struct GetCatalogConfigHandler {}
@@ -1579,6 +1949,35 @@ impl Operation for GetCatalogConfigHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_table_catalog_request(&req, AdminAction::GetTableCatalogAction).await?;
         build_json_response(StatusCode::OK, &catalog_config_response())
+    }
+}
+
+pub struct EnableTableBucketHandler {}
+
+#[async_trait::async_trait]
+impl Operation for EnableTableBucketHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
+        let store = table_catalog_store()?;
+        let response = enable_table_bucket_response(&store, &warehouse).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct GetTableBucketHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GetTableBucketHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableBucketAction).await?;
+        let store = table_catalog_store()?;
+        let enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let response = table_bucket_response(&store, &warehouse, enabled).await?;
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -1746,6 +2145,41 @@ impl Operation for RestDropTableHandler {
     }
 }
 
+pub struct GetTableMetadataLocationHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GetTableMetadataLocationHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataLocationAction).await?;
+        let store = table_catalog_store()?;
+        let response = get_table_metadata_location_response(&store, &warehouse, &namespace, &table).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct UpdateTableMetadataLocationHandler {}
+
+#[async_trait::async_trait]
+impl Operation for UpdateTableMetadataLocationHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
+        let request = read_json_body::<UpdateTableMetadataLocationRequest>(req.input).await?;
+        let metadata_backend = table_catalog_backend()?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let response =
+            update_table_metadata_location_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct RestTableMetadataMaintenanceHandler {}
 
 #[async_trait::async_trait]
@@ -1760,6 +2194,149 @@ impl Operation for RestTableMetadataMaintenanceHandler {
         let metadata_backend = table_catalog_backend()?;
         let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend);
         let response = table_metadata_maintenance_response(&store, &warehouse, &namespace, &table, request).await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct GetTableMaintenanceConfigHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GetTableMaintenanceConfigHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .get_table_maintenance_config(&warehouse, &namespace.public_name(), &table)
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct PutTableMaintenanceConfigHandler {}
+
+#[async_trait::async_trait]
+impl Operation for PutTableMaintenanceConfigHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableLifecycleAction).await?;
+        let request = read_json_body::<crate::table_catalog::TableMaintenanceConfig>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .put_table_maintenance_config(&warehouse, &namespace.public_name(), &table, request)
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct GetTableMaintenanceJobHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GetTableMaintenanceJobHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let job = job_id_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
+        let store = table_catalog_store()?;
+        let Some(response) = store
+            .get_table_metadata_maintenance_report(&warehouse, &namespace.public_name(), &table, &job)
+            .await
+            .map_err(catalog_store_error)?
+        else {
+            return Err(s3_error!(InvalidRequest, "maintenance job not found"));
+        };
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct ExportTableCatalogHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ExportTableCatalogHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .export_table_catalog_entry(&warehouse, &namespace.public_name(), &table)
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct ImportTableCatalogHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ImportTableCatalogHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
+        let request = read_json_body::<CatalogImportRequest>(req.input).await?;
+        let metadata_backend = table_catalog_backend()?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let response =
+            catalog_import_response(&store, &metadata_backend, &warehouse, &namespace, &table, request, table_bucket_enabled)
+                .await?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct GetTableCatalogDiagnosticsHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GetTableCatalogDiagnosticsHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        let store = table_catalog_store()?;
+        let config = store
+            .get_table_maintenance_config(&warehouse, &namespace.public_name(), &table)
+            .await
+            .map_err(catalog_store_error)?;
+        let response = store
+            .diagnose_table_catalog(&warehouse, &namespace.public_name(), &table, config.retain_recent_metadata_files)
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RollbackTableCatalogHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RollbackTableCatalogHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        let request = read_json_body::<RollbackTableRequest>(req.input).await?;
+        let metadata_backend = table_catalog_backend()?;
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let response = rollback_table_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -1819,6 +2396,8 @@ mod tests {
         );
 
         for (handler, action) in [
+            ("EnableTableBucketHandler", "AdminAction::SetTableBucketAction"),
+            ("GetTableBucketHandler", "AdminAction::GetTableBucketAction"),
             ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
             ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
             ("RestGetNamespaceHandler", "AdminAction::GetTableNamespaceAction"),
@@ -1829,7 +2408,16 @@ mod tests {
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
+            ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
+            ("UpdateTableMetadataLocationHandler", "AdminAction::SetTableMetadataLocationAction"),
             ("RestTableMetadataMaintenanceHandler", "AdminAction::RunTableMaintenanceAction"),
+            ("GetTableMaintenanceConfigHandler", "AdminAction::GetTableLifecycleAction"),
+            ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
+            ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
+            ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
+            ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
+            ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
+            ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
         ] {
             let block = operation_block(src, handler);
             assert!(
@@ -1850,7 +2438,16 @@ mod tests {
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
             ("RestCommitTableHandler", "AdminAction::CommitTableAction"),
             ("RestDropTableHandler", "AdminAction::DeleteTableAction"),
+            ("GetTableMetadataLocationHandler", "AdminAction::GetTableMetadataLocationAction"),
+            ("UpdateTableMetadataLocationHandler", "AdminAction::SetTableMetadataLocationAction"),
             ("RestTableMetadataMaintenanceHandler", "AdminAction::RunTableMaintenanceAction"),
+            ("GetTableMaintenanceConfigHandler", "AdminAction::GetTableLifecycleAction"),
+            ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
+            ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
+            ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
+            ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
+            ("GetTableCatalogDiagnosticsHandler", "AdminAction::GetTableMetadataAction"),
+            ("RollbackTableCatalogHandler", "AdminAction::CommitTableAction"),
         ] {
             let block = operation_block(src, handler);
             assert!(
@@ -1898,6 +2495,8 @@ mod tests {
     fn rest_catalog_mvp_routes_use_implemented_handlers() {
         fn assert_operation<T: Operation>() {}
 
+        let _: &EnableTableBucketHandler = &ENABLE_TABLE_BUCKET_HANDLER;
+        let _: &GetTableBucketHandler = &GET_TABLE_BUCKET_HANDLER;
         let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
         let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
         let _: &RestGetNamespaceHandler = &GET_NAMESPACE_HANDLER;
@@ -1908,8 +2507,19 @@ mod tests {
         let _: &RestLoadTableHandler = &LOAD_TABLE_HANDLER;
         let _: &RestCommitTableHandler = &COMMIT_TABLE_HANDLER;
         let _: &RestDropTableHandler = &DROP_TABLE_HANDLER;
+        let _: &GetTableMetadataLocationHandler = &GET_TABLE_METADATA_LOCATION_HANDLER;
+        let _: &UpdateTableMetadataLocationHandler = &UPDATE_TABLE_METADATA_LOCATION_HANDLER;
         let _: &RestTableMetadataMaintenanceHandler = &TABLE_METADATA_MAINTENANCE_HANDLER;
+        let _: &GetTableMaintenanceConfigHandler = &GET_TABLE_MAINTENANCE_CONFIG_HANDLER;
+        let _: &PutTableMaintenanceConfigHandler = &PUT_TABLE_MAINTENANCE_CONFIG_HANDLER;
+        let _: &GetTableMaintenanceJobHandler = &GET_TABLE_MAINTENANCE_JOB_HANDLER;
+        let _: &ExportTableCatalogHandler = &EXPORT_TABLE_CATALOG_HANDLER;
+        let _: &ImportTableCatalogHandler = &IMPORT_TABLE_CATALOG_HANDLER;
+        let _: &GetTableCatalogDiagnosticsHandler = &GET_TABLE_CATALOG_DIAGNOSTICS_HANDLER;
+        let _: &RollbackTableCatalogHandler = &ROLLBACK_TABLE_CATALOG_HANDLER;
 
+        assert_operation::<EnableTableBucketHandler>();
+        assert_operation::<GetTableBucketHandler>();
         assert_operation::<RestListNamespacesHandler>();
         assert_operation::<RestCreateNamespaceHandler>();
         assert_operation::<RestGetNamespaceHandler>();
@@ -1920,7 +2530,16 @@ mod tests {
         assert_operation::<RestLoadTableHandler>();
         assert_operation::<RestCommitTableHandler>();
         assert_operation::<RestDropTableHandler>();
+        assert_operation::<GetTableMetadataLocationHandler>();
+        assert_operation::<UpdateTableMetadataLocationHandler>();
         assert_operation::<RestTableMetadataMaintenanceHandler>();
+        assert_operation::<GetTableMaintenanceConfigHandler>();
+        assert_operation::<PutTableMaintenanceConfigHandler>();
+        assert_operation::<GetTableMaintenanceJobHandler>();
+        assert_operation::<ExportTableCatalogHandler>();
+        assert_operation::<ImportTableCatalogHandler>();
+        assert_operation::<GetTableCatalogDiagnosticsHandler>();
+        assert_operation::<RollbackTableCatalogHandler>();
     }
 
     #[test]
@@ -1942,6 +2561,27 @@ mod tests {
 
         assert_eq!(request.retain_recent_metadata_files, 2);
         assert!(request.delete);
+    }
+
+    #[tokio::test]
+    async fn table_bucket_response_reports_catalog_discovery_without_credentials() {
+        let store = TestTableCatalogStore::default();
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+
+        let response = table_bucket_response(&store, "warehouse", true)
+            .await
+            .expect("bucket response should build");
+
+        assert_eq!(response.table_bucket, "warehouse");
+        assert!(response.enabled);
+        assert_eq!(response.catalog_type, crate::table_catalog::TABLE_BUCKET_CATALOG_TYPE);
+        assert_eq!(response.warehouse_location, "s3://warehouse/");
+        assert_eq!(response.catalog_uri, "/iceberg/v1/warehouse");
+        assert_eq!(response.compat_catalog_uri, "/_iceberg/v1/warehouse");
+        assert_eq!(response.credential_vending, CREDENTIAL_VENDING_UNSUPPORTED);
+        assert!(response.catalog_entry_present);
     }
 
     #[test]
@@ -1979,6 +2619,36 @@ mod tests {
             "TableMetadataMaintenanceRequest",
             serde_json::json!({
                 "delete": true,
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<UpdateTableMetadataLocationRequest>(
+            "UpdateTableMetadataLocationRequest",
+            serde_json::json!({
+                "metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json",
+                "version-token": "token-v1",
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<CatalogImportRequest>(
+            "CatalogImportRequest",
+            serde_json::json!({
+                "metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<RollbackTableRequest>(
+            "RollbackTableRequest",
+            serde_json::json!({
+                "metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+                "version-token": "token-v2",
+                "unexpected": true
+            }),
+        );
+        assert_rejects_unknown_field::<crate::table_catalog::TableMaintenanceConfig>(
+            "TableMaintenanceConfig",
+            serde_json::json!({
+                "version": 1,
                 "unexpected": true
             }),
         );
@@ -2345,6 +3015,44 @@ mod tests {
             )
             .await;
 
+        let default_config = store
+            .get_table_maintenance_config(bucket, "analytics", "events")
+            .await
+            .expect("default maintenance config should load");
+        assert_eq!(default_config, crate::table_catalog::TableMaintenanceConfig::default());
+        let config = store
+            .put_table_maintenance_config(
+                bucket,
+                "analytics",
+                "events",
+                crate::table_catalog::TableMaintenanceConfig {
+                    version: crate::table_catalog::TABLE_MAINTENANCE_CONFIG_VERSION,
+                    retain_recent_metadata_files: 2,
+                    delete_enabled: true,
+                    background_enabled: false,
+                },
+            )
+            .await
+            .expect("maintenance config should persist");
+        assert_eq!(config.retain_recent_metadata_files, 2);
+        assert!(config.delete_enabled);
+        assert!(
+            store
+                .put_table_maintenance_config(
+                    bucket,
+                    "analytics",
+                    "events",
+                    crate::table_catalog::TableMaintenanceConfig {
+                        version: crate::table_catalog::TABLE_MAINTENANCE_CONFIG_VERSION,
+                        retain_recent_metadata_files: 2,
+                        delete_enabled: true,
+                        background_enabled: true,
+                    },
+                )
+                .await
+                .is_err()
+        );
+
         let dry_run = table_metadata_maintenance_response(
             &store,
             bucket,
@@ -2359,6 +3067,12 @@ mod tests {
         .expect("metadata maintenance dry-run should succeed");
         assert_eq!(dry_run.cleanup_candidate_locations, vec![old.clone()]);
         assert_eq!(dry_run.deletable_metadata_locations, vec![old.clone()]);
+        let stored_dry_run = store
+            .get_table_metadata_maintenance_report(bucket, "analytics", "events", &dry_run.job.job_id)
+            .await
+            .expect("maintenance job lookup should succeed")
+            .expect("maintenance job should be stored");
+        assert_eq!(stored_dry_run, dry_run);
         assert!(
             backend
                 .object_exists(bucket, &old)
@@ -2505,6 +3219,7 @@ mod tests {
         namespaces: tokio::sync::Mutex<Vec<crate::table_catalog::NamespaceEntry>>,
         tables: tokio::sync::Mutex<Vec<crate::table_catalog::TableEntry>>,
         commits: tokio::sync::Mutex<Vec<crate::table_catalog::CommitLogEntry>>,
+        fail_put_table_bucket: tokio::sync::Mutex<bool>,
     }
 
     #[derive(Clone, Default)]
@@ -2681,6 +3396,15 @@ mod tests {
             &self,
             entry: crate::table_catalog::TableBucketEntry,
         ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+            let mut fail_put_table_bucket = self.fail_put_table_bucket.lock().await;
+            if *fail_put_table_bucket {
+                *fail_put_table_bucket = false;
+                return Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                    "injected table bucket write failure".to_string(),
+                ));
+            }
+            drop(fail_put_table_bucket);
+
             let mut table_buckets = self.table_buckets.lock().await;
             table_buckets.retain(|existing| existing.table_bucket != entry.table_bucket);
             table_buckets.push(entry);
@@ -2926,6 +3650,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enable_table_bucket_response_fails_before_marker_when_catalog_entry_fails() {
+        let store = TestTableCatalogStore::default();
+        *store.fail_put_table_bucket.lock().await = true;
+
+        assert!(enable_table_bucket_response(&store, "warehouse").await.is_err());
+        assert!(
+            store
+                .get_table_bucket("warehouse")
+                .await
+                .expect("table bucket lookup should succeed")
+                .is_none()
+        );
+        assert!(!*store.fail_put_table_bucket.lock().await);
+    }
+
+    #[tokio::test]
     async fn namespace_helpers_call_catalog_store() {
         let store = TestTableCatalogStore::default();
         ensure_table_bucket_entry(&store, "warehouse", true)
@@ -3081,5 +3821,334 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_location_api_loads_and_updates_current_pointer() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let current_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json";
+        store
+            .register_table(
+                table_entry_from_register_request(
+                    "warehouse",
+                    &namespace,
+                    RegisterTableRequest {
+                        name: "events".to_string(),
+                        metadata_location: current_location.to_string(),
+                        overwrite: false,
+                    },
+                )
+                .expect("table entry should build"),
+            )
+            .await
+            .expect("table should register");
+        let current = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
+            .await
+            .expect("metadata location should load");
+        let next_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json";
+        metadata_backend
+            .put_json(
+                "warehouse",
+                next_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        let updated = update_table_metadata_location_response(
+            &store,
+            &metadata_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            UpdateTableMetadataLocationRequest {
+                metadata_location: next_location.to_string(),
+                version_token: current.version_token.clone(),
+                commit_id: Some("commit-1".to_string()),
+                idempotency_key: Some("retry-1".to_string()),
+            },
+        )
+        .await
+        .expect("metadata location should update");
+
+        assert_eq!(updated.metadata_location, next_location);
+        assert_eq!(updated.generation, current.generation + 1);
+        assert_ne!(updated.version_token, current.version_token);
+    }
+
+    #[tokio::test]
+    async fn metadata_location_api_rejects_invalid_target_metadata_before_commit() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let current_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json";
+        store
+            .register_table(
+                table_entry_from_register_request(
+                    "warehouse",
+                    &namespace,
+                    RegisterTableRequest {
+                        name: "events".to_string(),
+                        metadata_location: current_location.to_string(),
+                        overwrite: false,
+                    },
+                )
+                .expect("table entry should build"),
+            )
+            .await
+            .expect("table should register");
+        let current = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
+            .await
+            .expect("metadata location should load");
+        let invalid_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json";
+        metadata_backend
+            .put_json(
+                "warehouse",
+                invalid_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://other-warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        assert!(
+            update_table_metadata_location_response(
+                &store,
+                &metadata_backend,
+                "warehouse",
+                &namespace,
+                "events",
+                UpdateTableMetadataLocationRequest {
+                    metadata_location: invalid_location.to_string(),
+                    version_token: current.version_token,
+                    commit_id: Some("commit-1".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .is_err()
+        );
+        let unchanged = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
+            .await
+            .expect("metadata location should still load");
+        assert_eq!(unchanged.metadata_location, current_location);
+        assert_eq!(unchanged.generation, current.generation);
+    }
+
+    #[tokio::test]
+    async fn catalog_import_and_rollback_use_register_and_commit_paths() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        ensure_table_bucket_entry(&store, bucket, true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            bucket,
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let imported_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        backend
+            .put_json(
+                bucket,
+                &imported_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        let imported = catalog_import_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            CatalogImportRequest {
+                metadata_location: imported_location.clone(),
+                properties: BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]),
+            },
+            true,
+        )
+        .await
+        .expect("catalog import should register table");
+        assert_eq!(imported.metadata_location, imported_location);
+        let current = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        assert_eq!(current.properties.get("owner").map(String::as_str), Some("lakehouse"));
+
+        let rollback_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        backend
+            .put_json(
+                bucket,
+                &rollback_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id",
+                    "last-sequence-number": 2
+                }),
+            )
+            .await;
+        let rollback = rollback_table_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            RollbackTableRequest {
+                metadata_location: rollback_location.clone(),
+                version_token: current.version_token,
+                commit_id: Some("rollback-1".to_string()),
+                idempotency_key: None,
+            },
+        )
+        .await
+        .expect("rollback should commit selected metadata");
+
+        assert_eq!(rollback.metadata_location, rollback_location);
+        assert_eq!(rollback.commit_id, "rollback-1");
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_invalid_target_metadata_before_commit() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        ensure_table_bucket_entry(&store, bucket, true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            bucket,
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let current_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        backend
+            .put_json(
+                bucket,
+                &current_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
+        catalog_import_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            CatalogImportRequest {
+                metadata_location: current_location.clone(),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("catalog import should register table");
+        let current = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+
+        let invalid_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        backend
+            .put_json(
+                bucket,
+                &invalid_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://other-warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        assert!(
+            rollback_table_response(
+                &store,
+                &backend,
+                bucket,
+                &namespace,
+                "events",
+                RollbackTableRequest {
+                    metadata_location: invalid_location,
+                    version_token: current.version_token,
+                    commit_id: Some("rollback-1".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .is_err()
+        );
+        let unchanged = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+
+        assert_eq!(unchanged.metadata_location, current_location);
+        assert_eq!(unchanged.generation, current.generation);
     }
 }
