@@ -9987,6 +9987,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-storage-api"
+version = "1.0.0-beta.7"
+
+[[package]]
 name = "rustfs-targets"
 version = "1.0.0-beta.7"
 dependencies = [
