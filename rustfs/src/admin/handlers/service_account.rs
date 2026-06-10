@@ -425,6 +425,14 @@ fn can_fallback_view_access_key_info(requester: &StoredCredentials, target: &Sto
     request_user_name(requester) == target.access_key
 }
 
+fn can_fallback_view_access_key_info_after_admin_check_failed(
+    requester: &StoredCredentials,
+    target: &StoredCredentials,
+    no_explicit_deny: bool,
+) -> bool {
+    no_explicit_deny && can_fallback_view_access_key_info(requester, target)
+}
+
 async fn build_info_service_account_resp<T: IamStore>(
     iam_store: &rustfs_iam::sys::IamSys<T>,
     account: &StoredCredentials,
@@ -746,31 +754,51 @@ impl Operation for InfoAccessKey {
 
         let target_cred = iam_store.get_user(&access_key).await.map(|identity| identity.credentials);
 
+        let conditions = get_condition_values(
+            &req.headers,
+            &cred,
+            None,
+            None,
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        );
+        let claims = cred.claims_or_empty();
+
         if !iam_store
             .is_allowed(&Args {
                 account: &cred.access_key,
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-                ),
+                conditions: &conditions,
                 is_owner: owner,
                 object: "",
-                claims: cred.claims_or_empty(),
+                claims,
                 deny_only: false,
             })
             .await
         {
+            let no_explicit_deny = iam_store
+                .is_allowed(&Args {
+                    account: &cred.access_key,
+                    groups: &cred.groups,
+                    action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
+                    bucket: "",
+                    conditions: &conditions,
+                    is_owner: owner,
+                    object: "",
+                    claims,
+                    deny_only: true,
+                })
+                .await;
+            if !no_explicit_deny {
+                return Err(s3_error!(AccessDenied, "access denied"));
+            }
+
             let Some(target_cred) = target_cred.as_ref() else {
                 return Err(s3_error!(AccessDenied, "access denied"));
             };
 
-            if !can_fallback_view_access_key_info(&cred, target_cred) {
+            if !can_fallback_view_access_key_info_after_admin_check_failed(&cred, target_cred, no_explicit_deny) {
                 return Err(s3_error!(AccessDenied, "access denied"));
             }
         }
@@ -1542,6 +1570,38 @@ mod tests {
         };
 
         assert!(!can_fallback_view_access_key_info(&requester, &target));
+    }
+
+    #[test]
+    fn fallback_access_key_info_requires_no_explicit_deny() {
+        let requester = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            ..Default::default()
+        };
+        let target = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            ..Default::default()
+        };
+
+        assert!(can_fallback_view_access_key_info_after_admin_check_failed(&requester, &target, true));
+        assert!(!can_fallback_view_access_key_info_after_admin_check_failed(&requester, &target, false));
+    }
+
+    #[test]
+    fn fallback_access_key_info_requires_no_explicit_deny_for_parent_owned_derived_credentials() {
+        let requester = StoredCredentials {
+            access_key: "sts-user".to_string(),
+            session_token: "session-token".to_string(),
+            parent_user: "owner-user".to_string(),
+            ..Default::default()
+        };
+        let target = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            ..Default::default()
+        };
+
+        assert!(can_fallback_view_access_key_info_after_admin_check_failed(&requester, &target, true));
+        assert!(!can_fallback_view_access_key_info_after_admin_check_failed(&requester, &target, false));
     }
 
     #[test]
