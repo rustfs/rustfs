@@ -16,16 +16,18 @@
 
 use crate::config::{
     BackendConfig, CacheConfig, KmsBackend, KmsConfig, LocalConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig,
+    redacted_secret_option,
 };
 use crate::service_manager::KmsServiceStatus;
 use crate::types::{KeyMetadata, KeyUsage};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// Request to configure KMS with Local backend
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ConfigureLocalKmsRequest {
     /// Directory to store key files
     pub key_dir: PathBuf,
@@ -45,6 +47,23 @@ pub struct ConfigureLocalKmsRequest {
     pub max_cached_keys: Option<usize>,
     /// Cache TTL in seconds
     pub cache_ttl_seconds: Option<u64>,
+}
+
+impl fmt::Debug for ConfigureLocalKmsRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let master_key = redacted_secret_option(self.master_key.as_deref());
+        f.debug_struct("ConfigureLocalKmsRequest")
+            .field("key_dir", &self.key_dir)
+            .field("master_key", &master_key)
+            .field("file_permissions", &self.file_permissions)
+            .field("default_key_id", &self.default_key_id)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("retry_attempts", &self.retry_attempts)
+            .field("enable_cache", &self.enable_cache)
+            .field("max_cached_keys", &self.max_cached_keys)
+            .field("cache_ttl_seconds", &self.cache_ttl_seconds)
+            .finish()
+    }
 }
 
 /// Request to configure KMS with Vault KV v2 + Transit backend
@@ -428,6 +447,7 @@ impl ConfigureKmsRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::REDACTED_SECRET;
 
     #[test]
     fn test_deserialize_vault_kv2_configure_request_accepts_type_aliases() {
@@ -534,6 +554,104 @@ mod tests {
                 assert!(!skip_tls_verify);
             }
             other => panic!("expected vault-transit summary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_configure_request_debug_redacts_kms_secret_fields() {
+        let local = ConfigureKmsRequest::Local(ConfigureLocalKmsRequest {
+            key_dir: PathBuf::from("/tmp/kms"),
+            master_key: Some("local-configure-master-secret".to_string()),
+            file_permissions: Some(0o600),
+            default_key_id: Some("default-key".to_string()),
+            timeout_seconds: Some(30),
+            retry_attempts: Some(3),
+            enable_cache: Some(true),
+            max_cached_keys: Some(16),
+            cache_ttl_seconds: Some(60),
+        });
+        let vault = ConfigureKmsRequest::VaultTransit(ConfigureVaultTransitKmsRequest {
+            address: "https://vault.example.com:8200".to_string(),
+            auth_method: VaultAuthMethod::Token {
+                token: "configure-vault-token-secret".to_string(),
+            },
+            namespace: None,
+            mount_path: Some("transit".to_string()),
+            skip_tls_verify: Some(false),
+            default_key_id: None,
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+        });
+        let approle = ConfigureKmsRequest::VaultKv2(ConfigureVaultKmsRequest {
+            address: "https://vault.example.com:8200".to_string(),
+            auth_method: VaultAuthMethod::AppRole {
+                role_id: "configure-role-id".to_string(),
+                secret_id: "configure-approle-secret-id".to_string(),
+            },
+            namespace: None,
+            mount_path: Some("transit".to_string()),
+            kv_mount: Some("secret".to_string()),
+            key_path_prefix: Some("rustfs/kms/keys".to_string()),
+            skip_tls_verify: Some(false),
+            default_key_id: None,
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+        });
+
+        let rendered = format!("{local:?}\n{vault:?}\n{approle:?}");
+
+        assert!(!rendered.contains("local-configure-master-secret"));
+        assert!(!rendered.contains("configure-vault-token-secret"));
+        assert!(!rendered.contains("configure-approle-secret-id"));
+        assert!(rendered.contains("configure-role-id"));
+        assert!(rendered.contains(REDACTED_SECRET));
+    }
+
+    #[test]
+    fn test_kms_status_response_omits_secret_values_from_json_and_debug() {
+        let configs = [
+            KmsConfig {
+                backend: KmsBackend::Local,
+                backend_config: BackendConfig::Local(LocalConfig {
+                    key_dir: PathBuf::from("/tmp/kms"),
+                    master_key: Some("local-summary-master-secret".to_string()),
+                    file_permissions: Some(0o600),
+                }),
+                ..Default::default()
+            },
+            KmsConfig::vault(
+                url::Url::parse("https://vault.example.com:8200").expect("vault URL"),
+                "summary-vault-token-secret".to_string(),
+            ),
+            KmsConfig::vault_approle(
+                url::Url::parse("https://vault.example.com:8200").expect("vault URL"),
+                "summary-role-id".to_string(),
+                "summary-approle-secret-id".to_string(),
+            ),
+        ];
+
+        for config in configs {
+            let summary = KmsConfigSummary::from(&config);
+            let response = KmsStatusResponse {
+                status: KmsServiceStatus::Configured,
+                backend_type: Some(config.backend.clone()),
+                healthy: None,
+                config_summary: Some(summary),
+            };
+            let json = serde_json::to_string(&response).expect("kms status response should serialize");
+            let debug = format!("{response:?}");
+            let rendered = format!("{json}\n{debug}");
+
+            assert!(!rendered.contains("local-summary-master-secret"));
+            assert!(!rendered.contains("summary-vault-token-secret"));
+            assert!(!rendered.contains("summary-approle-secret-id"));
+            assert!(rendered.contains("has_master_key") || rendered.contains("has_stored_credentials"));
         }
     }
 }

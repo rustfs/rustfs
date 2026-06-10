@@ -51,6 +51,7 @@ rustfs-kms.workspace = true
 rustfs-s3-types = { workspace = true }
 rustfs-data-usage.workspace = true
 rustfs-object-capacity.workspace = true
+rustfs-storage-api.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }

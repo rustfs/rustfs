@@ -5,14 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-kms-action-taxonomy`
-- Baseline: `upstream/main` at `51c26278a4907449c565c7f1f52c1d9ae0616486`
+- Branch: `overtrue/arch-storage-api-error-contracts`
+- Baseline: `upstream/main` at `5fef10548477d9d25b0d391874f8280bf259d10e`
 - PR type for this branch: `contract`
-- Runtime behavior changes: none
-- Rust code changes: extend `KmsAction` with the dedicated policy action
-  taxonomy required before handler-level KMS authorization migration.
+- Runtime behavior changes: none.
+- Rust code changes: add the `rustfs-storage-api` error-code/result contract
+  and route ECStore storage error numeric conversion through that contract.
 - CI/script changes: none
-- Docs changes: record the S-011 KMS action taxonomy handoff.
+- Docs changes: record the API-002 first-slice contract boundary.
 
 ## Phase 0 Tasks
 
@@ -98,51 +98,113 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     service-control, clear-cache, generate-data-key, delete, rotate, list, and
     describe actions; wildcard matching still works.
   - Verification: `cargo test -p rustfs-policy action --no-fail-fast`.
+- [x] `S-012` Migrate KMS handlers to dedicated actions.
+  - Acceptance: KMS data-key, delete/cancel-delete, cache, configure,
+    service-control, list, and describe handlers use dedicated `kms:*` actions.
+  - Compatibility: legacy KMS create/status admin actions are retained only as
+    temporary compatibility paths and registered in
+    [`compat-cleanup-register.md`](compat-cleanup-register.md).
+  - Verification: focused handler and route policy tests, migration rules,
+    formatting, and `make pre-commit`.
+- [x] `S-013` Apply KMS redaction.
+  - Acceptance: KMS Debug output and admin status response summaries contain no
+    Vault token, AppRole secret ID, or local master key values.
+  - Must preserve: internal KMS config values remain available to runtime code
+    and persisted config serialization still writes the original secret values.
+  - Verification: focused KMS redaction/status tests, full KMS tests, migration
+    guards, Rust quality scan, clippy, and `make pre-commit` passed.
+
+## Phase 2 Storage API Tasks
+
+- [x] `API-001` Add `crates/storage-api`.
+  - Acceptance: `rustfs-storage-api` is a workspace member and remains a
+    dependency-free contract crate.
+  - Verification: `cargo check -p rustfs-storage-api`.
+- [~] `API-002` Move public storage error/result contracts.
+  - Current slice: add public `StorageErrorCode` and `StorageResult` contracts
+    in `rustfs-storage-api`, then make ECStore `StorageError::to_u32/from_u32`
+    consume the shared code table.
+  - Deferred: keep the full ECStore `StorageError` enum and ECStore-specific
+    conversions in `rustfs-ecstore` until the `DiskError`, filemeta, lock, and
+    `std::io::Error` downcast boundary is proven safe.
+  - Acceptance: storage-api contract tests pass, ECStore compatibility tests
+    prove numeric codes match the new contract, and
+    `cargo check -p rustfs-storage-api -p rustfs-ecstore` passes.
+  - Must preserve: storage error display, conversions, object error mapping,
+    quorum classification, and reserved code gaps `0x2B/0x2C`.
+  - Risk defense: no storage hot-path enum move in this PR; only numeric code
+    mapping uses the new contract.
+
+## Phase 8 Background Controller Tasks
+
+- [x] `BGC-001` Inventory background services.
+  - Acceptance:
+    [`background-services-inventory.md`](background-services-inventory.md)
+    records scanner, heal, lifecycle, replication, config reload, metrics,
+    shutdown, cancellation, and side-effect surfaces before controller work.
+  - Must preserve: no code behavior change and no new controller contract in
+    this PR.
+  - Verification: docs-only architecture checks and diff hygiene.
+- [x] `BGC-002` Define minimal controller contract.
+  - Acceptance:
+    [`background-controller-contract.md`](background-controller-contract.md)
+    defines desired/current/status/reconcile vocabulary, status state
+    semantics, service boundaries, and side-effect rules without starting
+    workers or changing scheduling.
+  - Must preserve: no Rust trait, scheduler, service registry, worker
+    start/stop path, storage write, readiness change, peer signal, or runtime
+    behavior change.
+  - Verification: docs-only architecture checks and diff hygiene.
 
 ## Next PRs
 
-1. `security-change`: migrate KMS handlers to dedicated actions with explicit
-   legacy compatibility where required.
-2. `contract`: add initial policy inventory tables for redaction, serde, or
-   supply-chain governance only after the contract shape remains stable.
+1. Continue `API-002` only after reviewing whether `DiskError` and
+   `std::io::Error` conversion ownership can move without orphan-rule or
+   downcast behavior loss.
+2. `contract`: move DTOs that are contract-only in `API-003`; keep ECStore
+   implementation, KMS/SSE readers, erasure logic, and remote disk internals out
+   of rustfs-storage-api.
+3. `test-only`: add focused compatibility checks before moving store traits or
+   consumer imports.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Pure policy taxonomy extension; names follow existing `KmsAction` variant style and the branch stays a single `contract` PR. |
-| Migration preservation | pass | No handler authorization, route policy inventory, startup, global state, crate split, or storage hot-path behavior changes. |
-| Testing/verification | pass | Baseline action tests, focused policy tests, full `rustfs-policy`, migration guard scripts, `make pre-commit`, nextest, and doctests pass. |
+| Quality/architecture | pass | rustfs-storage-api only adds `StorageErrorCode` and `StorageResult`; ECStore keeps `StorageError`, `DiskError`, filemeta, lock, and `std::io::Error` conversion ownership. |
+| Migration preservation | pass | ECStore numeric conversion now consumes the shared code table while preserving old variant defaults, reserved gaps `0x2B/0x2C`, and existing display/conversion logic. |
+| Testing/verification | pass | Focused storage-api and ECStore tests, cargo check, dependency guard, migration guards, Rust quality scan, `make pre-commit`, nextest, and doctests passed. |
 
 ## Verification Notes
 
 Passed:
-- Baseline `cargo test -p rustfs-policy action --no-fail-fast`
+- `cargo fmt --all`
 - `cargo fmt --all --check`
-- `cargo test -p rustfs-policy action --no-fail-fast`
-- `cargo test -p rustfs-policy`
+- `cargo test -p rustfs-storage-api`
+- `cargo test -p rustfs-ecstore error -- --nocapture`
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore`
+- `cargo tree -p rustfs-storage-api --edges normal`
 - `./scripts/check_architecture_migration_rules.sh`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
+- Rust quality scan on changed Rust files.
 - `make pre-commit`
+  - Full nextest: 5704 passed, 111 skipped.
+  - Workspace doctests passed.
 
 Notes:
-- This branch only extends KMS policy taxonomy. It does not change KMS handler
-  authorization, route policy inventory, runtime state, startup order, storage
-  paths, or compatibility mappings.
-- `make pre-commit` passed all checks, including 5672 nextest tests and
-  workspace doctests.
+- This branch changes Rust storage contract code and ECStore contract mapping.
+- Rust quality scan reported only existing patterns in `crates/ecstore/src/error.rs`:
+  a test-only `unwrap()` and the pre-existing `StorageError::other` boxed error
+  boundary. This PR does not add either pattern.
 
 ## Handoff Notes
 
-- Keep this S-011 branch as a pure `contract` PR. Do not change KMS handler
-  authorization, admin route registration, route policy inventory, Config moves,
-  Storage API moves, Runtime moves, or ECStore moves.
-- `rustfs` may depend on `rustfs-security-governance` for contract metadata;
-  the security-governance crate must stay independent from implementation
-  crates and runtime state.
+- Keep this branch as the API-002 first slice, not the full error enum move.
+- Do not move `StorageError`, `DiskError`, filemeta conversion, lock conversion,
+  or `std::io::Error` downcast behavior out of ECStore in this PR.
+- Do not add ECStore implementation, KMS/SSE reader logic, erasure logic, or
+  remote disk internals to `rustfs-storage-api`.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
-- S-012 must decide any legacy compatibility mapping explicitly instead of
-  silently replacing existing admin actions in this taxonomy PR.
