@@ -636,8 +636,8 @@ async fn enable_table_bucket_response<S>(store: &S, bucket: &str) -> S3Result<Ta
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    enable_table_bucket_marker(bucket).await?;
     ensure_table_bucket_entry(store, bucket, true).await?;
+    enable_table_bucket_marker(bucket).await?;
     table_bucket_response(store, bucket, true).await
 }
 
@@ -3213,6 +3213,7 @@ mod tests {
         namespaces: tokio::sync::Mutex<Vec<crate::table_catalog::NamespaceEntry>>,
         tables: tokio::sync::Mutex<Vec<crate::table_catalog::TableEntry>>,
         commits: tokio::sync::Mutex<Vec<crate::table_catalog::CommitLogEntry>>,
+        fail_put_table_bucket: tokio::sync::Mutex<bool>,
     }
 
     #[derive(Clone, Default)]
@@ -3389,6 +3390,15 @@ mod tests {
             &self,
             entry: crate::table_catalog::TableBucketEntry,
         ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+            let mut fail_put_table_bucket = self.fail_put_table_bucket.lock().await;
+            if *fail_put_table_bucket {
+                *fail_put_table_bucket = false;
+                return Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                    "injected table bucket write failure".to_string(),
+                ));
+            }
+            drop(fail_put_table_bucket);
+
             let mut table_buckets = self.table_buckets.lock().await;
             table_buckets.retain(|existing| existing.table_bucket != entry.table_bucket);
             table_buckets.push(entry);
@@ -3631,6 +3641,22 @@ mod tests {
                 .expect("table bucket lookup should succeed")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn enable_table_bucket_response_fails_before_marker_when_catalog_entry_fails() {
+        let store = TestTableCatalogStore::default();
+        *store.fail_put_table_bucket.lock().await = true;
+
+        assert!(enable_table_bucket_response(&store, "warehouse").await.is_err());
+        assert!(
+            store
+                .get_table_bucket("warehouse")
+                .await
+                .expect("table bucket lookup should succeed")
+                .is_none()
+        );
+        assert!(!*store.fail_put_table_bucket.lock().await);
     }
 
     #[tokio::test]

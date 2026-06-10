@@ -669,7 +669,7 @@ where
         table: &str,
         config: TableMaintenanceConfig,
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
-        validate_catalog_entry_version("table maintenance config", config.version)?;
+        validate_table_maintenance_config_version(config.version)?;
         if config.background_enabled {
             return Err(TableCatalogStoreError::Invalid(
                 "background table maintenance is not supported".to_string(),
@@ -1524,6 +1524,15 @@ fn metadata_candidate_is_past_safety_window(mod_time: Option<OffsetDateTime>, no
 fn validate_catalog_entry_version(kind: &str, version: u16) -> TableCatalogStoreResult<()> {
     if version != TABLE_CATALOG_ENTRY_VERSION {
         return Err(TableCatalogStoreError::Invalid(format!("unsupported {kind} entry version")));
+    }
+    Ok(())
+}
+
+fn validate_table_maintenance_config_version(version: u16) -> TableCatalogStoreResult<()> {
+    if version != TABLE_MAINTENANCE_CONFIG_VERSION {
+        return Err(TableCatalogStoreError::Invalid(
+            "unsupported table maintenance config entry version".to_string(),
+        ));
     }
     Ok(())
 }
@@ -2640,6 +2649,35 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn maintenance_config_rejects_unsupported_config_version() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+
+        let err = store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION.saturating_add(1),
+                    retain_recent_metadata_files: 1,
+                    delete_enabled: false,
+                    background_enabled: false,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, TableCatalogStoreError::Invalid(_));
     }
 
     #[tokio::test]
