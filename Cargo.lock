@@ -9564,6 +9564,7 @@ dependencies = [
  "moka",
  "rand 0.10.1",
  "reqwest",
+ "rustfs-security-governance",
  "rustfs-utils",
  "serde",
  "serde_json",
@@ -9984,6 +9985,10 @@ dependencies = [
  "time",
  "tracing",
 ]
+
+[[package]]
+name = "rustfs-storage-api"
+version = "1.0.0-beta.7"
 
 [[package]]
 name = "rustfs-targets"

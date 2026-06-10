@@ -5,16 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-kms-handler-actions`
-- Baseline: `upstream/main` at `4fec606dc4f92b19e085f1609a188e82a72720ff`
-- PR type for this branch: `security-change`
-- Runtime behavior changes: high-risk KMS admin handlers now authorize through
-  dedicated `kms:*` actions instead of broad `ServerInfoAdminAction`.
-- Rust code changes: migrate KMS handler action lists and route policy inventory
-  to dedicated KMS actions, while keeping temporary legacy create/status admin
-  action compatibility with `RUSTFS_COMPAT_TODO(S-012)`.
+- Branch: `overtrue/arch-background-controller-contract`
+- Baseline: `upstream/main` at `f9a5e6d7e67322ac6f626b6f437a5e722fbe22e2`
+- PR type for this branch: `docs-only`
+- Runtime behavior changes: none.
+- Rust code changes: none.
 - CI/script changes: none
-- Docs changes: record S-012 action migration status and temporary compatibility cleanup.
+- Docs changes: add BGC-002 background controller contract vocabulary and index
+  it from the background service inventory and architecture overview.
 
 ## Phase 0 Tasks
 
@@ -108,50 +106,74 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     [`compat-cleanup-register.md`](compat-cleanup-register.md).
   - Verification: focused handler and route policy tests, migration rules,
     formatting, and `make pre-commit`.
+- [x] `S-013` Apply KMS redaction.
+  - Acceptance: KMS Debug output and admin status response summaries contain no
+    Vault token, AppRole secret ID, or local master key values.
+  - Must preserve: internal KMS config values remain available to runtime code
+    and persisted config serialization still writes the original secret values.
+  - Verification: focused KMS redaction/status tests, full KMS tests, migration
+    guards, Rust quality scan, clippy, and `make pre-commit` passed.
+
+## Phase 8 Background Controller Tasks
+
+- [x] `BGC-001` Inventory background services.
+  - Acceptance:
+    [`background-services-inventory.md`](background-services-inventory.md)
+    records scanner, heal, lifecycle, replication, config reload, metrics,
+    shutdown, cancellation, and side-effect surfaces before controller work.
+  - Must preserve: no code behavior change and no new controller contract in
+    this PR.
+  - Verification: docs-only architecture checks and diff hygiene.
+- [x] `BGC-002` Define minimal controller contract.
+  - Acceptance:
+    [`background-controller-contract.md`](background-controller-contract.md)
+    defines desired/current/status/reconcile vocabulary, status state
+    semantics, service boundaries, and side-effect rules without starting
+    workers or changing scheduling.
+  - Must preserve: no Rust trait, scheduler, service registry, worker
+    start/stop path, storage write, readiness change, peer signal, or runtime
+    behavior change.
+  - Verification: docs-only architecture checks and diff hygiene.
 
 ## Next PRs
 
-1. `contract`: add initial policy inventory tables for redaction, serde, or
-   supply-chain governance only after the contract shape remains stable.
-2. `security-change`: apply KMS response/config redaction after action
-   migration settles.
+1. `test-only`: add focused preservation tests before moving scanner, heal,
+   replication, lifecycle, or disk health workers.
+2. `contract`: add a side-effect-free BGC-003 status snapshot for a low-risk
+   service such as memory observability.
+3. `behavior-change`: migrate one low-risk controller behind idempotence and
+   shutdown preservation tests.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `security-change` PR; KMS auth action lists are local helper functions, names match `KmsAction`, and no storage/startup/global-state logic is touched. |
-| Migration preservation | pass | Legacy create/status admin actions are retained only behind `RUSTFS_COMPAT_TODO(S-012)` and registered for cleanup; broad `ServerInfoAdminAction` is intentionally not retained for high-risk KMS operations. |
-| Testing/verification | pass | Focused handler/route-policy tests cover dedicated actions and broad-action negative cases; migration rules, formatting, full `make pre-commit`, nextest, and doctests pass. |
+| Quality/architecture | pass | Single `docs-only` BGC-002 contract; it defines vocabulary and boundaries without adding a Rust trait, scheduler, or service registry. |
+| Migration preservation | pass | No Rust source, Cargo manifest, workflow, script, runtime config, worker start/stop path, readiness path, or storage hot path diff. |
+| Testing/verification | pass | Architecture migration rules, layer dependency guard, metrics reference guard, docs diff hygiene, and no-code-diff check passed. |
 
 ## Verification Notes
 
 Passed:
-- Baseline `cargo test -p rustfs admin::handlers::kms --no-fail-fast`
-- Baseline `cargo test -p rustfs admin::route_policy --no-fail-fast`
-- `cargo fmt --all --check`
-- `cargo test -p rustfs admin::handlers::kms --no-fail-fast`
-- `cargo test -p rustfs admin::route_policy --no-fail-fast`
 - `./scripts/check_architecture_migration_rules.sh`
+- `./scripts/check_layer_dependencies.sh`
+- `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
-- `make pre-commit`
+- `git diff --name-only -- '*.rs' 'Cargo.toml' 'Cargo.lock' '.github/**' 'Makefile' 'Justfile'`
 
 Notes:
-- This branch changes only KMS admin authorization action selection and route
-  policy inventory. It does not change KMS runtime defaults, redaction, startup
-  order, global state, storage paths, or crate boundaries.
-- `make pre-commit` passed all checks, including 5682 nextest tests and
-  workspace doctests.
+- This branch changes architecture documentation only.
+- No Rust source, Cargo manifest, workflow, script, or runtime configuration is
+  changed.
+- `make pre-commit` is intentionally not required for this docs-only PR.
 
 ## Handoff Notes
 
-- Keep this S-012 branch as a focused `security-change` PR. Do not change KMS
-  defaults, redaction, admin route registration shape, Config moves, Storage API
-  moves, Runtime moves, or ECStore moves.
-- `rustfs` may depend on `rustfs-security-governance` for contract metadata;
-  the security-governance crate must stay independent from implementation
-  crates and runtime state.
+- Keep this BGC-002 branch as a focused `docs-only` PR.
+- Do not add controller traits, status structs, service registry code,
+  scheduling, shutdown wiring, worker tests, or runtime behavior changes in this
+  PR.
+- Follow-up BGC-003 should add a side-effect-free status snapshot for one
+  low-risk service first, preferably memory observability.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
-- The next KMS security PR should handle redaction or production default
-  hardening separately; do not bundle those with this action migration.

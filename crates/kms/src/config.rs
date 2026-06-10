@@ -15,11 +15,60 @@
 //! KMS configuration management
 
 use crate::error::{KmsError, Result};
+use rustfs_security_governance::{RedactionLevel, RedactionRule};
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_str};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
+
+pub const KMS_CONFIG_REDACTION_RULES: &[RedactionRule] = &[
+    RedactionRule::new("kms.local.master_key", RedactionLevel::Secret, "local backend key encryption material"),
+    RedactionRule::new("kms.vault.token", RedactionLevel::Secret, "vault authentication token"),
+    RedactionRule::new("kms.vault.approle.secret_id", RedactionLevel::Secret, "vault approle secret"),
+    RedactionRule::new("kms.vault_transit.token", RedactionLevel::Secret, "vault transit authentication token"),
+    RedactionRule::new(
+        "kms.vault_transit.approle.secret_id",
+        RedactionLevel::Secret,
+        "vault transit approle secret",
+    ),
+    RedactionRule::new(
+        "kms.configure.local.master_key",
+        RedactionLevel::Secret,
+        "admin configure request local master key",
+    ),
+    RedactionRule::new(
+        "kms.configure.vault.token",
+        RedactionLevel::Secret,
+        "admin configure request vault authentication token",
+    ),
+    RedactionRule::new(
+        "kms.configure.vault.approle.secret_id",
+        RedactionLevel::Secret,
+        "admin configure request vault approle secret",
+    ),
+    RedactionRule::new(
+        "kms.configure.vault_transit.token",
+        RedactionLevel::Secret,
+        "admin configure request vault transit authentication token",
+    ),
+    RedactionRule::new(
+        "kms.configure.vault_transit.approle.secret_id",
+        RedactionLevel::Secret,
+        "admin configure request vault transit approle secret",
+    ),
+];
+
+pub(crate) const REDACTED_SECRET: &str = "***redacted***";
+
+pub(crate) fn redacted_secret(value: &str) -> &'static str {
+    if value.is_empty() { "" } else { REDACTED_SECRET }
+}
+
+pub(crate) fn redacted_secret_option(value: Option<&str>) -> Option<&'static str> {
+    value.map(redacted_secret)
+}
 
 /// KMS backend types
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,7 +118,7 @@ impl Default for KmsConfig {
 }
 
 /// Backend-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum BackendConfig {
     /// Local backend configuration
     Local(LocalConfig),
@@ -86,8 +135,18 @@ impl Default for BackendConfig {
     }
 }
 
+impl fmt::Debug for BackendConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(config) => f.debug_tuple("Local").field(config).finish(),
+            Self::VaultKv2(config) => f.debug_tuple("VaultKv2").field(config).finish(),
+            Self::VaultTransit(config) => f.debug_tuple("VaultTransit").field(config).finish(),
+        }
+    }
+}
+
 /// Local KMS backend configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
     /// Directory to store key files
     pub key_dir: PathBuf,
@@ -95,6 +154,17 @@ pub struct LocalConfig {
     pub master_key: Option<String>,
     /// File permissions for key files (octal)
     pub file_permissions: Option<u32>,
+}
+
+impl fmt::Debug for LocalConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let master_key = redacted_secret_option(self.master_key.as_deref());
+        f.debug_struct("LocalConfig")
+            .field("key_dir", &self.key_dir)
+            .field("master_key", &master_key)
+            .field("file_permissions", &self.file_permissions)
+            .finish()
+    }
 }
 
 impl Default for LocalConfig {
@@ -108,7 +178,7 @@ impl Default for LocalConfig {
 }
 
 /// Vault KV v2 + Transit backend configuration (metadata in KV, key wrapping via Transit)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VaultConfig {
     /// Vault server URL
     pub address: String,
@@ -124,6 +194,20 @@ pub struct VaultConfig {
     pub key_path_prefix: String,
     /// TLS configuration
     pub tls: Option<TlsConfig>,
+}
+
+impl fmt::Debug for VaultConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultConfig")
+            .field("address", &self.address)
+            .field("auth_method", &self.auth_method)
+            .field("namespace", &self.namespace)
+            .field("mount_path", &self.mount_path)
+            .field("kv_mount", &self.kv_mount)
+            .field("key_path_prefix", &self.key_path_prefix)
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 impl Default for VaultConfig {
@@ -143,7 +227,7 @@ impl Default for VaultConfig {
 }
 
 /// Vault Transit backend configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VaultTransitConfig {
     /// Vault server URL
     pub address: String,
@@ -155,6 +239,18 @@ pub struct VaultTransitConfig {
     pub mount_path: String,
     /// TLS configuration
     pub tls: Option<TlsConfig>,
+}
+
+impl fmt::Debug for VaultTransitConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultTransitConfig")
+            .field("address", &self.address)
+            .field("auth_method", &self.auth_method)
+            .field("namespace", &self.namespace)
+            .field("mount_path", &self.mount_path)
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 impl Default for VaultTransitConfig {
@@ -172,12 +268,25 @@ impl Default for VaultTransitConfig {
 }
 
 /// Vault authentication methods
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum VaultAuthMethod {
     /// Token authentication
     Token { token: String },
     /// AppRole authentication
     AppRole { role_id: String, secret_id: String },
+}
+
+impl fmt::Debug for VaultAuthMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Token { token } => f.debug_struct("Token").field("token", &redacted_secret(token)).finish(),
+            Self::AppRole { role_id, secret_id } => f
+                .debug_struct("AppRole")
+                .field("role_id", role_id)
+                .field("secret_id", &redacted_secret(secret_id))
+                .finish(),
+        }
+    }
 }
 
 /// TLS configuration for Vault
@@ -460,6 +569,7 @@ impl KmsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_security_governance::validate_redaction_rules;
     use temp_env::with_vars;
     use tempfile::TempDir;
 
@@ -549,6 +659,53 @@ mod tests {
     fn test_vault_transit_backend_serialization_uses_pascal_case() {
         let serialized = serde_json::to_string(&KmsBackend::VaultTransit).expect("backend should serialize");
         assert_eq!(serialized, "\"VaultTransit\"");
+    }
+
+    #[test]
+    fn test_kms_redaction_rules_are_valid() {
+        assert!(validate_redaction_rules(KMS_CONFIG_REDACTION_RULES).is_ok());
+    }
+
+    #[test]
+    fn test_kms_config_debug_redacts_secret_fields() {
+        let local = KmsConfig {
+            backend: KmsBackend::Local,
+            backend_config: BackendConfig::Local(LocalConfig {
+                key_dir: PathBuf::from("/tmp/kms"),
+                master_key: Some("local-master-secret".to_string()),
+                file_permissions: Some(0o600),
+            }),
+            ..Default::default()
+        };
+        let vault = KmsConfig::vault(
+            Url::parse("https://vault.example.com:8200").expect("vault URL"),
+            "vault-token-secret".to_string(),
+        );
+        let approle = KmsConfig::vault_approle(
+            Url::parse("https://vault.example.com:8200").expect("vault URL"),
+            "role-id-visible".to_string(),
+            "approle-secret-id".to_string(),
+        );
+
+        let rendered = format!("{local:?}\n{vault:?}\n{approle:?}");
+
+        assert!(!rendered.contains("local-master-secret"));
+        assert!(!rendered.contains("vault-token-secret"));
+        assert!(!rendered.contains("approle-secret-id"));
+        assert!(rendered.contains("role-id-visible"));
+        assert!(rendered.contains(REDACTED_SECRET));
+    }
+
+    #[test]
+    fn test_kms_config_serialization_preserves_secret_fields_for_persistence() {
+        let config = KmsConfig::vault(
+            Url::parse("https://vault.example.com:8200").expect("vault URL"),
+            "persisted-token-secret".to_string(),
+        );
+
+        let serialized = serde_json::to_string(&config).expect("kms config should serialize for persistence");
+
+        assert!(serialized.contains("persisted-token-secret"));
     }
 
     #[test]

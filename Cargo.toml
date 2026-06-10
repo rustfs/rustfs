@@ -47,6 +47,7 @@ members = [
     "crates/scanner", # Scanner for data integrity checks and health monitoring
     "crates/security-governance", # Security governance contracts
     "crates/signer", # client signer
+    "crates/storage-api", # Storage API contracts
     "crates/targets", # Target-specific configurations and utilities
     "crates/trusted-proxies", # Trusted proxies management
     "crates/tls-runtime", # Project-wide TLS runtime foundation
@@ -113,6 +114,7 @@ rustfs-s3select-query = { path = "crates/s3select-query", version = "1.0.0-beta.
 rustfs-scanner = { path = "crates/scanner", version = "1.0.0-beta.7" }
 rustfs-security-governance = { path = "crates/security-governance", version = "1.0.0-beta.7" }
 rustfs-signer = { path = "crates/signer", version = "1.0.0-beta.7" }
+rustfs-storage-api = { path = "crates/storage-api", version = "1.0.0-beta.7" }
 rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-beta.7" }
 rustfs-targets = { path = "crates/targets", version = "1.0.0-beta.7" }
 rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.0-beta.7" }
