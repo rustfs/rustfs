@@ -5,16 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-admin-api-bind-ecstore`
-- Baseline: `origin/main` at `d9ddd1bedc3ee8d048511511e310018e2326f913`
-- PR type for this branch: `contract`
+- Branch: `overtrue/arch-storage-admin-consumers`
+- Baseline: `origin/main` at `4b1714438e13afd2b44872bf45fbe084065c9d18`
+- PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: implement the pure `rustfs-storage-api`
-  `StorageAdminApi` contract for `ECStore` by delegating to existing ECStore
-  handlers.
+- Rust code changes: migrate the admin storage-class config consumer from the
+  old `StorageAPI::set_drive_counts` import to the inventory-facing
+  `StorageAdminApi::set_drive_counts` contract.
 - CI/script changes: none
-- Docs changes: record API-007 first-slice branch context, verification
-  evidence, and expert review outcomes.
+- Docs changes: record API-007 admin config consumer-migration context,
+  verification evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
 
@@ -193,16 +193,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Verification: focused storage-api tests, dependency tree, migration guards,
     formatting, and diff hygiene.
 - [~] `API-007` Dual-route `get_disks` consumers.
-  - Current branch first slice: bind `ECStore` to `StorageAdminApi` while
-    keeping `StorageAPI::get_disks` and all existing consumers unchanged.
-  - Acceptance: `ECStore` satisfies the new admin contract with ECStore-owned
-    associated types and a compile-bound compatibility test.
+  - Completed first slice: `rustfs/rustfs#3331` bound `ECStore` to
+    `StorageAdminApi` while keeping all consumers unchanged.
+  - Current branch slice: migrate the admin storage-class config consumer to
+    `StorageAdminApi::set_drive_counts`.
+  - Acceptance: `rustfs/src/admin/service/config.rs` no longer imports old
+    `StorageAPI` only to read drive-count inventory, and `rustfs` owns an
+    explicit dependency on the contract crate.
   - Must preserve: old `StorageAPI` trait shape, `StorageAPI::get_disks`
-    behavior, readiness/admin/capacity/heal/scanner consumers, and storage hot
-    paths.
-  - Risk defense: do not make `StorageAPI` inherit `StorageAdminApi` in this
-    slice, because `Sets`, `SetDisks`, and test implementations still own the
-    old trait surface.
+    behavior, storage-class parsing/default semantics, admin config validation,
+    readiness/capacity/heal/scanner consumers, and storage hot paths.
+  - Risk defense: keep this slice to the admin config drive-count consumer;
+    do not migrate `backend_info`, `local_storage_info`, readiness, heal,
+    scanner, or RPC consumers in the same PR.
 
 ## Phase 8 Background Controller Tasks
 
@@ -227,8 +230,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `consumer-migration`: migrate readiness/admin/capacity consumers to the
-   inventory-facing admin contract one group at a time.
+1. `consumer-migration`: migrate the remaining readiness/admin/capacity
+   consumers to the inventory-facing admin contract one group at a time.
 2. `dependency-migration`: remove duplicate old-path admin surfaces only after
    consumer migration proves equivalent behavior.
 3. `api-extraction`: move only the pure server-config model into
@@ -246,21 +249,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the branch only adds ECStore's `StorageAdminApi` binding, keeps `rustfs-storage-api` independent from ECStore and madmin, and does not make old `StorageAPI` inherit the new trait. |
-| Migration preservation | pass | Confirmed old `StorageAPI`, `StorageAPI::get_disks`, all consumers, and storage hot paths remain unchanged; no compatibility shim was added. |
-| Testing/verification | pass | Confirmed the compile-bound compatibility test covers `ECStore: StorageAdminApi`, the clippy helper issue was fixed without behavior changes, and focused checks plus full pre-commit passed. |
+| Quality/architecture | pass | Confirmed this remains a narrow admin config consumer-migration slice, with an explicit `rustfs` dependency on the contract crate and no ECStore or storage-api boundary reshaping. |
+| Migration preservation | pass | Confirmed storage-class parsing/default behavior, old `StorageAPI`, `StorageAPI::get_disks`, ECStore handlers, and storage hot paths remain unchanged. |
+| Testing/verification | pass | Confirmed focused admin config tests, dependency guards, migration guards, formatting, diff hygiene, and full pre-commit evidence passed before push. |
 
 ## Verification Notes
 
 Passed:
-- baseline `cargo check -p rustfs-storage-api -p rustfs-ecstore`
-- `cargo test -p rustfs-ecstore --test storage_api_compat_test`
-- `cargo test -p rustfs-storage-api`
-- `cargo check -p rustfs-storage-api`
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore`
-- `cargo tree -p rustfs-storage-api --edges normal`
-- `cargo tree -p rustfs-ecstore --edges normal`
-- `cargo clippy -p rustfs-ecstore --test storage_api_compat_test --all-targets -- -D warnings`
+- `cargo check -p rustfs --lib`
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`
+- `cargo test -p rustfs admin::service::config --lib`
+- `cargo tree -p rustfs --edges normal`
 - `cargo fmt --all`
 - `cargo fmt --all --check`
 - `./scripts/check_architecture_migration_rules.sh`
@@ -268,23 +267,26 @@ Passed:
 - `./scripts/check_metrics_migration_refs.sh`
 - `./scripts/check_unsafe_code_allowances.sh`
 - `git diff --check`
-- Rust quality scan on changed Rust files.
 - `make NUM_CORES=1 pre-commit`
 
 Notes:
-- This branch adds no new dependency to `rustfs-storage-api`.
-- ECStore already depends on `rustfs-storage-api`; this branch uses that
-  existing dependency to implement the new contract.
-- No existing ECStore handler, consumer import, admin route, readiness path,
-  capacity calculation, or storage hot path is changed.
-- Full pre-commit passed with nextest `5745 passed, 111 skipped`; workspace
+- This branch adds a direct `rustfs` dependency on `rustfs-storage-api` so the
+  admin config consumer can call the contract crate instead of importing the
+  old ECStore `StorageAPI` trait.
+- `./scripts/check_layer_dependencies.sh` passes with the new dependency.
+- Only the admin storage-class config drive-count consumer changed.
+- No existing ECStore handler, admin route, readiness path, capacity
+  calculation, heal/scanner consumer, RPC consumer, or storage hot path is
+  changed.
+- Full pre-commit passed with nextest `5757 passed, 111 skipped`; workspace
   doctests passed.
+- No temporary compatibility shim was added.
 
 ## Handoff Notes
 
-- Keep this API-007 first-slice branch as a focused `contract` PR.
-- Do not migrate readiness, admin, capacity, heal, scanner, or RPC consumers in
-  this PR.
+- Keep this API-007 slice as a focused `consumer-migration` PR.
+- Do not migrate account-info `backend_info`, RPC `local_storage_info`,
+  readiness, capacity, heal, or scanner consumers in this PR.
 - Do not remove or route around `StorageAPI::get_disks` in this PR.
 - Do not make the old `StorageAPI` trait inherit `StorageAdminApi` in this PR.
 - Do not add temporary compatibility code unless a matching

@@ -19,13 +19,13 @@ use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
 use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
-use rustfs_ecstore::StorageAPI;
 use rustfs_ecstore::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
 use rustfs_ecstore::config::storageclass;
 use rustfs_ecstore::config::{Config as ServerConfig, KVS, set_global_server_config, set_global_storage_class};
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
+use rustfs_storage_api::StorageAdminApi;
 use rustfs_targets::config::{
     validate_amqp_config, validate_kafka_config, validate_mqtt_config, validate_mysql_config, validate_nats_config,
     validate_postgres_config, validate_pulsar_config, validate_redis_config, validate_webhook_config,
@@ -55,7 +55,10 @@ async fn apply_storage_class_runtime_config(config: &ServerConfig) -> S3Result<(
     };
 
     let kvs = config.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
-    let set_drive_count = store.set_drive_counts().into_iter().next().unwrap_or(1);
+    let set_drive_count = StorageAdminApi::set_drive_counts(store.as_ref())
+        .into_iter()
+        .next()
+        .unwrap_or(1);
     let parsed = storageclass::lookup_config(&kvs, set_drive_count)
         .map_err(|err| internal_error(format!("failed to apply storage class config: {err}")))?;
     set_global_storage_class(parsed);
@@ -77,7 +80,7 @@ async fn validate_storage_class_config(config: &ServerConfig) -> S3Result<()> {
     };
 
     let kvs = config.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
-    let set_drive_counts = store.set_drive_counts();
+    let set_drive_counts = StorageAdminApi::set_drive_counts(store.as_ref());
     if set_drive_counts.is_empty() {
         return validate_storage_class_kvs(&kvs, &[1]);
     }
