@@ -1588,6 +1588,79 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_table_admin_action_with_resource_is_limited_to_table_object_scope() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:GetTableMetadata"],
+      "Resource": ["arn:aws:s3:::warehouse-a/namespaces/analytics/tables/events"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+
+        let matching_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "namespaces/analytics/tables/events",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy.is_allowed(&matching_args).await,
+            "table admin action should allow the explicitly granted table resource"
+        );
+
+        let namespace_only_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "namespaces/analytics",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&namespace_only_args).await,
+            "table admin action must not match a namespace-only resource when a table resource is required"
+        );
+
+        let other_table_args = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+            bucket: "warehouse-a",
+            conditions: &conditions,
+            is_owner: false,
+            object: "namespaces/analytics/tables/orders",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&other_table_args).await,
+            "table admin action must not match a different table resource"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_table_admin_action_with_not_resource_excludes_bucket() -> Result<()> {
         use crate::policy::action::{Action, AdminAction};
 

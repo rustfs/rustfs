@@ -64,6 +64,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     when a register entry lacks a source marker, or when a source marker omits a
     removal condition.
 
+## Phase 1a Config Model Tasks
+
+- [x] `CFG-001` Inventory `ecstore::config::{Config, KV, KVS}` consumers.
+  - Acceptance:
+    [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md)
+    records the current definitions, persistence helpers, global accessors,
+    consumer groups, migration risks, and do-not-change contract.
+- [x] `CFG-002` Decide model boundary.
+  - Acceptance:
+    [`config-model-boundary-adr.md`](config-model-boundary-adr.md) records
+    `rustfs-config` as the target package, `server_config` as the future model
+    module, allowed dependencies, forbidden dependencies, preserved shape, and
+    extraction verification gates.
+- [ ] `CFG-003` Move pure model definitions.
+  - Next boundary: move only `Config`, `KV`, `KVS`, and default-registration
+    surface into `rustfs-config`; keep persistence helpers and global
+    server-config state in `ecstore`.
+- [ ] `CFG-004` Keep old `ecstore::config::*` compatibility path.
+  - Required compatibility: source must contain `RUSTFS_COMPAT_TODO(CFG-004)`
+    and a matching cleanup-register entry.
+
 ## Phase 1 Security Governance Tasks
 
 - [x] `S-001` Add `crates/security-governance`.
@@ -177,6 +198,12 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
    traits.
 3. `test-only`: add focused preservation tests before moving scanner, heal,
    replication, lifecycle, or disk health workers.
+4. `api-extraction`: move only the pure server-config model into
+   rustfs-config as CFG-003.
+5. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+   RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
+6. `consumer-migration`: migrate external consumers one group at a time only
+   after the model path and compatibility shim are stable.
 
 ## Pre-Push Review Log
 
@@ -185,6 +212,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | Only pure bucket/options DTOs moved into `rustfs-storage-api`; object, reader, compression, encryption, filemeta, multipart, storage, and runtime logic stayed in ECStore. |
 | Migration preservation | pass | Old `ecstore::store_api` import paths remain through `RUSTFS_COMPAT_TODO(API-003)` compatibility re-export, with cleanup registered. |
 | Testing/verification | pass | Focused DTO tests, ECStore compatibility test, migration guards, formatting, rio-v2 clippy, dependency review, diff checks, and pre-commit passed. |
+| Quality/architecture | pass | Single `docs-only` PR; ADR chooses existing rustfs-config, records module path and dependency boundaries, and avoids a speculative new crate. |
+| Migration preservation | pass | No code movement; ADR explicitly keeps persistence helpers, global server-config state, startup order, and old-path compatibility requirements out of CFG-002. |
+| Testing/verification | pass | Docs-only verification uses migration guard scripts, metrics reference guard, layer dependency guard, and whitespace checks. |
 
 ## Verification Notes
 
@@ -224,3 +254,5 @@ Notes:
   import bucket DTOs from `rustfs_storage_api`.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
+- Do not create a new config-model crate unless a later implementation attempt
+  proves `rustfs-config` cannot hold the pure model boundary.
