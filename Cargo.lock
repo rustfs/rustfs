@@ -9107,6 +9107,7 @@ dependencies = [
  "rustfs-scanner",
  "rustfs-security-governance",
  "rustfs-signer",
+ "rustfs-storage-api",
  "rustfs-targets",
  "rustfs-tls-runtime",
  "rustfs-trusted-proxies",
