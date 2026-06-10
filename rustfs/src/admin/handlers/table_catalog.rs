@@ -1918,6 +1918,13 @@ where
     else {
         return Err(s3_error!(InvalidRequest, "table not found"));
     };
+    let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
+        .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
+        return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
+    }
+    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+    validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
     let commit_request = crate::table_catalog::TableCommitRequest {
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -1932,8 +1939,7 @@ where
         writer: Some("rustfs-catalog-rollback-api".to_string()),
     };
     let result = store.commit_table(commit_request).await.map_err(catalog_store_error)?;
-    let metadata = read_table_metadata_json(metadata_backend, bucket, &result.table.metadata_location).await?;
-    Ok(commit_table_response_from_result(result, metadata))
+    Ok(commit_table_response_from_result(result, target_metadata))
 }
 
 pub struct GetCatalogConfigHandler {}
@@ -4051,5 +4057,98 @@ mod tests {
 
         assert_eq!(rollback.metadata_location, rollback_location);
         assert_eq!(rollback.commit_id, "rollback-1");
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_invalid_target_metadata_before_commit() {
+        let backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "warehouse";
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+        ensure_table_bucket_entry(&store, bucket, true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            bucket,
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let current_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        backend
+            .put_json(
+                bucket,
+                &current_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://warehouse/tables/table-id"
+                }),
+            )
+            .await;
+        catalog_import_response(
+            &store,
+            &backend,
+            bucket,
+            &namespace,
+            "events",
+            CatalogImportRequest {
+                metadata_location: current_location.clone(),
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("catalog import should register table");
+        let current = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+
+        let invalid_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        backend
+            .put_json(
+                bucket,
+                &invalid_location,
+                serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://other-warehouse/tables/table-id"
+                }),
+            )
+            .await;
+
+        assert!(
+            rollback_table_response(
+                &store,
+                &backend,
+                bucket,
+                &namespace,
+                "events",
+                RollbackTableRequest {
+                    metadata_location: invalid_location,
+                    version_token: current.version_token,
+                    commit_id: Some("rollback-1".to_string()),
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .is_err()
+        );
+        let unchanged = store
+            .load_table(bucket, "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+
+        assert_eq!(unchanged.metadata_location, current_location);
+        assert_eq!(unchanged.generation, current.generation);
     }
 }
