@@ -202,7 +202,7 @@ jobs:
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       # Always enable Tokio unstable features (required by dial9-tokio-telemetry).

@@ -14,6 +14,8 @@
 
 //! Storage API contracts for RustFS.
 
+pub mod bucket;
 pub mod error;
 
+pub use bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 pub use error::{StorageErrorCode, StorageResult};

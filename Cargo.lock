@@ -9990,6 +9990,11 @@ dependencies = [
 [[package]]
 name = "rustfs-storage-api"
 version = "1.0.0-beta.8"
+dependencies = [
+ "serde",
+ "serde_json",
+ "time",
+]
 
 [[package]]
 name = "rustfs-targets"
