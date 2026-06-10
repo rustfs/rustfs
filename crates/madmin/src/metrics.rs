@@ -128,9 +128,15 @@ pub struct ScannerSourceCycleSnapshot {
     pub cycles: u64,
 }
 
+const SCANNER_PRIMARY_PRESSURE_NONE: &str = "none";
+
+fn default_scanner_primary_pressure() -> String {
+    SCANNER_PRIMARY_PRESSURE_NONE.to_string()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ScannerPacingPressureSnapshot {
-    #[serde(rename = "primary_pressure", default)]
+    #[serde(rename = "primary_pressure", default = "default_scanner_primary_pressure")]
     pub primary_pressure: String,
     #[serde(rename = "current_queued_scans", default)]
     pub current_queued_scans: u64,
@@ -151,7 +157,7 @@ pub struct ScannerPacingPressureSnapshot {
 impl Default for ScannerPacingPressureSnapshot {
     fn default() -> Self {
         Self {
-            primary_pressure: "none".to_string(),
+            primary_pressure: default_scanner_primary_pressure(),
             current_queued_scans: 0,
             current_active_scans: 0,
             last_cycle_budget_limited: false,
@@ -174,7 +180,7 @@ impl ScannerPacingPressureSnapshot {
         } else if self.current_active_scans > 0 {
             "active_scans"
         } else {
-            "none"
+            SCANNER_PRIMARY_PRESSURE_NONE
         }
         .to_string();
     }
@@ -873,5 +879,18 @@ mod tests {
         assert_eq!(scanner.pacing_pressure.primary_pressure, "throttle_pause");
         assert!(scanner.pacing_pressure.last_cycle_pause_observed);
         assert_eq!(scanner.pacing_pressure.last_cycle_total_pause_ratio, 0.0);
+    }
+
+    #[test]
+    fn scanner_metrics_deserializes_missing_primary_pressure_as_none() {
+        let pacing_pressure: ScannerPacingPressureSnapshot = serde_json::from_str(
+            r#"{
+                "current_active_scans": 1
+            }"#,
+        )
+        .expect("deserialize partial scanner pacing pressure");
+
+        assert_eq!(pacing_pressure.primary_pressure, "none");
+        assert_eq!(pacing_pressure.current_active_scans, 1);
     }
 }
