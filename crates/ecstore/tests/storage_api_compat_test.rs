@@ -15,8 +15,9 @@
 use rustfs_ecstore::store_api::{
     BucketInfo as EcstoreBucketInfo, BucketOptions as EcstoreBucketOptions, MakeBucketOptions as EcstoreMakeBucketOptions,
 };
+use rustfs_ecstore::{disk::DiskStore, error::Error, store::ECStore};
 use rustfs_storage_api::{
-    BucketInfo as ApiBucketInfo, BucketOptions as ApiBucketOptions, MakeBucketOptions as ApiMakeBucketOptions,
+    BucketInfo as ApiBucketInfo, BucketOptions as ApiBucketOptions, MakeBucketOptions as ApiMakeBucketOptions, StorageAdminApi,
 };
 
 #[test]
@@ -35,4 +36,21 @@ fn old_store_api_bucket_dto_path_reexports_storage_api_types() {
     assert!(api_bucket.versioning);
     assert!(!ecstore_make.lock_enabled);
     assert!(!api_options.no_metadata);
+}
+
+fn storage_admin_api_type_name<T>() -> &'static str
+where
+    T: StorageAdminApi<
+            BackendInfo = rustfs_madmin::BackendInfo,
+            StorageInfo = rustfs_madmin::StorageInfo,
+            Disk = DiskStore,
+            Error = Error,
+        >,
+{
+    std::any::type_name::<T>()
+}
+
+#[test]
+fn ecstore_implements_storage_admin_api_contract() {
+    assert!(storage_admin_api_type_name::<ECStore>().ends_with("::ECStore"));
 }

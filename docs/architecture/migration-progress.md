@@ -5,15 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-api-disk-inventory`
-- Baseline: `upstream/main` at `3fed21c68ae858f4bbb7f1be375d73b2af522f02`
+- Branch: `overtrue/arch-storage-admin-api-bind-ecstore`
+- Baseline: `origin/main` at `d9ddd1bedc3ee8d048511511e310018e2326f913`
 - PR type for this branch: `contract`
 - Runtime behavior changes: none.
-- Rust code changes: add a pure `rustfs-storage-api` admin/disk inventory
-  contract trait.
+- Rust code changes: implement the pure `rustfs-storage-api`
+  `StorageAdminApi` contract for `ECStore` by delegating to existing ECStore
+  handlers.
 - CI/script changes: none
-- Docs changes: record API-006 branch context, verification evidence, and
-  expert review outcomes.
+- Docs changes: record API-007 first-slice branch context, verification
+  evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
 
@@ -177,7 +178,10 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Must preserve: no `ObjectOptions`, `ObjectInfo`, reader, compression,
     encryption, filemeta conversion, multipart conversion, route, storage, or
     runtime behavior changes in this PR.
-- [~] `API-006` Add disk inventory/admin trait.
+- [x] `API-006` Add disk inventory/admin trait.
+  - Current PR: `rustfs/rustfs#3330` merged.
+  - Completed slice: add `StorageAdminApi` and `DiskSetSelector` to
+    `rustfs-storage-api`.
   - Acceptance: `StorageAdminApi` exposes backend info, global storage info,
     local storage info, disk-set inventory, and drive-count surfaces without
     depending on ECStore implementation types.
@@ -188,6 +192,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     `rustfs-storage-api`.
   - Verification: focused storage-api tests, dependency tree, migration guards,
     formatting, and diff hygiene.
+- [~] `API-007` Dual-route `get_disks` consumers.
+  - Current branch first slice: bind `ECStore` to `StorageAdminApi` while
+    keeping `StorageAPI::get_disks` and all existing consumers unchanged.
+  - Acceptance: `ECStore` satisfies the new admin contract with ECStore-owned
+    associated types and a compile-bound compatibility test.
+  - Must preserve: old `StorageAPI` trait shape, `StorageAPI::get_disks`
+    behavior, readiness/admin/capacity/heal/scanner consumers, and storage hot
+    paths.
+  - Risk defense: do not make `StorageAPI` inherit `StorageAdminApi` in this
+    slice, because `Sets`, `SetDisks`, and test implementations still own the
+    old trait surface.
 
 ## Phase 8 Background Controller Tasks
 
@@ -212,38 +227,40 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `contract`: bind ECStore to `StorageAdminApi` while keeping
-   `StorageAPI::get_disks` available.
-2. `consumer-migration`: migrate readiness/admin/capacity consumers to the
+1. `consumer-migration`: migrate readiness/admin/capacity consumers to the
    inventory-facing admin contract one group at a time.
-3. `dependency-migration`: remove duplicate old-path admin surfaces only after
+2. `dependency-migration`: remove duplicate old-path admin surfaces only after
    consumer migration proves equivalent behavior.
-4. `api-extraction`: move only the pure server-config model into
+3. `api-extraction`: move only the pure server-config model into
    rustfs-config as CFG-003.
-5. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+4. `api-extraction`: keep the old rustfs_ecstore::config::* path with
    RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
-6. `consumer-migration`: migrate external consumers one group at a time only
+5. `consumer-migration`: migrate external consumers one group at a time only
    after the model path and compatibility shim are stable.
-7. `security-change`: make Local KMS unsafe defaults explicit development
+6. `security-change`: make Local KMS unsafe defaults explicit development
    opt-ins or production failures in KMSD-002.
-8. `security-change`: make Vault unsafe defaults explicit development opt-ins
+7. `security-change`: make Vault unsafe defaults explicit development opt-ins
    or production failures in KMSD-003.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | `StorageAdminApi` remains contract-only and introduces no `storage-api -> ecstore` or `storage-api -> madmin` coupling. |
-| Migration preservation | pass | No ECStore implementation, `StorageAPI::get_disks`, readiness, admin, capacity, or storage hot-path behavior changed. |
-| Testing/verification | pass | Focused tests, dependency tree, migration guards, Rust quality scan, and full pre-commit passed before push. |
+| Quality/architecture | pass | Confirmed the branch only adds ECStore's `StorageAdminApi` binding, keeps `rustfs-storage-api` independent from ECStore and madmin, and does not make old `StorageAPI` inherit the new trait. |
+| Migration preservation | pass | Confirmed old `StorageAPI`, `StorageAPI::get_disks`, all consumers, and storage hot paths remain unchanged; no compatibility shim was added. |
+| Testing/verification | pass | Confirmed the compile-bound compatibility test covers `ECStore: StorageAdminApi`, the clippy helper issue was fixed without behavior changes, and focused checks plus full pre-commit passed. |
 
 ## Verification Notes
 
 Passed:
+- baseline `cargo check -p rustfs-storage-api -p rustfs-ecstore`
+- `cargo test -p rustfs-ecstore --test storage_api_compat_test`
 - `cargo test -p rustfs-storage-api`
 - `cargo check -p rustfs-storage-api`
 - `cargo check -p rustfs-storage-api -p rustfs-ecstore`
 - `cargo tree -p rustfs-storage-api --edges normal`
+- `cargo tree -p rustfs-ecstore --edges normal`
+- `cargo clippy -p rustfs-ecstore --test storage_api_compat_test --all-targets -- -D warnings`
 - `cargo fmt --all`
 - `cargo fmt --all --check`
 - `./scripts/check_architecture_migration_rules.sh`
@@ -255,18 +272,20 @@ Passed:
 - `make NUM_CORES=1 pre-commit`
 
 Notes:
-- Normal `rustfs-storage-api` dependencies added by this branch are limited to
-  `async-trait`.
-- `tokio` is a dev-dependency only for the unit test runtime.
-- No ECStore implementation, consumer import, admin route, readiness path,
+- This branch adds no new dependency to `rustfs-storage-api`.
+- ECStore already depends on `rustfs-storage-api`; this branch uses that
+  existing dependency to implement the new contract.
+- No existing ECStore handler, consumer import, admin route, readiness path,
   capacity calculation, or storage hot path is changed.
-- Full nextest in pre-commit: 5740 passed, 111 skipped.
-- Workspace doctests passed.
+- Full pre-commit passed with nextest `5745 passed, 111 skipped`; workspace
+  doctests passed.
 
 ## Handoff Notes
 
-- Keep this API-006 branch as a focused `contract` PR.
-- Do not implement the trait for ECStore in this PR.
+- Keep this API-007 first-slice branch as a focused `contract` PR.
+- Do not migrate readiness, admin, capacity, heal, scanner, or RPC consumers in
+  this PR.
 - Do not remove or route around `StorageAPI::get_disks` in this PR.
+- Do not make the old `StorageAPI` trait inherit `StorageAdminApi` in this PR.
 - Do not add temporary compatibility code unless a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.
