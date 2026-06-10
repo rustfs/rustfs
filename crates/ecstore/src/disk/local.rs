@@ -66,6 +66,10 @@ const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_COUNT";
+const ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS";
+const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT: u64 = 2;
+const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: u64 = 100;
 
 fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
     warn!(
@@ -130,6 +134,21 @@ fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, sta
 
 fn record_file_cache_reclaim_error(kind: &'static str) {
     counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "err".to_string()).increment(1);
+}
+
+fn bitrot_size_mismatch_retry_count() -> usize {
+    rustfs_utils::get_env_u64(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT) as usize
+}
+
+fn bitrot_size_mismatch_retry_delay() -> Duration {
+    Duration::from_millis(rustfs_utils::get_env_u64(
+        ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
+        DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
+    ))
+}
+
+fn is_bitrot_size_mismatch_error(err: &std::io::Error) -> bool {
+    err.to_string().contains("bitrot shard file size mismatch")
 }
 
 impl FileCacheReclaimReader {
@@ -1368,16 +1387,42 @@ impl LocalDisk {
         sum: &[u8],
         shard_size: usize,
     ) -> Result<()> {
-        let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
+        let retry_count = bitrot_size_mismatch_retry_count();
+        let retry_delay = bitrot_size_mismatch_retry_delay();
 
-        let meta = file.metadata().await.map_err(to_file_error)?;
-        let file_size = meta.len() as usize;
+        for attempt in 0..=retry_count {
+            let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
+            let meta = file.metadata().await.map_err(to_file_error)?;
+            let file_size = meta.len() as usize;
 
-        bitrot_verify(Box::new(file), file_size, part_size, algo, Bytes::copy_from_slice(sum), shard_size)
+            match bitrot_verify(
+                Box::new(file),
+                file_size,
+                part_size,
+                algo.clone(),
+                Bytes::copy_from_slice(sum),
+                shard_size,
+            )
             .await
-            .map_err(to_file_error)?;
+            {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt < retry_count && is_bitrot_size_mismatch_error(&err) => {
+                    info!(
+                        path = %part_path.display(),
+                        expected_size = part_size,
+                        actual_size = file_size,
+                        retry_attempt = attempt + 1,
+                        retry_count,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        "bitrot verify observed shard size mismatch; retrying"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                }
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+        }
 
-        Ok(())
+        Err(DiskError::other("bitrot size mismatch retry loop exhausted"))
     }
 
     #[async_recursion::async_recursion]
@@ -4451,5 +4496,11 @@ mod test {
                 assert!(!should_reclaim_file_cache_after_read(1024));
             });
         });
+    }
+
+    #[test]
+    fn test_is_bitrot_size_mismatch_error_only_matches_target_message() {
+        assert!(is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot shard file size mismatch")));
+        assert!(!is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot hash mismatch")));
     }
 }
