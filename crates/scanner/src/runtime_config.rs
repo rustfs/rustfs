@@ -41,6 +41,8 @@ use tracing::warn;
 
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 const NO_DEFAULT_CYCLE_OVERRIDE: u64 = 0;
+const MAX_SCANNER_DELAY_FACTOR: f64 = 10_000.0;
+const SCANNER_DELAY_RANGE_REASON: &str = "expected scanner delay between 0 and 10000";
 
 static SCANNER_DEFAULT_CYCLE_SECS: AtomicU64 = AtomicU64::new(NO_DEFAULT_CYCLE_OVERRIDE);
 
@@ -153,7 +155,7 @@ pub struct ScannerRuntimeConfigValue<T> {
 pub struct ScannerRuntimeConfigStatus {
     pub speed: ScannerRuntimeConfigValue<String>,
     pub delay: ScannerRuntimeConfigValue<f64>,
-    pub max_wait_seconds: ScannerRuntimeConfigValue<u64>,
+    pub max_wait_seconds: ScannerRuntimeConfigValue<f64>,
     pub idle_mode: ScannerRuntimeConfigValue<bool>,
     pub start_delay_seconds: ScannerRuntimeConfigValue<Option<u64>>,
     pub cycle_interval_seconds: ScannerRuntimeConfigValue<u64>,
@@ -257,22 +259,22 @@ fn parse_config_speed(value: String) -> Result<ScannerSpeed, ScannerRuntimeConfi
     ScannerSpeed::parse_str(&value).ok_or_else(|| invalid_value(SCANNER_SPEED, value, "expected scanner speed preset"))
 }
 
-fn parse_config_f64(key: &'static str, value: String) -> Result<f64, ScannerRuntimeConfigError> {
+fn parse_config_delay(key: &'static str, value: String) -> Result<f64, ScannerRuntimeConfigError> {
     let parsed = value
         .parse::<f64>()
-        .map_err(|_| invalid_value(key, value.clone(), "expected non-negative finite float"))?;
-    if parsed.is_finite() && parsed >= 0.0 {
+        .map_err(|_| invalid_value(key, value.clone(), SCANNER_DELAY_RANGE_REASON))?;
+    if parsed.is_finite() && (0.0..=MAX_SCANNER_DELAY_FACTOR).contains(&parsed) {
         Ok(parsed)
     } else {
-        Err(invalid_value(key, value, "expected non-negative finite float"))
+        Err(invalid_value(key, value, SCANNER_DELAY_RANGE_REASON))
     }
 }
 
-fn parse_env_f64(key: &'static str, value: String, fallback: f64) -> f64 {
-    match parse_config_f64(key, value.clone()) {
+fn parse_env_delay(key: &'static str, value: String, fallback: f64) -> f64 {
+    match parse_config_delay(key, value.clone()) {
         Ok(parsed) => parsed,
         Err(_) => {
-            warn!(env = key, value, fallback, "Invalid scanner float config, using derived value");
+            warn!(env = key, value, fallback, "Invalid scanner delay config, using derived value");
             fallback
         }
     }
@@ -337,7 +339,7 @@ fn validate_persisted_scanner_runtime_config(config: &ServerConfig) -> Result<()
         parse_config_speed(value)?;
     }
     if let Some(value) = config_value(scanner_kvs, SCANNER_DELAY, "") {
-        parse_config_f64(SCANNER_DELAY, value)?;
+        parse_config_delay(SCANNER_DELAY, value)?;
     }
     validate_optional_config_u64(scanner_kvs, SCANNER_MAX_WAIT, "")?;
     if let Some(value) = config_value(scanner_kvs, SCANNER_IDLE_MODE, DEFAULT_SCANNER_IDLE_MODE) {
@@ -384,10 +386,10 @@ fn lookup_delay(
 ) -> Result<(f64, ScannerRuntimeConfigSource), ScannerRuntimeConfigError> {
     let derived = speed.sleep_factor();
     if let Some(value) = rustfs_utils::get_env_opt_str(ENV_SCANNER_DELAY) {
-        return Ok((parse_env_f64(ENV_SCANNER_DELAY, value, derived), ScannerRuntimeConfigSource::Env));
+        return Ok((parse_env_delay(ENV_SCANNER_DELAY, value, derived), ScannerRuntimeConfigSource::Env));
     }
     if let Some(value) = config_value(kvs, SCANNER_DELAY, "") {
-        return parse_config_f64(SCANNER_DELAY, value).map(|delay| (delay, ScannerRuntimeConfigSource::Config));
+        return parse_config_delay(SCANNER_DELAY, value).map(|delay| (delay, ScannerRuntimeConfigSource::Config));
     }
     Ok((derived, speed_source))
 }
@@ -691,7 +693,7 @@ pub fn scanner_runtime_config_status() -> ScannerRuntimeConfigStatus {
             source: config.delay_source,
         },
         max_wait_seconds: ScannerRuntimeConfigValue {
-            value: config.max_wait.as_secs(),
+            value: config.max_wait.as_secs_f64(),
             source: config.max_wait_source,
         },
         idle_mode: ScannerRuntimeConfigValue {
@@ -798,9 +800,10 @@ mod tests {
     use super::{ScannerRuntimeConfigSource, lookup_scanner_runtime_config, validate_scanner_runtime_config};
     use rustfs_config::{
         DEFAULT_DELIMITER, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE,
-        ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_SPEED, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, SCANNER_BITROT_CYCLE,
-        SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
-        SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE, SCANNER_SPEED, SCANNER_SUB_SYS, ScannerSpeed,
+        ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED, HEAL_BITROT_CYCLE,
+        HEAL_SUB_SYS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES,
+        SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE, SCANNER_SPEED, SCANNER_SUB_SYS,
+        ScannerSpeed,
     };
     use rustfs_ecstore::config::{Config as ServerConfig, KVS};
     use serial_test::serial;
@@ -953,6 +956,34 @@ mod tests {
     }
 
     #[test]
+    fn scanner_runtime_config_validation_rejects_excessive_persisted_delay() {
+        let config = server_config_with_scanner(&[(SCANNER_DELAY, "10000.1")]);
+
+        let err = validate_scanner_runtime_config(&config).expect_err("persisted scanner delay should be bounded");
+        assert!(err.to_string().contains("delay"));
+    }
+
+    #[test]
+    fn scanner_runtime_config_validation_accepts_delay_upper_bound() {
+        let config = server_config_with_scanner(&[(SCANNER_DELAY, "10000")]);
+
+        validate_scanner_runtime_config(&config).expect("delay upper bound should be accepted");
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_config_uses_derived_delay_for_excessive_env_override() {
+        let config = server_config_with_scanner(&[(SCANNER_SPEED, "slow")]);
+
+        with_var(ENV_SCANNER_DELAY, Some("1e308"), || {
+            let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+
+            assert_eq!(resolved.delay, ScannerSpeed::Slow.sleep_factor());
+            assert_eq!(resolved.delay_source, ScannerRuntimeConfigSource::Env);
+        });
+    }
+
+    #[test]
     fn scanner_runtime_config_validation_rejects_non_default_target() {
         let config = server_config_with_scanner_target("analytics", &[(SCANNER_SPEED, "slow")]);
 
@@ -996,7 +1027,7 @@ mod tests {
 
                 assert_eq!(encoded["delay"]["value"], 3.5);
                 assert_eq!(encoded["delay"]["source"], "config");
-                assert_eq!(encoded["max_wait_seconds"]["value"], 7);
+                assert_eq!(encoded["max_wait_seconds"]["value"], 7.0);
                 assert_eq!(encoded["max_wait_seconds"]["source"], "config");
             });
         });
@@ -1018,8 +1049,27 @@ mod tests {
 
                 assert_eq!(encoded["delay"]["value"], 1.25);
                 assert_eq!(encoded["delay"]["source"], "env");
-                assert_eq!(encoded["max_wait_seconds"]["value"], 2);
+                assert_eq!(encoded["max_wait_seconds"]["value"], 2.0);
                 assert_eq!(encoded["max_wait_seconds"]["source"], "env");
+            });
+        });
+        super::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_config_status_preserves_subsecond_max_wait() {
+        let config = server_config_with_scanner(&[(SCANNER_SPEED, "fast")]);
+
+        with_var_unset(ENV_SCANNER_SPEED, || {
+            with_var_unset(ENV_SCANNER_MAX_WAIT_SECS, || {
+                let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+                super::apply_resolved_runtime_config(resolved);
+
+                let status = super::scanner_runtime_config_status();
+
+                assert!((status.max_wait_seconds.value - 0.1).abs() < f64::EPSILON);
+                assert_eq!(status.max_wait_seconds.source, ScannerRuntimeConfigSource::Config);
             });
         });
         super::refresh_scanner_runtime_config_for_tests();
