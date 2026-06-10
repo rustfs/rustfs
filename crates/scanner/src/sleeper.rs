@@ -152,22 +152,32 @@ impl DynamicSleeper {
         }
     }
 
+    fn update_params(&self, factor: f64, max_sleep: Duration) {
+        let mut f = self.inner.factor.write().unwrap_or_else(|e| e.into_inner());
+        *f = factor;
+        let mut m = self.inner.max_sleep.write().unwrap_or_else(|e| e.into_inner());
+        *m = max_sleep;
+    }
+
     /// Swap in parameters from a new speed preset (for runtime reconfiguration).
     pub fn update(&self, speed: ScannerSpeed) {
-        let mut f = self.inner.factor.write().unwrap_or_else(|e| e.into_inner());
-        *f = speed.sleep_factor();
-        let mut m = self.inner.max_sleep.write().unwrap_or_else(|e| e.into_inner());
-        *m = speed.max_sleep();
+        self.update_params(speed.sleep_factor(), speed.max_sleep());
     }
 
     /// Reload speed and idle-mode settings from the current environment.
     pub fn refresh_from_env(&self) {
         let (speed, idle_mode) = scanner_env_config();
-        self.update_from_runtime_config(speed, idle_mode, scanner_yield_every_n_objects());
+        self.update_from_runtime_config(speed.sleep_factor(), speed.max_sleep(), idle_mode, scanner_yield_every_n_objects());
     }
 
-    pub(crate) fn update_from_runtime_config(&self, speed: ScannerSpeed, idle_mode: bool, yield_every_n_objects: u64) {
-        self.update(speed);
+    pub(crate) fn update_from_runtime_config(
+        &self,
+        sleep_factor: f64,
+        max_sleep: Duration,
+        idle_mode: bool,
+        yield_every_n_objects: u64,
+    ) {
+        self.update_params(sleep_factor, max_sleep);
         SCANNER_IDLE_MODE.store(idle_mode, Ordering::Relaxed);
         self.record_throttle_config_with_yield(yield_every_n_objects);
     }
@@ -262,6 +272,21 @@ mod tests {
         let (factor, max_sleep) = s.read_params();
         assert_eq!(factor, 10.0);
         assert_eq!(max_sleep, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn test_update_from_runtime_config_applies_explicit_pacing_params() {
+        let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
+        let s = DynamicSleeper::new(ScannerSpeed::Default);
+
+        s.update_from_runtime_config(3.5, Duration::from_secs(7), true, 64);
+
+        let (factor, max_sleep) = s.read_params();
+        assert_eq!(factor, 3.5);
+        assert_eq!(max_sleep, Duration::from_secs(7));
+        assert!(SCANNER_IDLE_MODE.load(Ordering::Relaxed));
+
+        SCANNER_IDLE_MODE.store(prev_mode, Ordering::Relaxed);
     }
 
     #[test]
