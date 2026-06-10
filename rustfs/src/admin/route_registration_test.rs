@@ -281,6 +281,8 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::DELETE, "/v3/oidc/config/{provider_id}", "/v3/oidc/config/default"),
         admin_route(Method::POST, "/v3/oidc/validate"),
         table_route(Method::GET, "/config"),
+        table_route_sample(Method::PUT, "/buckets/{warehouse}", "/buckets/analytics"),
+        table_route_sample(Method::GET, "/buckets/{warehouse}", "/buckets/analytics"),
         table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
@@ -320,7 +322,54 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
             "/analytics/namespaces/sales/tables/orders/maintenance/metadata",
         ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            "/analytics/namespaces/sales/tables/orders/metadata-location",
+        ),
+        table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            "/analytics/namespaces/sales/tables/orders/metadata-location",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            "/analytics/namespaces/sales/tables/orders/maintenance/config",
+        ),
+        table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            "/analytics/namespaces/sales/tables/orders/maintenance/config",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
+            "/analytics/namespaces/sales/tables/orders/catalog/export",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+            "/analytics/namespaces/sales/tables/orders/catalog/import",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+            "/analytics/namespaces/sales/tables/orders/catalog/diagnostics",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+            "/analytics/namespaces/sales/tables/orders/catalog/rollback",
+        ),
         compat_table_route(Method::GET, "/config"),
+        compat_table_route_sample(Method::PUT, "/buckets/{warehouse}", "/buckets/analytics"),
+        compat_table_route_sample(Method::GET, "/buckets/{warehouse}", "/buckets/analytics"),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
@@ -359,6 +408,51 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             Method::POST,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
             "/analytics/namespaces/sales/tables/orders/maintenance/metadata",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            "/analytics/namespaces/sales/tables/orders/metadata-location",
+        ),
+        compat_table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            "/analytics/namespaces/sales/tables/orders/metadata-location",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            "/analytics/namespaces/sales/tables/orders/maintenance/config",
+        ),
+        compat_table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            "/analytics/namespaces/sales/tables/orders/maintenance/config",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
+            "/analytics/namespaces/sales/tables/orders/catalog/export",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+            "/analytics/namespaces/sales/tables/orders/catalog/import",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+            "/analytics/namespaces/sales/tables/orders/catalog/diagnostics",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+            "/analytics/namespaces/sales/tables/orders/catalog/rollback",
         ),
     ]
 }
@@ -467,6 +561,8 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/scanner/status"));
 
     assert_route(&router, Method::GET, &table_catalog_path("/config"));
+    assert_route(&router, Method::PUT, &table_catalog_path("/buckets/analytics"));
+    assert_route(&router, Method::GET, &table_catalog_path("/buckets/analytics"));
     assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces"));
     assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces"));
     assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales"));
@@ -482,7 +578,54 @@ fn test_register_routes_cover_representative_admin_paths() {
         Method::POST,
         &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/metadata"),
     );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/metadata-location"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/metadata-location"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/config"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/config"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/export"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/import"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/diagnostics"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/rollback"),
+    );
     assert_route(&router, Method::GET, &compat_table_catalog_path("/config"));
+    assert_route(&router, Method::PUT, &compat_table_catalog_path("/buckets/analytics"));
+    assert_route(&router, Method::GET, &compat_table_catalog_path("/buckets/analytics"));
     assert_route(&router, Method::GET, &compat_table_catalog_path("/analytics/namespaces"));
     assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/namespaces"));
     assert_route(&router, Method::GET, &compat_table_catalog_path("/analytics/namespaces/sales"));
@@ -509,6 +652,51 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::POST,
         &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/metadata"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/metadata-location"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/metadata-location"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/config"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/config"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/export"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/import"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/diagnostics"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/rollback"),
     );
 
     assert_route(&router, Method::POST, &admin_path("/v3/service"));

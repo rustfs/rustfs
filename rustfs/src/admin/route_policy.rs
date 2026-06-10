@@ -39,8 +39,11 @@ const GET_GROUP: AdminActionRef = AdminActionRef::new("GetGroupAdminAction");
 const GET_POLICY: AdminActionRef = AdminActionRef::new("GetPolicyAdminAction");
 const GET_REPLICATION_METRICS: AdminActionRef = AdminActionRef::new("GetReplicationMetricsAction");
 const GET_TABLE: AdminActionRef = AdminActionRef::new("GetTableAction");
+const GET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("GetTableBucketAction");
 const GET_TABLE_CATALOG: AdminActionRef = AdminActionRef::new("GetTableCatalogAction");
+const GET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("GetTableLifecycleAction");
 const GET_TABLE_METADATA: AdminActionRef = AdminActionRef::new("GetTableMetadataAction");
+const GET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("GetTableMetadataLocationAction");
 const GET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("GetTableNamespaceAction");
 const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
@@ -66,6 +69,9 @@ const SERVER_INFO: AdminActionRef = AdminActionRef::new("ServerInfoAdminAction")
 const SET_BUCKET_QUOTA: AdminActionRef = AdminActionRef::new("SetBucketQuotaAdminAction");
 const SET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("SetBucketTargetAction");
 const SET_TABLE: AdminActionRef = AdminActionRef::new("SetTableAction");
+const SET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("SetTableBucketAction");
+const SET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("SetTableLifecycleAction");
+const SET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("SetTableMetadataLocationAction");
 const SET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("SetTableNamespaceAction");
 const SET_TIER: AdminActionRef = AdminActionRef::new("SetTierAction");
 const SITE_REPLICATION_ADD: AdminActionRef = AdminActionRef::new("SiteReplicationAddAction");
@@ -590,6 +596,13 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/oidc/validate", SERVER_INFO, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/iceberg/v1/config", GET_TABLE_CATALOG, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/buckets/{warehouse}",
+        GET_TABLE_BUCKET,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces",
@@ -651,12 +664,78 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+        GET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+        SET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Post,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
         RUN_TABLE_MAINTENANCE,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+        SET_TABLE_LIFECYCLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+        REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
     admin(HttpMethod::Get, "/_iceberg/v1/config", GET_TABLE_CATALOG, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/buckets/{warehouse}",
+        SET_TABLE_BUCKET,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/buckets/{warehouse}",
+        GET_TABLE_BUCKET,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(
         HttpMethod::Get,
         "/_iceberg/v1/{warehouse}/namespaces",
@@ -718,9 +797,63 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+        GET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+        SET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Post,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
         RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+        SET_TABLE_LIFECYCLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+        REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+        COMMIT_TABLE,
         RouteRiskLevel::High,
     ),
 ];
@@ -896,7 +1029,9 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 24);
+        assert_eq!(table_specs.count(), 46);
+        assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
+        assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
@@ -922,6 +1057,16 @@ mod tests {
             COMMIT_TABLE,
         );
         assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            GET_TABLE_METADATA_LOCATION,
+        );
+        assert_action(
+            HttpMethod::Put,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            SET_TABLE_METADATA_LOCATION,
+        );
+        assert_action(
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
             RUN_TABLE_MAINTENANCE,
@@ -930,6 +1075,26 @@ mod tests {
             HttpMethod::Post,
             "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
             RUN_TABLE_MAINTENANCE,
+        );
+        assert_action(
+            HttpMethod::Put,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            SET_TABLE_LIFECYCLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+            GET_TABLE_LIFECYCLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+            REGISTER_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+            COMMIT_TABLE,
         );
     }
 
