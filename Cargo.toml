@@ -260,7 +260,7 @@ ratelimit = "0.10.1"
 rayon = "1.12.0"
 reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std", "simd-accel"] }
 reed-solomon-simd = "3.1.0"
-regex = { version = "1.12.3" }
+regex = { version = "1.12.4" }
 rumqttc = { package = "rumqttc-next", version = "0.33.2", features = ["websocket"] }
 redis = { version = "1.2.2", features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
 rustix = { version = "1.1.4", features = ["fs"] }
@@ -289,7 +289,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
-uuid = { version = "1.23.2", features = ["v4", "fast-rng", "macro-diagnostics"] }
+uuid = { version = "1.23.3", features = ["v4", "fast-rng", "macro-diagnostics"] }
 vaultrs = { version = "0.8.0" }
 walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
