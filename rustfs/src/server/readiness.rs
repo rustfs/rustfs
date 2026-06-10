@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::server::has_path_prefix;
 use crate::server::{ServiceState, ServiceStateManager};
+use crate::server::{has_path_prefix, is_table_catalog_path};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
@@ -140,7 +140,7 @@ fn is_probe_path(path: &str) -> bool {
 
     let is_prefix_probe = has_path_prefix(path, crate::server::RUSTFS_ADMIN_PREFIX)
         || has_path_prefix(path, crate::server::MINIO_ADMIN_V3_PREFIX)
-        || has_path_prefix(path, crate::server::TABLE_CATALOG_PREFIX)
+        || is_table_catalog_path(path)
         || has_path_prefix(path, crate::server::CONSOLE_PREFIX)
         || has_path_prefix(path, crate::server::RPC_PREFIX)
         || has_path_prefix(path, crate::server::ADMIN_PREFIX)
@@ -721,6 +721,7 @@ mod tests {
         assert!(is_probe_path("/minio/admin/v3/info"));
         assert!(is_probe_path("/rustfs/admin/v3/info"));
         assert!(is_probe_path(&format!("{}/config", crate::server::TABLE_CATALOG_PREFIX)));
+        assert!(is_probe_path("/_iceberg/v1/config"));
         assert!(is_probe_path("/rustfs/console/"));
         assert!(!is_probe_path("/minio/adminx/object"));
         assert!(!is_probe_path("/rustfs/adminx/object"));
