@@ -119,13 +119,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Phase 2 Storage API Tasks
 
 - [x] `API-001` Add `crates/storage-api`.
-  - Acceptance: the crate is a workspace member and starts as a contract crate
-    with no ECStore implementation dependency.
+  - Acceptance: `rustfs-storage-api` is a workspace member and remains a
+    dependency-free contract crate.
   - Verification: `cargo check -p rustfs-storage-api`.
-- [~] `API-002` Move public storage error/result contracts.
-  - Current PR: `rustfs/rustfs#3313`.
-  - Acceptance: storage error code mapping is shared by the contract crate while
-    ECStore-specific error variants and conversions stay in ECStore.
+- [x] `API-002` Move public storage error/result contracts.
+  - Current PR: `rustfs/rustfs#3313` merged.
+  - Completed slice: add public `StorageErrorCode` and `StorageResult`
+    contracts in `rustfs-storage-api`, then make ECStore
+    `StorageError::to_u32/from_u32` consume the shared code table.
+  - Deferred: keep the full ECStore `StorageError` enum and ECStore-specific
+    conversions in `rustfs-ecstore` until the `DiskError`, filemeta, lock, and
+    `std::io::Error` downcast boundary is proven safe.
+  - Acceptance: storage-api contract tests pass, ECStore compatibility tests
+    prove numeric codes match the new contract, and
+    `cargo check -p rustfs-storage-api -p rustfs-ecstore` passes.
+  - Must preserve: storage error display, conversions, object error mapping,
+    quorum classification, and reserved code gaps `0x2B/0x2C`.
+  - Risk defense: no storage hot-path enum move in this PR; only numeric code
+    mapping uses the new contract.
 - [~] `API-003` Move DTOs.
   - Current branch: move the pure bucket/options DTO subset:
     `MakeBucketOptions`, `SRBucketDeleteOp`, `DeleteBucketOptions`,
@@ -186,6 +197,7 @@ Passed:
 - `cargo clippy -p rustfs-ecstore --features rio-v2 --all-targets -- -D warnings`
 - `cargo fmt --all`
 - `cargo fmt --all --check`
+- `cargo test -p rustfs-ecstore error -- --nocapture`
 - `./scripts/check_architecture_migration_rules.sh`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`

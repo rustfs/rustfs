@@ -24,7 +24,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetType, build_queued_payload_with_records, mark_target_disconnected_on_connectivity_error, open_target_queue_store,
-        persist_queued_payload_to_store,
+        persist_queued_payload_to_store, redacted_secret,
     },
 };
 use arc_swap::ArcSwap;
@@ -41,6 +41,7 @@ use rustfs_tls_runtime::{load_certs, load_private_key};
 use rustls::ClientConfig;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::fmt;
 use std::sync::Arc;
 use std::{
     marker::PhantomData,
@@ -78,7 +79,7 @@ impl MQTTTlsPolicy {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct MQTTTlsConfig {
     pub policy: Option<MQTTTlsPolicy>,
     pub ca_path: String,
@@ -86,6 +87,19 @@ pub struct MQTTTlsConfig {
     pub client_key_path: String,
     pub trust_leaf_as_ca: bool,
     pub ws_path_allowlist: Vec<String>,
+}
+
+impl fmt::Debug for MQTTTlsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MQTTTlsConfig")
+            .field("policy", &self.policy)
+            .field("ca_path", &self.ca_path)
+            .field("client_cert_path", &self.client_cert_path)
+            .field("client_key_path", &redacted_secret(&self.client_key_path))
+            .field("trust_leaf_as_ca", &self.trust_leaf_as_ca)
+            .field("ws_path_allowlist", &self.ws_path_allowlist)
+            .finish()
+    }
 }
 
 impl MQTTTlsConfig {
@@ -422,7 +436,7 @@ pub(crate) fn build_mqtt_options(
 }
 
 /// Arguments for configuring an MQTT target
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MQTTArgs {
     /// Whether the target is enabled
     pub enable: bool,
@@ -448,6 +462,25 @@ pub struct MQTTArgs {
     pub queue_limit: u64,
     /// the target type
     pub target_type: TargetType,
+}
+
+impl fmt::Debug for MQTTArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MQTTArgs")
+            .field("enable", &self.enable)
+            .field("broker", &self.broker)
+            .field("topic", &self.topic)
+            .field("qos", &self.qos)
+            .field("username", &self.username)
+            .field("password", &redacted_secret(&self.password))
+            .field("tls", &self.tls)
+            .field("max_reconnect_interval", &self.max_reconnect_interval)
+            .field("keep_alive", &self.keep_alive)
+            .field("queue_dir", &self.queue_dir)
+            .field("queue_limit", &self.queue_limit)
+            .field("target_type", &self.target_type)
+            .finish()
+    }
 }
 
 impl MQTTArgs {
@@ -1087,7 +1120,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MQTTTlsConfig, validate_mqtt_broker_url};
+    use super::{MQTTArgs, MQTTTlsConfig, QoS, validate_mqtt_broker_url};
+    use crate::target::{REDACTED_SECRET, TargetType};
+    use std::time::Duration;
     use url::Url;
 
     #[test]
@@ -1123,6 +1158,34 @@ mod tests {
         let url = Url::parse("mqtt://user:pass@broker.example.com:1883").expect("valid url");
         let err = validate_mqtt_broker_url(&url, &MQTTTlsConfig::default()).expect_err("url credentials should be rejected");
         assert!(err.to_string().contains("must not embed username or password"));
+    }
+
+    #[test]
+    fn debug_redacts_mqtt_secret_fields() {
+        let args = MQTTArgs {
+            enable: true,
+            broker: Url::parse("mqtt://broker.example.com:1883").expect("valid broker"),
+            topic: "rustfs/events".to_string(),
+            qos: QoS::AtLeastOnce,
+            username: "mqtt-user".to_string(),
+            password: "mqtt-password".to_string(),
+            tls: MQTTTlsConfig {
+                client_key_path: "/etc/rustfs/mqtt.key".to_string(),
+                ..MQTTTlsConfig::default()
+            },
+            max_reconnect_interval: Duration::from_secs(1),
+            keep_alive: Duration::from_secs(30),
+            queue_dir: String::new(),
+            queue_limit: 0,
+            target_type: TargetType::NotifyEvent,
+        };
+
+        let rendered = format!("{args:?}");
+
+        assert!(!rendered.contains("mqtt-password"));
+        assert!(!rendered.contains("/etc/rustfs/mqtt.key"));
+        assert!(rendered.contains(REDACTED_SECRET));
+        assert!(rendered.contains("mqtt-user"));
     }
 
     #[test]
