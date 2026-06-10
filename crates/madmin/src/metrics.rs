@@ -128,6 +128,67 @@ pub struct ScannerSourceCycleSnapshot {
     pub cycles: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScannerPacingPressureSnapshot {
+    #[serde(rename = "primary_pressure", default)]
+    pub primary_pressure: String,
+    #[serde(rename = "current_queued_scans", default)]
+    pub current_queued_scans: u64,
+    #[serde(rename = "current_active_scans", default)]
+    pub current_active_scans: u64,
+    #[serde(rename = "last_cycle_budget_limited", default)]
+    pub last_cycle_budget_limited: bool,
+    #[serde(rename = "last_cycle_throttle_sleep_ratio", default)]
+    pub last_cycle_throttle_sleep_ratio: f64,
+    #[serde(rename = "last_cycle_yield_ratio", default)]
+    pub last_cycle_yield_ratio: f64,
+    #[serde(rename = "last_cycle_total_pause_ratio", default)]
+    pub last_cycle_total_pause_ratio: f64,
+}
+
+impl Default for ScannerPacingPressureSnapshot {
+    fn default() -> Self {
+        Self {
+            primary_pressure: "none".to_string(),
+            current_queued_scans: 0,
+            current_active_scans: 0,
+            last_cycle_budget_limited: false,
+            last_cycle_throttle_sleep_ratio: 0.0,
+            last_cycle_yield_ratio: 0.0,
+            last_cycle_total_pause_ratio: 0.0,
+        }
+    }
+}
+
+impl ScannerPacingPressureSnapshot {
+    fn refresh_primary_pressure(&mut self) {
+        self.primary_pressure = if self.current_queued_scans > 0 {
+            "queued_scans"
+        } else if self.last_cycle_budget_limited {
+            "cycle_budget"
+        } else if self.last_cycle_total_pause_ratio > 0.0 {
+            "throttle_pause"
+        } else if self.current_active_scans > 0 {
+            "active_scans"
+        } else {
+            "none"
+        }
+        .to_string();
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.current_queued_scans = self.current_queued_scans.saturating_add(other.current_queued_scans);
+        self.current_active_scans = self.current_active_scans.saturating_add(other.current_active_scans);
+        self.last_cycle_budget_limited |= other.last_cycle_budget_limited;
+        self.last_cycle_throttle_sleep_ratio = self
+            .last_cycle_throttle_sleep_ratio
+            .max(other.last_cycle_throttle_sleep_ratio);
+        self.last_cycle_yield_ratio = self.last_cycle_yield_ratio.max(other.last_cycle_yield_ratio);
+        self.last_cycle_total_pause_ratio = self.last_cycle_total_pause_ratio.max(other.last_cycle_total_pause_ratio);
+        self.refresh_primary_pressure();
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerMetrics {
     #[serde(rename = "collected")]
@@ -154,6 +215,8 @@ pub struct ScannerMetrics {
     pub last_cycle_partial_source_code: u64,
     #[serde(rename = "partial_cycles_by_source", default)]
     pub partial_cycles_by_source: Vec<ScannerSourceCycleSnapshot>,
+    #[serde(rename = "pacing_pressure", default)]
+    pub pacing_pressure: ScannerPacingPressureSnapshot,
 }
 
 impl ScannerMetrics {
@@ -164,6 +227,8 @@ impl ScannerMetrics {
             self.last_cycle_partial_source = other.last_cycle_partial_source.clone();
             self.last_cycle_partial_source_code = other.last_cycle_partial_source_code;
         }
+
+        self.pacing_pressure.merge(&other.pacing_pressure);
 
         if self.ongoing_buckets < other.ongoing_buckets {
             self.ongoing_buckets = other.ongoing_buckets;
@@ -711,6 +776,15 @@ mod tests {
             collected_at,
             last_cycle_partial_source: "usage".to_string(),
             last_cycle_partial_source_code: 1,
+            pacing_pressure: ScannerPacingPressureSnapshot {
+                primary_pressure: "cycle_budget".to_string(),
+                current_active_scans: 1,
+                last_cycle_budget_limited: true,
+                last_cycle_throttle_sleep_ratio: 0.1,
+                last_cycle_yield_ratio: 0.2,
+                last_cycle_total_pause_ratio: 0.3,
+                ..Default::default()
+            },
             partial_cycles_by_source: vec![ScannerSourceCycleSnapshot {
                 source: "usage".to_string(),
                 cycles: 1,
@@ -722,6 +796,15 @@ mod tests {
             collected_at: collected_at + chrono::Duration::seconds(1),
             last_cycle_partial_source: "lifecycle".to_string(),
             last_cycle_partial_source_code: 2,
+            pacing_pressure: ScannerPacingPressureSnapshot {
+                primary_pressure: "queued_scans".to_string(),
+                current_queued_scans: 4,
+                current_active_scans: 2,
+                last_cycle_throttle_sleep_ratio: 0.4,
+                last_cycle_yield_ratio: 0.1,
+                last_cycle_total_pause_ratio: 0.5,
+                ..Default::default()
+            },
             partial_cycles_by_source: vec![
                 ScannerSourceCycleSnapshot {
                     source: "usage".to_string(),
@@ -737,6 +820,13 @@ mod tests {
 
         assert_eq!(scanner.last_cycle_partial_source, "lifecycle");
         assert_eq!(scanner.last_cycle_partial_source_code, 2);
+        assert_eq!(scanner.pacing_pressure.primary_pressure, "queued_scans");
+        assert_eq!(scanner.pacing_pressure.current_queued_scans, 4);
+        assert_eq!(scanner.pacing_pressure.current_active_scans, 3);
+        assert!(scanner.pacing_pressure.last_cycle_budget_limited);
+        assert_eq!(scanner.pacing_pressure.last_cycle_throttle_sleep_ratio, 0.4);
+        assert_eq!(scanner.pacing_pressure.last_cycle_yield_ratio, 0.2);
+        assert_eq!(scanner.pacing_pressure.last_cycle_total_pause_ratio, 0.5);
         assert_eq!(
             scanner.partial_cycles_by_source,
             vec![

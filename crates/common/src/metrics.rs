@@ -748,6 +748,31 @@ pub struct ScannerSourceCycleSnapshot {
     pub cycles: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScannerPacingPressureSnapshot {
+    pub primary_pressure: String,
+    pub current_queued_scans: u64,
+    pub current_active_scans: u64,
+    pub last_cycle_budget_limited: bool,
+    pub last_cycle_throttle_sleep_ratio: f64,
+    pub last_cycle_yield_ratio: f64,
+    pub last_cycle_total_pause_ratio: f64,
+}
+
+impl Default for ScannerPacingPressureSnapshot {
+    fn default() -> Self {
+        Self {
+            primary_pressure: "none".to_string(),
+            current_queued_scans: 0,
+            current_active_scans: 0,
+            last_cycle_budget_limited: false,
+            last_cycle_throttle_sleep_ratio: 0.0,
+            last_cycle_yield_ratio: 0.0,
+            last_cycle_total_pause_ratio: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerLastMinute {
     pub actions: HashMap<String, ScannerTimedAction>,
@@ -853,6 +878,8 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub partial_cycles_by_source: Vec<ScannerSourceCycleSnapshot>,
     #[serde(default)]
+    pub pacing_pressure: ScannerPacingPressureSnapshot,
+    #[serde(default)]
     pub throttle_idle_mode_enabled: bool,
     #[serde(default)]
     pub throttle_sleep_factor: f64,
@@ -930,6 +957,74 @@ fn scan_cycle_result_label(result: u8) -> &'static str {
         SCAN_CYCLE_RESULT_ERROR => SCAN_CYCLE_RESULT_ERROR_LABEL,
         SCAN_CYCLE_RESULT_PARTIAL => SCAN_CYCLE_RESULT_PARTIAL_LABEL,
         _ => SCAN_CYCLE_RESULT_UNKNOWN_LABEL,
+    }
+}
+
+fn scanner_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator <= 0.0 {
+        0.0
+    } else {
+        (numerator / denominator).clamp(0.0, 1.0)
+    }
+}
+
+fn scanner_last_cycle_budget_limited(result_code: u64, partial_reason: &str) -> bool {
+    result_code == u64::from(SCAN_CYCLE_RESULT_PARTIAL) && matches!(partial_reason, "runtime" | "objects" | "directories")
+}
+
+fn scanner_primary_pressure(
+    current_queued_scans: u64,
+    current_active_scans: u64,
+    last_cycle_budget_limited: bool,
+    last_cycle_throttle_sleep_events: u64,
+    last_cycle_yield_events: u64,
+) -> &'static str {
+    if current_queued_scans > 0 {
+        "queued_scans"
+    } else if last_cycle_budget_limited {
+        "cycle_budget"
+    } else if last_cycle_throttle_sleep_events > 0 || last_cycle_yield_events > 0 {
+        "throttle_pause"
+    } else if current_active_scans > 0 {
+        "active_scans"
+    } else {
+        "none"
+    }
+}
+
+fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPressureSnapshot {
+    let current_queued_scans = metrics
+        .current_set_scans_queued
+        .saturating_add(metrics.current_disk_bucket_scans_queued);
+    let current_active_scans = metrics
+        .current_set_scans_active
+        .saturating_add(metrics.current_disk_bucket_scans_active)
+        .max(usize_to_u64_saturated(metrics.active_scan_paths));
+    let last_cycle_budget_limited =
+        scanner_last_cycle_budget_limited(metrics.last_cycle_result_code, metrics.last_cycle_partial_reason.as_str());
+    let last_cycle_throttle_sleep_ratio =
+        scanner_ratio(metrics.last_cycle_throttle_sleep_duration_seconds, metrics.last_cycle_duration_seconds);
+    let last_cycle_yield_ratio = scanner_ratio(metrics.last_cycle_yield_duration_seconds, metrics.last_cycle_duration_seconds);
+    let last_cycle_total_pause_ratio = scanner_ratio(
+        metrics.last_cycle_throttle_sleep_duration_seconds.max(0.0) + metrics.last_cycle_yield_duration_seconds.max(0.0),
+        metrics.last_cycle_duration_seconds,
+    );
+
+    ScannerPacingPressureSnapshot {
+        primary_pressure: scanner_primary_pressure(
+            current_queued_scans,
+            current_active_scans,
+            last_cycle_budget_limited,
+            metrics.last_cycle_throttle_sleep_events,
+            metrics.last_cycle_yield_events,
+        )
+        .to_string(),
+        current_queued_scans,
+        current_active_scans,
+        last_cycle_budget_limited,
+        last_cycle_throttle_sleep_ratio,
+        last_cycle_yield_ratio,
+        last_cycle_total_pause_ratio,
     }
 }
 
@@ -1904,6 +1999,8 @@ impl Metrics {
             }
         }
 
+        m.pacing_pressure = scanner_pacing_pressure(&m);
+
         m
     }
 }
@@ -2058,6 +2155,35 @@ mod tests {
         assert_eq!(report.current_disk_scan_concurrency_limit, 0);
         assert_eq!(report.current_disk_bucket_scans_queued, 0);
         assert_eq!(report.current_disk_bucket_scans_active, 0);
+    }
+
+    #[tokio::test]
+    async fn report_derives_scanner_pacing_pressure() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_set_scan_state(Some(2), Some(3), Some(1));
+        metrics.record_scanner_disk_bucket_scan_state("0", "0", Some(1), Some(4), Some(1));
+        metrics.record_scan_cycle_partial_with_source(
+            Duration::from_secs(10),
+            ScanCyclePartialReason::Runtime,
+            Some(ScannerWorkSource::Usage),
+        );
+        metrics.record_scan_cycle_work(ScanCycleWorkSnapshot {
+            yield_events: 2,
+            yield_duration_millis: 500,
+            throttle_sleep_events: 4,
+            throttle_sleep_duration_millis: 2500,
+            ..Default::default()
+        });
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.pacing_pressure.primary_pressure, "queued_scans");
+        assert_eq!(report.pacing_pressure.current_queued_scans, 7);
+        assert_eq!(report.pacing_pressure.current_active_scans, 2);
+        assert!(report.pacing_pressure.last_cycle_budget_limited);
+        assert_eq!(report.pacing_pressure.last_cycle_throttle_sleep_ratio, 0.25);
+        assert_eq!(report.pacing_pressure.last_cycle_yield_ratio, 0.05);
+        assert_eq!(report.pacing_pressure.last_cycle_total_pause_ratio, 0.3);
     }
 
     #[tokio::test]
