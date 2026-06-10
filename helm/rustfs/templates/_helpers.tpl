@@ -169,7 +169,10 @@ Expects a dict with keys "root" (the chart root context) and "index".
 {{- if eq (int .index) 0 -}}
 {{- include "rustfs.fullname" .root -}}
 {{- else -}}
-{{- printf "%s-pool%d" (include "rustfs.fullname" .root) (int .index) -}}
+{{- /* Truncate the base name, not the suffix: the pool index must survive
+       truncation or two long-named pools could collide. */ -}}
+{{- $suffix := printf "-pool%d" (int .index) -}}
+{{- printf "%s%s" (include "rustfs.fullname" .root | trunc (int (sub 63 (len $suffix))) | trimSuffix "-") $suffix -}}
 {{- end -}}
 {{- end }}
 

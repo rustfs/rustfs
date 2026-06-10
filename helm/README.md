@@ -239,6 +239,10 @@ Notes:
   spread existing objects across the new pool.
 * Pod anti-affinity is scoped per pool, so two pools can share the same
   nodes while each pool's own pods still spread across distinct nodes.
+* The PodDisruptionBudget spans all pools: with the default
+  `pdb.maxUnavailable: 1`, at most one pod of the whole cluster may be
+  evicted at a time. This is deliberately conservative — quorum safety
+  matters across the union of all pools.
 
 # Installation
 
