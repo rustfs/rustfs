@@ -20,6 +20,12 @@ pub const SCANNER_SUB_SYS: &str = "scanner";
 /// Scanner config key selecting the speed preset.
 pub const SCANNER_SPEED: &str = "speed";
 
+/// Scanner config key overriding the scanner sleep multiplier.
+pub const SCANNER_DELAY: &str = "delay";
+
+/// Scanner config key overriding the maximum scanner sleep in seconds.
+pub const SCANNER_MAX_WAIT: &str = "max_wait";
+
 /// Scanner config key overriding the cycle interval in seconds.
 pub const SCANNER_CYCLE: &str = "cycle";
 
@@ -68,6 +74,8 @@ pub const SCANNER_ALERT_EXCESS_FOLDERS: &str = "alert_excess_folders";
 /// Scanner config keys supported by the admin config subsystem.
 pub const SCANNER_KEYS: &[&str] = &[
     SCANNER_SPEED,
+    SCANNER_DELAY,
+    SCANNER_MAX_WAIT,
     SCANNER_CYCLE,
     SCANNER_START_DELAY,
     SCANNER_CYCLE_MAX_DURATION,
@@ -122,6 +130,15 @@ pub const ENV_SCANNER_CYCLE_MAX_DIRECTORIES: &str = "RUSTFS_SCANNER_CYCLE_MAX_DI
 /// Controls the sleep factor, maximum sleep duration, and cycle interval.
 /// - Example: `export RUSTFS_SCANNER_SPEED=slow`
 pub const ENV_SCANNER_SPEED: &str = "RUSTFS_SCANNER_SPEED";
+
+/// Environment variable that overrides the scanner sleep multiplier.
+/// - Example: `export RUSTFS_SCANNER_DELAY=30.0`
+pub const ENV_SCANNER_DELAY: &str = "RUSTFS_SCANNER_DELAY";
+
+/// Environment variable that overrides the maximum scanner sleep in seconds.
+/// - Unit: seconds (u64).
+/// - Example: `export RUSTFS_SCANNER_MAX_WAIT_SECS=15`
+pub const ENV_SCANNER_MAX_WAIT_SECS: &str = "RUSTFS_SCANNER_MAX_WAIT_SECS";
 
 /// Default scanner speed preset.
 pub const DEFAULT_SCANNER_SPEED: &str = "default";
@@ -237,7 +254,9 @@ pub const DEFAULT_SCANNER_INLINE_HEAL_ENABLE: bool = false;
 /// | `slow`    | 10x    | 15 seconds| 1 minute       |
 /// | `slowest` | 100x   | 15 seconds| 30 minutes     |
 ///
-/// The cycle interval can be overridden by `RUSTFS_SCANNER_CYCLE`.
+/// The sleep factor, max sleep, and cycle interval can be overridden by
+/// `RUSTFS_SCANNER_DELAY`, `RUSTFS_SCANNER_MAX_WAIT_SECS`, and
+/// `RUSTFS_SCANNER_CYCLE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScannerSpeed {
     Fastest,

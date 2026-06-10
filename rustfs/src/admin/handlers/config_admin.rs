@@ -52,14 +52,15 @@ use rustfs_config::{
     COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
     ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, ENV_SCANNER_ALERT_EXCESS_VERSIONS, ENV_SCANNER_BITROT_CYCLE_SECS,
     ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
-    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_IDLE_MODE,
-    ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS,
-    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER,
-    MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC,
-    MQTT_USERNAME, SCANNER_ALERT_EXCESS_FOLDERS, SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS,
-    SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
-    SCANNER_CYCLE_MAX_OBJECTS, SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS,
-    SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS, SCANNER_YIELD_EVERY_N_OBJECTS, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
+    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY, ENV_SCANNER_IDLE_MODE,
+    ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED,
+    ENV_SCANNER_START_DELAY_SECS, ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE, HEAL_SUB_SYS,
+    MAX_ADMIN_REQUEST_BODY_SIZE, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
+    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TOPIC, MQTT_USERNAME, SCANNER_ALERT_EXCESS_FOLDERS,
+    SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT,
+    SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY,
+    SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT, SCANNER_SPEED,
+    SCANNER_START_DELAY, SCANNER_SUB_SYS, SCANNER_YIELD_EVERY_N_OBJECTS, WEBHOOK_AUTH_TOKEN, WEBHOOK_BATCH_SIZE,
     WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_HTTP_TIMEOUT, WEBHOOK_MAX_RETRY, WEBHOOK_QUEUE_DIR,
     WEBHOOK_QUEUE_LIMIT, WEBHOOK_RETRY_INTERVAL,
 };
@@ -190,6 +191,18 @@ const SCANNER_HELP_KEYS: &[HelpKeyMetadata] = &[
         key: SCANNER_SPEED,
         type_name: "fastest|fast|default|slow|slowest",
         description: "set scanner throttling preset",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_DELAY,
+        type_name: "float",
+        description: "override scanner sleep multiplier derived from speed",
+        optional: true,
+    },
+    HelpKeyMetadata {
+        key: SCANNER_MAX_WAIT,
+        type_name: "seconds",
+        description: "override scanner maximum sleep duration derived from speed",
         optional: true,
     },
     HelpKeyMetadata {
@@ -1322,6 +1335,8 @@ fn env_help_key(sub_system: &str, key: &str) -> String {
         (STORAGE_CLASS_SUB_SYS, "optimize") => OPTIMIZE_ENV.to_string(),
         (STORAGE_CLASS_SUB_SYS, "inline_block") => INLINE_BLOCK_ENV.to_string(),
         (SCANNER_SUB_SYS, SCANNER_SPEED) => ENV_SCANNER_SPEED.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_DELAY) => ENV_SCANNER_DELAY.to_string(),
+        (SCANNER_SUB_SYS, SCANNER_MAX_WAIT) => ENV_SCANNER_MAX_WAIT_SECS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_CYCLE) => ENV_SCANNER_CYCLE.to_string(),
         (SCANNER_SUB_SYS, SCANNER_START_DELAY) => ENV_SCANNER_START_DELAY_SECS.to_string(),
         (SCANNER_SUB_SYS, SCANNER_CYCLE_MAX_DURATION) => ENV_SCANNER_CYCLE_MAX_DURATION_SECS.to_string(),
@@ -1988,6 +2003,25 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
         assert_eq!(response.keys_help.len(), 1);
         assert_eq!(response.keys_help[0].key, "start_delay");
         assert!(response.keys_help[0].description.contains("cycle"));
+    }
+
+    #[test]
+    fn validate_config_directives_accepts_scanner_pacing_keys() {
+        let input = format!("{SCANNER_SUB_SYS} {SCANNER_DELAY}=\"3.5\" {SCANNER_MAX_WAIT}=\"7\"");
+        let directives = parse_config_directives(&input, false).expect("parse scanner pacing directive");
+
+        validate_config_directives(&directives).expect("scanner pacing keys should be supported");
+    }
+
+    #[test]
+    fn build_help_response_reports_scanner_delay() {
+        let response = build_help_response(Some(SCANNER_SUB_SYS), Some(SCANNER_DELAY), false).expect("scanner help response");
+
+        assert_eq!(response.sub_sys, SCANNER_SUB_SYS);
+        assert_eq!(response.keys_help.len(), 1);
+        assert_eq!(response.keys_help[0].key, SCANNER_DELAY);
+        assert_eq!(response.keys_help[0].type_name, "float");
+        assert!(response.keys_help[0].description.contains("multiplier"));
     }
 
     #[test]
