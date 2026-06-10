@@ -188,9 +188,9 @@ fn should_log_failed_object(failed_objects: usize) -> bool {
     failed_objects <= SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT || failed_objects.is_multiple_of(SCANNER_FAILED_OBJECT_LOG_EVERY)
 }
 
-fn record_scanner_ilm_action_if_queued(metrics: &Metrics, count: u64, queued: bool) -> bool {
+fn record_scanner_ilm_action_if_queued(metrics: &Metrics, action: IlmAction, count: u64, queued: bool) -> bool {
     if queued {
-        metrics.record_scanner_ilm_action(count);
+        metrics.record_scanner_lifecycle_action(action, count);
     }
     queued
 }
@@ -679,7 +679,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                        if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             remaining_versions = 0;
                         } else {
@@ -712,7 +712,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                        if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
                                 remaining_versions -= 1;
@@ -740,7 +740,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying transition rule for object: {} {}", oi.name, event.action);
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
-                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                        if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                         }
                     }
@@ -768,7 +768,7 @@ impl ScannerItem {
                 .await
                 .enqueue_by_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner)
                 .await;
-            if record_scanner_ilm_action_if_queued(global_metrics(), count, queued) {
+            if record_scanner_ilm_action_if_queued(global_metrics(), action, count, queued) {
                 done_ilm(count)();
                 remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
             }
@@ -2169,8 +2169,9 @@ mod tests {
     #[tokio::test]
     async fn test_scanner_ilm_action_accounting_requires_enqueue_success() {
         let metrics = Metrics::new();
+        let _start = metrics.start_scan_cycle_work();
 
-        record_scanner_ilm_action_if_queued(&metrics, 2, false);
+        record_scanner_ilm_action_if_queued(&metrics, IlmAction::DeleteAction, 2, false);
         let report = metrics.report().await;
         let lifecycle = report
             .source_work
@@ -2178,8 +2179,9 @@ mod tests {
             .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
             .expect("lifecycle source work should be visible");
         assert_eq!(lifecycle.executed, 0);
+        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 0);
 
-        record_scanner_ilm_action_if_queued(&metrics, 3, true);
+        record_scanner_ilm_action_if_queued(&metrics, IlmAction::DeleteAction, 3, true);
         let report = metrics.report().await;
         let lifecycle = report
             .source_work
@@ -2187,6 +2189,19 @@ mod tests {
             .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
             .expect("lifecycle source work should be visible");
         assert_eq!(lifecycle.executed, 3);
+        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 3);
+        assert_eq!(report.current_cycle_lifecycle_transition_actions, 0);
+
+        record_scanner_ilm_action_if_queued(&metrics, IlmAction::TransitionAction, 4, true);
+        let report = metrics.report().await;
+        let lifecycle = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source work should be visible");
+        assert_eq!(lifecycle.executed, 7);
+        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 3);
+        assert_eq!(report.current_cycle_lifecycle_transition_actions, 4);
     }
 
     #[test]

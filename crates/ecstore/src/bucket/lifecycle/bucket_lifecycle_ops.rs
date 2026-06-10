@@ -45,7 +45,7 @@ use futures::Future;
 use http::HeaderMap;
 use lazy_static::lazy_static;
 use rustfs_common::heal_channel::rep_has_active_rules;
-use rustfs_common::metrics::{IlmAction, Metrics, global_metrics};
+use rustfs_common::metrics::{IlmAction, Metrics, ScannerLifecycleTransitionStateUpdate, global_metrics};
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
     DEFAULT_TRANSITION_WORKERS_CAP, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS,
@@ -149,6 +149,20 @@ fn record_scanner_lifecycle_enqueue_result(src: &LcEventSrc, count: u64, queued:
     if matches!(src, LcEventSrc::Scanner) {
         global_metrics().record_scanner_ilm_enqueue_result(count, queued);
     }
+}
+
+fn record_scanner_transition_enqueue_result(src: &LcEventSrc, count: u64, queued: bool) {
+    if matches!(src, LcEventSrc::Scanner) {
+        global_metrics().record_scanner_transition_enqueue_result(count, queued);
+    }
+}
+
+fn nonnegative_i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or_default()
+}
+
+fn usize_to_u64_saturated(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -664,14 +678,17 @@ impl TransitionState {
             return false;
         }
         Self::inc_counter(&self.compensation_scheduled_tasks);
+        self.record_scanner_transition_state();
         let bucket = bucket.to_string();
         let scheduled = Arc::clone(&self.compensation_buckets);
         let state = Arc::clone(self);
         tokio::spawn(async move {
             Self::inc_counter(&state.compensation_running_tasks);
+            state.record_scanner_transition_state();
             let Some(api) = crate::new_object_layer_fn() else {
                 scheduled.lock().unwrap().remove(&bucket);
                 Self::add_counter(&state.compensation_running_tasks, -1);
+                state.record_scanner_transition_state();
                 warn!(bucket = %bucket, "transition compensation skipped because object layer is unavailable");
                 return;
             };
@@ -684,6 +701,7 @@ impl TransitionState {
 
             scheduled.lock().unwrap().remove(&bucket);
             Self::add_counter(&state.compensation_running_tasks, -1);
+            state.record_scanner_transition_state();
         });
         true
     }
@@ -701,6 +719,23 @@ impl TransitionState {
     #[inline]
     fn counter_value(counter: &AtomicI64) -> i64 {
         counter.load(Ordering::Relaxed)
+    }
+
+    fn scanner_transition_state_update(&self) -> ScannerLifecycleTransitionStateUpdate {
+        ScannerLifecycleTransitionStateUpdate {
+            queue_capacity: usize_to_u64_saturated(self.transition_queue_capacity),
+            queued: usize_to_u64_saturated(self.transition_rx.len()),
+            active: nonnegative_i64_to_u64(Self::counter_value(&self.active_tasks)),
+            workers: nonnegative_i64_to_u64(Self::counter_value(&self.num_workers)),
+            queue_full: nonnegative_i64_to_u64(Self::counter_value(&self.queue_full_tasks)),
+            queue_send_timeout: nonnegative_i64_to_u64(Self::counter_value(&self.queue_send_timeout_tasks)),
+            compensation_scheduled: nonnegative_i64_to_u64(Self::counter_value(&self.compensation_scheduled_tasks)),
+            compensation_running: nonnegative_i64_to_u64(Self::counter_value(&self.compensation_running_tasks)),
+        }
+    }
+
+    fn record_scanner_transition_state(&self) {
+        global_metrics().record_scanner_lifecycle_transition_state(self.scanner_transition_state_update());
     }
 
     fn handle_immediate_enqueue_failure(self: &Arc<Self>, oi: &ObjectInfo, src: &LcEventSrc, failure: ImmediateEnqueueFailure) {
@@ -755,7 +790,8 @@ impl TransitionState {
     pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
         if is_immediate_transition_source(src) && should_force_immediate_transition_enqueue_timeout() {
             self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::ForcedTimeout);
-            record_scanner_lifecycle_enqueue_result(src, 1, false);
+            record_scanner_transition_enqueue_result(src, 1, false);
+            self.record_scanner_transition_state();
             return false;
         }
 
@@ -797,13 +833,15 @@ impl TransitionState {
                     self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::QueueClosed { timeout_ms: None });
                 }
             }
-            record_scanner_lifecycle_enqueue_result(src, 1, queued);
+            record_scanner_transition_enqueue_result(src, 1, queued);
+            self.record_scanner_transition_state();
             return queued;
         }
 
         match self.transition_tx.try_send(Some(task)) {
             Ok(()) => queued = true,
             Err(async_channel::TrySendError::Full(_)) => {
+                Self::inc_counter(&self.queue_full_tasks);
                 debug!(
                     bucket = %oi.bucket,
                     object = %oi.name,
@@ -820,7 +858,8 @@ impl TransitionState {
                 );
             }
         }
-        record_scanner_lifecycle_enqueue_result(src, 1, queued);
+        record_scanner_transition_enqueue_result(src, 1, queued);
+        self.record_scanner_transition_state();
         queued
     }
 
@@ -893,6 +932,7 @@ impl TransitionState {
                         let task = task.as_any().downcast_ref::<TransitionTask>().expect("TransitionTask downcast failed");
 
                         TransitionState::inc_counter(&GLOBAL_TransitionState.active_tasks);
+                        GLOBAL_TransitionState.record_scanner_transition_state();
 
                         let obj_info_for_event = ObjectInfo {
                             bucket: task.obj_info.bucket.clone(),
@@ -903,6 +943,7 @@ impl TransitionState {
                         };
 
                         if let Err(err) = transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone())).await {
+                            global_metrics().record_scanner_transition_failed(1);
                             if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
                                 error!("Transition to {} failed for {}/{} version:{} with {}",
                                     task.event.storage_class, task.obj_info.bucket, task.obj_info.name, task.obj_info.version_id.map(|v| v.to_string()).unwrap_or_default(), err.to_string());
@@ -917,6 +958,7 @@ impl TransitionState {
                                 ..Default::default()
                             });
                         } else {
+                            global_metrics().record_scanner_transition_completed(1);
                             let mut ts = TierStats {
                                 total_size: task.obj_info.size as u64,
                                 num_versions: 1,
@@ -938,6 +980,7 @@ impl TransitionState {
                             });
                         }
                         TransitionState::add_counter(&GLOBAL_TransitionState.active_tasks, -1);
+                        GLOBAL_TransitionState.record_scanner_transition_state();
                     }
                 }
                 else => ()
@@ -1006,6 +1049,7 @@ impl TransitionState {
 
         let current_workers = workers.len() as i64;
         GLOBAL_TransitionState.num_workers.store(current_workers, Ordering::SeqCst);
+        GLOBAL_TransitionState.record_scanner_transition_state();
 
         info!(
             requested_transition_workers = requested,
@@ -2333,7 +2377,7 @@ mod tests {
         BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations, ObjectInfo, ObjectOptions, PutObjReader,
     };
     use futures::FutureExt;
-    use rustfs_common::metrics::IlmAction;
+    use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
@@ -2372,6 +2416,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn scanner_transition_enqueue_reports_full_queue() {
         let state = TransitionState::new_with_capacity(1);
         let object = ObjectInfo {
@@ -2390,6 +2435,35 @@ mod tests {
         assert!(first);
         assert!(!second);
         assert_eq!(state.transition_rx.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_transition_enqueue_updates_transition_status() {
+        let before = global_metrics().report().await.lifecycle_transition;
+        let state = TransitionState::new_with_capacity(1);
+        let object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        let first = state.queue_transition_task(&object, &event, &LcEventSrc::Scanner).await;
+        let second = state.queue_transition_task(&object, &event, &LcEventSrc::Scanner).await;
+
+        assert!(first);
+        assert!(!second);
+        let after = global_metrics().report().await.lifecycle_transition;
+        assert_eq!(after.scanner_queued.saturating_sub(before.scanner_queued), 1);
+        assert_eq!(after.scanner_missed.saturating_sub(before.scanner_missed), 1);
+        assert_eq!(after.queue_full, 1);
+        assert_eq!(after.current_queue_capacity, 1);
+        assert_eq!(after.current_queued, 1);
+        assert_eq!(after.current_active, 0);
     }
 
     #[test]
