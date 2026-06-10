@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-admin-consumers`
-- Baseline: `origin/main` at `4b1714438e13afd2b44872bf45fbe084065c9d18`
+- Branch: `overtrue/arch-admin-usecase-storage-info`
+- Baseline: `origin/main` at `8a90bda16ab233504ee2c4f9e15942c340d54631`
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: migrate the admin storage-class config consumer from the
-  old `StorageAPI::set_drive_counts` import to the inventory-facing
-  `StorageAdminApi::set_drive_counts` contract.
+- Rust code changes: migrate the admin use-case storage-info consumer from the
+  old `StorageAPI::storage_info` trait import to the inventory-facing
+  `StorageAdminApi::storage_info` contract.
 - CI/script changes: none
-- Docs changes: record API-007 admin config consumer-migration context,
+- Docs changes: record API-007 admin use-case consumer-migration context,
   verification evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
@@ -195,17 +195,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 - [~] `API-007` Dual-route `get_disks` consumers.
   - Completed first slice: `rustfs/rustfs#3331` bound `ECStore` to
     `StorageAdminApi` while keeping all consumers unchanged.
-  - Current branch slice: migrate the admin storage-class config consumer to
+  - Completed second slice: `rustfs/rustfs#3332` migrated the admin
+    storage-class config drive-count consumer to
     `StorageAdminApi::set_drive_counts`.
-  - Acceptance: `rustfs/src/admin/service/config.rs` no longer imports old
-    `StorageAPI` only to read drive-count inventory, and `rustfs` owns an
-    explicit dependency on the contract crate.
+  - Current branch slice: migrate the admin use-case storage-info consumer to
+    `StorageAdminApi::storage_info`.
+  - Acceptance: `rustfs/src/app/admin_usecase.rs` no longer imports old
+    `StorageAPI` only to read admin storage information.
   - Must preserve: old `StorageAPI` trait shape, `StorageAPI::get_disks`
-    behavior, storage-class parsing/default semantics, admin config validation,
-    readiness/capacity/heal/scanner consumers, and storage hot paths.
-  - Risk defense: keep this slice to the admin config drive-count consumer;
-    do not migrate `backend_info`, `local_storage_info`, readiness, heal,
-    scanner, or RPC consumers in the same PR.
+    behavior, admin storage-info response shape, data-usage capacity
+    correction semantics, readiness/heal/scanner/RPC consumers, and storage hot
+    paths.
+  - Risk defense: keep this slice to `DefaultAdminUsecase` storage-info reads;
+    do not migrate account-info `backend_info`, RPC `local_storage_info`,
+    readiness, heal, scanner, or storage hot-path consumers in the same PR.
 
 ## Phase 8 Background Controller Tasks
 
@@ -249,19 +252,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed this remains a narrow admin config consumer-migration slice, with an explicit `rustfs` dependency on the contract crate and no ECStore or storage-api boundary reshaping. |
-| Migration preservation | pass | Confirmed storage-class parsing/default behavior, old `StorageAPI`, `StorageAPI::get_disks`, ECStore handlers, and storage hot paths remain unchanged. |
-| Testing/verification | pass | Confirmed focused admin config tests, dependency guards, migration guards, formatting, diff hygiene, and full pre-commit evidence passed before push. |
+| Quality/architecture | pass | Confirmed this remains a narrow admin use-case storage-info consumer-migration slice, with no ECStore, `StorageAPI`, storage-api, manifest, or lockfile boundary reshaping. |
+| Migration preservation | pass | Confirmed admin storage-info response shape, capacity correction semantics, old `StorageAPI`, `StorageAPI::get_disks`, ECStore handlers, and storage hot paths remain unchanged. |
+| Testing/verification | pass | Confirmed focused admin use-case tests, migration guards, formatting, diff hygiene, and full pre-commit evidence passed before push. |
 
 ## Verification Notes
 
 Passed:
-- `cargo check -p rustfs --lib`
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`
-- `cargo test -p rustfs admin::service::config --lib`
-- `cargo tree -p rustfs --edges normal`
-- `cargo fmt --all`
 - `cargo fmt --all --check`
+- `cargo check -p rustfs --lib`
+- `cargo test -p rustfs app::admin_usecase --lib`
+- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`
 - `./scripts/check_architecture_migration_rules.sh`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_metrics_migration_refs.sh`
@@ -270,14 +271,11 @@ Passed:
 - `make NUM_CORES=1 pre-commit`
 
 Notes:
-- This branch adds a direct `rustfs` dependency on `rustfs-storage-api` so the
-  admin config consumer can call the contract crate instead of importing the
-  old ECStore `StorageAPI` trait.
-- `./scripts/check_layer_dependencies.sh` passes with the new dependency.
-- Only the admin storage-class config drive-count consumer changed.
-- No existing ECStore handler, admin route, readiness path, capacity
-  calculation, heal/scanner consumer, RPC consumer, or storage hot path is
-  changed.
+- This branch relies on the existing direct `rustfs` dependency on
+  `rustfs-storage-api` from the previous API-007 slice.
+- Only `DefaultAdminUsecase` storage-info read calls changed.
+- No existing ECStore handler, admin route, readiness path, heal/scanner
+  consumer, RPC consumer, or storage hot path is changed.
 - Full pre-commit passed with nextest `5757 passed, 111 skipped`; workspace
   doctests passed.
 - No temporary compatibility shim was added.
@@ -286,7 +284,7 @@ Notes:
 
 - Keep this API-007 slice as a focused `consumer-migration` PR.
 - Do not migrate account-info `backend_info`, RPC `local_storage_info`,
-  readiness, capacity, heal, or scanner consumers in this PR.
+  readiness, heal, scanner, or storage hot-path consumers in this PR.
 - Do not remove or route around `StorageAPI::get_disks` in this PR.
 - Do not make the old `StorageAPI` trait inherit `StorageAdminApi` in this PR.
 - Do not add temporary compatibility code unless a matching
