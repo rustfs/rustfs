@@ -44,6 +44,16 @@ pub(crate) use crate::runtime::tls::fingerprint::TargetTlsGeneration;
 pub(crate) use crate::runtime::tls::fingerprint::TargetTlsState;
 pub(crate) use crate::runtime::tls::fingerprint::build_target_tls_fingerprint;
 
+pub(crate) const REDACTED_SECRET: &str = "***redacted***";
+
+pub(crate) fn redacted_secret(value: &str) -> &'static str {
+    if value.is_empty() { "" } else { REDACTED_SECRET }
+}
+
+pub(crate) fn redacted_optional_secret(value: Option<&str>) -> &'static str {
+    value.filter(|secret| !secret.is_empty()).map_or("", |_| REDACTED_SECRET)
+}
+
 /// A read-only snapshot of delivery counters for a target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TargetDeliverySnapshot {

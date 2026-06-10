@@ -5,16 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-kms-handler-actions`
-- Baseline: `upstream/main` at `4fec606dc4f92b19e085f1609a188e82a72720ff`
-- PR type for this branch: `security-change`
-- Runtime behavior changes: high-risk KMS admin handlers now authorize through
-  dedicated `kms:*` actions instead of broad `ServerInfoAdminAction`.
-- Rust code changes: migrate KMS handler action lists and route policy inventory
-  to dedicated KMS actions, while keeping temporary legacy create/status admin
-  action compatibility with `RUSTFS_COMPAT_TODO(S-012)`.
+- Branch: `overtrue/arch-config-consumer-inventory`
+- Baseline: `upstream/main` at `a73c90c813bba16e668be090c5c4ca22c765b81b`
+- PR type for this branch: `docs-only`
+- Runtime behavior changes: none.
+- Rust code changes: none.
 - CI/script changes: none
-- Docs changes: record S-012 action migration status and temporary compatibility cleanup.
+- Docs changes: add the CFG-002 config model boundary ADR and link it from the
+  architecture overview, crate-boundary guardrails, and this progress handoff.
 
 ## Phase 0 Tasks
 
@@ -64,6 +62,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     when a register entry lacks a source marker, or when a source marker omits a
     removal condition.
 
+## Phase 1a Config Model Tasks
+
+- [x] `CFG-001` Inventory `ecstore::config::{Config, KV, KVS}` consumers.
+  - Acceptance:
+    [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md)
+    records the current definitions, persistence helpers, global accessors,
+    consumer groups, migration risks, and do-not-change contract.
+- [x] `CFG-002` Decide model boundary.
+  - Acceptance:
+    [`config-model-boundary-adr.md`](config-model-boundary-adr.md) records
+    `rustfs-config` as the target package, `server_config` as the future model
+    module, allowed dependencies, forbidden dependencies, preserved shape, and
+    extraction verification gates.
+- [ ] `CFG-003` Move pure model definitions.
+  - Next boundary: move only `Config`, `KV`, `KVS`, and default-registration
+    surface into `rustfs-config`; keep persistence helpers and global
+    server-config state in `ecstore`.
+- [ ] `CFG-004` Keep old `ecstore::config::*` compatibility path.
+  - Required compatibility: source must contain `RUSTFS_COMPAT_TODO(CFG-004)`
+    and a matching cleanup-register entry.
+
 ## Phase 1 Security Governance Tasks
 
 - [x] `S-001` Add `crates/security-governance`.
@@ -108,50 +127,106 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     [`compat-cleanup-register.md`](compat-cleanup-register.md).
   - Verification: focused handler and route policy tests, migration rules,
     formatting, and `make pre-commit`.
+- [x] `S-013` Apply KMS redaction.
+  - Acceptance: KMS Debug output and admin status response summaries contain no
+    Vault token, AppRole secret ID, or local master key values.
+  - Must preserve: internal KMS config values remain available to runtime code
+    and persisted config serialization still writes the original secret values.
+  - Verification: focused KMS redaction/status tests, full KMS tests, migration
+    guards, Rust quality scan, clippy, and `make pre-commit` passed.
+
+## Phase 2 Storage API Tasks
+
+- [x] `API-001` Add `crates/storage-api`.
+  - Acceptance: `rustfs-storage-api` is a workspace member and remains a
+    dependency-free contract crate.
+  - Verification: `cargo check -p rustfs-storage-api`.
+- [~] `API-002` Move public storage error/result contracts.
+  - Current slice: add public `StorageErrorCode` and `StorageResult` contracts
+    in `rustfs-storage-api`, then make ECStore `StorageError::to_u32/from_u32`
+    consume the shared code table.
+  - Deferred: keep the full ECStore `StorageError` enum and ECStore-specific
+    conversions in `rustfs-ecstore` until the `DiskError`, filemeta, lock, and
+    `std::io::Error` downcast boundary is proven safe.
+  - Acceptance: storage-api contract tests pass, ECStore compatibility tests
+    prove numeric codes match the new contract, and
+    `cargo check -p rustfs-storage-api -p rustfs-ecstore` passes.
+  - Must preserve: storage error display, conversions, object error mapping,
+    quorum classification, and reserved code gaps `0x2B/0x2C`.
+  - Risk defense: no storage hot-path enum move in this PR; only numeric code
+    mapping uses the new contract.
+
+## Phase 8 Background Controller Tasks
+
+- [x] `BGC-001` Inventory background services.
+  - Acceptance:
+    [`background-services-inventory.md`](background-services-inventory.md)
+    records scanner, heal, lifecycle, replication, config reload, metrics,
+    shutdown, cancellation, and side-effect surfaces before controller work.
+  - Must preserve: no code behavior change and no new controller contract in
+    this PR.
+  - Verification: docs-only architecture checks and diff hygiene.
+- [x] `BGC-002` Define minimal controller contract.
+  - Acceptance:
+    [`background-controller-contract.md`](background-controller-contract.md)
+    defines desired/current/status/reconcile vocabulary, status state
+    semantics, service boundaries, and side-effect rules without starting
+    workers or changing scheduling.
+  - Must preserve: no Rust trait, scheduler, service registry, worker
+    start/stop path, storage write, readiness change, peer signal, or runtime
+    behavior change.
+  - Verification: docs-only architecture checks and diff hygiene.
 
 ## Next PRs
 
-1. `contract`: add initial policy inventory tables for redaction, serde, or
-   supply-chain governance only after the contract shape remains stable.
-2. `security-change`: apply KMS response/config redaction after action
-   migration settles.
+1. Continue `API-002` only after reviewing whether `DiskError` and
+   `std::io::Error` conversion ownership can move without orphan-rule or
+   downcast behavior loss.
+2. `contract`: move DTOs that are contract-only in `API-003`; keep ECStore
+   implementation, KMS/SSE readers, erasure logic, and remote disk internals out
+   of rustfs-storage-api.
+3. `test-only`: add focused compatibility checks before moving store traits or
+   consumer imports.
+4. `api-extraction`: move only the pure server-config model into
+   rustfs-config as CFG-003.
+5. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+   RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
+6. `consumer-migration`: migrate external consumers one group at a time only
+   after the model path and compatibility shim are stable.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Single `security-change` PR; KMS auth action lists are local helper functions, names match `KmsAction`, and no storage/startup/global-state logic is touched. |
-| Migration preservation | pass | Legacy create/status admin actions are retained only behind `RUSTFS_COMPAT_TODO(S-012)` and registered for cleanup; broad `ServerInfoAdminAction` is intentionally not retained for high-risk KMS operations. |
-| Testing/verification | pass | Focused handler/route-policy tests cover dedicated actions and broad-action negative cases; migration rules, formatting, full `make pre-commit`, nextest, and doctests pass. |
+| Quality/architecture | pass | Single `docs-only` PR; ADR chooses existing rustfs-config, records module path and dependency boundaries, and avoids a speculative new crate. |
+| Migration preservation | pass | No code movement; ADR explicitly keeps persistence helpers, global server-config state, startup order, and old-path compatibility requirements out of CFG-002. |
+| Testing/verification | pass | Docs-only verification uses migration guard scripts, metrics reference guard, layer dependency guard, and whitespace checks. |
 
 ## Verification Notes
 
 Passed:
-- Baseline `cargo test -p rustfs admin::handlers::kms --no-fail-fast`
-- Baseline `cargo test -p rustfs admin::route_policy --no-fail-fast`
-- `cargo fmt --all --check`
-- `cargo test -p rustfs admin::handlers::kms --no-fail-fast`
-- `cargo test -p rustfs admin::route_policy --no-fail-fast`
 - `./scripts/check_architecture_migration_rules.sh`
+- `./scripts/check_layer_dependencies.sh`
+- `./scripts/check_metrics_migration_refs.sh`
 - `git diff --check`
-- `make pre-commit`
+- `git diff --name-only -- '*.rs' 'Cargo.toml' 'Cargo.lock' '.github/**' 'Makefile' 'Justfile'`
 
 Notes:
-- This branch changes only KMS admin authorization action selection and route
-  policy inventory. It does not change KMS runtime defaults, redaction, startup
-  order, global state, storage paths, or crate boundaries.
-- `make pre-commit` passed all checks, including 5682 nextest tests and
-  workspace doctests.
+- This branch changes architecture documentation only.
+- No Rust source, Cargo manifest, workflow, script, or runtime configuration is
+  changed.
+- `make pre-commit` is intentionally not required for this docs-only PR.
 
 ## Handoff Notes
 
-- Keep this S-012 branch as a focused `security-change` PR. Do not change KMS
-  defaults, redaction, admin route registration shape, Config moves, Storage API
-  moves, Runtime moves, or ECStore moves.
-- `rustfs` may depend on `rustfs-security-governance` for contract metadata;
-  the security-governance crate must stay independent from implementation
-  crates and runtime state.
+- Keep this CFG-002 branch as a focused `docs-only` PR. Do not move
+  `Config`, `KV`, `KVS`, persistence helpers, global server-config state,
+  Storage API code, startup code, or target/notify/audit/IAM consumers in this
+  branch.
+- The next extraction PR must preserve the tuple-struct shape, serde fields,
+  `hiddenIfEmpty` alias, `Config::new` default behavior, marshal/unmarshal
+  behavior, and old `rustfs_ecstore::config::*` path.
 - Do not add temporary compatibility code without a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry.
-- The next KMS security PR should handle redaction or production default
-  hardening separately; do not bundle those with this action migration.
+- Do not create a new config-model crate unless a later implementation attempt
+  proves `rustfs-config` cannot hold the pure model boundary.
