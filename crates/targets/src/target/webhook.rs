@@ -24,7 +24,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store,
+        persist_queued_payload_to_store, redacted_secret,
     },
 };
 use async_trait::async_trait;
@@ -34,6 +34,7 @@ use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{
+    fmt,
     marker::PhantomData,
     sync::{
         Arc,
@@ -45,7 +46,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Arguments for configuring a Webhook target
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebhookArgs {
     /// Whether the target is enabled
     pub enable: bool,
@@ -67,6 +68,23 @@ pub struct WebhookArgs {
     pub skip_tls_verify: bool,
     /// the target type
     pub target_type: TargetType,
+}
+
+impl fmt::Debug for WebhookArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebhookArgs")
+            .field("enable", &self.enable)
+            .field("endpoint", &self.endpoint)
+            .field("auth_token", &redacted_secret(&self.auth_token))
+            .field("queue_dir", &self.queue_dir)
+            .field("queue_limit", &self.queue_limit)
+            .field("client_cert", &self.client_cert)
+            .field("client_key", &redacted_secret(&self.client_key))
+            .field("client_ca", &self.client_ca)
+            .field("skip_tls_verify", &self.skip_tls_verify)
+            .field("target_type", &self.target_type)
+            .finish()
+    }
 }
 
 impl WebhookArgs {
@@ -562,7 +580,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{WebhookArgs, WebhookTarget};
-    use crate::target::{Target, TargetType, decode_object_name};
+    use crate::target::{REDACTED_SECRET, Target, TargetType, decode_object_name};
     use tokio::net::TcpListener;
     use url::Url;
     use url::form_urlencoded;
@@ -580,6 +598,22 @@ mod tests {
             skip_tls_verify: false,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[test]
+    fn debug_redacts_webhook_secret_fields() {
+        let args = WebhookArgs {
+            auth_token: "webhook-token".to_string(),
+            client_key: "/etc/rustfs/webhook.key".to_string(),
+            ..base_args()
+        };
+
+        let rendered = format!("{args:?}");
+
+        assert!(!rendered.contains("webhook-token"));
+        assert!(!rendered.contains("/etc/rustfs/webhook.key"));
+        assert!(rendered.contains(REDACTED_SECRET));
+        assert!(rendered.contains("WebhookArgs"));
     }
 
     #[test]

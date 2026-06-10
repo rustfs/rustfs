@@ -24,13 +24,14 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store,
+        persist_queued_payload_to_store, redacted_secret,
     },
 };
 use async_trait::async_trait;
 use rustfs_config::{NATS_CREDENTIALS_FILE, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NATSArgs {
     pub enable: bool,
     pub address: String,
@@ -54,6 +55,27 @@ pub struct NATSArgs {
     pub queue_dir: String,
     pub queue_limit: u64,
     pub target_type: TargetType,
+}
+
+impl fmt::Debug for NATSArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NATSArgs")
+            .field("enable", &self.enable)
+            .field("address", &self.address)
+            .field("subject", &self.subject)
+            .field("username", &self.username)
+            .field("password", &redacted_secret(&self.password))
+            .field("token", &redacted_secret(&self.token))
+            .field("credentials_file", &redacted_secret(&self.credentials_file))
+            .field("tls_ca", &self.tls_ca)
+            .field("tls_client_cert", &self.tls_client_cert)
+            .field("tls_client_key", &redacted_secret(&self.tls_client_key))
+            .field("tls_required", &self.tls_required)
+            .field("queue_dir", &self.queue_dir)
+            .field("queue_limit", &self.queue_limit)
+            .field("target_type", &self.target_type)
+            .finish()
+    }
 }
 
 impl NATSArgs {
@@ -429,6 +451,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::REDACTED_SECRET;
 
     fn base_args() -> NATSArgs {
         NATSArgs {
@@ -447,6 +470,26 @@ mod tests {
             queue_limit: 0,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[test]
+    fn debug_redacts_nats_secret_fields() {
+        let args = NATSArgs {
+            password: "nats-password".to_string(),
+            token: "nats-token".to_string(),
+            credentials_file: "/etc/rustfs/nats.creds".to_string(),
+            tls_client_key: "/etc/rustfs/nats.key".to_string(),
+            ..base_args()
+        };
+
+        let rendered = format!("{args:?}");
+
+        assert!(!rendered.contains("nats-password"));
+        assert!(!rendered.contains("nats-token"));
+        assert!(!rendered.contains("/etc/rustfs/nats.creds"));
+        assert!(!rendered.contains("/etc/rustfs/nats.key"));
+        assert!(rendered.contains(REDACTED_SECRET));
+        assert!(rendered.contains("rustfs.events"));
     }
 
     #[test]
