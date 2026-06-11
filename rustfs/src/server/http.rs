@@ -23,7 +23,8 @@ use crate::server::{
     hybrid::hybrid,
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
-        ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
+        ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer,
+        S3ErrorMessageCompatLayer,
     },
     tls_material::{
         TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
@@ -66,7 +67,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{Span, debug, error, info, instrument, warn};
+use tracing::{Span, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 const LABEL_HTTP_METHOD: &str = "method";
@@ -79,6 +80,13 @@ const METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_http_server_re
 const METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES: &str = "rustfs_http_server_request_body_size_bytes";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL: &str = "rustfs_http_server_response_body_bytes_total";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES: &str = "rustfs_http_server_response_body_size_bytes";
+const LOG_COMPONENT_SERVER: &str = "server";
+const LOG_SUBSYSTEM_HTTP: &str = "http";
+const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
+const LOG_SUBSYSTEM_TLS: &str = "tls";
+const EVENT_TLS_HANDSHAKE_FAILED: &str = "tls_handshake_failed";
+const EVENT_HTTP_TRANSPORT_CLOSED: &str = "http_transport_closed";
+const EVENT_HTTP_TRANSPORT_FAILED: &str = "http_transport_failed";
 
 static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
@@ -108,6 +116,78 @@ fn status_class_label(status: http::StatusCode) -> &'static str {
         5 => "5xx",
         _ => "unknown",
     }
+}
+
+#[inline]
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn log_tls_handshake_failure(peer_addr: &str, kind: TlsHandshakeFailureKind, err: &dyn std::fmt::Display) {
+    match kind {
+        TlsHandshakeFailureKind::UnexpectedEof => {
+            debug!(
+                event = EVENT_TLS_HANDSHAKE_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                peer_addr = %peer_addr,
+                failure_type = kind.as_str(),
+                error = %err,
+                result = "client_disconnect",
+                "TLS handshake failed"
+            );
+        }
+        TlsHandshakeFailureKind::ProtocolVersion | TlsHandshakeFailureKind::Certificate | TlsHandshakeFailureKind::Alert => {
+            warn!(
+                event = EVENT_TLS_HANDSHAKE_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                peer_addr = %peer_addr,
+                failure_type = kind.as_str(),
+                error = %err,
+                result = "client_error",
+                "TLS handshake failed"
+            );
+        }
+        TlsHandshakeFailureKind::Unknown => {
+            error!(
+                event = EVENT_TLS_HANDSHAKE_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                peer_addr = %peer_addr,
+                failure_type = kind.as_str(),
+                error = %err,
+                result = "transport_error",
+                "TLS handshake failed"
+            );
+        }
+    }
+}
+
+fn log_transport_closed(peer_addr: &str, error_kind: &str, error_message: &str, result: &str) {
+    debug!(
+        event = EVENT_HTTP_TRANSPORT_CLOSED,
+        component = LOG_COMPONENT_SERVER,
+        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+        peer_addr = %peer_addr,
+        error_kind,
+        error = %error_message,
+        result,
+        "HTTP transport closed"
+    );
+}
+
+fn log_transport_failed(peer_addr: &str, error_kind: &str, error_message: &str) {
+    warn!(
+        event = EVENT_HTTP_TRANSPORT_FAILED,
+        component = LOG_COMPONENT_SERVER,
+        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+        peer_addr = %peer_addr,
+        error_kind,
+        error = %error_message,
+        result = "transport_error",
+        "HTTP transport failed"
+    );
 }
 
 #[inline]
@@ -423,7 +503,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
         debug!("graceful initiated");
 
         loop {
-            debug!("Waiting for new connection...");
+            trace!("Waiting for new connection");
             let (socket, _) = {
                 #[cfg(unix)]
                 {
@@ -665,17 +745,18 @@ fn process_connection(
         //  7. CatchPanicLayer                        — panic → 500
         //  8. ReadinessGateLayer                     — blocks until ready
         //  9. KeystoneAuthLayer                      — X-Auth-Token validation
-        // 10. TraceLayer                             — request/response tracing + metrics
-        // 11. PropagateRequestIdLayer                — X-Request-ID → response
-        // 12. CompressionLayer                       — response compression (whitelist, path-aware)
-        // 13. PathCategoryInjectionLayer             — injects path category for compression predicate
-        // 14. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
-        // 15. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 16. ConditionalCorsLayer                   — S3 API CORS
-        // 17. RedirectLayer                          — console redirect (conditional)
-        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 20. PublicHealthEndpointLayer              — handles public health before s3s host parsing
+        // 10. TraceLayer                             — request span creation + metrics
+        // 11. RequestLoggingLayer                    — single completion event per request
+        // 12. PropagateRequestIdLayer                — X-Request-ID → response
+        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 14. PathCategoryInjectionLayer             — injects path category for compression predicate
+        // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
+        // 16. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 17. ConditionalCorsLayer                   — S3 API CORS
+        // 18. RedirectLayer                          — console redirect (conditional)
+        // 19. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 20. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 21. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -705,10 +786,15 @@ fn process_connection(
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
-                        let request_id = request
-                            .headers()
-                            .get(http::header::HeaderName::from_static("x-request-id"))
-                            .and_then(|v| v.to_str().ok())
+                        let request_context = request.extensions().get::<crate::storage::request_context::RequestContext>();
+                        let request_id = request_context
+                            .map(|ctx| ctx.request_id.as_str())
+                            .unwrap_or("unknown");
+                        let trace_id = request_context
+                            .and_then(|ctx| ctx.trace_id.as_deref())
+                            .unwrap_or("unknown");
+                        let span_id = request_context
+                            .and_then(|ctx| ctx.span_id.as_deref())
                             .unwrap_or("unknown");
 
                         let parent_context = global::get_text_map_propagator(|propagator| {
@@ -718,38 +804,49 @@ fn process_connection(
                         // Log trace context extraction for debugging distributed tracing
                         if parent_context.has_active_span() {
                             let span_ref = parent_context.span();
-                            debug!(
+                            trace!(
                                 otel_trace_id = %span_ref.span_context().trace_id(),
                                 otel_parent_span_id = %span_ref.span_context().span_id(),
                                 sampled = span_ref.span_context().is_sampled(),
                                 "Extracted trace context from incoming request headers"
                             );
                         } else {
-                            debug!("No trace context found in request headers, will create root span");
+                            trace!("No trace context found in request headers, will create root span");
                         }
                         // Extract real client IP from trusted proxy middleware if available
                         let client_info = request.extensions().get::<ClientInfo>();
-                        let real_ip = client_info
+                        let peer_addr = client_info
                             .map(|info| info.real_ip.to_string())
+                            .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
                             .unwrap_or_else(|| "unknown".to_string());
 
                         let span = tracing::info_span!("http-request",
                             request_id = %request_id,
+                            trace_id = %trace_id,
+                            span_id = %span_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
-                            real_ip = %real_ip,
+                            peer_addr = %peer_addr,
                             uri = %request.uri(),
                             version = ?request.version(),
+                            user_agent = tracing::field::Empty,
+                            content_type = tracing::field::Empty,
+                            content_length = tracing::field::Empty,
                         );
                         if span.is_disabled() {
                             return span;
                         }
                         if let Err(e) = span.set_parent(parent_context) {
-                            warn!("Failed to propagate tracing context: `{:?}`", e);
+                            debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
                         }
                         for (header_name, header_value) in request.headers() {
-                            if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
-                                span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
+                            let value = header_value.to_str().unwrap_or("invalid");
+                            if header_name == "user-agent" {
+                                span.record("user_agent", value);
+                            } else if header_name == "content-type" {
+                                span.record("content_type", value);
+                            } else if header_name == "content-length" {
+                                span.record("content_length", value);
                             }
                         }
 
@@ -757,7 +854,7 @@ fn process_connection(
                     })
                     .on_request(|request: &HttpRequest<_>, span: &Span| {
                         let _enter = span.enter();
-                        debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
+                        trace!("HTTP request started");
                         let method = request_method_label(request.method());
                         record_active_http_requests(1);
                         counter!(
@@ -803,14 +900,13 @@ fn process_connection(
                             )
                             .record(len as f64);
                         }
-                        debug!("http response generated in {:?}", latency)
                     })
                     .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
                         counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
-                            debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
+                            debug!(chunk_bytes = chunk.len(), duration_ms = duration_ms(latency), "HTTP response body chunk sent");
                         }
                         #[cfg(not(feature = "tracing-chunk-debug"))]
                         {
@@ -821,7 +917,7 @@ fn process_connection(
                         #[cfg(feature = "tracing-chunk-debug")]
                         {
                             let _enter = span.enter();
-                            debug!("http stream closed after {:?}", stream_duration);
+                            debug!(duration_ms = duration_ms(stream_duration), "HTTP response stream closed");
                         }
                         #[cfg(not(feature = "tracing-chunk-debug"))]
                         {
@@ -836,9 +932,10 @@ fn process_connection(
                             LABEL_HTTP_STATUS_CLASS => "transport"
                         )
                         .increment(1);
-                        debug!("http request failure error: {:?} in {:?}", _error, latency)
+                        trace!(error = ?_error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
                     }),
             )
+            .layer(RequestLoggingLayer)
             .layer(PropagateRequestIdLayer::x_request_id())
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
@@ -872,7 +969,7 @@ fn process_connection(
 
         // Decide whether to handle HTTPS or HTTP connections based on the existence of TLS Acceptor
         if let Some(holder) = tls_acceptor {
-            debug!("TLS handshake start");
+            trace!("TLS handshake start");
             let peer_addr = socket
                 .peer_addr()
                 .ok()
@@ -880,7 +977,7 @@ fn process_connection(
             let acceptor = holder.get();
             match acceptor.accept(socket).await {
                 Ok(tls_socket) => {
-                    debug!("TLS handshake successful");
+                    trace!("TLS handshake successful");
                     let stream = TokioIo::new(tls_socket);
                     let conn = http_server.serve_connection(stream, hybrid_service);
                     if let Err(err) = graceful.watch(conn).await {
@@ -890,25 +987,9 @@ fn process_connection(
                 Err(err) => {
                     let err_str = err.to_string();
                     let kind = TlsHandshakeFailureKind::classify(&err_str);
-                    match kind {
-                        TlsHandshakeFailureKind::UnexpectedEof => {
-                            warn!(peer_addr = %peer_addr, "TLS handshake failed (unexpected EOF). If this client needs HTTP, it should connect to the HTTP port instead");
-                        }
-                        TlsHandshakeFailureKind::ProtocolVersion => {
-                            error!(peer_addr = %peer_addr, "TLS handshake failed (protocol version mismatch): {}", err);
-                        }
-                        TlsHandshakeFailureKind::Certificate => {
-                            error!(peer_addr = %peer_addr, "TLS handshake failed (certificate issue): {}", err);
-                        }
-                        TlsHandshakeFailureKind::Alert => {
-                            error!(peer_addr = %peer_addr, "TLS handshake failed (alert): {}", err);
-                        }
-                        TlsHandshakeFailureKind::Unknown => {
-                            error!(peer_addr = %peer_addr, "TLS handshake failed: {}", err);
-                        }
-                    }
+                    log_tls_handshake_failure(&peer_addr, kind, &err);
                     counter!("rustfs_tls_handshake_failures", &[("failure_type", kind.as_str())]).increment(1);
-                    debug!(
+                    trace!(
                         peer_addr = %peer_addr,
                         error_type = %std::any::type_name_of_val(&err),
                         error_details = %err,
@@ -918,61 +999,85 @@ fn process_connection(
                     return;
                 }
             }
-            debug!("TLS handshake success");
+            trace!("TLS handshake success");
         } else {
-            debug!("Http handshake start");
+            trace!("HTTP connection handling start");
             let peer_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
             let stream = TokioIo::new(socket);
             let conn = http_server.serve_connection(stream, hybrid_service);
             if let Err(err) = graceful.watch(conn).await {
                 handle_connection_error(peer_addr.as_deref(), &*err);
             }
-            debug!("Http handshake success");
+            trace!("HTTP connection handling finished");
         };
     });
 }
 
 /// Handles connection errors by logging them with appropriate severity
 fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error + 'static)) {
+    let peer_addr = peer_addr.unwrap_or("unknown");
     let s = err.to_string();
     if s.contains("connection reset") || s.contains("broken pipe") {
-        warn!(
-            peer_addr = %peer_addr.unwrap_or("unknown"),
-            "The connection was reset by the peer or broken pipe: {}", s
-        );
-        // Ignore common non-fatal errors
+        log_transport_closed(peer_addr, "connection_reset", &s, "client_disconnect");
         return;
     }
 
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
         if hyper_err.is_incomplete_message() {
-            warn!(
-                peer_addr = %peer_addr.unwrap_or("unknown"),
-                "The HTTP connection is closed prematurely and the message is not completed:{}", hyper_err
-            );
+            log_transport_closed(peer_addr, "incomplete_message", &hyper_err.to_string(), "client_disconnect");
         } else if hyper_err.is_closed() {
-            warn!(peer_addr = %peer_addr.unwrap_or("unknown"), "The HTTP connection is closed:{}", hyper_err);
+            log_transport_closed(peer_addr, "connection_closed", &hyper_err.to_string(), "client_disconnect");
         } else if hyper_err.is_parse() {
-            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "HTTP message parsing failed:{}", hyper_err);
+            log_transport_failed(peer_addr, "parse_failure", &hyper_err.to_string());
         } else if hyper_err.is_user() {
-            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "HTTP user-custom error:{}", hyper_err);
+            error!(
+                event = EVENT_HTTP_TRANSPORT_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                peer_addr = %peer_addr,
+                error_kind = "service_error",
+                error = %hyper_err,
+                result = "transport_error",
+                "HTTP transport failed"
+            );
         } else if hyper_err.is_canceled() {
-            warn!(
-                peer_addr = %peer_addr.unwrap_or("unknown"),
-                "The HTTP connection is canceled:{}", hyper_err
-            );
+            log_transport_closed(peer_addr, "canceled", &hyper_err.to_string(), "client_disconnect");
         } else if format!("{:?}", hyper_err).contains("HeaderTimeout") {
-            info!(
-                peer_addr = %peer_addr.unwrap_or("unknown"),
-                "The HTTP connection timed out while reading request headers (HeaderTimeout): {}", hyper_err
-            );
+            log_transport_closed(peer_addr, "header_timeout", &hyper_err.to_string(), "client_timeout");
         } else {
-            error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown hyper error:{:?}", hyper_err);
+            error!(
+                event = EVENT_HTTP_TRANSPORT_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                peer_addr = %peer_addr,
+                error_kind = "hyper_error",
+                error = ?hyper_err,
+                result = "transport_error",
+                "HTTP transport failed"
+            );
         }
     } else if let Some(io_err) = err.downcast_ref::<Error>() {
-        error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown connection IO error:{}", io_err);
+        error!(
+            event = EVENT_HTTP_TRANSPORT_FAILED,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            peer_addr = %peer_addr,
+            error_kind = "io_error",
+            error = %io_err,
+            result = "transport_error",
+            "HTTP transport failed"
+        );
     } else {
-        error!(peer_addr = %peer_addr.unwrap_or("unknown"), "Unknown connection error type:{:?}", err);
+        error!(
+            event = EVENT_HTTP_TRANSPORT_FAILED,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            peer_addr = %peer_addr,
+            error_kind = "unknown_error",
+            error = ?err,
+            result = "transport_error",
+            "HTTP transport failed"
+        );
     }
 }
 
@@ -1097,8 +1202,8 @@ mod tests {
         };
 
         /// Number of middleware layers in the canonical stack order (see http.rs).
-        /// Layers 1-2 are per-connection (AddExtension), 3-15 are stateless.
-        pub const MIDDLEWARE_LAYER_COUNT: usize = 15;
+        /// Layers 1-2 are per-connection (AddExtension), 3-21 are stateless.
+        pub const MIDDLEWARE_LAYER_COUNT: usize = 21;
 
         /// Current HTTP/2 defaults (from rustfs_config).
         pub const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE;
@@ -1139,7 +1244,7 @@ mod tests {
 
     #[test]
     fn test_baseline_middleware_count() {
-        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 15);
+        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 21);
     }
 
     #[test]
