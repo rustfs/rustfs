@@ -687,7 +687,7 @@ mod tests {
         let config = KmsConfig::local(temp_dir.path().to_path_buf());
 
         assert!(config.validate().is_err());
-        assert!(config.clone().with_insecure_development_defaults().validate().is_ok());
+        assert!(config.with_insecure_development_defaults().validate().is_ok());
 
         let production_config = KmsConfig {
             backend: KmsBackend::Local,
@@ -856,10 +856,12 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let mut config = KmsConfig::default();
+        let mut config = KmsConfig {
+            allow_insecure_dev_defaults: true,
+            ..Default::default()
+        };
 
         // Valid config
-        config.allow_insecure_dev_defaults = true;
         assert!(config.validate().is_ok());
 
         // Invalid timeout

@@ -402,6 +402,7 @@ Passed on `a85cc0354c02fc55e2dd8eb64cfc6155c37921c7`:
 - `cargo check -p rustfs-kms --tests`.
 - `cargo test -p rustfs-kms --no-fail-fast`; 57 passed, 1 ignored, doc-test
   passed.
+- `cargo clippy -p rustfs-kms --all-targets -- -D warnings`.
 - `cargo test -p rustfs --lib config::config_test --no-fail-fast`; 20 passed.
 - `cargo test -p rustfs --lib storage::sse::tests::test_kms --no-fail-fast`;
   1 passed.
