@@ -28,6 +28,7 @@ use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectIO, ObjectInfo, Obj
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_filemeta::{FileInfo, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::path::encode_dir_object;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -732,7 +733,7 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn init_rebalance_meta(&self, bucktes: Vec<String>) -> Result<String> {
         info!("init_rebalance_meta: start rebalance");
-        let si = self.storage_info().await;
+        let si = StorageAdminApi::storage_info(self).await;
 
         let mut disk_stats = vec![DiskStat::default(); self.pools.len()];
 

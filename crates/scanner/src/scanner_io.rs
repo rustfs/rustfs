@@ -44,6 +44,7 @@ use rustfs_ecstore::set_disk::SetDisks;
 use rustfs_ecstore::store_api::{BucketInfo, BucketOperations, BucketOptions, ObjectInfo};
 use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
+use rustfs_storage_api::{DiskSetSelector, StorageAdminApi};
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
 use std::collections::{HashMap, HashSet};
@@ -1082,7 +1083,7 @@ impl ScannerIODisk for Disk {
             return Err(StorageError::other("Disk location not available".to_string()));
         };
 
-        let disks_result = ecstore.get_disks(pool_idx, set_idx).await?;
+        let disks_result = StorageAdminApi::disk_set_inventory(ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx)).await?;
 
         let Some(disk_idx) = disk_location.disk_idx else {
             error!("Disk index not available");
