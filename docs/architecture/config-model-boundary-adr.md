@@ -22,15 +22,17 @@ The exported path should be:
 rustfs_config::server_config::{Config, KV, KVS}
 ```
 
-The existing path must remain available through a temporary compatibility
-re-export:
+The extraction kept the existing path available through a temporary
+compatibility re-export:
 
 ```rust
 rustfs_ecstore::config::{Config, KV, KVS}
 ```
 
-That re-export must include `RUSTFS_COMPAT_TODO(CFG-004)` and a matching entry in
-[`compat-cleanup-register.md`](compat-cleanup-register.md).
+That re-export included `RUSTFS_COMPAT_TODO(CFG-004)` and a matching entry in
+[`compat-cleanup-register.md`](compat-cleanup-register.md) until the model
+consumers were migrated. The CFG-004 cleanup removed this old model path after
+code scans showed consumers import the model directly from `rustfs-config`.
 
 ## Why `rustfs-config`
 
@@ -129,8 +131,9 @@ The extraction PR must preserve:
 must not migrate consumers, change persistence helpers, or alter runtime
 behavior.
 
-`CFG-004` should keep the old `rustfs_ecstore::config::*` path as a temporary
-compatibility shim and register its removal condition.
+`CFG-004` kept the old `rustfs_ecstore::config::*` path as a temporary
+compatibility shim, registered its removal condition, and removed the shim after
+all in-repo consumers migrated.
 
 `CFG-005` should migrate external consumers one group at a time after the model
 and compatibility path are stable.
@@ -143,8 +146,9 @@ Before pushing an extraction PR, run:
 - tests for `hiddenIfEmpty` alias compatibility
 - tests for `KVS` insertion, lookup, extension, and keys behavior
 - tests for `Config::new`, `set_defaults`, `marshal`, `unmarshal`, and `merge`
-- a compile smoke test that the old `rustfs_ecstore::config::{Config, KV, KVS}`
-  path still works
+- a cleanup scan proving in-repo consumers no longer use the old
+  `rustfs_ecstore::config::{Config, KV, KVS}` model path before removing the
+  compatibility shim
 - `cargo tree -p rustfs-config --edges normal`
 - `cargo tree -p rustfs-ecstore --edges normal`
 - `./scripts/check_layer_dependencies.sh`

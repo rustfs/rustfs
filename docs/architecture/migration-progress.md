@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-config-scanner-consumer`
-- Baseline: `origin/main` at `704c95a22d9106b75cde26bf6fcc3988a175a19b`
-- PR type for this branch: `consumer-migration`
+- Branch: `overtrue/arch-config-compat-cleanup`
+- Baseline: `origin/main` at `69549634ea9524724dafd6bd90c8639880a2dbc6`
+- PR type for this branch: `api-extraction`
 - Runtime behavior changes: none.
-- Rust code changes: migrate the scanner runtime-config model consumer from
-  the temporary `rustfs_ecstore::config` model path to
-  `rustfs_config::server_config`, and enable the `server-config-model` feature
-  in `rustfs-scanner`.
+- Rust code changes: remove the temporary CFG-004
+  `rustfs_ecstore::config` server-config model compatibility re-export and its
+  smoke test after all in-repo consumers migrated to
+  `rustfs_config::server_config`.
 - CI/script changes: none.
-- Docs changes: record CFG-007 consumer-migration context, verification
-  evidence, and the preserved ECStore global server-config boundary.
+- Docs changes: record CFG-004 cleanup context, update the compatibility
+  cleanup register, and mark the model-boundary ADR cleanup status.
 
 ## Phase 0 Tasks
 
@@ -84,10 +84,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     and global server-config state remain in `ecstore`.
   - Must preserve: tuple struct shapes, serde alias behavior, default
     application, internal JSON shape, and existing persisted config semantics.
-- [x] `CFG-004` Keep old `ecstore::config::*` compatibility path.
+- [x] `CFG-004` Keep and clean up old `ecstore::config::*` compatibility path.
   - Completed slice: `rustfs/rustfs#3351` re-exported moved model types and
     default-registration surface from `rustfs_ecstore::config` with
     `RUSTFS_COMPAT_TODO(CFG-004)` and cleanup-register coverage.
+  - Cleanup slice: remove the temporary model re-export and smoke test after
+    CFG-005/CFG-006/CFG-007 migrated all in-repo consumers to
+    `rustfs_config::server_config`.
 - [x] `CFG-005` Migrate external server-config model consumers.
   - Current branch: migrate admin handlers, admin services, runtime context,
     server audit/event setup, and the audit/notify/targets/iam crates from the
@@ -337,36 +340,34 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `api-extraction`: remove the temporary `rustfs_ecstore::config` model
-   re-export after code scans prove only the deliberate CFG-004 compatibility
-   marker and smoke test still use the old model path.
-2. `security-change`: make Local KMS unsafe defaults explicit development
+1. `security-change`: make Local KMS unsafe defaults explicit development
    opt-ins or production failures in KMSD-002.
-3. `security-change`: make Vault unsafe defaults explicit development opt-ins
+2. `security-change`: make Vault unsafe defaults explicit development opt-ins
    or production failures in KMSD-003.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the diff only moves scanner pure model imports to `rustfs_config::server_config`, enables the required feature, and keeps ECStore global-state access through ECStore. |
-| Migration preservation | pass | Confirmed scanner defaults, env/config precedence, validation, cycle scheduling, bitrot compatibility, cache timeout, alert thresholds, and active global-config access are unchanged. |
-| Testing/verification | pass | Confirmed focused scanner runtime-config tests, scanner/ECStore/server compile check, migration guards, old-path scan, and added-line risk scan are sufficient; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed the diff only removes the temporary model re-export and smoke test; ECStore persistence helpers, global state, startup wiring, and default registration remain unchanged. |
+| Migration preservation | pass | Confirmed `ConfigSys`, `GLOBAL_SERVER_CONFIG`, storage-class globals/accessors, read/save/serde paths, scanner/admin consumers, and in-repo model imports remain correct after old-path removal. |
+| Testing/verification | pass | Confirmed ECStore config tests, rustfs-config/ECStore/server compile check, migration guards, old-path scan, and added-line risk scan are sufficient; full pre-commit is skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
 Passed:
+- `cargo test -p rustfs-ecstore config --lib`; 59 passed.
+- `cargo check -p rustfs-config -p rustfs-ecstore -p rustfs --lib`.
 - `cargo fmt --all --check`.
-- `cargo test -p rustfs-scanner runtime_config --lib`; 16 passed.
-- `cargo check -p rustfs-scanner -p rustfs-ecstore -p rustfs --lib`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
 - `./scripts/check_unsafe_code_allowances.sh`.
 - `git diff --check`.
-- Old model code-path scan:
+- CFG-004 old model code-path scan found no
   `rustfs_ecstore::config::{Config, KV, KVS, DEFAULT_KVS,
-  register_default_kvs}` is absent from `crates/**/*.rs` and `rustfs/src`.
+  register_default_kvs}` imports and no `RUSTFS_COMPAT_TODO(CFG-004)` markers
+  in `crates/**/*.rs` or `rustfs/src`.
 - Added-line risk scan found no production `unwrap`/`expect`, lossy numeric
   casts, stringly public errors, boxed dynamic errors, stdout/stderr printing,
   or relaxed atomic ordering.
@@ -374,20 +375,17 @@ Passed:
 Notes:
 - Full pre-commit may be skipped if focused tests, compile checks, and guards
   pass, per the current instruction to increase PR granularity.
-- This slice migrates the scanner model consumer only. ECStore retains
-  persistence helpers, ConfigSys, global server-config state, storage-class
-  global state, startup wiring, and all storage/config persistence logic.
-- The old rustfs_ecstore::config model path intentionally remains as a
-  temporary compatibility re-export with `RUSTFS_COMPAT_TODO(CFG-004)` and a
-  matching cleanup-register entry.
-- The remaining old-path references are limited to architecture documentation;
-  the deliberate CFG-004 compatibility re-export remains available but is no
-  longer imported by Rust code in `crates` or `rustfs/src`.
+- This slice removes only the old pure model compatibility path. ECStore
+  retains persistence helpers, ConfigSys, global server-config state,
+  storage-class global state, startup wiring, and all storage/config persistence
+  logic.
+- The old `rustfs_ecstore::config` model path is no longer available after this
+  cleanup. Consumers must use `rustfs_config::server_config`.
 
 ## Handoff Notes
 
-- Keep this CFG-007 slice as a `consumer-migration` PR that only updates the
-  scanner model type import and affected crate feature gate.
+- Keep this CFG-004 cleanup slice as an `api-extraction` PR that only removes
+  the temporary model compatibility re-export and its cleanup-register entry.
 - Do not move `ConfigSys`, `GLOBAL_SERVER_CONFIG`, storage-class global state,
   `read_config_without_migrate`, `save_server_config`, config-object helpers,
   startup wiring, storage-class helpers, ECStore persistence helpers, or storage

@@ -34,12 +34,10 @@ use rustfs_config::notify::{
     NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
+use rustfs_config::server_config::{Config, register_default_kvs};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
-
-// RUSTFS_COMPAT_TODO(CFG-004): keep old rustfs_ecstore::config model import paths while server-config model consumers migrate. Remove after all consumers import Config, KV, KVS, DEFAULT_KVS, and register_default_kvs from rustfs_config::server_config.
-pub use rustfs_config::server_config::{Config, DEFAULT_KVS, KV, KVS, register_default_kvs};
 
 pub static GLOBAL_STORAGE_CLASS: LazyLock<RwLock<storageclass::Config>> =
     LazyLock::new(|| RwLock::new(storageclass::Config::default()));
@@ -134,6 +132,7 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_config::server_config::KVS;
     use rustfs_config::{
         DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, DEFAULT_SCANNER_SPEED, HEAL_BITROT_CYCLE, SCANNER_CYCLE_MAX_OBJECTS,
         SCANNER_DELAY, SCANNER_MAX_WAIT, SCANNER_SPEED, SCANNER_SUB_SYS,
@@ -174,24 +173,5 @@ mod tests {
             .expect("heal defaults should exist");
 
         assert_eq!(heal_kvs.get(HEAL_BITROT_CYCLE), DEFAULT_HEAL_BITROT_CYCLE_SECS.to_string());
-    }
-
-    #[test]
-    fn old_config_model_path_reexports_moved_types() {
-        let mut kvs = crate::config::KVS::new();
-        kvs.insert("key".to_string(), "value".to_string());
-        let cfg = crate::config::Config(HashMap::from([(
-            "subsys".to_string(),
-            HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]),
-        )]));
-        let moved_cfg: rustfs_config::server_config::Config = cfg;
-
-        assert_eq!(
-            moved_cfg
-                .get_value("subsys", DEFAULT_DELIMITER)
-                .expect("subsys should exist")
-                .get("key"),
-            "value"
-        );
     }
 }
