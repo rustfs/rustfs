@@ -19,7 +19,11 @@ use rustfs_targets::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
-use tracing::info;
+use tracing::{debug, info};
+
+const LOG_COMPONENT_NOTIFY: &str = "notify";
+const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
+const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
 
 #[derive(Clone)]
 pub struct NotifyRuntimeFacade {
@@ -55,9 +59,24 @@ impl NotifyRuntimeFacade {
             }),
             Arc::new(|target_id, has_replay| {
                 if has_replay {
-                    info!("Event stream processing for target {} is started successfully", target_id);
+                    info!(
+                        event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+                        component = LOG_COMPONENT_NOTIFY,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        target_id = %target_id,
+                        state = "replay_started",
+                        "Started notify replay worker"
+                    );
                 } else {
-                    info!("Target {} has no replay worker to start", target_id);
+                    debug!(
+                        event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+                        component = LOG_COMPONENT_NOTIFY,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        target_id = %target_id,
+                        state = "replay_skipped",
+                        reason = "no_store_configured",
+                        "Skipped notify replay worker startup"
+                    );
                 }
             }),
             Some(concurrency_limiter),
@@ -97,10 +116,23 @@ impl NotifyRuntimeFacade {
     }
 
     pub async fn shutdown(&self) {
-        info!("Turn off the notification system");
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "stopping",
+            "Stopping notification runtime"
+        );
 
         let active_targets = self.replay_workers.read().await.len();
-        info!("Stops {} active event stream processing tasks", active_targets);
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "replay_stopping",
+            active_targets,
+            "Stopping notify replay workers"
+        );
 
         {
             // Lock order: replay_workers -> target_list (matches notify AGENTS.md).
@@ -116,7 +148,13 @@ impl NotifyRuntimeFacade {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        info!("Notify the system to be shut down completed");
+        info!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "stopped",
+            "Stopped notification runtime"
+        );
     }
 }
 
