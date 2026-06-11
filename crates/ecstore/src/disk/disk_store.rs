@@ -649,6 +649,11 @@ impl LocalDiskWrapper {
         self.health.reset_for_store_init_retry(&self.disk.endpoint());
     }
 
+    #[cfg(test)]
+    pub fn health_check_enabled_for_test(&self) -> bool {
+        self.health_check
+    }
+
     /// Enable health monitoring after disk creation.
     /// Used to defer health checks until after startup format loading completes.
     pub fn enable_health_check(&self) {

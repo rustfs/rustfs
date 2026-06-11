@@ -484,10 +484,12 @@ fn is_empty_body_admin_path(method: &Method, uri: &http::Uri) -> bool {
                 path,
                 "/minio/admin/v3/rebalance/start"
                     | "/minio/admin/v3/rebalance/stop"
+                    | "/minio/admin/v3/background-heal/status"
                     | "/minio/admin/v3/pools/decommission"
                     | "/minio/admin/v3/pools/cancel"
                     | "/rustfs/admin/v3/rebalance/start"
                     | "/rustfs/admin/v3/rebalance/stop"
+                    | "/rustfs/admin/v3/background-heal/status"
                     | "/rustfs/admin/v3/pools/decommission"
                     | "/rustfs/admin/v3/pools/cancel"
             ) || is_heal_status_query(path, uri.query())
@@ -1833,6 +1835,28 @@ mod tests {
         let paths = [
             format!("{ADMIN_PREFIX}/v3/heal/?clientToken=root-heal"),
             format!("{ADMIN_PREFIX}/v3/heal/bucket?clientToken=bucket-heal"),
+        ];
+
+        for path in paths {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path.clone())
+                .header(http::header::TRANSFER_ENCODING, "chunked")
+                .body(())
+                .expect("request");
+
+            assert!(
+                should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} should force Content-Length: 0"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_background_heal_status_without_content_length_is_normalized() {
+        let paths = [
+            format!("{MINIO_ADMIN_V3_PREFIX}/background-heal/status"),
+            format!("{ADMIN_PREFIX}/v3/background-heal/status"),
         ];
 
         for path in paths {

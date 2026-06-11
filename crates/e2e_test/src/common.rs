@@ -722,6 +722,13 @@ impl RustFSTestClusterEnvironment {
         self.extra_env.push((key.into(), value.into()));
     }
 
+    fn ensure_node_index(&self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if node_idx >= self.nodes.len() {
+            return Err(format!("node_idx {node_idx} is invalid").into());
+        }
+        Ok(())
+    }
+
     /// Build the volumes argument string for RustFS binary (internal helper method).
     ///
     /// Concatenates the address and data directory of all cluster nodes into a single string
@@ -778,6 +785,39 @@ impl RustFSTestClusterEnvironment {
             self.wait_for_node_service_ready(node_idx).await?;
         }
 
+        Ok(())
+    }
+
+    /// Start one node process using the cluster's existing volume layout.
+    pub async fn start_node(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_node_index(node_idx)?;
+        if self.nodes[node_idx].process.is_some() {
+            return Err(format!("cluster node {node_idx} is already running").into());
+        }
+
+        let binary_path = rustfs_binary_path();
+        let volumes_arg = self.build_volumes_arg();
+        let node = &mut self.nodes[node_idx];
+        info!("Starting cluster node {} on {}", node_idx, node.address);
+
+        let mut command = Command::new(&binary_path);
+        command
+            .env("RUSTFS_VOLUMES", &volumes_arg)
+            .env("RUSTFS_ADDRESS", &node.address)
+            .env("RUSTFS_ACCESS_KEY", &self.access_key)
+            .env("RUSTFS_SECRET_KEY", &self.secret_key)
+            .env("RUSTFS_CONSOLE_ENABLE", "false")
+            .env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
+
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+
+        let process = command.current_dir(&node.data_dir).spawn()?;
+        node.process = Some(process);
+
+        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await?;
+        self.wait_for_node_service_ready(node_idx).await?;
         Ok(())
     }
 
@@ -910,6 +950,19 @@ impl RustFSTestClusterEnvironment {
                 }
             }
         }
+    }
+
+    /// Stop a single cluster node and wait for its process to exit.
+    pub fn stop_node(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_node_index(node_idx)?;
+        let Some(mut process) = self.nodes[node_idx].process.take() else {
+            return Ok(());
+        };
+
+        info!("Stopping cluster node {}", node_idx);
+        process.kill()?;
+        process.wait()?;
+        Ok(())
     }
 }
 
