@@ -16,7 +16,7 @@ use crate::config::{Config, KVS, audit, notify, oidc, set_global_storage_class, 
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
-use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
+use crate::store_api::{ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, PutObjReader};
 use http::HeaderMap;
 use rustfs_config::audit::{
     AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
@@ -181,12 +181,12 @@ fn audit_target_descriptors() -> [TargetConfigDescriptor; 9] {
 }
 
 #[instrument(skip(api))]
-pub async fn read_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+pub async fn read_config<S: ObjectIO>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
     Ok(data)
 }
 
-pub async fn read_config_no_lock<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+pub async fn read_config_no_lock<S: ObjectIO>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
     let (data, _obj) = read_config_with_metadata(
         api,
         file,
@@ -199,7 +199,7 @@ pub async fn read_config_no_lock<S: StorageAPI>(api: Arc<S>, file: &str) -> Resu
     Ok(data)
 }
 
-pub async fn read_config_with_metadata<S: StorageAPI>(
+pub async fn read_config_with_metadata<S: ObjectIO>(
     api: Arc<S>,
     file: &str,
     opts: &ObjectOptions,
@@ -227,7 +227,7 @@ pub async fn read_config_with_metadata<S: StorageAPI>(
 }
 
 #[instrument(skip(api, data))]
-pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
+pub async fn save_config<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
     save_config_with_opts(
         api,
         file,
@@ -241,7 +241,7 @@ pub async fn save_config<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>) 
 }
 
 #[instrument(skip(api))]
-pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()> {
+pub async fn delete_config<S: ObjectOperations>(api: Arc<S>, file: &str) -> Result<()> {
     match api
         .delete_object(
             RUSTFS_META_BUCKET,
@@ -265,7 +265,7 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
     }
 }
 
-pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
+pub async fn save_config_with_opts<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
     let mut put_data = PutObjReader::from_vec(data);
     if let Err(err) = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         error!("save_config_with_opts: err: {:?}, file: {}", err, file);
@@ -280,7 +280,7 @@ fn new_server_config() -> Config {
 
 async fn new_and_save_server_config<S>(api: Arc<S>) -> Result<Config>
 where
-    S: StorageAPI + StorageAdminApi,
+    S: ObjectIO + StorageAdminApi,
 {
     let mut cfg = new_server_config();
     lookup_configs(&mut cfg, api.clone()).await;
@@ -982,7 +982,10 @@ fn is_object_not_found(err: &Error) -> bool {
     *err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _) | Error::BucketNotFound(_))
 }
 
-pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
+pub async fn try_migrate_server_config<S>(api: Arc<S>)
+where
+    S: ObjectIO + ObjectOperations,
+{
     let config_file = get_config_file();
     match api
         .get_object_info(
@@ -1065,7 +1068,7 @@ pub async fn try_migrate_server_config<S: StorageAPI>(api: Arc<S>) {
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
 async fn handle_missing_config<S>(api: Arc<S>, context: &str) -> Result<Config>
 where
-    S: StorageAPI + StorageAdminApi,
+    S: ObjectIO + StorageAdminApi,
 {
     warn!("Configuration not found ({}): Start initializing new configuration", context);
     let cfg = if is_first_cluster_node_local().await {
@@ -1087,7 +1090,7 @@ fn handle_config_read_error(err: Error, file_path: &str) -> Result<Config> {
 
 pub async fn read_config_without_migrate<S>(api: Arc<S>) -> Result<Config>
 where
-    S: StorageAPI + StorageAdminApi,
+    S: ObjectIO + StorageAdminApi,
 {
     let config_file = get_config_file();
 
@@ -1101,7 +1104,7 @@ where
 
 async fn read_server_config<S>(api: Arc<S>, data: &[u8]) -> Result<Config>
 where
-    S: StorageAPI + StorageAdminApi,
+    S: ObjectIO + StorageAdminApi,
 {
     // If the provided data is empty, try to read from the file again
     if data.is_empty() {
@@ -1125,7 +1128,7 @@ where
     Ok(cfg.merge())
 }
 
-pub async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Result<()> {
+pub async fn save_server_config<S: ObjectIO>(api: Arc<S>, cfg: &Config) -> Result<()> {
     let config_file = get_config_file();
     let existing = match read_config(api.clone(), &config_file).await {
         Ok(v) => Some(v),
@@ -1156,7 +1159,7 @@ pub async fn save_server_config<S: StorageAPI>(api: Arc<S>, cfg: &Config) -> Res
 
 pub async fn lookup_configs<S>(cfg: &mut Config, api: Arc<S>)
 where
-    S: StorageAPI + StorageAdminApi,
+    S: StorageAdminApi,
 {
     // TODO: from etcd
     if let Err(err) = apply_dynamic_config(cfg, api).await {
@@ -1166,7 +1169,7 @@ where
 
 async fn apply_dynamic_config<S>(cfg: &mut Config, api: Arc<S>) -> Result<()>
 where
-    S: StorageAPI + StorageAdminApi,
+    S: StorageAdminApi,
 {
     for key in SUB_SYSTEMS_DYNAMIC.iter() {
         apply_dynamic_config_for_sub_sys(cfg, api.clone(), key).await?;
@@ -1177,7 +1180,7 @@ where
 
 async fn apply_dynamic_config_for_sub_sys<S>(cfg: &mut Config, api: Arc<S>, subsys: &str) -> Result<()>
 where
-    S: StorageAPI + StorageAdminApi,
+    S: StorageAdminApi,
 {
     let set_drive_counts = StorageAdminApi::set_drive_counts(api.as_ref());
     if subsys == STORAGE_CLASS_SUB_SYS {
