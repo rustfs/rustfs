@@ -217,5 +217,20 @@ mod tests {
                 "Event processing initiated for {} targets for bucket: {}",
             ],
         );
+        assert_no_unmasked_access_key_logging(
+            "crates/notify/src/bucket_config_manager.rs",
+            &["Available ARNs: {:?}", "Loaded notification config for bucket: {}"],
+        );
+        assert_no_unmasked_access_key_logging(
+            "crates/notify/src/rule_engine.rs",
+            &[
+                "Updated notification rules for bucket: {}",
+                "Removed all notification rules for bucket: {}",
+            ],
+        );
+        assert_no_unmasked_access_key_logging(
+            "crates/audit/src/observability.rs",
+            &["Audit configuration reloaded", "Audit system started", "Audit metrics reset"],
+        );
     }
 }

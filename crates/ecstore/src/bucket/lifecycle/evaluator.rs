@@ -23,6 +23,10 @@ use crate::bucket::object_lock::objectlock_sys::is_object_locked_by_metadata;
 use crate::bucket::replication::ReplicationConfig;
 use rustfs_common::metrics::IlmAction;
 
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+const EVENT_LIFECYCLE_VERSION_SCAN_SKIPPED: &str = "lifecycle_version_scan_skipped";
+
 /// Evaluator - evaluates lifecycle policy on objects for the given lifecycle
 /// configuration, lock retention configuration and replication configuration.
 pub struct Evaluator {
@@ -112,7 +116,14 @@ impl Evaluator {
                             // events after DeleteAllVersionsAction*
                             events[i] = event;
 
-                            info!("eval_inner: skipping remaining versions' lifecycle events after DeleteAllVersionsAction*");
+                            info!(
+                                event = EVENT_LIFECYCLE_VERSION_SCAN_SKIPPED,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                reason = "delete_all_versions_action",
+                                action = ?events[i].action,
+                                "Skipped remaining lifecycle version scan"
+                            );
 
                             break 'top_loop;
                         }

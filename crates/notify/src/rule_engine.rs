@@ -20,6 +20,10 @@ use starshard::{AsyncShardedHashMap, DEFAULT_SHARDS, SnapshotMode};
 use std::sync::Arc;
 use tracing::info;
 
+const LOG_COMPONENT_NOTIFY: &str = "notify";
+const LOG_SUBSYSTEM_RULE_ENGINE: &str = "rule_engine";
+const EVENT_NOTIFY_RULES_UPDATED: &str = "notify_bucket_rules_updated";
+
 fn decoded_object_key_for_matching(object_key: &str) -> Option<String> {
     if !object_key.contains('%') {
         return None;
@@ -52,12 +56,21 @@ impl NotifyRuleEngine {
     }
 
     pub async fn set_bucket_rules(&self, bucket: &str, rules_map: RulesMap) {
+        let event_count = rules_map.iter_events().count();
         if rules_map.is_empty() {
             self.bucket_rules_map.remove(&bucket.to_string()).await;
         } else {
             self.bucket_rules_map.insert(bucket.to_string(), rules_map).await;
         }
-        info!("Updated notification rules for bucket: {}", bucket);
+        info!(
+            event = EVENT_NOTIFY_RULES_UPDATED,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_RULE_ENGINE,
+            bucket = %bucket,
+            state = "updated",
+            event_count,
+            "Updated bucket notification rules"
+        );
     }
 
     pub async fn get_bucket_rules(&self, bucket: &str) -> Option<RulesMap> {
@@ -66,7 +79,14 @@ impl NotifyRuleEngine {
 
     pub async fn clear_bucket_rules(&self, bucket: &str) {
         if self.bucket_rules_map.remove(&bucket.to_string()).await.is_some() {
-            info!("Removed all notification rules for bucket: {}", bucket);
+            info!(
+                event = EVENT_NOTIFY_RULES_UPDATED,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_RULE_ENGINE,
+                bucket = %bucket,
+                state = "removed",
+                "Removed bucket notification rules"
+            );
         }
     }
 
