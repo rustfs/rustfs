@@ -564,6 +564,8 @@ pub struct LocalKmsBackend {
 impl LocalKmsBackend {
     /// Create a new LocalKmsBackend
     pub async fn new(config: KmsConfig) -> Result<Self> {
+        config.validate()?;
+
         let local_config = match &config.backend_config {
             crate::config::BackendConfig::Local(local_config) => local_config.clone(),
             crate::config::BackendConfig::VaultKv2(_) | crate::config::BackendConfig::VaultTransit(_) => {

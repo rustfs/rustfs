@@ -38,7 +38,7 @@ use rustfs_ecstore::disk::RUSTFS_META_BUCKET;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::{
     set_disk::get_lock_acquire_timeout,
-    store_api::{HTTPPreconditions, ObjectOptions, PutObjReader, StorageAPI},
+    store_api::{HTTPPreconditions, NamespaceLocking, ObjectOptions, PutObjReader, StorageAPI},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime};
@@ -1459,7 +1459,7 @@ pub(crate) type EcStoreTableCatalogStore<S> = ObjectTableCatalogStore<EcStoreTab
 #[async_trait::async_trait]
 impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI,
+    S: StorageAPI + NamespaceLocking,
 {
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         self.read_object_with_options(bucket, object, ObjectOptions::default()).await

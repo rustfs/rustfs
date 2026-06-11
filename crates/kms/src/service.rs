@@ -738,7 +738,9 @@ mod tests {
 
     async fn create_test_service() -> (ObjectEncryptionService, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_default_key("test-key".to_string());
+        let config = KmsConfig::local(temp_dir.path().to_path_buf())
+            .with_insecure_development_defaults()
+            .with_default_key("test-key".to_string());
         let backend = Arc::new(
             crate::backends::local::LocalKmsBackend::new(config.clone())
                 .await
