@@ -35,10 +35,10 @@ consumers were migrated. The CFG-004 cleanup removed this old model path after
 code scans showed consumers import the model directly from `rustfs-config`.
 
 Follow-up `CFG-008` moved the process-global server-config snapshot accessors
-to `rustfs_config::server_config` after the model path stabilized. ECStore keeps
-only a temporary `rustfs_ecstore::config::{get_global_server_config,
-set_global_server_config}` compatibility re-export while in-repo runtime
-consumers migrate.
+to `rustfs_config::server_config` after the model path stabilized. Its temporary
+`rustfs_ecstore::config::{get_global_server_config, set_global_server_config}`
+compatibility re-export was removed after in-repo runtime consumers migrated to
+the `rustfs-config` owner.
 
 ## Why `rustfs-config`
 
@@ -120,8 +120,9 @@ Move in `CFG-008`:
 - `get_global_server_config`
 - `set_global_server_config`
 
-Keep a temporary ECStore compatibility re-export for these accessors until all
-consumers use `rustfs_config::server_config` directly.
+The temporary ECStore compatibility re-export for these accessors was removed
+after code scans showed in-repo consumers use `rustfs_config::server_config`
+directly.
 
 ## Required Shape Preservation
 
