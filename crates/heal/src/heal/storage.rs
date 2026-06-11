@@ -19,11 +19,10 @@ use rustfs_ecstore::{
     disk::{DiskStore, endpoint::Endpoint},
     error::StorageError,
     store::ECStore,
-    store_api::{
-        BucketInfo, BucketOperations, HealOperations, ListOperations, ObjectIO, ObjectOperations, ObjectOptions, StorageAPI,
-    },
+    store_api::{BucketInfo, BucketOperations, HealOperations, ListOperations, ObjectIO, ObjectOperations, ObjectOptions},
 };
 use rustfs_madmin::heal_commands::HealResultItem;
+use rustfs_storage_api::{DiskSetSelector, StorageAdminApi};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -619,9 +618,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
 
         // Get the first available disk from the set
-        let disks = self
-            .ecstore
-            .get_disks(pool_idx, set_idx)
+        let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
             .await
             .map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to get disks for pool {pool_idx} set {set_idx}: {e}"),
