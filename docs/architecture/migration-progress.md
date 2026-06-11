@@ -5,16 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-api-dto-compat-cleanup`
-- Baseline: `origin/main` at `0a987d870b3dca248bea8d4872568a25e235d917`
+- Branch: `overtrue/arch-storage-api-namespace-lock-cleanup`
+- Baseline: `origin/main` at `7146c893cbbb84a0d5332a7a8a79b70d57191bcc`
 - PR type for this branch: `api-extraction`
 - Runtime behavior changes: none intended.
-- Rust code changes: migrate remaining in-repo bucket DTO consumers to
-  `rustfs_storage_api` and remove the temporary API-003 public ECStore
-  `store_api` bucket DTO re-export.
+- Rust code changes: migrate remaining namespace-lock consumers to
+  `NamespaceLocking`, implement namespace locking directly on ECStore storage
+  types, and remove the temporary namespace-lock compatibility method from the
+  full storage trait.
 - CI/script changes: none.
-- Docs changes: remove the API-003 cleanup-register entry and record the
-  completed storage API DTO compatibility cleanup in progress notes.
+- Docs changes: remove the API-012 cleanup-register entry and record the
+  completed namespace-lock compatibility cleanup in progress notes.
 
 ## Phase 0 Tasks
 
@@ -273,9 +274,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Completed slice: `rustfs/rustfs#3340` removed duplicate admin-read methods
     from the old `StorageAPI` trait and its ECStore/Sets/SetDisks/test
     implementations after API-007 migrated their consumers.
-  - Acceptance: old `StorageAPI` keeps storage operation traits and
-    `new_ns_lock`, while admin inventory surfaces live only on
-    `StorageAdminApi`.
+  - Acceptance: old `StorageAPI` keeps storage operation traits while admin
+    inventory surfaces live only on `StorageAdminApi`.
 
 - [x] `API-009` Narrow metadata helper storage bounds.
   - Completed slice: `rustfs/rustfs#3343` narrowed server config, tier config,
@@ -315,23 +315,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 - [x] `API-012` Narrow table catalog object backend bounds.
   - Completed slice: `rustfs/rustfs#3350` added a narrow `NamespaceLocking`
-    operation-group trait as a compatibility facade over
-    `StorageAPI::new_ns_lock`, then narrowed `EcStoreTableCatalogObjectBackend`
-    from full `StorageAPI` to `ObjectIO`, `ObjectOperations`,
-    `ListOperations`, and `NamespaceLocking`.
+    operation-group trait as a compatibility facade, then narrowed
+    `EcStoreTableCatalogObjectBackend` from full `StorageAPI` to `ObjectIO`,
+    `ObjectOperations`, `ListOperations`, and `NamespaceLocking`.
+  - Cleanup slice: migrate the remaining scanner leader-lock and self-copy
+    object use-case namespace-lock consumers to `NamespaceLocking`, implement
+    namespace locking directly on ECStore storage types, and remove the
+    temporary namespace-lock compatibility method from the full storage trait
+    and cleanup register entry.
   - Acceptance: table catalog object backend contracts express the actual
     object read/write, metadata/delete, list, and namespace-lock capabilities
-    they need, while table catalog store logic and lock behavior remain
-    unchanged.
+    they need; namespace-lock consumers depend on `NamespaceLocking` instead of
+    full `StorageAPI`; and storage lock behavior remains unchanged.
   - Must preserve: table catalog object paths, metadata pointer semantics,
     optimistic write preconditions, object listing pagination, missing-object
-    handling, namespace write-lock acquisition, `StorageAPI::new_ns_lock`
-    compatibility, object APIs, scanner/heal/replication/config persistence,
-    and storage hot paths.
-  - Risk defense: do not remove `StorageAPI::new_ns_lock`, do not move traits
-    into `rustfs-storage-api`, do not change lock implementation code, do not
-    alter table catalog method bodies, and track the retained old lock method
-    with `RUSTFS_COMPAT_TODO(API-012)`.
+    handling, namespace write-lock acquisition, object APIs,
+    scanner/heal/replication/config persistence, and storage hot paths.
+  - Risk defense: do not move traits into `rustfs-storage-api`, do not change
+    lock implementation code, do not alter table catalog method bodies, and do
+    not retain stale API-012 compatibility markers after the old `StorageAPI`
+    lock method is removed.
   - Verification: focused compile/tests, migration guards, Rust risk scan, and
     required quality/architecture, migration-preservation, and
     testing/verification review passed.
@@ -359,43 +362,35 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `api-extraction`: continue API-012 namespace-lock-only cleanup after all
-   callers that only need locking depend on `NamespaceLocking`.
-2. `security-change`: make Local KMS unsafe defaults explicit development
+1. `security-change`: make Local KMS unsafe defaults explicit development
    opt-ins or production failures in KMSD-002.
-3. `security-change`: make Vault unsafe defaults explicit development opt-ins
+2. `security-change`: make Vault unsafe defaults explicit development opt-ins
    or production failures in KMSD-003.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the diff only removes the temporary API-003 public ECStore bucket DTO re-export and migrates remaining in-repo external consumers to `rustfs_storage_api`; bucket operation traits and runtime control flow remain unchanged. |
-| Migration preservation | pass | Confirmed ECStore keeps crate-private DTO visibility for its own implementation while no external in-repo consumer uses the old public `rustfs_ecstore::store_api` DTO path. |
-| Testing/verification | pass | Confirmed focused compile/tests, rustfs all-targets compile, heal/scanner test target compile, migration guards, dependency guard, source old-path scan, and added-line Rust risk scan cover this cleanup; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed the diff removes the temporary namespace-lock method from the full `StorageAPI` trait while keeping `NamespaceLocking` as the narrow operation-group contract. |
+| Migration preservation | pass | Confirmed ECStore, Sets, SetDisks, scanner leader locking, self-copy locking, replication resync, rebalance metadata, and config test storage retain their existing lock behavior and only narrow trait dependencies. |
+| Testing/verification | pass | Confirmed focused compile/tests, migration guards, dependency guard, old-path scan, and added-line Rust risk scan cover this cleanup; full pre-commit is skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
-Passed after rebasing onto `0a987d870b3dca248bea8d4872568a25e235d917`:
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs-heal -p rustfs-scanner -p rustfs-obs -p rustfs-protocols --lib`.
-- `cargo check -p rustfs --all-targets`.
-- `cargo test -p rustfs-storage-api --lib`; 7 passed.
-- `cargo test -p rustfs-ecstore --test storage_api_compat_test`; 1 passed.
-- `cargo test -p rustfs-heal --tests --no-run`.
+Passed on `7146c893cbbb84a0d5332a7a8a79b70d57191bcc`:
+- `cargo check -p rustfs-ecstore -p rustfs-scanner -p rustfs --all-targets`.
+- `cargo test -p rustfs-ecstore --test storage_api_compat_test`; 2 passed.
+- `cargo test -p rustfs-ecstore --lib new_ns_lock`; 2 passed.
 - `cargo test -p rustfs-scanner --tests --no-run`.
-- `cargo test -p rustfs-protocols --lib swift`; 0 matched, lib test target
-  compiled and ran successfully.
-- `cargo test -p rustfs-obs --lib stats_collector`; 14 passed.
+- `cargo test -p rustfs --lib --no-run`.
 - `cargo fmt --all --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
 - `git diff --check`.
-- API-003 source old-path and marker scan found no
-  `RUSTFS_COMPAT_TODO(API-003)` or
-  `rustfs_ecstore::store_api::{BucketInfo, BucketOptions,
-  DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp}` matches in
-  `crates/**/*.rs` or `rustfs/src`.
+- API-012 old-path and marker scan found no stale API-012 compatibility marker
+  or old full-storage-trait namespace-lock method references in `crates`,
+  `rustfs/src`, or architecture docs.
 - Added-line Rust risk scan found no new production `unwrap`/`expect`, lossy
   numeric casts, stringly public errors, boxed dynamic errors, stdout/stderr
   printing, or relaxed atomic ordering.
@@ -403,20 +398,21 @@ Passed after rebasing onto `0a987d870b3dca248bea8d4872568a25e235d917`:
 Notes:
 - Full pre-commit may be skipped if focused tests, compile checks, and guards
   pass, per the current instruction to increase PR granularity.
-- This slice removes only the old API-003 public bucket DTO re-export.
-  ECStore retains bucket operation traits, object/listing DTOs, storage
-  implementation wiring, and crate-private access to the storage API bucket
-  DTOs for its own trait implementations.
-- The old public `rustfs_ecstore::store_api` bucket DTO path is no longer
-  available after this cleanup. Consumers must use `rustfs_storage_api`.
+- This slice removes only the old namespace-lock method from the full storage
+  trait. ECStore retains bucket, object, listing, multipart, heal, replication,
+  rebalance, scanner, config persistence, and namespace-lock implementation
+  behavior.
+- Consumers that need namespace locks should depend on `NamespaceLocking`
+  instead of the full storage trait.
 
 ## Handoff Notes
 
-- Keep this API-003 cleanup slice as an `api-extraction` PR that only removes
-  the temporary public ECStore bucket DTO compatibility re-export, migrates
-  remaining in-repo external imports, and deletes the cleanup-register entry.
-- Do not move `ObjectOptions`, `ObjectInfo`, reader types, multipart DTOs,
-  list result DTOs, storage traits, bucket operation logic, storage runtime
-  wiring, route behavior, or storage persistence logic in this PR.
-- Do not add temporary compatibility code unless a matching
-  `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.
+- Keep this API-012 cleanup slice as an `api-extraction` PR that only removes
+  the temporary namespace-lock method from the full storage trait, migrates
+  namespace-lock consumers to `NamespaceLocking`, and deletes the
+  cleanup-register entry.
+- Do not move storage traits, bucket/object/list/multipart/heal operation
+  logic, lock implementation code, storage runtime wiring, route behavior, or
+  storage persistence logic in this PR.
+- Do not add temporary compatibility code unless a matching task marker and
+  cleanup-register entry are added.

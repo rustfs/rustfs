@@ -24,6 +24,7 @@ use tracing::{debug, info};
 const LOG_COMPONENT_NOTIFY: &str = "notify";
 const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
 const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
+const EVENT_NOTIFY_RUNTIME_SHUTDOWN_FAILED: &str = "notify_runtime_shutdown_failed";
 
 #[derive(Clone)]
 pub struct NotifyRuntimeFacade {
@@ -143,7 +144,13 @@ impl NotifyRuntimeFacade {
                 .shutdown(target_list.runtime_mut(), &mut replay_workers)
                 .await
             {
-                tracing::error!(error = %err, "Failed to shutdown notify runtime cleanly");
+                tracing::error!(
+                    event = EVENT_NOTIFY_RUNTIME_SHUTDOWN_FAILED,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    error = %err,
+                    "Failed to shutdown notify runtime cleanly"
+                );
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

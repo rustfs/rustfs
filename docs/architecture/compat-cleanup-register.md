@@ -18,12 +18,6 @@ for later deletion.
   - Why: legacy KMS create-key and key-status admin grants must keep working during the dedicated KMS policy migration.
   - Removal condition: remove after KMS admin clients and built-in policies use `kms:Configure`, `kms:DescribeKey`, and `kms:ListKeys`.
   - Status: planned cleanup.
-- `RUSTFS_COMPAT_TODO(API-012)`
-  - Task: `API-012`
-  - File: `crates/ecstore/src/store_api/traits.rs`
-  - Why: old `StorageAPI::new_ns_lock` callers must keep compiling while namespace-lock-only consumers migrate to NamespaceLocking.
-  - Removal condition: remove after all namespace-lock-only consumers depend on NamespaceLocking and StorageAPI no longer owns namespace lock capability.
-  - Status: planned cleanup.
 
 ## Review Checklist
 

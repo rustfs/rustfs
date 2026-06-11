@@ -27,7 +27,7 @@ use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::read_config;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
-use crate::store_api::{ObjectIO, ObjectInfo};
+use crate::store_api::{NamespaceLocking, ObjectIO, ObjectInfo};
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfReplicateEntry;
 use rustfs_filemeta::ReplicateDecision;
@@ -205,7 +205,7 @@ impl Default for ReplicationPoolOpts {
 }
 /// Main replication pool structure
 #[derive(Debug)]
-pub struct ReplicationPool<S: StorageAPI> {
+pub struct ReplicationPool<S: StorageAPI + NamespaceLocking> {
     // Atomic counters for active workers
     active_workers: Arc<AtomicI32>,
     active_lrg_workers: Arc<AtomicI32>,
@@ -245,7 +245,7 @@ pub struct ReplicationPool<S: StorageAPI> {
     resyncer: Arc<ReplicationResyncer>,
 }
 
-impl<S: StorageAPI> ReplicationPool<S> {
+impl<S: StorageAPI + NamespaceLocking> ReplicationPool<S> {
     /// Creates a new replication pool with specified options
     pub async fn new(opts: ReplicationPoolOpts, stats: Arc<ReplicationStats>, storage: Arc<S>) -> Arc<Self> {
         let max_workers = opts.max_workers.unwrap_or(WORKER_MAX_LIMIT);
@@ -1093,7 +1093,7 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
 
 // Implement the trait for ReplicationPool
 #[async_trait::async_trait]
-impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
+impl<S: StorageAPI + NamespaceLocking> ReplicationPoolTrait for ReplicationPool<S> {
     fn active_workers(&self) -> i32 {
         ReplicationPool::<S>::active_workers(self)
     }
@@ -1145,7 +1145,7 @@ lazy_static! {
 }
 
 /// Initializes background replication with the given options
-pub async fn init_background_replication<S: StorageAPI>(storage: Arc<S>) {
+pub async fn init_background_replication<S: StorageAPI + NamespaceLocking>(storage: Arc<S>) {
     let stats = GLOBAL_REPLICATION_STATS
         .get_or_init(|| async {
             let stats = Arc::new(ReplicationStats::new());
@@ -1169,7 +1169,12 @@ pub fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
     GLOBAL_REPLICATION_POOL.get().cloned()
 }
 
-pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc: ReplicateDecision, op_type: ReplicationType) {
+pub async fn schedule_replication<S: StorageAPI + NamespaceLocking>(
+    oi: ObjectInfo,
+    o: Arc<S>,
+    dsc: ReplicateDecision,
+    op_type: ReplicationType,
+) {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
     let tm = get_str(&oi.user_defined, SUFFIX_REPLICATION_TIMESTAMP)

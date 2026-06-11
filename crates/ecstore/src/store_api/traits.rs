@@ -179,25 +179,12 @@ pub trait NamespaceLocking: Send + Sync + Debug + 'static {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper>;
 }
 
-#[async_trait::async_trait]
-impl<T> NamespaceLocking for T
-where
-    T: StorageAPI + ?Sized + 'static,
-{
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        StorageAPI::new_ns_lock(self, bucket, object).await
-    }
-}
-
 /// Unified storage API combining all operation groups.
 ///
 /// Consumers can depend on specific sub-traits (e.g., `BucketOperations`)
 /// when they don't need the full API surface.
-#[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait StorageAPI:
     ObjectIO + BucketOperations + ObjectOperations + ListOperations + MultipartOperations + HealOperations + Debug
 {
-    // RUSTFS_COMPAT_TODO(API-012): keep old StorageAPI lock callers compiling while namespace-lock-only consumers migrate. Remove after namespace-lock-only consumers depend on NamespaceLocking and StorageAPI no longer owns namespace locking.
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper>;
 }
