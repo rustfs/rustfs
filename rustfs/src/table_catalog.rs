@@ -1447,7 +1447,7 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI,
+    S: StorageAPI + NamespaceLocking,
 {
     pub fn new(store: Arc<S>) -> Self {
         Self { store }
@@ -1558,7 +1558,7 @@ where
 
 impl<S> EcStoreTableCatalogObjectBackend<S>
 where
-    S: StorageAPI,
+    S: StorageAPI + NamespaceLocking,
 {
     async fn read_object_with_options(
         &self,
