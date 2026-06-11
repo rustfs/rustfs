@@ -300,6 +300,7 @@ impl SetDisks {
         // Check that the endpoint matches
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
+        new_disk.enable_health_check();
 
         if new_disk.is_local() {
             let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
@@ -337,7 +338,14 @@ impl SetDisks {
     }
 
     pub(super) async fn connect_endpoint(ep: &Endpoint) -> disk::error::Result<(DiskStore, FormatV3)> {
-        let disk = new_disk(ep, &DiskOption::default()).await?;
+        let disk = new_disk(
+            ep,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+        )
+        .await?;
 
         let fm = load_format_erasure(&disk, false).await?;
 
@@ -600,6 +608,45 @@ mod tests {
         assert!(
             infos.iter().all(|info| info.error.is_empty()),
             "runtime reprobe should recover a usable candidate set without probe errors"
+        );
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn renew_disk_enables_health_monitoring_for_recovered_disk() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, _) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![None; disk_count])),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints.clone(),
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        set_disks.renew_disk(&endpoints[0]).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        let renewed_disk = disks[0].as_ref().expect("renew_disk should attach the recovered disk");
+        assert!(
+            renewed_disk.health_check_enabled_for_test(),
+            "renewed disks must keep health monitoring enabled so later faulty marks can recover"
         );
 
         drop(temp_dirs);
