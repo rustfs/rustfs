@@ -5,15 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-api-next-contracts`
-- Baseline: `origin/main` at `87968275a776362e9b3734eac5bd9e3233d6cbe9`
+- Branch: `overtrue/arch-storage-api-bound-narrowing`
+- Baseline: `origin/main` at `6b86e3875c4912f3a7c27915b0bbd43399402847`
 - PR type for this branch: `dependency-migration`
 - Runtime behavior changes: none.
-- Rust code changes: remove duplicate admin-read methods from the old
-  `StorageAPI` trait after all admin inventory consumers have moved to
-  `StorageAdminApi`.
+- Rust code changes: narrow metadata helper generic bounds away from full
+  `StorageAPI` where helpers only need object I/O, object metadata/delete,
+  bucket listing, object listing, or `StorageAdminApi`.
 - CI/script changes: none.
-- Docs changes: record API-007 completion and the current admin surface cleanup
+- Docs changes: record API-008 completion and the current bound-narrowing
   context, verification evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
@@ -218,25 +218,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     drive-count, or disk-set inventory when the inventory-facing
     `StorageAdminApi` contract represents the same read-only operation.
 
-- [~] `API-008` Remove duplicate old-path admin surfaces.
-  - Current branch slice: remove admin-read methods from the old `StorageAPI`
-    trait and its ECStore/Sets/SetDisks test implementations after API-007
-    migrated their consumers.
+- [x] `API-008` Remove duplicate old-path admin surfaces.
+  - Completed slice: `rustfs/rustfs#3340` removed duplicate admin-read methods
+    from the old `StorageAPI` trait and its ECStore/Sets/SetDisks/test
+    implementations after API-007 migrated their consumers.
   - Acceptance: old `StorageAPI` keeps storage operation traits and
     `new_ns_lock`, while admin inventory surfaces live only on
     `StorageAdminApi`.
-  - Must preserve: object API trait bounds, namespace lock behavior, bucket,
-    object, list, multipart, and heal operations; config read/write byte shape;
-    dynamic storage-class lookup; object/rebalance object selection paths;
-    scanner cache persistence; replication/tier persistence; and storage hot
-    paths.
-  - Risk defense: do not remove `StorageAPI` itself, do not move object/config
-    persistence contracts, and only replace previous `SetDisks::get_disks(0, 0)`
-    trait calls with the same internal `disk_inventory()` data source that the
-    old impl returned.
-  - Verification: pending focused compile/tests, migration guards, Rust risk
-    scan, and required quality/architecture, migration-preservation, and
-    testing/verification review.
+
+- [~] `API-009` Narrow metadata helper storage bounds.
+  - Current branch slice: narrow server config, tier config, rebalance
+    metadata, and startup metadata migration helper bounds away from full
+    `StorageAPI` when the helper only needs `ObjectIO`, `ObjectOperations`,
+    `BucketOperations`, `ListOperations`, or `StorageAdminApi`.
+  - Acceptance: metadata helper contracts express the actual operation group
+    they need, while callers and persistence behavior remain unchanged.
+  - Must preserve: config/tier/rebalance serialized byte shapes, read/write
+    object names, legacy bucket/IAM migration normalization and skip behavior,
+    lock behavior around rebalance metadata merge, dynamic storage-class lookup,
+    object APIs, scanner cache persistence, heal repair, replication
+    persistence, and storage hot paths.
+  - Risk defense: do not move traits to `rustfs-storage-api`, do not remove
+    `StorageAPI`, do not alter helper bodies or storage options, and keep
+    `save_rebalance_meta_with_merge` on full `StorageAPI` because it still needs
+    `new_ns_lock`.
+  - Verification: focused compile/tests, migration guards, Rust risk scan, and
+    required quality/architecture, migration-preservation, and
+    testing/verification review passed before push.
 
 ## Phase 8 Background Controller Tasks
 
@@ -261,28 +269,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `consumer-migration`: migrate the remaining readiness/admin/capacity
-   consumers to the inventory-facing admin contract one group at a time.
-2. `dependency-migration`: remove duplicate old-path admin surfaces only after
-   consumer migration proves equivalent behavior.
-3. `api-extraction`: move only the pure server-config model into
+1. `dependency-migration`: narrow metadata/helper bounds away from full
+   `StorageAPI` where the helper only needs a specific operation trait.
+2. `api-extraction`: move only the pure server-config model into
    rustfs-config as CFG-003.
-4. `api-extraction`: keep the old rustfs_ecstore::config::* path with
+3. `api-extraction`: keep the old rustfs_ecstore::config::* path with
    RUSTFS_COMPAT_TODO(CFG-004) and cleanup-register coverage.
-5. `consumer-migration`: migrate external consumers one group at a time only
+4. `consumer-migration`: migrate external consumers one group at a time only
    after the model path and compatibility shim are stable.
-6. `security-change`: make Local KMS unsafe defaults explicit development
+5. `security-change`: make Local KMS unsafe defaults explicit development
    opt-ins or production failures in KMSD-002.
-7. `security-change`: make Vault unsafe defaults explicit development opt-ins
+6. `security-change`: make Vault unsafe defaults explicit development opt-ins
    or production failures in KMSD-003.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the old `StorageAPI` now keeps only operation traits and `new_ns_lock`, admin inventory surfaces remain on `StorageAdminApi`, dependency direction is clean, and scope/naming stay limited to API-008. |
-| Migration preservation | pass | Confirmed object/bucket/list/multipart/heal contracts, namespace locks, config byte paths, dynamic storage-class behavior, rebalance selection, scanner cache, heal repair, replication/tier/config persistence, and storage hot paths are preserved. |
-| Testing/verification | pass | Initially requested wider rebalance coverage; after `cargo test -p rustfs-ecstore rebalance --lib` passed, confirmed the focused matrix is sufficient for this larger dependency-migration slice while skipping full pre-commit per current instruction. |
+| Quality/architecture | pass | Confirmed the Rust diff only changes imports/generic bounds, the new operation-group bounds match actual calls, `StorageAPI` and `new_ns_lock` remain where needed, and no over-abstraction, naming regression, dependency reversal, or hot-path intrusion was found. |
+| Migration preservation | pass | Confirmed config/tier/rebalance byte shapes, object names, buckets, options, bucket/IAM normalization and skip behavior, dynamic storage-class lookup, and rebalance metadata merge locking remain unchanged. |
+| Testing/verification | pass | Confirmed the focused compile, config/tier/rebalance/bucket migration tests, migration guards, diff hygiene, and added-line Rust risk scan are sufficient; full pre-commit can be skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
@@ -292,42 +298,40 @@ Passed:
 - `cargo fmt --all --check`.
 - `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`.
 - `cargo test -p rustfs-ecstore config --lib`; 59 passed.
-- `cargo test -p rustfs-ecstore store::rebalance --lib`; 19 passed.
+- `cargo test -p rustfs-ecstore tier --lib`; 27 passed.
 - `cargo test -p rustfs-ecstore rebalance --lib`; 198 passed.
-- `cargo test -p rustfs-ecstore set_disk --lib`; 86 passed.
+- `cargo test -p rustfs-ecstore bucket::migration --lib`; 2 passed.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
 - `./scripts/check_unsafe_code_allowances.sh`.
 - `git diff --check`.
-- Rust code-quality scan on changed `.rs` files, plus added-line scan for
-  unwrap/expect, numeric casts, `Result<_, String>`, `Box<dyn Error>`,
-  println/eprintln, and `Ordering::Relaxed`.
+- Rust code-quality scan on changed `.rs` files: broad full-file matches are
+  pre-existing test/business-code patterns; added-line scan found no new
+  unwrap/expect, numeric cast, `Result<_, String>`, `Box<dyn Error>`,
+  println/eprintln, or `Ordering::Relaxed`.
 
 Notes:
 - Full pre-commit is intentionally skipped when the focused tests and guards
   pass, per the current instruction to increase PR granularity.
-- The broad changed-file quality scan reports pre-existing unwrap/cast matches
-  and `Result<String>` business return values in touched ECStore files; the
-  added-line scan found no new risky code patterns.
-- Old `StorageAPI` remains as the object/bucket/list/multipart/heal namespace
-  lock contract; only duplicate admin inventory methods are removed.
-- Config dynamic storage-class lookup now reads drive counts through
-  `StorageAdminApi`.
-- Object/rebalance object selection paths, scanner cache persistence, heal
-  object repair, object APIs, replication/config/tier persistence paths, and
-  storage hot paths must remain unchanged.
+- This slice changes generic bounds and imports only; helper bodies, storage
+  options, object names, and metadata normalization logic are unchanged.
+- `save_rebalance_meta_with_merge` intentionally still requires full
+  `StorageAPI` because it uses `new_ns_lock`.
 - No temporary compatibility shim was added.
 
 ## Handoff Notes
 
-- Keep this API-008 slice as a `dependency-migration` PR that only removes
-  duplicate admin inventory methods from old `StorageAPI`.
+- Keep this API-009 slice as a `dependency-migration` PR that only narrows
+  metadata/helper generic bounds for config, tier, rebalance, and startup
+  metadata migration helpers.
 - Do not remove `StorageAPI` itself, object operation traits, or
   `new_ns_lock` in this PR.
-- Do not migrate scanner cache writes, heal object repair, object APIs,
-  replication, config/tier persistence, or storage hot-path consumers in this
-  PR.
-- Do not make the old `StorageAPI` trait inherit `StorageAdminApi`.
+- Do not move traits into `rustfs-storage-api` or introduce new compatibility
+  shims in this PR.
+- Do not alter config/tier/rebalance serialized byte shapes, legacy bucket/IAM
+  migration normalization, object names, storage options, scanner cache writes,
+  heal object repair, object APIs, replication persistence, or storage hot-path
+  consumers in this PR.
 - Do not add temporary compatibility code unless a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.
