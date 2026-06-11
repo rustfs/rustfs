@@ -5,16 +5,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-replication-resync-bounds`
-- Baseline: `origin/main` at `7191a3abae08918eedb117955280dc81e65450de`
+- Branch: `overtrue/arch-storage-api-helper-cleanup`
+- Baseline: `origin/main` at `2f7cc7cb9e5891b46db6e686c67636e9343762ce`
 - PR type for this branch: `dependency-migration`
 - Runtime behavior changes: none.
-- Rust code changes: narrow replication resync metadata helper generic bounds
-  away from full `StorageAPI` where helpers only need object I/O.
+- Rust code changes: narrow scanner data-usage cache load/save helper generic
+  bounds away from full `StorageAPI` where helpers only need object I/O.
 - CI/script changes: none.
-- Docs changes: record API-009 completion and the current replication resync
-  metadata bound-narrowing context, verification evidence, and expert review
-  outcomes.
+- Docs changes: record API-010 completion and the current scanner cache
+  bound-narrowing context, verification evidence, and expert review outcomes.
 
 ## Phase 0 Tasks
 
@@ -235,23 +234,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Acceptance: metadata helper contracts express the actual operation group
     they need, while callers and persistence behavior remain unchanged.
 
-- [~] `API-010` Narrow replication resync metadata bounds.
-  - Current branch slice: narrow replication resync status load/save/mark/persist
-    helper bounds away from full `StorageAPI` when the helper only needs
-    `ObjectIO`.
+- [x] `API-010` Narrow replication resync metadata bounds.
+  - Completed slice: `rustfs/rustfs#3345` narrowed replication resync status
+    load/save/mark/persist helper bounds away from full `StorageAPI` when the
+    helper only needs `ObjectIO`.
   - Acceptance: resync metadata helpers express object-I/O-only persistence
     requirements, while replication execution, delete replication, multipart
     replication, object lookups, and scheduling behavior remain on full
     `StorageAPI` where needed.
-  - Must preserve: resync status serialization, resync metadata object paths,
-    in-memory status-map mutation order, stale-update rejection, periodic
-    persistence cadence, worker-token behavior, target replication decisions,
-    object replication, delete replication, multipart replication, scanner,
-    heal, and storage hot paths.
+
+- [~] `API-011` Narrow scanner cache helper storage bounds.
+  - Current branch slice: narrow scanner data-usage cache load/save and cache
+    snapshot persistence helper bounds away from full `StorageAPI` when the
+    helper only needs `ObjectIO`.
+  - Acceptance: scanner cache persistence helpers express object-I/O-only
+    requirements, while scanner cycle orchestration, bucket scanning, local disk
+    selection, cache publication, and storage hot paths remain unchanged.
+  - Must preserve: data-usage cache wire format, cache object paths, backup
+    cache paths, retry and timeout behavior, cache-save metrics, publish/update
+    channel behavior, scanner cycle scheduling, disk scan concurrency, bucket
+    scan semantics, lifecycle/replication decisions, and storage hot paths.
   - Risk defense: do not move traits to `rustfs-storage-api`, do not remove
-    `StorageAPI`, do not alter helper bodies or storage options, and do not
-    narrow replication execution paths that use object/list/multipart/delete
-    operations beyond metadata persistence.
+    `StorageAPI`, do not alter helper bodies, and do not narrow scanner paths
+    that need bucket operations, disk inventory, or full storage orchestration.
   - Verification: focused compile/tests, migration guards, and Rust risk scan
     passed; required quality/architecture, migration-preservation, and
     testing/verification review is pending before push.
@@ -279,8 +284,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `dependency-migration`: narrow replication resync metadata helper bounds
-   away from full `StorageAPI` where the helper only needs `ObjectIO`.
+1. `dependency-migration`: narrow scanner data-usage cache helper bounds away
+   from full `StorageAPI` where the helper only needs `ObjectIO`.
 2. `api-extraction`: move only the pure server-config model into
    rustfs-config as CFG-003.
 3. `api-extraction`: keep the old rustfs_ecstore::config::* path with
@@ -296,19 +301,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the Rust diff only adds the `ObjectIO` import and narrows resync metadata load/save/mark/persist helper bounds; helper bodies are unchanged, broader replication execution paths remain on `StorageAPI`, and no new abstraction or crate split was added. |
-| Migration preservation | pass | Confirmed `read_config`/`save_config` already use the `ObjectIO` contract, while resync metadata serialization, object paths, storage options, status-map flow, and object/delete/multipart replication paths remain unchanged. |
-| Testing/verification | pass | Confirmed the focused compile, replication/resync tests, migration guards, diff hygiene, and added-line risk scan are sufficient for this generic-bound-only slice, so full pre-commit can be skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed the Rust diff only narrows scanner cache helper bounds from `StorageAPI` to `ObjectIO`; helper bodies, scanner orchestration, bucket/disk/lifecycle/replication paths, and storage hot paths are unchanged. |
+| Migration preservation | pass | Confirmed `ObjectIO` covers the actual `get_object_reader` and `put_object` calls, while cache wire format, object paths, backup behavior, retry/timeouts, metrics, publish/update flow, scanner scheduling, concurrency, and bucket scanning remain unchanged. |
+| Testing/verification | pass | Confirmed the focused compile, `data_usage` and `scanner_io` tests, migration guards, diff hygiene, and added-line risk scan are sufficient for this generic-bound-only slice, so full pre-commit can be skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
 Passed:
 - `cargo fmt --all`.
-- `cargo check -p rustfs-ecstore`.
+- `cargo check -p rustfs-scanner -p rustfs-ecstore -p rustfs --lib`.
 - `cargo fmt --all --check`.
-- `cargo check -p rustfs-storage-api -p rustfs-ecstore -p rustfs --lib`.
-- `cargo test -p rustfs-ecstore replication --lib`; 58 passed.
-- `cargo test -p rustfs-ecstore resync --lib`; 31 passed.
+- `cargo test -p rustfs-scanner data_usage --lib`; 21 passed.
+- `cargo test -p rustfs-scanner scanner_io --lib`; 18 passed.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
@@ -323,24 +327,25 @@ Passed:
 Notes:
 - Full pre-commit is intentionally skipped when the focused tests and guards
   pass, per the current instruction to increase PR granularity.
-- This slice changes generic bounds and imports only; helper bodies, storage
-  options, object paths, and resync serialization logic are unchanged.
-- Replication execution paths intentionally still require full `StorageAPI`
-  where they use object/list/multipart/delete operations.
+- This slice changes generic bounds and imports only; helper bodies, cache
+  object paths, backup paths, retry/timeout behavior, metrics, and publish
+  logic are unchanged.
+- Scanner orchestration paths intentionally still require full `StorageAPI`
+  where they use bucket operations, disk inventory, or broader storage
+  orchestration.
 - No temporary compatibility shim was added.
 
 ## Handoff Notes
 
-- Keep this API-010 slice as a `dependency-migration` PR that only narrows
-  replication resync metadata helper generic bounds.
+- Keep this API-011 slice as a `dependency-migration` PR that only narrows
+  scanner data-usage cache helper generic bounds.
 - Do not remove `StorageAPI` itself, object operation traits, or
   `new_ns_lock` in this PR.
 - Do not move traits into `rustfs-storage-api` or introduce new compatibility
   shims in this PR.
-- Do not alter resync status serialization, metadata object paths, stale-update
-  rejection, status-map mutation order, periodic persistence cadence, worker
-  token behavior, replication execution, delete replication, multipart
-  replication, scanner cache writes, heal object repair, object APIs, or storage
-  hot-path consumers in this PR.
+- Do not alter data-usage cache wire format, cache object paths, backup paths,
+  retry/timeout behavior, metrics, update publication, scanner cycle
+  orchestration, bucket scanning, disk scan concurrency, heal object repair,
+  object APIs, or storage hot-path consumers in this PR.
 - Do not add temporary compatibility code unless a matching
   `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.
