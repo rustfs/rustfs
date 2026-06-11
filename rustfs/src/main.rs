@@ -28,7 +28,7 @@ use rustfs::init::init_sftp_system;
 
 use futures_util::future::join_all;
 use rustfs::capacity::capacity_integration::init_capacity_management;
-use rustfs::license::{current_license, init_license, license_status};
+use rustfs::license::{init_license, license_status};
 use rustfs::server::{
     ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
@@ -73,6 +73,22 @@ const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
 const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
+const LOG_COMPONENT_MAIN: &str = "main";
+const LOG_SUBSYSTEM_STARTUP: &str = "startup";
+const LOG_SUBSYSTEM_LICENSE: &str = "license";
+const LOG_SUBSYSTEM_AUTH: &str = "auth";
+const EVENT_EXTERNAL_ENV_COMPAT_CONFLICT: &str = "external_env_compat_conflict";
+const EVENT_EXTERNAL_ENV_COMPAT_APPLIED: &str = "external_env_compat_applied";
+const EVENT_DIAL9_RUNTIME_STATUS: &str = "dial9_runtime_status";
+const EVENT_RUNTIME_LICENSE_STATUS: &str = "runtime_license_status";
+const EVENT_TLS_OUTBOUND_INITIALIZED: &str = "tls_outbound_initialized";
+const EVENT_DEFAULT_CREDENTIALS_DETECTED: &str = "default_credentials_detected";
+const EVENT_SERVER_CONFIG_SANITIZED: &str = "server_config_sanitized";
+const EVENT_SERVER_STARTING: &str = "server_starting";
+const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
+const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
+const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
+const EVENT_SERVER_READY: &str = "server_ready";
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -82,10 +98,6 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    if let Err(err) = bootstrap_external_prefix_compat() {
-        eprintln!("[WARN] Failed to bootstrap external-prefix compatibility: {err}");
-    }
-
     // Build Tokio runtime with optional dial9 telemetry support
     let runtime = rustfs::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
@@ -96,29 +108,9 @@ fn main() {
     }
 }
 
-fn bootstrap_external_prefix_compat() -> Result<()> {
+fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
     let env_compat_report = apply_external_env_compat();
-    if env_compat_report.conflict_count() > 0 {
-        // RUSTFS_* is the canonical namespace in this codebase, so on key conflicts we keep RUSTFS_*
-        // to preserve explicit user/operator overrides and avoid changing existing runtime behavior.
-        eprintln!(
-            "[WARN] Found {} source/RUSTFS_ conflict(s), keeping RUSTFS_ values: {}",
-            env_compat_report.conflict_count(),
-            env_compat_report.conflict_keys.join(", ")
-        );
-    }
-
-    if env_compat_report.mapped_count() == 0 {
-        return Ok(());
-    }
-
-    eprintln!(
-        "[INFO] Applying external-prefix compatibility in-process for {} variable(s): {}",
-        env_compat_report.mapped_count(),
-        format_external_prefix_mappings(&env_compat_report)
-    );
-
-    Ok(())
+    Ok(env_compat_report)
 }
 
 fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
@@ -137,6 +129,8 @@ fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
 const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
 
 async fn async_main() -> Result<()> {
+    let env_compat_report = bootstrap_external_prefix_compat()?;
+
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let command_result = match rustfs::config::Opt::parse_command(args) {
@@ -176,7 +170,7 @@ async fn async_main() -> Result<()> {
     // Store in global storage
     match set_global_guard(guard).map_err(Error::other) {
         Ok(_) => {
-            info!(target: "rustfs::main", "Global observability guard set successfully.");
+            debug!(target: "rustfs::main", "Global observability guard set successfully.");
         }
         Err(e) => {
             error!("Failed to set global observability guard: {}", e);
@@ -184,22 +178,42 @@ async fn async_main() -> Result<()> {
         }
     }
 
+    log_external_prefix_compat_report(&env_compat_report);
+
     // Check dial9 Tokio runtime telemetry status
     // Note: The actual telemetry session is created in build_tokio_runtime()
     // which stores the TelemetryGuard globally for the program duration.
     if rustfs_obs::dial9::is_enabled() {
-        info!(target: "rustfs::main", "Dial9 Tokio telemetry is configured as enabled; runtime guard was installed during startup.");
+        info!(
+            target: "rustfs::main",
+            event = EVENT_DIAL9_RUNTIME_STATUS,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            enabled = true,
+            "Dial9 Tokio runtime telemetry is enabled"
+        );
     } else {
-        info!(target: "rustfs::main", "Dial9 Tokio telemetry is not configured (set RUSTFS_RUNTIME_DIAL9_ENABLED=true to enable).");
+        debug!(
+            target: "rustfs::main",
+            event = EVENT_DIAL9_RUNTIME_STATUS,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            enabled = false,
+            "Dial9 Tokio runtime telemetry is disabled"
+        );
     }
 
-    info!("license status: {}", license_status());
-    if let Some(token) = current_license() {
-        info!("runtime license loaded: {}", token.name);
-    }
+    info!(
+        target: "rustfs::main",
+        event = EVENT_RUNTIME_LICENSE_STATUS,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_LICENSE,
+        license_status = %license_status(),
+        "Initialized runtime license state"
+    );
 
     // print startup logo
-    info!("{}", rustfs::server::LOGO);
+    debug!("{}", rustfs::server::LOGO);
 
     // Initialize performance profiling if enabled
     rustfs::profiling::init_from_env().await;
@@ -223,7 +237,15 @@ async fn async_main() -> Result<()> {
                 let generation = TlsGeneration(rustfs_common::get_global_outbound_tls_generation().saturating_add(1));
                 publish_global_outbound_tls_state(generation, &snapshot.outbound).await;
                 record_tls_generation("rustfs_server_startup", generation.0);
-                info!(target: "rustfs::main", "TLS outbound material initialized from {}", tls_path);
+                info!(
+                    target: "rustfs::main",
+                    event = EVENT_TLS_OUTBOUND_INITIALIZED,
+                    component = LOG_COMPONENT_MAIN,
+                    subsystem = LOG_SUBSYSTEM_STARTUP,
+                    tls_path,
+                    generation = generation.0,
+                    "Initialized TLS outbound material"
+                );
             }
             Err(e) => {
                 error!("Failed to initialize TLS from {}: {}", tls_path, e);
@@ -247,7 +269,23 @@ async fn async_main() -> Result<()> {
 
 #[instrument(skip(config))]
 async fn run(config: rustfs::config::Config) -> Result<()> {
-    debug!("config: {:?}", &config);
+    debug!(
+        target: "rustfs::main::run",
+        event = EVENT_SERVER_CONFIG_SANITIZED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        address = %config.address,
+        volume_count = config.volumes.len(),
+        server_domain_count = config.server_domains.len(),
+        console_enable = config.console_enable,
+        console_address = %config.console_address,
+        tls_enabled = config.tls_path.as_deref().is_some_and(|value| !value.trim().is_empty()),
+        kms_enable = config.kms_enable,
+        kms_backend = %config.kms_backend,
+        region = config.region.as_deref().unwrap_or_default(),
+        buffer_profile = %config.buffer_profile,
+        "Loaded sanitized server configuration"
+    );
     // 1. Initialize global readiness tracker
     let readiness = Arc::new(GlobalReadiness::new());
 
@@ -263,23 +301,32 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     let server_address = server_addr.to_string();
 
     if is_using_default_credentials(&config) {
-        warn!("{}", DEFAULT_CREDENTIALS_WARNING_MESSAGE);
+        warn!(
+            target: "rustfs::main::run",
+            event = EVENT_DEFAULT_CREDENTIALS_DETECTED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_AUTH,
+            warning = DEFAULT_CREDENTIALS_WARNING_MESSAGE,
+            "{DEFAULT_CREDENTIALS_WARNING_MESSAGE}"
+        );
     }
 
     info!(
         target: "rustfs::main::run",
+        event = EVENT_SERVER_STARTING,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
         server_address = %server_address,
         ip = %server_addr.ip(),
         port = %server_port,
         version = %rustfs::version::get_version(),
-        "Starting RustFS server at {}",
-        &server_address
+        "Starting RustFS server"
     );
 
     // Set up AK and SK
     match init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone())) {
         Ok(_) => {
-            info!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
+            debug!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
         }
         Err(e) => {
             let msg = format!("init global action credentials failed: {e:?}");
@@ -316,7 +363,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     update_erasure_type(setup_type).await;
 
     // Initialize the local disk
-    info!(
+    debug!(
         target: "rustfs::main::run",
         "starting local disk initialization"
     );
@@ -339,6 +386,11 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
             target: "rustfs::main::run",
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            pool_id = i + 1,
+            set_count = eps.set_count,
+            drives_per_set = eps.drives_per_set,
             "Formatting {}st pool, {} set(s), {} drives per set.",
             i + 1,
             eps.set_count,
@@ -351,7 +403,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     }
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
-        info!(
+        debug!(
             target: "rustfs::main::run",
             id = i,
             set_count = eps.set_count,
@@ -362,7 +414,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
         );
 
         for ep in eps.endpoints.as_ref().iter() {
-            info!(
+            debug!(
                 target: "rustfs::main::run",
                 "  - endpoint: {}", ep
             );
@@ -394,7 +446,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // init store
     // 2. Start Storage Engine (ECStore)
-    info!(
+    debug!(
         target: "rustfs::main::run",
         "starting ECStore initialization"
     );
@@ -566,7 +618,12 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
     if keystone_config.enable {
         match rustfs::auth_keystone::init_keystone_auth(keystone_config).await {
-            Ok(_) => info!("Keystone authentication initialized successfully"),
+            Ok(_) => info!(
+                event = EVENT_KEYSTONE_AUTH_INITIALIZED,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_AUTH,
+                "Initialized Keystone authentication"
+            ),
             Err(e) => {
                 error!("Failed to initialize Keystone authentication: {}", e);
                 // Continue without Keystone - fall back to standard auth
@@ -576,7 +633,13 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // 3b. Initialize OIDC System (non-fatal if no providers configured)
     if let Err(e) = init_oidc_sys().await {
-        warn!("OIDC initialization failed (non-fatal): {}", e);
+        warn!(
+            event = EVENT_OIDC_INITIALIZATION_FAILED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_AUTH,
+            error = %e,
+            "OIDC initialization failed; continuing without OIDC providers"
+        );
     }
 
     add_bucket_notification_configuration(buckets.clone()).await;
@@ -596,9 +659,12 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     info!(
         target: "rustfs::main::run",
+        event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
         enable_scanner = enable_scanner,
         enable_heal = enable_heal,
-        "Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal
+        "Configured background services"
     );
 
     // Scanner depends on the heal channel/manager, so scanner implies heal.
@@ -608,7 +674,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     }
 
     if !enable_heal && !enable_scanner {
-        info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
+        debug!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
 
     // print server info
@@ -628,10 +694,14 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     info!(
         target: "rustfs::main::run",
-        "RustFS server version: {} started successfully at {}, current time: {}",
-        rustfs::version::get_version(),
-        &server_address,
-        jiff::Zoned::now()
+        event = EVENT_SERVER_READY,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        version = %rustfs::version::get_version(),
+        server_address = %server_address,
+        started_at = %jiff::Zoned::now(),
+        iam_bootstrap = ?iam_bootstrap,
+        "RustFS server started successfully"
     );
     if iam_bootstrap == IamBootstrapDisposition::ReadyInline {
         rustfs::server::publish_ready_when_runtime_ready(readiness.as_ref(), Some(state_manager.as_ref())).await?;
@@ -662,6 +732,32 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     info!(target: "rustfs::main::run","server is stopped state: {:?}", state_manager.current_state());
     Ok(())
+}
+
+fn log_external_prefix_compat_report(report: &ExternalEnvCompatReport) {
+    if report.conflict_count() > 0 {
+        warn!(
+            target: "rustfs::main",
+            event = EVENT_EXTERNAL_ENV_COMPAT_CONFLICT,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            conflict_count = report.conflict_count(),
+            conflict_keys = %report.conflict_keys.join(", "),
+            "Detected external-prefix compatibility conflicts; keeping RUSTFS_ values"
+        );
+    }
+
+    if report.mapped_count() > 0 {
+        info!(
+            target: "rustfs::main",
+            event = EVENT_EXTERNAL_ENV_COMPAT_APPLIED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            mapped_count = report.mapped_count(),
+            mapped_pairs = %format_external_prefix_mappings(report),
+            "Applied external-prefix compatibility mappings"
+        );
+    }
 }
 
 /// Shutdown channels for every protocol server. None means the protocol was
