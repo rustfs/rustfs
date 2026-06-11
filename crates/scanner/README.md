@@ -1,21 +1,9 @@
 # RustFS Scanner
 
-RustFS Scanner 提供了数据完整性检查、健康监控和存储分析等扫描功能。
+RustFS Scanner 是后台维护扫描循环，负责用量统计、生命周期过期和分层转移准入、桶复制修复准入、scanner 发起的 heal/bitrot 检查，以及命名空间告警。
 
-## 功能特性
-
-- 数据完整性扫描
-- 健康监控
-- 存储分析
-- 可扩展的扫描框架
-
-## 使用示例
-
-```rust
-use rustfs_scanner::ScannerError;
-
-// TODO: 添加使用示例
-```
+面向运维人员的运行时控制项、状态字段和调参流程，请参考
+[Scanner Runtime Controls](../../docs/operations/scanner-runtime-controls.md)。
 
 ## 开发
 
