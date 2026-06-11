@@ -78,7 +78,7 @@ fn scanner_cycle_max_duration() -> Option<Duration> {
 }
 
 fn resolve_scanner_runtime_config() -> crate::runtime_config::ScannerRuntimeConfig {
-    let config = rustfs_ecstore::config::get_global_server_config();
+    let config = rustfs_config::server_config::get_global_server_config();
     match lookup_scanner_runtime_config(config.as_ref()) {
         Ok(config) => config,
         Err(err) => {

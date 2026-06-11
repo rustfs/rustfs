@@ -30,6 +30,12 @@ for later deletion.
   - Why: old `StorageAPI::new_ns_lock` callers must keep compiling while namespace-lock-only consumers migrate to NamespaceLocking.
   - Removal condition: remove after all namespace-lock-only consumers depend on NamespaceLocking and StorageAPI no longer owns namespace lock capability.
   - Status: planned cleanup.
+- `RUSTFS_COMPAT_TODO(CFG-008)`
+  - Task: `CFG-008`
+  - File: `crates/ecstore/src/config/mod.rs`
+  - Why: old `rustfs_ecstore::config` global server-config accessor paths must keep compiling while runtime consumers migrate.
+  - Removal condition: remove after all consumers import global server-config accessors from `rustfs_config::server_config`.
+  - Status: planned cleanup.
 
 ## Review Checklist
 

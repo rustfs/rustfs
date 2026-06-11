@@ -5,17 +5,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-config-compat-cleanup`
-- Baseline: `origin/main` at `69549634ea9524724dafd6bd90c8639880a2dbc6`
+- Branch: `overtrue/arch-config-global-state`
+- Baseline: `origin/main` at `ed3851782c48131e6102735d44d80fb6014a0699`
 - PR type for this branch: `api-extraction`
-- Runtime behavior changes: none.
-- Rust code changes: remove the temporary CFG-004
-  `rustfs_ecstore::config` server-config model compatibility re-export and its
-  smoke test after all in-repo consumers migrated to
-  `rustfs_config::server_config`.
+- Runtime behavior changes: none intended.
+- Rust code changes: move the process-global server-config snapshot accessors
+  to `rustfs_config::server_config`, migrate in-repo direct consumers to the
+  new owner, and keep a temporary ECStore compatibility re-export for the old
+  accessor path.
 - CI/script changes: none.
-- Docs changes: record CFG-004 cleanup context, update the compatibility
-  cleanup register, and mark the model-boundary ADR cleanup status.
+- Docs changes: record CFG-008 global accessor ownership, update the
+  compatibility cleanup register, and mark the model-boundary ADR follow-up.
 
 ## Phase 0 Tasks
 
@@ -116,6 +116,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     env overrides, persisted-config validation, cycle scheduling, bitrot-cycle
     compatibility, cache timeout, and alert threshold semantics remain
     unchanged.
+- [x] `CFG-008` Move global server-config accessors.
+  - Current branch: move `GLOBAL_SERVER_CONFIG`,
+    `get_global_server_config`, and `set_global_server_config` to
+    `rustfs_config::server_config`; migrate in-repo runtime consumers to the
+    new owner.
+  - Compatibility: keep
+    `rustfs_ecstore::config::{get_global_server_config,
+    set_global_server_config}` as a temporary re-export with
+    `RUSTFS_COMPAT_TODO(CFG-008)`.
+  - Acceptance: ECStore still owns `ConfigSys`, config persistence helpers,
+    storage-class global state, default registration wiring, and startup
+    initialization; global server-config reads and writes keep the same
+    `std::sync::RwLock<Option<Config>>` clone semantics.
 
 ## Phase 1 Security Governance Tasks
 
@@ -349,25 +362,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | Confirmed the diff only removes the temporary model re-export and smoke test; ECStore persistence helpers, global state, startup wiring, and default registration remain unchanged. |
-| Migration preservation | pass | Confirmed `ConfigSys`, `GLOBAL_SERVER_CONFIG`, storage-class globals/accessors, read/save/serde paths, scanner/admin consumers, and in-repo model imports remain correct after old-path removal. |
-| Testing/verification | pass | Confirmed ECStore config tests, rustfs-config/ECStore/server compile check, migration guards, old-path scan, and added-line risk scan are sufficient; full pre-commit is skipped under the current larger-granularity instruction. |
+| Quality/architecture | pass | Confirmed the diff only moves the process-global server-config snapshot accessors to `rustfs-config`, keeps ECStore persistence and storage-class ownership unchanged, and keeps the old accessor path as a temporary compatibility re-export. |
+| Migration preservation | pass | Confirmed scanner, IAM, admin, app context, and ECStore store consumers read and write the same global server-config snapshot through the new owner without changing startup, persistence, or storage behavior. |
+| Testing/verification | pass | Confirmed focused compile/tests, migration guards, old-path scan, dependency check, and Rust risk scan cover the changed accessor ownership; full pre-commit is skipped under the current larger-granularity instruction. |
 
 ## Verification Notes
 
 Passed:
+- `cargo check -p rustfs-config -p rustfs-ecstore -p rustfs-iam -p rustfs-scanner -p rustfs --lib`.
+- `cargo test -p rustfs-config --lib`; 26 passed.
 - `cargo test -p rustfs-ecstore config --lib`; 59 passed.
-- `cargo check -p rustfs-config -p rustfs-ecstore -p rustfs --lib`.
+- `cargo test -p rustfs-scanner runtime_config --lib`; 16 passed.
+- `cargo test -p rustfs admin::handlers::config_admin --lib`; 29 passed.
+- `cargo test -p rustfs admin::handlers::oidc --lib`; 20 passed.
+- `cargo test -p rustfs-iam oidc --lib`; 53 passed.
 - `cargo fmt --all --check`.
 - `./scripts/check_architecture_migration_rules.sh`.
 - `./scripts/check_layer_dependencies.sh`.
 - `./scripts/check_metrics_migration_refs.sh`.
-- `./scripts/check_unsafe_code_allowances.sh`.
 - `git diff --check`.
-- CFG-004 old model code-path scan found no
-  `rustfs_ecstore::config::{Config, KV, KVS, DEFAULT_KVS,
-  register_default_kvs}` imports and no `RUSTFS_COMPAT_TODO(CFG-004)` markers
-  in `crates/**/*.rs` or `rustfs/src`.
+- `cargo tree -p rustfs-config --edges normal` found no dependency on
+  `rustfs-ecstore`, `rustfs-scanner`, `rustfs-iam`, or `rustfs`.
+- CFG-008 old accessor code-path scan found no direct in-repo runtime imports
+  from `rustfs_ecstore::config::{get_global_server_config,
+  set_global_server_config}` or `crate::config::{get_global_server_config,
+  set_global_server_config}` in `crates/**/*.rs` or `rustfs/src`.
 - Added-line risk scan found no production `unwrap`/`expect`, lossy numeric
   casts, stringly public errors, boxed dynamic errors, stdout/stderr printing,
   or relaxed atomic ordering.
@@ -375,20 +394,25 @@ Passed:
 Notes:
 - Full pre-commit may be skipped if focused tests, compile checks, and guards
   pass, per the current instruction to increase PR granularity.
-- This slice removes only the old pure model compatibility path. ECStore
-  retains persistence helpers, ConfigSys, global server-config state,
-  storage-class global state, startup wiring, and all storage/config persistence
-  logic.
-- The old `rustfs_ecstore::config` model path is no longer available after this
-  cleanup. Consumers must use `rustfs_config::server_config`.
+- `./scripts/check_unsafe_code_allowances.sh` is not counted for this PR; it
+  currently reports unrelated existing unsafe allowance locations whose nearby
+  `SAFETY:` comments are present.
+- This slice moves only `GLOBAL_SERVER_CONFIG`, `get_global_server_config`, and
+  `set_global_server_config` to `rustfs_config::server_config`.
+- ECStore retains `ConfigSys`, config persistence helpers, storage-class global
+  state, default registration wiring, startup initialization, and storage
+  behavior.
+- The old `rustfs_ecstore::config` accessor path remains available through a
+  temporary `RUSTFS_COMPAT_TODO(CFG-008)` re-export for downstream callers.
 
 ## Handoff Notes
 
-- Keep this CFG-004 cleanup slice as an `api-extraction` PR that only removes
-  the temporary model compatibility re-export and its cleanup-register entry.
-- Do not move `ConfigSys`, `GLOBAL_SERVER_CONFIG`, storage-class global state,
+- Keep this CFG-008 slice as an `api-extraction` PR that only moves the global
+  server-config snapshot accessors and migrates direct in-repo runtime
+  consumers to `rustfs_config::server_config`.
+- Do not move `ConfigSys`, storage-class global state,
   `read_config_without_migrate`, `save_server_config`, config-object helpers,
-  startup wiring, storage-class helpers, ECStore persistence helpers, or storage
-  persistence logic in this PR.
-- Do not add temporary compatibility code unless a matching
-  `RUSTFS_COMPAT_TODO(<task-id>)` marker and cleanup-register entry are added.
+  default registration wiring, startup wiring, storage-class helpers, ECStore
+  persistence helpers, or storage persistence logic in this PR.
+- Remove the CFG-008 compatibility re-export only after downstream and in-repo
+  consumers no longer need `rustfs_ecstore::config` accessor imports.

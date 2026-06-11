@@ -37,6 +37,7 @@ use matchit::Router;
 use reqwest::Url;
 use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
 use rustfs_config::server_config::Config;
+use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
@@ -55,7 +56,6 @@ use rustfs_ecstore::bucket::target::{BucketTarget, BucketTargetType, BucketTarge
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::config::com::read_config_without_migrate;
-use rustfs_ecstore::config::get_global_server_config;
 use rustfs_ecstore::global::GLOBAL_BOOT_TIME;
 use rustfs_ecstore::notification_sys::get_global_notification_sys;
 use rustfs_ecstore::rpc::PeerRestClient;

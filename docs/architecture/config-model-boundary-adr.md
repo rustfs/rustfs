@@ -34,6 +34,12 @@ That re-export included `RUSTFS_COMPAT_TODO(CFG-004)` and a matching entry in
 consumers were migrated. The CFG-004 cleanup removed this old model path after
 code scans showed consumers import the model directly from `rustfs-config`.
 
+Follow-up `CFG-008` moved the process-global server-config snapshot accessors
+to `rustfs_config::server_config` after the model path stabilized. ECStore keeps
+only a temporary `rustfs_ecstore::config::{get_global_server_config,
+set_global_server_config}` compatibility re-export while in-repo runtime
+consumers migrate.
+
 ## Why `rustfs-config`
 
 `rustfs-config` is already the lowest RustFS crate for configuration constants
@@ -51,7 +57,8 @@ removing any storage or runtime dependency by itself.
 The server-config model module may use only:
 
 - `std::collections::HashMap`
-- `std::sync::{LazyLock, OnceLock}` for the default `KVS` registration surface
+- `std::sync::{LazyLock, OnceLock, RwLock}` for the default `KVS` registration
+  surface and process-global server-config snapshot
 - `serde` for `KV` and `KVS` serialization compatibility
 - `serde_json` for `Config::marshal` and `Config::unmarshal`
 - existing `rustfs-config` constants and subsystem modules
@@ -71,7 +78,8 @@ The model module must not depend on:
 - notify, audit, targets, IAM, scanner, KMS, or admin handler crates
 - async runtimes, HTTP/router crates, object-store crates, or runtime lifecycle
   state
-- global server-config snapshot state such as `GLOBAL_SERVER_CONFIG`
+- unrelated runtime global state outside the process-global server-config
+  snapshot
 - `ConfigSys`, `read_config_without_migrate`, `save_server_config`, or any
   `com.rs` persistence helper
 
@@ -94,9 +102,6 @@ Move in the first extraction:
 Keep in `ecstore`:
 
 - `ConfigSys`
-- `GLOBAL_SERVER_CONFIG`
-- `get_global_server_config`
-- `set_global_server_config`
 - `init_global_config_sys`
 - `try_migrate_server_config`
 - `read_config_without_migrate`
@@ -108,6 +113,15 @@ Keep default registration wiring in `ecstore::config::init` until a later PR
 extracts a dedicated default-registration contract. The values may be registered
 through the moved `rustfs_config::server_config::register_default_kvs`, but the
 startup order and caller remain unchanged.
+
+Move in `CFG-008`:
+
+- `GLOBAL_SERVER_CONFIG`
+- `get_global_server_config`
+- `set_global_server_config`
+
+Keep a temporary ECStore compatibility re-export for these accessors until all
+consumers use `rustfs_config::server_config` directly.
 
 ## Required Shape Preservation
 
@@ -137,6 +151,11 @@ all in-repo consumers migrated.
 
 `CFG-005` should migrate external consumers one group at a time after the model
 and compatibility path are stable.
+
+`CFG-008` moves only the global server-config snapshot accessors to
+`rustfs-config` and migrates in-repo direct consumers. It must not move
+`ConfigSys`, storage-class global state, persistence helpers, default
+registration wiring, startup order, or storage behavior.
 
 ## Verification Gate
 
