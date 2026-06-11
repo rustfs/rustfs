@@ -2,7 +2,7 @@
 %global _empty_manifest_terminate_build 0
 Name:           rustfs
 Version:        1.0.0
-Release:        beta.7
+Release:        beta.8
 Summary:       High-performance distributed object storage for MinIO alternative
 
 License:        Apache-2.0
@@ -57,6 +57,9 @@ install %_builddir/%{name}-%{version}-%{release}/target/%_arch/%_arch-unknown-li
 %_bindir/rustfs
 
 %changelog
+* Wed Jun 10 2026 houseme <housemecn@gmail.com>
+- Update RPM package to RustFS 1.0.0-beta.8
+
 * Wed Jun 03 2026 houseme <housemecn@gmail.com>
 - Update RPM package to RustFS 1.0.0-beta.7
 

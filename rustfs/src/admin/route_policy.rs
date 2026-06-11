@@ -39,14 +39,22 @@ const GET_GROUP: AdminActionRef = AdminActionRef::new("GetGroupAdminAction");
 const GET_POLICY: AdminActionRef = AdminActionRef::new("GetPolicyAdminAction");
 const GET_REPLICATION_METRICS: AdminActionRef = AdminActionRef::new("GetReplicationMetricsAction");
 const GET_TABLE: AdminActionRef = AdminActionRef::new("GetTableAction");
+const GET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("GetTableBucketAction");
 const GET_TABLE_CATALOG: AdminActionRef = AdminActionRef::new("GetTableCatalogAction");
+const GET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("GetTableLifecycleAction");
 const GET_TABLE_METADATA: AdminActionRef = AdminActionRef::new("GetTableMetadataAction");
+const GET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("GetTableMetadataLocationAction");
 const GET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("GetTableNamespaceAction");
 const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
 const IMPORT_IAM: AdminActionRef = AdminActionRef::new("ImportIAMAction");
-const KMS_CREATE_KEY: AdminActionRef = AdminActionRef::new("KMSCreateKeyAdminAction");
-const KMS_KEY_STATUS: AdminActionRef = AdminActionRef::new("KMSKeyStatusAdminAction");
+const KMS_CLEAR_CACHE: AdminActionRef = AdminActionRef::new("kms:ClearCache");
+const KMS_CONFIGURE: AdminActionRef = AdminActionRef::new("kms:Configure");
+const KMS_DELETE_KEY: AdminActionRef = AdminActionRef::new("kms:DeleteKey");
+const KMS_DESCRIBE_KEY: AdminActionRef = AdminActionRef::new("kms:DescribeKey");
+const KMS_GENERATE_DATA_KEY: AdminActionRef = AdminActionRef::new("kms:GenerateDataKey");
+const KMS_LIST_KEYS: AdminActionRef = AdminActionRef::new("kms:ListKeys");
+const KMS_SERVICE_CONTROL: AdminActionRef = AdminActionRef::new("kms:ServiceControl");
 const LIST_GROUPS: AdminActionRef = AdminActionRef::new("ListGroupsAdminAction");
 const LIST_TEMPORARY_ACCOUNTS: AdminActionRef = AdminActionRef::new("ListTemporaryAccountsAdminAction");
 const LIST_TIER: AdminActionRef = AdminActionRef::new("ListTierAction");
@@ -56,10 +64,14 @@ const PROFILING: AdminActionRef = AdminActionRef::new("ProfilingAdminAction");
 const REBALANCE: AdminActionRef = AdminActionRef::new("RebalanceAdminAction");
 const REGISTER_TABLE: AdminActionRef = AdminActionRef::new("RegisterTableAction");
 const REMOVE_USER_FROM_GROUP: AdminActionRef = AdminActionRef::new("RemoveUserFromGroupAdminAction");
+const RUN_TABLE_MAINTENANCE: AdminActionRef = AdminActionRef::new("RunTableMaintenanceAction");
 const SERVER_INFO: AdminActionRef = AdminActionRef::new("ServerInfoAdminAction");
 const SET_BUCKET_QUOTA: AdminActionRef = AdminActionRef::new("SetBucketQuotaAdminAction");
 const SET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("SetBucketTargetAction");
 const SET_TABLE: AdminActionRef = AdminActionRef::new("SetTableAction");
+const SET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("SetTableBucketAction");
+const SET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("SetTableLifecycleAction");
+const SET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("SetTableMetadataLocationAction");
 const SET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("SetTableNamespaceAction");
 const SET_TIER: AdminActionRef = AdminActionRef::new("SetTierAction");
 const SITE_REPLICATION_ADD: AdminActionRef = AdminActionRef::new("SiteReplicationAddAction");
@@ -475,59 +487,74 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/profile", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/status", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/tls/status", PROFILING, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/create-key", KMS_CREATE_KEY, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/key/create", KMS_CREATE_KEY, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/create-key", KMS_CONFIGURE, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/key/create", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/describe-key",
-        KMS_KEY_STATUS,
+        KMS_DESCRIBE_KEY,
         RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/key/status",
-        KMS_KEY_STATUS,
+        KMS_DESCRIBE_KEY,
         RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/list-keys",
-        KMS_KEY_STATUS,
+        KMS_LIST_KEYS,
         RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/kms/generate-data-key",
-        SERVER_INFO,
+        KMS_GENERATE_DATA_KEY,
         RouteRiskLevel::High,
     ),
-    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/status", SERVER_INFO, RouteRiskLevel::Sensitive),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/status", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/config", SERVER_INFO, RouteRiskLevel::Sensitive),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/clear-cache", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/start", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/stop", SERVER_INFO, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/kms/status",
+        KMS_SERVICE_CONTROL,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/status", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/config", KMS_CONFIGURE, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/clear-cache",
+        KMS_CLEAR_CACHE,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", KMS_CONFIGURE, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/start", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/stop", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/service-status",
-        SERVER_INFO,
+        KMS_SERVICE_CONTROL,
         RouteRiskLevel::Sensitive,
     ),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/reconfigure", SERVER_INFO, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys", KMS_CREATE_KEY, RouteRiskLevel::High),
-    admin(HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete", SERVER_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/reconfigure", KMS_CONFIGURE, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys", KMS_CONFIGURE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/kms/keys/delete",
+        KMS_DELETE_KEY,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/kms/keys/cancel-deletion",
-        SERVER_INFO,
+        KMS_DELETE_KEY,
         RouteRiskLevel::High,
     ),
-    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/keys", KMS_KEY_STATUS, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/keys", KMS_LIST_KEYS, RouteRiskLevel::Sensitive),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/keys/{key_id}",
-        KMS_KEY_STATUS,
+        KMS_DESCRIBE_KEY,
         RouteRiskLevel::Sensitive,
     ),
     public(
@@ -569,6 +596,13 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/oidc/validate", SERVER_INFO, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/iceberg/v1/config", GET_TABLE_CATALOG, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/buckets/{warehouse}",
+        GET_TABLE_BUCKET,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces",
@@ -627,6 +661,199 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Delete,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         DELETE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+        GET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+        SET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+        SET_TABLE_LIFECYCLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+        REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Get, "/_iceberg/v1/config", GET_TABLE_CATALOG, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/buckets/{warehouse}",
+        SET_TABLE_BUCKET,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/buckets/{warehouse}",
+        GET_TABLE_BUCKET,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces",
+        GET_TABLE_NAMESPACE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces",
+        SET_TABLE_NAMESPACE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}",
+        GET_TABLE_NAMESPACE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}",
+        DELETE_TABLE_NAMESPACE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables",
+        GET_TABLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables",
+        CREATE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/register",
+        REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+        DELETE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+        GET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+        SET_TABLE_METADATA_LOCATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+        SET_TABLE_LIFECYCLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+        REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+        COMMIT_TABLE,
         RouteRiskLevel::High,
     ),
 ];
@@ -801,13 +1028,22 @@ mod tests {
     fn route_policy_keeps_table_catalog_outside_admin_prefix() {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
-            .filter(|spec| spec.path().starts_with("/iceberg/v1"));
-        assert_eq!(table_specs.count(), 11);
+            .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
+        assert_eq!(table_specs.count(), 46);
+        assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
+        assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
+        assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(
             HttpMethod::Get,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+            GET_TABLE_METADATA,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
             GET_TABLE_METADATA,
         );
         assert_action(
@@ -815,6 +1051,78 @@ mod tests {
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
             COMMIT_TABLE,
         );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
+            COMMIT_TABLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            GET_TABLE_METADATA_LOCATION,
+        );
+        assert_action(
+            HttpMethod::Put,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            SET_TABLE_METADATA_LOCATION,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+            RUN_TABLE_MAINTENANCE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+            RUN_TABLE_MAINTENANCE,
+        );
+        assert_action(
+            HttpMethod::Put,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            SET_TABLE_LIFECYCLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+            GET_TABLE_LIFECYCLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+            REGISTER_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+            COMMIT_TABLE,
+        );
+    }
+
+    #[test]
+    fn route_policy_records_dedicated_kms_actions() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/create-key", KMS_CONFIGURE);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/describe-key", KMS_DESCRIBE_KEY);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/list-keys", KMS_LIST_KEYS);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/generate-data-key", KMS_GENERATE_DATA_KEY);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/clear-cache", KMS_CLEAR_CACHE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", KMS_CONFIGURE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/start", KMS_SERVICE_CONTROL);
+        assert_action(HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete", KMS_DELETE_KEY);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion", KMS_DELETE_KEY);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/keys/{key_id}", KMS_DESCRIBE_KEY);
+    }
+
+    #[test]
+    fn route_policy_rejects_server_info_for_sensitive_kms_actions() {
+        for (method, path) in [
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/generate-data-key"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/clear-cache"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/configure"),
+            (HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion"),
+        ] {
+            assert_not_action(method, path, SERVER_INFO);
+        }
     }
 
     #[test]
@@ -854,6 +1162,14 @@ mod tests {
             .find(|spec| spec.method() == method && spec.path() == path)
             .expect("expected direct route policy");
         assert_eq!(spec.access().admin_action(), Some(action));
+    }
+
+    fn assert_not_action(method: HttpMethod, path: &str, action: AdminActionRef) {
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == method && spec.path() == path)
+            .expect("expected direct route policy");
+        assert_ne!(spec.access().admin_action(), Some(action));
     }
 
     fn assert_public(method: HttpMethod, path: &str, kind: PublicRouteKind) {

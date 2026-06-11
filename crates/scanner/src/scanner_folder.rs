@@ -62,6 +62,7 @@ use rustfs_ecstore::store_utils::is_reserved_or_invalid_bucket;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicationStatusType};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
+use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -75,10 +76,12 @@ const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
 const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
 const ENV_DATA_USAGE_UPDATE_DIR_CYCLES: &str = "RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES";
 const ENV_HEAL_OBJECT_SELECT_PROB: &str = "RUSTFS_HEAL_OBJECT_SELECT_PROB";
+const ENV_SCANNER_DEEP_VERIFY_COOLDOWN_SECS: &str = "RUSTFS_SCANNER_DEEP_VERIFY_COOLDOWN_SECS";
 const ENV_FAILED_OBJECT_TTL_SECS: &str = "RUSTFS_DATA_USAGE_FAILED_OBJECT_TTL_SECS";
 const ENV_FAILED_OBJECTS_MAX: &str = "RUSTFS_DATA_USAGE_FAILED_OBJECTS_MAX";
 const DEFAULT_FAILED_OBJECT_TTL_SECS: u32 = 86_400;
 const DEFAULT_FAILED_OBJECTS_MAX: u32 = 10_000;
+const DEFAULT_SCANNER_DEEP_VERIFY_COOLDOWN_SECS: u64 = 60;
 const METRIC_SCANNER_INLINE_HEAL_TOTAL: &str = "rustfs_scanner_inline_heal_total";
 const METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL: &str = "rustfs_scanner_excess_object_versions_total";
 const METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL: &str = "rustfs_scanner_excess_object_version_size_total";
@@ -94,6 +97,34 @@ pub fn data_usage_update_dir_cycles() -> u32 {
 
 pub fn heal_object_select_prob() -> u32 {
     rustfs_utils::get_env_u32(ENV_HEAL_OBJECT_SELECT_PROB, DEFAULT_HEAL_OBJECT_SELECT_PROB)
+}
+
+fn deep_verify_cooldown() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        ENV_SCANNER_DEEP_VERIFY_COOLDOWN_SECS,
+        DEFAULT_SCANNER_DEEP_VERIFY_COOLDOWN_SECS,
+    ))
+}
+
+fn object_is_within_deep_verify_cooldown(mod_time: Option<OffsetDateTime>, now: OffsetDateTime, cooldown: Duration) -> bool {
+    let Some(mod_time) = mod_time else {
+        return false;
+    };
+    let Ok(cooldown) = time::Duration::try_from(cooldown) else {
+        return false;
+    };
+    mod_time > now - cooldown
+}
+
+fn effective_object_heal_scan_mode(heal_bitrot: bool, mod_time: Option<OffsetDateTime>, now: OffsetDateTime) -> HealScanMode {
+    if !heal_bitrot {
+        return HealScanMode::Normal;
+    }
+    if object_is_within_deep_verify_cooldown(mod_time, now, deep_verify_cooldown()) {
+        HealScanMode::Normal
+    } else {
+        HealScanMode::Deep
+    }
 }
 
 fn scanner_inline_heal_enabled() -> bool {
@@ -157,9 +188,9 @@ fn should_log_failed_object(failed_objects: usize) -> bool {
     failed_objects <= SCANNER_FAILED_OBJECT_LOG_INITIAL_LIMIT || failed_objects.is_multiple_of(SCANNER_FAILED_OBJECT_LOG_EVERY)
 }
 
-fn record_scanner_ilm_action_if_queued(metrics: &Metrics, count: u64, queued: bool) -> bool {
+fn record_scanner_ilm_action_if_queued(metrics: &Metrics, action: IlmAction, count: u64, queued: bool) -> bool {
     if queued {
-        metrics.record_scanner_ilm_action(count);
+        metrics.record_scanner_lifecycle_action(action, count);
     }
     queued
 }
@@ -648,7 +679,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                        if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             remaining_versions = 0;
                         } else {
@@ -681,7 +712,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying expiry rule for object: {} {}", oi.name, event.action);
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
-                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                        if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
                                 remaining_versions -= 1;
@@ -709,7 +740,7 @@ impl ScannerItem {
                         debug!("apply_actions: applying transition rule for object: {} {}", oi.name, event.action);
                         let done_ilm = Metrics::time_ilm(event.action);
                         let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
-                        if record_scanner_ilm_action_if_queued(global_metrics(), 1, queued) {
+                        if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                         }
                     }
@@ -737,7 +768,7 @@ impl ScannerItem {
                 .await
                 .enqueue_by_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner)
                 .await;
-            if record_scanner_ilm_action_if_queued(global_metrics(), count, queued) {
+            if record_scanner_ilm_action_if_queued(global_metrics(), action, count, queued) {
                 done_ilm(count)();
                 remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
             }
@@ -828,11 +859,25 @@ impl ScannerItem {
             oi.version_id.unwrap_or_default()
         );
 
-        let scan_mode = if self.heal_bitrot {
-            HealScanMode::Deep
-        } else {
-            HealScanMode::Normal
-        };
+        let now = OffsetDateTime::now_utc();
+        let scan_mode = effective_object_heal_scan_mode(self.heal_bitrot, oi.mod_time, now);
+        if self.heal_bitrot && scan_mode != HealScanMode::Deep {
+            let cooldown = deep_verify_cooldown();
+            let age_secs = oi.mod_time.map(|mod_time| {
+                let age = now - mod_time;
+                age.whole_seconds().max(0)
+            });
+            info!(
+                bucket = %self.bucket,
+                object = %self.object_path(),
+                version_id = %oi.version_id.unwrap_or_default(),
+                object_age_secs = age_secs.unwrap_or_default(),
+                cooldown_secs = cooldown.as_secs(),
+                original_scan_mode = %HealScanMode::Deep.as_str(),
+                effective_scan_mode = %scan_mode.as_str(),
+                "scanner deep heal downgraded to normal during new-object cooldown"
+            );
+        }
 
         let result = send_scanner_heal_request(
             "object",
@@ -2124,8 +2169,9 @@ mod tests {
     #[tokio::test]
     async fn test_scanner_ilm_action_accounting_requires_enqueue_success() {
         let metrics = Metrics::new();
+        let _start = metrics.start_scan_cycle_work();
 
-        record_scanner_ilm_action_if_queued(&metrics, 2, false);
+        record_scanner_ilm_action_if_queued(&metrics, IlmAction::DeleteAction, 2, false);
         let report = metrics.report().await;
         let lifecycle = report
             .source_work
@@ -2133,8 +2179,9 @@ mod tests {
             .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
             .expect("lifecycle source work should be visible");
         assert_eq!(lifecycle.executed, 0);
+        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 0);
 
-        record_scanner_ilm_action_if_queued(&metrics, 3, true);
+        record_scanner_ilm_action_if_queued(&metrics, IlmAction::DeleteAction, 3, true);
         let report = metrics.report().await;
         let lifecycle = report
             .source_work
@@ -2142,6 +2189,19 @@ mod tests {
             .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
             .expect("lifecycle source work should be visible");
         assert_eq!(lifecycle.executed, 3);
+        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 3);
+        assert_eq!(report.current_cycle_lifecycle_transition_actions, 0);
+
+        record_scanner_ilm_action_if_queued(&metrics, IlmAction::TransitionAction, 4, true);
+        let report = metrics.report().await;
+        let lifecycle = report
+            .source_work
+            .iter()
+            .find(|work| work.source == ScannerWorkSource::Lifecycle.as_str())
+            .expect("lifecycle source work should be visible");
+        assert_eq!(lifecycle.executed, 7);
+        assert_eq!(report.current_cycle_lifecycle_expiry_actions, 3);
+        assert_eq!(report.current_cycle_lifecycle_transition_actions, 4);
     }
 
     #[test]
@@ -2542,6 +2602,26 @@ mod tests {
         assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
         assert_eq!(request.priority, HealChannelPriority::Low);
         assert_eq!(request.remove_corrupted, Some(HEAL_DELETE_DANGLING));
+    }
+
+    #[test]
+    fn test_effective_object_heal_scan_mode_keeps_normal_when_bitrot_disabled() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(effective_object_heal_scan_mode(false, Some(now), now), HealScanMode::Normal);
+    }
+
+    #[test]
+    fn test_effective_object_heal_scan_mode_downgrades_recent_object_to_normal() {
+        let now = OffsetDateTime::now_utc();
+        let recent = now - time::Duration::seconds(5);
+        assert_eq!(effective_object_heal_scan_mode(true, Some(recent), now), HealScanMode::Normal);
+    }
+
+    #[test]
+    fn test_effective_object_heal_scan_mode_keeps_old_object_deep() {
+        let now = OffsetDateTime::now_utc();
+        let old = now - time::Duration::seconds((DEFAULT_SCANNER_DEEP_VERIFY_COOLDOWN_SECS as i64) + 5);
+        assert_eq!(effective_object_heal_scan_mode(true, Some(old), now), HealScanMode::Deep);
     }
 
     #[test]

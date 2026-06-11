@@ -14,6 +14,7 @@
 
 use crate::bucket::error::BucketMetadataError;
 use crate::disk::error::DiskError;
+use rustfs_storage_api::StorageErrorCode;
 use rustfs_utils::path::decode_dir_object;
 use s3s::{S3Error, S3ErrorCode};
 
@@ -460,156 +461,181 @@ impl Clone for StorageError {
 }
 
 impl StorageError {
-    pub fn to_u32(&self) -> u32 {
+    fn code(&self) -> StorageErrorCode {
         match self {
-            StorageError::Io(_) => 0x01,
-            StorageError::FaultyDisk => 0x02,
-            StorageError::DiskFull => 0x03,
-            StorageError::VolumeNotFound => 0x04,
-            StorageError::VolumeExists => 0x05,
-            StorageError::FileNotFound => 0x06,
-            StorageError::FileVersionNotFound => 0x07,
-            StorageError::FileNameTooLong => 0x08,
-            StorageError::FileAccessDenied => 0x09,
-            StorageError::FileCorrupt => 0x0A,
-            StorageError::IsNotRegular => 0x0B,
-            StorageError::VolumeNotEmpty => 0x0C,
-            StorageError::VolumeAccessDenied => 0x0D,
-            StorageError::CorruptedFormat => 0x0E,
-            StorageError::CorruptedBackend => 0x0F,
-            StorageError::UnformattedDisk => 0x10,
-            StorageError::DiskNotFound => 0x11,
-            StorageError::DriveIsRoot => 0x12,
-            StorageError::FaultyRemoteDisk => 0x13,
-            StorageError::DiskAccessDenied => 0x14,
-            StorageError::Unexpected => 0x15,
-            StorageError::NotImplemented => 0x16,
-            StorageError::InvalidArgument(_, _, _) => 0x17,
-            StorageError::MethodNotAllowed => 0x18,
-            StorageError::BucketNotFound(_) => 0x19,
-            StorageError::BucketNotEmpty(_) => 0x1A,
-            StorageError::BucketNameInvalid(_) => 0x1B,
-            StorageError::ObjectNameInvalid(_, _) => 0x1C,
-            StorageError::BucketExists(_) => 0x1D,
-            StorageError::StorageFull => 0x1E,
-            StorageError::SlowDown => 0x1F,
-            StorageError::PrefixAccessDenied(_, _) => 0x20,
-            StorageError::InvalidUploadIDKeyCombination(_, _) => 0x21,
-            StorageError::MalformedUploadID(_) => 0x22,
-            StorageError::ObjectNameTooLong(_, _) => 0x23,
-            StorageError::ObjectNamePrefixAsSlash(_, _) => 0x24,
-            StorageError::ObjectNotFound(_, _) => 0x25,
-            StorageError::VersionNotFound(_, _, _) => 0x26,
-            StorageError::InvalidUploadID(_, _, _) => 0x27,
-            StorageError::InvalidVersionID(_, _, _) => 0x28,
-            StorageError::DataMovementOverwriteErr(_, _, _) => 0x29,
-            StorageError::ObjectExistsAsDirectory(_, _) => 0x2A,
-            // StorageError::InsufficientReadQuorum => 0x2B,
-            // StorageError::InsufficientWriteQuorum => 0x2C,
-            StorageError::DecommissionNotStarted => 0x2D,
-            StorageError::InvalidPart(_, _, _) => 0x2E,
-            StorageError::DoneForNow => 0x2F,
-            StorageError::DecommissionAlreadyRunning => 0x30,
-            StorageError::RebalanceAlreadyRunning => 0x40,
-            StorageError::OperationCanceled => 0x41,
-            StorageError::ErasureReadQuorum => 0x31,
-            StorageError::ErasureWriteQuorum => 0x32,
-            StorageError::NotFirstDisk => 0x33,
-            StorageError::FirstDiskWait => 0x34,
-            StorageError::ConfigNotFound => 0x35,
-            StorageError::TooManyOpenFiles => 0x36,
-            StorageError::NoHealRequired => 0x37,
-            StorageError::Lock(_) => 0x38,
-            StorageError::InsufficientReadQuorum(_, _) => 0x39,
-            StorageError::InsufficientWriteQuorum(_, _) => 0x3A,
-            StorageError::PreconditionFailed => 0x3B,
-            StorageError::EntityTooSmall(_, _, _) => 0x3C,
-            StorageError::InvalidRangeSpec(_) => 0x3D,
-            StorageError::NotModified => 0x3E,
-            StorageError::InvalidPartNumber(_) => 0x3F,
-            StorageError::NamespaceLockQuorumUnavailable { .. } => 0x42,
+            StorageError::Io(_) => StorageErrorCode::Io,
+            StorageError::FaultyDisk => StorageErrorCode::FaultyDisk,
+            StorageError::DiskFull => StorageErrorCode::DiskFull,
+            StorageError::VolumeNotFound => StorageErrorCode::VolumeNotFound,
+            StorageError::VolumeExists => StorageErrorCode::VolumeExists,
+            StorageError::FileNotFound => StorageErrorCode::FileNotFound,
+            StorageError::FileVersionNotFound => StorageErrorCode::FileVersionNotFound,
+            StorageError::FileNameTooLong => StorageErrorCode::FileNameTooLong,
+            StorageError::FileAccessDenied => StorageErrorCode::FileAccessDenied,
+            StorageError::FileCorrupt => StorageErrorCode::FileCorrupt,
+            StorageError::IsNotRegular => StorageErrorCode::IsNotRegular,
+            StorageError::VolumeNotEmpty => StorageErrorCode::VolumeNotEmpty,
+            StorageError::VolumeAccessDenied => StorageErrorCode::VolumeAccessDenied,
+            StorageError::CorruptedFormat => StorageErrorCode::CorruptedFormat,
+            StorageError::CorruptedBackend => StorageErrorCode::CorruptedBackend,
+            StorageError::UnformattedDisk => StorageErrorCode::UnformattedDisk,
+            StorageError::DiskNotFound => StorageErrorCode::DiskNotFound,
+            StorageError::DriveIsRoot => StorageErrorCode::DriveIsRoot,
+            StorageError::FaultyRemoteDisk => StorageErrorCode::FaultyRemoteDisk,
+            StorageError::DiskAccessDenied => StorageErrorCode::DiskAccessDenied,
+            StorageError::Unexpected => StorageErrorCode::Unexpected,
+            StorageError::NotImplemented => StorageErrorCode::NotImplemented,
+            StorageError::InvalidArgument(_, _, _) => StorageErrorCode::InvalidArgument,
+            StorageError::MethodNotAllowed => StorageErrorCode::MethodNotAllowed,
+            StorageError::BucketNotFound(_) => StorageErrorCode::BucketNotFound,
+            StorageError::BucketNotEmpty(_) => StorageErrorCode::BucketNotEmpty,
+            StorageError::BucketNameInvalid(_) => StorageErrorCode::BucketNameInvalid,
+            StorageError::ObjectNameInvalid(_, _) => StorageErrorCode::ObjectNameInvalid,
+            StorageError::BucketExists(_) => StorageErrorCode::BucketExists,
+            StorageError::StorageFull => StorageErrorCode::StorageFull,
+            StorageError::SlowDown => StorageErrorCode::SlowDown,
+            StorageError::PrefixAccessDenied(_, _) => StorageErrorCode::PrefixAccessDenied,
+            StorageError::InvalidUploadIDKeyCombination(_, _) => StorageErrorCode::InvalidUploadIDKeyCombination,
+            StorageError::MalformedUploadID(_) => StorageErrorCode::MalformedUploadID,
+            StorageError::ObjectNameTooLong(_, _) => StorageErrorCode::ObjectNameTooLong,
+            StorageError::ObjectNamePrefixAsSlash(_, _) => StorageErrorCode::ObjectNamePrefixAsSlash,
+            StorageError::ObjectNotFound(_, _) => StorageErrorCode::ObjectNotFound,
+            StorageError::VersionNotFound(_, _, _) => StorageErrorCode::VersionNotFound,
+            StorageError::InvalidUploadID(_, _, _) => StorageErrorCode::InvalidUploadID,
+            StorageError::InvalidVersionID(_, _, _) => StorageErrorCode::InvalidVersionID,
+            StorageError::DataMovementOverwriteErr(_, _, _) => StorageErrorCode::DataMovementOverwriteErr,
+            StorageError::ObjectExistsAsDirectory(_, _) => StorageErrorCode::ObjectExistsAsDirectory,
+            StorageError::DecommissionNotStarted => StorageErrorCode::DecommissionNotStarted,
+            StorageError::InvalidPart(_, _, _) => StorageErrorCode::InvalidPart,
+            StorageError::DoneForNow => StorageErrorCode::DoneForNow,
+            StorageError::DecommissionAlreadyRunning => StorageErrorCode::DecommissionAlreadyRunning,
+            StorageError::RebalanceAlreadyRunning => StorageErrorCode::RebalanceAlreadyRunning,
+            StorageError::OperationCanceled => StorageErrorCode::OperationCanceled,
+            StorageError::ErasureReadQuorum => StorageErrorCode::ErasureReadQuorum,
+            StorageError::ErasureWriteQuorum => StorageErrorCode::ErasureWriteQuorum,
+            StorageError::NotFirstDisk => StorageErrorCode::NotFirstDisk,
+            StorageError::FirstDiskWait => StorageErrorCode::FirstDiskWait,
+            StorageError::ConfigNotFound => StorageErrorCode::ConfigNotFound,
+            StorageError::TooManyOpenFiles => StorageErrorCode::TooManyOpenFiles,
+            StorageError::NoHealRequired => StorageErrorCode::NoHealRequired,
+            StorageError::Lock(_) => StorageErrorCode::Lock,
+            StorageError::InsufficientReadQuorum(_, _) => StorageErrorCode::InsufficientReadQuorum,
+            StorageError::InsufficientWriteQuorum(_, _) => StorageErrorCode::InsufficientWriteQuorum,
+            StorageError::PreconditionFailed => StorageErrorCode::PreconditionFailed,
+            StorageError::EntityTooSmall(_, _, _) => StorageErrorCode::EntityTooSmall,
+            StorageError::InvalidRangeSpec(_) => StorageErrorCode::InvalidRangeSpec,
+            StorageError::NotModified => StorageErrorCode::NotModified,
+            StorageError::InvalidPartNumber(_) => StorageErrorCode::InvalidPartNumber,
+            StorageError::NamespaceLockQuorumUnavailable { .. } => StorageErrorCode::NamespaceLockQuorumUnavailable,
         }
     }
 
+    pub fn to_u32(&self) -> u32 {
+        self.code().as_u32()
+    }
+
     pub fn from_u32(error: u32) -> Option<Self> {
-        match error {
-            0x01 => Some(StorageError::Io(std::io::Error::other("Io error"))),
-            0x02 => Some(StorageError::FaultyDisk),
-            0x03 => Some(StorageError::DiskFull),
-            0x04 => Some(StorageError::VolumeNotFound),
-            0x05 => Some(StorageError::VolumeExists),
-            0x06 => Some(StorageError::FileNotFound),
-            0x07 => Some(StorageError::FileVersionNotFound),
-            0x08 => Some(StorageError::FileNameTooLong),
-            0x09 => Some(StorageError::FileAccessDenied),
-            0x0A => Some(StorageError::FileCorrupt),
-            0x0B => Some(StorageError::IsNotRegular),
-            0x0C => Some(StorageError::VolumeNotEmpty),
-            0x0D => Some(StorageError::VolumeAccessDenied),
-            0x0E => Some(StorageError::CorruptedFormat),
-            0x0F => Some(StorageError::CorruptedBackend),
-            0x10 => Some(StorageError::UnformattedDisk),
-            0x11 => Some(StorageError::DiskNotFound),
-            0x12 => Some(StorageError::DriveIsRoot),
-            0x13 => Some(StorageError::FaultyRemoteDisk),
-            0x14 => Some(StorageError::DiskAccessDenied),
-            0x15 => Some(StorageError::Unexpected),
-            0x16 => Some(StorageError::NotImplemented),
-            0x17 => Some(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default())),
-            0x18 => Some(StorageError::MethodNotAllowed),
-            0x19 => Some(StorageError::BucketNotFound(Default::default())),
-            0x1A => Some(StorageError::BucketNotEmpty(Default::default())),
-            0x1B => Some(StorageError::BucketNameInvalid(Default::default())),
-            0x1C => Some(StorageError::ObjectNameInvalid(Default::default(), Default::default())),
-            0x1D => Some(StorageError::BucketExists(Default::default())),
-            0x1E => Some(StorageError::StorageFull),
-            0x1F => Some(StorageError::SlowDown),
-            0x20 => Some(StorageError::PrefixAccessDenied(Default::default(), Default::default())),
-            0x21 => Some(StorageError::InvalidUploadIDKeyCombination(Default::default(), Default::default())),
-            0x22 => Some(StorageError::MalformedUploadID(Default::default())),
-            0x23 => Some(StorageError::ObjectNameTooLong(Default::default(), Default::default())),
-            0x24 => Some(StorageError::ObjectNamePrefixAsSlash(Default::default(), Default::default())),
-            0x25 => Some(StorageError::ObjectNotFound(Default::default(), Default::default())),
-            0x26 => Some(StorageError::VersionNotFound(Default::default(), Default::default(), Default::default())),
-            0x27 => Some(StorageError::InvalidUploadID(Default::default(), Default::default(), Default::default())),
-            0x28 => Some(StorageError::InvalidVersionID(Default::default(), Default::default(), Default::default())),
-            0x29 => Some(StorageError::DataMovementOverwriteErr(
+        match StorageErrorCode::from_u32(error)? {
+            StorageErrorCode::Io => Some(StorageError::Io(std::io::Error::other("Io error"))),
+            StorageErrorCode::FaultyDisk => Some(StorageError::FaultyDisk),
+            StorageErrorCode::DiskFull => Some(StorageError::DiskFull),
+            StorageErrorCode::VolumeNotFound => Some(StorageError::VolumeNotFound),
+            StorageErrorCode::VolumeExists => Some(StorageError::VolumeExists),
+            StorageErrorCode::FileNotFound => Some(StorageError::FileNotFound),
+            StorageErrorCode::FileVersionNotFound => Some(StorageError::FileVersionNotFound),
+            StorageErrorCode::FileNameTooLong => Some(StorageError::FileNameTooLong),
+            StorageErrorCode::FileAccessDenied => Some(StorageError::FileAccessDenied),
+            StorageErrorCode::FileCorrupt => Some(StorageError::FileCorrupt),
+            StorageErrorCode::IsNotRegular => Some(StorageError::IsNotRegular),
+            StorageErrorCode::VolumeNotEmpty => Some(StorageError::VolumeNotEmpty),
+            StorageErrorCode::VolumeAccessDenied => Some(StorageError::VolumeAccessDenied),
+            StorageErrorCode::CorruptedFormat => Some(StorageError::CorruptedFormat),
+            StorageErrorCode::CorruptedBackend => Some(StorageError::CorruptedBackend),
+            StorageErrorCode::UnformattedDisk => Some(StorageError::UnformattedDisk),
+            StorageErrorCode::DiskNotFound => Some(StorageError::DiskNotFound),
+            StorageErrorCode::DriveIsRoot => Some(StorageError::DriveIsRoot),
+            StorageErrorCode::FaultyRemoteDisk => Some(StorageError::FaultyRemoteDisk),
+            StorageErrorCode::DiskAccessDenied => Some(StorageError::DiskAccessDenied),
+            StorageErrorCode::Unexpected => Some(StorageError::Unexpected),
+            StorageErrorCode::NotImplemented => Some(StorageError::NotImplemented),
+            StorageErrorCode::InvalidArgument => {
+                Some(StorageError::InvalidArgument(Default::default(), Default::default(), Default::default()))
+            }
+            StorageErrorCode::MethodNotAllowed => Some(StorageError::MethodNotAllowed),
+            StorageErrorCode::BucketNotFound => Some(StorageError::BucketNotFound(Default::default())),
+            StorageErrorCode::BucketNotEmpty => Some(StorageError::BucketNotEmpty(Default::default())),
+            StorageErrorCode::BucketNameInvalid => Some(StorageError::BucketNameInvalid(Default::default())),
+            StorageErrorCode::ObjectNameInvalid => Some(StorageError::ObjectNameInvalid(Default::default(), Default::default())),
+            StorageErrorCode::BucketExists => Some(StorageError::BucketExists(Default::default())),
+            StorageErrorCode::StorageFull => Some(StorageError::StorageFull),
+            StorageErrorCode::SlowDown => Some(StorageError::SlowDown),
+            StorageErrorCode::PrefixAccessDenied => {
+                Some(StorageError::PrefixAccessDenied(Default::default(), Default::default()))
+            }
+            StorageErrorCode::InvalidUploadIDKeyCombination => {
+                Some(StorageError::InvalidUploadIDKeyCombination(Default::default(), Default::default()))
+            }
+            StorageErrorCode::MalformedUploadID => Some(StorageError::MalformedUploadID(Default::default())),
+            StorageErrorCode::ObjectNameTooLong => Some(StorageError::ObjectNameTooLong(Default::default(), Default::default())),
+            StorageErrorCode::ObjectNamePrefixAsSlash => {
+                Some(StorageError::ObjectNamePrefixAsSlash(Default::default(), Default::default()))
+            }
+            StorageErrorCode::ObjectNotFound => Some(StorageError::ObjectNotFound(Default::default(), Default::default())),
+            StorageErrorCode::VersionNotFound => {
+                Some(StorageError::VersionNotFound(Default::default(), Default::default(), Default::default()))
+            }
+            StorageErrorCode::InvalidUploadID => {
+                Some(StorageError::InvalidUploadID(Default::default(), Default::default(), Default::default()))
+            }
+            StorageErrorCode::InvalidVersionID => {
+                Some(StorageError::InvalidVersionID(Default::default(), Default::default(), Default::default()))
+            }
+            StorageErrorCode::DataMovementOverwriteErr => Some(StorageError::DataMovementOverwriteErr(
                 Default::default(),
                 Default::default(),
                 Default::default(),
             )),
-            0x2A => Some(StorageError::ObjectExistsAsDirectory(Default::default(), Default::default())),
-            // 0x2B => Some(StorageError::InsufficientReadQuorum),
-            // 0x2C => Some(StorageError::InsufficientWriteQuorum),
-            0x2D => Some(StorageError::DecommissionNotStarted),
-            0x2E => Some(StorageError::InvalidPart(Default::default(), Default::default(), Default::default())),
-            0x2F => Some(StorageError::DoneForNow),
-            0x30 => Some(StorageError::DecommissionAlreadyRunning),
-            0x40 => Some(StorageError::RebalanceAlreadyRunning),
-            0x41 => Some(StorageError::OperationCanceled),
-            0x31 => Some(StorageError::ErasureReadQuorum),
-            0x32 => Some(StorageError::ErasureWriteQuorum),
-            0x33 => Some(StorageError::NotFirstDisk),
-            0x34 => Some(StorageError::FirstDiskWait),
-            0x35 => Some(StorageError::ConfigNotFound),
-            0x36 => Some(StorageError::TooManyOpenFiles),
-            0x37 => Some(StorageError::NoHealRequired),
-            0x38 => Some(StorageError::Lock(rustfs_lock::LockError::internal("Generic lock error".to_string()))),
-            0x39 => Some(StorageError::InsufficientReadQuorum(Default::default(), Default::default())),
-            0x3A => Some(StorageError::InsufficientWriteQuorum(Default::default(), Default::default())),
-            0x3B => Some(StorageError::PreconditionFailed),
-            0x3C => Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default())),
-            0x3D => Some(StorageError::InvalidRangeSpec(Default::default())),
-            0x3E => Some(StorageError::NotModified),
-            0x3F => Some(StorageError::InvalidPartNumber(Default::default())),
-            0x42 => Some(StorageError::NamespaceLockQuorumUnavailable {
+            StorageErrorCode::ObjectExistsAsDirectory => {
+                Some(StorageError::ObjectExistsAsDirectory(Default::default(), Default::default()))
+            }
+            StorageErrorCode::DecommissionNotStarted => Some(StorageError::DecommissionNotStarted),
+            StorageErrorCode::InvalidPart => {
+                Some(StorageError::InvalidPart(Default::default(), Default::default(), Default::default()))
+            }
+            StorageErrorCode::DoneForNow => Some(StorageError::DoneForNow),
+            StorageErrorCode::DecommissionAlreadyRunning => Some(StorageError::DecommissionAlreadyRunning),
+            StorageErrorCode::RebalanceAlreadyRunning => Some(StorageError::RebalanceAlreadyRunning),
+            StorageErrorCode::OperationCanceled => Some(StorageError::OperationCanceled),
+            StorageErrorCode::ErasureReadQuorum => Some(StorageError::ErasureReadQuorum),
+            StorageErrorCode::ErasureWriteQuorum => Some(StorageError::ErasureWriteQuorum),
+            StorageErrorCode::NotFirstDisk => Some(StorageError::NotFirstDisk),
+            StorageErrorCode::FirstDiskWait => Some(StorageError::FirstDiskWait),
+            StorageErrorCode::ConfigNotFound => Some(StorageError::ConfigNotFound),
+            StorageErrorCode::TooManyOpenFiles => Some(StorageError::TooManyOpenFiles),
+            StorageErrorCode::NoHealRequired => Some(StorageError::NoHealRequired),
+            StorageErrorCode::Lock => {
+                Some(StorageError::Lock(rustfs_lock::LockError::internal("Generic lock error".to_string())))
+            }
+            StorageErrorCode::InsufficientReadQuorum => {
+                Some(StorageError::InsufficientReadQuorum(Default::default(), Default::default()))
+            }
+            StorageErrorCode::InsufficientWriteQuorum => {
+                Some(StorageError::InsufficientWriteQuorum(Default::default(), Default::default()))
+            }
+            StorageErrorCode::PreconditionFailed => Some(StorageError::PreconditionFailed),
+            StorageErrorCode::EntityTooSmall => {
+                Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default()))
+            }
+            StorageErrorCode::InvalidRangeSpec => Some(StorageError::InvalidRangeSpec(Default::default())),
+            StorageErrorCode::NotModified => Some(StorageError::NotModified),
+            StorageErrorCode::InvalidPartNumber => Some(StorageError::InvalidPartNumber(Default::default())),
+            StorageErrorCode::NamespaceLockQuorumUnavailable => Some(StorageError::NamespaceLockQuorumUnavailable {
                 mode: "write",
                 bucket: Default::default(),
                 object: Default::default(),
                 required: Default::default(),
                 achieved: Default::default(),
             }),
-            _ => None,
         }
     }
 }
@@ -1046,6 +1072,25 @@ mod tests {
 
         // Test invalid code returns None
         assert!(StorageError::from_u32(0xFF).is_none());
+    }
+
+    #[test]
+    fn test_storage_error_code_contract_matches_storage_api() {
+        assert_eq!(StorageError::DiskFull.to_u32(), StorageErrorCode::DiskFull.as_u32());
+        assert_eq!(
+            StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()).to_u32(),
+            StorageErrorCode::ObjectNotFound.as_u32()
+        );
+        assert!(matches!(
+            StorageError::from_u32(StorageErrorCode::ErasureReadQuorum.as_u32()),
+            Some(StorageError::ErasureReadQuorum)
+        ));
+        assert!(matches!(
+            StorageError::from_u32(StorageErrorCode::NamespaceLockQuorumUnavailable.as_u32()),
+            Some(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
+        assert!(StorageError::from_u32(0x2B).is_none());
+        assert!(StorageError::from_u32(0x2C).is_none());
     }
 
     #[test]

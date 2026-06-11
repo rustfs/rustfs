@@ -113,7 +113,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # 使用指定版本运行
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.7
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.8
 ```
 
 如果您通过绑定挂载启用 TLS 证书目录，也请用同样方式准备该目录：

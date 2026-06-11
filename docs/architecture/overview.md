@@ -22,11 +22,20 @@ hot-path behavior must not drift during this migration.
   startup/readiness, and shutdown contracts.
 - [`storage-control-data-plane.md`](storage-control-data-plane.md): boundaries
   between StorageCore, ECStore, ClusterControlPlane, and BackgroundControllers.
+- [`background-services-inventory.md`](background-services-inventory.md): current
+  scanner, heal, lifecycle, replication, config reload, metrics, and shutdown
+  surface before BackgroundController work.
+- [`background-controller-contract.md`](background-controller-contract.md):
+  desired/current/status/reconcile vocabulary and lifecycle boundaries for
+  future read-only BackgroundController work.
 - [`crate-boundaries.md`](crate-boundaries.md): PR types, crate direction,
   compatibility rules, and migration guardrails.
 - [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md):
   current `ecstore::config::{Config, KV, KVS}` definitions, consumers,
   migration risks, and do-not-change contract.
+- [`config-model-boundary-adr.md`](config-model-boundary-adr.md): target crate,
+  module path, dependency rules, and verification gates for moving the pure
+  server-config model.
 - [`migration-progress.md`](migration-progress.md): current task state and context
   handoff.
 - [`compat-cleanup-register.md`](compat-cleanup-register.md): temporary
@@ -65,3 +74,4 @@ The first implementation sequence is conservative:
 2. Establish PR and compatibility rules.
 3. Add dependency and loss-prevention checks in a separate `ci-gate` PR.
 4. Inventory `ecstore::config::{Config, KV, KVS}` before moving any code.
+5. Decide the config model boundary before extracting or migrating consumers.
