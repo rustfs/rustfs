@@ -99,6 +99,11 @@ impl RequestContext {
             start_time: Instant::now(),
         }
     }
+
+    /// Return the elapsed request lifetime in whole milliseconds.
+    pub fn duration_ms(&self) -> u64 {
+        self.start_time.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+    }
 }
 
 fn current_trace_context_ids() -> Option<(String, String)> {
@@ -215,6 +220,12 @@ mod tests {
             assert_eq!(ctx.trace_id.as_deref(), Some(trace_id));
             assert!(ctx.span_id.is_some());
         });
+    }
+
+    #[test]
+    fn test_request_context_duration_ms_is_non_negative() {
+        let ctx = RequestContext::fallback();
+        assert!(ctx.duration_ms() <= 10);
     }
 
     #[test]
