@@ -9693,6 +9693,7 @@ dependencies = [
  "rustfs-storage-api",
  "rustfs-utils",
  "serde",
+ "serde_json",
  "sysinfo",
  "temp-env",
  "tempfile",

@@ -82,3 +82,4 @@ jemalloc_pprof = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
+serde_json = { workspace = true }
