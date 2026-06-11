@@ -14,8 +14,6 @@
 
 use rustfs_security_governance::{RedactionLevel, RedactionPolicyError, RedactionRule, validate_redaction_rules};
 use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
 
 pub const REDACTED_LOG_VALUE: &str = "***redacted***";
 
@@ -96,6 +94,8 @@ impl fmt::Debug for MaskedAccessKey<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     fn workspace_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
