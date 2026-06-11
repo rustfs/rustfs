@@ -27,9 +27,9 @@ use rustfs_config::oidc::{
     OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
 use rustfs_config::server_config::Config as ServerConfig;
+use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
-use rustfs_ecstore::config::get_global_server_config;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};

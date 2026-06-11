@@ -664,7 +664,7 @@ pub fn apply_scanner_runtime_config(config: &ServerConfig) -> Result<(), Scanner
 }
 
 pub(crate) fn refresh_scanner_runtime_config_from_global() -> Result<(), ScannerRuntimeConfigError> {
-    let config = rustfs_ecstore::config::get_global_server_config();
+    let config = rustfs_config::server_config::get_global_server_config();
     let resolved = lookup_scanner_runtime_config(config.as_ref())?;
     apply_resolved_runtime_config(resolved);
     Ok(())

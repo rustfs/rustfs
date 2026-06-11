@@ -30,6 +30,7 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_TLS_PATH,
     MAX_ADMIN_REQUEST_BODY_SIZE,
@@ -46,7 +47,6 @@ use rustfs_ecstore::bucket::target::{ARN, BucketTarget, BucketTargetType, Bucket
 use rustfs_ecstore::bucket::utils::{deserialize, serialize};
 use rustfs_ecstore::bucket::versioning::VersioningApi;
 use rustfs_ecstore::config::com::{delete_config, read_config, save_config};
-use rustfs_ecstore::config::get_global_server_config;
 use rustfs_ecstore::error::Error as StorageError;
 use rustfs_ecstore::global::{get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port};
 use rustfs_ecstore::new_object_layer_fn;
